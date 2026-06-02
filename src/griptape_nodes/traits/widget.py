@@ -13,18 +13,23 @@ class Widget(Trait):
 
     library: str  # Library that provides the widget (e.g., "example_nodes_template")
     element_id: str = field(default_factory=lambda: "Widget")
+    synced_parameters: list[str] = field(default_factory=list)
 
-    def __init__(self, name: str, library: str) -> None:
+    def __init__(self, name: str, library: str, synced_parameters: list[str] | None = None) -> None:
         super().__init__()
         self.name = name
         self.library = library
+        self.synced_parameters = synced_parameters if synced_parameters is not None else []
 
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["widget"]
 
     def ui_options_for_trait(self) -> dict:
-        return {
+        options: dict = {
             "widget": self.name,
             "library": self.library,
         }
+        if self.synced_parameters:
+            options["synced_parameters"] = self.synced_parameters
+        return options
