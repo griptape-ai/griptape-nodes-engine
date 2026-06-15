@@ -78,13 +78,14 @@ def worker_manager() -> WorkerManager:
 
 
 def _managed_proc_mock() -> MagicMock:
-    """Build a mock worker process whose ``wait()`` is awaitable.
+    """Build a mock worker process that reports as exited after SIGTERM.
 
-    ``_terminate_managed_process`` awaits ``proc.wait()`` after SIGTERM; a bare
-    MagicMock returns a non-awaitable, so stand in an AsyncMock for ``wait``.
+    ``_terminate_managed_process`` polls ``proc.returncode`` to decide whether to
+    escalate to SIGKILL; a non-None value means the process already exited, so the
+    happy path returns without killing.
     """
     proc = MagicMock()
-    proc.wait = AsyncMock()
+    proc.returncode = 0
     return proc
 
 
@@ -504,16 +505,11 @@ class TestResetWorkers:
     @pytest.mark.asyncio
     async def test_escalates_to_sigkill_when_terminate_times_out(self, worker_manager: WorkerManager) -> None:
         """A worker that ignores SIGTERM must be SIGKILLed after the grace period."""
-        proc = _managed_proc_mock()
+        proc = MagicMock()
+        proc.returncode = None  # never exits, so the grace-period poll always times out
         worker_manager._managed_worker_processes["Lib A"] = proc
 
-        def _close_and_timeout(awaitable: object, *_args: object, **_kwargs: object) -> None:
-            # Close the proc.wait() coroutine we are bypassing so it is not
-            # reported as never-awaited, then simulate the SIGTERM grace expiring.
-            awaitable.close()  # type: ignore[attr-defined]
-            raise TimeoutError
-
-        with patch("asyncio.wait_for", side_effect=_close_and_timeout):
+        with patch.object(WorkerManager, "DEFAULT_TERMINATE_GRACE_S", 0.0):
             await worker_manager.reset_workers()
 
         proc.terminate.assert_called_once()

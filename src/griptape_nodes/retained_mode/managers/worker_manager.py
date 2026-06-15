@@ -411,6 +411,12 @@ class WorkerManager:
         event loop; a wedged loop never services it. After DEFAULT_TERMINATE_GRACE_S
         we send SIGKILL, which the kernel delivers regardless of loop state, so a
         hung worker can never leak.
+
+        The subprocess transport is bound to the loop that spawned it (the engine
+        event-queue loop), which may differ from the loop running eviction (the
+        websocket-tasks loop). Awaiting proc.wait() across loops raises "attached
+        to a different loop", so we poll the loop-agnostic returncode attribute,
+        and terminate()/kill() are synchronous os.kill calls usable from any loop.
         """
         try:
             proc.terminate()
@@ -418,20 +424,26 @@ class WorkerManager:
             logger.debug("Worker for key '%s' already exited before termination", library_name)
             return
         logger.info("Terminated worker for key '%s' (pid %s)", library_name, proc.pid)
+
+        deadline = time.monotonic() + WorkerManager.DEFAULT_TERMINATE_GRACE_S
+        # ASYNC110: an asyncio.Event cannot replace the poll here. returncode is
+        # set by the spawning loop's child watcher, and an Event would bind to
+        # whichever loop created it, reintroducing the cross-loop await we avoid.
+        while proc.returncode is None and time.monotonic() < deadline:  # noqa: ASYNC110
+            await asyncio.sleep(0.1)
+        if proc.returncode is not None:
+            return
+
+        logger.warning(
+            "Worker for key '%s' (pid %s) did not exit within %.0fs of SIGTERM; sending SIGKILL",
+            library_name,
+            proc.pid,
+            WorkerManager.DEFAULT_TERMINATE_GRACE_S,
+        )
         try:
-            await asyncio.wait_for(proc.wait(), timeout=WorkerManager.DEFAULT_TERMINATE_GRACE_S)
-        except TimeoutError:
-            logger.warning(
-                "Worker for key '%s' (pid %s) did not exit within %.0fs of SIGTERM; sending SIGKILL",
-                library_name,
-                proc.pid,
-                WorkerManager.DEFAULT_TERMINATE_GRACE_S,
-            )
-            try:
-                proc.kill()
-            except ProcessLookupError:
-                return
-            await proc.wait()
+            proc.kill()
+        except ProcessLookupError:
+            return
 
     def register_worker_evicted_callback(self, callback: Callable[[str, str | None], None]) -> None:
         """Register a callback invoked when a worker is evicted.
