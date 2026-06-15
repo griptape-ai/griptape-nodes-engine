@@ -227,7 +227,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     async def aprepare_workflow_for_run(
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
         **kwargs: Any,
     ) -> str:
         """Prepares a local workflow for execution.
@@ -237,15 +236,10 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         workflow, and preparing the specified workflow for execution.
         Parameters:
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
 
         Returns:
             str: The name of the prepared flow.
         """
-        if storage_backend is not None:
-            msg = "The storage_backend parameter is deprecated. Pass `storage_backend` to the constructor instead."
-            raise ValueError(msg)
-
         GriptapeNodes.EventManager().initialize_queue()
 
         # Load workflow from file if workflow_path is provided
@@ -372,7 +366,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     async def arun(
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
+        storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
         pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
@@ -385,7 +379,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         Parameters:
             workflow_name: The name of the workflow to execute.
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
+            storage_backend: Accepted for compatibility with the base-class run path,
+                but ignored here: the storage backend is applied once at construction
+                via `_set_storage_backend`. Passing it to the run path has no effect.
             pickle_control_flow_result: Per-call override for the executor's
                 save-time default. None means "use the instance default".
 
@@ -394,7 +390,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """
         flow_name = await self.aprepare_workflow_for_run(
             flow_input=flow_input,
-            storage_backend=storage_backend,
             **kwargs,
         )
 
