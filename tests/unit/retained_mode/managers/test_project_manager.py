@@ -4525,3 +4525,194 @@ directories:
         assert isinstance(result.template.parent_project_path, PerPlatformProjectPath)
         assert result.template.parent_project_path.darwin == base_path.as_posix()
         assert result.template.parent_project_path.linux == "/mnt/base.yml"
+
+
+class TestActivateWorkspaceProject:
+    """`on_activate_workspace_project_request`: the app's boot-time pre-activation seam."""
+
+    VALID_PROJECT_YAML = """\
+project_template_schema_version: "0.1.0"
+name: Workspace Project
+situations:
+  save_node_output:
+    macro: "{outputs}/custom/{file_name_base}.{file_extension}"
+    policy:
+      on_collision: create_new
+      create_dirs: true
+"""
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = {}
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    def _setup_system_defaults(self, pm: ProjectManager, workspace_dir: str = "/workspace") -> None:
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, ProjectInfo
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            project_file_path=None,
+            project_base_dir=Path(workspace_dir),
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+        pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
+        pm._current_project_id = SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_no_workspace_project_is_success_noop(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """No resolvable project file: Success, system defaults stay active (a no-op is not a failure)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_resolvable_workspace_project_activates(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A resolvable workspace project is activated and returns Success."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+            mock_file_cls.return_value = mock_file_instance
+
+            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == str(workspace_project_path)
+
+    @pytest.mark.asyncio
+    async def test_unloadable_workspace_project_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project file that resolves but fails to load returns Failure (still on system defaults)."""
+        from griptape_nodes.files.file import FileLoadError
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        # File exists so the path resolves, but the read fails so activation cannot take.
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(
+                side_effect=FileLoadError(
+                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
+                    result_details="permission denied",
+                )
+            )
+            mock_file_cls.return_value = mock_file_instance
+
+            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultFailure)
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_malformed_yaml_workspace_project_is_failure_with_detail(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A project file whose YAML can't be parsed returns Failure carrying the detail, never raises.
+
+        Exercises the reworked failure signaling: _load_workspace_project returns a detail
+        string (rather than the handler inferring failure from a current-project read-back),
+        and the handler surfaces it in the result_details. The read-back inference is gone,
+        so this path must not depend on _current_project_id staying on system defaults.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
+            mock_file_cls.return_value = mock_file_instance
+
+            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultFailure)
+        assert str(workspace_project_path) in str(result.result_details)
+        assert "Failed because" in str(result.result_details)
