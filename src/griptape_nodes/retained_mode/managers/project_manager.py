@@ -298,18 +298,36 @@ class _ProjectActivationOutcome(NamedTuple):
     workspace_changed: bool
 
 
+class WorkspaceDecision(NamedTuple):
+    """The workspace dir a project resolves to, plus whether activation pins it.
+
+    `workspace_dir` is the directory whose griptape_nodes_config.json supplies the
+    workspace config layer. `apply_override` is True only when activation calls
+    set_workspace_override(workspace_dir): the project_workspaces mapping and the
+    auto-default-to-project-dir branches. It is False when env vars or the
+    project-adjacent config supply workspace_directory, because activation then
+    leaves the override unset so the workspace config layer can re-point it.
+    """
+
+    workspace_dir: Path
+    apply_override: bool
+
+
 class _ProvisioningConfigDirs(NamedTuple):
     """The two directories that determine a project's merged provisioning config.
 
     `project_dir` holds the project-adjacent griptape_nodes_config.json;
     `workspace_dir` is the directory whose config supplies the workspace layer
-    (decided read-only by resolve_project_workspace_dir). The provisioning preview
-    feeds both into ConfigManager.compute_project_provisioning_config so the plan it
+    (decided read-only by decide_workspace). `apply_override` carries that
+    decision's pin bit so the preview applies the workspace_directory override
+    exactly when (and only when) activation would. The provisioning preview feeds
+    all three into ConfigManager.compute_project_provisioning_config so the plan it
     shows matches what activation would reconcile.
     """
 
     project_dir: Path
     workspace_dir: Path
+    apply_override: bool
 
 
 class ProjectManager:
@@ -1042,8 +1060,8 @@ class ProjectManager:
         Canonicalizes `project_id` the same way on_set_current_project_request does
         (so a raw path - unexpanded `~`, symlinked, or relative - resolves to the
         registry key it was loaded under, instead of missing the lookup), finds the
-        loaded file-backed project, then decides its workspace dir read-only via
-        resolve_project_workspace_dir. Returns None when the project is not loaded or
+        loaded file-backed project, then decides its workspace dir + override bit
+        read-only via decide_workspace. Returns None when the project is not loaded or
         has no backing file, mirroring get_loaded_project_dir's "nothing to preview"
         contract. Mutates no config state.
         """
@@ -1058,31 +1076,32 @@ class ProjectManager:
         project_dir = project_file_path.parent
         project_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
-        workspace_dir = self.resolve_project_workspace_dir(project_file_path, project_config, env_config)
-        return _ProvisioningConfigDirs(project_dir=project_dir, workspace_dir=workspace_dir)
+        decision = self.decide_workspace(project_file_path, project_config, env_config)
+        return _ProvisioningConfigDirs(
+            project_dir=project_dir,
+            workspace_dir=decision.workspace_dir,
+            apply_override=decision.apply_override,
+        )
 
-    def resolve_project_workspace_dir(self, project_file_path: Path, project_config: dict, env_config: dict) -> Path:
-        """Decide which directory supplies a project's workspace config layer, read-only.
+    def decide_workspace(self, project_file_path: Path, project_config: dict, env_config: dict) -> WorkspaceDecision:
+        """Decide a project's workspace dir and override bit read-only, mutating nothing.
 
-        Returns the directory whose griptape_nodes_config.json `_activate_project`
-        loads as the workspace layer (the argument it passes to load_workspace_config),
-        without mutating any config state. Priority, highest first:
+        Returns the directory whose griptape_nodes_config.json activation loads as the
+        workspace layer, plus whether activation pins it via set_workspace_override.
+        Priority, highest first (matching _activate_project's block):
 
-        1. project_workspaces user-config override mapped to this project file
-        2. workspace_directory from env vars (GTN_CONFIG_WORKSPACE_DIRECTORY)
-        3. workspace_directory from the project-adjacent config
-        4. the project's own directory (auto-default)
+        1. project_workspaces user-config override -> (override dir, apply_override=True)
+        2. workspace_directory from env vars -> (env dir, apply_override=False)
+        3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
+        4. the project's own directory (auto-default) -> (project dir, apply_override=True)
 
-        The provisioning preview feeds the result into
-        ConfigManager.compute_project_provisioning_config so its merged config reads
-        the same workspace layer the live activation would, keeping the previewed
-        library/engine_version plan in sync with what _reconcile_libraries_from_config
-        actually does. `_activate_project` itself is NOT routed through this helper: it
-        must additionally decide whether to apply set_workspace_override (it leaves the
-        override unset when the config supplies workspace_directory, so a workspace-layer
-        config can re-point the final workspace_path), which a plain Path return can't
-        express. Keep this priority in lockstep with _activate_project's block so the
-        preview and the live path cannot drift.
+        `apply_override` is True only for the override-mapping and auto-default branches,
+        because those are the cases where activation calls set_workspace_override. For env
+        or project-adjacent workspace_directory, activation leaves the override unset so the
+        workspace config layer can re-point the final workspace_path; a forced override
+        would mask that. Both _activate_project (live) and the provisioning preview drive
+        off this one decision, so the previewed library/engine_version plan and what
+        _reconcile_libraries_from_config actually does cannot drift.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
@@ -1091,17 +1110,17 @@ class ProjectManager:
         )
         workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
         if workspace_override is not None:
-            return Path(workspace_override)
+            return WorkspaceDecision(Path(workspace_override), apply_override=True)
 
         env_workspace = env_config.get("workspace_directory")
         if env_workspace is not None:
-            return Path(env_workspace)
+            return WorkspaceDecision(Path(env_workspace), apply_override=False)
 
         project_workspace = project_config.get("workspace_directory")
         if project_workspace is not None:
-            return Path(project_workspace)
+            return WorkspaceDecision(Path(project_workspace), apply_override=False)
 
-        return project_file_path.parent
+        return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
         """Return the user-configured workspace override for a project file, or None if not mapped."""
@@ -1250,27 +1269,18 @@ class ProjectManager:
             project_dir = project_file_path.parent
             self._config_manager.load_project_config(project_dir)
 
-            # Determine workspace directory using the following priority:
-            # 1. project_workspaces in user config (per-user, per-project override)
-            # 2. workspace_directory in project-adjacent config (shared project default)
-            # 3. env vars
-            # 4. Auto-default to project directory
-            project_workspaces = self._config_manager.get_config_value(
-                "project_workspaces",
-                config_source="user_config",
-                default={},
+            # Decide the workspace dir + override bit once (shared with the provisioning
+            # preview via decide_workspace, so the two cannot drift). apply_override is
+            # True only for the project_workspaces mapping and the auto-default-to-project
+            # branches; for an env/project-adjacent workspace_directory it is False, so the
+            # override stays unset and the workspace config layer can re-point workspace_path.
+            decision = self.decide_workspace(
+                project_file_path,
+                self._config_manager.project_config,
+                self._config_manager.env_config,
             )
-            workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
-
-            if workspace_override is not None:
-                self._config_manager.set_workspace_override(Path(workspace_override))
-            elif (
-                "workspace_directory" not in self._config_manager.project_config
-                and "workspace_directory" not in self._config_manager.env_config
-            ):
-                # If neither the project-adjacent config nor env vars explicitly set
-                # workspace_directory, default the workspace to the project directory itself.
-                self._config_manager.set_workspace_override(project_dir)
+            if decision.apply_override:
+                self._config_manager.set_workspace_override(decision.workspace_dir)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)

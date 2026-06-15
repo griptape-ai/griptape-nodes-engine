@@ -300,7 +300,9 @@ class ConfigManager:
         self._workspace_config_path = workspace_dir / "griptape_nodes_config.json"
         self.load_configs()
 
-    def compute_project_provisioning_config(self, project_dir: Path, workspace_dir: Path) -> dict:
+    def compute_project_provisioning_config(
+        self, project_dir: Path, workspace_dir: Path, *, apply_override: bool
+    ) -> dict:
         """Return the merged config a project WOULD activate with, mutating nothing.
 
         Mirrors load_configs()'s layer order (defaults -> user -> project-adjacent ->
@@ -312,13 +314,20 @@ class ConfigManager:
         project-adjacent file alone, which diverges when a higher-priority layer
         (a separate-dir workspace config, env vars, or the user config) sets those keys.
 
-        `workspace_dir` is the directory the project would resolve to (decided by
-        ProjectManager.resolve_project_workspace_dir, the same decision the live
-        activation applies); its griptape_nodes_config.json is the workspace layer.
+        `workspace_dir` and `apply_override` come from ProjectManager.decide_workspace,
+        the same decision the live activation applies. The override is applied here only
+        when `apply_override` is True (the project_workspaces mapping and auto-default
+        branches), exactly as _activate_project calls set_workspace_override; for an
+        env/project-adjacent workspace_directory it is False so the workspace config layer
+        can re-point workspace_directory, matching the live path. When applied, the value
+        is resolved the same way set_workspace_override resolves it (expanduser + resolve),
+        so the merged workspace_directory matches the live merged config byte-for-byte.
 
         Args:
             project_dir: Directory holding the project YAML and its adjacent config.
             workspace_dir: The resolved workspace directory for this project.
+            apply_override: Whether activation would pin workspace_directory to
+                workspace_dir via set_workspace_override.
         """
         merged = Settings().model_dump()
 
@@ -334,9 +343,12 @@ class ConfigManager:
         if workspace_config_path != project_config_path:
             merged = merge_dicts(merged, self._load_config_from_file(workspace_config_path, "workspace"))
 
-        # The resolved workspace dir is the runtime override the live path would apply;
-        # it sits above config files but below env vars (GTN_CONFIG_WORKSPACE_DIRECTORY).
-        merged["workspace_directory"] = str(workspace_dir)
+        # Apply the runtime workspace override conditionally, mirroring _activate_project:
+        # only the project_workspaces and auto-default branches pin it (apply_override),
+        # and the value is resolved exactly as set_workspace_override would so preview and
+        # live agree. It sits above config files but below env vars.
+        if apply_override:
+            merged["workspace_directory"] = str(Path(workspace_dir).expanduser().resolve())
 
         env_config = self._load_config_from_env_vars()
         if env_config:

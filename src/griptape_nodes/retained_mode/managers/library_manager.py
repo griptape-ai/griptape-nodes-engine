@@ -3102,7 +3102,9 @@ class LibraryManager:
                 f"Failed because the project is not loaded or has no project-adjacent config directory",
             )
 
-        merged = GriptapeNodes.ConfigManager().compute_project_provisioning_config(dirs.project_dir, dirs.workspace_dir)
+        merged = GriptapeNodes.ConfigManager().compute_project_provisioning_config(
+            dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override
+        )
         engine_version_failure = engine_version_failure_detail(get_dot_value(merged, ENGINE_VERSION_KEY, default=None))
 
         raw_libraries = get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY, default=[])

@@ -1756,14 +1756,15 @@ class TestLoadSystemDefaults:
         assert str(project_info.project_base_dir) != "~/GriptapeNodes"
 
 
-class TestResolveProjectWorkspaceDir:
-    """`resolve_project_workspace_dir` decides a project's workspace-layer dir read-only.
+class TestDecideWorkspace:
+    """`decide_workspace` decides a project's workspace-layer dir + override bit read-only.
 
-    The provisioning preview feeds the result into
-    ConfigManager.compute_project_provisioning_config so its plan reads the same
-    workspace layer the live activation would. The priority must stay in lockstep
-    with _activate_project's inline decision (the TestProjectManagerProjectWorkspaces
-    matrix guards the live path).
+    Both the live `_activate_project` block and the provisioning preview drive off this
+    one decision. `apply_override` is True only for the project_workspaces mapping and the
+    auto-default branches (where activation calls set_workspace_override); it is False for
+    an env/project-adjacent workspace_directory so the workspace config layer can re-point
+    it. The TestProjectManagerProjectWorkspaces matrix guards the live path; this guards the
+    decision both paths share.
     """
 
     @staticmethod
@@ -1778,48 +1779,52 @@ class TestResolveProjectWorkspaceDir:
         mapped_workspace = tmp_path / "mapped"
 
         pm = self._pm_with_project_workspaces({str(project_file): str(mapped_workspace)})
-        resolved = pm.resolve_project_workspace_dir(
+        decision = pm.decide_workspace(
             project_file,
             project_config={"workspace_directory": "/ignored/project"},
             env_config={"workspace_directory": "/ignored/env"},
         )
 
-        assert resolved == Path(str(mapped_workspace))
+        assert decision.workspace_dir == Path(str(mapped_workspace))
+        assert decision.apply_override is True
 
     def test_env_workspace_wins_over_project_adjacent(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
         pm = self._pm_with_project_workspaces({})
-        resolved = pm.resolve_project_workspace_dir(
+        decision = pm.decide_workspace(
             project_file,
             project_config={"workspace_directory": "/from/project"},
             env_config={"workspace_directory": "/from/env"},
         )
 
-        assert resolved == Path("/from/env")
+        assert decision.workspace_dir == Path("/from/env")
+        assert decision.apply_override is False
 
     def test_project_adjacent_workspace_used_when_no_override_or_env(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
         pm = self._pm_with_project_workspaces({})
-        resolved = pm.resolve_project_workspace_dir(
+        decision = pm.decide_workspace(
             project_file,
             project_config={"workspace_directory": "/from/project"},
             env_config={},
         )
 
-        assert resolved == Path("/from/project")
+        assert decision.workspace_dir == Path("/from/project")
+        assert decision.apply_override is False
 
     def test_auto_defaults_to_project_dir(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
         pm = self._pm_with_project_workspaces({})
-        resolved = pm.resolve_project_workspace_dir(project_file, project_config={}, env_config={})
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
 
-        assert resolved == project_file.parent
+        assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
 
 
 class TestProjectManagerProjectWorkspaces:

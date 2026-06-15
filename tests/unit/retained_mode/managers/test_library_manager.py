@@ -2226,7 +2226,7 @@ class TestPreviewProjectProvisioning:
             )
 
         compute = mock_gn.ConfigManager.return_value.compute_project_provisioning_config
-        compute.assert_called_once_with(dirs.project_dir, dirs.workspace_dir)
+        compute.assert_called_once_with(dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override)
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
         assert [a.library_name for a in result.actions] == ["merged-lib"]
         assert result.actions[0].kind == LibraryProvisioningActionKind.INSTALL
