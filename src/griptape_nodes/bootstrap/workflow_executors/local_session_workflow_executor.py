@@ -100,7 +100,9 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         Parameters:
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
+            storage_backend: Accepted for compatibility with the base-class run path,
+                but ignored here: the storage backend is applied once at construction
+                via `_set_storage_backend`. Passing it to the run path has no effect.
             pickle_control_flow_result: Per-call override for the executor's
                 save-time default. None means "use the instance default".
 
@@ -132,15 +134,18 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def _arun(  # noqa: C901, PLR0915
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
+        storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
         pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
     ) -> None:
-        """Internal async run method with detailed event handling and websocket integration."""
+        """Internal async run method with detailed event handling and websocket integration.
+
+        `storage_backend` is accepted for signature parity with `arun`/the base run path,
+        but ignored: the backend is applied once at construction via `_set_storage_backend`.
+        """
         flow_name = await self.aprepare_workflow_for_run(
             flow_input=flow_input,
-            storage_backend=storage_backend,
             **kwargs,
         )
 
