@@ -118,10 +118,10 @@ directories:
 
 `parent_project_path` accepts two forms:
 
-| Form     | Example                                                      | Notes                                                                                                                         |
-| -------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| Form     | Example                                                      | Notes                                                                                                                          |
+| -------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
 | Relative | `../team-base/griptape-nodes-project.yml`                    | Preferred. Resolved against the directory of *this* project's YAML file, so the link survives moves between machines and OSes. |
-| Absolute | `/Users/alice/projects/team-base/griptape-nodes-project.yml` | Bakes in a per-machine path; works locally but does not travel.                                                             |
+| Absolute | `/Users/alice/projects/team-base/griptape-nodes-project.yml` | Bakes in a per-machine path; works locally but does not travel.                                                                |
 
 No macros are expanded inside `parent_project_path`. Tokens like `{workspace_dir}`, `{project_dir}`, and `{outputs}` are not substituted here — a path containing them is treated literally. Macros belong in `path_macro` and `situations.*.macro` fields.
 
