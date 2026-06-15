@@ -458,6 +458,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
                 timestamp=datetime.now(tz=UTC).isoformat(),
                 user=user,
                 user_organization=user_organization,
+                is_initializing=GriptapeNodes.LibraryManager().is_initializing(),
                 result_details="Engine heartbeat successful",
                 **instance_info,
                 **workflow_info,
