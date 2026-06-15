@@ -35,7 +35,7 @@ class TestLibraryRegistrationSources:
         assert registration.git_url == "griptape-ai/git-lib@v2.0"
 
     def test_no_source_and_no_path_raises(self) -> None:
-        with pytest.raises(ValidationError, match="at least one of 'path', 'git_url', or 'requirement_specifier'"):
+        with pytest.raises(ValidationError, match="at least one of 'path' or 'git_url'"):
             LibraryRegistration.model_validate({"version": ">=1.0"})
 
     def test_sourced_entry_without_name_raises(self) -> None:

@@ -1339,44 +1339,32 @@ class LibraryProvisioningActionKind(StrEnum):
     OVERWRITE = "OVERWRITE"  # wrong version installed -> replace
 
 
-class LibraryProvisioningSource(StrEnum):
-    """Where a sourced library is installed from."""
-
-    GIT = "GIT"
-    PYPI = "PYPI"
-
-
 @dataclass
 class LibraryProvisioningAction:
-    """The planned provisioning outcome for one sourced library registration.
+    """The planned provisioning outcome for one git-sourced library registration.
 
     Computed by a pure registry-read + PEP 440 compare so the preview and the
     real execution derive from the same decision. `destructive` is True ONLY for
     a git OVERWRITE, the path that deletes the local library directory before
-    re-cloning. A PyPI OVERWRITE installs into a per-library venv and never
-    deletes a local lib dir, so it is non-destructive; INSTALL/SKIP never are.
+    re-cloning; INSTALL/SKIP never are.
 
     Fields:
         library_name: Library name, matching the registration's `name`.
         kind: SKIP / INSTALL / OVERWRITE.
-        source: GIT or PYPI (inferred from which registration field is set).
         installed_version: Currently registered version, or None when not installed.
         pinned_version: The registration's PEP 440 version specifier, or None for a source-only entry.
-        git_url: The registration's git source (url@ref form), when source is GIT.
+        git_url: The registration's git source (url@ref form).
         git_ref: The branch/tag/commit parsed from `git_url`, when present.
-        requirement_specifier: The composed PyPI specifier, when source is PYPI.
         destructive: True only for a git OVERWRITE (deletes the local dir).
         reason: Human-readable explanation of the decision.
     """
 
     library_name: str
     kind: LibraryProvisioningActionKind
-    source: LibraryProvisioningSource
     installed_version: str | None
     pinned_version: str | None
     git_url: str | None
     git_ref: str | None
-    requirement_specifier: str | None
     destructive: bool
     reason: str
 

@@ -117,8 +117,8 @@ class LibraryRegistration(BaseModel):
     Bare path strings remain valid in the config; this object form is used when
     additional fields (such as `enabled` or `worker_mode_override`) need to be
     set per entry. An entry may describe a local library (via `path`) and/or a
-    remote, version-pinned source (via `git_url` / `requirement_specifier`),
-    which the engine provisions to match when the owning project is activated.
+    remote, version-pinned source (via `git_url`), which the engine provisions to
+    match when the owning project is activated.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -127,7 +127,7 @@ class LibraryRegistration(BaseModel):
         default=None,
         description=(
             "Path to a griptape_nodes_library.json file or a directory scanned recursively. "
-            "Optional when git_url/requirement_specifier provide a remote source."
+            "Optional when git_url provides a remote source."
         ),
     )
     enabled: bool = Field(
@@ -147,7 +147,7 @@ class LibraryRegistration(BaseModel):
         default=None,
         description=(
             "Library name, matching the library's manifest `name`. Required for sourced "
-            "entries (git_url/requirement_specifier) so the installed version can be matched."
+            "entries (git_url) so the installed version can be matched."
         ),
     )
     version: str | None = Field(
@@ -164,18 +164,14 @@ class LibraryRegistration(BaseModel):
             "(e.g. 'griptape-ai/griptape-nodes-library-standard@v2.0')."
         ),
     )
-    requirement_specifier: str | None = Field(
-        default=None,
-        description="PyPI requirement specifier used to install the library into its own venv (e.g. 'my-lib==2.0').",
-    )
 
     @model_validator(mode="after")
     def _validate_sources(self) -> Self:
-        if self.path is None and self.git_url is None and self.requirement_specifier is None:
-            msg = "LibraryRegistration requires at least one of 'path', 'git_url', or 'requirement_specifier'"
+        if self.path is None and self.git_url is None:
+            msg = "LibraryRegistration requires at least one of 'path' or 'git_url'"
             raise ValueError(msg)
-        if (self.git_url is not None or self.requirement_specifier is not None) and self.name is None:
-            msg = "LibraryRegistration with a 'git_url' or 'requirement_specifier' source requires 'name'"
+        if self.git_url is not None and self.name is None:
+            msg = "LibraryRegistration with a 'git_url' source requires 'name'"
             raise ValueError(msg)
         return self
 

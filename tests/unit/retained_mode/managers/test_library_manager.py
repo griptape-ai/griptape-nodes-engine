@@ -1808,10 +1808,7 @@ class TestLibraryManagerProvisioningPlan:
     """`_plan_one_library_provisioning` is a pure decision the preview and execution share."""
 
     def test_satisfied_git_entry_plans_skip(self, griptape_nodes: GriptapeNodes) -> None:
-        from griptape_nodes.retained_mode.events.library_events import (
-            LibraryProvisioningActionKind,
-            LibraryProvisioningSource,
-        )
+        from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         registration = LibraryRegistration(name="git-lib", version=">=2.0,<3", git_url="griptape-ai/git-lib@v2")
@@ -1819,14 +1816,10 @@ class TestLibraryManagerProvisioningPlan:
             action = library_manager._plan_one_library_provisioning(registration)
 
         assert action.kind == LibraryProvisioningActionKind.SKIP
-        assert action.source == LibraryProvisioningSource.GIT
         assert action.destructive is False
 
     def test_missing_git_entry_plans_install(self, griptape_nodes: GriptapeNodes) -> None:
-        from griptape_nodes.retained_mode.events.library_events import (
-            LibraryProvisioningActionKind,
-            LibraryProvisioningSource,
-        )
+        from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         registration = LibraryRegistration(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
@@ -1834,14 +1827,10 @@ class TestLibraryManagerProvisioningPlan:
             action = library_manager._plan_one_library_provisioning(registration)
 
         assert action.kind == LibraryProvisioningActionKind.INSTALL
-        assert action.source == LibraryProvisioningSource.GIT
         assert action.destructive is False
 
     def test_wrong_git_version_plans_destructive_overwrite(self, griptape_nodes: GriptapeNodes) -> None:
-        from griptape_nodes.retained_mode.events.library_events import (
-            LibraryProvisioningActionKind,
-            LibraryProvisioningSource,
-        )
+        from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         registration = LibraryRegistration(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
@@ -1849,25 +1838,8 @@ class TestLibraryManagerProvisioningPlan:
             action = library_manager._plan_one_library_provisioning(registration)
 
         assert action.kind == LibraryProvisioningActionKind.OVERWRITE
-        assert action.source == LibraryProvisioningSource.GIT
         # A git overwrite deletes the local library directory before re-cloning.
         assert action.destructive is True
-
-    def test_wrong_pypi_version_plans_nondestructive_overwrite(self, griptape_nodes: GriptapeNodes) -> None:
-        from griptape_nodes.retained_mode.events.library_events import (
-            LibraryProvisioningActionKind,
-            LibraryProvisioningSource,
-        )
-
-        library_manager = griptape_nodes.LibraryManager()
-        registration = LibraryRegistration(name="pypi-lib", version="2.0", requirement_specifier="pypi-lib")
-        with patch.object(library_manager, "_installed_library_version", return_value="1.0.0"):
-            action = library_manager._plan_one_library_provisioning(registration)
-
-        assert action.kind == LibraryProvisioningActionKind.OVERWRITE
-        assert action.source == LibraryProvisioningSource.PYPI
-        # A PyPI overwrite installs into a per-library venv and never deletes a local dir.
-        assert action.destructive is False
 
 
 class TestInstalledLibraryVersion:
@@ -1957,7 +1929,7 @@ class TestInstalledLibraryManifestPath:
 class TestDiscoverSourcedLibraries:
     """Discovery resolves sourced-only entries to their provisioned manifest.
 
-    Sourced-only entries (git_url/requirement_specifier, no path) are cloned by reconcile, so
+    Sourced-only entries (git_url, no path) are cloned by reconcile, so
     discovery must resolve them to their provisioned on-disk manifest. Without this, a sourced
     library is on disk but never loaded -- the bug where a pinned standard library showed up in
     neither the engine nor the editor after a project switch.
@@ -2032,19 +2004,6 @@ class TestRegistrationSatisfiedByInstalled:
         assert _LibraryManager._registration_satisfied_by_installed(registration, "2.0.0") is False
 
 
-class TestComposeRequirementSpecifier:
-    """The entry's version is folded into the PyPI specifier only when it carries no constraint."""
-
-    def test_no_version_returns_specifier_unchanged(self) -> None:
-        assert _LibraryManager._compose_requirement_specifier(None, "my-lib") == "my-lib"
-
-    def test_appends_version_when_specifier_has_no_constraint(self) -> None:
-        assert _LibraryManager._compose_requirement_specifier("==2.0", "my-lib") == "my-lib==2.0"
-
-    def test_leaves_specifier_that_already_constrains(self) -> None:
-        assert _LibraryManager._compose_requirement_specifier(">=1.0", "my-lib==3.0") == "my-lib==3.0"
-
-
 class TestReconcileLibrariesFromConfig:
     """Reconcile gates on engine_version first, then provisions sourced entries."""
 
@@ -2068,7 +2027,7 @@ class TestReconcileLibrariesFromConfig:
             "griptape_nodes_library.json",
             {"path": "../shared/lib"},
             {"name": "git-lib", "git_url": "griptape-ai/git-lib@v2", "version": ">=2.0"},
-            {"name": "pypi-lib", "requirement_specifier": "pypi-lib", "version": "==2.0"},
+            {"name": "git-lib-two", "git_url": "griptape-ai/git-lib-two@v2", "version": "==2.0"},
         ]
         config_manager = MagicMock()
         config_manager.get_config_value.return_value = raw_libraries

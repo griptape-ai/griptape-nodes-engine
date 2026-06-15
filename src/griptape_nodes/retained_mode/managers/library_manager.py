@@ -121,7 +121,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesResultSuccess,
     LibraryProvisioningAction,
     LibraryProvisioningActionKind,
-    LibraryProvisioningSource,
     ListCapableLibraryEventHandlersRequest,
     ListCapableLibraryEventHandlersResultFailure,
     ListCapableLibraryEventHandlersResultSuccess,
@@ -421,7 +420,7 @@ class LibraryManager:
 
         `path` is the file or directory to scan for manifests: the
         workspace-resolved path for a path-backed entry, or the provisioned
-        manifest located by name for a sourced (git/PyPI) entry. `registered_path`
+        manifest located by name for a git-sourced entry. `registered_path`
         is the key the GUI uses to map metadata back to the user's config row.
         """
 
@@ -3017,7 +3016,7 @@ class LibraryManager:
     async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> list[str]:
         """Reconcile sourced libraries, then discover and load every enabled library.
 
-        Reconcile runs first (engine_version gate + provision of git/PyPI-sourced
+        Reconcile runs first (engine_version gate + provision of git-sourced
         entries) so freshly provisioned libraries are present on disk for the
         discovery pass below. Reconcile failure details are returned, not raised:
         the boot caller logs and continues so a bad pin cannot brick startup,
@@ -3121,7 +3120,7 @@ class LibraryManager:
 
         raw_libraries = get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY, default=[])
         registrations = normalize_library_registrations(raw_libraries)
-        sourced = [reg for reg in registrations if reg.git_url is not None or reg.requirement_specifier is not None]
+        sourced = [reg for reg in registrations if reg.git_url is not None]
 
         actions = [self._plan_one_library_provisioning(reg) for reg in sourced]
         destructive_count = sum(1 for action in actions if action.destructive)
@@ -3138,7 +3137,7 @@ class LibraryManager:
 
         The project (its adjacent config, already merged into the live config by
         the time this runs) is the source of truth for the libraries it needs:
-        each git/PyPI-sourced entry is provisioned to match its version. A path-only
+        each git-sourced entry is provisioned to match its version. A path-only
         entry is left to normal discovery. The engine_version gate runs first,
         before any disk mutation, so a version mismatch blocks provisioning
         entirely rather than half-applying it.
@@ -3156,7 +3155,7 @@ class LibraryManager:
 
         failures: list[str] = []
         for registration in registrations:
-            if registration.git_url is None and registration.requirement_specifier is None:
+            if registration.git_url is None:
                 continue
             failure = await self._provision_one_library(registration)
             if failure is not None:
@@ -3181,110 +3180,81 @@ class LibraryManager:
         provisioning path re-runs it at execution time; both read the same
         on-disk state, which survives the reload's registry unload, so the two
         cannot drift. Branch order mirrors `_provision_one_library`: the
-        already-satisfied SKIP first, then the source dispatch.
+        already-satisfied SKIP first, then the git clone/overwrite.
 
         `destructive` is True ONLY for a git OVERWRITE, matching the
         `overwrite_existing = installed_version is not None` decision in
         `_provision_git_library` that triggers the local directory delete.
 
-        The LibraryRegistration validator guarantees a sourced entry carries a
-        `name`, so `registration.name` is non-None here.
+        Callers pass only git-sourced entries, and the LibraryRegistration
+        validator guarantees such an entry carries a `name`, so both
+        `registration.git_url` and `registration.name` are non-None here.
         """
+        if registration.git_url is None:
+            msg = (
+                f"Attempted to plan provisioning for library '{registration.name}'. "
+                f"Failed because the registration has no git_url source."
+            )
+            raise ValueError(msg)
+
         library_name = registration.name if registration.name is not None else ""
         installed_version = self._installed_library_version(library_name)
         satisfied = self._registration_satisfied_by_installed(registration, installed_version)
         if satisfied:
-            source = (
-                LibraryProvisioningSource.GIT if registration.git_url is not None else LibraryProvisioningSource.PYPI
-            )
             return LibraryProvisioningAction(
                 library_name=library_name,
                 kind=LibraryProvisioningActionKind.SKIP,
-                source=source,
                 installed_version=installed_version,
                 pinned_version=registration.version,
                 git_url=registration.git_url,
                 git_ref=None,
-                requirement_specifier=registration.requirement_specifier,
                 destructive=False,
                 reason=f"Installed version {installed_version} already satisfies the entry",
             )
 
-        if registration.git_url is not None:
-            parsed = parse_git_url_with_ref(registration.git_url)
-            if installed_version is None:
-                kind = LibraryProvisioningActionKind.INSTALL
-                reason = f"Not installed; will clone from {registration.git_url}"
-            else:
-                kind = LibraryProvisioningActionKind.OVERWRITE
-                reason = (
-                    f"Installed version {installed_version} does not satisfy the entry; "
-                    f"will delete the local library directory and re-clone from {registration.git_url}"
-                )
-            return LibraryProvisioningAction(
-                library_name=library_name,
-                kind=kind,
-                source=LibraryProvisioningSource.GIT,
-                installed_version=installed_version,
-                pinned_version=registration.version,
-                git_url=parsed.url,
-                git_ref=parsed.ref,
-                requirement_specifier=None,
-                destructive=kind == LibraryProvisioningActionKind.OVERWRITE,
-                reason=reason,
-            )
-
-        requirement_specifier = registration.requirement_specifier
-        if requirement_specifier is None:
-            msg = (
-                f"Attempted to plan provisioning for library '{library_name}'. "
-                f"Failed because the registration has no git_url or requirement_specifier source."
-            )
-            raise ValueError(msg)
-
-        composed_specifier = self._compose_requirement_specifier(registration.version, requirement_specifier)
+        parsed = parse_git_url_with_ref(registration.git_url)
         if installed_version is None:
             kind = LibraryProvisioningActionKind.INSTALL
-            reason = f"Not installed; will install '{composed_specifier}' into its own venv"
+            reason = f"Not installed; will clone from {registration.git_url}"
         else:
             kind = LibraryProvisioningActionKind.OVERWRITE
             reason = (
                 f"Installed version {installed_version} does not satisfy the entry; "
-                f"will reinstall '{composed_specifier}' into its own venv"
+                f"will delete the local library directory and re-clone from {registration.git_url}"
             )
         return LibraryProvisioningAction(
             library_name=library_name,
             kind=kind,
-            source=LibraryProvisioningSource.PYPI,
             installed_version=installed_version,
             pinned_version=registration.version,
-            git_url=None,
-            git_ref=None,
-            requirement_specifier=composed_specifier,
-            destructive=False,
+            git_url=parsed.url,
+            git_ref=parsed.ref,
+            destructive=kind == LibraryProvisioningActionKind.OVERWRITE,
             reason=reason,
         )
 
     async def _provision_one_library(self, registration: LibraryRegistration) -> str | None:
-        """Provision a single sourced library, skipping when already satisfied.
+        """Provision a single git-sourced library, skipping when already satisfied.
 
         Computes the plan with the same pure decision function the preview uses
-        (`_plan_one_library_provisioning`), then dispatches on the result.
-        Delegates the actual clone/venv work to the existing handlers, which
-        recompute their own `overwrite_existing`/specifier so the wire payloads
-        are unchanged. Returns a failure detail string, or None on success/skip.
+        (`_plan_one_library_provisioning`), then clones/overwrites via the
+        download handler, which recomputes its own `overwrite_existing` so the
+        wire payload is unchanged. Returns a failure detail string, or None on
+        success/skip. Callers pass only git-sourced entries, so `git_url` is
+        non-None here.
         """
         action = self._plan_one_library_provisioning(registration)
         if action.kind == LibraryProvisioningActionKind.SKIP:
             return None
 
-        if action.source == LibraryProvisioningSource.GIT and registration.git_url is not None:
-            return await self._provision_git_library(
-                registration, git_url=registration.git_url, installed_version=action.installed_version
+        if registration.git_url is None:
+            return (
+                f"Attempted to provision library '{registration.name}'. "
+                f"Failed because the registration has no git_url source."
             )
 
-        return await self._provision_requirement_library(
-            registration, requirement_specifier=registration.requirement_specifier
+        return await self._provision_git_library(
+            registration, git_url=registration.git_url, installed_version=action.installed_version
         )
 
     async def _provision_git_library(
@@ -3334,36 +3304,13 @@ class LibraryManager:
             )
         return None
 
-    async def _provision_requirement_library(
-        self, registration: LibraryRegistration, *, requirement_specifier: str | None
-    ) -> str | None:
-        """Install a PyPI-sourced entry into its own venv via the register handler.
-
-        The venv-reuse guard in the handler is not version-aware, so the entry's
-        version is folded into the requirement specifier (e.g. 'name==2.0') when
-        a separate version spec is declared and the specifier does not already
-        carry one.
-        """
-        if requirement_specifier is None:
-            return None
-        composed_specifier = self._compose_requirement_specifier(registration.version, requirement_specifier)
-
-        register_request = RegisterLibraryFromRequirementSpecifierRequest(requirement_specifier=composed_specifier)
-        register_result = await GriptapeNodes.ahandle_request(register_request)
-        if not isinstance(register_result, RegisterLibraryFromRequirementSpecifierResultSuccess):
-            return (
-                f"Failed to provision library '{registration.name}' from requirement "
-                f"'{composed_specifier}': {register_result.result_details}"
-            )
-        return None
-
     @staticmethod
     def _installed_library_manifest_path(library_name: str) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
-        git-sourced libraries and where PyPI-sourced libraries land in their venv)
-        rather than the in-memory `LibraryRegistry`, because the reload path
+        git-sourced libraries) rather than the in-memory `LibraryRegistry`,
+        because the reload path
         unregisters every library before reconcile runs (see
         `reload_libraries_request`). Returns the first manifest whose `name`
         matches; None when the directory is unconfigured or missing, or no
@@ -3434,20 +3381,6 @@ class LibraryManager:
             return PackagingVersion(installed_version) in specifier_set
         except (InvalidSpecifier, InvalidVersion):
             return False
-
-    @staticmethod
-    def _compose_requirement_specifier(version: str | None, requirement_specifier: str) -> str:
-        """Fold the entry's version into the requirement specifier when needed.
-
-        Returns the declared specifier unchanged when it already carries a
-        version constraint or when the entry has no separate version; otherwise
-        appends the entry's PEP 440 version so uv resolves the pinned release.
-        """
-        if version is None:
-            return requirement_specifier
-        if any(operator in requirement_specifier for operator in ("==", ">=", "<=", "~=", ">", "<", "!=", "===")):
-            return requirement_specifier
-        return f"{requirement_specifier}{version}"
 
     async def _ensure_libraries_from_config(self) -> None:
         """Ensure libraries from git URLs specified in config are downloaded.
@@ -4946,8 +4879,8 @@ class LibraryManager:
     def _resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> ResolvedDiscoveryPath | None:
         """Resolve a `libraries_to_register` entry to a concrete on-disk path to scan.
 
-        A path-backed entry resolves against the workspace; a sourced-only
-        (git/PyPI) entry has no local path, so its provisioned manifest is located
+        A path-backed entry resolves against the workspace; a git-sourced-only
+        entry has no local path, so its provisioned manifest is located
         by name through `_installed_library_manifest_path` -- the same resolver the
         provisioning planner uses, so the file the planner reasoned about is
         exactly the file discovery loads. Returns None when nothing resolves on

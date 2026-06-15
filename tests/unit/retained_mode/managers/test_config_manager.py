@@ -586,7 +586,6 @@ class TestConfigManagerEventEmission:
                 "name": None,
                 "version": None,
                 "git_url": None,
-                "requirement_specifier": None,
             },
         ]
 
