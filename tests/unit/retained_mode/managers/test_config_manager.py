@@ -818,6 +818,28 @@ class TestComputeProjectProvisioningConfig:
         assert manager._workspace_config_path == workspace_path_before
         assert manager._workspace_dir_override == override_before
 
+    def test_system_defaults_config_ignores_project_and_workspace_files(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """The system-defaults config reads only defaults->user->env, never a project/workspace file.
+
+        The system-defaults activation path loads no project-adjacent or workspace
+        griptape_nodes_config.json, so neither may leak into this preview, or the plan
+        would diverge from what the switch actually reconciles.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        # A stray config file sitting in cwd-adjacent dirs must not be consulted.
+        self._write_config(tmp_path / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["stray-file-lib"])
+        self._write_config(isolate_user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            merged = manager.compute_system_defaults_provisioning_config()
+
+        assert get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY) == ["user-pin-lib"]
+
 
 class TestProvisioningPreviewMatchesActivation:
     """The provisioning preview's merged config matches what activation actually produces.
@@ -1019,3 +1041,39 @@ class TestProvisioningPreviewMatchesActivation:
                 expected_libraries=["project-lib"],
                 expected_engine_version=">=1.0",
             )
+
+    def test_system_defaults_branch(self, isolate_user_config: Path) -> None:
+        """Switching to system defaults merges defaults->user->env with no project/workspace file.
+
+        _activate_project's system-defaults branch runs clear_project_layers() then load_configs(),
+        so the preview's compute_system_defaults_provisioning_config must agree on the keys it
+        consumes. A user-config library pin proves the user layer is actually read (a both-empty
+        pass would not), which is exactly the pin that can force a destructive reconcile on the
+        switch to Default Project.
+        """
+        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
+
+        user_config: dict = {}
+        set_dot_value(user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
+        set_dot_value(user_config, ENGINE_VERSION_KEY, ">=9.0")
+        isolate_user_config.write_text(json.dumps(user_config), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+
+            # Preview path, read-only.
+            preview_merged = cm.compute_system_defaults_provisioning_config()
+
+            # Live path, mirroring _activate_project's system-defaults branch.
+            cm.clear_project_layers()
+            cm.load_configs()
+            live_merged = cm.merged_config
+
+        assert get_dot_value(preview_merged, LIBRARIES_TO_REGISTER_KEY) == get_dot_value(
+            live_merged, LIBRARIES_TO_REGISTER_KEY
+        )
+        assert get_dot_value(preview_merged, ENGINE_VERSION_KEY) == get_dot_value(live_merged, ENGINE_VERSION_KEY)
+        # The user layer was actually consumed (not a both-empty pass).
+        assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == ["user-pin-lib"]
+        assert get_dot_value(live_merged, ENGINE_VERSION_KEY) == ">=9.0"

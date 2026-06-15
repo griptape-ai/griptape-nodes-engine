@@ -42,6 +42,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import LibraryRegistration
 
 
@@ -2127,6 +2128,16 @@ class TestPreviewProjectProvisioning:
         mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = dirs
         mock_gn.ConfigManager.return_value.compute_project_provisioning_config.return_value = merged
 
+    @staticmethod
+    def _patch_system_defaults(mock_gn: MagicMock, *, merged: object) -> None:
+        """Wire the mocked ConfigManager for the system-defaults branch.
+
+        System defaults reads its merged config from compute_system_defaults_provisioning_config
+        (defaults -> user -> env, no project-adjacent or workspace file), so the handler never
+        calls ProjectManager.resolve_provisioning_config_dirs for it.
+        """
+        mock_gn.ConfigManager.return_value.compute_system_defaults_provisioning_config.return_value = merged
+
     def test_not_loaded_project_is_failure(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
             PreviewProjectProvisioningRequest,
@@ -2275,6 +2286,81 @@ class TestPreviewProjectProvisioning:
             )
 
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert result.engine_version_failure is None
+
+    def test_system_defaults_plans_from_user_layer_without_resolving_dirs(self, griptape_nodes: GriptapeNodes) -> None:
+        """System defaults is previewable: it plans from the defaults->user->env merge.
+
+        Switching to system defaults activates that merge (no project-adjacent or
+        workspace file), and a user-config git pin can still force a destructive
+        OVERWRITE there. The handler must match SYSTEM_DEFAULTS_KEY verbatim and read
+        compute_system_defaults_provisioning_config, never resolve_provisioning_config_dirs
+        (which returns None for the synthetic id and would wrongly produce a Failure).
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            LibraryProvisioningActionKind,
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        merged = self._merged_config([{"name": "user-pin", "git_url": "griptape-ai/user-pin@v2", "version": "==2.0.0"}])
+        with (
+            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(library_manager, "_installed_library_version", return_value="1.0.0"),
+        ):
+            self._patch_system_defaults(mock_gn, merged=merged)
+            result = library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            )
+
+        mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.assert_not_called()
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert [a.library_name for a in result.actions] == ["user-pin"]
+        assert result.actions[0].kind == LibraryProvisioningActionKind.OVERWRITE
+        assert result.actions[0].destructive is True
+
+    def test_system_defaults_unsatisfiable_engine_version_populates_failure(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """A user-config engine_version pin gates the system-defaults switch too."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        merged = self._merged_config([], engine_version=">=2.0,<3.0")
+        with (
+            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
+        ):
+            self._patch_system_defaults(mock_gn, merged=merged)
+            result = library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert result.engine_version_failure is not None
+        assert "0.5.3" in result.engine_version_failure
+
+    def test_system_defaults_no_pins_is_empty_success(self, griptape_nodes: GriptapeNodes) -> None:
+        """No user-config pins means nothing to provision: empty plan, no modal."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        merged = self._merged_config(["griptape_nodes_library.json", {"path": "../shared/lib"}])
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            self._patch_system_defaults(mock_gn, merged=merged)
+            result = library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert result.actions == []
         assert result.engine_version_failure is None
 
 

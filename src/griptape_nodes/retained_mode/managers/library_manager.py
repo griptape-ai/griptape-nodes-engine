@@ -212,6 +212,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     UpdateConfigCategoryProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     ENGINE_VERSION_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
@@ -3091,20 +3092,31 @@ class LibraryManager:
         engine_version gate (`engine_version_failure_detail`) on that merged config
         so the preview can warn before the user approves a plan that activation
         would reject. The GUI calls this before committing to a switch so the user
-        can approve or refuse the changes. Only an already-loaded, file-backed
-        project can be previewed; a project that is not loaded (or has no adjacent
-        config dir) is a Failure.
+        can approve or refuse the changes. System defaults are previewable too:
+        switching to them merges defaults -> user -> env (no project-adjacent or
+        workspace-file layer), and that merged config can still carry a user-config
+        library pin or engine_version, so it gets the same plan + gate. A non-loaded
+        file-backed project (or one with no adjacent config dir) is a Failure.
         """
-        dirs = GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
-        if dirs is None:
-            return PreviewProjectProvisioningResultFailure(
-                result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
-                f"Failed because the project is not loaded or has no project-adjacent config directory",
+        config_mgr = GriptapeNodes.ConfigManager()
+
+        # System defaults is a synthetic id, not a path, so match it verbatim before
+        # any canonicalization (mirroring on_set_current_project_request). Its activation
+        # reads no project-adjacent or workspace-file config layer, so the preview must
+        # not either, or it would drift from what the reconcile actually provisions.
+        if request.project_id == SYSTEM_DEFAULTS_KEY:
+            merged = config_mgr.compute_system_defaults_provisioning_config()
+        else:
+            dirs = GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
+            if dirs is None:
+                return PreviewProjectProvisioningResultFailure(
+                    result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
+                    f"Failed because the project is not loaded or has no project-adjacent config directory",
+                )
+            merged = config_mgr.compute_project_provisioning_config(
+                dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override
             )
 
-        merged = GriptapeNodes.ConfigManager().compute_project_provisioning_config(
-            dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override
-        )
         engine_version_failure = engine_version_failure_detail(get_dot_value(merged, ENGINE_VERSION_KEY, default=None))
 
         raw_libraries = get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY, default=[])

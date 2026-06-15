@@ -356,6 +356,30 @@ class ConfigManager:
 
         return merged
 
+    def compute_system_defaults_provisioning_config(self) -> dict:
+        """Return the merged config system defaults WOULD activate with, mutating nothing.
+
+        Mirrors what _activate_project does for SYSTEM_DEFAULTS_KEY: clear_project_layers()
+        drops the project-adjacent and workspace config-file layers and the workspace
+        override, then load_configs() merges defaults -> user -> env vars only. The
+        provisioning preview uses this so a switch to "Default Project" shows the same
+        `libraries_to_register` / `engine_version` that _reconcile_libraries_from_config
+        reads from the live merged config after activation. Unlike
+        compute_project_provisioning_config, it reads no project-adjacent or workspace
+        griptape_nodes_config.json, because the system-defaults activation path reads
+        neither.
+        """
+        merged = Settings().model_dump()
+
+        if USER_CONFIG_PATH.exists():
+            merged = merge_dicts(merged, self._load_config_from_file(USER_CONFIG_PATH, "user"))
+
+        env_config = self._load_config_from_env_vars()
+        if env_config:
+            merged = merge_dicts(merged, env_config)
+
+        return merged
+
     def reset_user_config(self) -> None:
         """Reset the user configuration to the default values.
 
