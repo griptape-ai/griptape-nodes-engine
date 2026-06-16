@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
+    ModelCatalogLibraryProperty,
     NodeDeclaration,
     SuggestedWorkerMode,
     WorkerCompatibility,
@@ -124,6 +125,21 @@ class LibraryMetadata(BaseModel):
             msg = (
                 "Library declares WorkerModeCompatibility(compatibility=INCOMPATIBLE) but also "
                 "declares SuggestedWorkerMode(mode=WORKER); the two are contradictory."
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
+        # Node references and the duplicate-id check assume a single catalog
+        # (see library_validation._find_model_catalog). Two catalogs would let
+        # the second one's models go unseen, so reject the ambiguity here where
+        # all declarations are visible together.
+        catalog_count = sum(1 for d in self.declarations if isinstance(d, ModelCatalogLibraryProperty))
+        if catalog_count > 1:
+            msg = (
+                f"Library declares {catalog_count} 'model_catalog' declarations; at most one is allowed. "
+                f"Merge the providers into a single 'model_catalog'."
             )
             raise ValueError(msg)
         return self

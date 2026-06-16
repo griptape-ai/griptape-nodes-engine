@@ -2334,16 +2334,12 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
           "anthropic": {
             "display_name": "Anthropic",
             "terms_url": "https://www.anthropic.com/legal/commercial-terms",
-            "families": {
-              "claude_4": {
-                "display_name": "Claude 4",
-                "offerings": {
-                  "claude_opus_byok": {
-                    "display_name": "Claude Opus 4 (BYOK)",
-                    "model": "claude-opus-4",
-                    "key_support": "REQUIRES_CUSTOMER_KEY"
-                  }
-                }
+            "models": {
+              "claude_opus_byok": {
+                "display_name": "Claude Opus 4 (BYOK)",
+                "family": "Claude 4",
+                "provider_model_id": "claude-opus-4",
+                "key_support": "REQUIRES_CUSTOMER_KEY"
               }
             }
           }
@@ -2379,7 +2375,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
         "icon": "image",
         "group": "processing",
         "declarations": [
-          { "type": "model_usage", "offering_ids": ["claude_opus_byok"] }
+          { "type": "model_usage", "model_ids": ["claude_opus_byok"] }
         ]
       }
     }
@@ -2431,7 +2427,7 @@ Semantics:
 
 #### `model_catalog`
 
-A library-level declaration of the third-party models nodes in the library can use, organized as a `provider → family → offering` hierarchy. Identifiers at every level are dict keys (the key *is* the stable handle used by node references and admin policies); each entry carries a `display_name` for UI plus optional `terms_url` and `notes`. Leaf `ModelOffering`s additionally declare `key_support` (required) and an optional upstream `model` identifier.
+A library-level declaration of the third-party models nodes in the library can use, organized as a `provider → model` registry. Identifiers at both levels are dict keys (the key *is* the stable handle used by node references and admin policies); each entry carries a `display_name` for UI plus optional `terms_url` and `notes`. Each `Model` additionally declares `key_support` (required), an optional `family` grouping tag, and an optional upstream `provider_model_id`.
 
 The `key_support` value tells admins what kind of API key authorizes the call:
 
@@ -2442,7 +2438,7 @@ The `key_support` value tells admins what kind of API key authorizes the call:
 | `REQUIRES_GRIPTAPE_KEY`                 | Griptape-provided key only.                                                         |
 | `NO_KEY_REQUIRED`                       | The model runs locally or otherwise needs no API key (e.g. an Ollama-hosted model). |
 
-`notes` (available at every level — provider, family, and offering) is free-form author guidance rendered alongside the entry. Use it for caveats that don't fit other fields, like "BYOK requires injecting a provider-specific prompt driver."
+`notes` (available on both the provider and the model) is free-form author guidance rendered alongside the entry. Use it for caveats that don't fit other fields, like "BYOK requires injecting a provider-specific prompt driver."
 
 ```jsonc
 {
@@ -2451,34 +2447,36 @@ The `key_support` value tells admins what kind of API key authorizes the call:
     "anthropic": {
       "display_name": "Anthropic",
       "terms_url": "https://www.anthropic.com/legal/commercial-terms",
-      "families": {
-        "claude_4": {
-          "display_name": "Claude 4",
-          "offerings": {
-            "claude_opus_byok": {
-              "display_name": "Claude Opus 4 (BYOK)",
-              "model": "claude-opus-4",
-              "key_support": "REQUIRES_CUSTOMER_KEY"
-            },
-            "claude_opus_griptape": {
-              "display_name": "Claude Opus 4 (Griptape Key)",
-              "model": "claude-opus-4",
-              "key_support": "REQUIRES_GRIPTAPE_KEY"
-            }
-          }
+      "models": {
+        "claude_opus_byok": {
+          "display_name": "Claude Opus 4 (BYOK)",
+          "family": "Claude 4",
+          "provider_model_id": "claude-opus-4",
+          "key_support": "REQUIRES_CUSTOMER_KEY"
+        },
+        "claude_opus_griptape": {
+          "display_name": "Claude Opus 4 (Griptape Key)",
+          "family": "Claude 4",
+          "provider_model_id": "claude-opus-4",
+          "key_support": "REQUIRES_GRIPTAPE_KEY"
         }
       }
     },
     "kling": {
       "display_name": "Kling",
       "terms_url": "https://app.klingai.com/global/about/terms",
-      "offerings": {
+      "models": {
         "kling_v2": {
           "display_name": "Kling v2",
-          "model": "kling-v2-master",
+          "provider_model_id": "kling-v2-master",
           "key_support": "REQUIRES_GRIPTAPE_KEY"
         }
       }
+    },
+    "ollama": {
+      "display_name": "Ollama",
+      "key_support": "NO_KEY_REQUIRED",
+      "notes": "Local runtime; models enumerated at runtime, none declared here."
     }
   }
 }
@@ -2486,46 +2484,32 @@ The `key_support` value tells admins what kind of API key authorizes the call:
 
 A few rules worth knowing:
 
-- **Family is optional.** Providers without meaningful families (Kling above) put offerings directly under `provider.offerings`. Providers with meaningful families (Anthropic above) put offerings under `provider.families.<family_id>.offerings`.
-- **`terms_url` cascades most-specific-wins.** If a `ModelOffering` sets `terms_url`, that wins. Otherwise the parent family's `terms_url` is used; otherwise the parent provider's. Absence at every level is reported as "no TOS declared" rather than silently defaulting.
-- **`key_support` lives on the offering by default.** Every `ModelOffering` declares its own value. The same upstream model with two different key requirements becomes two offerings under two distinct dict keys (see `claude_opus_byok` and `claude_opus_griptape` above). `ModelProvider` and `ModelFamily` also accept an optional `key_support` for cases where a provider has no offerings at all (e.g. a local-runtime provider like Ollama where `key_support=NO_KEY_REQUIRED` is the only meaningful signal).
-- **Offering IDs must be unique across the entire library.** Pydantic enforces sibling-uniqueness within each `offerings` dict for free; cross-parent collisions are caught at library-load time as `DuplicateModelOfferingIdProblem`.
+- **`family` is just a tag.** It clusters related models for display (e.g. the two Claude 4 entries above). It is not a container and is not part of a model's identity, so providers without meaningful families simply omit it.
+- **`key_support` lives on the model by default.** Every `Model` declares its own value. The same upstream model with two different key requirements becomes two models under two distinct dict keys (see `claude_opus_byok` and `claude_opus_griptape` above). A `ModelProvider` also accepts an optional `key_support` used only when it declares no models at all (e.g. a local-runtime provider like Ollama where `key_support=NO_KEY_REQUIRED` is the only meaningful signal).
+- **Model IDs must be unique across the entire library.** Pydantic enforces uniqueness within each provider's `models` dict for free; collisions across providers are caught at library-load time as `DuplicateModelIdProblem`.
+- **At most one `model_catalog` per library.** Declaring two is rejected at validation time; merge their providers into one.
 
 ##### `model_usage`
 
-A node references one or more catalog offerings by their dict keys. Use this when the node binds to a specific, named set of offerings. Each entry must resolve to an offering somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.
+A node references one or more catalog models by their dict keys. Use this when the node binds to a specific, named set of models. Each entry must resolve to a model somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.
 
 ```jsonc
-{ "type": "model_usage", "offering_ids": ["claude_opus_byok", "kling_v2"] }
-```
-
-##### `model_family_usage`
-
-A node references one or more entire model families. Use this when a node dynamically enumerates every offering in a family at runtime. Family ids are scoped within their provider, so each entry carries both the `provider_id` and the `family_id`. Unresolved references surface as `UnresolvedModelFamilyUsageReferenceProblem`.
-
-```jsonc
-{
-  "type": "model_family_usage",
-  "families": [
-    { "provider_id": "openai",    "family_id": "gpt_5" },
-    { "provider_id": "anthropic", "family_id": "claude_4_6" }
-  ]
-}
+{ "type": "model_usage", "model_ids": ["claude_opus_byok", "kling_v2"] }
 ```
 
 ##### `model_provider_usage`
 
-A node references one or more entire providers. Use this when a node dynamically enumerates every offering across a whole provider at runtime. Each entry must resolve to a provider declared in the catalog; unresolved references surface as `UnresolvedModelProviderUsageReferenceProblem`.
+A node references one or more entire providers. Use this when a node dynamically enumerates every model a provider offers at runtime. Each entry must resolve to a provider declared in the catalog; unresolved references surface as `UnresolvedModelProviderUsageReferenceProblem`.
 
 ```jsonc
-{ "type": "model_provider_usage", "provider_ids": ["anthropic", "openai"] }
+{ "type": "model_provider_usage", "provider_ids": ["anthropic", "ollama"] }
 ```
 
-The three usage declarations are independent. A node can carry any combination — for instance, "every offering in this family, plus these two specific offerings from another provider."
+The two usage declarations are independent. A node can carry any combination — for instance, "every model this provider offers, plus these two specific models from another provider."
 
 #### Combining declarations
 
-A node can carry any combination of declarations. For example, a Labs node that supports two model offerings:
+A node can carry any combination of declarations. For example, a Labs node that uses two models:
 
 ```jsonc
 "metadata": {
@@ -2534,7 +2518,7 @@ A node can carry any combination of declarations. For example, a Labs node that 
   "display_name": "Labs Node",
   "declarations": [
     { "type": "lifecycle_stage", "stage": "LABS" },
-    { "type": "model_usage", "offering_ids": ["claude_opus_byok", "kling_v2"] }
+    { "type": "model_usage", "model_ids": ["claude_opus_byok", "kling_v2"] }
   ]
 }
 ```

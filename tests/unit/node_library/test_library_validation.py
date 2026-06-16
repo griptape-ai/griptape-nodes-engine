@@ -1,16 +1,13 @@
-"""Tests for `validate_library_declarations`."""
+"""Tests for `validate_library_declarations` and `detect_retired_node_declarations`."""
 
 from __future__ import annotations
 
 from typing import Any
 
 from griptape_nodes.node_library.library_declarations import (
-    FamilyReference,
     KeySupport,
+    Model,
     ModelCatalogLibraryProperty,
-    ModelFamily,
-    ModelFamilyUsageNodeProperty,
-    ModelOffering,
     ModelProvider,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
@@ -22,10 +19,13 @@ from griptape_nodes.node_library.library_registry import (
     NodeDefinition,
     NodeMetadata,
 )
-from griptape_nodes.node_library.library_validation import validate_library_declarations
+from griptape_nodes.node_library.library_validation import (
+    detect_retired_node_declarations,
+    validate_library_declarations,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
-    DuplicateModelOfferingIdProblem,
-    UnresolvedModelFamilyUsageReferenceProblem,
+    DuplicateModelIdProblem,
+    RetiredNodeDeclarationProblem,
     UnresolvedModelProviderUsageReferenceProblem,
     UnresolvedModelUsageReferenceProblem,
 )
@@ -68,8 +68,8 @@ def _make_schema(
     )
 
 
-def _offering(display_name: str = "X") -> ModelOffering:
-    return ModelOffering(display_name=display_name, key_support=KeySupport.REQUIRES_CUSTOMER_KEY)
+def _model(display_name: str = "X") -> Model:
+    return Model(display_name=display_name, key_support=KeySupport.REQUIRES_CUSTOMER_KEY)
 
 
 # ---------- No declarations / clean library ----------
@@ -79,165 +79,104 @@ class TestCleanLibrary:
     def test_library_with_no_declarations_has_no_problems(self) -> None:
         schema = _make_schema()
 
-        result = validate_library_declarations(schema)
-
-        assert result.fatal == []
-        assert result.warnings == []
+        assert validate_library_declarations(schema) == []
 
     def test_library_with_only_a_clean_catalog_has_no_problems(self) -> None:
         schema = _make_schema(
             library_declarations=[
                 ModelCatalogLibraryProperty(
-                    providers={
-                        "p": ModelProvider(
-                            display_name="P",
-                            offerings={"o": _offering()},
-                        ),
-                    },
+                    providers={"p": ModelProvider(display_name="P", models={"m": _model()})},
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
-
-        assert result.fatal == []
-        assert result.warnings == []
+        assert validate_library_declarations(schema) == []
 
 
-# ---------- Duplicate offering ids ----------
+# ---------- Duplicate model ids ----------
 
 
-class TestDuplicateOfferingIds:
+class TestDuplicateModelIds:
     def test_same_id_under_two_providers_is_fatal(self) -> None:
         schema = _make_schema(
             library_declarations=[
                 ModelCatalogLibraryProperty(
                     providers={
-                        "anthropic": ModelProvider(
-                            display_name="Anthropic",
-                            offerings={"shared": _offering()},
-                        ),
-                        "kling": ModelProvider(
-                            display_name="Kling",
-                            offerings={"shared": _offering()},
-                        ),
+                        "anthropic": ModelProvider(display_name="Anthropic", models={"shared": _model()}),
+                        "kling": ModelProvider(display_name="Kling", models={"shared": _model()}),
                     },
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        duplicates = [p for p in result.fatal if isinstance(p, DuplicateModelOfferingIdProblem)]
+        duplicates = [p for p in problems if isinstance(p, DuplicateModelIdProblem)]
         assert len(duplicates) == 1
-        assert duplicates[0].offering_id == "shared"
-        assert sorted(duplicates[0].parent_paths) == ["anthropic", "kling"]
-
-    def test_same_id_under_provider_and_family_is_fatal(self) -> None:
-        schema = _make_schema(
-            library_declarations=[
-                ModelCatalogLibraryProperty(
-                    providers={
-                        "anthropic": ModelProvider(
-                            display_name="Anthropic",
-                            families={
-                                "claude_4": ModelFamily(
-                                    display_name="Claude 4",
-                                    offerings={"shared": _offering()},
-                                ),
-                            },
-                            offerings={"shared": _offering()},
-                        ),
-                    },
-                ),
-            ],
-        )
-
-        result = validate_library_declarations(schema)
-
-        duplicates = [p for p in result.fatal if isinstance(p, DuplicateModelOfferingIdProblem)]
-        assert len(duplicates) == 1
-        assert sorted(duplicates[0].parent_paths) == ["anthropic", "anthropic/claude_4"]
+        assert duplicates[0].model_id == "shared"
+        assert sorted(duplicates[0].provider_ids) == ["anthropic", "kling"]
 
     def test_unique_ids_pass(self) -> None:
         schema = _make_schema(
             library_declarations=[
                 ModelCatalogLibraryProperty(
                     providers={
-                        "anthropic": ModelProvider(
-                            display_name="Anthropic",
-                            offerings={"a": _offering()},
-                        ),
-                        "kling": ModelProvider(
-                            display_name="Kling",
-                            offerings={"b": _offering()},
-                        ),
+                        "anthropic": ModelProvider(display_name="Anthropic", models={"a": _model()}),
+                        "kling": ModelProvider(display_name="Kling", models={"b": _model()}),
                     },
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        assert [p for p in result.fatal if isinstance(p, DuplicateModelOfferingIdProblem)] == []
+        assert [p for p in problems if isinstance(p, DuplicateModelIdProblem)] == []
 
 
 # ---------- Unresolved model usage references ----------
 
 
 class TestUnresolvedModelUsageReferences:
-    def test_node_referencing_missing_offering_is_fatal(self) -> None:
+    def test_node_referencing_missing_model_is_fatal(self) -> None:
         schema = _make_schema(
             library_declarations=[
                 ModelCatalogLibraryProperty(
-                    providers={
-                        "p": ModelProvider(
-                            display_name="P",
-                            offerings={"o": _offering()},
-                        ),
-                    },
+                    providers={"p": ModelProvider(display_name="P", models={"m": _model()})},
                 ),
             ],
             nodes=[
                 NodeDefinition(
                     class_name="UsesMissing",
                     file_path="x.py",
-                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(offering_ids=["nonexistent"])]),
+                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(model_ids=["nonexistent"])]),
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        unresolved = [p for p in result.fatal if isinstance(p, UnresolvedModelUsageReferenceProblem)]
+        unresolved = [p for p in problems if isinstance(p, UnresolvedModelUsageReferenceProblem)]
         assert len(unresolved) == 1
-        assert unresolved[0].node_name == "UsesMissing"
-        assert unresolved[0].offering_id == "nonexistent"
+        assert unresolved[0].class_name == "UsesMissing"
+        assert unresolved[0].model_id == "nonexistent"
 
-    def test_node_referencing_existing_offering_passes(self) -> None:
+    def test_node_referencing_existing_model_passes(self) -> None:
         schema = _make_schema(
             library_declarations=[
                 ModelCatalogLibraryProperty(
-                    providers={
-                        "p": ModelProvider(
-                            display_name="P",
-                            offerings={"o": _offering()},
-                        ),
-                    },
+                    providers={"p": ModelProvider(display_name="P", models={"m": _model()})},
                 ),
             ],
             nodes=[
                 NodeDefinition(
                     class_name="UsesExisting",
                     file_path="x.py",
-                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(offering_ids=["o"])]),
+                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(model_ids=["m"])]),
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
-
-        assert result.fatal == []
+        assert validate_library_declarations(schema) == []
 
     def test_node_with_no_catalog_and_a_reference_is_fatal(self) -> None:
         schema = _make_schema(
@@ -246,15 +185,14 @@ class TestUnresolvedModelUsageReferences:
                 NodeDefinition(
                     class_name="UsesMissing",
                     file_path="x.py",
-                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(offering_ids=["o"])]),
+                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(model_ids=["m"])]),
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        unresolved = [p for p in result.fatal if isinstance(p, UnresolvedModelUsageReferenceProblem)]
-        assert len(unresolved) == 1
+        assert len([p for p in problems if isinstance(p, UnresolvedModelUsageReferenceProblem)]) == 1
 
     def test_multiple_unresolved_references_all_reported(self) -> None:
         schema = _make_schema(
@@ -263,116 +201,30 @@ class TestUnresolvedModelUsageReferences:
                 NodeDefinition(
                     class_name="N",
                     file_path="x.py",
-                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(offering_ids=["a", "b"])]),
+                    metadata=_make_node_metadata(declarations=[ModelUsageNodeProperty(model_ids=["a", "b"])]),
                 ),
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        ids = [p.offering_id for p in result.fatal if isinstance(p, UnresolvedModelUsageReferenceProblem)]
+        ids = [p.model_id for p in problems if isinstance(p, UnresolvedModelUsageReferenceProblem)]
         assert sorted(ids) == ["a", "b"]
-
-
-# ---------- Unresolved family-usage references ----------
-
-
-def _catalog_with_one_family() -> ModelCatalogLibraryProperty:
-    return ModelCatalogLibraryProperty(
-        providers={
-            "openai": ModelProvider(
-                display_name="OpenAI",
-                families={
-                    "gpt_5": ModelFamily(
-                        display_name="GPT-5",
-                        offerings={"openai_gpt_5": _offering()},
-                    ),
-                },
-            ),
-        },
-    )
-
-
-class TestUnresolvedFamilyUsageReferences:
-    def test_node_referencing_existing_family_passes(self) -> None:
-        schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
-            nodes=[
-                NodeDefinition(
-                    class_name="UsesGpt5",
-                    file_path="x.py",
-                    metadata=_make_node_metadata(
-                        declarations=[
-                            ModelFamilyUsageNodeProperty(
-                                families=[FamilyReference(provider_id="openai", family_id="gpt_5")],
-                            ),
-                        ],
-                    ),
-                ),
-            ],
-        )
-
-        result = validate_library_declarations(schema)
-
-        assert result.fatal == []
-
-    def test_node_referencing_missing_family_is_fatal(self) -> None:
-        schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
-            nodes=[
-                NodeDefinition(
-                    class_name="UsesNonexistent",
-                    file_path="x.py",
-                    metadata=_make_node_metadata(
-                        declarations=[
-                            ModelFamilyUsageNodeProperty(
-                                families=[FamilyReference(provider_id="openai", family_id="gpt_99")],
-                            ),
-                        ],
-                    ),
-                ),
-            ],
-        )
-
-        result = validate_library_declarations(schema)
-
-        unresolved = [p for p in result.fatal if isinstance(p, UnresolvedModelFamilyUsageReferenceProblem)]
-        assert len(unresolved) == 1
-        assert unresolved[0].provider_id == "openai"
-        assert unresolved[0].family_id == "gpt_99"
-
-    def test_family_under_unknown_provider_is_fatal(self) -> None:
-        schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
-            nodes=[
-                NodeDefinition(
-                    class_name="UsesUnknownProvider",
-                    file_path="x.py",
-                    metadata=_make_node_metadata(
-                        declarations=[
-                            ModelFamilyUsageNodeProperty(
-                                families=[FamilyReference(provider_id="acme", family_id="gpt_5")],
-                            ),
-                        ],
-                    ),
-                ),
-            ],
-        )
-
-        result = validate_library_declarations(schema)
-
-        unresolved = [p for p in result.fatal if isinstance(p, UnresolvedModelFamilyUsageReferenceProblem)]
-        assert len(unresolved) == 1
-        assert unresolved[0].provider_id == "acme"
 
 
 # ---------- Unresolved provider-usage references ----------
 
 
+def _catalog_with_one_provider() -> ModelCatalogLibraryProperty:
+    return ModelCatalogLibraryProperty(
+        providers={"openai": ModelProvider(display_name="OpenAI", models={"openai_gpt_5": _model()})},
+    )
+
+
 class TestUnresolvedProviderUsageReferences:
     def test_node_referencing_existing_provider_passes(self) -> None:
         schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
+            library_declarations=[_catalog_with_one_provider()],
             nodes=[
                 NodeDefinition(
                     class_name="UsesOpenai",
@@ -384,13 +236,11 @@ class TestUnresolvedProviderUsageReferences:
             ],
         )
 
-        result = validate_library_declarations(schema)
-
-        assert result.fatal == []
+        assert validate_library_declarations(schema) == []
 
     def test_node_referencing_missing_provider_is_fatal(self) -> None:
         schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
+            library_declarations=[_catalog_with_one_provider()],
             nodes=[
                 NodeDefinition(
                     class_name="UsesAcme",
@@ -402,15 +252,16 @@ class TestUnresolvedProviderUsageReferences:
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        unresolved = [p for p in result.fatal if isinstance(p, UnresolvedModelProviderUsageReferenceProblem)]
+        unresolved = [p for p in problems if isinstance(p, UnresolvedModelProviderUsageReferenceProblem)]
         assert len(unresolved) == 1
+        assert unresolved[0].class_name == "UsesAcme"
         assert unresolved[0].provider_id == "acme"
 
     def test_multiple_unresolved_providers_all_reported(self) -> None:
         schema = _make_schema(
-            library_declarations=[_catalog_with_one_family()],
+            library_declarations=[_catalog_with_one_provider()],
             nodes=[
                 NodeDefinition(
                     class_name="N",
@@ -422,7 +273,50 @@ class TestUnresolvedProviderUsageReferences:
             ],
         )
 
-        result = validate_library_declarations(schema)
+        problems = validate_library_declarations(schema)
 
-        ids = [p.provider_id for p in result.fatal if isinstance(p, UnresolvedModelProviderUsageReferenceProblem)]
+        ids = [p.provider_id for p in problems if isinstance(p, UnresolvedModelProviderUsageReferenceProblem)]
         assert sorted(ids) == ["acme", "wile_e"]
+
+
+# ---------- Retired node declarations (raw JSON scan) ----------
+
+
+class TestDetectRetiredNodeDeclarations:
+    def test_retired_key_support_is_detected(self) -> None:
+        library_json = {
+            "name": "Old Library",
+            "nodes": [
+                {
+                    "class_name": "OldNode",
+                    "metadata": {"declarations": [{"type": "key_support", "support": "REQUIRES_CUSTOMER_KEY"}]},
+                },
+            ],
+        }
+
+        problems = detect_retired_node_declarations(library_json)
+
+        assert len(problems) == 1
+        problem = problems[0]
+        assert isinstance(problem, RetiredNodeDeclarationProblem)
+        assert problem.class_name == "OldNode"
+        assert problem.declaration_type == "key_support"
+        assert problem.guidance
+
+    def test_current_declarations_are_not_flagged(self) -> None:
+        library_json = {
+            "name": "Current Library",
+            "nodes": [
+                {
+                    "class_name": "CurrentNode",
+                    "metadata": {"declarations": [{"type": "model_usage", "model_ids": ["m"]}]},
+                },
+            ],
+        }
+
+        assert detect_retired_node_declarations(library_json) == []
+
+    def test_missing_or_malformed_nodes_are_ignored(self) -> None:
+        assert detect_retired_node_declarations({"name": "No Nodes"}) == []
+        assert detect_retired_node_declarations({"name": "Bad", "nodes": "not-a-list"}) == []
+        assert detect_retired_node_declarations({"name": "Bad", "nodes": [42, {"metadata": None}]}) == []

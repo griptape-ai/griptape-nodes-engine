@@ -1,35 +1,34 @@
 """Cross-reference validation for declarative library declarations.
 
 After Pydantic shape validation via `LibrarySchema.model_validate()`, references
-between declarations (a `ModelUsageNodeProperty.offering_ids` entry pointing to
-an offering id in `ModelCatalogLibraryProperty`) need to be resolved against
-the library's own declarations.
+between declarations (a `ModelUsageNodeProperty.model_ids` entry pointing to a
+model id in `ModelCatalogLibraryProperty`) need to be resolved against the
+library's own declarations.
 
-This module's single public entry point is `validate_library_declarations`,
-which walks a validated `LibrarySchema` and returns a
-`LibraryDeclarationValidationResult` with two lists: `fatal` problems that
-should block library load, and `warnings` that should be surfaced alongside a
-successful load.
+`validate_library_declarations` walks a validated `LibrarySchema` and returns
+the list of blocking problems found; the caller blocks the library load when
+that list is non-empty.
 
-The caller folds these into the existing library-loading problem-reporting flow.
+`detect_retired_node_declarations` runs against the *raw* JSON before Pydantic
+validation, turning declaration `type` tags that were valid in an older schema
+into targeted migration guidance instead of opaque discriminator errors.
 """
 
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.node_library.library_declarations import (
     ModelCatalogLibraryProperty,
-    ModelFamilyUsageNodeProperty,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
-    iter_catalog_offerings,
+    iter_catalog_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
-    DuplicateModelOfferingIdProblem,
+    DuplicateModelIdProblem,
     LibraryProblem,
-    UnresolvedModelFamilyUsageReferenceProblem,
+    RetiredNodeDeclarationProblem,
     UnresolvedModelProviderUsageReferenceProblem,
     UnresolvedModelUsageReferenceProblem,
 )
@@ -37,52 +36,85 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 if TYPE_CHECKING:
     from griptape_nodes.node_library.library_registry import LibrarySchema
 
-
-class LibraryDeclarationValidationResult(NamedTuple):
-    """Outcome of `validate_library_declarations`.
-
-    - `fatal`: problems that must block library load. Cross-parent duplicate
-      offering ids and any unresolved node-side reference (`ModelUsageNodeProperty`,
-      `ModelFamilyUsageNodeProperty`, `ModelProviderUsageNodeProperty`) go here.
-    - `warnings`: problems that should be surfaced but do not block load.
-      Currently empty by construction; the slot stays in case future
-      validation surfaces hygiene-only issues.
-    """
-
-    fatal: list[LibraryProblem]
-    warnings: list[LibraryProblem]
+# Node declaration `type` tags removed in a schema version, mapped to migration guidance.
+# Detected in the raw JSON so authors get a targeted message instead of a Pydantic
+# discriminator error.
+RETIRED_NODE_DECLARATION_GUIDANCE: dict[str, str] = {
+    "key_support": (
+        "Node-level 'key_support' was removed. Declare the models a node uses in a "
+        "library-level 'model_catalog' (each model carries its own 'key_support') and "
+        "reference them from the node with 'model_usage'."
+    ),
+}
 
 
-def validate_library_declarations(library_data: LibrarySchema) -> LibraryDeclarationValidationResult:
+def validate_library_declarations(library_data: LibrarySchema) -> list[LibraryProblem]:
     """Resolve cross-references within a library.
 
-    All failures are collected; validation does not short-circuit on the first problem.
+    Returns every blocking problem found; validation does not short-circuit on
+    the first one.
     """
-    fatal: list[LibraryProblem] = []
-    warnings: list[LibraryProblem] = []
+    problems: list[LibraryProblem] = []
     library_name = library_data.name
 
     catalog = _find_model_catalog(library_data)
-    declared_offering_ids: set[str] = set()
+    declared_model_ids: set[str] = set()
     declared_provider_ids: set[str] = set()
-    declared_families: set[tuple[str, str]] = set()
     if catalog is not None:
-        declared_offering_ids = _check_duplicate_offering_ids(library_name, catalog, fatal)
+        declared_model_ids = _check_duplicate_model_ids(library_name, catalog, problems)
         declared_provider_ids = set(catalog.providers.keys())
-        for provider_id, provider in catalog.providers.items():
-            for family_id in provider.families:
-                declared_families.add((provider_id, family_id))
 
     _check_unresolved_node_references(
         library_name=library_name,
         library_data=library_data,
-        declared_offering_ids=declared_offering_ids,
+        declared_model_ids=declared_model_ids,
         declared_provider_ids=declared_provider_ids,
-        declared_families=declared_families,
-        fatal=fatal,
+        problems=problems,
     )
 
-    return LibraryDeclarationValidationResult(fatal=fatal, warnings=warnings)
+    return problems
+
+
+def detect_retired_node_declarations(library_json: dict[str, Any]) -> list[LibraryProblem]:
+    """Scan raw library JSON for node declarations using a retired `type` tag.
+
+    Runs before Pydantic validation so a library written against an older schema
+    fails with migration guidance rather than an opaque discriminator error.
+    """
+    library_name = library_json.get("name", "<unknown>")
+    nodes = library_json.get("nodes")
+    if not isinstance(nodes, list):
+        return []
+
+    problems: list[LibraryProblem] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        class_name = node.get("class_name", "<unknown>")
+        metadata = node.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        declarations = metadata.get("declarations")
+        if not isinstance(declarations, list):
+            continue
+        for declaration in declarations:
+            if not isinstance(declaration, dict):
+                continue
+            declaration_type = declaration.get("type")
+            if not isinstance(declaration_type, str):
+                continue
+            guidance = RETIRED_NODE_DECLARATION_GUIDANCE.get(declaration_type)
+            if guidance is None:
+                continue
+            problems.append(
+                RetiredNodeDeclarationProblem(
+                    library_name=library_name,
+                    class_name=class_name,
+                    declaration_type=declaration_type,
+                    guidance=guidance,
+                )
+            )
+    return problems
 
 
 def _find_model_catalog(library_data: LibrarySchema) -> ModelCatalogLibraryProperty | None:
@@ -92,79 +124,63 @@ def _find_model_catalog(library_data: LibrarySchema) -> ModelCatalogLibraryPrope
     return None
 
 
-def _check_duplicate_offering_ids(
+def _check_duplicate_model_ids(
     library_name: str,
     catalog: ModelCatalogLibraryProperty,
-    fatal: list[LibraryProblem],
+    problems: list[LibraryProblem],
 ) -> set[str]:
-    """Walk the catalog and report cross-parent duplicate offering ids.
+    """Walk the catalog and report model ids declared under more than one provider.
 
-    Returns the set of declared offering ids (ignoring duplicates) so the caller
-    can validate node references against it.
+    Returns the set of declared model ids (ignoring duplicates) so the caller can
+    validate node references against it.
     """
-    parents_by_id: dict[str, list[str]] = defaultdict(list)
-    for resolved in iter_catalog_offerings(catalog):
-        parent_path = resolved.provider_id
-        if resolved.family_id is not None:
-            parent_path = f"{resolved.provider_id}/{resolved.family_id}"
-        parents_by_id[resolved.offering_id].append(parent_path)
+    providers_by_id: dict[str, list[str]] = defaultdict(list)
+    for resolved in iter_catalog_models(catalog):
+        providers_by_id[resolved.model_id].append(resolved.provider_id)
 
-    for offering_id, parent_paths in parents_by_id.items():
-        if len(parent_paths) > 1:
-            fatal.append(
-                DuplicateModelOfferingIdProblem(
+    for model_id, provider_ids in providers_by_id.items():
+        if len(provider_ids) > 1:
+            problems.append(
+                DuplicateModelIdProblem(
                     library_name=library_name,
-                    offering_id=offering_id,
-                    parent_paths=tuple(parent_paths),
+                    model_id=model_id,
+                    provider_ids=tuple(provider_ids),
                 )
             )
 
-    return set(parents_by_id.keys())
+    return set(providers_by_id.keys())
 
 
-def _check_unresolved_node_references(  # noqa: C901, PLR0913  -- one branch per declaration kind; explicit kwargs are clearer than packing
+def _check_unresolved_node_references(
     *,
     library_name: str,
     library_data: LibrarySchema,
-    declared_offering_ids: set[str],
+    declared_model_ids: set[str],
     declared_provider_ids: set[str],
-    declared_families: set[tuple[str, str]],
-    fatal: list[LibraryProblem],
+    problems: list[LibraryProblem],
 ) -> None:
-    """Walk every node and validate each model_usage / family / provider reference."""
+    """Walk every node and validate each model_usage / provider reference."""
     for node_def in library_data.nodes:
         for node_decl in node_def.metadata.declarations:
             if isinstance(node_decl, ModelUsageNodeProperty):
-                for offering_id in node_decl.offering_ids:
-                    if offering_id in declared_offering_ids:
+                for model_id in node_decl.model_ids:
+                    if model_id in declared_model_ids:
                         continue
-                    fatal.append(
+                    problems.append(
                         UnresolvedModelUsageReferenceProblem(
                             library_name=library_name,
-                            node_name=node_def.class_name,
-                            offering_id=offering_id,
-                        )
-                    )
-            elif isinstance(node_decl, ModelFamilyUsageNodeProperty):
-                for ref in node_decl.families:
-                    if (ref.provider_id, ref.family_id) in declared_families:
-                        continue
-                    fatal.append(
-                        UnresolvedModelFamilyUsageReferenceProblem(
-                            library_name=library_name,
-                            node_name=node_def.class_name,
-                            provider_id=ref.provider_id,
-                            family_id=ref.family_id,
+                            class_name=node_def.class_name,
+                            model_id=model_id,
                         )
                     )
             elif isinstance(node_decl, ModelProviderUsageNodeProperty):
                 for provider_id in node_decl.provider_ids:
                     if provider_id in declared_provider_ids:
                         continue
-                    fatal.append(
+                    problems.append(
                         UnresolvedModelProviderUsageReferenceProblem(
                             library_name=library_name,
-                            node_name=node_def.class_name,
+                            class_name=node_def.class_name,
                             provider_id=provider_id,
                         )
                     )

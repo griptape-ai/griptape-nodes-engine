@@ -7,7 +7,7 @@ from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
 from .deprecated_node_warning_problem import DeprecatedNodeWarningProblem
 from .duplicate_library_problem import DuplicateLibraryProblem
-from .duplicate_model_offering_id_problem import DuplicateModelOfferingIdProblem
+from .duplicate_model_id_problem import DuplicateModelIdProblem
 from .duplicate_node_registration_problem import DuplicateNodeRegistrationProblem
 from .duplicate_widget_registration_problem import DuplicateWidgetRegistrationProblem
 from .engine_version_error_problem import EngineVersionErrorProblem
@@ -26,10 +26,10 @@ from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
 from .node_class_not_found_problem import NodeClassNotFoundProblem
 from .node_module_import_problem import NodeModuleImportProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
+from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
 from .ui_options_field_modified_warning_problem import UiOptionsFieldModifiedWarningProblem
-from .unresolved_model_family_usage_reference_problem import UnresolvedModelFamilyUsageReferenceProblem
 from .unresolved_model_provider_usage_reference_problem import UnresolvedModelProviderUsageReferenceProblem
 from .unresolved_model_usage_reference_problem import UnresolvedModelUsageReferenceProblem
 from .update_config_category_problem import UpdateConfigCategoryProblem
@@ -43,7 +43,7 @@ __all__ = [
     "DependencyInstallationFailedProblem",
     "DeprecatedNodeWarningProblem",
     "DuplicateLibraryProblem",
-    "DuplicateModelOfferingIdProblem",
+    "DuplicateModelIdProblem",
     "DuplicateNodeRegistrationProblem",
     "DuplicateWidgetRegistrationProblem",
     "EngineVersionErrorProblem",
@@ -62,10 +62,10 @@ __all__ = [
     "NodeClassNotFoundProblem",
     "NodeModuleImportProblem",
     "OldXdgLocationWarningProblem",
+    "RetiredNodeDeclarationProblem",
     "SandboxDirectoryMissingProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",
     "UiOptionsFieldModifiedWarningProblem",
-    "UnresolvedModelFamilyUsageReferenceProblem",
     "UnresolvedModelProviderUsageReferenceProblem",
     "UnresolvedModelUsageReferenceProblem",
     "UpdateConfigCategoryProblem",
