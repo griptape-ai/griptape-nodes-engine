@@ -8,7 +8,6 @@ from __future__ import annotations
 import pathlib
 
 from griptape_nodes.common import macro_parser
-from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file
 from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
@@ -181,6 +180,13 @@ class DirectoryDestination:
             else:
                 macro_path = project_events.MacroPath(macro_parser.ParsedMacro(self._dir_path + "_{_index}"), {})
 
+        # Guarantee the template has a {_index} slot. Without one,
+        # GetNextVersionIndexRequest fails. This covers macro strings like
+        # "{outputs}/renders" that carry other variables but omit {_index}.
+        if not any(var.name == "_index" for var in macro_path.parsed_macro.get_variables()):
+            new_template = macro_path.parsed_macro.template + "_{_index}"
+            macro_path = project_events.MacroPath(macro_parser.ParsedMacro(new_template), macro_path.variables)
+
         # Get the next available version index for this macro path.
         # The macro is expected to contain an {_index} variable, which is used to find the next available version.
         index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
@@ -254,7 +260,6 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
         msg = f"Failed to resolve macro path '{macro_path.parsed_macro.template}': {resolve_result.result_details}"
         raise DirectoryError(msg)
     return str(resolve_result.absolute_path)
-
 
 
 def _map_to_macro_directory(absolute_path: pathlib.Path, fallback_path: str | project_events.MacroPath) -> Directory:
