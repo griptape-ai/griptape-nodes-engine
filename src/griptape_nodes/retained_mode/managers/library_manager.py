@@ -1072,8 +1072,6 @@ class LibraryManager:
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
         for discovered in library_files:
-            if discovered.registration.path is None:
-                continue
             metadata_request = LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path)
             metadata_result = self.load_library_metadata_from_file_request(metadata_request)
 
@@ -4680,11 +4678,6 @@ class LibraryManager:
         # Add all regular libraries from config
         for discovered in config_library_entries:
             entry = discovered.registration
-            # _discover_library_files yields path-backed entries directly and
-            # resolves sourced-only entries to their provisioned on-disk manifest,
-            # so every entry here carries a concrete path. Guard defensively.
-            if entry.path is None:
-                continue
             file_path = Path(entry.path)
             file_path_str = entry.path
 
@@ -4917,11 +4910,9 @@ class LibraryManager:
         resolves against the workspace. Libraries pinned to a git source live in
         `libraries_to_download`; the download handler appends each provisioned
         manifest path back into `libraries_to_register`, so they reach discovery
-        as ordinary path-backed entries. Returns None when the entry has no path
-        or the path does not exist on disk.
+        as ordinary path-backed entries. Returns None when the path does not exist
+        on disk.
         """
-        if entry.path is None:
-            return None
         # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
         library_path = resolve_workspace_path(Path(entry.path), workspace_path)
         if not library_path.exists():

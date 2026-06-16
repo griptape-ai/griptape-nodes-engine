@@ -32,6 +32,11 @@ class TestLibraryRegistration:
         with pytest.raises(ValidationError):
             LibraryRegistration.model_validate({"git_url": "griptape-ai/git-lib@v2.0", "name": "git-lib"})
 
+    def test_missing_path_raises(self) -> None:
+        # A register entry's only identity is its path; the object form requires it.
+        with pytest.raises(ValidationError):
+            LibraryRegistration.model_validate({"worker_mode_override": "WORKER"})
+
 
 class TestLibraryDownload:
     """libraries_to_download entries carry git_url plus an optional version pin and name."""

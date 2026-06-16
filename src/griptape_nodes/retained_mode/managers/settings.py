@@ -122,10 +122,7 @@ class LibraryRegistration(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    path: str | None = Field(
-        default=None,
-        description="Path to a griptape_nodes_library.json file or a directory scanned recursively.",
-    )
+    path: str = Field(description="Path to a griptape_nodes_library.json file or a directory scanned recursively.")
     enabled: bool = Field(
         default=True,
         description="When False, the library remains in config but is not loaded on startup.",
