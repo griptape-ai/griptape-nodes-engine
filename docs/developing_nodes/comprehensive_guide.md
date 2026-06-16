@@ -2511,8 +2511,8 @@ The two usage declarations are independent. A node can carry any combination —
 
 Declares that a node executes arbitrary Python code supplied at runtime (for example, an artist-authored script). Node-level only. This is a security-relevant identity fact: consumers (UI) can warn an artist before the node runs. Absence of this declaration means the node does not execute arbitrary Python.
 
-| Field                       | Meaning                                                |
-| --------------------------- | ------------------------------------------------------ |
+| Field                       | Meaning                                                      |
+| --------------------------- | ------------------------------------------------------------ |
 | `executes_arbitrary_python` | `true` when the node runs unvetted, runtime-supplied Python. |
 
 ```jsonc
