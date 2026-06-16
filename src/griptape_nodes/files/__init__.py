@@ -2,6 +2,12 @@
 
 To use the File loader API:
     from griptape_nodes.files.file import File, FileContent, FileDestination, FileLoadError, FileWriteError
+
+To use the Directory API:
+    from griptape_nodes.files.directory import Directory, DirectoryDestination, DirectoryError
+
+To use the FileSequence API:
+    from griptape_nodes.files.file_sequence import FileSequence, FileSequenceDestination, FileSequenceError
 """
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
