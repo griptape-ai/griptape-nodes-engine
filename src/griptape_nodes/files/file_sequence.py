@@ -173,7 +173,8 @@ class FileSequence:
             )
         )
         if not isinstance(scan_result, os_events.ScanSequencesResultSuccess):
-            return []
+            msg = f"Attempted to scan sequence. Failed to scan path '{resolve_result.absolute_path}': {scan_result.result_details}"
+            raise FileSequenceError(msg)
         return scan_result.sequences
 
 

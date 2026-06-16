@@ -298,14 +298,17 @@ class TestFileSequenceScan:
         with mock.patch(HANDLE_REQUEST_PATH, return_value=failure), pytest.raises(file_sequence.FileSequenceError):
             seq.scan()
 
-    def test_returns_empty_list_when_scan_request_fails(self, tmp_path: pathlib.Path) -> None:
+    def test_raises_when_scan_request_fails(self, tmp_path: pathlib.Path) -> None:
         seq = file_sequence.FileSequence(project_events.MacroPath(macro_parser.ParsedMacro(self._TEMPLATE), {}))
         scan_failure = os_events.ScanSequencesResultFailure(
             result_details="listing error",
             failure_reason=os_events.SequenceScanFailureReason.INVALID_TEMPLATE,
         )
-        with mock.patch(HANDLE_REQUEST_PATH, side_effect=[self._path_success(tmp_path), scan_failure]):
-            assert seq.scan() == []
+        with (
+            mock.patch(HANDLE_REQUEST_PATH, side_effect=[self._path_success(tmp_path), scan_failure]),
+            pytest.raises(file_sequence.FileSequenceError),
+        ):
+            seq.scan()
 
     def test_returns_sequences_on_success(self, tmp_path: pathlib.Path) -> None:
         seq = file_sequence.FileSequence(project_events.MacroPath(macro_parser.ParsedMacro(self._TEMPLATE), {}))
