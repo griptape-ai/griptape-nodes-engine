@@ -433,6 +433,10 @@ class LibraryManager:
         ] = {}
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
+        # True for the duration of the engine's initialization sequence (library + workflow
+        # loading) driven by on_app_initialization_complete. Reported on the engine heartbeat so
+        # a client connecting mid-startup can render a loading state instead of an empty list.
+        self._is_initializing: bool = False
         self._pre_reload_callbacks: list[Callable[[], Awaitable[None]]] = []
         # True when this process is a dedicated worker
         self._is_worker: bool = False
@@ -520,6 +524,14 @@ class LibraryManager:
 
         worker_manager.register_worker_evicted_callback(self.on_worker_evicted)
         self._pre_reload_callbacks.append(worker_manager.reset_workers)
+
+    def is_initializing(self) -> bool:
+        """Return True while the engine is running its initialization sequence.
+
+        Covers the full on_app_initialization_complete / reload flow (library and workflow
+        loading), not just the library phase. Reported on the engine heartbeat.
+        """
+        return self._is_initializing
 
     def register_pre_reload_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Register a callback invoked immediately before all libraries are reloaded.
@@ -2942,6 +2954,29 @@ class LibraryManager:
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""
+        # Emit the LOADING event BEFORE registering: register_library_from_file_request installs
+        # the library's dependencies (a slow pip/uv step), so emitting after it would leave the
+        # GUI with no progress signal during the longest part of startup. The library name is
+        # populated during discovery; fall back to a path-derived name if it isn't set yet.
+        pre_register_info = self._library_file_path_to_info.get(lib_path)
+        pending_library_name = (
+            pre_register_info.library_name
+            if pre_register_info and pre_register_info.library_name
+            else Path(lib_path).stem
+        )
+        GriptapeNodes.EventManager().put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.LIBRARIES,
+                    item_name=pending_library_name,
+                    status=InitializationStatus.LOADING,
+                    current=index,
+                    total=total,
+                    is_worker=self._is_worker,
+                )
+            )
+        )
+
         load_result = await self.register_library_from_file_request(
             RegisterLibraryFromFileRequest(
                 file_path=lib_path,
@@ -3152,6 +3187,15 @@ class LibraryManager:
         return dict(task.result() for task in tasks)
 
     async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        # Bracket the whole init sequence so the heartbeat can report is_initializing to clients
+        # that connect mid-startup. finally guarantees the flag clears even if init raises.
+        self._is_initializing = True
+        try:
+            await self._run_app_initialization(payload)
+        finally:
+            self._is_initializing = False
+
+    async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
         if payload.skip_library_loading:
             # Register all secrets even in headless mode
             GriptapeNodes.SecretsManager().register_all_secrets()
@@ -4099,7 +4143,16 @@ class LibraryManager:
 
         return new_downloads
 
-    async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
+        # Bracket the reload like on_app_initialization_complete so the heartbeat reports
+        # is_initializing during a mid-session reload too. finally clears it even on failure.
+        self._is_initializing = True
+        try:
+            return await self._run_reload_libraries(request)
+        finally:
+            self._is_initializing = False
+
+    async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
         clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
@@ -4369,6 +4422,30 @@ class LibraryManager:
         total_libraries = len(libraries_to_load)
 
         for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
+            # Emit the LOADING event BEFORE registering: register_library_from_file_request
+            # installs the library's dependencies (a slow pip/uv step), so emitting after it
+            # would leave the GUI with no progress signal during the longest part of startup.
+            # The library name isn't resolved until metadata loads, so fall back to a name
+            # derived from the path; the COMPLETE/FAILED event below reports the resolved name.
+            pre_register_info = self._library_file_path_to_info.get(lib_path)
+            pending_library_name = (
+                pre_register_info.library_name
+                if pre_register_info and pre_register_info.library_name
+                else Path(lib_path).stem
+            )
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.LIBRARIES,
+                        item_name=pending_library_name,
+                        status=InitializationStatus.LOADING,
+                        current=current_library_index,
+                        total=total_libraries,
+                        is_worker=self._is_worker,
+                    )
+                )
+            )
+
             load_result = await self.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(
                     file_path=lib_path,
@@ -4382,27 +4459,11 @@ class LibraryManager:
             else:
                 library_name = lib_path
 
-            # Check if library was already loaded (skip event emission if so)
+            # Check if library was already loaded (skip the COMPLETE event so reloads stay quiet).
             if isinstance(load_result, RegisterLibraryFromFileResultSuccess) and load_result.was_already_loaded:
-                # Library was already loaded - skip events and continue
+                # Library was already loaded - already counted, nothing more to emit.
                 loaded_count += 1
                 continue
-
-            # Library was actually loaded or failed - emit appropriate events
-
-            # Emit loading event
-            GriptapeNodes.EventManager().put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.LIBRARIES,
-                        item_name=library_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_library_index,
-                        total=total_libraries,
-                        is_worker=self._is_worker,
-                    )
-                )
-            )
 
             if isinstance(load_result, RegisterLibraryFromFileResultSuccess):
                 loaded_count += 1

@@ -17,7 +17,7 @@ Place this file in your workspace directory. It is optional — if absent, the [
 ## Project file structure
 
 ```yaml
-project_template_schema_version: "0.1.0"
+project_template_schema_version: "0.3.2"
 name: "My Project"
 description: "Optional description"
 
@@ -106,7 +106,7 @@ A project can declare another project as its parent. The parent's fully merged t
 ```yaml
 project_template_schema_version: "0.3.2"
 name: "Marketing Renders"
-parent_project_path: "{workspace_dir}/team-base/griptape-nodes-project.yml"
+parent_project_path: "../team-base/griptape-nodes-project.yml"
 
 # Only the diffs against the parent need to be listed.
 directories:
@@ -116,15 +116,14 @@ directories:
 
 ### Path forms
 
-`parent_project_path` accepts three forms:
+`parent_project_path` accepts two forms:
 
-| Form            | Example                                                      | Notes                                                                                                          |
-| --------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
-| Workspace macro | `{workspace_dir}/team-base/griptape-nodes-project.yml`       | Preferred. Expands to the active workspace at load time, so the link survives moves between machines and OSes. |
-| Relative        | `../team-base/griptape-nodes-project.yml`                    | Resolved against the directory of *this* project's YAML file.                                                  |
-| Absolute        | `/Users/alice/projects/team-base/griptape-nodes-project.yml` | Bakes in a per-machine path; works locally but does not travel.                                                |
+| Form     | Example                                                      | Notes                                                                                                                          |
+| -------- | ------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| Relative | `../team-base/griptape-nodes-project.yml`                    | Preferred. Resolved against the directory of *this* project's YAML file, so the link survives moves between machines and OSes. |
+| Absolute | `/Users/alice/projects/team-base/griptape-nodes-project.yml` | Bakes in a per-machine path; works locally but does not travel.                                                                |
 
-Only `{workspace_dir}` is honored as a macro inside `parent_project_path`. Other macros (`{project_dir}`, `{outputs}`, etc.) are not expanded here — those belong in `path_macro` and `situations.*.macro` fields.
+No macros are expanded inside `parent_project_path`. Tokens like `{workspace_dir}`, `{project_dir}`, and `{outputs}` are not substituted here — a path containing them is treated literally. Macros belong in `path_macro` and `situations.*.macro` fields.
 
 ### Inheritance and tombstones
 
@@ -139,6 +138,8 @@ directories:
 
 Setting `parent_project_path: null` explicitly clears an inherited link, falling the project back to the system defaults as its base. Omitting the field entirely inherits the parent's link (which is rarely what you want — typically you set `parent_project_path` on each child explicitly).
 
+A project whose base *is* the system defaults should leave `parent_project_path` out entirely — absence already means "system defaults are the base," so there is nothing to point at. Only set the field when the parent is a *different* project file. This matters for sharing: writing a parent path into a project saved to shared or synced storage bakes in a machine-specific link that will not resolve on another person's machine, so a default-derived project should carry no path at all.
+
 ### Cycles and missing parents
 
 The engine refuses to load a project whose parent chain contains a cycle. A direct self-reference, A → B → A, and longer cycles are all caught and reported as a validation error on the child being loaded.
@@ -147,7 +148,7 @@ A parent that cannot be read or parsed surfaces as a validation error on the chi
 
 ### Sharing across machines
 
-A workspace zipped on one machine and unpacked on another will keep parent links intact as long as the parent is referenced via `{workspace_dir}/...` and lives inside the workspace. Absolute paths break across machines (different home directories, different drive letters); the macro form is what makes parent chains portable.
+A workspace zipped on one machine and unpacked on another will keep parent links intact as long as the parent is referenced with a relative path and travels alongside the child inside the workspace. Absolute paths break across machines (different home directories, different drive letters); the relative form is what makes parent chains portable.
 
 ## Validation status
 

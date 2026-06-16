@@ -642,3 +642,33 @@ class GetAllSituationsForProjectResultSuccess(WorkflowNotAlteredMixin, ResultPay
 @PayloadRegistry.register
 class GetAllSituationsForProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Failure result when cannot get situations."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectRequest(RequestPayload):
+    """Resolve and activate the workspace project before app initialization completes.
+
+    Emitted by the app orchestrator after role setup but before the
+    AppInitializationComplete broadcast, mirroring the CLI executor which loads
+    its --project-file-path before broadcasting. Establishing the project's
+    config/workspace/env layers first ensures LibraryManager loads libraries
+    against the correct workspace (and enforces the project's engine_version and
+    library pins) instead of the default workspace.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workspace project activated, or no workspace project found (a no-op is success)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Workspace project activation failed.
+
+    Boot is soft: the app logs this and continues so the engine still starts and
+    the user can switch to a working project.
+    """
