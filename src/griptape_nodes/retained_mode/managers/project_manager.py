@@ -90,6 +90,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+from griptape_nodes.utils.file_utils import find_files_recursive
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -405,6 +406,16 @@ class ProjectManager:
     ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
         """Load user's project.yml and merge with system defaults.
 
+        Thin wrapper over _load_and_cache_project_template. Explicit loads
+        persist the path so the project survives engine restarts.
+        """
+        return await self._load_and_cache_project_template(request.project_path, persist_path=True)
+
+    async def _load_and_cache_project_template(
+        self, project_path: Path, *, persist_path: bool
+    ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
+        """Load a project.yml, merge with system defaults, and cache the result.
+
         Flow:
         1. Issue ReadFileRequest to OSManager (for proper Windows long path handling)
         2. Parse YAML and load partial template (overlay) using load_partial_project_template()
@@ -412,7 +423,12 @@ class ProjectManager:
         4. Merge the overlay onto that base using ProjectTemplate.merge()
         5. Cache validation in registered_template_status
         6. If usable, cache template in successful_templates
-        7. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+        7. If persist_path, append the path to projects_to_register config
+        8. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+
+        persist_path is False for directory-discovered project files: the
+        directory entry stays in config and is re-scanned each startup, so the
+        individual files must not be persisted alongside it.
         """
         # Expand ~/env vars and resolve to absolute so the same file always
         # produces the same project_id regardless of how the caller spelled
@@ -420,7 +436,7 @@ class ProjectManager:
         # _registered_template_status (keyed by Path) and
         # _successfully_loaded_project_templates (keyed by str project_id) must
         # use the canonical form so dedupe checks line up.
-        project_file_path = canonicalize_for_identity(request.project_path)
+        project_file_path = canonicalize_for_identity(project_path)
 
         read_load = await self._read_overlay(project_file_path)
         if isinstance(read_load, LoadProjectTemplateResultFailure):
@@ -477,8 +493,10 @@ class ProjectManager:
         # Track validation status for all load attempts (for UI display)
         self._registered_template_status[project_file_path] = validation
 
-        # Persist path so the project survives engine restarts
-        self._register_project_path(project_id)
+        # Persist path so the project survives engine restarts. Skipped for
+        # directory-discovered files, which are covered by their directory entry.
+        if persist_path:
+            self._register_project_path(project_id)
 
         return LoadProjectTemplateResultSuccess(
             project_id=project_id,
@@ -2053,15 +2071,22 @@ class ProjectManager:
                     entry,
                 )
                 continue
-            # Project IDs are canonicalized absolute paths, so expand ~/env
-            # vars and resolve the persisted string before checking for an
-            # existing load (prevents duplicate entries when the same file
-            # was persisted under different spellings).
-            resolved_id = str(canonicalize_for_identity(path_str))
-            if resolved_id in self._successfully_loaded_project_templates:
+            # Entries support ${ENV}/~, so expand + absolutize before touching
+            # the filesystem. canonicalize_for_identity is the same form used
+            # for project_id keys, so the result also serves as the dedupe key.
+            resolved_entry = canonicalize_for_identity(path_str)
+
+            # A directory entry is recursively scanned for project files (each
+            # loaded without persisting), mirroring how libraries_to_register
+            # expands a folder. The directory entry stays verbatim in config.
+            if resolved_entry.is_dir():
+                await self._load_projects_from_directory(resolved_entry)
                 continue
-            load_request = LoadProjectTemplateRequest(project_path=Path(path_str))
-            result = await self.on_load_project_template_request(load_request)
+
+            if str(resolved_entry) in self._successfully_loaded_project_templates:
+                continue
+            # Already persisted in config, so don't re-persist on reload.
+            result = await self._load_and_cache_project_template(Path(path_str), persist_path=False)
             if result.failed():
                 logger.warning(
                     "Failed to load registered project '%s' on startup: %s",
@@ -2070,6 +2095,38 @@ class ProjectManager:
                 )
             else:
                 logger.debug("Reloaded registered project from '%s'", path_str)
+
+    async def _load_projects_from_directory(self, directory: Path) -> None:
+        """Discover and load every project file under a registered directory.
+
+        Recursively scans for WORKSPACE_PROJECT_FILE, loading each match into
+        memory without persisting it. The directory entry is the unit of
+        registration, so discovered files cannot be individually unregistered;
+        they are re-discovered on each startup. Hidden directories (e.g. .venv,
+        .git) are skipped by find_files_recursive.
+        """
+        discovered = find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        if not discovered:
+            logger.warning(
+                "projects_to_register directory '%s' contains no '%s' files; skipping",
+                directory,
+                WORKSPACE_PROJECT_FILE,
+            )
+            return
+        for project_file in discovered:
+            resolved_id = str(canonicalize_for_identity(project_file))
+            if resolved_id in self._successfully_loaded_project_templates:
+                continue
+            result = await self._load_and_cache_project_template(project_file, persist_path=False)
+            if result.failed():
+                logger.warning(
+                    "Failed to load discovered project '%s' from directory '%s': %s",
+                    project_file,
+                    directory,
+                    result.result_details,
+                )
+            else:
+                logger.debug("Loaded discovered project '%s' from directory '%s'", project_file, directory)
 
     def _register_project_path(self, project_id: str) -> None:
         """Persist a project file path so it is loaded on the next engine restart.

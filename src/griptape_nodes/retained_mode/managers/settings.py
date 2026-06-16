@@ -160,11 +160,15 @@ class AppInitializationComplete(BaseModel):
         category=PROJECTS,
         default_factory=list,
         description=(
-            "List of griptape-nodes-project.yml file paths to load at startup. "
+            "List of project entries to load at startup. "
             "Each entry may be either: "
             "(1) a single path string (supports `${ENV_VAR}` and `~` expansion), or "
             "(2) a per-platform mapping with optional `linux`, `darwin`, `windows`, and `default` keys "
             "for cross-platform deployments where the same project resolves to different paths on each OS. "
+            "A path entry may point to a single griptape-nodes-project.yml file, or to a directory that is "
+            "recursively scanned for all griptape-nodes-project.yml files (each loaded as a registered template). "
+            "Directory entries are kept verbatim and re-scanned each startup; the discovered files are not "
+            "expanded into individual entries. "
             "Per-platform entries with no key matching the active platform and no `default` are skipped with a warning."
         ),
     )
