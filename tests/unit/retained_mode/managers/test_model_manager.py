@@ -3,6 +3,7 @@
 Covers:
 - `on_handle_get_model_info_request` — token guard and HF API delegation
 - `on_handle_search_models_request` — search result handling
+- `on_handle_declare_model_invocation_request` — clears a declared invocation past the pre-dispatch chain
 - `_download_model_task` — the spawned subprocess targets a runnable module
 """
 
@@ -13,7 +14,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.model_events import (
+    DeclareModelInvocationRequest,
+    DeclareModelInvocationResultFailure,
+    DeclareModelInvocationResultSuccess,
     GetModelInfoRequest,
     GetModelInfoResultFailure,
     GetModelInfoResultSuccess,
@@ -21,6 +26,7 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, ModelManager
 
 
@@ -178,6 +184,54 @@ class TestOnHandleSearchModelsRequest:
             result = await model_manager.on_handle_search_models_request(SearchModelsRequest(query="model"))
 
         assert isinstance(result, SearchModelsResultFailure)
+
+
+# ---------------------------------------------------------------------------
+# on_handle_declare_model_invocation_request
+# ---------------------------------------------------------------------------
+
+
+class TestOnHandleDeclareModelInvocationRequest:
+    def test_clears_the_node_to_proceed(self, model_manager: ModelManager) -> None:
+        # Reaching the handler means the pre-dispatch chain did not deny the
+        # declaration, so the node is cleared to invoke the model itself.
+        result = model_manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(
+                model="claude-opus-4-7",
+                provider_id="anthropic",
+                node_name="Agent_1",
+            )
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultSuccess)
+        assert result.model == "claude-opus-4-7"
+
+    def test_a_denying_pre_dispatch_hook_short_circuits_before_the_handler(self) -> None:
+        # End to end: enforcement lives in the pre-dispatch chain, not the
+        # handler. A hook that denies the declaration short-circuits with its
+        # own failure; an allowed declaration reaches the handler and comes
+        # back as a clear-to-proceed success. Policies gate the shared catalog
+        # handles (here, the provider), not the concrete model string.
+        event_manager = EventManager()
+        ModelManager(event_manager)
+
+        def deny(request: RequestPayload, _context: object) -> DeclareModelInvocationResultFailure | None:
+            if isinstance(request, DeclareModelInvocationRequest) and request.provider_id == "blocked_provider":
+                return DeclareModelInvocationResultFailure(result_details="This provider is blocked by your license.")
+            return None
+
+        event_manager.add_pre_dispatch_hook(deny)
+
+        denied = event_manager.handle_request(
+            DeclareModelInvocationRequest(model="blocked-model", provider_id="blocked_provider")
+        )
+        allowed = event_manager.handle_request(DeclareModelInvocationRequest(model="gpt-ok", provider_id="openai"))
+
+        assert isinstance(denied.result, DeclareModelInvocationResultFailure)
+        assert "blocked by your license" in str(denied.result.result_details)
+        # The allowed declaration reached the handler, which cleared it.
+        assert isinstance(allowed.result, DeclareModelInvocationResultSuccess)
+        assert allowed.result.model == "gpt-ok"
 
 
 # ---------------------------------------------------------------------------
