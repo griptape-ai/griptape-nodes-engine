@@ -462,13 +462,18 @@ class WorkerManager:
             await asyncio.wait_for(asyncio.wrap_future(future), timeout=WorkerManager.DEFAULT_TERMINATE_HOP_TIMEOUT_S)
         except asyncio.CancelledError:
             # Termination was cancelled during shutdown; ensure the worker still
-            # gets a kill signal that needs no await on the spawning loop.
+            # gets a kill signal that needs no await on the spawning loop, then
+            # re-raise so cooperative cancellation propagates. Both hop callers run
+            # under TaskGroup-driven teardown (orchestrator_heartbeat_loop and the
+            # reset_workers gather); swallowing the cancel would let cleanup resume
+            # in a context that was supposed to stop and wedge TaskGroup convergence.
             logger.warning(
                 "Termination of worker for key '%s' was cancelled; sending a "
                 "synchronous signal without awaiting exit confirmation",
                 library_name,
             )
             self._terminate_without_wait(library_name, proc)
+            raise
         except TimeoutError:
             # The hop was scheduled but never completed: the spawning loop most
             # likely closed mid-shutdown before draining it. Stop waiting on a

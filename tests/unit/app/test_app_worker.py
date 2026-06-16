@@ -636,6 +636,48 @@ class TestTerminateViaSpawnLoop:
             thread.join(timeout=5)
             spawn_loop.close()
 
+    @pytest.mark.asyncio
+    async def test_cancellation_signals_worker_then_propagates(self, worker_manager: WorkerManager) -> None:
+        """A cancelled hop must signal the worker AND re-raise the cancellation.
+
+        Both hop callers run under TaskGroup-driven teardown; swallowing the
+        CancelledError would let cleanup resume in a context that was meant to
+        stop. The fallback kill still fires, but the cancel must propagate.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+
+            async def _never_exits() -> None:
+                await asyncio.Event().wait()
+
+            proc.wait = _never_exits  # keep the hop pending so we can cancel it
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            task = asyncio.ensure_future(worker_manager._terminate_via_spawn_loop("Lib A", proc))
+            # Let the hop reach the await before cancelling.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            proc.kill.assert_called_once()
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
+
 
 class TestSetSessionReady:
     def test_sets_session_ready_event(self, worker_manager: WorkerManager) -> None:
