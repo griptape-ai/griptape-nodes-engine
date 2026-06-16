@@ -155,7 +155,7 @@ class DirectoryDestination:
                 if resolved.exists():
                     msg = f"Attempted to create directory. Failed because directory already exists: {resolved}"
                     raise DirectoryError(msg)
-                return self._create_direct()
+                return self._create_direct(exist_ok=False)
             case _:
                 msg = f"Unsupported existing directory policy: {self._existing_dir_policy!r}"
                 raise DirectoryError(msg)
@@ -216,11 +216,11 @@ class DirectoryDestination:
         locked_macro = project_events.MacroPath(macro_path.parsed_macro, variables)
         return _map_to_macro_directory(absolute_path, locked_macro)
 
-    def _create_direct(self) -> Directory:
+    def _create_direct(self, exist_ok: bool=True) -> Directory:  # noqa: FBT001, FBT002
         """Create the directory without versioning."""
         resolved = pathlib.Path(_resolve_dir_path(self._dir_path))
         mkdir_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=True)
+            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=exist_ok)
         )
         if not isinstance(mkdir_result, os_events.MakeDirectoryResultSuccess):
             msg = f"Attempted to create directory. Failed to create '{resolved}': {mkdir_result.result_details}"
