@@ -1842,9 +1842,9 @@ class TestProjectManagerProjectWorkspaces:
         default.
         """
         from griptape_nodes.retained_mode.managers.settings import (
-            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_DOWNLOAD_KEY,
             LIBRARIES_TO_REGISTER_KEY,
+            REQUIRES_ENGINE_KEY,
         )
 
         state = {"libraries": ["base-lib"]}
@@ -1865,7 +1865,9 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.load_project_config.side_effect = load_project_config
 
     @staticmethod
-    def _config_for_workspace_lookup(mock_config: Mock, project_workspaces: dict[str, str], workspace_path: Path) -> None:
+    def _config_for_workspace_lookup(
+        mock_config: Mock, project_workspaces: dict[str, str], workspace_path: Path
+    ) -> None:
         """Configure a mock config for activation tests that exercise workspace lookup.
 
         Returns `project_workspaces` for that key and each call's `default`
@@ -1922,9 +1924,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        self._config_for_workspace_lookup(
-            mock_config, {str(project_file.resolve()): str(workspace_dir)}, tmp_path
-        )
+        self._config_for_workspace_lookup(mock_config, {str(project_file.resolve()): str(workspace_dir)}, tmp_path)
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
 
@@ -2094,9 +2094,9 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, ProjectInfo
         from griptape_nodes.retained_mode.managers.settings import (
-            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_DOWNLOAD_KEY,
             LIBRARIES_TO_REGISTER_KEY,
+            REQUIRES_ENGINE_KEY,
         )
 
         pinned_file = tmp_path / "pinned" / "project.yml"
@@ -4984,8 +4984,8 @@ class TestSnapshotLibraryConfig:
 
     def test_identical_config_snapshots_are_equal(self) -> None:
         from griptape_nodes.retained_mode.managers.settings import (
-            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_REGISTER_KEY,
+            REQUIRES_ENGINE_KEY,
         )
 
         pm = self._pm_reading({LIBRARIES_TO_REGISTER_KEY: ["a", "b"], REQUIRES_ENGINE_KEY: ">=0.5,<0.6"})
@@ -5012,7 +5012,7 @@ class TestSnapshotLibraryConfig:
         # libraries_directory is workspace-relative, so two projects with identical
         # config strings but different workspaces resolve to different on-disk
         # libraries/ trees and must still reload.
-        values = {"libraries_directory": "libraries"}
+        values: dict[str, object] = {"libraries_directory": "libraries"}
         before = self._pm_reading(values, workspace_path="/ws-a")._snapshot_library_config()
         after = self._pm_reading(values, workspace_path="/ws-b")._snapshot_library_config()
 

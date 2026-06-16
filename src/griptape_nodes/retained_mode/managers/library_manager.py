@@ -3360,7 +3360,9 @@ class LibraryManager:
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
-    def _installed_manifest_path_for_download(download: LibraryDownload, libraries_path: Path | None = None) -> Path | None:
+    def _installed_manifest_path_for_download(
+        download: LibraryDownload, libraries_path: Path | None = None
+    ) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
 
         Locates the installed copy the same way the download handler lands it:

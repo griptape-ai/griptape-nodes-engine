@@ -1150,9 +1150,7 @@ class ProjectManager:
         reload, even though the three values above are unchanged.
         """
         libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
-        resolved_libraries_dir = str(
-            resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path)
-        )
+        resolved_libraries_dir = str(resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path))
         snapshot = {
             LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
             LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),

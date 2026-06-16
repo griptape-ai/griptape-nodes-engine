@@ -884,7 +884,7 @@ class TestProvisioningPreviewMatchesActivation:
         made BOTH paths ignore it (preview == live but both wrong) still fails.
         """
         from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value
 
         pm = ProjectManager(Mock(), cm, Mock())
@@ -919,7 +919,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -952,7 +952,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_env_workspace_branch(self, tmp_path: Path) -> None:
         """GTN_CONFIG_WORKSPACE_DIRECTORY points at a separate workspace dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -982,7 +982,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_project_adjacent_workspace_branch(self, tmp_path: Path) -> None:
         """The project-adjacent config sets workspace_directory to a separate dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -1016,7 +1016,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_auto_default_branch(self, tmp_path: Path) -> None:
         """No workspace driver: the project's own dir is the workspace (apply_override=True)."""
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -1047,7 +1047,7 @@ class TestProvisioningPreviewMatchesActivation:
         pass would not), which is exactly the pin that can force a destructive reconcile on the
         switch to Default Project.
         """
-        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
 
         user_config: dict = {}

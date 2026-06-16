@@ -2175,7 +2175,7 @@ class TestPreviewProjectProvisioning:
         libraries: object,
         *,
         engine_version: str | None = None,
-        workspace_directory: str = "/tmp/target-ws",
+        workspace_directory: str = "/ws/target",
         libraries_directory: str = "libraries",
     ) -> dict:
         """Build a merged-config dict shaped like compute_project_provisioning_config's output.
@@ -2263,7 +2263,7 @@ class TestPreviewProjectProvisioning:
             patch.object(
                 library_manager,
                 "_installed_download_version",
-                side_effect=lambda download, libraries_path=None: installed[download.name],
+                side_effect=lambda download, _libraries_path=None: installed[download.name],
             ),
         ):
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
