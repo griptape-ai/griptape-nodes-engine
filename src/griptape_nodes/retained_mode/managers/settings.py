@@ -14,7 +14,7 @@ WORKFLOWS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.workflows
 SECRETS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.secrets_to_register"
 MODELS_TO_DOWNLOAD_KEY = "app_events.on_app_initialization_complete.models_to_download"
 PROJECTS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.projects_to_register"
-ENGINE_VERSION_KEY = "app_events.on_app_initialization_complete.engine_version"
+REQUIRES_ENGINE_KEY = "app_events.on_app_initialization_complete.requires_engine"
 PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
@@ -206,7 +206,7 @@ class AppInitializationComplete(BaseModel):
             "Per-platform entries with no key matching the active platform and no `default` are skipped with a warning."
         ),
     )
-    engine_version: str | None = Field(
+    requires_engine: str | None = Field(
         category=PROJECTS,
         default=None,
         description=(

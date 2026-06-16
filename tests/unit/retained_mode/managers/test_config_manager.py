@@ -884,7 +884,7 @@ class TestProvisioningPreviewMatchesActivation:
         made BOTH paths ignore it (preview == live but both wrong) still fails.
         """
         from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value
 
         pm = ProjectManager(Mock(), cm, Mock())
@@ -910,16 +910,16 @@ class TestProvisioningPreviewMatchesActivation:
         assert get_dot_value(preview_merged, LIBRARIES_TO_REGISTER_KEY) == get_dot_value(
             live_merged, LIBRARIES_TO_REGISTER_KEY
         )
-        assert get_dot_value(preview_merged, ENGINE_VERSION_KEY) == get_dot_value(live_merged, ENGINE_VERSION_KEY)
+        assert get_dot_value(preview_merged, REQUIRES_ENGINE_KEY) == get_dot_value(live_merged, REQUIRES_ENGINE_KEY)
         assert preview_merged["workspace_directory"] == live_merged["workspace_directory"]
 
         # The workspace layer was actually consumed (not a both-wrong pass).
         assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == expected_libraries
-        assert get_dot_value(live_merged, ENGINE_VERSION_KEY) == expected_engine_version
+        assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == expected_engine_version
 
     def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -930,11 +930,11 @@ class TestProvisioningPreviewMatchesActivation:
 
         self._write_config_file(
             project_dir / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], ENGINE_VERSION_KEY: ">=1.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
         )
         self._write_config_file(
             mapped_workspace / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["workspace-lib"], ENGINE_VERSION_KEY: ">=2.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["workspace-lib"], REQUIRES_ENGINE_KEY: ">=2.0"},
         )
         isolate_user_config.write_text(
             json.dumps({"project_workspaces": {str(project_file): str(mapped_workspace)}}), encoding="utf-8"
@@ -952,7 +952,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_env_workspace_branch(self, tmp_path: Path) -> None:
         """GTN_CONFIG_WORKSPACE_DIRECTORY points at a separate workspace dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -963,11 +963,11 @@ class TestProvisioningPreviewMatchesActivation:
 
         self._write_config_file(
             project_dir / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], ENGINE_VERSION_KEY: ">=1.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
         )
         self._write_config_file(
             env_workspace / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["env-workspace-lib"], ENGINE_VERSION_KEY: ">=3.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["env-workspace-lib"], REQUIRES_ENGINE_KEY: ">=3.0"},
         )
 
         with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace)}, clear=True):
@@ -982,7 +982,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_project_adjacent_workspace_branch(self, tmp_path: Path) -> None:
         """The project-adjacent config sets workspace_directory to a separate dir (apply_override=False)."""
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -995,13 +995,13 @@ class TestProvisioningPreviewMatchesActivation:
             project_dir / "griptape_nodes_config.json",
             {
                 LIBRARIES_TO_REGISTER_KEY: ["project-lib"],
-                ENGINE_VERSION_KEY: ">=1.0",
+                REQUIRES_ENGINE_KEY: ">=1.0",
                 "workspace_directory": str(adjacent_workspace),
             },
         )
         self._write_config_file(
             adjacent_workspace / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["adjacent-workspace-lib"], ENGINE_VERSION_KEY: ">=4.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["adjacent-workspace-lib"], REQUIRES_ENGINE_KEY: ">=4.0"},
         )
 
         with patch.dict(os.environ, {}, clear=True):
@@ -1016,7 +1016,7 @@ class TestProvisioningPreviewMatchesActivation:
 
     def test_auto_default_branch(self, tmp_path: Path) -> None:
         """No workspace driver: the project's own dir is the workspace (apply_override=True)."""
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
 
         project_dir = tmp_path / "project"
         project_dir.mkdir()
@@ -1025,7 +1025,7 @@ class TestProvisioningPreviewMatchesActivation:
 
         self._write_config_file(
             project_dir / "griptape_nodes_config.json",
-            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], ENGINE_VERSION_KEY: ">=1.0"},
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
         )
 
         with patch.dict(os.environ, {}, clear=True):
@@ -1047,12 +1047,12 @@ class TestProvisioningPreviewMatchesActivation:
         pass would not), which is exactly the pin that can force a destructive reconcile on the
         switch to Default Project.
         """
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY, LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY, LIBRARIES_TO_REGISTER_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
 
         user_config: dict = {}
         set_dot_value(user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
-        set_dot_value(user_config, ENGINE_VERSION_KEY, ">=9.0")
+        set_dot_value(user_config, REQUIRES_ENGINE_KEY, ">=9.0")
         isolate_user_config.write_text(json.dumps(user_config), encoding="utf-8")
 
         with patch.dict(os.environ, {}, clear=True):
@@ -1069,7 +1069,7 @@ class TestProvisioningPreviewMatchesActivation:
         assert get_dot_value(preview_merged, LIBRARIES_TO_REGISTER_KEY) == get_dot_value(
             live_merged, LIBRARIES_TO_REGISTER_KEY
         )
-        assert get_dot_value(preview_merged, ENGINE_VERSION_KEY) == get_dot_value(live_merged, ENGINE_VERSION_KEY)
+        assert get_dot_value(preview_merged, REQUIRES_ENGINE_KEY) == get_dot_value(live_merged, REQUIRES_ENGINE_KEY)
         # The user layer was actually consumed (not a both-empty pass).
         assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == ["user-pin-lib"]
-        assert get_dot_value(live_merged, ENGINE_VERSION_KEY) == ">=9.0"
+        assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == ">=9.0"

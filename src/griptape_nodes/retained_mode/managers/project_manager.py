@@ -96,10 +96,10 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import (
-    ENGINE_VERSION_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     PROJECTS_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
 )
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -739,7 +739,7 @@ class ProjectManager:
                     parent_path = project_info.project_file_path.parent / parent_path
                 resolved_parent = str(canonicalize_for_identity(parent_path))
 
-            # Read the project-adjacent config's engine_version specifier without
+            # Read the project-adjacent config's requires_engine specifier without
             # merging it into the live config, so the GUI can disable activation
             # for a project the running engine can't satisfy. A project with no
             # backing file (or no specifier) is compatible by default.
@@ -747,7 +747,7 @@ class ProjectManager:
             if project_info.project_file_path is not None:
                 config_path = project_info.project_file_path.parent / "griptape_nodes_config.json"
                 required_engine_version = self._config_manager.read_config_file_value(
-                    config_path, ENGINE_VERSION_KEY, default=None
+                    config_path, REQUIRES_ENGINE_KEY, default=None
                 )
             engine_version_reason = engine_version_failure_detail(required_engine_version)
 
@@ -1139,9 +1139,9 @@ class ProjectManager:
         """Return a stable string of the merged library-affecting config for change detection.
 
         Captures the merged `libraries_to_register`, `libraries_to_download`, and
-        `engine_version` values plus the RESOLVED libraries directory as one
+        `requires_engine` values plus the RESOLVED libraries directory as one
         sorted-key JSON string so two snapshots can be compared with `==`.
-        Including `engine_version` ensures a pure engine_version change still trips
+        Including `requires_engine` ensures a pure requires_engine change still trips
         `library_config_changed`, which is what re-runs the reload (and so the
         engine_version gate) on activation. Including the resolved libraries dir
         catches a workspace-only switch: `libraries_directory` is workspace-relative
@@ -1156,7 +1156,7 @@ class ProjectManager:
         snapshot = {
             LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
             LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
-            ENGINE_VERSION_KEY: self._config_manager.get_config_value(ENGINE_VERSION_KEY, default=None),
+            REQUIRES_ENGINE_KEY: self._config_manager.get_config_value(REQUIRES_ENGINE_KEY, default=None),
             "resolved_libraries_directory": resolved_libraries_dir,
         }
         return json.dumps(snapshot, sort_keys=True, default=str)

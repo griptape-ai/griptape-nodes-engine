@@ -2180,13 +2180,13 @@ class TestPreviewProjectProvisioning:
     ) -> dict:
         """Build a merged-config dict shaped like compute_project_provisioning_config's output.
 
-        Populates the nested `libraries_to_download` / `engine_version` keys plus the
+        Populates the nested `libraries_to_download` / `requires_engine` keys plus the
         top-level `workspace_directory` / `libraries_directory` the preview reads to
         probe the TARGET project's libraries dir.
         """
         on_init: dict[str, object] = {"libraries_to_download": libraries}
         if engine_version is not None:
-            on_init["engine_version"] = engine_version
+            on_init["requires_engine"] = engine_version
         return {
             "workspace_directory": workspace_directory,
             "libraries_directory": libraries_directory,

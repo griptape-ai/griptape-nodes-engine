@@ -1842,7 +1842,7 @@ class TestProjectManagerProjectWorkspaces:
         default.
         """
         from griptape_nodes.retained_mode.managers.settings import (
-            ENGINE_VERSION_KEY,
+            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_DOWNLOAD_KEY,
             LIBRARIES_TO_REGISTER_KEY,
         )
@@ -1854,7 +1854,7 @@ class TestProjectManagerProjectWorkspaces:
                 return list(state["libraries"])
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
-            if key == ENGINE_VERSION_KEY:
+            if key == REQUIRES_ENGINE_KEY:
                 return None
             return default if default is not None else {}
 
@@ -2094,7 +2094,7 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, ProjectInfo
         from griptape_nodes.retained_mode.managers.settings import (
-            ENGINE_VERSION_KEY,
+            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_DOWNLOAD_KEY,
             LIBRARIES_TO_REGISTER_KEY,
         )
@@ -2112,7 +2112,7 @@ class TestProjectManagerProjectWorkspaces:
                 return ["base-lib", "pinned-lib"] if state["project_layer_active"] else ["base-lib"]
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
-            if key == ENGINE_VERSION_KEY:
+            if key == REQUIRES_ENGINE_KEY:
                 return None
             return default if default is not None else {}
 
@@ -4984,11 +4984,11 @@ class TestSnapshotLibraryConfig:
 
     def test_identical_config_snapshots_are_equal(self) -> None:
         from griptape_nodes.retained_mode.managers.settings import (
-            ENGINE_VERSION_KEY,
+            REQUIRES_ENGINE_KEY,
             LIBRARIES_TO_REGISTER_KEY,
         )
 
-        pm = self._pm_reading({LIBRARIES_TO_REGISTER_KEY: ["a", "b"], ENGINE_VERSION_KEY: ">=0.5,<0.6"})
+        pm = self._pm_reading({LIBRARIES_TO_REGISTER_KEY: ["a", "b"], REQUIRES_ENGINE_KEY: ">=0.5,<0.6"})
 
         assert pm._snapshot_library_config() == pm._snapshot_library_config()
 
@@ -5000,11 +5000,11 @@ class TestSnapshotLibraryConfig:
 
         assert before != after
 
-    def test_engine_version_only_change_changes_snapshot(self) -> None:
-        from griptape_nodes.retained_mode.managers.settings import ENGINE_VERSION_KEY
+    def test_requires_engine_only_change_changes_snapshot(self) -> None:
+        from griptape_nodes.retained_mode.managers.settings import REQUIRES_ENGINE_KEY
 
-        before = self._pm_reading({ENGINE_VERSION_KEY: ">=0.5,<0.6"})._snapshot_library_config()
-        after = self._pm_reading({ENGINE_VERSION_KEY: ">=0.6,<0.7"})._snapshot_library_config()
+        before = self._pm_reading({REQUIRES_ENGINE_KEY: ">=0.5,<0.6"})._snapshot_library_config()
+        after = self._pm_reading({REQUIRES_ENGINE_KEY: ">=0.6,<0.7"})._snapshot_library_config()
 
         assert before != after
 

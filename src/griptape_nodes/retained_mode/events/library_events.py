@@ -1396,7 +1396,7 @@ class PreviewProjectProvisioningResultSuccess(WorkflowNotAlteredMixin, ResultPay
     Args:
         actions: One action per libraries_to_download entry, in config order. Empty when the
             project declares no libraries to download/provision.
-        engine_version_failure: Non-None when the project's pinned engine_version
+        engine_version_failure: Non-None when the project's pinned `requires_engine`
             cannot be satisfied by the running engine. The same text the live
             reconcile would surface, computed on the same merged config the preview
             reads, so the UI can warn before the user approves a plan that would

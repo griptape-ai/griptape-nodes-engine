@@ -138,10 +138,10 @@ class ProjectTemplateInfo:
             reconstructing the parent/child hierarchy. None means no parent
             (system defaults are the only base).
         engine_version_compatible: False when the project's project-adjacent
-            config declares an `engine_version` specifier the running engine
+            config declares a `requires_engine` specifier the running engine
             fails (or that is malformed). The GUI disables activation for such a
-            project. True when compatible or when no engine_version is declared.
-        required_engine_version: The declared `engine_version` specifier, when any.
+            project. True when compatible or when no requires_engine is declared.
+        required_engine_version: The declared `requires_engine` specifier, when any.
         current_engine_version: The running engine version, for display.
         engine_version_reason: Human-readable detail explaining an incompatibility,
             None when compatible.

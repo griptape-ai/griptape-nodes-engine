@@ -213,9 +213,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
-    ENGINE_VERSION_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     LibraryDownload,
     LibraryRegistration,
@@ -3116,7 +3116,7 @@ class LibraryManager:
                 dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override
             )
 
-        engine_version_failure = engine_version_failure_detail(get_dot_value(merged, ENGINE_VERSION_KEY, default=None))
+        engine_version_failure = engine_version_failure_detail(get_dot_value(merged, REQUIRES_ENGINE_KEY, default=None))
 
         raw_libraries = get_dot_value(merged, LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         downloads = normalize_library_downloads(raw_libraries)
@@ -3173,10 +3173,10 @@ class LibraryManager:
     def _check_engine_version(self) -> str | None:
         """Return a failure detail when the running engine fails the configured spec.
 
-        Reads the merged `engine_version` config key and delegates the PEP 440
+        Reads the merged `requires_engine` config key and delegates the PEP 440
         compare to `engine_version_failure_detail`. No key means no constraint.
         """
-        spec_string = GriptapeNodes.ConfigManager().get_config_value(ENGINE_VERSION_KEY, default=None)
+        spec_string = GriptapeNodes.ConfigManager().get_config_value(REQUIRES_ENGINE_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
     def _plan_one_library_provisioning(

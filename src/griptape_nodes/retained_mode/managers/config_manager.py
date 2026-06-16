@@ -309,7 +309,7 @@ class ConfigManager:
         workspace -> workspace override -> env vars) for the given project and
         workspace directories, reading files fresh into a local dict. The
         provisioning preview uses this so its plan reflects the same effective
-        `libraries_to_register` / `engine_version` that _reconcile_libraries_from_config
+        `libraries_to_register` / `requires_engine` that _reconcile_libraries_from_config
         reads from the live merged config after activation - instead of the
         project-adjacent file alone, which diverges when a higher-priority layer
         (a separate-dir workspace config, env vars, or the user config) sets those keys.
@@ -363,7 +363,7 @@ class ConfigManager:
         drops the project-adjacent and workspace config-file layers and the workspace
         override, then load_configs() merges defaults -> user -> env vars only. The
         provisioning preview uses this so a switch to "Default Project" shows the same
-        `libraries_to_register` / `engine_version` that _reconcile_libraries_from_config
+        `libraries_to_register` / `requires_engine` that _reconcile_libraries_from_config
         reads from the live merged config after activation. Unlike
         compute_project_provisioning_config, it reads no project-adjacent or workspace
         griptape_nodes_config.json, because the system-defaults activation path reads
