@@ -32,6 +32,14 @@ def _attempt_map_to_project(absolute_path: Path) -> str | None:
     return None
 
 
+def _attempt_map_to_project(absolute_path: Path) -> str | None:
+    """Fire AttemptMapAbsolutePathToProjectRequest; return the mapped macro path string or None."""
+    map_result = GriptapeNodes.handle_request(AttemptMapAbsolutePathToProjectRequest(absolute_path=absolute_path))
+    if isinstance(map_result, AttemptMapAbsolutePathToProjectResultSuccess) and map_result.mapped_path is not None:
+        return map_result.mapped_path
+    return None
+
+
 class ProjectFileDestination(FileDestination):
     """A FileDestination that maps written absolute paths back to project macro form.
 

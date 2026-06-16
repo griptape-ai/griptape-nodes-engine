@@ -388,6 +388,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     engine_name: str
     user: UserInfo | None
     user_organization: OrganizationInfo | None
+    # Whether the engine is still running its initialization sequence (loading libraries and
+    # workflows). Lets a client connecting mid-startup render a loading state instead of an
+    # empty workflow list; the live EngineInitializationProgress stream fills in the detail.
+    # Defaulted for backward compatibility with older clients.
+    is_initializing: bool = False
 
 
 @dataclass

@@ -41,6 +41,9 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
+    ActivateWorkspaceProjectRequest,
+    ActivateWorkspaceProjectResultFailure,
+    ActivateWorkspaceProjectResultSuccess,
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultFailure,
     AttemptMapAbsolutePathToProjectResultSuccess,
@@ -146,6 +149,13 @@ _BUILTIN_VARIABLE_INFO: dict[str, BuiltinVariableInfo] = {var.name: var for var 
 # Builtin variables available in all macros (read-only)
 BUILTIN_VARIABLES = frozenset(var.name for var in _BUILTIN_VARIABLE_DEFINITIONS)
 
+# Variable names produced by derivation rules. These are only computed in the
+# situation-macro path (on_get_path_for_macro_request runs apply_derivation_rules
+# before resolution); the directory/env resolver below never runs derivation, so a
+# derived token there can only ever be unresolved. Used to raise an explanatory
+# error instead of a bare MISSING_REQUIRED_VARIABLES.
+DERIVED_VARIABLE_NAMES = frozenset(rule.name for rule in DERIVATION_RULES)
+
 
 @dataclass
 class _ProjectVariableResolver:
@@ -250,6 +260,24 @@ class _ProjectVariableResolver:
                     shell_value = os.environ.get(ref)
                     if shell_value is not None:
                         bag[ref] = shell_value
+                    elif ref in DERIVED_VARIABLE_NAMES and var_info.is_required:
+                        # Derived variables are only computed in the situation-macro path
+                        # (apply_derivation_rules runs there, not here). A required derived
+                        # token in a directory/env macro can never resolve, so raise an
+                        # explanatory error instead of a bare MISSING_REQUIRED_VARIABLES.
+                        # The optional form (e.g. `{file_extension_directory?:/}`) is left
+                        # unresolved and degrades cleanly via parsed.resolve().
+                        msg = (
+                            f"Cannot resolve {owner_kind} '{owner_name}': '{ref}' is a derived macro "
+                            f"variable that is only available in situation macros (resolved per-file at "
+                            f"write time), not in directory or environment path_macros. Move it to a "
+                            f"situation's filename macro, e.g. `{{{ref}?:/}}`."
+                        )
+                        raise MacroResolutionError(
+                            msg,
+                            failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                            variable_name=ref,
+                        )
                     # else: leave unresolved; parsed.resolve() will raise MISSING_REQUIRED_VARIABLES
             resolved = parsed.resolve(bag, self.secrets_manager)
         finally:
@@ -355,6 +383,9 @@ class ProjectManager:
         )
         event_manager.assign_manager_to_request_type(
             ValidateProjectTemplateRequest, self.on_validate_project_template_request
+        )
+        event_manager.assign_manager_to_request_type(
+            ActivateWorkspaceProjectRequest, self.on_activate_workspace_project_request
         )
 
         # Register app initialization listener
@@ -1461,6 +1492,44 @@ class ProjectManager:
             result_details=f"Analyzed macro with {len(all_variables)} variables: {len(satisfied_variables)} satisfied, {len(missing_required_variables)} missing, {len(conflicting_variables)} conflicting",
         )
 
+    async def on_activate_workspace_project_request(
+        self, _request: ActivateWorkspaceProjectRequest
+    ) -> ActivateWorkspaceProjectResultSuccess | ActivateWorkspaceProjectResultFailure:
+        """Resolve and activate the workspace project before initialization completes.
+
+        Called by the app orchestrator after role setup but before the
+        AppInitializationComplete broadcast, mirroring the CLI executor which loads
+        its project file first. Establishing the project's config/workspace/env
+        layers now means LibraryManager loads libraries against the correct
+        workspace (enforcing the project's engine_version and library pins) when the
+        init event fires, instead of against the default workspace.
+
+        Runs before `_initialization_complete` is set, so the activation it triggers
+        establishes config/workspace/env layers but skips the in-handler library
+        reload (LibraryManager performs the correctly-scoped load on init). A boot
+        with no workspace project is a no-op success; a project that resolves but
+        fails to load or activate is a failure (the detail comes from
+        `_load_workspace_project`). The engine_version gate is intentionally deferred to
+        LibraryManager at boot (soft-log); this handler reports load/activation failure
+        only, not gate failure.
+        """
+        workspace_project_path = self._resolve_project_file_path()
+        if workspace_project_path is None:
+            return ActivateWorkspaceProjectResultSuccess(
+                result_details="No workspace project found; system defaults remain active",
+            )
+
+        failure_detail = await self._load_workspace_project()
+        if failure_detail is not None:
+            return ActivateWorkspaceProjectResultFailure(
+                result_details=f"Attempted to activate workspace project at '{workspace_project_path}'. "
+                f"Failed because {failure_detail}",
+            )
+
+        return ActivateWorkspaceProjectResultSuccess(
+            result_details=f"Activated workspace project: {self._current_project_id}",
+        )
+
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Load system default project template when app initializes.
 
@@ -1863,16 +1932,21 @@ class ProjectManager:
 
         return workspace_project_path
 
-    async def _load_workspace_project(self) -> None:
+    async def _load_workspace_project(self) -> str | None:
         """Load workspace-level project template overlay if present.
 
         Checks for a project file using _resolve_project_file_path. If found, loads
         it as an overlay on top of system defaults and sets it as the current project.
         If no file is found, the system defaults remain current.
+
+        Returns a failure-detail string when a resolved project file fails to load or
+        activate (the same text that is logged), or None on success or when no project
+        file is present. Callers that report activation outcome use this signal directly
+        rather than inferring failure from current-project read-back.
         """
         workspace_project_path = self._resolve_project_file_path()
         if workspace_project_path is None:
-            return
+            return None
 
         workspace_project_path = workspace_project_path.resolve()
         logger.debug("Found workspace project file at '%s', loading", workspace_project_path)
@@ -1885,7 +1959,7 @@ class ProjectManager:
                 workspace_project_path,
                 e.result_details,
             )
-            return
+            return f"the project file could not be read: {e.result_details}"
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
         overlay = load_partial_project_template(yaml_text, validation)
@@ -1895,7 +1969,7 @@ class ProjectManager:
                 "Attempted to load workspace project from '%s'. Failed because YAML could not be parsed",
                 workspace_project_path,
             )
-            return
+            return "the project YAML could not be parsed"
 
         template = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
 
@@ -1912,7 +1986,7 @@ class ProjectManager:
                 validation.status,
                 problem_details,
             )
-            return
+            return f"the project template is not usable (status: {validation.status}). Problems: {problem_details}"
 
         project_id = str(workspace_project_path)
         situation_schemas = self._parse_situation_macros(template.situations, validation)
@@ -1939,9 +2013,10 @@ class ProjectManager:
                 workspace_project_path,
                 set_result.result_details,
             )
-            return
+            return f"setting it as the current project failed: {set_result.result_details}"
 
         logger.debug("Successfully loaded workspace project from '%s'", workspace_project_path)
+        return None
 
     async def _load_registered_projects(self) -> None:
         """Load project templates from paths persisted in user config.

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple, Protocol, cast, runtime_checkable
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.retained_mode.events.os_events import (
@@ -24,6 +24,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
+    GetPathForMacroResultSuccess,
     MacroPath,
     PathResolutionFailureReason,
 )
@@ -94,47 +95,48 @@ _PATH_FAILURE_TO_FILE_IO: dict[PathResolutionFailureReason, FileIOFailureReason]
 }
 
 
-def _make_file_load_error(result: GetPathForMacroResultFailure) -> FileLoadError:
+def _make_file_load_error(result: ResultPayload) -> FileLoadError:
+    if isinstance(result, GetPathForMacroResultFailure):
+        return FileLoadError(
+            failure_reason=_PATH_FAILURE_TO_FILE_IO[result.failure_reason],
+            result_details=str(result.result_details),
+            missing_variables=result.missing_variables,
+            conflicting_variables=result.conflicting_variables,
+        )
     return FileLoadError(
-        failure_reason=_PATH_FAILURE_TO_FILE_IO[result.failure_reason],
+        failure_reason=FileIOFailureReason.UNKNOWN,
         result_details=str(result.result_details),
-        missing_variables=result.missing_variables,
-        conflicting_variables=result.conflicting_variables,
     )
 
 
-def _resolve_macro_path(
-    macro_path: MacroPath,
-    exc_factory: Callable[[GetPathForMacroResultFailure], Exception],
-) -> str:
+def _resolve_macro_path(macro_path: MacroPath) -> str:
     """Dispatch GetPathForMacroRequest and return the resolved absolute path string.
 
     Args:
         macro_path: The MacroPath to resolve.
-        exc_factory: Called with the failure result to produce the exception to raise.
 
     Returns:
         Resolved absolute path string.
+
+    Raises:
+        FileLoadError: If macro resolution fails.
     """
     result = GriptapeNodes.handle_request(
         GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
-    if isinstance(result, GetPathForMacroResultFailure):
-        raise exc_factory(result)
-    return str(result.absolute_path)  # type: ignore[union-attr]
+    if not isinstance(result, GetPathForMacroResultSuccess):
+        raise _make_file_load_error(result)
+    return str(result.absolute_path)
 
 
-async def _aresolve_macro_path(
-    macro_path: MacroPath,
-    exc_factory: Callable[[GetPathForMacroResultFailure], Exception],
-) -> str:
+async def _aresolve_macro_path(macro_path: MacroPath) -> str:
     """Async version of _resolve_macro_path."""
     result = await GriptapeNodes.ahandle_request(
         GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
-    if isinstance(result, GetPathForMacroResultFailure):
-        raise exc_factory(result)
-    return str(result.absolute_path)  # type: ignore[union-attr]
+    if not isinstance(result, GetPathForMacroResultSuccess):
+        raise _make_file_load_error(result)
+    return str(result.absolute_path)
 
 
 def _resolve_file_path(file_path: str | MacroPath) -> str:
@@ -151,7 +153,7 @@ def _resolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-    return _resolve_macro_path(file_path, _make_file_load_error)
+    return _resolve_macro_path(file_path)
 
 
 async def _aresolve_file_path(file_path: str | MacroPath) -> str:
@@ -168,7 +170,7 @@ async def _aresolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-    return await _aresolve_macro_path(file_path, _make_file_load_error)
+    return await _aresolve_macro_path(file_path)
 
 
 # Pairs of suffixes that should be treated as equivalent when comparing a

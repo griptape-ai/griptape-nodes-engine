@@ -9,7 +9,7 @@ from griptape_nodes.common import macro_parser
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.handle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.directory.griptape_nodes_mod.GriptapeNodes.handle_request"
 
 
 class TestDirectoryConstructor:
@@ -419,3 +419,50 @@ class TestDirectoryDestinationCreateVersioning:
             directory = dest.create()
 
         assert directory.location == "{outputs}/renders_v{_index:03}"
+
+    def test_create_new_macro_string_without_index_appends_index_slot(self, tmp_path: pathlib.Path) -> None:
+        """Regression: a macro string with variables but no {_index} must auto-append _{_index}."""
+        versioned_dir = tmp_path / "renders_1"
+
+        index_result = os_events.GetNextVersionIndexResultSuccess(result_details="OK", index=1)
+        resolve_result = project_events.GetPathForMacroResultSuccess(
+            result_details="OK",
+            resolved_path=pathlib.Path("renders_1"),
+            absolute_path=versioned_dir,
+        )
+        mkdir_result = os_events.MakeDirectoryResultSuccess(result_details="OK", created_path=str(versioned_dir))
+        map_result = project_events.AttemptMapAbsolutePathToProjectResultSuccess(result_details="OK", mapped_path=None)
+
+        dest = directory_mod.DirectoryDestination(
+            "{outputs}/renders", existing_dir_policy=os_events.ExistingFilePolicy.CREATE_NEW
+        )
+
+        with mock.patch(HANDLE_REQUEST_PATH, side_effect=[index_result, resolve_result, mkdir_result, map_result]):
+            directory = dest.create()
+
+        # The returned directory carries the locked macro template; {_index} must have been appended.
+        assert directory.location == "{outputs}/renders_{_index}"
+
+    def test_create_new_macro_path_without_index_appends_index_slot(self, tmp_path: pathlib.Path) -> None:
+        """Regression: a MacroPath without {_index} must auto-append _{_index} for versioning."""
+        versioned_dir = tmp_path / "renders_1"
+
+        index_result = os_events.GetNextVersionIndexResultSuccess(result_details="OK", index=1)
+        resolve_result = project_events.GetPathForMacroResultSuccess(
+            result_details="OK",
+            resolved_path=pathlib.Path("renders_1"),
+            absolute_path=versioned_dir,
+        )
+        mkdir_result = os_events.MakeDirectoryResultSuccess(result_details="OK", created_path=str(versioned_dir))
+        map_result = project_events.AttemptMapAbsolutePathToProjectResultSuccess(result_details="OK", mapped_path=None)
+
+        macro_path = project_events.MacroPath(macro_parser.ParsedMacro("{outputs}/renders"), {})
+        dest = directory_mod.DirectoryDestination(
+            macro_path, existing_dir_policy=os_events.ExistingFilePolicy.CREATE_NEW
+        )
+
+        with mock.patch(HANDLE_REQUEST_PATH, side_effect=[index_result, resolve_result, mkdir_result, map_result]):
+            directory = dest.create()
+
+        # The returned directory carries the locked macro template; {_index} must have been appended.
+        assert directory.location == "{outputs}/renders_{_index}"

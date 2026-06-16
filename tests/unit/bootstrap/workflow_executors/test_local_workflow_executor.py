@@ -104,6 +104,69 @@ class TestLoadProject:
         assert mock_gn.ahandle_request.call_count == EXPECTED_REQUEST_COUNT
 
 
+class TestPrepareWorkflowForRunStorageBackend:
+    """Regression tests for issue #4828.
+
+    Generated workflow files splat the same `**kwargs` into both the
+    `LocalWorkflowExecutor(...)` constructor and `executor.arun(...)`, so a
+    `storage_backend` forwarded through `execute_workflow(**kwargs)` reaches the
+    run path. The run path used to hard-raise on any non-None `storage_backend`,
+    turning a valid caller into an error. The backend is applied once at
+    construction; the run path must tolerate a forwarded value.
+    """
+
+    @pytest.mark.asyncio
+    async def test_aprepare_does_not_raise_on_forwarded_storage_backend(self) -> None:
+        """A `storage_backend` forwarded into the run path must no longer raise."""
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+
+        with (
+            patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn,
+            patch.object(executor, "_load_flow_for_workflow", return_value="flow-name"),
+            patch.object(executor, "_set_input_for_flow", new=AsyncMock()),
+        ):
+            mock_gn.EventManager.return_value.initialize_queue = MagicMock()
+
+            # storage_backend arrives via **kwargs, exactly like the generated double-splat.
+            flow_name = await executor.aprepare_workflow_for_run(
+                flow_input={},
+                storage_backend=StorageBackend.GTC,
+            )
+
+        assert flow_name == "flow-name"
+
+    @pytest.mark.asyncio
+    async def test_arun_tolerates_forwarded_storage_backend(self) -> None:
+        """`arun` must accept a forwarded storage_backend (base-class run path) and ignore it."""
+        executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+        executor._pickle_control_flow_result = False
+
+        mock_start_result = MagicMock()
+        mock_start_result.failed.return_value = True  # short-circuit before the event loop
+        mock_prepare = AsyncMock(return_value="flow-name")
+
+        with (
+            patch.object(executor, "aprepare_workflow_for_run", new=mock_prepare),
+            patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn,
+        ):
+            mock_gn.ahandle_request = AsyncMock(return_value=mock_start_result)
+
+            # Reaching LocalExecutorError (not ValueError about deprecation) proves the
+            # forwarded storage_backend was tolerated and arun proceeded to start the flow.
+            with pytest.raises(LocalExecutorError, match="Failed to start flow"):
+                await executor.arun(flow_input={}, storage_backend=StorageBackend.GTC)
+
+        # arun must NOT forward storage_backend down to aprepare_workflow_for_run, in any
+        # form. Assert it appears in neither the positional args nor the keyword args of the
+        # call (asserting only `not in kwargs` would be tautological, since storage_backend
+        # is a named parameter of arun and can never land in arun's own **kwargs).
+        mock_prepare.assert_awaited_once()
+        await_args = mock_prepare.await_args
+        assert await_args is not None
+        assert StorageBackend.GTC not in await_args.args
+        assert "storage_backend" not in await_args.kwargs
+
+
 class TestLocalWorkflowExecutorCli:
     """Tests for LocalWorkflowExecutor's CLI surface (issue #4599)."""
 

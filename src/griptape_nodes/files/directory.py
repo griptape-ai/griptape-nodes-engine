@@ -8,7 +8,6 @@ from __future__ import annotations
 import pathlib
 
 from griptape_nodes.common import macro_parser
-from griptape_nodes.files import file as file_mod
 from griptape_nodes.files import project_file
 from griptape_nodes.retained_mode import griptape_nodes as griptape_nodes_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
@@ -110,27 +109,25 @@ class DirectoryDestination:
             create_parents: If True, create intermediate directories automatically.
                 Defaults to True.
         """
-        self._dir_path = dir_path
+        self._directory = Directory(dir_path)
         self._existing_dir_policy = existing_dir_policy
         self._create_parents = create_parents
 
-    def resolve(self) -> pathlib.Path:
+    def resolve(self) -> str:
         """Resolve and return the absolute path for this destination.
 
         Returns:
-            Absolute Path object.
+            Absolute path string.
 
         Raises:
             DirectoryError: If macro resolution fails.
         """
-        return pathlib.Path(_resolve_dir_path(self._dir_path))
+        return str(self._directory.resolve())
 
     @property
     def location(self) -> str:
         """Return the most portable string representation of this destination's location."""
-        if isinstance(self._dir_path, project_events.MacroPath):
-            return self._dir_path.parsed_macro.template
-        return self._dir_path
+        return self._directory.location
 
     def create(self) -> Directory:
         """Create the directory and return a Directory referencing it.
@@ -151,31 +148,39 @@ class DirectoryDestination:
             case os_events.ExistingFilePolicy.OVERWRITE:
                 return self._create_direct()
             case os_events.ExistingFilePolicy.FAIL:
-                resolved = pathlib.Path(_resolve_dir_path(self._dir_path))
-                if resolved.exists():
-                    msg = f"Attempted to create directory. Failed because directory already exists: {resolved}"
+                if self._directory.resolve().exists():
+                    msg = f"Attempted to create directory. Failed because directory already exists: {self._directory.location}"
                     raise DirectoryError(msg)
-                return self._create_direct()
+                return self._create_direct(exist_ok=False)
+            case _:
+                msg = f"Unsupported existing directory policy: {self._existing_dir_policy!r}"
+                raise DirectoryError(msg)
 
     def _create_with_versioning(self) -> Directory:
         """Use GetNextVersionIndexRequest to find an available version slot, then create it.
 
-        If the path is a MacroPath with an ``_index`` variable, we can use it directly, if it's a string, we just add index in the end.
+        Directory.__init__ normalises strings-with-macros to MacroPath, so the
+        stored _dir_path is either a MacroPath (any string that had variables) or
+        a plain string (no variables, or invalid macro syntax).  Plain strings get
+        a ``_{_index}`` suffix appended to enable versioning.
         """
-        if isinstance(self._dir_path, project_events.MacroPath):
-            macro_path = self._dir_path
+        if isinstance(self._directory._dir_path, project_events.MacroPath):
+            macro_path = self._directory._dir_path
         else:
             try:
-                parsed = macro_parser.ParsedMacro(self._dir_path)
-                has_variables = bool(parsed.get_variables())
+                macro_path = project_events.MacroPath(
+                    macro_parser.ParsedMacro(self._directory._dir_path + "_{_index}"), {}
+                )
             except macro_parser.MacroSyntaxError as exc:
-                msg = f"Attempted to create versioned directory. Failed because path is not a valid macro: {self._dir_path}"
+                msg = f"Attempted to create versioned directory. Failed because path is not a valid macro: {self._directory._dir_path}"
                 raise DirectoryError(msg) from exc
 
-            if has_variables:
-                macro_path = project_events.MacroPath(parsed, {})
-            else:
-                macro_path = project_events.MacroPath(macro_parser.ParsedMacro(self._dir_path + "_{_index}"), {})
+        # Guarantee the template has a {_index} slot. Without one,
+        # GetNextVersionIndexRequest fails. This covers macro strings like
+        # "{outputs}/renders" that carry other variables but omit {_index}.
+        if not any(var.name == "_index" for var in macro_path.parsed_macro.get_variables()):
+            new_template = macro_path.parsed_macro.template + "_{_index}"
+            macro_path = project_events.MacroPath(macro_parser.ParsedMacro(new_template), macro_path.variables)
 
         # Get the next available version index for this macro path.
         # The macro is expected to contain an {_index} variable, which is used to find the next available version.
@@ -206,17 +211,17 @@ class DirectoryDestination:
         locked_macro = project_events.MacroPath(macro_path.parsed_macro, variables)
         return _map_to_macro_directory(absolute_path, locked_macro)
 
-    def _create_direct(self) -> Directory:
+    def _create_direct(self, *, exist_ok: bool = True) -> Directory:
         """Create the directory without versioning."""
-        resolved = pathlib.Path(_resolve_dir_path(self._dir_path))
+        resolved = self._directory.resolve()
         mkdir_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=True)
+            os_events.MakeDirectoryRequest(path=str(resolved), create_parents=self._create_parents, exist_ok=exist_ok)
         )
         if not isinstance(mkdir_result, os_events.MakeDirectoryResultSuccess):
             msg = f"Attempted to create directory. Failed to create '{resolved}': {mkdir_result.result_details}"
             raise DirectoryError(msg)
 
-        return _map_to_macro_directory(resolved, self._dir_path)
+        return _map_to_macro_directory(resolved, self._directory._dir_path)
 
 
 def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
@@ -232,11 +237,24 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
         DirectoryError: If macro resolution fails.
     """
     if isinstance(dir_path, str):
-        return dir_path
-    return file_mod._resolve_macro_path(
-        dir_path,
-        lambda r: DirectoryError(f"Attempted to resolve directory path. Failed: {r.result_details}"),
+        try:
+            parsed = macro_parser.ParsedMacro(dir_path)
+        except macro_parser.MacroSyntaxError as exc:
+            msg = f"Attempted to resolve directory path. Failed because path has invalid macro syntax: {dir_path!r}"
+            raise DirectoryError(msg) from exc
+        if not parsed.get_variables():
+            return dir_path
+        macro_path = project_events.MacroPath(parsed, {})
+    else:
+        macro_path = dir_path
+
+    resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
+    if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
+        msg = f"Failed to resolve macro path '{macro_path.parsed_macro.template}': {resolve_result.result_details}"
+        raise DirectoryError(msg)
+    return str(resolve_result.absolute_path)
 
 
 def _map_to_macro_directory(absolute_path: pathlib.Path, fallback_path: str | project_events.MacroPath) -> Directory:

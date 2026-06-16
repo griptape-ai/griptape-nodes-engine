@@ -1,15 +1,17 @@
 """FileSequence and FileSequenceDestination for numbered file collections (frames, audio takes, etc.).
 
-Entry macros like ``{outputs}/dialogue_v{_index:03}/{entry:04}.wav`` drive both reading
-(FileSequence) and writing (FileSequenceDestination). Scanning delegates to the engine via
-ScanSequencesRequest; versioned destinations lock a free directory index via
+Templates like ``{outputs}/dialogue_v{_index:03}/####.wav`` drive both reading
+(FileSequence) and writing (FileSequenceDestination). The ``####`` slot is a
+literal string that the sequence scanning layer (fileseq) understands natively;
+it is NOT a macro variable, so it passes through ``GetPathForMacroRequest``
+resolution unchanged. Scanning delegates to the engine via ScanSequencesRequest;
+versioned destinations lock a free directory index via
 build_versioned_sequence_destination.
 """
 
 from __future__ import annotations
 
 import pathlib
-import re
 import typing
 
 from fileseq import constants as fileseq_constants
@@ -25,9 +27,6 @@ from griptape_nodes.retained_mode.events import os_events, project_events
 if typing.TYPE_CHECKING:
     import collections.abc
 
-_ENTRY_VAR_NAME = "entry"
-_ENTRY_MACRO_PATTERN = re.compile(r"\{entry(?::(\d+))?\}")
-
 
 class FileSequenceError(Exception):
     """Raised when a file sequence operation fails."""
@@ -37,63 +36,85 @@ class FileSequenceError(Exception):
         super().__init__(result_details)
 
 
-class FileSequence:
-    """A collection of files identified by an entry-number pattern.
+def _resolve_entry_path(macro_path: project_events.MacroPath, entry_number: int) -> str:
+    """Resolve macro variables then use fileseq to format the entry number.
 
-    Internally stores a MacroPath template with a ``{entry:XX}`` variable slot.
-    Exposes the industry-standard ``####`` notation at property boundaries for
-    DCC software interop.
+    Supports all sequence token formats fileseq understands: ``####``,
+    ``%04d``, ``@@@@``, ``$F4``, etc.
+
+    Args:
+        macro_path: MacroPath whose template contains a sequence token slot.
+        entry_number: Frame/entry index to substitute.
+
+    Returns:
+        Absolute path string for the given entry.
+
+    Raises:
+        FileSequenceError: If the macro path cannot be resolved.
+    """
+    resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        project_events.GetPathForMacroRequest(
+            parsed_macro=macro_path.parsed_macro,
+            variables=macro_path.variables,
+        )
+    )
+    if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
+        msg = f"Attempted to get entry {entry_number}. Failed to resolve sequence path: {resolve_result.result_details}"
+        raise FileSequenceError(msg)
+    fseq = fileseq_filesequence.FileSequence(
+        str(resolve_result.absolute_path),
+        pad_style=fileseq_constants.PAD_STYLE_HASH1,
+    )
+    return fseq.frame(entry_number)
+
+
+class FileSequence:
+    """A collection of files identified by a #### hash-pattern slot.
+
+    Stores a MacroPath whose template contains a run of ``#`` characters
+    (e.g. ``####``) representing the sequence number.  All other variables
+    in the template (``{outputs}``, ``{_index}``, …) are resolved through
+    the normal macro system; the ``####`` slot is plain literal text that
+    fileseq understands natively.
 
     Use ``entry(n)`` to get a ``File`` for reading a specific entry, and
-    ``directory`` to get the containing folder.
+    ``scan()`` to discover what is present on disk.
     """
 
-    def __init__(self, entry_macro: project_events.MacroPath) -> None:
-        """Store the entry macro. No I/O is performed.
+    def __init__(self, macro_path: project_events.MacroPath) -> None:
+        """Store the hash-pattern macro. No I/O is performed.
 
         Args:
-            entry_macro: MacroPath whose template contains an ``{entry}`` variable
-                slot and whose variables dict holds all resolved values (including
-                a locked ``_index`` when versioning is in effect).
+            macro_path: MacroPath whose template contains a ``####`` slot and
+                whose variables dict holds all resolved values (including a
+                locked ``_index`` when versioning is in effect).
         """
-        self._entry_macro = entry_macro
+        self._macro_path = macro_path
 
     @property
     def location(self) -> str:
         """Return the raw macro template for this sequence.
 
         Unresolved placeholders (including ``{_index}`` when versioning is in
-        effect) remain in the returned string. Use ``_entry_macro`` directly
-        when a self-contained (template + locked variables) representation is
-        needed for serialisation.
-
-        Example: ``"{outputs}/dialogue_v{_index:03}/{entry:04}.wav"``
-        """
-        return self._entry_macro.parsed_macro.template
-
-    @property
-    def pattern(self) -> str:
-        """Return the #### notation form of this sequence's entry pattern.
-
-        The ``{entry:NN}`` macro variable is replaced with a run of ``#``
-        characters matching the padding width. Other placeholders (e.g.
-        ``{_index}``) remain unresolved.
+        effect) remain in the returned string.  The ``####`` slot is also
+        returned as-is.
 
         Example: ``"{outputs}/dialogue_v{_index:03}/####.wav"``
         """
-        return entry_macro_to_hash_pattern(self.location)
+        return self._macro_path.parsed_macro.template
 
     @property
     def directory(self) -> directory_mod.Directory:
         """Return the containing directory as a Directory.
 
         No I/O is performed; the directory path is derived from the macro
-        template by stripping the filename component. The locked variables
+        template by stripping the filename component.  The locked variables
         (e.g. ``_index``) are preserved so the returned Directory can be resolved.
         """
         dir_template = str(pathlib.PurePosixPath(self.location).parent)
-        dir_variables = {k: v for k, v in self._entry_macro.variables.items() if k != _ENTRY_VAR_NAME}
-        return directory_mod.Directory(project_events.MacroPath(macro_parser.ParsedMacro(dir_template), dir_variables))
+        return directory_mod.Directory(
+            project_events.MacroPath(macro_parser.ParsedMacro(dir_template), self._macro_path.variables)
+        )
 
     def entry(self, entry_number: int) -> file_mod.File:
         """Return a File for reading a specific entry.
@@ -103,9 +124,11 @@ class FileSequence:
 
         Returns:
             File that resolves to the absolute path of that entry.
+
+        Raises:
+            FileSequenceError: If the macro path cannot be resolved.
         """
-        variables = {**self._entry_macro.variables, _ENTRY_VAR_NAME: entry_number}
-        return file_mod.File(project_events.MacroPath(self._entry_macro.parsed_macro, variables))
+        return file_mod.File(_resolve_entry_path(self._macro_path, entry_number))
 
     def scan(
         self,
@@ -116,36 +139,42 @@ class FileSequence:
     ) -> list[sequences.Sequence]:
         """Scan the sequence directory and return what's on disk.
 
+        The ``####`` slot in the template passes through macro resolution
+        unchanged, so the resolved path is handed directly to
+        ``ScanSequencesRequest`` without any string manipulation.
+
         Args:
             policy: How to handle gaps in the number range. Defaults to SPLIT.
             start: Optional lower bound (inclusive) for the active subset.
             end: Optional upper bound (inclusive) for the active subset.
 
         Returns:
-            List of Sequence objects. Empty if the directory cannot be resolved
-            or contains no matching files.
+            List of Sequence objects. Empty if the directory exists but contains
+            no matching files.
+
+        Raises:
+            FileSequenceError: If the macro path cannot be resolved.
         """
-        probe_vars = {**self._entry_macro.variables, _ENTRY_VAR_NAME: 0}
         resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-            project_events.GetPathForMacroRequest(parsed_macro=self._entry_macro.parsed_macro, variables=probe_vars)
+            project_events.GetPathForMacroRequest(
+                parsed_macro=self._macro_path.parsed_macro,
+                variables=self._macro_path.variables,
+            )
         )
         if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
-            return []
-        filename_template = pathlib.PurePosixPath(self.location).name
-        entry_match = _ENTRY_MACRO_PATTERN.search(filename_template)
-        entry_width = int(entry_match.group(1)) if entry_match and entry_match.group(1) else 4
-        entry_zero_str = format(0, f"0{entry_width}d")
-        filename_pattern = resolve_result.absolute_path.name.replace(entry_zero_str, "#" * entry_width, 1)
+            msg = f"Attempted to scan sequence. Failed to resolve macro path: {resolve_result.result_details}"
+            raise FileSequenceError(msg)
         scan_result = griptape_nodes_mod.GriptapeNodes.handle_request(
             os_events.ScanSequencesRequest(
-                path=str(resolve_result.absolute_path.parent / filename_pattern),
+                path=str(resolve_result.absolute_path),
                 policy=policy,
                 start_number=start,
                 end_number=end,
             )
         )
         if not isinstance(scan_result, os_events.ScanSequencesResultSuccess):
-            return []
+            msg = f"Attempted to scan sequence. Failed to scan path '{resolve_result.absolute_path}': {scan_result.result_details}"
+            raise FileSequenceError(msg)
         return scan_result.sequences
 
 
@@ -154,7 +183,7 @@ class _EntryWriteDestination(project_file.ProjectFileDestination):
 
     def __init__(
         self,
-        entry_path: project_events.MacroPath,
+        entry_path: str | project_events.MacroPath,
         *,
         existing_file_policy: os_events.ExistingFilePolicy,
         create_parents: bool,
@@ -191,7 +220,7 @@ class _EntryWriteDestination(project_file.ProjectFileDestination):
 class FileSequenceDestination:
     """A pre-configured write handle for a file sequence.
 
-    Bundles an entry macro path and write policy. The caller resolves a
+    Bundles a hash-pattern macro path and write policy.  The caller resolves a
     version index once (via ``build_versioned_sequence_destination``), then
     calls ``entry(n)`` to get a ``FileDestination`` for each entry.
 
@@ -200,23 +229,25 @@ class FileSequenceDestination:
 
     def __init__(
         self,
-        entry_macro: project_events.MacroPath,
+        macro_path: project_events.MacroPath,
         *,
         existing_file_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.OVERWRITE,
         create_parents: bool = True,
     ) -> None:
-        """Store entry macro and write configuration. No I/O is performed.
+        """Store the hash-pattern macro and write configuration. No I/O is performed.
 
         Args:
-            entry_macro: MacroPath with template containing an ``{entry}`` variable.
-                Should already have ``_index`` locked in the variables dict.
+            macro_path: MacroPath with template containing a ``####`` slot.
+                Should already have ``_index`` locked in the variables dict
+                when versioning is in effect.
             existing_file_policy: How to handle existing entry files. Defaults to OVERWRITE.
             create_parents: If True, create parent directories automatically. Defaults to True.
         """
-        self._entry_macro = entry_macro
+        self._macro_path = macro_path
         self._existing_file_policy = existing_file_policy
         self._create_parents = create_parents
         self._written_sequence: FileSequence | None = None
+        self._fseq: fileseq_filesequence.FileSequence | None = None
 
     @property
     def file_sequence(self) -> FileSequence | None:
@@ -229,6 +260,10 @@ class FileSequenceDestination:
     def entry(self, entry_number: int) -> file_mod.FileDestination:
         """Return a FileDestination for writing a specific entry.
 
+        The macro path is resolved on the first call and cached for all
+        subsequent calls, so writing many entries fires only one
+        ``GetPathForMacroRequest``.
+
         After the returned destination is used to write, the ``file_sequence``
         property becomes available.
 
@@ -237,24 +272,43 @@ class FileSequenceDestination:
 
         Returns:
             FileDestination pre-configured with the resolved entry path and policy.
+
+        Raises:
+            FileSequenceError: If the macro path cannot be resolved (first call only).
         """
-        variables = {**self._entry_macro.variables, _ENTRY_VAR_NAME: entry_number}
-        entry_path = project_events.MacroPath(self._entry_macro.parsed_macro, variables)
         return _EntryWriteDestination(
-            entry_path,
+            self._resolve_fseq().frame(entry_number),
             existing_file_policy=self._existing_file_policy,
             create_parents=self._create_parents,
             on_written=self._on_entry_written,
         )
 
+    def _resolve_fseq(self) -> fileseq_filesequence.FileSequence:
+        """Resolve the macro path to a fileseq FileSequence, caching the result."""
+        if self._fseq is None:
+            resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+                project_events.GetPathForMacroRequest(
+                    parsed_macro=self._macro_path.parsed_macro,
+                    variables=self._macro_path.variables,
+                )
+            )
+            if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
+                msg = f"Attempted to prepare sequence for writing. Failed to resolve macro path: {resolve_result.result_details}"
+                raise FileSequenceError(msg)
+            self._fseq = fileseq_filesequence.FileSequence(
+                str(resolve_result.absolute_path),
+                pad_style=fileseq_constants.PAD_STYLE_HASH1,
+            )
+        return self._fseq
+
     def _on_entry_written(self, written_file: file_mod.File) -> None:  # noqa: ARG002
         """Record that an entry was written to expose the FileSequence descriptor."""
         if self._written_sequence is None:
-            self._written_sequence = FileSequence(self._entry_macro)
+            self._written_sequence = FileSequence(self._macro_path)
 
 
 def build_versioned_sequence_destination(
-    entry_macro: project_events.MacroPath,
+    macro_path: project_events.MacroPath,
     *,
     existing_file_policy: os_events.ExistingFilePolicy = os_events.ExistingFilePolicy.OVERWRITE,
     create_parents: bool = True,
@@ -262,10 +316,11 @@ def build_versioned_sequence_destination(
     """Find the next available version index and return a locked FileSequenceDestination.
 
     Delegates index discovery to GetNextVersionIndexRequest (a single glob pass),
-    then locks the returned index into the entry macro variables.
+    then locks the returned index into the macro variables.
 
     Args:
-        entry_macro: MacroPath template with ``{entry}`` and ``{_index}`` variables.
+        macro_path: MacroPath template with a ``####`` slot and a ``{_index}``
+            variable for versioning.
         existing_file_policy: Policy for individual entry files. Defaults to OVERWRITE.
         create_parents: Whether to create parent directories. Defaults to True.
 
@@ -275,9 +330,8 @@ def build_versioned_sequence_destination(
     Raises:
         FileSequenceError: If the engine cannot determine the next available version index.
     """
-    dir_template = str(pathlib.PurePosixPath(entry_macro.parsed_macro.template).parent)
-    dir_variables = {k: v for k, v in entry_macro.variables.items() if k != _ENTRY_VAR_NAME}
-    dir_macro = project_events.MacroPath(macro_parser.ParsedMacro(dir_template), dir_variables)
+    dir_template = str(pathlib.PurePosixPath(macro_path.parsed_macro.template).parent)
+    dir_macro = project_events.MacroPath(macro_parser.ParsedMacro(dir_template), macro_path.variables)
 
     index_result = griptape_nodes_mod.GriptapeNodes.handle_request(
         os_events.GetNextVersionIndexRequest(macro_path=dir_macro)
@@ -289,52 +343,10 @@ def build_versioned_sequence_destination(
         raise FileSequenceError(msg)
 
     index = index_result.index if index_result.index is not None else 1
-    locked_vars = {**entry_macro.variables, "_index": index}
-    locked_macro = project_events.MacroPath(entry_macro.parsed_macro, locked_vars)
+    locked_vars = {**macro_path.variables, "_index": index}
+    locked_macro = project_events.MacroPath(macro_path.parsed_macro, locked_vars)
     return FileSequenceDestination(
         locked_macro,
         existing_file_policy=existing_file_policy,
         create_parents=create_parents,
     )
-
-
-def hash_pattern_to_entry_macro(pattern: str) -> str:
-    """Convert a sequence token pattern to a macro template with {entry:NN} syntax.
-
-    Accepts all fileseq token forms: ``####``, ``%04d``, ``@@@@``, ``$F4``.
-
-    Args:
-        pattern: Pattern string like ``"render_####.exr"``, ``"render_%04d.exr"``,
-            or a full path like ``"{outputs}/renders/render_####.exr"``.
-
-    Returns:
-        Macro template string with the token replaced by ``{entry:NN}``. Returns
-        the input unchanged if no sequence token is found.
-    """
-    path = pathlib.PurePosixPath(pattern)
-    fseq = fileseq_filesequence.FileSequence(path.name, pad_style=fileseq_constants.PAD_STYLE_HASH1)
-    width = fseq.zfill()
-    if width == 0:
-        return pattern
-    entry_part = f"{{entry:{width:02}}}"
-    new_name = fseq.basename() + entry_part + fseq.extension()
-    parent = str(path.parent)
-    return f"{parent}/{new_name}" if parent != "." else new_name
-
-
-def entry_macro_to_hash_pattern(template: str) -> str:
-    """Convert a macro template with {entry:NN} syntax to a #### pattern.
-
-    Args:
-        template: Macro template like ``"render_{entry:04}.exr"``.
-
-    Returns:
-        Pattern string like ``"render_####.exr"``.
-    """
-
-    def replace_entry_var(match: re.Match) -> str:
-        width_str = match.group(1)
-        width = int(width_str) if width_str else 4
-        return "#" * width
-
-    return _ENTRY_MACRO_PATTERN.sub(replace_entry_var, template)
