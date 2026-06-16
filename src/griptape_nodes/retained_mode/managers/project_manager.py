@@ -33,7 +33,12 @@ from griptape_nodes.common.project_templates import (
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileLoadError, FileWriteError
-from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_file_path, resolve_path_safely
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity,
+    resolve_file_path,
+    resolve_path_safely,
+    resolve_workspace_path,
+)
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.library_events import (
@@ -1134,15 +1139,25 @@ class ProjectManager:
         """Return a stable string of the merged library-affecting config for change detection.
 
         Captures the merged `libraries_to_register`, `libraries_to_download`, and
-        `engine_version` values as one sorted-key JSON string so two snapshots can
-        be compared with `==`. Including `engine_version` ensures a pure
-        engine_version change still trips `library_config_changed`, which is what
-        re-runs the reload (and so the engine_version gate) on activation.
+        `engine_version` values plus the RESOLVED libraries directory as one
+        sorted-key JSON string so two snapshots can be compared with `==`.
+        Including `engine_version` ensures a pure engine_version change still trips
+        `library_config_changed`, which is what re-runs the reload (and so the
+        engine_version gate) on activation. Including the resolved libraries dir
+        catches a workspace-only switch: `libraries_directory` is workspace-relative
+        by default, so two projects with identical config strings but different
+        workspaces resolve to different on-disk `libraries/` trees and must still
+        reload, even though the three values above are unchanged.
         """
+        libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
+        resolved_libraries_dir = str(
+            resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path)
+        )
         snapshot = {
             LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
             LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
             ENGINE_VERSION_KEY: self._config_manager.get_config_value(ENGINE_VERSION_KEY, default=None),
+            "resolved_libraries_directory": resolved_libraries_dir,
         }
         return json.dumps(snapshot, sort_keys=True, default=str)
 
@@ -1288,6 +1303,11 @@ class ProjectManager:
             # Switching to system defaults: clear_project_layers() above already dropped
             # the prior project's override and config-file paths, so reloading configs now
             # resolves workspace_path and all config layers from defaults only.
+            self._config_manager.load_configs()
+        else:
+            # Unknown project id (no loaded template): clear_project_layers() above already
+            # dropped the prior project's layers, so remerge from defaults rather than leave
+            # config in the cleared, unmerged state.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after

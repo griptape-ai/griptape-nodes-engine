@@ -1864,6 +1864,24 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.get_config_value.side_effect = get_config_value
         mock_config.load_project_config.side_effect = load_project_config
 
+    @staticmethod
+    def _config_for_workspace_lookup(mock_config: Mock, project_workspaces: dict[str, str], workspace_path: Path) -> None:
+        """Configure a mock config for activation tests that exercise workspace lookup.
+
+        Returns `project_workspaces` for that key and each call's `default`
+        otherwise, so `_snapshot_library_config` reads a string `libraries_directory`
+        (not the project_workspaces dict) and resolves it against a real
+        `workspace_path`.
+        """
+
+        def get_config_value(key: str, *_args: object, default: object = None, **_kwargs: object) -> object:
+            if key == "project_workspaces":
+                return project_workspaces
+            return default
+
+        mock_config.get_config_value.side_effect = get_config_value
+        mock_config.workspace_path = workspace_path
+
     def _make_project_manager_with_project(self, project_file_path: Path, mock_config: Mock) -> ProjectManager:
         """Create a ProjectManager with a loaded project template at the given path."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
@@ -1904,7 +1922,9 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        mock_config.get_config_value.return_value = {str(project_file.resolve()): str(workspace_dir)}
+        self._config_for_workspace_lookup(
+            mock_config, {str(project_file.resolve()): str(workspace_dir)}, tmp_path
+        )
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
 
@@ -1931,7 +1951,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.env_config = {}
         mock_config.merged_config = {}
         # Key uses the unresolved path; the code must resolve both sides before comparing.
-        mock_config.get_config_value.return_value = {str(project_file): str(workspace_dir)}
+        self._config_for_workspace_lookup(mock_config, {str(project_file): str(workspace_dir)}, tmp_path)
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
 
@@ -1954,7 +1974,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        mock_config.get_config_value.return_value = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
 
@@ -1982,7 +2002,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {"workspace_directory": "/some/shared/workspace"}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        mock_config.get_config_value.return_value = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
 
@@ -2021,7 +2041,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        mock_config.get_config_value.return_value = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
 
         pm = self._make_project_manager_with_project(auto_default_file, mock_config)
         # Register the second project (which supplies its own workspace_directory).
@@ -2140,6 +2160,40 @@ class TestProjectManagerProjectWorkspaces:
         mock_gn.ahandle_request.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_unknown_project_id_remerges_after_clearing_layers(self, tmp_path: Path) -> None:
+        """An unknown project id remerges config instead of leaving layers cleared.
+
+        Activation unconditionally calls clear_project_layers() up front. For a
+        known project (load_project_config) or system defaults (load_configs) a
+        remerge follows; an id with no loaded template must still remerge via
+        load_configs(), otherwise config is left in the cleared, unmerged state.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        # No project file created and no template registered: the id is unknown.
+        unknown_file = tmp_path / "unknown.yml"
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, Mock())
+        pm._initialization_complete = True
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock()
+            await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
+
+        mock_config.clear_project_layers.assert_called_once()
+        mock_config.load_configs.assert_called_once()
+        mock_config.load_project_config.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_initialization_incomplete_skips_reload(self, tmp_path: Path) -> None:
         """When _initialization_complete is False, no library reload or workflow re-registration occurs."""
         from unittest.mock import AsyncMock, patch
@@ -2151,7 +2205,7 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        mock_config.get_config_value.return_value = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
 
         pm = self._make_project_manager_with_project(project_file, mock_config)
         # _initialization_complete starts False
@@ -4922,9 +4976,10 @@ class TestSnapshotLibraryConfig:
     """`_snapshot_library_config` powers conditional reload: same config skips the deep reset."""
 
     @staticmethod
-    def _pm_reading(values: dict[str, object]) -> ProjectManager:
+    def _pm_reading(values: dict[str, object], *, workspace_path: str = "/workspace") -> ProjectManager:
         mock_config_manager = Mock()
         mock_config_manager.get_config_value.side_effect = lambda key, default=None: values.get(key, default)
+        mock_config_manager.workspace_path = Path(workspace_path)
         return ProjectManager(Mock(), mock_config_manager, Mock())
 
     def test_identical_config_snapshots_are_equal(self) -> None:
@@ -4950,6 +5005,16 @@ class TestSnapshotLibraryConfig:
 
         before = self._pm_reading({ENGINE_VERSION_KEY: ">=0.5,<0.6"})._snapshot_library_config()
         after = self._pm_reading({ENGINE_VERSION_KEY: ">=0.6,<0.7"})._snapshot_library_config()
+
+        assert before != after
+
+    def test_workspace_only_change_changes_snapshot(self) -> None:
+        # libraries_directory is workspace-relative, so two projects with identical
+        # config strings but different workspaces resolve to different on-disk
+        # libraries/ trees and must still reload.
+        values = {"libraries_directory": "libraries"}
+        before = self._pm_reading(values, workspace_path="/ws-a")._snapshot_library_config()
+        after = self._pm_reading(values, workspace_path="/ws-b")._snapshot_library_config()
 
         assert before != after
 

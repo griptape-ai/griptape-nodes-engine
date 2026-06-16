@@ -1996,6 +1996,25 @@ class TestInstalledDownloadVersion:
             mock_gn.ConfigManager.return_value = config_manager
             assert library_manager._installed_download_version(download) is None
 
+    def test_explicit_libraries_path_probes_target_not_live(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        # The preview passes the TARGET project's libraries dir. The probe must read it,
+        # not the live config, so it never falls back to the active workspace.
+        library_manager = griptape_nodes.LibraryManager()
+        target_libs = tmp_path / "target" / "libraries"
+        TestInstalledLibraryVersion._write_manifest(target_libs / "git-lib", "Griptape Nodes Library", "3.3.0")
+        download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
+        live_config = MagicMock()
+        # Live config points elsewhere; an explicit libraries_path must win, and the live
+        # libraries_directory must never be read.
+        live_config.get_config_value.return_value = str(tmp_path / "live" / "libraries")
+        live_config.workspace_path = str(tmp_path / "live")
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            mock_gn.ConfigManager.return_value = live_config
+            assert library_manager._installed_download_version(download, target_libs) == "3.3.0"
+        live_config.get_config_value.assert_not_called()
+
 
 class TestDiscoverProvisionedManifestPaths:
     """Discovery loads a provisioned library from the manifest path in the register list.
@@ -2152,16 +2171,27 @@ class TestPreviewProjectProvisioning:
     """
 
     @staticmethod
-    def _merged_config(libraries: object, *, engine_version: str | None = None) -> dict:
+    def _merged_config(
+        libraries: object,
+        *,
+        engine_version: str | None = None,
+        workspace_directory: str = "/tmp/target-ws",
+        libraries_directory: str = "libraries",
+    ) -> dict:
         """Build a merged-config dict shaped like compute_project_provisioning_config's output.
 
-        Only the nested `libraries_to_download` / `engine_version` keys the preview
-        reads via get_dot_value are populated.
+        Populates the nested `libraries_to_download` / `engine_version` keys plus the
+        top-level `workspace_directory` / `libraries_directory` the preview reads to
+        probe the TARGET project's libraries dir.
         """
         on_init: dict[str, object] = {"libraries_to_download": libraries}
         if engine_version is not None:
             on_init["engine_version"] = engine_version
-        return {"app_events": {"on_app_initialization_complete": on_init}}
+        return {
+            "workspace_directory": workspace_directory,
+            "libraries_directory": libraries_directory,
+            "app_events": {"on_app_initialization_complete": on_init},
+        }
 
     @staticmethod
     def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object) -> None:
@@ -2231,7 +2261,9 @@ class TestPreviewProjectProvisioning:
         with (
             patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
             patch.object(
-                library_manager, "_installed_download_version", side_effect=lambda download: installed[download.name]
+                library_manager,
+                "_installed_download_version",
+                side_effect=lambda download, libraries_path=None: installed[download.name],
             ),
         ):
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
@@ -2284,6 +2316,50 @@ class TestPreviewProjectProvisioning:
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
         assert [a.library_name for a in result.actions] == ["merged-lib"]
         assert result.actions[0].kind == LibraryProvisioningActionKind.INSTALL
+
+    def test_probes_target_workspace_not_live_for_destructive_plan(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """The installed-version probe reads the TARGET project's libraries dir.
+
+        Guards the defect where the preview resolved the probe against the live
+        (active) workspace: a stale version sitting in the target workspace would
+        be missed, so a destructive OVERWRITE would be under-reported as a
+        non-destructive INSTALL. This exercises the real on-disk probe (no mock of
+        _installed_download_version): the target workspace holds an unsatisfying
+        version, the live config points at an empty dir, and the plan must still be
+        a destructive OVERWRITE.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            LibraryProvisioningActionKind,
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        target_ws = tmp_path / "target"
+        TestInstalledLibraryVersion._write_manifest(target_ws / "libraries" / "git-lib", "git-lib", "1.0.0")
+        merged = self._merged_config(
+            [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}],
+            workspace_directory=str(target_ws),
+            libraries_directory="libraries",
+        )
+        # Live config points at a different, empty workspace; if the probe used it the
+        # plan would wrongly be a non-destructive INSTALL.
+        live_config = MagicMock()
+        live_config.get_config_value.return_value = str(tmp_path / "live" / "libraries")
+        live_config.workspace_path = str(tmp_path / "live")
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            mock_gn.ConfigManager.return_value = live_config
+            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
+            result = library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert [a.kind for a in result.actions] == [LibraryProvisioningActionKind.OVERWRITE]
+        assert result.actions[0].destructive is True
+        assert result.actions[0].installed_version == "1.0.0"
 
     def test_unsatisfiable_engine_version_populates_failure(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path

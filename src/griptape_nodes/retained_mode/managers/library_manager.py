@@ -3121,7 +3121,15 @@ class LibraryManager:
         raw_libraries = get_dot_value(merged, LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         downloads = normalize_library_downloads(raw_libraries)
 
-        actions = [self._plan_one_library_provisioning(download) for download in downloads]
+        # Probe the installed versions against the TARGET project's libraries dir, not the
+        # live one, so the plan matches what activation would reconcile in that workspace.
+        # Both keys come from Settings defaults, so they are always present in `merged`.
+        libraries_path = resolve_workspace_path(
+            Path(get_dot_value(merged, "libraries_directory")),
+            Path(get_dot_value(merged, "workspace_directory")),
+        )
+
+        actions = [self._plan_one_library_provisioning(download, libraries_path) for download in downloads]
         destructive_count = sum(1 for action in actions if action.destructive)
         change_count = sum(1 for action in actions if action.kind != LibraryProvisioningActionKind.SKIP)
         return PreviewProjectProvisioningResultSuccess(
@@ -3171,7 +3179,9 @@ class LibraryManager:
         spec_string = GriptapeNodes.ConfigManager().get_config_value(ENGINE_VERSION_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
-    def _plan_one_library_provisioning(self, download: LibraryDownload) -> LibraryProvisioningAction:
+    def _plan_one_library_provisioning(
+        self, download: LibraryDownload, libraries_path: Path | None = None
+    ) -> LibraryProvisioningAction:
         """Decide what provisioning will do to one download entry, reading only.
 
         A manifest read for the installed version (under `libraries_directory`)
@@ -3180,6 +3190,12 @@ class LibraryManager:
         on-disk state, which survives the reload's registry unload, so the two
         cannot drift. Branch order mirrors `_provision_one_library`: the
         already-satisfied SKIP first, then the git clone/overwrite.
+
+        `libraries_path` is the TARGET project's resolved libraries directory.
+        The preview passes it so the installed-version probe reads the workspace
+        the switch would land in, not the currently-active one; activation runs
+        after the config layers switch, so its reconcile leaves this None and
+        resolves from the (now-target) live config.
 
         `destructive` is True ONLY for a git OVERWRITE, matching the
         `overwrite_existing = installed_version is not None` decision in
@@ -3192,7 +3208,7 @@ class LibraryManager:
         The action's `library_name` falls back to the repo name for display.
         """
         library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
-        installed_version = self._installed_download_version(download)
+        installed_version = self._installed_download_version(download, libraries_path)
         parsed = parse_git_url_with_ref(download.git_url)
         satisfied = self._registration_satisfied_by_installed(download, installed_version)
         if satisfied:
@@ -3292,7 +3308,7 @@ class LibraryManager:
         return None
 
     @staticmethod
-    def _installed_library_manifest_path(library_name: str) -> Path | None:
+    def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
@@ -3303,18 +3319,24 @@ class LibraryManager:
         matches; None when the directory is unconfigured or missing, or no
         manifest matches.
 
+        `libraries_path` lets the provisioning preview probe the TARGET project's
+        libraries directory rather than the live one. When None it resolves from
+        the live config, which is correct for the real reconcile (it runs after
+        activation has switched the config layers to the target).
+
         This is the single source of truth for the provisioning planner
         (`_installed_library_version`, which decides SKIP/INSTALL/OVERWRITE) and
         the overwrite path (`_provision_git_library`, which deletes the manifest's
         directory before re-cloning), guaranteeing the file the planner reasoned
         about is exactly the file overwrite targets.
         """
-        config_mgr = GriptapeNodes.ConfigManager()
-        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-        if not libraries_dir_setting:
-            return None
+        if libraries_path is None:
+            config_mgr = GriptapeNodes.ConfigManager()
+            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
+            if not libraries_dir_setting:
+                return None
+            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
 
-        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
         for manifest_path in find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
@@ -3338,7 +3360,7 @@ class LibraryManager:
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
-    def _installed_manifest_path_for_download(download: LibraryDownload) -> Path | None:
+    def _installed_manifest_path_for_download(download: LibraryDownload, libraries_path: Path | None = None) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
 
         Locates the installed copy the same way the download handler lands it:
@@ -3348,29 +3370,35 @@ class LibraryManager:
         `name` overrides the directory match for a library installed under a
         differently-named directory, resolving by manifest name instead. None when
         the directory is unconfigured/missing or no manifest is found.
+
+        `libraries_path` lets the provisioning preview probe the TARGET project's
+        libraries directory; when None it resolves from the live config (correct
+        for the real reconcile, which runs post-activation).
         """
         if download.name is not None:
-            return LibraryManager._installed_library_manifest_path(download.name)
+            return LibraryManager._installed_library_manifest_path(download.name, libraries_path)
 
-        config_mgr = GriptapeNodes.ConfigManager()
-        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-        if not libraries_dir_setting:
-            return None
+        if libraries_path is None:
+            config_mgr = GriptapeNodes.ConfigManager()
+            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
+            if not libraries_dir_setting:
+                return None
+            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
 
-        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
         repo_name = extract_repo_name_from_url(download.git_url)
         repo_directory = libraries_path / repo_name
         return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
 
     @staticmethod
-    def _installed_download_version(download: LibraryDownload) -> str | None:
+    def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
         """Return the on-disk version for a download entry, or None when absent.
 
         Resolves the installed manifest via `_installed_manifest_path_for_download`
         (repo-name directory, or `name` override), then reads
-        `metadata.library_version`.
+        `metadata.library_version`. `libraries_path` threads the TARGET project's
+        libraries directory through for the preview; None resolves from live config.
         """
-        manifest_path = LibraryManager._installed_manifest_path_for_download(download)
+        manifest_path = LibraryManager._installed_manifest_path_for_download(download, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
