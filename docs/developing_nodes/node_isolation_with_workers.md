@@ -85,7 +85,7 @@ combination.
 ```json
 {
     "name": "My Library",
-    "library_schema_version": "0.9.0",
+    "library_schema_version": "0.10.0",
     "metadata": {
         "author": "<Your Name>",
         "description": "<Description>",
