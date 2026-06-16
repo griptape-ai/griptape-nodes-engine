@@ -1207,16 +1207,17 @@ class ProjectManager:
     def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
         """Resolve the project-adjacent and workspace dirs for a provisioning preview.
 
-        Canonicalizes `project_id` the same way on_set_current_project_request does
-        (so a raw path - unexpanded `~`, symlinked, or relative - resolves to the
-        registry key it was loaded under, instead of missing the lookup), finds the
-        loaded file-backed project, then decides its workspace dir + override bit
-        read-only via decide_workspace. Returns None when the project is not loaded or
-        has no backing file, mirroring get_loaded_project_dir's "nothing to preview"
-        contract. Mutates no config state.
+        Looks up `project_id` verbatim as the registry key, the same way
+        on_set_current_project_request does: the id is opaque and must NOT be
+        canonicalized, or a GUID (or custom string) would be treated as a relative
+        path against the CWD and miss the registry. Legacy projects whose id is a
+        canonical path string were already canonicalized at load time, so a verbatim
+        lookup still hits. Finds the loaded file-backed project, then decides its
+        workspace dir + override bit read-only via decide_workspace. Returns None when
+        the project is not loaded or has no backing file, mirroring
+        get_loaded_project_dir's "nothing to preview" contract. Mutates no config state.
         """
-        resolved_project_id = str(canonicalize_for_identity(project_id))
-        project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
+        project_info = self._successfully_loaded_project_templates.get(project_id)
         if project_info is None:
             return None
         if project_info.project_file_path is None:
