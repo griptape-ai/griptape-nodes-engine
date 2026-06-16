@@ -1341,7 +1341,7 @@ class LibraryProvisioningActionKind(StrEnum):
 
 @dataclass
 class LibraryProvisioningAction:
-    """The planned provisioning outcome for one git-sourced library registration.
+    """The planned provisioning outcome for one libraries_to_download entry.
 
     Computed by a pure registry-read + PEP 440 compare so the preview and the
     real execution derive from the same decision. `destructive` is True ONLY for
@@ -1349,11 +1349,11 @@ class LibraryProvisioningAction:
     re-cloning; INSTALL/SKIP never are.
 
     Fields:
-        library_name: Library name, matching the registration's `name`.
+        library_name: Library name, matching the download entry's `name`.
         kind: SKIP / INSTALL / OVERWRITE.
         installed_version: Currently registered version, or None when not installed.
-        pinned_version: The registration's PEP 440 version specifier, or None for a source-only entry.
-        git_url: The registration's git source (url@ref form).
+        pinned_version: The download entry's PEP 440 version specifier, or None for a source-only entry.
+        git_url: The download entry's git source (url@ref form).
         git_ref: The branch/tag/commit parsed from `git_url`, when present.
         destructive: True only for a git OVERWRITE (deletes the local dir).
         reason: Human-readable explanation of the decision.
@@ -1374,10 +1374,10 @@ class LibraryProvisioningAction:
 class PreviewProjectProvisioningRequest(RequestPayload):
     """Compute, without touching disk, what activating a project would provision.
 
-    Use when: the UI wants to show the user which sourced libraries will be
-    installed or overwritten before committing to a project switch. Read-only:
-    a registry read plus a PEP 440 compare, no clone/venv/delete work. Reads the
-    target project's project-adjacent config without mutating the live config layers.
+    Use when: the UI wants to show the user which libraries_to_download entries
+    will be installed or overwritten before committing to a project switch.
+    Read-only: a registry read plus a PEP 440 compare, no clone/venv/delete work.
+    Reads the target project's project-adjacent config without mutating the live config layers.
 
     Args:
         project_id: Identifier of an already-loaded project to preview.
@@ -1394,8 +1394,8 @@ class PreviewProjectProvisioningResultSuccess(WorkflowNotAlteredMixin, ResultPay
     """Provisioning plan computed.
 
     Args:
-        actions: One action per sourced library, in config order. Empty when the
-            project declares no library sources to provision.
+        actions: One action per libraries_to_download entry, in config order. Empty when the
+            project declares no libraries to download/provision.
         engine_version_failure: Non-None when the project's pinned engine_version
             cannot be satisfied by the running engine. The same text the live
             reconcile would surface, computed on the same merged config the preview

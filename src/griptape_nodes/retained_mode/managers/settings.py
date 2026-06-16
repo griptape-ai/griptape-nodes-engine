@@ -1,8 +1,8 @@
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, Literal, Self
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic import Field as PydanticField
 
 from griptape_nodes.common.project_templates import PerPlatformProjectPath
@@ -116,19 +116,15 @@ class LibraryRegistration(BaseModel):
 
     Bare path strings remain valid in the config; this object form is used when
     additional fields (such as `enabled` or `worker_mode_override`) need to be
-    set per entry. An entry may describe a local library (via `path`) and/or a
-    remote, version-pinned source (via `git_url`), which the engine provisions to
-    match when the owning project is activated.
+    set per entry. Each entry names an already-present local library by `path`;
+    version-pinned remote sources are declared separately in `libraries_to_download`.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     path: str | None = Field(
         default=None,
-        description=(
-            "Path to a griptape_nodes_library.json file or a directory scanned recursively. "
-            "Optional when git_url provides a remote source."
-        ),
+        description="Path to a griptape_nodes_library.json file or a directory scanned recursively.",
     )
     enabled: bool = Field(
         default=True,
@@ -143,11 +139,27 @@ class LibraryRegistration(BaseModel):
             "None reverts to the manifest's SuggestedWorkerMode."
         ),
     )
-    name: str | None = Field(
-        default=None,
+
+
+class LibraryDownload(BaseModel):
+    """A library entry in libraries_to_download that the engine provisions to a version.
+
+    Bare git-URL strings remain valid in the config; this object form is used
+    when a version pin (or an explicit manifest `name`) is needed. The engine
+    downloads the library and, when the installed version does not satisfy the
+    pin, overwrites the local copy so the owning project gets the version it
+    declares. Only libraries listed here may be overwritten by project
+    activation; a library that is merely registered (libraries_to_register) is
+    never overwritten.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    git_url: str = Field(
         description=(
-            "Library name, matching the library's manifest `name`. Required for sourced "
-            "entries (git_url) so the installed version can be matched."
+            "Git source in the engine's `url@ref` form: a full URL or `user/repo` shorthand, "
+            "with an optional `@branch|tag|commit` suffix "
+            "(e.g. 'griptape-ai/griptape-nodes-library-standard@v2.0')."
         ),
     )
     version: str | None = Field(
@@ -156,30 +168,19 @@ class LibraryRegistration(BaseModel):
             "PEP 440 version specifier the installed library must satisfy (e.g. '>=1.2,<2'). None pins by source only."
         ),
     )
-    git_url: str | None = Field(
+    name: str | None = Field(
         default=None,
         description=(
-            "Git source in the engine's `url@ref` form (same as `libraries_to_download`): "
-            "a full URL or `user/repo` shorthand, with an optional `@branch|tag|commit` suffix "
-            "(e.g. 'griptape-ai/griptape-nodes-library-standard@v2.0')."
+            "Library name, matching the library's manifest `name`. When set, the installed "
+            "version is matched by name to decide whether a re-download is needed."
         ),
     )
 
-    @model_validator(mode="after")
-    def _validate_sources(self) -> Self:
-        if self.path is None and self.git_url is None:
-            msg = "LibraryRegistration requires at least one of 'path' or 'git_url'"
-            raise ValueError(msg)
-        if self.git_url is not None and self.name is None:
-            msg = "LibraryRegistration with a 'git_url' source requires 'name'"
-            raise ValueError(msg)
-        return self
-
 
 class AppInitializationComplete(BaseModel):
-    libraries_to_download: list[str] = Field(
+    libraries_to_download: list[str | LibraryDownload] = Field(
         default_factory=list,
-        description="Git URLs of libraries to automatically download when the engine starts. Downloaded into libraries_directory. Supports full URLs or GitHub shorthand (e.g., 'user/repo'). Optionally specify a branch, tag, or commit with @ref syntax (e.g., 'user/repo@stable' or 'https://github.com/user/repo@v1.0.0'). If no ref is specified, uses the repository's default branch.",
+        description="Libraries to automatically download when the engine starts, into libraries_directory. Each entry is either a bare git URL string or an object with `git_url` plus an optional PEP 440 `version` pin and manifest `name`. Git URLs support full URLs or GitHub shorthand (e.g., 'user/repo'). Optionally specify a branch, tag, or commit with @ref syntax (e.g., 'user/repo@stable' or 'https://github.com/user/repo@v1.0.0'). If no ref is specified, uses the repository's default branch. The engine provisions each entry to its pinned version and may overwrite a wrong installed version; libraries listed only in libraries_to_register are never overwritten.",
     )
     libraries_to_register: list[str | LibraryRegistration] = Field(
         default_factory=list,

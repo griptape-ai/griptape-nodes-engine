@@ -217,6 +217,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
+    LibraryDownload,
     LibraryRegistration,
 )
 from griptape_nodes.utils.async_utils import subprocess_run
@@ -246,6 +247,7 @@ from griptape_nodes.utils.library_utils import (
     extract_library_path,
     filter_old_xdg_library_paths,
     is_monorepo,
+    normalize_library_downloads,
     normalize_library_registrations,
 )
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
@@ -3087,7 +3089,7 @@ class LibraryManager:
         merges every layer (defaults -> user -> project-adjacent -> workspace ->
         override -> env) without mutating live state. Reading the project-adjacent
         file alone diverges whenever a higher-priority layer sets
-        `libraries_to_register`/`engine_version`. It also runs the same
+        `libraries_to_download`/`engine_version`. It also runs the same
         engine_version gate (`engine_version_failure_detail`) on that merged config
         so the preview can warn before the user approves a plan that activation
         would reject. The GUI calls this before committing to a switch so the user
@@ -3118,11 +3120,10 @@ class LibraryManager:
 
         engine_version_failure = engine_version_failure_detail(get_dot_value(merged, ENGINE_VERSION_KEY, default=None))
 
-        raw_libraries = get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY, default=[])
-        registrations = normalize_library_registrations(raw_libraries)
-        sourced = [reg for reg in registrations if reg.git_url is not None]
+        raw_libraries = get_dot_value(merged, LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        downloads = normalize_library_downloads(raw_libraries)
 
-        actions = [self._plan_one_library_provisioning(reg) for reg in sourced]
+        actions = [self._plan_one_library_provisioning(download) for download in downloads]
         destructive_count = sum(1 for action in actions if action.destructive)
         change_count = sum(1 for action in actions if action.kind != LibraryProvisioningActionKind.SKIP)
         return PreviewProjectProvisioningResultSuccess(
@@ -3133,14 +3134,16 @@ class LibraryManager:
         )
 
     async def _reconcile_libraries_from_config(self) -> list[str]:
-        """Enforce the engine_version gate and provision sourced libraries from config.
+        """Enforce the engine_version gate and provision libraries_to_download from config.
 
         The project (its adjacent config, already merged into the live config by
         the time this runs) is the source of truth for the libraries it needs:
-        each git-sourced entry is provisioned to match its version. A path-only
-        entry is left to normal discovery. The engine_version gate runs first,
-        before any disk mutation, so a version mismatch blocks provisioning
-        entirely rather than half-applying it.
+        each `libraries_to_download` entry is provisioned to match its version,
+        which may overwrite a wrong installed copy. A library listed only in
+        `libraries_to_register` is left to normal discovery and is never
+        overwritten. The engine_version gate runs first, before any disk
+        mutation, so a version mismatch blocks provisioning entirely rather than
+        half-applying it.
 
         Returns a list of failure detail strings (empty on success). Callers
         decide whether to log-and-continue (boot) or fail (interactive reload).
@@ -3150,14 +3153,12 @@ class LibraryManager:
             return [engine_version_failure]
 
         config_mgr = GriptapeNodes.ConfigManager()
-        raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
-        registrations = normalize_library_registrations(raw_libraries)
+        raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        downloads = normalize_library_downloads(raw_libraries)
 
         failures: list[str] = []
-        for registration in registrations:
-            if registration.git_url is None:
-                continue
-            failure = await self._provision_one_library(registration)
+        for download in downloads:
+            failure = await self._provision_one_library(download)
             if failure is not None:
                 failures.append(failure)
 
@@ -3172,8 +3173,8 @@ class LibraryManager:
         spec_string = GriptapeNodes.ConfigManager().get_config_value(ENGINE_VERSION_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
-    def _plan_one_library_provisioning(self, registration: LibraryRegistration) -> LibraryProvisioningAction:
-        """Decide what provisioning will do to one entry, reading only.
+    def _plan_one_library_provisioning(self, download: LibraryDownload) -> LibraryProvisioningAction:
+        """Decide what provisioning will do to one download entry, reading only.
 
         A manifest read for the installed version (under `libraries_directory`)
         plus a PEP 440 compare. The preview lists this output and the real
@@ -3186,79 +3187,67 @@ class LibraryManager:
         `overwrite_existing = installed_version is not None` decision in
         `_provision_git_library` that triggers the local directory delete.
 
-        Callers pass only git-sourced entries, and the LibraryRegistration
-        validator guarantees such an entry carries a `name`, so both
-        `registration.git_url` and `registration.name` are non-None here.
+        A LibraryDownload always carries a `git_url`; `name` is optional. When
+        `name` is absent the installed copy is located by its repo-name directory
+        (`_installed_manifest_path_for_download`), the same place the download
+        handler lands it, so a `version` pin is enforced without requiring `name`.
+        The action's `library_name` falls back to the repo name for display.
         """
-        if registration.git_url is None:
-            msg = (
-                f"Attempted to plan provisioning for library '{registration.name}'. "
-                f"Failed because the registration has no git_url source."
-            )
-            raise ValueError(msg)
-
-        library_name = registration.name if registration.name is not None else ""
-        installed_version = self._installed_library_version(library_name)
-        satisfied = self._registration_satisfied_by_installed(registration, installed_version)
+        library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
+        installed_version = self._installed_download_version(download)
+        parsed = parse_git_url_with_ref(download.git_url)
+        satisfied = self._registration_satisfied_by_installed(download, installed_version)
         if satisfied:
             return LibraryProvisioningAction(
                 library_name=library_name,
                 kind=LibraryProvisioningActionKind.SKIP,
                 installed_version=installed_version,
-                pinned_version=registration.version,
-                git_url=registration.git_url,
-                git_ref=None,
+                pinned_version=download.version,
+                git_url=parsed.url,
+                git_ref=parsed.ref,
                 destructive=False,
                 reason=f"Installed version {installed_version} already satisfies the entry",
             )
 
-        parsed = parse_git_url_with_ref(registration.git_url)
         if installed_version is None:
             kind = LibraryProvisioningActionKind.INSTALL
-            reason = f"Not installed; will clone from {registration.git_url}"
+            reason = f"Not installed; will clone from {download.git_url}"
         else:
             kind = LibraryProvisioningActionKind.OVERWRITE
             reason = (
                 f"Installed version {installed_version} does not satisfy the entry; "
-                f"will delete the local library directory and re-clone from {registration.git_url}"
+                f"will delete the local library directory and re-clone from {download.git_url}"
             )
         return LibraryProvisioningAction(
             library_name=library_name,
             kind=kind,
             installed_version=installed_version,
-            pinned_version=registration.version,
+            pinned_version=download.version,
             git_url=parsed.url,
             git_ref=parsed.ref,
             destructive=kind == LibraryProvisioningActionKind.OVERWRITE,
             reason=reason,
         )
 
-    async def _provision_one_library(self, registration: LibraryRegistration) -> str | None:
+    async def _provision_one_library(self, download: LibraryDownload) -> str | None:
         """Provision a single git-sourced library, skipping when already satisfied.
 
         Computes the plan with the same pure decision function the preview uses
         (`_plan_one_library_provisioning`), then clones/overwrites via the
         download handler, which recomputes its own `overwrite_existing` so the
         wire payload is unchanged. Returns a failure detail string, or None on
-        success/skip. Callers pass only git-sourced entries, so `git_url` is
-        non-None here.
+        success/skip. A LibraryDownload always carries a `git_url`.
         """
-        action = self._plan_one_library_provisioning(registration)
+        action = self._plan_one_library_provisioning(download)
         if action.kind == LibraryProvisioningActionKind.SKIP:
             return None
 
-        if registration.git_url is None:
-            return (
-                f"Attempted to provision library '{registration.name}'. "
-                f"Failed because the registration has no git_url source."
-            )
-
         return await self._provision_git_library(
-            registration, git_url=registration.git_url, installed_version=action.installed_version
+            download, git_url=download.git_url, installed_version=action.installed_version
         )
 
     async def _provision_git_library(
-        self, registration: LibraryRegistration, *, git_url: str, installed_version: str | None
+        self, download: LibraryDownload, *, git_url: str, installed_version: str | None
     ) -> str | None:
         """Download a git-sourced entry, overwriting only a wrong installed version.
 
@@ -3268,22 +3257,23 @@ class LibraryManager:
         handler land the library normally.
 
         When overwriting, the destructive delete must target the directory the
-        installed manifest actually lives in, which is not necessarily
-        `libraries_path/<git-repo-name>` (the handler's default guess): a library
-        can be installed under a differently-named directory. So the installed
-        manifest is resolved via the same `_installed_library_manifest_path` the
-        planner used, and its parent directory is passed explicitly. Without this
-        the delete misses the stale dir and the re-clone lands elsewhere, orphaning
-        the old copy. A fresh install (installed_version is None) leaves both hints
-        None and keeps the handler's repo-name default.
+        installed library actually lives in. The handler's default guess is
+        `libraries_path/<git-repo-name>`, which is correct for any library this
+        engine downloaded. An explicit `name` overrides that for a library
+        installed under a differently-named directory: the installed manifest is
+        resolved by `name` and its parent directory is passed so the delete hits
+        the stale dir and the re-clone does not orphan the old copy. Without a
+        `name` (the common case) both hints stay None and the handler's repo-name
+        default applies. A fresh install (installed_version is None) also leaves
+        both hints None.
         """
         parsed = parse_git_url_with_ref(git_url)
         overwrite_existing = installed_version is not None
 
         download_directory: str | None = None
         target_directory_name: str | None = None
-        if overwrite_existing and registration.name is not None:
-            manifest_path = self._installed_library_manifest_path(registration.name)
+        if overwrite_existing and download.name is not None:
+            manifest_path = self._installed_library_manifest_path(download.name)
             if manifest_path is not None:
                 download_directory = str(manifest_path.parent.parent)
                 target_directory_name = manifest_path.parent.name
@@ -3299,9 +3289,8 @@ class LibraryManager:
         )
         download_result = await GriptapeNodes.ahandle_request(download_request)
         if not isinstance(download_result, DownloadLibraryResultSuccess):
-            return (
-                f"Failed to provision library '{registration.name}' from '{git_url}': {download_result.result_details}"
-            )
+            library_label = download.name if download.name is not None else extract_repo_name_from_url(git_url)
+            return f"Failed to provision library '{library_label}' from '{git_url}': {download_result.result_details}"
         return None
 
     @staticmethod
@@ -3316,11 +3305,11 @@ class LibraryManager:
         matches; None when the directory is unconfigured or missing, or no
         manifest matches.
 
-        This is the single source of truth shared by the provisioning planner
+        This is the single source of truth for the provisioning planner
         (`_installed_library_version`, which decides SKIP/INSTALL/OVERWRITE) and
-        the loader (`_discover_library_files`, which turns a sourced entry into a
-        loadable path). Routing both through one resolver guarantees the file the
-        planner reasoned about is exactly the file that gets loaded.
+        the overwrite path (`_provision_git_library`, which deletes the manifest's
+        directory before re-cloning), guaranteeing the file the planner reasoned
+        about is exactly the file overwrite targets.
         """
         config_mgr = GriptapeNodes.ConfigManager()
         libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
@@ -3348,6 +3337,47 @@ class LibraryManager:
         manifest matches or the version is absent/unreadable.
         """
         manifest_path = LibraryManager._installed_library_manifest_path(library_name)
+        return LibraryManager._library_version_from_manifest(manifest_path)
+
+    @staticmethod
+    def _installed_manifest_path_for_download(download: LibraryDownload) -> Path | None:
+        """Return the on-disk manifest path for a download entry, or None when absent.
+
+        Locates the installed copy the same way the download handler lands it:
+        by the repo-name directory `libraries_directory/<repo-name>/`. This keeps
+        the provisioning version-check consistent with the clone/skip/overwrite
+        logic, so a `version` pin works without requiring `name`. An explicit
+        `name` overrides the directory match for a library installed under a
+        differently-named directory, resolving by manifest name instead. None when
+        the directory is unconfigured/missing or no manifest is found.
+        """
+        if download.name is not None:
+            return LibraryManager._installed_library_manifest_path(download.name)
+
+        config_mgr = GriptapeNodes.ConfigManager()
+        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
+        if not libraries_dir_setting:
+            return None
+
+        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+        repo_name = extract_repo_name_from_url(download.git_url)
+        repo_directory = libraries_path / repo_name
+        return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
+
+    @staticmethod
+    def _installed_download_version(download: LibraryDownload) -> str | None:
+        """Return the on-disk version for a download entry, or None when absent.
+
+        Resolves the installed manifest via `_installed_manifest_path_for_download`
+        (repo-name directory, or `name` override), then reads
+        `metadata.library_version`.
+        """
+        manifest_path = LibraryManager._installed_manifest_path_for_download(download)
+        return LibraryManager._library_version_from_manifest(manifest_path)
+
+    @staticmethod
+    def _library_version_from_manifest(manifest_path: Path | None) -> str | None:
+        """Read `metadata.library_version` from a manifest path, or None when unreadable/absent."""
         if manifest_path is None:
             return None
 
@@ -3364,7 +3394,7 @@ class LibraryManager:
         return str(version) if version is not None else None
 
     @staticmethod
-    def _registration_satisfied_by_installed(registration: LibraryRegistration, installed_version: str | None) -> bool:
+    def _registration_satisfied_by_installed(download: LibraryDownload, installed_version: str | None) -> bool:
         """Decide whether the installed library already satisfies the entry.
 
         Nothing installed is never satisfied. An entry without a version spec is
@@ -3374,10 +3404,10 @@ class LibraryManager:
         """
         if installed_version is None:
             return False
-        if registration.version is None:
+        if download.version is None:
             return True
         try:
-            specifier_set = SpecifierSet(registration.version)
+            specifier_set = SpecifierSet(download.version)
             return PackagingVersion(installed_version) in specifier_set
         except (InvalidSpecifier, InvalidVersion):
             return False
@@ -3394,7 +3424,8 @@ class LibraryManager:
         Libraries are registered later by load_all_libraries_from_config().
         """
         config_mgr = GriptapeNodes.ConfigManager()
-        git_urls = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        raw_downloads = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        git_urls = [download.git_url for download in normalize_library_downloads(raw_downloads)]
 
         if not git_urls:
             logger.debug("No libraries to download from config")
@@ -4426,23 +4457,26 @@ class LibraryManager:
 
     def _add_git_urls_for_removed_libraries(
         self,
-        current_downloads: list[str],
+        current_downloads: list[Any],
         removed_library_names: set[str],
-    ) -> list[str]:
+    ) -> list[Any]:
         """Add git URLs for removed libraries if not already present.
 
         Args:
-            current_downloads: Current list of git URLs in libraries_to_download
+            current_downloads: Current libraries_to_download entries (bare git URL strings or object form)
             removed_library_names: Set of library names that were removed (e.g., "griptape_nodes_library")
 
         Returns:
-            Updated list with new git URLs added (deduplicated)
+            Updated list with new git URLs added (deduplicated), preserving existing entry shapes
         """
         if not removed_library_names:
             return current_downloads
 
-        # Get current repository names for deduplication
-        current_repo_names = {extract_repo_name_from_url(url) for url in current_downloads}
+        # Get current repository names for deduplication. Entries may be bare strings or
+        # object form, so normalize to git URLs before deriving repo names.
+        current_repo_names = {
+            extract_repo_name_from_url(download.git_url) for download in normalize_library_downloads(current_downloads)
+        }
 
         new_downloads = current_downloads.copy()
 
@@ -4879,28 +4913,20 @@ class LibraryManager:
     def _resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> ResolvedDiscoveryPath | None:
         """Resolve a `libraries_to_register` entry to a concrete on-disk path to scan.
 
-        A path-backed entry resolves against the workspace; a git-sourced-only
-        entry has no local path, so its provisioned manifest is located
-        by name through `_installed_library_manifest_path` -- the same resolver the
-        provisioning planner uses, so the file the planner reasoned about is
-        exactly the file discovery loads. Returns None when nothing resolves on
-        disk (path missing, or sourced entry not yet provisioned).
+        A register entry names an already-present local library by `path`, which
+        resolves against the workspace. Libraries pinned to a git source live in
+        `libraries_to_download`; the download handler appends each provisioned
+        manifest path back into `libraries_to_register`, so they reach discovery
+        as ordinary path-backed entries. Returns None when the entry has no path
+        or the path does not exist on disk.
         """
-        if entry.path is not None:
-            # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
-            library_path = resolve_workspace_path(Path(entry.path), workspace_path)
-            if not library_path.exists():
-                return None
-            return LibraryManager.ResolvedDiscoveryPath(path=library_path, registered_path=entry.path)
-
-        # The LibraryRegistration validator guarantees a sourced entry carries a
-        # name, so entry.name is non-None here; guard defensively regardless.
-        if entry.name is None:
+        if entry.path is None:
             return None
-        manifest_path = LibraryManager._installed_library_manifest_path(entry.name)
-        if manifest_path is None:
+        # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
+        library_path = resolve_workspace_path(Path(entry.path), workspace_path)
+        if not library_path.exists():
             return None
-        return LibraryManager.ResolvedDiscoveryPath(path=manifest_path, registered_path=str(manifest_path))
+        return LibraryManager.ResolvedDiscoveryPath(path=library_path, registered_path=entry.path)
 
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
@@ -5514,11 +5540,13 @@ class LibraryManager:
         # Collect git URLs from both config keys
         download_config = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         register_config = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        # libraries_to_download entries carry the git URL (bare string or object form).
+        git_urls_from_download = [download.git_url for download in normalize_library_downloads(download_config)]
         # Disabled entries are still synced; disabling only affects loading.
         git_urls_from_register = [path for entry in register_config if is_git_url(path := extract_library_path(entry))]
 
         # Combine and deduplicate
-        all_git_urls = list(set(download_config + git_urls_from_register))
+        all_git_urls = list(set(git_urls_from_download + git_urls_from_register))
 
         # Use shared download method
         update_summary = {}

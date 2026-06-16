@@ -24,7 +24,7 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY, LIBRARIES_TO_REGISTER_KEY
 from griptape_nodes.utils.git_utils import extract_repo_name_from_url
-from griptape_nodes.utils.library_utils import filter_old_xdg_library_paths
+from griptape_nodes.utils.library_utils import filter_old_xdg_library_paths, normalize_library_downloads
 
 config_manager = GriptapeNodes.ConfigManager()
 secrets_manager = GriptapeNodes.SecretsManager()
@@ -243,9 +243,10 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
             LIBRARIES_TO_REGISTER_KEY,
             libraries_config.libraries_to_register,
         )
-        console.print(
-            f"[bold green]Libraries to download: {', '.join(libraries_config.libraries_to_download)}[/bold green]"
-        )
+        download_git_urls = [
+            download.git_url for download in normalize_library_downloads(libraries_config.libraries_to_download)
+        ]
+        console.print(f"[bold green]Libraries to download: {', '.join(download_git_urls)}[/bold green]")
         console.print(
             f"[bold green]Libraries to register: {', '.join(libraries_config.libraries_to_register)}[/bold green]"
         )
@@ -504,8 +505,16 @@ def _prompt_for_griptape_cloud_library(*, default_prompt_for_griptape_cloud_libr
 class LibrariesConfig(NamedTuple):
     """Configuration for library lists."""
 
-    libraries_to_download: list[str]
+    libraries_to_download: list[Any]
     libraries_to_register: list[str]
+
+
+def _download_entry_repo_name(entry: Any) -> str | None:
+    """Repo name for a libraries_to_download entry (bare git URL string or object form)."""
+    downloads = normalize_library_downloads([entry])
+    if not downloads:
+        return None
+    return extract_repo_name_from_url(downloads[0].git_url)
 
 
 def _build_libraries_list(
@@ -533,8 +542,11 @@ def _build_libraries_list(
     # Remove old XDG data home library paths from libraries_to_register
     new_register, _ = filter_old_xdg_library_paths(new_register)
 
-    # Create a set of current download identifiers for fast lookup
-    current_download_identifiers = {extract_repo_name_from_url(lib) for lib in current_downloads}
+    # Create a set of current download identifiers for fast lookup. Entries may be bare
+    # git URL strings or object form, so derive each repo name via the shared normalizer.
+    current_download_identifiers = {
+        repo_name for lib in current_downloads if (repo_name := _download_entry_repo_name(lib)) is not None
+    }
 
     # Default library
     default_library = "https://github.com/griptape-ai/griptape-nodes-library-standard@stable"
@@ -549,7 +561,7 @@ def _build_libraries_list(
         if advanced_identifier not in current_download_identifiers:
             new_downloads.append(advanced_media_library)
     else:
-        libraries_to_remove = [lib for lib in new_downloads if extract_repo_name_from_url(lib) == advanced_identifier]
+        libraries_to_remove = [lib for lib in new_downloads if _download_entry_repo_name(lib) == advanced_identifier]
         for lib in libraries_to_remove:
             new_downloads.remove(lib)
 
@@ -561,7 +573,7 @@ def _build_libraries_list(
             new_downloads.append(griptape_cloud_library)
     else:
         libraries_to_remove = [
-            lib for lib in new_downloads if extract_repo_name_from_url(lib) == griptape_cloud_identifier
+            lib for lib in new_downloads if _download_entry_repo_name(lib) == griptape_cloud_identifier
         ]
         for lib in libraries_to_remove:
             new_downloads.remove(lib)

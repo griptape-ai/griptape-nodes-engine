@@ -191,10 +191,12 @@ def extract_repo_name_from_url(url: str) -> str:
         "griptape-ai/repo" -> "repo"
         "griptape-ai/repo@main" -> "repo"
     """
-    url = url.strip().rstrip("/")
+    url = url.strip()
 
-    # Strip @ref suffix if present
+    # Strip @ref suffix first, then trailing slashes: a slash right before the ref
+    # (e.g. "owner/repo/@ref") would otherwise survive and leave an empty repo name.
     url, _ = parse_git_url_with_ref(url)
+    url = url.rstrip("/")
 
     # Remove .git suffix if present
     url = url.removesuffix(".git")

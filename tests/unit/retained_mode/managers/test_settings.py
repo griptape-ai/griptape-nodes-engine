@@ -7,13 +7,14 @@ from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
     AppInitializationComplete,
+    LibraryDownload,
     LibraryRegistration,
     Settings,
 )
 
 
-class TestLibraryRegistrationSources:
-    """A registration must name at least one source, and sourced entries need a name."""
+class TestLibraryRegistration:
+    """libraries_to_register entries name a local library by path; git fields moved to LibraryDownload."""
 
     def test_bare_string_entry_is_valid_in_the_list(self) -> None:
         config = AppInitializationComplete.model_validate({"libraries_to_register": ["griptape_nodes_library.json"]})
@@ -26,21 +27,52 @@ class TestLibraryRegistrationSources:
         assert registration.path == "../shared/lib"
         assert registration.worker_mode_override == "WORKER"
 
-    def test_sourced_entry_without_path_is_valid(self) -> None:
-        registration = LibraryRegistration.model_validate(
-            {"name": "git-lib", "git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0,<3"}
+    def test_git_fields_are_rejected(self) -> None:
+        # git_url/version/name moved to LibraryDownload; extra="forbid" now rejects them here.
+        with pytest.raises(ValidationError):
+            LibraryRegistration.model_validate({"git_url": "griptape-ai/git-lib@v2.0", "name": "git-lib"})
+
+
+class TestLibraryDownload:
+    """libraries_to_download entries carry git_url plus an optional version pin and name."""
+
+    def test_object_form_is_valid(self) -> None:
+        download = LibraryDownload.model_validate(
+            {"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0,<3", "name": "git-lib"}
         )
 
-        assert registration.path is None
-        assert registration.git_url == "griptape-ai/git-lib@v2.0"
+        assert download.git_url == "griptape-ai/git-lib@v2.0"
+        assert download.version == ">=2.0,<3"
+        assert download.name == "git-lib"
 
-    def test_no_source_and_no_path_raises(self) -> None:
-        with pytest.raises(ValidationError, match="at least one of 'path' or 'git_url'"):
-            LibraryRegistration.model_validate({"version": ">=1.0"})
+    def test_version_and_name_default_to_none(self) -> None:
+        download = LibraryDownload.model_validate({"git_url": "griptape-ai/git-lib@v2.0"})
 
-    def test_sourced_entry_without_name_raises(self) -> None:
-        with pytest.raises(ValidationError, match="requires 'name'"):
-            LibraryRegistration.model_validate({"git_url": "griptape-ai/git-lib@v2.0"})
+        assert download.version is None
+        assert download.name is None
+
+    def test_bare_string_entry_is_valid_in_the_list(self) -> None:
+        config = AppInitializationComplete.model_validate({"libraries_to_download": ["griptape-ai/git-lib@v2.0"]})
+
+        assert config.libraries_to_download == ["griptape-ai/git-lib@v2.0"]
+
+    def test_object_entry_is_valid_in_the_list(self) -> None:
+        config = AppInitializationComplete.model_validate(
+            {"libraries_to_download": [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}]}
+        )
+
+        entry = config.libraries_to_download[0]
+        assert isinstance(entry, LibraryDownload)
+        assert entry.git_url == "griptape-ai/git-lib@v2.0"
+        assert entry.version == ">=2.0"
+
+    def test_missing_git_url_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            LibraryDownload.model_validate({"version": ">=1.0"})
+
+    def test_unknown_field_raises(self) -> None:
+        with pytest.raises(ValidationError):
+            LibraryDownload.model_validate({"git_url": "griptape-ai/git-lib@v2.0", "path": "../shared/lib"})
 
 
 class TestThreadStorageBackend:

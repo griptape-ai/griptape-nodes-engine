@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.retained_mode.managers.settings import LibraryRegistration
+from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
 from griptape_nodes.utils.file_utils import find_all_files_in_directory
 from griptape_nodes.utils.git_utils import (
     get_git_repository_root,
@@ -166,6 +166,35 @@ def normalize_library_registrations(raw: list[Any]) -> list[LibraryRegistration]
         else:
             logger.warning(
                 "Skipping libraries_to_register entry of unexpected type %s: %r",
+                type(item).__name__,
+                item,
+            )
+    return entries
+
+
+def normalize_library_downloads(raw: list[Any]) -> list[LibraryDownload]:
+    """Normalize a libraries_to_download config list into LibraryDownload entries.
+
+    Bare strings become git-URL-only entries. Dict-shaped entries are validated
+    against the LibraryDownload schema. Already parsed LibraryDownload instances
+    pass through unchanged. Malformed entries are skipped with a warning so a
+    single bad entry cannot block startup.
+    """
+    entries: list[LibraryDownload] = []
+    for item in raw:
+        if isinstance(item, LibraryDownload):
+            entries.append(item)
+        elif isinstance(item, str):
+            if item:
+                entries.append(LibraryDownload(git_url=item))
+        elif isinstance(item, dict):
+            try:
+                entries.append(LibraryDownload.model_validate(item))
+            except ValidationError as err:
+                logger.warning("Skipping malformed libraries_to_download entry %r: %s", item, err)
+        else:
+            logger.warning(
+                "Skipping libraries_to_download entry of unexpected type %s: %r",
                 type(item).__name__,
                 item,
             )
