@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -32,7 +33,12 @@ from griptape_nodes.common.project_templates import (
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileLoadError, FileWriteError
-from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_file_path, resolve_path_safely
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity,
+    resolve_file_path,
+    resolve_path_safely,
+    resolve_workspace_path,
+)
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.library_events import (
@@ -89,7 +95,13 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_TO_DOWNLOAD_KEY,
+    LIBRARIES_TO_REGISTER_KEY,
+    PROJECTS_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
+)
+from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -302,6 +314,50 @@ class ProjectInfo:
     # Cached parsed macros (populated during load for performance)
     parsed_situation_schemas: dict[str, ParsedMacro]  # situation_name -> ParsedMacro
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
+
+
+class _ProjectActivationOutcome(NamedTuple):
+    """Result of establishing a project's config/workspace/env layers and reloading.
+
+    `failure` is the reload failure (None on success). `workspace_changed` reports
+    whether the workspace directory changed, so the caller can flag
+    `altered_workflow_state` on the success result.
+    """
+
+    failure: SetCurrentProjectResultFailure | None
+    workspace_changed: bool
+
+
+class WorkspaceDecision(NamedTuple):
+    """The workspace dir a project resolves to, plus whether activation pins it.
+
+    `workspace_dir` is the directory whose griptape_nodes_config.json supplies the
+    workspace config layer. `apply_override` is True only when activation calls
+    set_workspace_override(workspace_dir): the project_workspaces mapping and the
+    auto-default-to-project-dir branches. It is False when env vars or the
+    project-adjacent config supply workspace_directory, because activation then
+    leaves the override unset so the workspace config layer can re-point it.
+    """
+
+    workspace_dir: Path
+    apply_override: bool
+
+
+class _ProvisioningConfigDirs(NamedTuple):
+    """The two directories that determine a project's merged provisioning config.
+
+    `project_dir` holds the project-adjacent griptape_nodes_config.json;
+    `workspace_dir` is the directory whose config supplies the workspace layer
+    (decided read-only by decide_workspace). `apply_override` carries that
+    decision's pin bit so the preview applies the workspace_directory override
+    exactly when (and only when) activation would. The provisioning preview feeds
+    all three into ConfigManager.compute_project_provisioning_config so the plan it
+    shows matches what activation would reconcile.
+    """
+
+    project_dir: Path
+    workspace_dir: Path
+    apply_override: bool
 
 
 class ProjectManager:
@@ -644,6 +700,21 @@ class ProjectManager:
             return None
         return parent_template
 
+    def get_loaded_project_dir(self, project_id: str) -> Path | None:
+        """Return the directory of a loaded, file-backed project, or None.
+
+        The directory holds the project YAML and its adjacent
+        griptape_nodes_config.json. Returns None when the project is not loaded
+        or has no backing file (e.g. system defaults), so callers can treat both
+        as "no project-adjacent config to read".
+        """
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return None
+        if project_info.project_file_path is None:
+            return None
+        return project_info.project_file_path.parent
+
     def on_get_project_template_request(
         self, request: GetProjectTemplateRequest
     ) -> GetProjectTemplateResultSuccess | GetProjectTemplateResultFailure:
@@ -693,12 +764,28 @@ class ProjectManager:
                     parent_path = project_info.project_file_path.parent / parent_path
                 resolved_parent = str(canonicalize_for_identity(parent_path))
 
+            # Read the project-adjacent config's requires_engine specifier without
+            # merging it into the live config, so the GUI can disable activation
+            # for a project the running engine can't satisfy. A project with no
+            # backing file (or no specifier) is compatible by default.
+            required_engine_version: str | None = None
+            if project_info.project_file_path is not None:
+                config_path = project_info.project_file_path.parent / "griptape_nodes_config.json"
+                required_engine_version = self._config_manager.read_config_file_value(
+                    config_path, REQUIRES_ENGINE_KEY, default=None
+                )
+            engine_version_reason = engine_version_failure_detail(required_engine_version)
+
             successfully_loaded.append(
                 ProjectTemplateInfo(
                     project_id=project_id,
                     validation=project_info.validation,
                     name=project_info.template.name,
                     parent_project_path=resolved_parent,
+                    engine_version_compatible=engine_version_reason is None,
+                    required_engine_version=required_engine_version,
+                    current_engine_version=engine_version,
+                    engine_version_reason=engine_version_reason,
                 )
             )
 
@@ -997,6 +1084,74 @@ class ProjectManager:
             secrets_manager=self._secrets_manager,
         )
 
+    def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
+        """Resolve the project-adjacent and workspace dirs for a provisioning preview.
+
+        Canonicalizes `project_id` the same way on_set_current_project_request does
+        (so a raw path - unexpanded `~`, symlinked, or relative - resolves to the
+        registry key it was loaded under, instead of missing the lookup), finds the
+        loaded file-backed project, then decides its workspace dir + override bit
+        read-only via decide_workspace. Returns None when the project is not loaded or
+        has no backing file, mirroring get_loaded_project_dir's "nothing to preview"
+        contract. Mutates no config state.
+        """
+        resolved_project_id = str(canonicalize_for_identity(project_id))
+        project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
+        if project_info is None:
+            return None
+        if project_info.project_file_path is None:
+            return None
+
+        project_file_path = project_info.project_file_path
+        project_dir = project_file_path.parent
+        project_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
+        env_config = self._config_manager.read_env_config()
+        decision = self.decide_workspace(project_file_path, project_config, env_config)
+        return _ProvisioningConfigDirs(
+            project_dir=project_dir,
+            workspace_dir=decision.workspace_dir,
+            apply_override=decision.apply_override,
+        )
+
+    def decide_workspace(self, project_file_path: Path, project_config: dict, env_config: dict) -> WorkspaceDecision:
+        """Decide a project's workspace dir and override bit read-only, mutating nothing.
+
+        Returns the directory whose griptape_nodes_config.json activation loads as the
+        workspace layer, plus whether activation pins it via set_workspace_override.
+        Priority, highest first (matching _activate_project's block):
+
+        1. project_workspaces user-config override -> (override dir, apply_override=True)
+        2. workspace_directory from env vars -> (env dir, apply_override=False)
+        3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
+        4. the project's own directory (auto-default) -> (project dir, apply_override=True)
+
+        `apply_override` is True only for the override-mapping and auto-default branches,
+        because those are the cases where activation calls set_workspace_override. For env
+        or project-adjacent workspace_directory, activation leaves the override unset so the
+        workspace config layer can re-point the final workspace_path; a forced override
+        would mask that. Both _activate_project (live) and the provisioning preview drive
+        off this one decision, so the previewed library/engine_version plan and what
+        _reconcile_libraries_from_config actually does cannot drift.
+        """
+        project_workspaces = self._config_manager.get_config_value(
+            "project_workspaces",
+            config_source="user_config",
+            default={},
+        )
+        workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
+        if workspace_override is not None:
+            return WorkspaceDecision(Path(workspace_override), apply_override=True)
+
+        env_workspace = env_config.get("workspace_directory")
+        if env_workspace is not None:
+            return WorkspaceDecision(Path(env_workspace), apply_override=False)
+
+        project_workspace = project_config.get("workspace_directory")
+        if project_workspace is not None:
+            return WorkspaceDecision(Path(project_workspace), apply_override=False)
+
+        return WorkspaceDecision(project_file_path.parent, apply_override=True)
+
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
         """Return the user-configured workspace override for a project file, or None if not mapped."""
         resolved_project_path = str(canonicalize_for_identity(project_file_path))
@@ -1005,44 +1160,71 @@ class ProjectManager:
             None,
         )
 
+    def _snapshot_library_config(self) -> str:
+        """Return a stable string of the merged library-affecting config for change detection.
+
+        Captures the merged `libraries_to_register`, `libraries_to_download`, and
+        `requires_engine` values plus the RESOLVED libraries directory as one
+        sorted-key JSON string so two snapshots can be compared with `==`.
+        Including `requires_engine` ensures a pure requires_engine change still trips
+        `library_config_changed`, which is what re-runs the reload (and so the
+        engine_version gate) on activation. Including the resolved libraries dir
+        catches a workspace-only switch: `libraries_directory` is workspace-relative
+        by default, so two projects with identical config strings but different
+        workspaces resolve to different on-disk `libraries/` trees and must still
+        reload, even though the three values above are unchanged.
+        """
+        libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
+        resolved_libraries_dir = str(resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path))
+        snapshot = {
+            LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
+            LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
+            REQUIRES_ENGINE_KEY: self._config_manager.get_config_value(REQUIRES_ENGINE_KEY, default=None),
+            "resolved_libraries_directory": resolved_libraries_dir,
+        }
+        return json.dumps(snapshot, sort_keys=True, default=str)
+
     async def _reload_after_project_switch(
-        self, project_id: str, *, workspace_changed: bool
+        self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
         """Reload libraries and optionally re-register workflows after a project switch.
 
-        Always reloads libraries (project config can affect env vars and library behavior).
-        Only re-registers workflows when the workspace directory actually changed.
+        Only reloads libraries when the project's library-affecting config
+        actually changed: the reload triggers LibraryManager's reconcile, which
+        provisions sourced libraries and enforces the engine_version gate. A
+        switch that leaves library config untouched (e.g. default project to
+        default workspace) skips the deep reset. Workflows are re-registered only
+        when the workspace directory changed.
 
-        Returns a failure result if library reload fails, otherwise None.
+        Returns a failure result if the library reload (reconcile/engine_version
+        gate included) fails, otherwise None.
         """
-        reload_result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
-        if isinstance(reload_result, ReloadAllLibrariesResultFailure):
-            return SetCurrentProjectResultFailure(
-                result_details=f"Attempted to set project '{project_id}'. "
-                f"Config updated but library reload failed: {reload_result.result_details}",
-            )
+        if library_config_changed:
+            reload_result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
+            if isinstance(reload_result, ReloadAllLibrariesResultFailure):
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set project '{project_id}'. "
+                    f"Config updated but library reload failed: {reload_result.result_details}",
+                )
         if workspace_changed:
             await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
         return None
 
-    async def on_set_current_project_request(  # noqa: C901
+    async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
         """Set which project user has selected.
 
-        Captures workspace path before and after config layer changes. If the
-        workspace actually changed and startup is complete, performs an expensive
-        workspace switch: reloads all libraries and re-registers workflows.
-        During startup, LibraryManager handles library loading concurrently, so
-        the workspace switch is skipped.
+        Establishes the target project's config/workspace/env layers and reloads
+        libraries. When the reload fails (e.g. an engine_version mismatch or a
+        failed provisioning), the previously active project is re-established so
+        the engine is never left adopting a broken project: the user can keep
+        working in the project they had. Re-establishment runs only after startup
+        (interactive switches); during boot the failure is returned as-is.
         """
-        # Restore os.environ entries mutated by the outgoing project before any config
-        # layer changes. Workspace resolution below may consult env vars, so the old
-        # project's values must not leak into the new project's workspace decision.
-        self._restore_project_env()
-
-        # Capture workspace BEFORE config changes for comparison after
-        old_workspace = self._config_manager.workspace_path
+        # Remember the project that was active before this switch so a failed
+        # activation can roll back to it. SYSTEM_DEFAULTS_KEY is a valid target.
+        previous_project_id = self._current_project_id
 
         # `None` is the wire-level "no project specified" signal -- normalize to
         # SYSTEM_DEFAULTS_KEY so the engine lands on system defaults instead of
@@ -1060,7 +1242,64 @@ class ProjectManager:
         if resolved_project_id != SYSTEM_DEFAULTS_KEY:
             resolved_project_id = str(canonicalize_for_identity(resolved_project_id))
 
+        outcome = await self._activate_project(resolved_project_id)
+        if outcome.failure is not None:
+            # During boot, leave the failure to the caller (soft handling); there is
+            # no prior interactive project to fall back to. After startup, restore the
+            # previously active project so the engine stays in a working state, then
+            # surface the original failure to the GUI.
+            if self._initialization_complete and previous_project_id != resolved_project_id:
+                rollback = await self._activate_project(previous_project_id)
+                if rollback.failure is not None:
+                    logger.error(
+                        "Attempted to roll back to previous project '%s' after activation of '%s' failed. "
+                        "Rollback also failed: %s",
+                        previous_project_id,
+                        resolved_project_id,
+                        rollback.failure.result_details,
+                    )
+            return outcome.failure
+
+        result = SetCurrentProjectResultSuccess(
+            result_details=f"Successfully set current project. ID: {resolved_project_id}",
+        )
+        if outcome.workspace_changed and self._initialization_complete:
+            result.altered_workflow_state = True
+        return result
+
+    async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
+        """Establish a project's config/workspace/env layers and reload libraries.
+
+        Captures workspace path before and after config layer changes. If the
+        workspace actually changed and startup is complete, performs an expensive
+        workspace switch: reloads all libraries and re-registers workflows.
+        During startup, LibraryManager handles library loading concurrently, so
+        the workspace switch is skipped.
+
+        `resolved_project_id` is already canonicalized. Returns the reload failure
+        (None on success) and whether the workspace changed. This is the shared
+        body used both for the requested switch and for rolling back to the
+        previously active project when a switch fails.
+        """
+        # Restore os.environ entries mutated by the outgoing project before any config
+        # layer changes. Workspace resolution below may consult env vars, so the old
+        # project's values must not leak into the new project's workspace decision.
+        self._restore_project_env()
+
+        # Capture workspace and library-affecting config BEFORE config changes for comparison after
+        old_workspace = self._config_manager.workspace_path
+        old_library_config = self._snapshot_library_config()
+
         self._current_project_id = resolved_project_id
+
+        # Each activation re-decides its config layers from scratch. Drop the prior
+        # project's per-activation state (workspace override + project-adjacent and
+        # workspace config-file paths) so none of it leaks into the new project. Without
+        # this, a rollback to a project whose config supplies workspace_directory keeps
+        # the failed project's override, and switching to system defaults re-merges the
+        # prior project's griptape_nodes_config.json (re-applying its pins). The branches
+        # below remerge via load_project_config()/load_workspace_config()/load_configs().
+        self._config_manager.clear_project_layers()
 
         project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
         if project_info is not None and project_info.project_file_path is not None:
@@ -1068,34 +1307,30 @@ class ProjectManager:
             project_dir = project_file_path.parent
             self._config_manager.load_project_config(project_dir)
 
-            # Determine workspace directory using the following priority:
-            # 1. project_workspaces in user config (per-user, per-project override)
-            # 2. workspace_directory in project-adjacent config (shared project default)
-            # 3. env vars
-            # 4. Auto-default to project directory
-            project_workspaces = self._config_manager.get_config_value(
-                "project_workspaces",
-                config_source="user_config",
-                default={},
+            # Decide the workspace dir + override bit once (shared with the provisioning
+            # preview via decide_workspace, so the two cannot drift). apply_override is
+            # True only for the project_workspaces mapping and the auto-default-to-project
+            # branches; for an env/project-adjacent workspace_directory it is False, so the
+            # override stays unset and the workspace config layer can re-point workspace_path.
+            decision = self.decide_workspace(
+                project_file_path,
+                self._config_manager.project_config,
+                self._config_manager.env_config,
             )
-            workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
-
-            if workspace_override is not None:
-                self._config_manager.set_workspace_override(Path(workspace_override))
-            elif (
-                "workspace_directory" not in self._config_manager.project_config
-                and "workspace_directory" not in self._config_manager.env_config
-            ):
-                # If neither the project-adjacent config nor env vars explicitly set
-                # workspace_directory, default the workspace to the project directory itself.
-                self._config_manager.set_workspace_override(project_dir)
+            if decision.apply_override:
+                self._config_manager.set_workspace_override(decision.workspace_dir)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
         elif project_info is not None and project_info.project_file_path is None:
-            # Switching to system defaults: clear any project-specific workspace override
-            # and reload configs so workspace_path resolves from default config layers.
-            self._config_manager.set_workspace_override(None)
+            # Switching to system defaults: clear_project_layers() above already dropped
+            # the prior project's override and config-file paths, so reloading configs now
+            # resolves workspace_path and all config layers from defaults only.
+            self._config_manager.load_configs()
+        else:
+            # Unknown project id (no loaded template): clear_project_layers() above already
+            # dropped the prior project's layers, so remerge from defaults rather than leave
+            # config in the cleared, unmerged state.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after
@@ -1108,6 +1343,8 @@ class ProjectManager:
 
         new_workspace = self._config_manager.workspace_path
         workspace_changed = old_workspace != new_workspace
+        new_library_config = self._snapshot_library_config()
+        library_config_changed = old_library_config != new_library_config
 
         if self._initialization_complete:
             # Persist the active project's file path so the next engine restart
@@ -1123,16 +1360,15 @@ class ProjectManager:
             except Exception:
                 logger.warning("Failed to persist project_file '%s' to config", persisted_project_file)
 
-            failure = await self._reload_after_project_switch(resolved_project_id, workspace_changed=workspace_changed)
+            failure = await self._reload_after_project_switch(
+                resolved_project_id,
+                workspace_changed=workspace_changed,
+                library_config_changed=library_config_changed,
+            )
             if failure is not None:
-                return failure
+                return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
-        result = SetCurrentProjectResultSuccess(
-            result_details=f"Successfully set current project. ID: {resolved_project_id}",
-        )
-        if workspace_changed and self._initialization_complete:
-            result.altered_workflow_state = True
-        return result
+        return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest

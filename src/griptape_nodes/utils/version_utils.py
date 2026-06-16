@@ -7,11 +7,45 @@ import json
 from pathlib import Path
 from typing import Literal
 
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion
+from packaging.version import Version as PackagingVersion
 from rich.console import Console
 
 console = Console()
 
 engine_version = importlib.metadata.version("griptape-nodes-engine")
+
+
+def engine_version_failure_detail(spec_string: str | None) -> str | None:
+    """Return a failure detail when the running engine fails `spec_string`, else None.
+
+    A PEP 440 compare of the running engine against the given specifier. `None`
+    means no constraint (no engine_version declared). A malformed spec or engine
+    version is itself a failure detail rather than a raise, so callers (the
+    activation-time gate and the read-only project-list preflight) can surface
+    the same message without crashing.
+    """
+    if spec_string is None:
+        return None
+
+    try:
+        specifier_set = SpecifierSet(spec_string)
+    except InvalidSpecifier:
+        return f"Config pins engine version '{spec_string}', which is not a valid PEP 440 specifier (e.g. '>=0.5,<0.6')"
+
+    try:
+        current_version = PackagingVersion(engine_version)
+    except InvalidVersion:
+        return (
+            f"Config pins engine version '{spec_string}' but the running engine "
+            f"version '{engine_version}' is not a valid PEP 440 version"
+        )
+
+    if current_version not in specifier_set:
+        return f"Config requires engine version '{spec_string}' but the running engine is '{engine_version}'"
+
+    return None
 
 
 def get_current_version() -> str:
