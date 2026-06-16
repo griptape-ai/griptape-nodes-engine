@@ -110,20 +110,21 @@ class DirectoryDestination:
             create_parents: If True, create intermediate directories automatically.
                 Defaults to True.
         """
+        self._directory = Directory(dir_path)
         self._dir_path = dir_path
         self._existing_dir_policy = existing_dir_policy
         self._create_parents = create_parents
 
-    def resolve(self) -> pathlib.Path:
+    def resolve(self) -> str:
         """Resolve and return the absolute path for this destination.
 
         Returns:
-            Absolute Path object.
+            Absolute path string.
 
         Raises:
             DirectoryError: If macro resolution fails.
         """
-        return pathlib.Path(_resolve_dir_path(self._dir_path))
+        return _resolve_dir_path(self._dir_path)
 
     @property
     def location(self) -> str:
@@ -151,7 +152,7 @@ class DirectoryDestination:
             case os_events.ExistingFilePolicy.OVERWRITE:
                 return self._create_direct()
             case os_events.ExistingFilePolicy.FAIL:
-                resolved = pathlib.Path(_resolve_dir_path(self._dir_path))
+                resolved = pathlib.Path(self.resolve())
                 if resolved.exists():
                     msg = f"Attempted to create directory. Failed because directory already exists: {resolved}"
                     raise DirectoryError(msg)
@@ -234,12 +235,16 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
     Raises:
         DirectoryError: If macro resolution fails.
     """
-    if isinstance(dir_path, str):
-        return dir_path
-    return file_mod._resolve_macro_path(
-        dir_path,
-        lambda r: DirectoryError(f"Attempted to resolve directory path. Failed: {r.result_details}"),
+    variables = {} if not isinstance(dir_path, project_events.MacroPath) else dir_path.variables
+    parsed_macro = dir_path.parsed_macro if isinstance(dir_path, project_events.MacroPath) else macro_parser.ParsedMacro(dir_path)
+    resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
+        project_events.GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables)
     )
+    if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
+        msg = f"Failed to resolve macro path '{parsed_macro.template}': {resolve_result.result_details}"
+        raise DirectoryError(msg)
+    return str(resolve_result.absolute_path)
+
 
 
 def _map_to_macro_directory(absolute_path: pathlib.Path, fallback_path: str | project_events.MacroPath) -> Directory:
