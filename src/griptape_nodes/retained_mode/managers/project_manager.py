@@ -149,6 +149,13 @@ _BUILTIN_VARIABLE_INFO: dict[str, BuiltinVariableInfo] = {var.name: var for var 
 # Builtin variables available in all macros (read-only)
 BUILTIN_VARIABLES = frozenset(var.name for var in _BUILTIN_VARIABLE_DEFINITIONS)
 
+# Variable names produced by derivation rules. These are only computed in the
+# situation-macro path (on_get_path_for_macro_request runs apply_derivation_rules
+# before resolution); the directory/env resolver below never runs derivation, so a
+# derived token there can only ever be unresolved. Used to raise an explanatory
+# error instead of a bare MISSING_REQUIRED_VARIABLES.
+DERIVED_VARIABLE_NAMES = frozenset(rule.name for rule in DERIVATION_RULES)
+
 
 @dataclass
 class _ProjectVariableResolver:
@@ -253,6 +260,24 @@ class _ProjectVariableResolver:
                     shell_value = os.environ.get(ref)
                     if shell_value is not None:
                         bag[ref] = shell_value
+                    elif ref in DERIVED_VARIABLE_NAMES and var_info.is_required:
+                        # Derived variables are only computed in the situation-macro path
+                        # (apply_derivation_rules runs there, not here). A required derived
+                        # token in a directory/env macro can never resolve, so raise an
+                        # explanatory error instead of a bare MISSING_REQUIRED_VARIABLES.
+                        # The optional form (e.g. `{file_extension_directory?:/}`) is left
+                        # unresolved and degrades cleanly via parsed.resolve().
+                        msg = (
+                            f"Cannot resolve {owner_kind} '{owner_name}': '{ref}' is a derived macro "
+                            f"variable that is only available in situation macros (resolved per-file at "
+                            f"write time), not in directory or environment path_macros. Move it to a "
+                            f"situation's filename macro, e.g. `{{{ref}?:/}}`."
+                        )
+                        raise MacroResolutionError(
+                            msg,
+                            failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                            variable_name=ref,
+                        )
                     # else: leave unresolved; parsed.resolve() will raise MISSING_REQUIRED_VARIABLES
             resolved = parsed.resolve(bag, self.secrets_manager)
         finally:
