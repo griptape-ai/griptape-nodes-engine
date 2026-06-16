@@ -2565,3 +2565,54 @@ class TestProvisionGitLibraryOverwriteDir:
         assert sent_request.overwrite_existing is False
         assert sent_request.download_directory is None
         assert sent_request.target_directory_name is None
+
+
+class TestLibraryManagerInitializationFlag:
+    """Test the is_initializing flag reported on the engine heartbeat."""
+
+    def test_not_initializing_by_default(self, griptape_nodes: GriptapeNodes) -> None:
+        assert griptape_nodes.LibraryManager().is_initializing() is False
+
+    @pytest.mark.asyncio
+    async def test_reload_brackets_is_initializing(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """is_initializing() is True for the duration of the reload and False once it returns."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            ReloadAllLibrariesRequest,
+            ReloadAllLibrariesResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        observed: dict[str, bool] = {}
+
+        async def fake_run(_request: ReloadAllLibrariesRequest) -> ReloadAllLibrariesResultSuccess:
+            observed["during"] = library_manager.is_initializing()
+            return ReloadAllLibrariesResultSuccess(result_details="ok")
+
+        monkeypatch.setattr(library_manager, "_run_reload_libraries", fake_run)
+
+        await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
+
+        assert observed["during"] is True
+        assert library_manager.is_initializing() is False
+
+    @pytest.mark.asyncio
+    async def test_reload_clears_is_initializing_on_exception(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failure during reload still clears the flag (finally), so the GUI doesn't hang."""
+        from griptape_nodes.retained_mode.events.library_events import ReloadAllLibrariesRequest
+
+        library_manager = griptape_nodes.LibraryManager()
+
+        async def boom(_request: ReloadAllLibrariesRequest) -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        monkeypatch.setattr(library_manager, "_run_reload_libraries", boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
+
+        assert library_manager.is_initializing() is False

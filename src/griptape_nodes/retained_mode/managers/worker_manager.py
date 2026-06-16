@@ -85,6 +85,14 @@ class WorkerManager:
     # loop; a wedged loop never services it, so SIGTERM alone can leak the process.
     DEFAULT_TERMINATE_GRACE_S: float = 10.0
 
+    # Ceiling on awaiting a cross-loop termination hopped onto the spawning loop.
+    # The hopped coroutine itself can take up to DEFAULT_TERMINATE_GRACE_S, so this
+    # must exceed it; the extra margin covers the SIGKILL escalation and reap. It
+    # bounds the case where the spawning loop closes after the hop is scheduled but
+    # before it completes, so the evicting loop never blocks forever on a future
+    # that will never resolve.
+    DEFAULT_TERMINATE_HOP_TIMEOUT_S: float = 15.0
+
     _WORKER_RESPONSE_TOPIC_RE: re.Pattern = re.compile(r"sessions/[^/]+/workers/(?P<worker_engine_id>[^/]+)/response$")
 
     def __init__(
@@ -102,6 +110,12 @@ class WorkerManager:
 
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
+
+        # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
+        # binds its exit Future to its creating loop, so proc.wait() is only legal on this
+        # loop. Eviction can run on a different loop (the websocket-tasks loop), which is
+        # why termination is hopped back here. Captured in spawn_worker.
+        self._spawn_loop: asyncio.AbstractEventLoop | None = None
 
         # Orchestrator-side: worker_engine_id → monotonic timestamp of last heartbeat response
         self._worker_last_seen: dict[str, float] = {}
@@ -309,6 +323,9 @@ class WorkerManager:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
         proc = await asyncio.create_subprocess_exec(*args, env={**os.environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        # Record the loop that owns this subprocess so termination can hop back to it.
+        # All spawns run on the engine event-queue loop, so this is idempotent.
+        self._spawn_loop = asyncio.get_running_loop()
         self._managed_worker_processes[worker_key] = proc
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
@@ -327,7 +344,7 @@ class WorkerManager:
         )
         await asyncio.gather(
             *(
-                self._terminate_managed_process(library_name, proc)
+                self._terminate_via_spawn_loop(library_name, proc)
                 for library_name, proc in list(self._managed_worker_processes.items())
             )
         )
@@ -393,7 +410,7 @@ class WorkerManager:
         if lib_name:
             proc = self._managed_worker_processes.pop(lib_name, None)
             if proc is not None:
-                await self._terminate_managed_process(lib_name, proc)
+                await self._terminate_via_spawn_loop(lib_name, proc)
         # Cancel any requests that were awaiting a result from this worker.
         await self._tx.request_client.cancel_requests_by_tag(worker_engine_id)
 
@@ -404,6 +421,72 @@ class WorkerManager:
             except Exception:
                 logger.warning("Worker-evicted callback raised an exception for worker '%s'", worker_engine_id)
 
+    async def _terminate_via_spawn_loop(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
+        """Terminate a managed worker on the loop that owns its subprocess.
+
+        asyncio.subprocess.Process binds its exit Future to the loop that created
+        it (the engine event-queue loop), so proc.wait() is only legal there.
+        Eviction can run on a different loop (the websocket-tasks loop); awaiting
+        proc.wait() from there raises "got Future attached to a different loop".
+        Hop the termination coroutine back onto the spawning loop via
+        run_coroutine_threadsafe so proc.wait() always touches its own loop.
+
+        During shutdown the spawning loop may be cancelling or closed. If the hop
+        cannot complete, fall back to a loop-agnostic signal (terminate/kill are
+        plain os.kill, safe from any loop) without awaiting the exit Future.
+        """
+        spawn_loop = self._spawn_loop
+        running_loop = asyncio.get_running_loop()
+        # No separate spawn loop (tests / single-loop deploys) or already on it:
+        # proc.wait() is legal here, so run termination inline.
+        if spawn_loop is None or spawn_loop is running_loop:
+            await self._terminate_managed_process(library_name, proc)
+            return
+        coro = self._terminate_managed_process(library_name, proc)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, spawn_loop)
+        except RuntimeError as e:
+            # The spawning loop is closed (shutdown). The coroutine was never
+            # scheduled, so close it to avoid a never-awaited warning, then signal
+            # the worker directly without awaiting its exit Future.
+            coro.close()
+            logger.warning(
+                "Spawning loop unavailable to terminate worker for key '%s' (%s); "
+                "sending a synchronous signal without awaiting exit confirmation",
+                library_name,
+                e,
+            )
+            self._terminate_without_wait(library_name, proc)
+            return
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=WorkerManager.DEFAULT_TERMINATE_HOP_TIMEOUT_S)
+        except asyncio.CancelledError:
+            # Termination was cancelled during shutdown; ensure the worker still
+            # gets a kill signal that needs no await on the spawning loop, then
+            # re-raise so cooperative cancellation propagates. Both hop callers run
+            # under TaskGroup-driven teardown (orchestrator_heartbeat_loop and the
+            # reset_workers gather); swallowing the cancel would let cleanup resume
+            # in a context that was supposed to stop and wedge TaskGroup convergence.
+            logger.warning(
+                "Termination of worker for key '%s' was cancelled; sending a "
+                "synchronous signal without awaiting exit confirmation",
+                library_name,
+            )
+            self._terminate_without_wait(library_name, proc)
+            raise
+        except TimeoutError:
+            # The hop was scheduled but never completed: the spawning loop most
+            # likely closed mid-shutdown before draining it. Stop waiting on a
+            # future that will never resolve and signal the worker directly.
+            future.cancel()
+            logger.warning(
+                "Termination of worker for key '%s' did not complete on the spawning loop "
+                "within %.0fs; sending a synchronous signal without awaiting exit confirmation",
+                library_name,
+                WorkerManager.DEFAULT_TERMINATE_HOP_TIMEOUT_S,
+            )
+            self._terminate_without_wait(library_name, proc)
+
     async def _terminate_managed_process(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
         """Terminate a managed worker, escalating to SIGKILL if it does not exit.
 
@@ -411,6 +494,9 @@ class WorkerManager:
         event loop; a wedged loop never services it. After DEFAULT_TERMINATE_GRACE_S
         we send SIGKILL, which the kernel delivers regardless of loop state, so a
         hung worker can never leak.
+
+        Must run on the loop that spawned proc, since it awaits proc.wait(). Callers
+        on another loop route through _terminate_via_spawn_loop.
         """
         try:
             proc.terminate()
@@ -432,6 +518,24 @@ class WorkerManager:
             except ProcessLookupError:
                 return
             await proc.wait()
+
+    def _terminate_without_wait(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
+        """Signal a worker to die without awaiting its exit Future.
+
+        Shutdown-only fallback for when the spawning loop is unavailable to run
+        proc.wait(). terminate() then kill() are synchronous os.kill calls, safe
+        from any loop; we forgo the graceful grace period and exit confirmation
+        because the orchestrator is tearing down and only needs the worker gone.
+        """
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            logger.debug("Worker for key '%s' already exited before termination", library_name)
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
 
     def register_worker_evicted_callback(self, callback: Callable[[str, str | None], None]) -> None:
         """Register a callback invoked when a worker is evicted.

@@ -51,7 +51,7 @@ class ProjectTemplate(BaseModel):
     environment: dict[str, str] = Field(default_factory=dict, description="Custom environment variables")
     file_extension_directories: dict[str, str] = Field(
         default_factory=dict,
-        description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable",
+        description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable. This variable is only available inside situation macros (the filename layer, resolved per-file at write time), not in directory or environment path_macros.",
     )
 
     def get_situation(self, situation_name: str) -> SituationTemplate | None:

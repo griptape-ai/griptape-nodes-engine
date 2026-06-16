@@ -5,7 +5,10 @@ from __future__ import annotations
 import base64
 import logging
 from pathlib import Path
-from typing import NamedTuple, Protocol, cast, runtime_checkable
+from typing import TYPE_CHECKING, NamedTuple, Protocol, cast, runtime_checkable
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.retained_mode.events.os_events import (
@@ -21,6 +24,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
+    GetPathForMacroResultSuccess,
     MacroPath,
     PathResolutionFailureReason,
 )
@@ -91,6 +95,50 @@ _PATH_FAILURE_TO_FILE_IO: dict[PathResolutionFailureReason, FileIOFailureReason]
 }
 
 
+def _make_file_load_error(result: ResultPayload) -> FileLoadError:
+    if isinstance(result, GetPathForMacroResultFailure):
+        return FileLoadError(
+            failure_reason=_PATH_FAILURE_TO_FILE_IO[result.failure_reason],
+            result_details=str(result.result_details),
+            missing_variables=result.missing_variables,
+            conflicting_variables=result.conflicting_variables,
+        )
+    return FileLoadError(
+        failure_reason=FileIOFailureReason.UNKNOWN,
+        result_details=str(result.result_details),
+    )
+
+
+def _resolve_macro_path(macro_path: MacroPath) -> str:
+    """Dispatch GetPathForMacroRequest and return the resolved absolute path string.
+
+    Args:
+        macro_path: The MacroPath to resolve.
+
+    Returns:
+        Resolved absolute path string.
+
+    Raises:
+        FileLoadError: If macro resolution fails.
+    """
+    result = GriptapeNodes.handle_request(
+        GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
+    )
+    if not isinstance(result, GetPathForMacroResultSuccess):
+        raise _make_file_load_error(result)
+    return str(result.absolute_path)
+
+
+async def _aresolve_macro_path(macro_path: MacroPath) -> str:
+    """Async version of _resolve_macro_path."""
+    result = await GriptapeNodes.ahandle_request(
+        GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
+    )
+    if not isinstance(result, GetPathForMacroResultSuccess):
+        raise _make_file_load_error(result)
+    return str(result.absolute_path)
+
+
 def _resolve_file_path(file_path: str | MacroPath) -> str:
     """Resolve a file path, handling MacroPath resolution if needed.
 
@@ -105,27 +153,11 @@ def _resolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-
-    # It's a MacroPath - resolve it via project-aware resolution
-    resolve_result = GriptapeNodes.handle_request(
-        GetPathForMacroRequest(parsed_macro=file_path.parsed_macro, variables=file_path.variables)
-    )
-
-    if isinstance(resolve_result, GetPathForMacroResultFailure):
-        raise FileLoadError(
-            failure_reason=_PATH_FAILURE_TO_FILE_IO[resolve_result.failure_reason],
-            result_details=str(resolve_result.result_details),
-            missing_variables=resolve_result.missing_variables,
-            conflicting_variables=resolve_result.conflicting_variables,
-        )
-
-    return str(resolve_result.absolute_path)  # type: ignore[union-attr]
+    return _resolve_macro_path(file_path)
 
 
 async def _aresolve_file_path(file_path: str | MacroPath) -> str:
     """Async version of _resolve_file_path.
-
-    Resolve a file path, handling MacroPath resolution if needed.
 
     Args:
         file_path: A plain path string or a MacroPath.
@@ -138,21 +170,7 @@ async def _aresolve_file_path(file_path: str | MacroPath) -> str:
     """
     if isinstance(file_path, str):
         return file_path
-
-    # It's a MacroPath - resolve it via project-aware resolution
-    resolve_result = await GriptapeNodes.ahandle_request(
-        GetPathForMacroRequest(parsed_macro=file_path.parsed_macro, variables=file_path.variables)
-    )
-
-    if isinstance(resolve_result, GetPathForMacroResultFailure):
-        raise FileLoadError(
-            failure_reason=_PATH_FAILURE_TO_FILE_IO[resolve_result.failure_reason],
-            result_details=str(resolve_result.result_details),
-            missing_variables=resolve_result.missing_variables,
-            conflicting_variables=resolve_result.conflicting_variables,
-        )
-
-    return str(resolve_result.absolute_path)  # type: ignore[union-attr]
+    return await _aresolve_macro_path(file_path)
 
 
 # Pairs of suffixes that should be treated as equivalent when comparing a

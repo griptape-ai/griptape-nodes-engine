@@ -20,6 +20,8 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.model_events import (
+    DeclareModelInvocationRequest,
+    DeclareModelInvocationResultSuccess,
     DeleteModelDownloadRequest,
     DeleteModelDownloadResultFailure,
     DeleteModelDownloadResultSuccess,
@@ -239,6 +241,9 @@ class ModelManager:
             event_manager.assign_manager_to_request_type(DeleteModelRequest, self.on_handle_delete_model_request)
             event_manager.assign_manager_to_request_type(SearchModelsRequest, self.on_handle_search_models_request)
             event_manager.assign_manager_to_request_type(GetModelInfoRequest, self.on_handle_get_model_info_request)
+            event_manager.assign_manager_to_request_type(
+                DeclareModelInvocationRequest, self.on_handle_declare_model_invocation_request
+            )
             event_manager.assign_manager_to_request_type(
                 ListModelDownloadsRequest, self.on_handle_list_model_downloads_request
             )
@@ -716,6 +721,27 @@ class ModelManager:
             downloads=getattr(info, "downloads", None),
             likes=getattr(info, "likes", None),
             result_details=f"Retrieved info for '{request.model_id}'",
+        )
+
+    def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
+        """Acknowledge a node's declaration that it is about to invoke a model.
+
+        This request is how a well-intentioned node opts into the permission
+        system: it declares the invocation and the engine decides whether it is
+        permitted. Enforcement runs entirely in the event manager's
+        pre-dispatch hook chain before this handler is reached, so arriving here
+        means the invocation is sanctioned. The node performs the actual
+        inference itself; this handler does not run any backend.
+
+        Args:
+            request: The declared invocation, identifying the model and task
+
+        Returns:
+            ResultPayload: Success, meaning the node is cleared to proceed
+        """
+        return DeclareModelInvocationResultSuccess(
+            model=request.model,
+            result_details=f"Model invocation permitted for '{request.model}'.",
         )
 
     def _search_models(self, request: SearchModelsRequest) -> SearchResultsData:

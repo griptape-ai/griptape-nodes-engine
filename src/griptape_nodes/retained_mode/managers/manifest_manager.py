@@ -1,0 +1,185 @@
+"""ManifestManager - Generates manifests describing engine-local resources."""
+
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+from griptape_nodes.common.manifests.manifest import (
+    LibraryManifestEntry,
+    Manifest,
+    ProjectTemplateManifestEntry,
+)
+from griptape_nodes.retained_mode.events.app_events import (
+    GetEngineVersionRequest,
+    GetEngineVersionResultSuccess,
+)
+from griptape_nodes.retained_mode.events.library_events import (
+    GetLibraryMetadataRequest,
+    GetLibraryMetadataResultSuccess,
+    GetLibrarySourceInfoRequest,
+    GetLibrarySourceInfoResultSuccess,
+    ListRegisteredLibrariesRequest,
+    ListRegisteredLibrariesResultSuccess,
+)
+from griptape_nodes.retained_mode.events.manifest_events import (
+    GenerateManifestRequest,
+    GenerateManifestResultFailure,
+    GenerateManifestResultSuccess,
+)
+from griptape_nodes.retained_mode.events.project_events import (
+    ListProjectTemplatesRequest,
+    ListProjectTemplatesResultSuccess,
+)
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+
+logger = logging.getLogger("griptape_nodes")
+
+
+class ManifestManager:
+    """Builds manifests describing the engine's registered libraries and project templates.
+
+    The manager owns no persistent state. It assembles a manifest on demand by
+    querying the existing library and project registries through their events.
+    """
+
+    def __init__(self, event_manager: EventManager) -> None:
+        """Initialize the ManifestManager.
+
+        Args:
+            event_manager: The EventManager instance to use for event handling.
+        """
+        event_manager.assign_manager_to_request_type(GenerateManifestRequest, self.on_generate_manifest_request)
+
+    async def on_generate_manifest_request(
+        self, request: GenerateManifestRequest
+    ) -> GenerateManifestResultSuccess | GenerateManifestResultFailure:
+        """Build a manifest from the engine's currently registered resources."""
+        libraries: list[LibraryManifestEntry] = []
+        if request.include_libraries:
+            list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+            if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
+                return GenerateManifestResultFailure(
+                    result_details=f"Attempted to generate manifest. Failed to list registered libraries: {list_result.result_details}"
+                )
+            libraries = await self._build_library_entries(list_result.libraries)
+
+        projects: list[ProjectTemplateManifestEntry] = []
+        if request.include_project_templates:
+            # System builtins (the always-loaded default project) are included:
+            # they are real templates an engine can be working in, so consumers
+            # picking from the manifest must be able to reference them.
+            projects_result = await GriptapeNodes.ahandle_request(
+                ListProjectTemplatesRequest(include_system_builtins=True, broadcast_result=False)
+            )
+            if not isinstance(projects_result, ListProjectTemplatesResultSuccess):
+                return GenerateManifestResultFailure(
+                    result_details=f"Attempted to generate manifest. Failed to list project templates: {projects_result.result_details}"
+                )
+            projects = self._build_project_template_entries(projects_result.successfully_loaded)
+
+        manifest = Manifest(
+            generated_at=datetime.now(UTC).isoformat(),
+            engine_id=self._resolve_engine_id(),
+            engine_version=await self._resolve_engine_version(),
+            libraries=libraries,
+            project_templates=projects,
+        )
+
+        return GenerateManifestResultSuccess(
+            manifest=manifest,
+            result_details=f"Successfully generated manifest with {len(libraries)} library/libraries and {len(projects)} project template(s).",
+        )
+
+    async def _build_library_entries(self, library_names: list[str]) -> list[LibraryManifestEntry]:
+        """Build a manifest entry for each registered library.
+
+        A library whose metadata or source path cannot be resolved is still
+        included with whatever could be gathered, so one bad library does not
+        omit it from the manifest.
+        """
+        entries: list[LibraryManifestEntry] = []
+        for name in library_names:
+            metadata_result = await GriptapeNodes.ahandle_request(
+                GetLibraryMetadataRequest(library=name, broadcast_result=False)
+            )
+            metadata = None
+            if isinstance(metadata_result, GetLibraryMetadataResultSuccess):
+                metadata = metadata_result.metadata
+            else:
+                logger.warning(
+                    "Could not load metadata for library '%s' while generating manifest: %s",
+                    name,
+                    metadata_result.result_details,
+                )
+
+            source_result = await GriptapeNodes.ahandle_request(
+                GetLibrarySourceInfoRequest(library=name, broadcast_result=False)
+            )
+            path = None
+            if isinstance(source_result, GetLibrarySourceInfoResultSuccess):
+                path = source_result.library_json_path
+            else:
+                logger.warning(
+                    "Could not resolve source path for library '%s' while generating manifest: %s",
+                    name,
+                    source_result.result_details,
+                )
+
+            entries.append(
+                LibraryManifestEntry(
+                    name=name,
+                    path=path,
+                    version=metadata.library_version if metadata else None,
+                    author=metadata.author if metadata else None,
+                    description=metadata.description if metadata else None,
+                    tags=list(metadata.tags) if metadata else [],
+                )
+            )
+        return entries
+
+    def _build_project_template_entries(
+        self, project_infos: list[ProjectTemplateInfo]
+    ) -> list[ProjectTemplateManifestEntry]:
+        """Build a manifest entry for each successfully loaded project template.
+
+        ``path`` is populated for file-backed templates, where the registry's
+        ``project_id`` is the template file's canonical path. System builtins
+        carry a synthetic id and no file, so their ``path`` stays None.
+        """
+        entries: list[ProjectTemplateManifestEntry] = []
+        for info in project_infos:
+            entries.append(  # noqa: PERF401
+                ProjectTemplateManifestEntry(
+                    project_id=info.project_id,
+                    name=info.name,
+                    parent_project_path=info.parent_project_path,
+                    path=info.project_id if info.project_id != SYSTEM_DEFAULTS_KEY else None,
+                )
+            )
+        return entries
+
+    def _resolve_engine_id(self) -> str | None:
+        """Resolve the engine's identifier, or None when it cannot be determined."""
+        try:
+            return GriptapeNodes.EngineIdentityManager().engine_id
+        except Exception:
+            logger.warning("Could not resolve engine id while generating manifest.", exc_info=True)
+            return None
+
+    async def _resolve_engine_version(self) -> str | None:
+        """Resolve the engine version string, or None when it cannot be determined."""
+        version_result = await GriptapeNodes.ahandle_request(GetEngineVersionRequest(broadcast_result=False))
+        if isinstance(version_result, GetEngineVersionResultSuccess):
+            return f"{version_result.major}.{version_result.minor}.{version_result.patch}"
+        logger.warning(
+            "Could not resolve engine version while generating manifest: %s",
+            version_result.result_details,
+        )
+        return None
