@@ -5272,7 +5272,15 @@ parent_project_id: "ghost-parent-id"
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
         mock_config_manager.merged_config = {}
-        mock_config_manager.get_config_value.return_value = []
+
+        # Return each call's own `default` so per-key types stay correct: a
+        # set-current activation reaches _snapshot_library_config, which reads
+        # `libraries_directory` as a string (default="") and the library lists as
+        # lists. A blanket return_value would feed Path() a list and crash.
+        def get_config_value(_key: str, *_args: object, default: object = None, **_kwargs: object) -> object:
+            return default
+
+        mock_config_manager.get_config_value.side_effect = get_config_value
         mock_config_manager.workspace_path = tmp_path
         return ProjectManager(mock_event_manager, mock_config_manager, Mock())
 

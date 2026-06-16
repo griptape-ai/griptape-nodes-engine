@@ -849,53 +849,7 @@ class ProjectManager:
             if not request.include_system_builtins and project_id == SYSTEM_DEFAULTS_KEY:
                 continue
 
-            # Emit the parent's id so the GUI can reconstruct the hierarchy by
-            # matching it against another entry's project_id. An explicit
-            # parent_project_id is already an id and is emitted as-is. A legacy
-            # parent_project_path is resolved to a canonical path, then mapped to
-            # the parent's actual id via the registry; if the parent is not
-            # registered, its id is its canonical path string (the legacy bridge),
-            # so the canonical string is the correct fallback. Per-platform
-            # mappings are reduced to the active platform's value first.
-            resolved_parent_id: str | None = None
-            if project_info.template.parent_project_id is not None:
-                resolved_parent_id = project_info.template.parent_project_id
-            else:
-                selected_parent = select_project_path(project_info.template.parent_project_path)
-                if selected_parent is not None:
-                    parent_path = Path(selected_parent)
-                    if not parent_path.is_absolute() and project_info.project_file_path is not None:
-                        parent_path = project_info.project_file_path.parent / parent_path
-                    canonical_parent = canonicalize_for_identity(parent_path)
-                    resolved_parent_id = file_path_to_id.get(canonical_parent, str(canonical_parent))
-
-            # Read the project-adjacent config's requires_engine specifier without
-            # merging it into the live config, so the GUI can disable activation
-            # for a project the running engine can't satisfy. A project with no
-            # backing file (or no specifier) is compatible by default.
-            required_engine_version: str | None = None
-            if project_info.project_file_path is not None:
-                config_path = project_info.project_file_path.parent / "griptape_nodes_config.json"
-                required_engine_version = self._config_manager.read_config_file_value(
-                    config_path, REQUIRES_ENGINE_KEY, default=None
-                )
-            engine_version_reason = engine_version_failure_detail(required_engine_version)
-
-            successfully_loaded.append(
-                ProjectTemplateInfo(
-                    project_id=project_id,
-                    validation=project_info.validation,
-                    name=project_info.template.name,
-                    project_file_path=(
-                        str(project_info.project_file_path) if project_info.project_file_path is not None else None
-                    ),
-                    parent_project_id=resolved_parent_id,
-                    engine_version_compatible=engine_version_reason is None,
-                    required_engine_version=required_engine_version,
-                    current_engine_version=engine_version,
-                    engine_version_reason=engine_version_reason,
-                )
-            )
+            successfully_loaded.append(self._build_loaded_template_info(project_id, project_info, file_path_to_id))
 
         # Gather failed templates from _registered_template_status.
         # These are tracked by Path, so correlate against the id-keyed registry
@@ -919,6 +873,63 @@ class ProjectManager:
             successfully_loaded=successfully_loaded,
             failed_to_load=failed_to_load,
             result_details=f"Successfully listed project templates. Loaded: {len(successfully_loaded)}, Failed: {len(failed_to_load)}",
+        )
+
+    def _build_loaded_template_info(
+        self,
+        project_id: ProjectID,
+        project_info: ProjectInfo,
+        file_path_to_id: dict[Path, ProjectID],
+    ) -> ProjectTemplateInfo:
+        """Build the ProjectTemplateInfo for a successfully loaded template.
+
+        Resolves the parent's id and the project-adjacent engine-version
+        compatibility for the listing emitted to the GUI.
+        """
+        # Emit the parent's id so the GUI can reconstruct the hierarchy by
+        # matching it against another entry's project_id. An explicit
+        # parent_project_id is already an id and is emitted as-is. A legacy
+        # parent_project_path is resolved to a canonical path, then mapped to
+        # the parent's actual id via the registry; if the parent is not
+        # registered, its id is its canonical path string (the legacy bridge),
+        # so the canonical string is the correct fallback. Per-platform
+        # mappings are reduced to the active platform's value first.
+        resolved_parent_id: str | None = None
+        if project_info.template.parent_project_id is not None:
+            resolved_parent_id = project_info.template.parent_project_id
+        else:
+            selected_parent = select_project_path(project_info.template.parent_project_path)
+            if selected_parent is not None:
+                parent_path = Path(selected_parent)
+                if not parent_path.is_absolute() and project_info.project_file_path is not None:
+                    parent_path = project_info.project_file_path.parent / parent_path
+                canonical_parent = canonicalize_for_identity(parent_path)
+                resolved_parent_id = file_path_to_id.get(canonical_parent, str(canonical_parent))
+
+        # Read the project-adjacent config's requires_engine specifier without
+        # merging it into the live config, so the GUI can disable activation
+        # for a project the running engine can't satisfy. A project with no
+        # backing file (or no specifier) is compatible by default.
+        required_engine_version: str | None = None
+        if project_info.project_file_path is not None:
+            config_path = project_info.project_file_path.parent / "griptape_nodes_config.json"
+            required_engine_version = self._config_manager.read_config_file_value(
+                config_path, REQUIRES_ENGINE_KEY, default=None
+            )
+        engine_version_reason = engine_version_failure_detail(required_engine_version)
+
+        return ProjectTemplateInfo(
+            project_id=project_id,
+            validation=project_info.validation,
+            name=project_info.template.name,
+            project_file_path=(
+                str(project_info.project_file_path) if project_info.project_file_path is not None else None
+            ),
+            parent_project_id=resolved_parent_id,
+            engine_version_compatible=engine_version_reason is None,
+            required_engine_version=required_engine_version,
+            current_engine_version=engine_version,
+            engine_version_reason=engine_version_reason,
         )
 
     def on_get_situation_request(
