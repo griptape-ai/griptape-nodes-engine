@@ -235,13 +235,23 @@ def _resolve_dir_path(dir_path: str | project_events.MacroPath) -> str:
     Raises:
         DirectoryError: If macro resolution fails.
     """
-    variables = {} if not isinstance(dir_path, project_events.MacroPath) else dir_path.variables
-    parsed_macro = dir_path.parsed_macro if isinstance(dir_path, project_events.MacroPath) else macro_parser.ParsedMacro(dir_path)
+    if isinstance(dir_path, str):
+        try:
+            parsed = macro_parser.ParsedMacro(dir_path)
+        except macro_parser.MacroSyntaxError as exc:
+            msg = f"Attempted to resolve directory path. Failed because path has invalid macro syntax: {dir_path!r}"
+            raise DirectoryError(msg) from exc
+        if not parsed.get_variables():
+            return dir_path
+        macro_path = project_events.MacroPath(parsed, {})
+    else:
+        macro_path = dir_path
+
     resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
-        project_events.GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables)
+        project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=macro_path.variables)
     )
     if not isinstance(resolve_result, project_events.GetPathForMacroResultSuccess):
-        msg = f"Failed to resolve macro path '{parsed_macro.template}': {resolve_result.result_details}"
+        msg = f"Failed to resolve macro path '{macro_path.parsed_macro.template}': {resolve_result.result_details}"
         raise DirectoryError(msg)
     return str(resolve_result.absolute_path)
 

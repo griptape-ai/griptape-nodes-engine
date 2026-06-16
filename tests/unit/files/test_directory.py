@@ -9,7 +9,7 @@ from griptape_nodes.common import macro_parser
 from griptape_nodes.files import directory as directory_mod
 from griptape_nodes.retained_mode.events import os_events, project_events
 
-HANDLE_REQUEST_PATH = "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.handle_request"
+HANDLE_REQUEST_PATH = "griptape_nodes.files.directory.griptape_nodes_mod.GriptapeNodes.handle_request"
 
 
 class TestDirectoryConstructor:
