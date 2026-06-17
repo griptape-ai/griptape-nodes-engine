@@ -2,8 +2,8 @@ import ast
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import TYPE_CHECKING, NamedTuple
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import anyio
 import pytest
@@ -834,6 +834,147 @@ class TestWorkflowManager:
             finally:
                 if context_manager.has_current_workflow():
                     context_manager.pop_workflow()
+
+    class _RenameScenario(NamedTuple):
+        workflow_name: str
+        requested_name: str
+        source_file_path: str
+        save_file_path: str
+        save_workflow_name: str
+
+    def _run_rename(self, workflow_manager: WorkflowManager, scenario: "TestWorkflowManager._RenameScenario") -> dict:
+        """Drive on_rename_workflow_request with mocked save/delete, capturing the SaveWorkflowRequest."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            DeleteWorkflowResultSuccess,
+            RenameWorkflowRequest,
+            RenameWorkflowResultSuccess,
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+
+        mock_source = MagicMock()
+        mock_source.file_path = scenario.source_file_path
+        captured: dict[str, object] = {}
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, SaveWorkflowRequest):
+                captured["save_file_name"] = req.file_name
+                return SaveWorkflowResultSuccess(
+                    file_path=scenario.save_file_path,
+                    workflow_name=scenario.save_workflow_name,
+                    result_details="ok",
+                )
+            return DeleteWorkflowResultSuccess(result_details="ok")
+
+        with (
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=True),
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_source),
+            patch.object(workflow_manager, "_persist_external_workflow_registration") as mock_persist,
+            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(workflow_name=scenario.workflow_name, requested_name=scenario.requested_name)
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultSuccess)
+        captured["result_new_name"] = result.new_workflow_name
+        captured["persist_calls"] = mock_persist.call_args_list
+        return captured
+
+    def test_rename_preserves_workspace_subdir(self, griptape_nodes: GriptapeNodes) -> None:
+        """Renaming a workflow in a sub-directory keeps it there (bar/workflow -> bar/new_name)."""
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="bar/workflow",
+                requested_name="new_name",
+                source_file_path="bar/workflow.py",
+                save_file_path="/workspace/bar/new_name.py",
+                save_workflow_name="bar/new_name",
+            ),
+        )
+        assert captured["save_file_name"] == "bar/new_name"
+
+    def test_rename_root_workflow_has_no_directory(self, griptape_nodes: GriptapeNodes) -> None:
+        """Renaming a workspace-root workflow has no directory prefix."""
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="workflow",
+                requested_name="new_name",
+                source_file_path="workflow.py",
+                save_file_path="/workspace/new_name.py",
+                save_workflow_name="new_name",
+            ),
+        )
+        assert captured["save_file_name"] == "new_name"
+
+    def test_rename_preserves_absolute_dir_and_reregisters(self, griptape_nodes: GriptapeNodes) -> None:
+        """Renaming an externally-registered (absolute path) workflow keeps it external and re-registers it."""
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="/ext/workflow",
+                requested_name="new_name",
+                source_file_path="/ext/workflow.py",
+                save_file_path="/ext/new_name.py",
+                save_workflow_name="/ext/new_name",
+            ),
+        )
+        assert captured["save_file_name"] == "/ext/new_name"
+        # The new absolute path is handed to the external-registration helper.
+        persist_calls = captured["persist_calls"]
+        assert persist_calls == [call("/ext/new_name.py")]
+
+    def test_rename_returns_new_registry_key(self, griptape_nodes: GriptapeNodes) -> None:
+        """The returned new_workflow_name is the real directory-qualified key, not the bare stem."""
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="bar/workflow",
+                requested_name="new_name",
+                source_file_path="bar/workflow.py",
+                save_file_path="/workspace/bar/new_name.py",
+                save_workflow_name="bar/new_name",
+            ),
+        )
+        assert captured["result_new_name"] == "bar/new_name"
+
+    def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
+        """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
+        workflow_manager = griptape_nodes.WorkflowManager()
+        abs_path = Path("/ext/new_name.py")
+
+        with patch.object(
+            workflow_manager,
+            "_build_workflow_save_path",
+            return_value=WorkflowManager.WorkflowSavePath(file_path=abs_path, relative_file_path=str(abs_path)),
+        ) as mock_build:
+            resolved = workflow_manager._resolve_named_save_path("/ext/new_name")
+
+        mock_build.assert_called_once_with("/ext/new_name.py")
+        assert resolved.file_name == "new_name"
+        assert resolved.relative_file_path == str(abs_path)
+
+    def test_resolve_named_save_path_relative_passes_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
+        """A relative requested name splits into stem + sub_dirs (unchanged behavior)."""
+        workflow_manager = griptape_nodes.WorkflowManager()
+        workspace = griptape_nodes.ConfigManager().workspace_path
+        resolved_path = workspace / "team" / "new_name.py"
+
+        with patch.object(
+            workflow_manager,
+            "_build_workflow_save_path",
+            return_value=WorkflowManager.WorkflowSavePath(
+                file_path=resolved_path, relative_file_path=str(Path("team") / "new_name.py")
+            ),
+        ) as mock_build:
+            resolved = workflow_manager._resolve_named_save_path("team/new_name")
+
+        mock_build.assert_called_once_with("new_name.py", sub_dirs="team")
+        assert resolved.file_name == "new_name"
 
     def test_delete_active_workflow_clears_context_stack(self, griptape_nodes: GriptapeNodes) -> None:
         """Deleting the active workflow tears down its flows and pops the context stack.
