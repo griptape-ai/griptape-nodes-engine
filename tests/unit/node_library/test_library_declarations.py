@@ -24,6 +24,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerModeCompatibility,
     iter_catalog_models,
     requires_worker_process,
+    resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
@@ -544,3 +545,70 @@ class TestModelProviderUsageRoundTrip:
         decl = rebuilt.declarations[0]
         assert isinstance(decl, ModelProviderUsageNodeProperty)
         assert decl.provider_ids == ["anthropic"]
+
+
+class TestResolveNodeModels:
+    def test_model_usage_resolves_in_declaration_order(self) -> None:
+        catalog = _build_catalog()
+        decls = [ModelUsageNodeProperty(model_ids=["kling_v2", "claude_opus_byok"])]
+
+        resolved = resolve_node_models(catalog, decls)
+
+        assert [r.model_id for r in resolved] == ["kling_v2", "claude_opus_byok"]
+
+    def test_provider_usage_resolves_all_provider_models_in_catalog_order(self) -> None:
+        catalog = _build_catalog()
+        decls = [ModelProviderUsageNodeProperty(provider_ids=["anthropic"])]
+
+        resolved = resolve_node_models(catalog, decls)
+
+        assert [r.model_id for r in resolved] == ["claude_opus_byok", "claude_opus_griptape"]
+        assert {r.provider_id for r in resolved} == {"anthropic"}
+
+    def test_provider_usage_for_model_less_provider_is_empty(self) -> None:
+        # Ollama declares no models; a provider reference resolves to nothing,
+        # leaving the node to enumerate its models dynamically at runtime.
+        catalog = _build_catalog()
+
+        resolved = resolve_node_models(catalog, [ModelProviderUsageNodeProperty(provider_ids=["ollama"])])
+
+        assert resolved == []
+
+    def test_combination_dedups_keeping_first_occurrence(self) -> None:
+        # A model named directly and again via its provider appears once, at the
+        # position of its first mention.
+        catalog = _build_catalog()
+        decls = [
+            ModelUsageNodeProperty(model_ids=["claude_opus_byok"]),
+            ModelProviderUsageNodeProperty(provider_ids=["anthropic"]),
+        ]
+
+        resolved = resolve_node_models(catalog, decls)
+
+        assert [r.model_id for r in resolved] == ["claude_opus_byok", "claude_opus_griptape"]
+
+    def test_unresolved_references_are_skipped(self) -> None:
+        catalog = _build_catalog()
+        decls = [
+            ModelUsageNodeProperty(model_ids=["does_not_exist"]),
+            ModelProviderUsageNodeProperty(provider_ids=["also_missing"]),
+        ]
+
+        assert resolve_node_models(catalog, decls) == []
+
+    def test_non_model_declarations_are_ignored(self) -> None:
+        catalog = _build_catalog()
+        decls = [LifecycleStageNodeProperty(stage=LifecycleStage.BETA)]
+
+        assert resolve_node_models(catalog, decls) == []
+
+    def test_carries_provider_and_model_context(self) -> None:
+        catalog = _build_catalog()
+
+        resolved = resolve_node_models(catalog, [ModelUsageNodeProperty(model_ids=["claude_opus_byok"])])
+
+        (entry,) = resolved
+        assert entry.provider_id == "anthropic"
+        assert entry.model.provider_model_id == "claude-opus-4"
+        assert entry.model.family == "Claude 4"
+        assert entry.provider.display_name == "Anthropic"
