@@ -13,11 +13,29 @@ from griptape_nodes.retained_mode.events.library_events import (
     DiscoverLibrariesRequest,
     DiscoverLibrariesResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
 
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+def _config_value_side_effect(libraries: list[str]) -> Callable[..., object]:
+    """Return a get_config_value stub that only answers the libraries_to_register key.
+
+    afind_files_recursive reads the discovery_max_depth setting through the same
+    ConfigManager, so a blanket return_value would feed it the library list. This
+    answers the library key with the provided list and defers every other key to
+    the caller's own `default` (so the depth read gets its int fallback).
+    """
+
+    def get_config_value(key: str, *, default: object = None, **_: object) -> object:
+        if key == LIBRARIES_TO_REGISTER_KEY:
+            return libraries
+        return default
+
+    return get_config_value
 
 
 class TestLibraryManagerDeterministicOrdering:
@@ -85,7 +103,11 @@ class TestLibraryManagerDeterministicOrdering:
         lib_b.write_text("{}")
 
         # Mock config to point to the parent directory
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=[str(lib_dir)]):
+        with patch.object(
+            griptape_nodes.ConfigManager(),
+            "get_config_value",
+            side_effect=_config_value_side_effect([str(lib_dir)]),
+        ):
             result = await library_manager._discover_library_files()
 
             # Files from directory should be sorted alphabetically by path
@@ -128,7 +150,11 @@ class TestLibraryManagerDeterministicOrdering:
         # Config order: direct file, directory, another direct file
         config_order = [str(direct_lib), str(lib_dir), str(another_direct)]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
+        with patch.object(
+            griptape_nodes.ConfigManager(),
+            "get_config_value",
+            side_effect=_config_value_side_effect(config_order),
+        ):
             result = await library_manager._discover_library_files()
 
             # Should be: direct_lib, dir_lib_a, dir_lib_b, another_direct

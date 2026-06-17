@@ -49,8 +49,9 @@ class ProjectTemplateManifestEntry(BaseModel):
             project events and referenced by external consumers such as
             policies). Consumers must not parse or construct it.
         name: Display name from the project template body, when available.
-        parent_project_path: Canonical absolute path of the parent project
-            template, or None when the template has no parent.
+        parent_project_id: Opaque id of the parent project template, matchable
+            against another entry's ``project_id``, or None when the template has
+            no parent.
         path: Filesystem location of the template file on this engine, or None
             for templates that are not file-backed (e.g. the system defaults).
             Carried separately from ``project_id`` so consumers never have to
@@ -59,7 +60,7 @@ class ProjectTemplateManifestEntry(BaseModel):
 
     project_id: str
     name: str | None = None
-    parent_project_path: str | None = None
+    parent_project_id: str | None = None
     path: str | None = None
 
 

@@ -920,3 +920,128 @@ class TestOverlayDeletions:
             and o.action == ProjectOverrideAction.REMOVED
         ]
         assert len(removed) == 1
+
+
+class TestProjectIdAndParentId:
+    """Round-trip and merge behavior for the opaque `id` and id-based parent link.
+
+    `id` is identity: it is always emitted (never diffed away) and the child's
+    own id always wins on merge (never inherited). `parent_project_id` is the
+    portable parent link that supersedes the legacy, machine-specific
+    `parent_project_path` (engine#4806).
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_id_survives_overlay_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "my-guid"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.id == "my-guid"
+
+    def test_id_always_emitted_even_when_matching_base(self) -> None:
+        # id is identity, not a diff: it must be emitted whenever present, even if
+        # the (unusual) base carries the same id. The default base has id=None, so
+        # use a base that already declares the same id to exercise the "matches
+        # base" path.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "same-guid"})
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "same-guid"})
+
+        overlay_yaml = modified.to_overlay_yaml(base)
+
+        assert '"id":' in overlay_yaml
+        assert "same-guid" in overlay_yaml
+
+    def test_parent_project_id_survives_overlay_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "child-guid", "parent_project_id": "parent-guid"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.id == "child-guid"
+        assert merged.parent_project_id == "parent-guid"
+        # The id-based link must not also carry a legacy path.
+        assert merged.parent_project_path is None
+
+    def test_new_save_emits_parent_project_id_not_path(self) -> None:
+        # engine#4806: a child of a non-default parent emits the portable id, never
+        # the author's machine-specific path, so a coworker can open the shared file.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "child-guid", "parent_project_id": "parent-guid"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+        assert "parent_project_id" in overlay_yaml
+        assert "parent_project_path" not in overlay_yaml
+
+    def test_parent_project_id_wins_over_path_on_emit(self) -> None:
+        # parent_project_id and parent_project_path are mutually exclusive on emit:
+        # when both are set, only the id is written.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "id": "child-guid",
+                "parent_project_id": "parent-guid",
+                "parent_project_path": "/abs/parent/griptape-nodes-project.yml",
+            }
+        )
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+        assert "parent_project_id" in overlay_yaml
+        assert "parent_project_path" not in overlay_yaml
+
+    def test_clears_parent_project_id_tombstone(self) -> None:
+        # An explicit `parent_project_id: null` overlay tombstones an inherited
+        # id-based link. The loader records the clear; merge yields None (the link
+        # is never inherited from base regardless, but the tombstone is honored).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": "parent-guid"})
+        yaml_text = """
+project_template_schema_version: "0.3.3"
+name: "Child"
+parent_project_id: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_parent_project_id is True
+        assert overlay_data.parent_project_id is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.parent_project_id is None
+
+    def test_legacy_parent_project_path_still_round_trips(self) -> None:
+        # Backwards compat: a legacy child with no id and a parent_project_path must
+        # still emit and re-parse the path (the id-based emit must not shadow it).
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={"parent_project_path": "/abs/parent/griptape-nodes-project.yml"}
+        )
+
+        merged = self._roundtrip(modified)
+
+        assert merged.parent_project_path == "/abs/parent/griptape-nodes-project.yml"
+        assert merged.parent_project_id is None
+
+    def test_to_yaml_includes_id(self) -> None:
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "my-guid"})
+
+        yaml_str = template.to_yaml()
+
+        assert '"id":' in yaml_str
+        assert "my-guid" in yaml_str
+
+    def test_to_yaml_omits_none_id(self) -> None:
+        # to_yaml uses exclude_none, so a template with no id (the default) must not
+        # emit an id key.
+        assert '"id":' not in DEFAULT_PROJECT_TEMPLATE.to_yaml()

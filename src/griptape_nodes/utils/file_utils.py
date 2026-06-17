@@ -13,36 +13,29 @@ import anyio
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_MAX_SEARCH_DEPTH_FALLBACK = 5
-
-
-def _read_max_search_depth() -> int:
-    """Read the discovery depth cap from GTN_DISCOVERY_MAX_DEPTH.
-
-    Runs at import on the boot path, so a malformed value must not crash startup:
-    non-integer input falls back to the default with a warning, and negatives are
-    clamped to 0 (top-level only) since negative depth is meaningless.
-    """
-    raw = os.getenv("GTN_DISCOVERY_MAX_DEPTH")
-    if raw is None:
-        return _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Invalid GTN_DISCOVERY_MAX_DEPTH=%r; expected an integer. Falling back to %d.",
-            raw,
-            _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK,
-        )
-        return _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
-    return max(value, 0)
-
-
-# Default ceiling on how deep recursive discovery walks. Bounds boot-time scans
+# Fallback ceiling on how deep recursive discovery walks, used only when the
+# `discovery_max_depth` engine setting cannot be read. Bounds boot-time scans
 # against pathologically deep trees and symlink loops without a visited-set.
-# Operators can override the cap with the GTN_DISCOVERY_MAX_DEPTH env var to widen
-# or tighten discovery for unusually deep (or flat) project/library/workflow trees.
-DEFAULT_MAX_SEARCH_DEPTH = _read_max_search_depth()
+DEFAULT_MAX_SEARCH_DEPTH = 5
+
+
+def _resolve_discovery_max_depth() -> int:
+    """Read the operator-configured ``discovery_max_depth`` ceiling for recursive discovery.
+
+    Returns the live `discovery_max_depth` engine setting (overridable via the
+    `GTN_CONFIG_DISCOVERY_MAX_DEPTH` env var), falling back to
+    DEFAULT_MAX_SEARCH_DEPTH only when the setting is absent.
+    """
+    # Lazy import: file_utils is a leaf util imported by the managers, so reaching
+    # GriptapeNodes/ConfigManager at module top-level would create a cycle
+    # (file_utils <- managers <- griptape_nodes). config_manager.py breaks the
+    # same cycle the same way.
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.managers.settings import DISCOVERY_MAX_DEPTH_KEY
+
+    return GriptapeNodes.ConfigManager().get_config_value(
+        DISCOVERY_MAX_DEPTH_KEY, default=DEFAULT_MAX_SEARCH_DEPTH, cast_type=int
+    )
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -210,23 +203,20 @@ async def afind_files_recursive(
     pattern: str,
     *,
     skip_hidden: bool = True,
-    max_depth: int = DEFAULT_MAX_SEARCH_DEPTH,
     max_files: int | None = None,
 ) -> list[Path]:
     """Asynchronously search directory recursively for files matching pattern.
 
     Depth-bounded async finder suitable for the engine boot path: it walks via
-    anyio so it yields to the event loop instead of blocking it, and max_depth
-    bounds recursion so a pathologically deep tree or symlink loop can't stall
-    startup.
+    anyio so it yields to the event loop instead of blocking it, and the
+    `discovery_max_depth` setting bounds recursion so a pathologically deep tree
+    or symlink loop can't stall startup.
 
     Args:
         directory: Directory to search in
         pattern: Glob pattern to match file names against (e.g., '*.json')
         skip_hidden: If True, skip hidden directories (those starting with .).
             This avoids descending into large hidden trees like .git or .venv.
-        max_depth: Maximum directory depth to descend. 0 scans only the top-level
-            directory; each nested level adds 1. Defaults to DEFAULT_MAX_SEARCH_DEPTH.
         max_files: If set, stop and return as soon as this many matches are found.
 
     Returns:
@@ -244,7 +234,7 @@ async def afind_files_recursive(
     params = _AsyncWalkParams(
         pattern=pattern,
         skip_hidden=skip_hidden,
-        max_depth=max_depth,
+        max_depth=_resolve_discovery_max_depth(),
         max_files=max_files,
         matches=matches,
     )

@@ -20,6 +20,7 @@ EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 
 
 class Category(BaseModel):
@@ -361,6 +362,16 @@ class Settings(BaseModel):
         category=SYSTEM_REQUIREMENTS,
         default=1.0,
         description="Minimum disk space in GB required for saving workflows",
+    )
+    discovery_max_depth: int = Field(
+        category=SYSTEM_REQUIREMENTS,
+        default=5,
+        description=(
+            "Maximum directory depth the engine walks when a registered entry points at a directory "
+            "to recursively discover files (e.g. project files under projects_to_register). Bounds boot-time "
+            "scans against pathologically deep trees and symlink loops. 0 scans only the top-level directory; "
+            "each nested level adds 1."
+        ),
     )
     synced_workflows_directory: str = Field(
         category=FILE_SYSTEM,

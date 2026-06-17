@@ -9,6 +9,7 @@ import pytest
 from pydantic import ValidationError
 
 from griptape_nodes.node_library.library_declarations import (
+    ArbitraryPythonExecutionNodeProperty,
     KeySupport,
     LifecycleStage,
     LifecycleStageLibraryProperty,
@@ -88,6 +89,17 @@ class TestDeclarationDiscriminator:
         decl = rebuilt.declarations[0]
         assert isinstance(decl, ModelUsageNodeProperty)
         assert decl.model_ids == ["claude_opus_byok"]
+
+    def test_node_arbitrary_python_execution_round_trips(self) -> None:
+        metadata = _make_node_metadata(
+            declarations=[ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=True)]
+        )
+
+        rebuilt = NodeMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, ArbitraryPythonExecutionNodeProperty)
+        assert decl.executes_arbitrary_python is True
 
     def test_library_lifecycle_stage_round_trips(self) -> None:
         metadata = _make_library_metadata(
@@ -181,6 +193,36 @@ class TestRoundTripSerialization:
         assert node_decls[0].stage is LifecycleStage.ALPHA
         assert isinstance(node_decls[1], ModelUsageNodeProperty)
         assert node_decls[1].model_ids == ["claude_opus_byok"]
+
+
+# ---------- ArbitraryPythonExecutionNodeProperty ----------
+
+
+class TestArbitraryPythonExecutionNodeProperty:
+    def test_round_trips_each_value(self) -> None:
+        for executes in (True, False):
+            decl = ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=executes)
+
+            rebuilt = ArbitraryPythonExecutionNodeProperty.model_validate(json.loads(decl.model_dump_json()))
+
+            assert rebuilt.executes_arbitrary_python is executes
+
+    def test_executes_arbitrary_python_is_required(self) -> None:
+        # Single-value declarations require their value to be set explicitly;
+        # absence of the entire declaration is the only meaningful "default."
+        with pytest.raises(ValidationError):
+            ArbitraryPythonExecutionNodeProperty()  # type: ignore[call-arg]
+
+    def test_node_metadata_round_trips_declaration(self) -> None:
+        metadata = _make_node_metadata(
+            declarations=[ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=True)],
+        )
+
+        rebuilt = NodeMetadata.model_validate(metadata.model_dump())
+
+        decl = rebuilt.declarations[0]
+        assert isinstance(decl, ArbitraryPythonExecutionNodeProperty)
+        assert decl.executes_arbitrary_python is True
 
 
 # ---------- WorkerModeCompatibility ----------

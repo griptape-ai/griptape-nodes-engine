@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -353,20 +352,21 @@ class TestAfindFilesRecursive:
         assert result == sorted([file1, file2])
 
     @pytest.mark.asyncio
-    async def test_max_depth_zero_scans_only_top_level(self, temp_dir: Path) -> None:
-        """max_depth=0 returns only matches directly in the directory."""
+    async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path) -> None:
+        """A discovery_max_depth setting of 0 returns only matches directly in the directory."""
         root_file = temp_dir / "root.json"
         nested_file = temp_dir / "sub" / "nested.json"
         nested_file.parent.mkdir()
         root_file.write_text("{}")
         nested_file.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json", max_depth=0)
+        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=0):
+            result = await afind_files_recursive(temp_dir, "*.json")
 
         assert result == [root_file]
 
     @pytest.mark.asyncio
-    async def test_max_depth_excludes_files_below_cap(self, temp_dir: Path) -> None:
+    async def test_depth_setting_excludes_files_below_cap(self, temp_dir: Path) -> None:
         """Files at the depth cap are included; deeper files are excluded."""
         at_cap = temp_dir / "a" / "at_cap.json"
         below_cap = temp_dir / "a" / "b" / "below_cap.json"
@@ -374,7 +374,8 @@ class TestAfindFilesRecursive:
         at_cap.write_text("{}")
         below_cap.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json", max_depth=1)
+        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=1):
+            result = await afind_files_recursive(temp_dir, "*.json")
 
         assert result == [at_cap]
 
@@ -387,39 +388,6 @@ class TestAfindFilesRecursive:
         result = await afind_files_recursive(temp_dir, "*.json", max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
-
-
-class TestReadMaxSearchDepth:
-    """Test _read_max_search_depth: env-var parsing for the discovery depth cap."""
-
-    def test_default_when_unset(self) -> None:
-        """Falls back to the default when the env var is absent."""
-        from griptape_nodes.utils.file_utils import _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK, _read_max_search_depth
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("GTN_DISCOVERY_MAX_DEPTH", None)
-            assert _read_max_search_depth() == _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
-
-    def test_valid_value_is_used(self) -> None:
-        """A valid integer is parsed and returned."""
-        from griptape_nodes.utils.file_utils import _read_max_search_depth
-
-        with patch.dict(os.environ, {"GTN_DISCOVERY_MAX_DEPTH": "12"}):
-            assert _read_max_search_depth() == 12  # noqa: PLR2004
-
-    def test_invalid_value_falls_back_to_default(self) -> None:
-        """A non-integer value falls back to the default instead of crashing."""
-        from griptape_nodes.utils.file_utils import _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK, _read_max_search_depth
-
-        with patch.dict(os.environ, {"GTN_DISCOVERY_MAX_DEPTH": "oops"}):
-            assert _read_max_search_depth() == _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
-
-    def test_negative_value_is_clamped_to_zero(self) -> None:
-        """A negative value is clamped to 0 (top-level only)."""
-        from griptape_nodes.utils.file_utils import _read_max_search_depth
-
-        with patch.dict(os.environ, {"GTN_DISCOVERY_MAX_DEPTH": "-3"}):
-            assert _read_max_search_depth() == 0
 
 
 class TestAtomicWriteBytes:
