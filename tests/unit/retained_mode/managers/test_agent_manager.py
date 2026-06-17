@@ -43,16 +43,34 @@ class TestComposeInstructions:
 
     def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
         agent_manager._instructions = "BASE"
+        agent_manager._user_instructions = ""
         assert agent_manager._compose_instructions([]) == "BASE"
 
     def test_rules_are_appended_to_base_instructions(self, agent_manager: AgentManager) -> None:
         agent_manager._instructions = "BASE"
+        agent_manager._user_instructions = ""
         composed = agent_manager._compose_instructions(
             ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"]
         )
         assert composed.startswith("BASE")
         assert "be terse" in composed
         assert "be kind" in composed
+
+    def test_user_instructions_are_included_between_base_and_server_rules(self, agent_manager: AgentManager) -> None:
+        agent_manager._instructions = "BASE"
+        agent_manager._user_instructions = "USER"
+        composed = agent_manager._compose_instructions(["SERVER"])
+        assert composed.index("BASE") < composed.index("USER") < composed.index("SERVER")
+
+    def test_empty_user_instructions_are_not_included(self, agent_manager: AgentManager) -> None:
+        agent_manager._instructions = "BASE"
+        agent_manager._user_instructions = ""
+        assert agent_manager._compose_instructions([]) == "BASE"
+
+    def test_whitespace_only_user_instructions_are_not_included(self, agent_manager: AgentManager) -> None:
+        agent_manager._instructions = "BASE"
+        agent_manager._user_instructions = "   "
+        assert agent_manager._compose_instructions([]) == "BASE"
 
 
 class TestOnHandleListAgentModelsRequest:
