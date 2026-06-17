@@ -102,6 +102,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     PROJECTS_TO_REGISTER_KEY,
     REQUIRES_ENGINE_KEY,
 )
+from griptape_nodes.utils.file_utils import afind_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
@@ -475,6 +476,16 @@ class ProjectManager:
     ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
         """Load user's project.yml and merge with system defaults.
 
+        Thin wrapper over _load_and_cache_project_template. Explicit loads
+        persist the path so the project survives engine restarts.
+        """
+        return await self._load_and_cache_project_template(request.project_path, persist_path=True)
+
+    async def _load_and_cache_project_template(
+        self, project_path: Path, *, persist_path: bool
+    ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
+        """Load a project.yml, merge with system defaults, and cache the result.
+
         Flow:
         1. Issue ReadFileRequest to OSManager (for proper Windows long path handling)
         2. Parse YAML and load partial template (overlay) using load_partial_project_template()
@@ -482,13 +493,18 @@ class ProjectManager:
         4. Merge the overlay onto that base using ProjectTemplate.merge()
         5. Cache validation in registered_template_status
         6. If usable, cache template in successful_templates
-        7. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+        7. If persist_path, append the path to projects_to_register config
+        8. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+
+        persist_path is False for directory-discovered project files: the
+        directory entry stays in config and is re-scanned each startup, so the
+        individual files must not be persisted alongside it.
         """
         # Expand ~/env vars and resolve to absolute so the same file is always
         # located the same way regardless of how the caller spelled the path
         # (relative vs absolute, ~/ prefix, symlinks, etc.). The canonical path
         # is the file locator; _registered_template_status is keyed by it.
-        project_file_path = canonicalize_for_identity(request.project_path)
+        project_file_path = canonicalize_for_identity(project_path)
 
         read_load = await self._read_overlay(project_file_path)
         if isinstance(read_load, LoadProjectTemplateResultFailure):
@@ -586,8 +602,10 @@ class ProjectManager:
 
         # Persist the file path (the locator) so the project survives engine
         # restarts. PROJECTS_TO_REGISTER_KEY stores paths, not ids: boot reloads
-        # each file by path and re-derives its id.
-        self._register_project_path(str(project_file_path))
+        # each file by path and re-derives its id. Skipped for directory-discovered
+        # files, which are covered by their directory entry.
+        if persist_path:
+            self._register_project_path(str(project_file_path))
 
         return LoadProjectTemplateResultSuccess(
             project_id=project_id,
@@ -2511,11 +2529,18 @@ class ProjectManager:
         )
         resolved_paths = self._resolve_registered_entry_paths(registered_entries)
 
+        # A directory entry is recursively scanned for project files (each loaded
+        # without persisting), mirroring how libraries_to_register expands a
+        # folder. Split directories from individual file entries so the id pre-pass
+        # and the per-file load loop only see files; directories are scanned after.
+        directory_paths = [path for path in resolved_paths if path.is_dir()]
+        file_paths = [path for path in resolved_paths if not path.is_dir()]
+
         # Pre-pass: index id -> canonical path so child-before-parent ordering
         # still resolves id-based parents (which carry no path) during the load
         # loop below.
         self._boot_id_to_file_path = {}
-        for canonical_path in resolved_paths:
+        for canonical_path in file_paths:
             read_load = await self._read_overlay(canonical_path)
             if isinstance(read_load, LoadProjectTemplateResultFailure):
                 continue
@@ -2524,7 +2549,7 @@ class ProjectManager:
                 self._boot_id_to_file_path[overlay.id] = canonical_path
 
         try:
-            for canonical_path in resolved_paths:
+            for canonical_path in file_paths:
                 # Skip files already loaded (e.g. the workspace project). Correlate
                 # by the file path locator, not by id: the registry is id-keyed, so
                 # a path string would never match an explicitly-id'd project's key.
@@ -2544,6 +2569,9 @@ class ProjectManager:
                     )
                 else:
                     logger.debug("Reloaded registered project from '%s'", canonical_path)
+
+            for directory in directory_paths:
+                await self._load_projects_from_directory(directory)
         finally:
             # The index is only meaningful during boot.
             self._boot_id_to_file_path = {}
@@ -2590,6 +2618,46 @@ class ProjectManager:
             seen.add(canonical_path)
             resolved.append(canonical_path)
         return resolved
+
+    async def _load_projects_from_directory(self, directory: Path) -> None:
+        """Discover and load every project file under a registered directory.
+
+        Recursively scans for WORKSPACE_PROJECT_FILE, loading each match into
+        memory without persisting it. The directory entry is the unit of
+        registration, so discovered files cannot be individually unregistered;
+        they are re-discovered on each startup. The scan is depth-bounded by the
+        `discovery_max_depth` setting and hidden directories (e.g. .venv, .git)
+        are skipped by afind_files_recursive.
+        """
+        discovered = await afind_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        if not discovered:
+            logger.warning(
+                "projects_to_register directory '%s' contains no '%s' files; skipping",
+                directory,
+                WORKSPACE_PROJECT_FILE,
+            )
+            return
+        for project_file in discovered:
+            # Correlate by the file path locator, not by id: the registry is
+            # id-keyed, so a path string would never match an explicitly-id'd
+            # project's key.
+            canonical_path = canonicalize_for_identity(project_file)
+            already_loaded = any(
+                info.project_file_path == canonical_path
+                for info in self._successfully_loaded_project_templates.values()
+            )
+            if already_loaded:
+                continue
+            result = await self._load_and_cache_project_template(project_file, persist_path=False)
+            if result.failed():
+                logger.warning(
+                    "Failed to load discovered project '%s' from directory '%s': %s",
+                    project_file,
+                    directory,
+                    result.result_details,
+                )
+            else:
+                logger.debug("Loaded discovered project '%s' from directory '%s'", project_file, directory)
 
     def _register_project_path(self, project_file_path: str) -> None:
         """Persist a project file path so it is loaded on the next engine restart.

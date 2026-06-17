@@ -20,6 +20,7 @@ EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 
 
 class Category(BaseModel):
@@ -198,11 +199,15 @@ class AppInitializationComplete(BaseModel):
         category=PROJECTS,
         default_factory=list,
         description=(
-            "List of griptape-nodes-project.yml file paths to load at startup. "
+            "List of project entries to load at startup. "
             "Each entry may be either: "
             "(1) a single path string (supports `${ENV_VAR}` and `~` expansion), or "
             "(2) a per-platform mapping with optional `linux`, `darwin`, `windows`, and `default` keys "
             "for cross-platform deployments where the same project resolves to different paths on each OS. "
+            "A path entry may point to a single griptape-nodes-project.yml file, or to a directory that is "
+            "recursively scanned for all griptape-nodes-project.yml files (each loaded as a registered template). "
+            "Directory entries are kept verbatim and re-scanned each startup; the discovered files are not "
+            "expanded into individual entries. "
             "Per-platform entries with no key matching the active platform and no `default` are skipped with a warning."
         ),
     )
@@ -357,6 +362,16 @@ class Settings(BaseModel):
         category=SYSTEM_REQUIREMENTS,
         default=1.0,
         description="Minimum disk space in GB required for saving workflows",
+    )
+    discovery_max_depth: int = Field(
+        category=SYSTEM_REQUIREMENTS,
+        default=5,
+        description=(
+            "Maximum directory depth the engine walks when a registered entry points at a directory "
+            "to recursively discover files (e.g. project files under projects_to_register). Bounds boot-time "
+            "scans against pathologically deep trees and symlink loops. 0 scans only the top-level directory; "
+            "each nested level adds 1."
+        ),
     )
     synced_workflows_directory: str = Field(
         category=FILE_SYSTEM,
