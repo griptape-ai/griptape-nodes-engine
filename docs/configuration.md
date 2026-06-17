@@ -156,6 +156,18 @@ This is useful for scripted environments, containers, and CI/CD pipelines where 
 GTN_CONFIG_PROJECT_FILE=/shared/studio-project.yml gtn
 ```
 
+### Recursive Discovery Depth (`GTN_DISCOVERY_MAX_DEPTH`)
+
+When `projects_to_register` points at a directory, the engine recursively scans it for project files on startup. The scan is depth-bounded so a pathologically deep tree (or a symlink loop) can't stall the boot sequence. The default cap is **5** directory levels below the registered directory, which comfortably covers normal project layouts.
+
+Set `GTN_DISCOVERY_MAX_DEPTH` to raise or lower that cap:
+
+```bash
+GTN_DISCOVERY_MAX_DEPTH=20 gtn   # scan deeper-nested project layouts
+```
+
+A value of `0` scans only the top-level directory (no subdirectories). This is a standalone behavioral variable, not a `GTN_CONFIG_*` setting, so it is not stored in any config file.
+
 ## Workspace Directory
 
 During `gtn init`, you specify a Workspace Directory. This is the root for your projects, saved flows, and potentially project-specific settings.

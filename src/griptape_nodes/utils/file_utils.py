@@ -15,7 +15,9 @@ logger = logging.getLogger(__name__)
 
 # Default ceiling on how deep recursive discovery walks. Bounds boot-time scans
 # against pathologically deep trees and symlink loops without a visited-set.
-DEFAULT_MAX_SEARCH_DEPTH = 10
+# Operators can override the cap with the GTN_DISCOVERY_MAX_DEPTH env var to widen
+# or tighten discovery for unusually deep (or flat) project/library/workflow trees.
+DEFAULT_MAX_SEARCH_DEPTH = int(os.getenv("GTN_DISCOVERY_MAX_DEPTH", "5"))
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
