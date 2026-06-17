@@ -2601,6 +2601,75 @@ situations:
         assert str(project_path) in pm._successfully_loaded_project_templates
 
     @pytest.mark.asyncio
+    async def test_directory_entry_loads_nested_projects_without_persisting(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A directory entry is recursively scanned; each project file is loaded but not persisted."""
+        from griptape_nodes.retained_mode.events.os_events import ReadFileResultSuccess
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        top_project = tmp_path / WORKSPACE_PROJECT_FILE
+        nested_project = tmp_path / "sub" / WORKSPACE_PROJECT_FILE
+        nested_project.parent.mkdir()
+        top_project.write_text(self.VALID_PROJECT_YAML)
+        nested_project.write_text(self.VALID_PROJECT_YAML)
+        yaml_content = self.VALID_PROJECT_YAML
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(tmp_path)]
+            return []
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
+            patch.object(pm, "_register_project_path") as mock_register,
+        ):
+            mock_gn.ahandle_request = AsyncMock(
+                return_value=ReadFileResultSuccess(
+                    content=yaml_content,
+                    file_size=len(yaml_content),
+                    mime_type="text/plain",
+                    encoding="utf-8",
+                    result_details="ok",
+                )
+            )
+
+            await pm._load_registered_projects()
+
+        assert str(top_project) in pm._successfully_loaded_project_templates
+        assert str(nested_project) in pm._successfully_loaded_project_templates
+        # Directory-discovered files are covered by the directory entry, so they
+        # must not be persisted individually back into config.
+        mock_register.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_empty_directory_entry_is_logged_and_skipped(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A directory entry with no project files logs a warning and loads nothing."""
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(tmp_path)]
+            return []
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+
+        with (
+            patch.object(pm, "_load_and_cache_project_template", new=AsyncMock()) as mock_load,
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+        ):
+            await pm._load_registered_projects()
+            mock_load.assert_not_called()
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("contains no" in msg for msg in warning_messages)
+
+    @pytest.mark.asyncio
     async def test_load_failure_is_logged_as_warning(
         self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:

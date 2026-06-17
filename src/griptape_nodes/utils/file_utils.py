@@ -13,11 +13,36 @@ import anyio
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_MAX_SEARCH_DEPTH_FALLBACK = 5
+
+
+def _read_max_search_depth() -> int:
+    """Read the discovery depth cap from GTN_DISCOVERY_MAX_DEPTH.
+
+    Runs at import on the boot path, so a malformed value must not crash startup:
+    non-integer input falls back to the default with a warning, and negatives are
+    clamped to 0 (top-level only) since negative depth is meaningless.
+    """
+    raw = os.getenv("GTN_DISCOVERY_MAX_DEPTH")
+    if raw is None:
+        return _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid GTN_DISCOVERY_MAX_DEPTH=%r; expected an integer. Falling back to %d.",
+            raw,
+            _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK,
+        )
+        return _DEFAULT_MAX_SEARCH_DEPTH_FALLBACK
+    return max(value, 0)
+
+
 # Default ceiling on how deep recursive discovery walks. Bounds boot-time scans
 # against pathologically deep trees and symlink loops without a visited-set.
 # Operators can override the cap with the GTN_DISCOVERY_MAX_DEPTH env var to widen
 # or tighten discovery for unusually deep (or flat) project/library/workflow trees.
-DEFAULT_MAX_SEARCH_DEPTH = int(os.getenv("GTN_DISCOVERY_MAX_DEPTH", "5"))
+DEFAULT_MAX_SEARCH_DEPTH = _read_max_search_depth()
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
