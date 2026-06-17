@@ -2392,7 +2392,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
     - Category should be `app_events.on_app_initialization_complete`
     - Secrets are accessed via `GriptapeNodes.SecretsManager().get_secret()`
 - **metadata.dependencies**: PIP packages installed on library load
-- **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
+- **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, arbitrary Python execution) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
 - **widgets**: Register custom JS widget components (see [Custom Widget Components](#custom-widget-components))
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
@@ -2404,7 +2404,7 @@ Use flat directory structures. The engine automatically registers and loads libr
 
 ### Library and Node Declarations
 
-Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers a lifecycle-stage property and a library-level model catalog with per-node references; future engine releases add more declaration types under the same field.
+Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers a lifecycle-stage property, a library-level model catalog with per-node references, and an arbitrary-Python-execution property; future engine releases add more declaration types under the same field.
 
 Both `metadata.declarations` (library-level) and per-node `metadata.declarations` accept a list. Order in the list does not matter. The field defaults to `[]`, so libraries on older schema versions (`0.6.0`, `0.4.0`, `0.1.0`) load unchanged.
 
@@ -2506,6 +2506,20 @@ A node references one or more entire providers. Use this when a node dynamically
 ```
 
 The two usage declarations are independent. A node can carry any combination — for instance, "every model this provider offers, plus these two specific models from another provider."
+
+#### `arbitrary_python_execution`
+
+Declares that a node executes arbitrary Python code supplied at runtime (for example, an artist-authored script). Node-level only. This is a security-relevant identity fact: consumers (UI) can warn an artist before the node runs. Absence of this declaration means the node does not execute arbitrary Python.
+
+| Field                       | Meaning                                                      |
+| --------------------------- | ------------------------------------------------------------ |
+| `executes_arbitrary_python` | `true` when the node runs unvetted, runtime-supplied Python. |
+
+```jsonc
+"declarations": [
+  { "type": "arbitrary_python_execution", "executes_arbitrary_python": true }
+]
+```
 
 #### Combining declarations
 

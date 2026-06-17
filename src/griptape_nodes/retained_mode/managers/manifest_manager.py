@@ -33,7 +33,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     ListProjectTemplatesResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
@@ -149,9 +148,10 @@ class ManifestManager:
     ) -> list[ProjectTemplateManifestEntry]:
         """Build a manifest entry for each successfully loaded project template.
 
-        ``path`` is populated for file-backed templates, where the registry's
-        ``project_id`` is the template file's canonical path. System builtins
-        carry a synthetic id and no file, so their ``path`` stays None.
+        ``path`` is populated from the template's file locator. System builtins
+        and other non-file-backed templates have no locator, so their ``path``
+        stays None. ``path`` is carried separately from ``project_id`` because the
+        id is opaque (a GUID or custom string) and must not be assumed to be a path.
         """
         entries: list[ProjectTemplateManifestEntry] = []
         for info in project_infos:
@@ -159,8 +159,8 @@ class ManifestManager:
                 ProjectTemplateManifestEntry(
                     project_id=info.project_id,
                     name=info.name,
-                    parent_project_path=info.parent_project_path,
-                    path=info.project_id if info.project_id != SYSTEM_DEFAULTS_KEY else None,
+                    parent_project_id=info.parent_project_id,
+                    path=info.project_file_path,
                 )
             )
         return entries

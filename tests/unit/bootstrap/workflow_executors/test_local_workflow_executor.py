@@ -103,6 +103,27 @@ class TestLoadProject:
         # Verify both requests were made
         assert mock_gn.ahandle_request.call_count == EXPECTED_REQUEST_COUNT
 
+    @pytest.mark.asyncio
+    async def test_load_project_activates_by_opaque_id_not_path(self) -> None:
+        """The executor must activate by the load result's opaque id, never the file path (internal#110)."""
+        # The opaque id the engine echoes back differs from the on-disk path, so a
+        # path-based activation would not match it.
+        opaque_id = "deadbeef-0000-1111-2222-333344445555"
+        mock_load_result = MagicMock(spec=LoadProjectTemplateResultSuccess)
+        mock_load_result.project_id = opaque_id
+
+        mock_set_result = MagicMock(spec=SetCurrentProjectResultSuccess)
+        mock_set_result.failed.return_value = False
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.ahandle_request = AsyncMock(side_effect=[mock_load_result, mock_set_result])
+
+            executor = LocalWorkflowExecutor.__new__(LocalWorkflowExecutor)
+            await executor._load_project(Path("/some/project.yaml"))
+
+        set_request = mock_gn.ahandle_request.call_args_list[1].args[0]
+        assert set_request.project_id == opaque_id
+
 
 class TestPrepareWorkflowForRunStorageBackend:
     """Regression tests for issue #4828.
