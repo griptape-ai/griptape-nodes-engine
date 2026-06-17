@@ -29,7 +29,10 @@ class TestLibraryManagerDeterministicOrdering:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir).resolve()
 
-    def test_discover_library_files_preserves_config_order(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_discover_library_files_preserves_config_order(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
         """Test that _discover_library_files preserves the order from libraries_to_register."""
         library_manager = griptape_nodes.LibraryManager()
 
@@ -48,7 +51,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(lib_z), str(lib_a), str(lib_m)]
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
             # Should preserve config order, not alphabetical
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [
@@ -58,7 +61,8 @@ class TestLibraryManagerDeterministicOrdering:
             ]
             assert all(entry.registration.enabled for entry in result)
 
-    def test_discover_library_files_handles_directories_deterministically(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_handles_directories_deterministically(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
         """Test that files discovered from directories are sorted deterministically."""
@@ -82,7 +86,7 @@ class TestLibraryManagerDeterministicOrdering:
 
         # Mock config to point to the parent directory
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=[str(lib_dir)]):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
             # Files from directory should be sorted alphabetically by path
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [
@@ -91,7 +95,8 @@ class TestLibraryManagerDeterministicOrdering:
                 lib_z,
             ]
 
-    def test_discover_library_files_mixed_files_and_directories_preserves_order(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_mixed_files_and_directories_preserves_order(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
         """Test that mixing direct files and directories preserves config order."""
@@ -124,7 +129,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(direct_lib), str(lib_dir), str(another_direct)]
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
             # Should be: direct_lib, dir_lib_a, dir_lib_b, another_direct
             # (directory contents are sorted alphabetically by path)
@@ -135,7 +140,8 @@ class TestLibraryManagerDeterministicOrdering:
                 another_direct,
             ]
 
-    def test_discover_library_files_deduplicates_preserving_first_occurrence(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_deduplicates_preserving_first_occurrence(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
         """Test that duplicate libraries are removed, preserving first occurrence."""
@@ -151,13 +157,14 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(lib), str(lib)]
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
             # Should only appear once
             assert [Path(entry.registration.path) for entry in result if entry.registration.path is not None] == [lib]
             assert len(result) == 1
 
-    def test_discover_libraries_request_returns_list_in_order(
+    @pytest.mark.asyncio
+    async def test_discover_libraries_request_returns_list_in_order(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
         """Test that discover_libraries_request returns libraries as a list in order."""
@@ -178,7 +185,7 @@ class TestLibraryManagerDeterministicOrdering:
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
             request = DiscoverLibrariesRequest(include_sandbox=False)
-            result = library_manager.discover_libraries_request(request)
+            result = await library_manager.discover_libraries_request(request)
 
             assert isinstance(result, DiscoverLibrariesResultSuccess)
             # Result should be a list, not a set
@@ -187,7 +194,8 @@ class TestLibraryManagerDeterministicOrdering:
             discovered_paths = [lib.path for lib in result.libraries_discovered]
             assert discovered_paths == [lib1, lib2]
 
-    def test_discover_libraries_request_deterministic_across_calls(
+    @pytest.mark.asyncio
+    async def test_discover_libraries_request_deterministic_across_calls(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
         """Test that multiple calls return the same order."""
@@ -205,9 +213,9 @@ class TestLibraryManagerDeterministicOrdering:
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=libs):
             request = DiscoverLibrariesRequest(include_sandbox=False)
 
-            result1 = library_manager.discover_libraries_request(request)
-            result2 = library_manager.discover_libraries_request(request)
-            result3 = library_manager.discover_libraries_request(request)
+            result1 = await library_manager.discover_libraries_request(request)
+            result2 = await library_manager.discover_libraries_request(request)
+            result3 = await library_manager.discover_libraries_request(request)
 
             assert isinstance(result1, DiscoverLibrariesResultSuccess)
             assert isinstance(result2, DiscoverLibrariesResultSuccess)

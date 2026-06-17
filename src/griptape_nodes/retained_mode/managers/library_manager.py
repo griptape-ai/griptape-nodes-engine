@@ -226,7 +226,7 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
-from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
+from griptape_nodes.utils.file_utils import afind_files_recursive, find_file_in_directory
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
     GitPullError,
@@ -1108,7 +1108,10 @@ class LibraryManager:
             result_details=details,
         )
 
-    def load_metadata_for_all_libraries_request(self, request: LoadMetadataForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def load_metadata_for_all_libraries_request(
+        self,
+        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
+    ) -> ResultPayload:
         """Load metadata for all libraries from configuration without loading node modules.
 
         This loads metadata from both library JSON files specified in configuration
@@ -1118,7 +1121,7 @@ class LibraryManager:
         failed_libraries = []
 
         # Discover library files for metadata loading
-        library_files = self._discover_library_files()
+        library_files = await self._discover_library_files()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
@@ -1890,7 +1893,7 @@ class LibraryManager:
 
         # If not found and discovery is allowed, try discovery
         if library_info is None and request.perform_discovery_if_not_found:
-            discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+            discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
             if isinstance(discover_result, DiscoverLibrariesResultSuccess):
                 library_info = self.get_library_info_by_library_name(library_name)
 
@@ -3108,7 +3111,7 @@ class LibraryManager:
         reconcile_failures = await self._reconcile_libraries_from_config()
 
         # Discover all available libraries (config + sandbox)
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             logger.error("Failed to discover libraries: %s", discover_result.result_details)
             self._libraries_loading_complete.set()
@@ -4743,7 +4746,7 @@ class LibraryManager:
             requires_worker=requires_worker,
         )
 
-    def discover_libraries_request(
+    async def discover_libraries_request(
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
@@ -4753,7 +4756,7 @@ class LibraryManager:
         Scans configured library paths and creates LibraryInfo entries in DISCOVERED state.
         """
         try:
-            config_library_entries = self._discover_library_files()
+            config_library_entries = await self._discover_library_files()
         except Exception as e:
             logger.exception("Failed to discover library files")
             return DiscoverLibrariesResultFailure(
@@ -4865,7 +4868,7 @@ class LibraryManager:
         New code should use LoadLibraryRequest to load specific libraries instead.
         """
         # First, discover all available libraries
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             return LoadLibrariesResultFailure(result_details=f"Discovery failed: {discover_result.result_details}")
 
@@ -4986,7 +4989,7 @@ class LibraryManager:
 
         return LoadLibrariesResultSuccess(result_details=ResultDetails(message=message, level=logging.INFO))
 
-    def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
+    async def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
         """Discover library JSON files from config and workspace recursively.
 
         Returns:
@@ -5001,11 +5004,13 @@ class LibraryManager:
         discovered_entries: list[LibraryManager.DiscoveredLibraryEntry] = []
         seen_paths: set[Path] = set()
 
-        def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
+        async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
             """Process a path, handling both files and directories."""
-            if path.is_dir():
-                # Recursively find library files, skipping hidden directories
-                for lib_path in find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+            if await anyio.Path(path).is_dir():
+                # Recursively find library files. afind_files_recursive skips hidden
+                # directories and bounds recursion depth so a deep or symlink-looped
+                # tree can't stall the boot scan.
+                for lib_path in await afind_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
                         discovered_entries.append(
@@ -5028,7 +5033,7 @@ class LibraryManager:
         for entry in normalize_library_registrations(config_libraries):
             resolved = self._resolve_discovery_path(entry, config_mgr.workspace_path)
             if resolved is not None:
-                process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
+                await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
 
         return discovered_entries
 

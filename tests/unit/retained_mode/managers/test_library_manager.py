@@ -109,7 +109,7 @@ class TestLibraryManagerLoadLibraries:
         mock_library.name = "SomeLib"
         with (
             patch.object(library_manager, "_library_file_path_to_info", {"some_lib": mock_lib_info}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("some_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("some_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
             patch.object(LibraryRegistry, "get_library", return_value=mock_library),
         ):
@@ -132,7 +132,7 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock()
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("new_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
@@ -157,7 +157,7 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock(side_effect=Exception("Config error"))
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("new_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
@@ -187,7 +187,8 @@ class TestLibraryManagerDisabledEntries:
         disabled_lib.write_text("{}")
         return enabled_lib, disabled_lib
 
-    def test_discover_library_files_marks_disabled_entries(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_marks_disabled_entries(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Object-shaped entries with enabled=False produce disabled register entries."""
@@ -200,7 +201,7 @@ class TestLibraryManagerDisabledEntries:
         ]
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         by_path = {
             Path(entry.registration.path): entry.registration.enabled
@@ -210,7 +211,8 @@ class TestLibraryManagerDisabledEntries:
         assert by_path[enabled_lib] is True
         assert by_path[disabled_lib] is False
 
-    def test_discover_library_files_bare_string_defaults_to_enabled(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_bare_string_defaults_to_enabled(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Bare path strings continue to be treated as enabled."""
@@ -218,12 +220,13 @@ class TestLibraryManagerDisabledEntries:
         enabled_lib, _ = lib_files
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=[str(enabled_lib)]):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         assert len(result) == 1
         assert result[0].registration.enabled is True
 
-    def test_discover_libraries_request_marks_disabled_lifecycle(
+    @pytest.mark.asyncio
+    async def test_discover_libraries_request_marks_disabled_lifecycle(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """discover_libraries_request creates LibraryInfo with DISABLED lifecycle for disabled entries."""
@@ -238,7 +241,7 @@ class TestLibraryManagerDisabledEntries:
         library_manager._library_file_path_to_info = {}
 
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
-            result = library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            result = await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         from griptape_nodes.retained_mode.events.library_events import DiscoverLibrariesResultSuccess
 
@@ -254,7 +257,8 @@ class TestLibraryManagerDisabledEntries:
         assert flags[enabled_lib] is True
         assert flags[disabled_lib] is False
 
-    def test_invalid_entry_is_skipped_with_warning(
+    @pytest.mark.asyncio
+    async def test_invalid_entry_is_skipped_with_warning(
         self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Entries that are neither strings nor dicts with a path are skipped."""
@@ -266,13 +270,14 @@ class TestLibraryManagerDisabledEntries:
             patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         assert result == []
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("libraries_to_register" in m for m in warnings)
 
-    def test_rediscovery_reconciles_toggled_enabled_flag(
+    @pytest.mark.asyncio
+    async def test_rediscovery_reconciles_toggled_enabled_flag(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Re-running discovery after a refresh updates lifecycle when the user toggles enabled.
@@ -293,7 +298,7 @@ class TestLibraryManagerDisabledEntries:
         # Initial discovery: first_lib enabled, second_lib disabled.
         initial_config = [str(first_lib), {"path": str(second_lib), "enabled": False}]
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=initial_config):
-            library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
@@ -303,7 +308,7 @@ class TestLibraryManagerDisabledEntries:
         # User flips the config: first_lib disabled, second_lib enabled, then triggers refresh.
         toggled_config = [{"path": str(first_lib), "enabled": False}, str(second_lib)]
         with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=toggled_config):
-            library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state_after = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state_after = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
