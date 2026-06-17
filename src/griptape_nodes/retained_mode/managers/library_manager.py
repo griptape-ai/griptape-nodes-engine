@@ -4752,7 +4752,6 @@ class LibraryManager:
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
         """Discover libraries from config and track them in discovered state.
 
-        This is the event handler for DiscoverLibrariesRequest.
         Scans configured library paths and creates LibraryInfo entries in DISCOVERED state.
         """
         try:
