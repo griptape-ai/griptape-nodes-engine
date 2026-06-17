@@ -145,6 +145,12 @@ class TestExtractRepoNameFromUrl:
 
         assert result == "my-repo"
 
+    def test_extract_repo_name_from_url_with_trailing_slash_before_ref(self) -> None:
+        """A trailing slash right before the @ref must not swallow the repo name."""
+        result = extract_repo_name_from_url("https://github.com/user/my-repo/@stable")
+
+        assert result == "my-repo"
+
 
 class TestIsGitUrl:
     """Test is_git_url function."""

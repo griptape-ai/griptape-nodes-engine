@@ -3,7 +3,7 @@ import os
 import platform
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -366,6 +366,35 @@ class TestConfigManager:
                 manager.load_configs()
                 assert manager.workspace_path == default_workspace
 
+    def test_clear_project_layers_resets_override_and_config_paths(self) -> None:
+        """clear_project_layers() drops the override and both config-file paths to None.
+
+        Regression guard for the per-activation state-leak: switching projects (or rolling
+        back to one) must not inherit the prior project's workspace override or its
+        project-adjacent/workspace config-file layers.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+            workspace_dir = Path(temp_dir) / "workspace"
+            workspace_dir.mkdir()
+
+            with patch.dict(os.environ, {}, clear=True):
+                manager = ConfigManager()
+                manager.set_workspace_override(project_dir)
+                manager.load_project_config(project_dir)
+                manager.load_workspace_config(workspace_dir)
+
+                assert manager._workspace_dir_override is not None
+                assert manager._project_config_path is not None
+                assert manager._workspace_config_path is not None
+
+                manager.clear_project_layers()
+
+                assert manager._workspace_dir_override is None
+                assert manager._project_config_path is None
+                assert manager._workspace_config_path is None
+
 
 @pytest.mark.skipif(
     platform.system() == "Windows", reason="xdg_base_dirs cannot find XDG_CONFIG_HOME on Windows on GitHub Actions"
@@ -545,12 +574,16 @@ class TestConfigManagerEventEmission:
         assert entries[1].enabled is False
 
         # Round-trip: bare strings stay strings, objects stay objects.
-        # Object form serializes every field on LibraryRegistration; `worker_mode_override`
-        # defaults to None when the user didn't set one (added alongside `enabled`).
+        # Object form serializes every field on LibraryRegistration: path, enabled,
+        # and worker_mode_override (which defaults to None when the user didn't set one).
         dumped = validated.app_events.on_app_initialization_complete.model_dump()
         assert dumped["libraries_to_register"] == [
             "/path/to/enabled.json",
-            {"path": "/path/to/disabled.json", "enabled": False, "worker_mode_override": None},
+            {
+                "path": "/path/to/disabled.json",
+                "enabled": False,
+                "worker_mode_override": None,
+            },
         ]
 
 
@@ -686,3 +719,357 @@ class TestConfigManagerUtf8:
         result = manager._load_config_from_file(config_file, "test")
 
         assert result == {}
+
+
+class TestComputeProjectProvisioningConfig:
+    """`compute_project_provisioning_config` builds a project's merged config read-only.
+
+    The provisioning preview uses it so its plan reflects the same effective
+    `libraries_to_register` / `engine_version` the live reconcile reads after
+    activation, instead of the project-adjacent file alone.
+    """
+
+    @staticmethod
+    def _write_config(path: Path, dot_key: str, value: object) -> None:
+        from griptape_nodes.utils.dict_utils import set_dot_value
+
+        path.write_text(json.dumps(set_dot_value({}, dot_key, value)), encoding="utf-8")
+
+    def test_workspace_layer_overrides_project_adjacent_libraries(self, tmp_path: Path) -> None:
+        """A separate-dir workspace config's libraries_to_register wins over the project file.
+
+        Mirrors load_configs's last-writer-wins replacement (merge_lists=False), so the
+        preview must read the merged value, not the project-adjacent one.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        project_dir = tmp_path / "project"
+        workspace_dir = tmp_path / "workspace"
+        project_dir.mkdir()
+        workspace_dir.mkdir()
+        self._write_config(project_dir / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["project-lib"])
+        self._write_config(workspace_dir / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["workspace-lib"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            merged = manager.compute_project_provisioning_config(project_dir, workspace_dir, apply_override=True)
+
+        assert get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY) == ["workspace-lib"]
+
+    def test_env_var_overrides_all_file_layers(self, tmp_path: Path) -> None:
+        """A GTN_CONFIG_ env var sits above every config-file layer, matching load_configs."""
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        self._write_config(project_dir / "griptape_nodes_config.json", "storage_backend", "from-project")
+
+        with patch.dict(os.environ, {"GTN_CONFIG_STORAGE_BACKEND": "from-env"}, clear=True):
+            manager = ConfigManager()
+            merged = manager.compute_project_provisioning_config(project_dir, project_dir, apply_override=True)
+
+        assert get_dot_value(merged, "storage_backend") == "from-env"
+
+    def test_self_contained_project_skips_duplicate_workspace_layer(self, tmp_path: Path) -> None:
+        """When workspace dir == project dir, the project-adjacent file is the only file layer.
+
+        Matches load_configs's guard that skips loading the same file twice; the single
+        file's value still lands in the merged config.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        self._write_config(project_dir / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["only-lib"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            merged = manager.compute_project_provisioning_config(project_dir, project_dir, apply_override=True)
+
+        assert get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY) == ["only-lib"]
+        # apply_override resolves the dir the same way set_workspace_override does.
+        assert merged["workspace_directory"] == str(project_dir.expanduser().resolve())
+
+    def test_does_not_mutate_live_config_state(self, tmp_path: Path) -> None:
+        """The computation is read-only: it leaves the live merged config and layer paths intact."""
+        project_dir = tmp_path / "project"
+        workspace_dir = tmp_path / "workspace"
+        project_dir.mkdir()
+        workspace_dir.mkdir()
+        self._write_config(project_dir / "griptape_nodes_config.json", "storage_backend", "from-project")
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            merged_before = manager.merged_config.copy()
+            project_path_before = manager._project_config_path
+            workspace_path_before = manager._workspace_config_path
+            override_before = manager._workspace_dir_override
+
+            manager.compute_project_provisioning_config(project_dir, workspace_dir, apply_override=True)
+
+        assert manager.merged_config == merged_before
+        assert manager._project_config_path == project_path_before
+        assert manager._workspace_config_path == workspace_path_before
+        assert manager._workspace_dir_override == override_before
+
+    def test_system_defaults_config_ignores_project_and_workspace_files(
+        self, tmp_path: Path, isolate_user_config: Path
+    ) -> None:
+        """The system-defaults config reads only defaults->user->env, never a project/workspace file.
+
+        The system-defaults activation path loads no project-adjacent or workspace
+        griptape_nodes_config.json, so neither may leak into this preview, or the plan
+        would diverge from what the switch actually reconciles.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        # A stray config file sitting in cwd-adjacent dirs must not be consulted.
+        self._write_config(tmp_path / "griptape_nodes_config.json", LIBRARIES_TO_REGISTER_KEY, ["stray-file-lib"])
+        self._write_config(isolate_user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
+
+        with patch.dict(os.environ, {}, clear=True):
+            manager = ConfigManager()
+            merged = manager.compute_system_defaults_provisioning_config()
+
+        assert get_dot_value(merged, LIBRARIES_TO_REGISTER_KEY) == ["user-pin-lib"]
+
+
+class TestProvisioningPreviewMatchesActivation:
+    """The provisioning preview's merged config matches what activation actually produces.
+
+    Defect #2 was the preview reading only the project-adjacent file while reconcile reads
+    the fully-merged config, so the plan a user approved could differ from what activation
+    did. The fix routes both through ConfigManager.compute_project_provisioning_config and a
+    single ProjectManager.decide_workspace. These tests drive a real ConfigManager through the
+    live _activate_project sequence (clear_project_layers -> load_project_config -> conditional
+    set_workspace_override -> load_workspace_config) and, independently, through the preview path
+    (read_config_file / read_env_config -> decide_workspace -> compute_project_provisioning_config),
+    then assert the two agree on the only keys the preview consumes (libraries_to_register,
+    engine_version) plus workspace_directory.
+
+    Equality is asserted per-key, not as a blanket ==: the live merged config also carries
+    unrelated layers (e.g. project_workspaces from the user config) that the preview legitimately
+    includes too, so a blanket == would be hostage to that noise and to scalar normalization.
+    All four decide_workspace branches are covered, since each resolves the workspace layer
+    differently and is the surface where preview and live could drift.
+    """
+
+    @staticmethod
+    def _write_config_file(path: Path, values: dict[str, object]) -> None:
+        from griptape_nodes.utils.dict_utils import set_dot_value
+
+        config: dict = {}
+        for dot_key, value in values.items():
+            set_dot_value(config, dot_key, value)
+        path.write_text(json.dumps(config), encoding="utf-8")
+
+    @staticmethod
+    def _assert_preview_matches_live(
+        cm: ConfigManager,
+        project_dir: Path,
+        project_file: Path,
+        *,
+        expected_libraries: list,
+        expected_engine_version: str,
+    ) -> None:
+        """Compute the preview and live-activation merged configs and assert they agree.
+
+        Mirrors resolve_provisioning_config_dirs -> compute_project_provisioning_config for the
+        preview (read-only, before any activation mutation) and _activate_project's workspace
+        block for the live path, then cross-checks the consumed keys + workspace_directory. The
+        expected-winner assertions prove the workspace layer was actually consumed, so a bug that
+        made BOTH paths ignore it (preview == live but both wrong) still fails.
+        """
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = ProjectManager(Mock(), cm, Mock())
+
+        # Preview path, read-only and before any live mutation.
+        preview_project_config = cm.read_config_file(project_dir / "griptape_nodes_config.json")
+        preview_env_config = cm.read_env_config()
+        preview_decision = pm.decide_workspace(project_file, preview_project_config, preview_env_config)
+        preview_merged = cm.compute_project_provisioning_config(
+            project_dir, preview_decision.workspace_dir, apply_override=preview_decision.apply_override
+        )
+
+        # Live path, mirroring _activate_project's workspace block.
+        cm.clear_project_layers()
+        cm.load_project_config(project_dir)
+        live_decision = pm.decide_workspace(project_file, cm.project_config, cm.env_config)
+        if live_decision.apply_override:
+            cm.set_workspace_override(live_decision.workspace_dir)
+        cm.load_workspace_config(cm.workspace_path)
+        live_merged = cm.merged_config
+
+        # The preview and live paths must agree on every key the preview consumes.
+        assert get_dot_value(preview_merged, LIBRARIES_TO_REGISTER_KEY) == get_dot_value(
+            live_merged, LIBRARIES_TO_REGISTER_KEY
+        )
+        assert get_dot_value(preview_merged, REQUIRES_ENGINE_KEY) == get_dot_value(live_merged, REQUIRES_ENGINE_KEY)
+        assert preview_merged["workspace_directory"] == live_merged["workspace_directory"]
+
+        # The workspace layer was actually consumed (not a both-wrong pass).
+        assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == expected_libraries
+        assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == expected_engine_version
+
+    def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        project_file = project_dir / "project.yml"
+        project_file.touch()
+        mapped_workspace = tmp_path / "mapped"
+        mapped_workspace.mkdir()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
+        )
+        self._write_config_file(
+            mapped_workspace / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["workspace-lib"], REQUIRES_ENGINE_KEY: ">=2.0"},
+        )
+        isolate_user_config.write_text(
+            json.dumps({"project_workspaces": {str(project_file): str(mapped_workspace)}}), encoding="utf-8"
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["workspace-lib"],
+                expected_engine_version=">=2.0",
+            )
+
+    def test_env_workspace_branch(self, tmp_path: Path) -> None:
+        """GTN_CONFIG_WORKSPACE_DIRECTORY points at a separate workspace dir (apply_override=False)."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        project_file = project_dir / "project.yml"
+        project_file.touch()
+        env_workspace = tmp_path / "env_workspace"
+        env_workspace.mkdir()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
+        )
+        self._write_config_file(
+            env_workspace / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["env-workspace-lib"], REQUIRES_ENGINE_KEY: ">=3.0"},
+        )
+
+        with patch.dict(os.environ, {"GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace)}, clear=True):
+            cm = ConfigManager()
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["env-workspace-lib"],
+                expected_engine_version=">=3.0",
+            )
+
+    def test_project_adjacent_workspace_branch(self, tmp_path: Path) -> None:
+        """The project-adjacent config sets workspace_directory to a separate dir (apply_override=False)."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        project_file = project_dir / "project.yml"
+        project_file.touch()
+        adjacent_workspace = tmp_path / "adjacent_workspace"
+        adjacent_workspace.mkdir()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {
+                LIBRARIES_TO_REGISTER_KEY: ["project-lib"],
+                REQUIRES_ENGINE_KEY: ">=1.0",
+                "workspace_directory": str(adjacent_workspace),
+            },
+        )
+        self._write_config_file(
+            adjacent_workspace / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["adjacent-workspace-lib"], REQUIRES_ENGINE_KEY: ">=4.0"},
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["adjacent-workspace-lib"],
+                expected_engine_version=">=4.0",
+            )
+
+    def test_auto_default_branch(self, tmp_path: Path) -> None:
+        """No workspace driver: the project's own dir is the workspace (apply_override=True)."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        project_dir = tmp_path / "project"
+        project_dir.mkdir()
+        project_file = project_dir / "project.yml"
+        project_file.touch()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["project-lib"],
+                expected_engine_version=">=1.0",
+            )
+
+    def test_system_defaults_branch(self, isolate_user_config: Path) -> None:
+        """Switching to system defaults merges defaults->user->env with no project/workspace file.
+
+        _activate_project's system-defaults branch runs clear_project_layers() then load_configs(),
+        so the preview's compute_system_defaults_provisioning_config must agree on the keys it
+        consumes. A user-config library pin proves the user layer is actually read (a both-empty
+        pass would not), which is exactly the pin that can force a destructive reconcile on the
+        switch to Default Project.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value, set_dot_value
+
+        user_config: dict = {}
+        set_dot_value(user_config, LIBRARIES_TO_REGISTER_KEY, ["user-pin-lib"])
+        set_dot_value(user_config, REQUIRES_ENGINE_KEY, ">=9.0")
+        isolate_user_config.write_text(json.dumps(user_config), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+
+            # Preview path, read-only.
+            preview_merged = cm.compute_system_defaults_provisioning_config()
+
+            # Live path, mirroring _activate_project's system-defaults branch.
+            cm.clear_project_layers()
+            cm.load_configs()
+            live_merged = cm.merged_config
+
+        assert get_dot_value(preview_merged, LIBRARIES_TO_REGISTER_KEY) == get_dot_value(
+            live_merged, LIBRARIES_TO_REGISTER_KEY
+        )
+        assert get_dot_value(preview_merged, REQUIRES_ENGINE_KEY) == get_dot_value(live_merged, REQUIRES_ENGINE_KEY)
+        # The user layer was actually consumed (not a both-empty pass).
+        assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == ["user-pin-lib"]
+        assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == ">=9.0"

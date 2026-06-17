@@ -137,12 +137,24 @@ class ProjectTemplateInfo:
             direct equality matching against another entry's project_id when
             reconstructing the parent/child hierarchy. None means no parent
             (system defaults are the only base).
+        engine_version_compatible: False when the project's project-adjacent
+            config declares a `requires_engine` specifier the running engine
+            fails (or that is malformed). The GUI disables activation for such a
+            project. True when compatible or when no requires_engine is declared.
+        required_engine_version: The declared `requires_engine` specifier, when any.
+        current_engine_version: The running engine version, for display.
+        engine_version_reason: Human-readable detail explaining an incompatibility,
+            None when compatible.
     """
 
     project_id: ProjectID
     validation: ProjectValidationInfo
     name: str | None = None
     parent_project_path: str | None = None
+    engine_version_compatible: bool = True
+    required_engine_version: str | None = None
+    current_engine_version: str | None = None
+    engine_version_reason: str | None = None
 
 
 @dataclass
