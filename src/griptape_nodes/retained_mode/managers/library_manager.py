@@ -3152,7 +3152,7 @@ class LibraryManager:
         self._libraries_loading_complete.set()
         return reconcile_failures
 
-    def on_preview_project_provisioning_request(
+    async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
     ) -> PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure:
         """Compute the library provisioning plan for a loaded project, read-only.
@@ -3206,7 +3206,9 @@ class LibraryManager:
             Path(get_dot_value(merged, "workspace_directory")),
         )
 
-        actions = [self._plan_one_library_provisioning(download, libraries_path) for download in downloads]
+        actions = await asyncio.gather(
+            *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
+        )
         destructive_count = sum(1 for action in actions if action.destructive)
         change_count = sum(1 for action in actions if action.kind != LibraryProvisioningActionKind.SKIP)
         return PreviewProjectProvisioningResultSuccess(
@@ -3256,7 +3258,7 @@ class LibraryManager:
         spec_string = GriptapeNodes.ConfigManager().get_config_value(REQUIRES_ENGINE_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
-    def _plan_one_library_provisioning(
+    async def _plan_one_library_provisioning(
         self, download: LibraryDownload, libraries_path: Path | None = None
     ) -> LibraryProvisioningAction:
         """Decide what provisioning will do to one download entry, reading only.
@@ -3285,7 +3287,7 @@ class LibraryManager:
         The action's `library_name` falls back to the repo name for display.
         """
         library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
-        installed_version = self._installed_download_version(download, libraries_path)
+        installed_version = await self._installed_download_version(download, libraries_path)
         parsed = parse_git_url_with_ref(download.git_url)
         satisfied = self._registration_satisfied_by_installed(download, installed_version)
         if satisfied:
@@ -3329,7 +3331,7 @@ class LibraryManager:
         wire payload is unchanged. Returns a failure detail string, or None on
         success/skip. A LibraryDownload always carries a `git_url`.
         """
-        action = self._plan_one_library_provisioning(download)
+        action = await self._plan_one_library_provisioning(download)
         if action.kind == LibraryProvisioningActionKind.SKIP:
             return None
 
@@ -3364,7 +3366,7 @@ class LibraryManager:
         download_directory: str | None = None
         target_directory_name: str | None = None
         if overwrite_existing and download.name is not None:
-            manifest_path = self._installed_library_manifest_path(download.name)
+            manifest_path = await self._installed_library_manifest_path(download.name)
             if manifest_path is not None:
                 download_directory = str(manifest_path.parent.parent)
                 target_directory_name = manifest_path.parent.name
@@ -3385,7 +3387,7 @@ class LibraryManager:
         return None
 
     @staticmethod
-    def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
+    async def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
@@ -3414,7 +3416,7 @@ class LibraryManager:
                 return None
             libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
 
-        for manifest_path in find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+        for manifest_path in await afind_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
                 manifest = json.loads(content)
@@ -3426,18 +3428,18 @@ class LibraryManager:
         return None
 
     @staticmethod
-    def _installed_library_version(library_name: str) -> str | None:
+    async def _installed_library_version(library_name: str) -> str | None:
         """Return the on-disk version of a library by manifest name, or None when absent.
 
         Locates the provisioned manifest via `_installed_library_manifest_path`
         (the shared resolver), then reads `metadata.library_version`. None when no
         manifest matches or the version is absent/unreadable.
         """
-        manifest_path = LibraryManager._installed_library_manifest_path(library_name)
+        manifest_path = await LibraryManager._installed_library_manifest_path(library_name)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
-    def _installed_manifest_path_for_download(
+    async def _installed_manifest_path_for_download(
         download: LibraryDownload, libraries_path: Path | None = None
     ) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
@@ -3455,7 +3457,7 @@ class LibraryManager:
         for the real reconcile, which runs post-activation).
         """
         if download.name is not None:
-            return LibraryManager._installed_library_manifest_path(download.name, libraries_path)
+            return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
 
         if libraries_path is None:
             config_mgr = GriptapeNodes.ConfigManager()
@@ -3469,7 +3471,7 @@ class LibraryManager:
         return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
 
     @staticmethod
-    def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
+    async def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
         """Return the on-disk version for a download entry, or None when absent.
 
         Resolves the installed manifest via `_installed_manifest_path_for_download`
@@ -3477,7 +3479,7 @@ class LibraryManager:
         `metadata.library_version`. `libraries_path` threads the TARGET project's
         libraries directory through for the preview; None resolves from live config.
         """
-        manifest_path = LibraryManager._installed_manifest_path_for_download(download, libraries_path)
+        manifest_path = await LibraryManager._installed_manifest_path_for_download(download, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
