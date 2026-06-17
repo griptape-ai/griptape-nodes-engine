@@ -179,6 +179,7 @@ class AgentManager:
         self._model_name: str = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
+        self._user_instructions: str = config_manager.get_config_value("agent_instructions", default="")
 
         self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
@@ -444,6 +445,12 @@ class AgentManager:
                 if new_image_model != self._image_model_name:
                     self._image_model_name = new_image_model
                     self._runner_cache.clear()
+            if request.instructions is not None:
+                new_instructions = request.instructions
+                if new_instructions != self._user_instructions:
+                    self._user_instructions = new_instructions
+                    config_manager.set_config_value("agent_instructions", new_instructions)
+                    self._runner_cache.clear()
         except Exception as e:
             details = f"Error configuring agent: {e}"
             logger.exception(details)
@@ -520,15 +527,17 @@ class AgentManager:
         return runner
 
     def _compose_instructions(self, server_rules: list[str]) -> str:
-        """Append any per-MCP-server `rules` to the base instructions.
+        """Compose the full system prompt from base, user, and per-server rules.
 
-        The previous harness injected each enabled MCP server's configured
-        ``rules`` as agent rulesets; this folds them into the system prompt so
-        that user-configured per-server guidance is not silently dropped.
+        Composition order: built-in base instructions → user instructions (if
+        set) → per-MCP-server rules (if any). The base instructions are always
+        first so their non-negotiable behavioral rules cannot be overridden.
         """
-        if not server_rules:
-            return self._instructions
-        return self._instructions + "\n\n" + "\n\n".join(server_rules)
+        parts = [self._instructions]
+        if self._user_instructions.strip():
+            parts.append(self._user_instructions.strip())
+        parts.extend(server_rules)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _lookup_mcp_configs(server_names: list[str]) -> list[dict[str, Any]]:
