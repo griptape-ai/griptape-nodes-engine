@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -57,6 +58,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMatchPathAgainstMacroRequest,
     AttemptMatchPathAgainstMacroResultFailure,
     AttemptMatchPathAgainstMacroResultSuccess,
+    ExportProjectRequest,
+    ExportProjectResultFailure,
+    ExportProjectResultSuccess,
     GetAllSituationsForProjectRequest,
     GetAllSituationsForProjectResultFailure,
     GetAllSituationsForProjectResultSuccess,
@@ -75,6 +79,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
+    ImportProjectRequest,
+    ImportProjectResultFailure,
+    ImportProjectResultSuccess,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
     LoadProjectTemplateRequest,
@@ -82,6 +89,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     MacroPath,
     PathResolutionFailureReason,
+    PreviewImportProjectRequest,
+    PreviewImportProjectResultFailure,
+    PreviewImportProjectResultSuccess,
     ProjectTemplateInfo,
     SaveProjectTemplateRequest,
     SaveProjectTemplateResultFailure,
@@ -108,6 +118,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     PROJECTS_TO_REGISTER_KEY,
     REQUIRES_ENGINE_KEY,
 )
+from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -471,6 +482,11 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(
             ActivateWorkspaceProjectRequest, self.on_activate_workspace_project_request
         )
+        event_manager.assign_manager_to_request_type(ExportProjectRequest, self.on_export_project_request)
+        event_manager.assign_manager_to_request_type(
+            PreviewImportProjectRequest, self.on_preview_import_project_request
+        )
+        event_manager.assign_manager_to_request_type(ImportProjectRequest, self.on_import_project_request)
 
         # Register app initialization listener
         event_manager.add_listener_to_app_event(
@@ -2238,6 +2254,179 @@ class ProjectManager:
         return ActivateWorkspaceProjectResultSuccess(
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
+
+    def on_export_project_request(
+        self, request: ExportProjectRequest
+    ) -> ExportProjectResultSuccess | ExportProjectResultFailure:
+        """Package a loaded project and its dependencies into a portable .zip.
+
+        Validates that the project is loaded and file-backed and that the
+        destination's parent directory exists, then hands the project base dir and
+        its adjacent griptape_nodes_config.json to ProjectPackager. Secret VALUES
+        never leave the machine: only required secret KEY names travel.
+        """
+        project_info = self._successfully_loaded_project_templates.get(request.project_id)
+        if project_info is None:
+            return ExportProjectResultFailure(
+                result_details=f"Attempted to export project '{request.project_id}'. Failed because it is not loaded.",
+            )
+        if project_info.project_file_path is None:
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}'. "
+                    f"Failed because it has no backing file (e.g. system defaults)."
+                ),
+            )
+
+        destination_path = request.destination_path
+        if not destination_path.parent.is_dir():
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}' to '{destination_path}'. "
+                    f"Failed because the destination directory '{destination_path.parent}' does not exist."
+                ),
+            )
+
+        project_dir = project_info.project_file_path.parent
+        adjacent_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
+
+        try:
+            result = ProjectPackager().package_project_to_zip(project_info, adjacent_config, destination_path)
+        except (RuntimeError, OSError) as err:
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}' to '{destination_path}'. "
+                    f"Failed during packaging because {err}"
+                ),
+            )
+
+        return ExportProjectResultSuccess(
+            archive_path=result.archive_path,
+            referenced_libraries=result.referenced_library_names,
+            copied_libraries=result.copied_library_names,
+            required_secret_keys=result.required_secret_keys,
+            warnings=result.warnings,
+            result_details=f"Exported project '{request.project_id}' to '{result.archive_path}'.",
+        )
+
+    def on_preview_import_project_request(
+        self, request: PreviewImportProjectRequest
+    ) -> PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure:
+        """Read a project package's manifest without extracting it (read-only).
+
+        Surfaces the manifest plus the required secret keys that are unset in the
+        current environment, computed via get_secret(should_error_on_not_found=False)
+        so nothing is written.
+        """
+        try:
+            manifest = ProjectPackager.read_manifest(request.archive_path)
+        except (FileNotFoundError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+            return PreviewImportProjectResultFailure(
+                result_details=(f"Attempted to preview project package '{request.archive_path}'. Failed because {err}"),
+            )
+
+        if not ProjectPackager.is_manifest_schema_compatible(manifest):
+            return PreviewImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to preview project package '{request.archive_path}'. "
+                    f"Failed because its manifest schema version "
+                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                ),
+            )
+
+        required_secret_keys = manifest.get("required_secret_keys", [])
+        unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
+        return PreviewImportProjectResultSuccess(
+            manifest=manifest,
+            unset_secret_keys=unset_secret_keys,
+            result_details=f"Read manifest from project package '{request.archive_path}'.",
+        )
+
+    async def on_import_project_request(
+        self, request: ImportProjectRequest
+    ) -> ImportProjectResultSuccess | ImportProjectResultFailure:
+        """Extract a project package to a target directory and register it.
+
+        Mirrors on_load_project_template_request: the package's base-dir tree is
+        extracted 1:1, the optional rename is applied to the extracted YAML, then
+        the project is loaded (which persists its path and re-derives a fresh id).
+        Macro-defined directories re-resolve against the new location automatically.
+        Secrets are never auto-created; required/unset keys are returned for the GUI.
+        """
+        try:
+            manifest = ProjectPackager.read_manifest(request.archive_path)
+        except (FileNotFoundError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+            return ImportProjectResultFailure(
+                result_details=f"Attempted to import project package '{request.archive_path}'. Failed because {err}",
+            )
+
+        if not ProjectPackager.is_manifest_schema_compatible(manifest):
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}'. "
+                    f"Failed because its manifest schema version "
+                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                ),
+            )
+
+        target_yaml = request.target_directory / WORKSPACE_PROJECT_FILE
+        if target_yaml.exists() and not request.overwrite_existing:
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed because a project file already exists at "
+                    f"'{target_yaml}' and overwrite_existing is False."
+                ),
+            )
+
+        try:
+            ProjectPackager.extract_archive(request.archive_path, request.target_directory)
+            if request.new_project_name is not None:
+                ProjectPackager.rename_project_template(target_yaml, request.new_project_name)
+        except (zipfile.BadZipFile, OSError) as err:
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed during extraction because {err}"
+                ),
+            )
+
+        load_result = await self.on_load_project_template_request(LoadProjectTemplateRequest(project_path=target_yaml))
+        if isinstance(load_result, LoadProjectTemplateResultFailure):
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Extracted successfully but the project failed to load: "
+                    f"{load_result.result_details}"
+                ),
+            )
+
+        required_secret_keys = manifest.get("required_secret_keys", [])
+        unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
+
+        if request.set_as_current:
+            await self.on_set_current_project_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        return ImportProjectResultSuccess(
+            project_id=load_result.project_id,
+            project_file_path=target_yaml,
+            required_secret_keys=required_secret_keys,
+            unset_secret_keys=unset_secret_keys,
+            warnings=manifest.get("warnings", []),
+            result_details=f"Imported project package '{request.archive_path}' into '{request.target_directory}'.",
+        )
+
+    def _compute_unset_secret_keys(self, required_secret_keys: list[str]) -> list[str]:
+        """Return the subset of required keys with no value in the current environment.
+
+        Uses get_secret(should_error_on_not_found=False) so detection never writes
+        a value or raises. Secrets are never auto-created on import.
+        """
+        return [
+            key
+            for key in required_secret_keys
+            if self._secrets_manager.get_secret(key, should_error_on_not_found=False) is None
+        ]
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Load system default project template when app initializes.
