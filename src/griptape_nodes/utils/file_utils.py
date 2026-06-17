@@ -5,10 +5,17 @@ from __future__ import annotations
 import logging
 import os
 import tempfile
+from dataclasses import dataclass
 from fnmatch import fnmatch
 from pathlib import Path
 
+import anyio
+
 logger = logging.getLogger(__name__)
+
+# Default ceiling on how deep recursive discovery walks. Bounds boot-time scans
+# against pathologically deep trees and symlink loops without a visited-set.
+DEFAULT_MAX_SEARCH_DEPTH = 10
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -180,4 +187,105 @@ def find_files_recursive(directory: Path, pattern: str, *, skip_hidden: bool = T
     else:
         logger.debug("Found %d file(s) matching pattern '%s' in directory: %s", len(matches), pattern, directory)
 
+    return sorted(matches)
+
+
+@dataclass
+class _AsyncWalkParams:
+    """Immutable walk settings shared across recursion levels of the async finder."""
+
+    pattern: str
+    skip_hidden: bool
+    max_depth: int
+    max_files: int | None
+    matches: list[Path]
+
+
+async def _arecurse_find(path: anyio.Path, depth: int, params: _AsyncWalkParams) -> None:
+    """Depth-bounded async walk that appends matching files into ``params.matches``.
+
+    Manual recursion via iterdir, because anyio.Path.rglob cannot express a
+    max_depth limit.
+    """
+    try:
+        entries = [entry async for entry in path.iterdir()]
+    except (PermissionError, OSError) as e:
+        logger.debug("Cannot access directory %s: %s", path, e)
+        return
+
+    for item in sorted(entries):
+        if params.max_files is not None and len(params.matches) >= params.max_files:
+            return
+        if params.skip_hidden and item.name.startswith("."):
+            continue
+
+        # is_file/is_dir stat the entry, which can raise on protected paths
+        # (e.g. macOS system caches). Skip the offending entry rather than
+        # aborting the whole directory.
+        try:
+            item_is_file = await item.is_file()
+            item_is_dir = await item.is_dir()
+        except (PermissionError, OSError) as e:
+            logger.debug("Cannot access entry %s: %s", item, e)
+            continue
+
+        if item_is_file:
+            if fnmatch(item.name, params.pattern):
+                params.matches.append(Path(item))
+        elif item_is_dir and depth < params.max_depth:
+            await _arecurse_find(item, depth + 1, params)
+
+
+async def afind_files_recursive(
+    directory: Path,
+    pattern: str,
+    *,
+    skip_hidden: bool = True,
+    max_depth: int = DEFAULT_MAX_SEARCH_DEPTH,
+    max_files: int | None = None,
+) -> list[Path]:
+    """Asynchronously search directory recursively for files matching pattern.
+
+    Async, depth-bounded counterpart to find_files_recursive, suitable for the
+    engine boot path: it walks via anyio so it yields to the event loop instead
+    of blocking it, and max_depth bounds recursion so a pathologically deep tree
+    or symlink loop can't stall startup.
+
+    Args:
+        directory: Directory to search in
+        pattern: Glob pattern to match file names against (e.g., '*.json')
+        skip_hidden: If True, skip hidden directories (those starting with .).
+            This avoids descending into large hidden trees like .git or .venv.
+        max_depth: Maximum directory depth to descend. 0 scans only the top-level
+            directory; each nested level adds 1. Defaults to DEFAULT_MAX_SEARCH_DEPTH.
+        max_files: If set, stop and return as soon as this many matches are found.
+
+    Returns:
+        Sorted list of matching file paths. Returns empty list if none found.
+    """
+    if not await anyio.Path(directory).exists():
+        logger.debug("Directory does not exist: %s", directory)
+        return []
+
+    if not await anyio.Path(directory).is_dir():
+        logger.debug("Path is not a directory: %s", directory)
+        return []
+
+    matches: list[Path] = []
+    params = _AsyncWalkParams(
+        pattern=pattern,
+        skip_hidden=skip_hidden,
+        max_depth=max_depth,
+        max_files=max_files,
+        matches=matches,
+    )
+    await _arecurse_find(anyio.Path(directory), 0, params)
+
+    if not matches:
+        logger.debug("No files matching pattern '%s' found in directory: %s", pattern, directory)
+    else:
+        logger.debug("Found %d file(s) matching pattern '%s' in directory: %s", len(matches), pattern, directory)
+
+    if max_files is not None:
+        return sorted(matches)[:max_files]
     return sorted(matches)

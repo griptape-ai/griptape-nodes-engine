@@ -1525,13 +1525,16 @@ situations:
         """on_app_initialization_complete sets workspace project as current when present."""
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
         from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
 
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
         workspace_project_path.write_text(self.VALID_PROJECT_YAML)
 
-        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
             if key == "project_file":
                 return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
             if "project_workspaces" in key:
                 return {}
             return str(tmp_path)
@@ -1555,10 +1558,13 @@ situations:
         """on_app_initialization_complete keeps system defaults when no workspace project file exists."""
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
 
-        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
             if key == "project_file":
                 return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
             if "project_workspaces" in key:
                 return {}
             return str(tmp_path)

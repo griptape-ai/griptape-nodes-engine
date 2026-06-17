@@ -90,7 +90,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
-from griptape_nodes.utils.file_utils import find_files_recursive
+from griptape_nodes.utils.file_utils import afind_files_recursive
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -2102,10 +2102,11 @@ class ProjectManager:
         Recursively scans for WORKSPACE_PROJECT_FILE, loading each match into
         memory without persisting it. The directory entry is the unit of
         registration, so discovered files cannot be individually unregistered;
-        they are re-discovered on each startup. Hidden directories (e.g. .venv,
-        .git) are skipped by find_files_recursive.
+        they are re-discovered on each startup. The scan is depth-bounded
+        (DEFAULT_MAX_SEARCH_DEPTH) and hidden directories (e.g. .venv, .git) are
+        skipped by afind_files_recursive.
         """
-        discovered = find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        discovered = await afind_files_recursive(directory, WORKSPACE_PROJECT_FILE)
         if not discovered:
             logger.warning(
                 "projects_to_register directory '%s' contains no '%s' files; skipping",
