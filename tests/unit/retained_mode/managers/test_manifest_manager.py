@@ -43,7 +43,8 @@ def _project_info() -> ProjectTemplateInfo:
     info = MagicMock(spec=ProjectTemplateInfo)
     info.project_id = "/workspace/projectA/griptape-nodes-project.yml"
     info.name = "Project A"
-    info.parent_project_path = None
+    info.project_file_path = "/workspace/projectA/griptape-nodes-project.yml"
+    info.parent_project_id = None
     return info
 
 
@@ -107,7 +108,7 @@ class TestManifestManager:
         project = manifest.project_templates[0]
         assert project.project_id == "/workspace/projectA/griptape-nodes-project.yml"
         assert project.name == "Project A"
-        assert project.parent_project_path is None
+        assert project.parent_project_id is None
         assert project.path == "/workspace/projectA/griptape-nodes-project.yml"
 
     @pytest.mark.asyncio
@@ -165,7 +166,8 @@ class TestManifestManager:
         default_info = MagicMock(spec=ProjectTemplateInfo)
         default_info.project_id = SYSTEM_DEFAULTS_KEY
         default_info.name = "Default Project"
-        default_info.parent_project_path = None
+        default_info.project_file_path = None
+        default_info.parent_project_id = None
 
         with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
             mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"

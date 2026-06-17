@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 # Field name constants
 FIELD_NAME = "name"
+FIELD_ID = "id"
 FIELD_SITUATIONS = "situations"
 FIELD_DIRECTORIES = "directories"
 FIELD_PROJECT_TEMPLATE_SCHEMA_VERSION = "project_template_schema_version"
@@ -30,6 +31,7 @@ FIELD_ENVIRONMENT = "environment"
 FIELD_FILE_EXTENSION_DIRECTORIES = "file_extension_directories"
 FIELD_DESCRIPTION = "description"
 FIELD_PARENT_PROJECT_PATH = "parent_project_path"
+FIELD_PARENT_PROJECT_ID = "parent_project_id"
 
 # Special constants
 ROOT_FIELD_PATH = "<root>"
@@ -84,12 +86,15 @@ class ProjectOverlayData(NamedTuple):
     description: str | None
     parent_project_path: str | PerPlatformProjectPath | None
     line_info: YAMLLineInfo
+    id: str | None = None
+    parent_project_id: str | None = None
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
     removed_file_extension_directories: frozenset[str] = frozenset()
     clears_description: bool = False
     clears_parent_project_path: bool = False
+    clears_parent_project_id: bool = False
 
 
 def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
@@ -356,6 +361,18 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
 
     file_extension_directories, removed_file_extension_directories = _split_tombstones(file_extension_directories_raw)
 
+    # Optional field: id. Absent on legacy projects; the manager derives the
+    # id from the canonicalized file path in that case. The id is opaque, so
+    # only a type check is applied here.
+    project_id = data.get(FIELD_ID)
+    if project_id is not None and not isinstance(project_id, str):
+        validation_info.add_error(
+            field_path=FIELD_ID,
+            message=f"Must be string, got {type(project_id).__name__}",
+            line_number=line_info.get_line(FIELD_ID),
+        )
+        project_id = None
+
     # Optional field: description. Distinguish absent (inherit base) from
     # explicit null (clear base value).
     clears_description = FIELD_DESCRIPTION in data and data.get(FIELD_DESCRIPTION) is None
@@ -403,6 +420,20 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
                 line_number=line_info.get_line(FIELD_PARENT_PROJECT_PATH),
             )
 
+    # Optional field: parent_project_id. Same absent-vs-null semantics as
+    # parent_project_path (absent = inherit base, explicit null = tombstone the
+    # link). Unlike the path form there is no per-platform variant: ids are
+    # engine-global opaque strings.
+    clears_parent_project_id = FIELD_PARENT_PROJECT_ID in data and data.get(FIELD_PARENT_PROJECT_ID) is None
+    parent_project_id = data.get(FIELD_PARENT_PROJECT_ID)
+    if parent_project_id is not None and not isinstance(parent_project_id, str):
+        validation_info.add_error(
+            field_path=FIELD_PARENT_PROJECT_ID,
+            message=f"Must be string, got {type(parent_project_id).__name__}",
+            line_number=line_info.get_line(FIELD_PARENT_PROJECT_ID),
+        )
+        parent_project_id = None
+
     return ProjectOverlayData(
         name=name,
         project_template_schema_version=schema_version,
@@ -413,12 +444,15 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         description=description,
         parent_project_path=parent_project_path,
         line_info=line_info,
+        id=project_id,
+        parent_project_id=parent_project_id,
         removed_situations=frozenset(removed_situations),
         removed_directories=frozenset(removed_directories),
         removed_environment=frozenset(removed_environment),
         removed_file_extension_directories=frozenset(removed_file_extension_directories),
         clears_description=clears_description,
         clears_parent_project_path=clears_parent_project_path,
+        clears_parent_project_id=clears_parent_project_id,
     )
 
 
