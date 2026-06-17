@@ -297,8 +297,24 @@ class ModelProviderUsageNodeProperty(BaseModel):
     provider_ids: list[str]
 
 
+class ArbitraryPythonExecutionNodeProperty(BaseModel):
+    """Declares that this node executes arbitrary Python code supplied at runtime.
+
+    A security-relevant identity fact: a node carrying this property runs Python
+    code that is not vetted at authoring time (e.g. an artist-supplied script).
+    Consumers (UI) can surface a warning before such a node runs. Absence of this
+    declaration means the node does not execute arbitrary Python.
+    """
+
+    type: Literal["arbitrary_python_execution"] = "arbitrary_python_execution"
+    executes_arbitrary_python: bool
+
+
 # See the comment above `LibraryDeclaration` for how `Annotated[... discriminator ...]` works.
 NodeDeclaration = Annotated[
-    LifecycleStageNodeProperty | ModelUsageNodeProperty | ModelProviderUsageNodeProperty,
+    LifecycleStageNodeProperty
+    | ModelUsageNodeProperty
+    | ModelProviderUsageNodeProperty
+    | ArbitraryPythonExecutionNodeProperty,
     Field(discriminator="type"),
 ]
