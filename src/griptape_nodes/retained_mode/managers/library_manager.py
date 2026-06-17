@@ -57,6 +57,10 @@ from griptape_nodes.node_library.library_registry import (
     NodeDefinition,
     NodeMetadata,
 )
+from griptape_nodes.node_library.library_validation import (
+    detect_retired_node_declarations,
+    validate_library_declarations,
+)
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     AppSessionStartedEvent,
@@ -951,7 +955,7 @@ class LibraryManager:
         result = GetLibraryMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
-    def load_library_metadata_from_file_request(  # noqa: PLR0911
+    def load_library_metadata_from_file_request(  # noqa: PLR0911, PLR0915, C901
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
         """Load library metadata from a JSON file without loading the actual node modules.
@@ -1001,6 +1005,24 @@ class LibraryManager:
         # Try to extract library name from JSON for better error reporting
         library_name = library_json.get("name") if isinstance(library_json, dict) else None
 
+        # Surface retired declaration types with migration guidance before the
+        # discriminated-union validator rejects them with an opaque message.
+        if isinstance(library_json, dict):
+            retired_problems = detect_retired_node_declarations(library_json)
+            if retired_problems:
+                details = (
+                    f"Attempted to load Library JSON file from '{json_path}'. "
+                    f"Failed because it uses node declaration types removed in a newer schema. "
+                    f"Count: {len(retired_problems)}."
+                )
+                return LoadLibraryMetadataFromFileResultFailure(
+                    library_path=file_path,
+                    library_name=library_name,
+                    status=LibraryManager.LibraryFitness.UNUSABLE,
+                    problems=retired_problems,
+                    result_details=details,
+                )
+
         # Do you comport, my dude
         try:
             library_data = LibrarySchema.model_validate(library_json)
@@ -1040,6 +1062,23 @@ class LibraryManager:
                 library_name=library_data.name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=[InvalidVersionStringProblem(version_string=str(library_data.metadata.library_version))],
+                result_details=details,
+            )
+
+        # Resolve cross-references between declarations (catalog model ids,
+        # node-level model_usage references, etc.). Any problem blocks the load.
+        declaration_problems = validate_library_declarations(library_data)
+        if declaration_problems:
+            details = (
+                f"Attempted to load Library '{library_data.name}' JSON file from '{json_path}'. "
+                f"Failed because declarative references did not resolve. "
+                f"Count: {len(declaration_problems)}."
+            )
+            return LoadLibraryMetadataFromFileResultFailure(
+                library_path=file_path,
+                library_name=library_data.name,
+                status=LibraryManager.LibraryFitness.UNUSABLE,
+                problems=list(declaration_problems),
                 result_details=details,
             )
 
