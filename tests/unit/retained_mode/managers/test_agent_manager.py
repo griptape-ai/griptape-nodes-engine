@@ -39,7 +39,7 @@ def agent_manager() -> AgentManager:
 
 
 class TestComposeInstructions:
-    """Per-MCP-server `rules` are folded into the system prompt, not dropped."""
+    """Per-MCP-server `rules` are folded into the instructions string, not dropped."""
 
     def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
         agent_manager._instructions = "BASE"

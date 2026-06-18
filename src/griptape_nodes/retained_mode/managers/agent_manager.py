@@ -91,7 +91,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
 )
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
@@ -179,6 +179,7 @@ class AgentManager:
         self._model_name: str = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
+        self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
 
         self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
@@ -217,11 +218,23 @@ class AgentManager:
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
             )
+            event_manager.add_listener_to_app_event(
+                ConfigChanged,
+                self._on_config_changed,
+            )
 
     def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         sock = bind_free_socket(GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT)
         self._mcp_server_port = sock.getsockname()[1]
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
+
+    def _on_config_changed(self, event: ConfigChanged) -> None:
+        if event.key not in ("agent.system_prompt", "agent", ""):
+            return
+        new_value = config_manager.get_config_value("agent.system_prompt", default="")
+        if new_value != self._system_prompt_extra:
+            self._system_prompt_extra = new_value
+            self._runner_cache.clear()
 
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
         try:
@@ -509,6 +522,7 @@ class AgentManager:
             workspace_root=workspace_root,
             storage=self._thread_storage,
             instructions=self._compose_instructions(server_rules),
+            system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
@@ -520,15 +534,16 @@ class AgentManager:
         return runner
 
     def _compose_instructions(self, server_rules: list[str]) -> str:
-        """Append any per-MCP-server `rules` to the base instructions.
+        """Compose the instructions string from base rules and per-MCP-server rules.
 
-        The previous harness injected each enabled MCP server's configured
-        ``rules`` as agent rulesets; this folds them into the system prompt so
-        that user-configured per-server guidance is not silently dropped.
+        Composition order: built-in base instructions → per-MCP-server rules (if
+        any). The base instructions are always first so their non-negotiable
+        behavioral rules cannot be overridden. User system prompt text is passed
+        separately via PydanticAgentRunner.system_prompt.
         """
-        if not server_rules:
-            return self._instructions
-        return self._instructions + "\n\n" + "\n\n".join(server_rules)
+        parts = [self._instructions]
+        parts.extend(server_rules)
+        return "\n\n".join(parts)
 
     @staticmethod
     def _lookup_mcp_configs(server_names: list[str]) -> list[dict[str, Any]]:
