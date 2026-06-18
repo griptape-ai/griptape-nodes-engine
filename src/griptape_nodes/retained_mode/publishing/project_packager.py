@@ -216,6 +216,16 @@ class ProjectPackager:
         dict). The template.environment field resolves builtins/dirs/shell-env,
         not secrets, so it is not a secret source. GetAllSecretValuesRequest is
         never used: no secret VALUE ever leaves the machine.
+
+        Scoping caveat: secrets_to_register reflects the engine's MERGED GLOBAL
+        config (the currently-active project plus its LOADED libraries' declared
+        secrets), not the exported project's own adjacent config. Exporting a
+        project that is not the active one can therefore both over-report (keys
+        the active project's libraries need but the exported one does not) and
+        under-report (the exported project's own libraries are not loaded, so
+        their declared secrets never reach the global config). Exporting the
+        active project yields the closest-to-correct list. Scoping the key list
+        to the exported project specifically is deferred.
         """
         return sorted(GriptapeNodes.SecretsManager().secrets_to_register.keys())
 

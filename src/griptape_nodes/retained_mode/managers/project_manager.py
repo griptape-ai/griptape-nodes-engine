@@ -2264,6 +2264,12 @@ class ProjectManager:
         destination's parent directory exists, then hands the project base dir and
         its adjacent griptape_nodes_config.json to ProjectPackager. Secret VALUES
         never leave the machine: only required secret KEY names travel.
+
+        Any loaded project may be exported, active or not. The library/asset
+        content is read from the exported project's own files and is correct
+        regardless. The required-secret-KEY list, however, is derived from the
+        engine's merged global config and is most accurate when the exported
+        project is the active one (see ProjectPackager.collect_required_secret_keys).
         """
         project_info = self._successfully_loaded_project_templates.get(request.project_id)
         if project_info is None:
@@ -2304,6 +2310,7 @@ class ProjectManager:
                 ),
             )
 
+        logger.info("Exported project '%s' to '%s'", request.project_id, result.archive_path)
         return ExportProjectResultSuccess(
             archive_path=result.archive_path,
             referenced_libraries=result.referenced_library_names,
