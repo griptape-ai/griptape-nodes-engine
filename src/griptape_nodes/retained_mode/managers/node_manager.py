@@ -3542,8 +3542,14 @@ class NodeManager:
         with GriptapeNodes.ContextManager().node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
                 if isinstance(
-                    element_command, (AlterParameterDetailsRequest, AddParameterToNodeRequest)
-                ):  # are there more types of requests we could encounter here?
+                    element_command,
+                    (
+                        AlterParameterDetailsRequest,
+                        AddParameterToNodeRequest,
+                        AddParameterGroupToNodeRequest,
+                        AlterParameterGroupDetailsRequest,
+                    ),
+                ):
                     element_command.node_name = node_name
                 element_result = GriptapeNodes().handle_request(element_command)
                 if element_result.failed():
