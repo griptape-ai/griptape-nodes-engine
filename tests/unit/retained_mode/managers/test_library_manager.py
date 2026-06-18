@@ -3158,3 +3158,82 @@ class TestModelCatalogResolution:
         node = _ModelProbe(name="stale", metadata={"library": "no-such-library", "node_type": _ModelProbe.__name__})
 
         assert get_declared_models(node) == []
+
+
+class TestLibraryManagerMetadataLoadFailureSurfacing:
+    """A failed metadata load must surface its real status and problems on the LibraryInfo.
+
+    Regression guard: a metadata-load failure used to be stored back unchanged, leaving the
+    library at its pre-load defaults so status output rendered it as
+    "*UNKNOWN* v*UNKNOWN* (PENDING) - No problems detected." even though the load failed.
+    """
+
+    @pytest.mark.asyncio
+    async def test_schema_validation_failure_surfaces_on_library_info(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        library_manager = griptape_nodes.LibraryManager()
+
+        # A library JSON with a usable name and version but a schema-violating body (missing
+        # required categories/nodes), mirroring the user's "settings.0.category" failure.
+        lib_dir = tmp_path / "broken"
+        lib_dir.mkdir()
+        lib_json = lib_dir / "griptape_nodes_library.json"
+        lib_json.write_text(
+            json.dumps({"name": "broken-lib", "metadata": {"library_version": "1.2.3"}, "settings": [{"foo": "bar"}]})
+        )
+        file_path = str(lib_json)
+
+        library_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path=file_path,
+            is_sandbox=False,
+        )
+        library_manager._library_file_path_to_info = {file_path: library_info}
+
+        result = await library_manager._progress_library_through_lifecycle(
+            library_info, file_path, RegisterLibraryFromFileRequest(file_path=file_path)
+        )
+
+        assert isinstance(result, RegisterLibraryFromFileResultFailure)
+
+        stored = library_manager._library_file_path_to_info[file_path]
+        assert stored.lifecycle_state == LibraryManager.LibraryLifecycleState.FAILURE
+        assert stored.fitness == LibraryManager.LibraryFitness.UNUSABLE
+        # Name is extracted from the raw JSON rather than left as None (*UNKNOWN*).
+        assert stored.library_name == "broken-lib"
+        # Version is extracted from the raw JSON rather than left as None (v*UNKNOWN*).
+        assert stored.library_version == "1.2.3"
+        # Problems are recorded, so status output shows the real error instead of
+        # "No problems detected."
+        assert stored.problems
+        assert library_manager.collate_problems_for_lib_info(stored) is not None
+
+    @pytest.mark.asyncio
+    async def test_missing_file_surfaces_missing_fitness(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        library_manager = griptape_nodes.LibraryManager()
+
+        file_path = str(tmp_path / "does_not_exist" / "griptape_nodes_library.json")
+        library_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path=file_path,
+            is_sandbox=False,
+        )
+        library_manager._library_file_path_to_info = {file_path: library_info}
+
+        result = await library_manager._progress_library_through_lifecycle(
+            library_info, file_path, RegisterLibraryFromFileRequest(file_path=file_path)
+        )
+
+        assert isinstance(result, RegisterLibraryFromFileResultFailure)
+
+        stored = library_manager._library_file_path_to_info[file_path]
+        assert stored.lifecycle_state == LibraryManager.LibraryLifecycleState.FAILURE
+        assert stored.fitness == LibraryManager.LibraryFitness.MISSING
+        assert stored.problems
