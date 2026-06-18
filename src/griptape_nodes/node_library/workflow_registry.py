@@ -58,6 +58,8 @@ class WorkflowMetadata(BaseModel):
     image: str | None = None
     is_griptape_provided: bool | None = False
     is_template: bool | None = False
+    # Hidden from the GUI workflow picker. Set on library-internal workflows (e.g. integration tests)
+    # that ship inside a library directory but should never surface to users.
     is_private: bool | None = False
     creation_date: datetime | None = Field(default=None)
     last_modified_date: datetime | None = Field(default=None)
