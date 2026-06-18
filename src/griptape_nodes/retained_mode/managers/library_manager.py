@@ -226,7 +226,7 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
-from griptape_nodes.utils.file_utils import afind_files_recursive, find_file_in_directory
+from griptape_nodes.utils.file_utils import find_files_recursive, find_file_in_directory
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
     GitPullError,
@@ -3416,7 +3416,7 @@ class LibraryManager:
                 return None
             libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
 
-        for manifest_path in await afind_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+        for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
                 manifest = json.loads(content)
@@ -5008,10 +5008,10 @@ class LibraryManager:
         async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
             """Process a path, handling both files and directories."""
             if await anyio.Path(path).is_dir():
-                # Recursively find library files. afind_files_recursive skips hidden
+                # Recursively find library files. find_files_recursive skips hidden
                 # directories and bounds recursion depth so a deep or symlink-looped
                 # tree can't stall the boot scan.
-                for lib_path in await afind_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+                for lib_path in await find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
                         discovered_entries.append(

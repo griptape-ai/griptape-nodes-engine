@@ -193,7 +193,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
-from griptape_nodes.utils.file_utils import afind_files_recursive
+from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
@@ -5678,10 +5678,10 @@ class WorkflowManager:
             if not await apath.exists():
                 return
             if await apath.is_dir():
-                # afind_files_recursive skips hidden directories (.venv, .git) and
+                # find_files_recursive skips hidden directories (.venv, .git) and
                 # bounds recursion depth, so a deep or symlink-looped tree can't stall
                 # the boot scan.
-                for workflow_file in await afind_files_recursive(path, "*.py"):
+                for workflow_file in await find_files_recursive(path, "*.py"):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).

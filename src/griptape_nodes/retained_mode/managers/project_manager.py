@@ -102,7 +102,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     PROJECTS_TO_REGISTER_KEY,
     REQUIRES_ENGINE_KEY,
 )
-from griptape_nodes.utils.file_utils import afind_files_recursive
+from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
@@ -2627,9 +2627,9 @@ class ProjectManager:
         registration, so discovered files cannot be individually unregistered;
         they are re-discovered on each startup. The scan is depth-bounded by the
         `discovery_max_depth` setting and hidden directories (e.g. .venv, .git)
-        are skipped by afind_files_recursive.
+        are skipped by find_files_recursive.
         """
-        discovered = await afind_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
         if not discovered:
             logger.warning(
                 "projects_to_register directory '%s' contains no '%s' files; skipping",

@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 def _config_value_side_effect(libraries: list[str]) -> Callable[..., object]:
     """Return a get_config_value stub that only answers the libraries_to_register key.
 
-    afind_files_recursive reads the discovery_max_depth setting through the same
+    find_files_recursive reads the discovery_max_depth setting through the same
     ConfigManager, so a blanket return_value would feed it the library list. This
     answers the library key with the provided list and defers every other key to
     the caller's own `default` (so the depth read gets its int fallback).

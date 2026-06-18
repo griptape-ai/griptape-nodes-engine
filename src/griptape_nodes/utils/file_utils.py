@@ -198,7 +198,7 @@ async def _arecurse_find(path: anyio.Path, depth: int, params: _AsyncWalkParams)
             await _arecurse_find(item, depth + 1, params)
 
 
-async def afind_files_recursive(
+async def find_files_recursive(
     directory: Path,
     pattern: str,
     *,

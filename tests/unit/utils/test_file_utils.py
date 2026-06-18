@@ -10,7 +10,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.file_utils import (
-    afind_files_recursive,
+    find_files_recursive,
     atomic_write_bytes,
     find_all_files_in_directory,
     find_file_in_directory,
@@ -242,7 +242,7 @@ class TestFindAllFilesInDirectory:
 
 
 class TestAfindFilesRecursive:
-    """Test afind_files_recursive: the async, depth-bounded finder."""
+    """Test find_files_recursive: the async, depth-bounded finder."""
 
     @pytest.fixture
     def temp_dir(self) -> Generator[Path, None, None]:
@@ -253,7 +253,7 @@ class TestAfindFilesRecursive:
     @pytest.mark.asyncio
     async def test_when_directory_does_not_exist(self) -> None:
         """Empty list is returned when directory doesn't exist."""
-        result = await afind_files_recursive(Path("/non/existent/directory"), "*.json")
+        result = await find_files_recursive(Path("/non/existent/directory"), "*.json")
 
         assert result == []
 
@@ -263,7 +263,7 @@ class TestAfindFilesRecursive:
         test_file = temp_dir / "test.txt"
         test_file.write_text("content")
 
-        result = await afind_files_recursive(test_file, "*.json")
+        result = await find_files_recursive(test_file, "*.json")
 
         assert result == []
 
@@ -273,7 +273,7 @@ class TestAfindFilesRecursive:
         (temp_dir / "test.txt").write_text("content")
         (temp_dir / "another.py").write_text("content")
 
-        result = await afind_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == []
 
@@ -287,7 +287,7 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [file1, file2, file3]
 
@@ -306,7 +306,7 @@ class TestAfindFilesRecursive:
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [file1, file3, file2]
 
@@ -320,7 +320,7 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [visible_file]
 
@@ -334,7 +334,7 @@ class TestAfindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json", skip_hidden=False)
+        result = await find_files_recursive(temp_dir, "*.json", skip_hidden=False)
 
         assert set(result) == {hidden_file, visible_file}
 
@@ -347,7 +347,7 @@ class TestAfindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*library*.json")
+        result = await find_files_recursive(temp_dir, "*library*.json")
 
         assert result == sorted([file1, file2])
 
@@ -361,7 +361,7 @@ class TestAfindFilesRecursive:
         nested_file.write_text("{}")
 
         with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=0):
-            result = await afind_files_recursive(temp_dir, "*.json")
+            result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [root_file]
 
@@ -375,7 +375,7 @@ class TestAfindFilesRecursive:
         below_cap.write_text("{}")
 
         with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=1):
-            result = await afind_files_recursive(temp_dir, "*.json")
+            result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [at_cap]
 
@@ -385,7 +385,7 @@ class TestAfindFilesRecursive:
         for name in ["a.json", "b.json", "c.json", "d.json"]:
             (temp_dir / name).write_text("{}")
 
-        result = await afind_files_recursive(temp_dir, "*.json", max_files=2)
+        result = await find_files_recursive(temp_dir, "*.json", max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
 
