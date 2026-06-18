@@ -26,6 +26,7 @@ from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
 from .node_class_not_found_problem import NodeClassNotFoundProblem
 from .node_module_import_problem import NodeModuleImportProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
+from .permission_denied_library_problem import PermissionDeniedLibraryProblem
 from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
@@ -62,6 +63,7 @@ __all__ = [
     "NodeClassNotFoundProblem",
     "NodeModuleImportProblem",
     "OldXdgLocationWarningProblem",
+    "PermissionDeniedLibraryProblem",
     "RetiredNodeDeclarationProblem",
     "SandboxDirectoryMissingProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",

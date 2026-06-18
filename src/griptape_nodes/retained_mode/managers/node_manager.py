@@ -291,6 +291,11 @@ class NodeManager:
         self._worker_inflight_aprocesses: dict[str, tuple[asyncio.Task, BaseNode]] = {}
 
         event_manager.assign_manager_to_request_type(CreateNodeRequest, self.on_create_node_request)
+        # CreateNodeRequest screens itself through the pre-dispatch hook chain from
+        # inside its handler so a denial can be turned into an Error Proxy node
+        # (rather than a bare short-circuit) and so node creation reached by direct
+        # call is gated the same as dispatched creation.
+        event_manager.mark_request_type_self_screened(CreateNodeRequest)
         event_manager.assign_manager_to_request_type(
             AddNodesToNodeGroupRequest, self.on_add_nodes_to_node_group_request
         )
@@ -495,6 +500,21 @@ class NodeManager:
         # OK, let's try and create the Node.
         node = None
         try:
+            # Screen creation through the registered pre-dispatch hook chain (the
+            # host application installs license-policy enforcement there).
+            # CreateNodeRequest is marked self-screened, so the dispatcher does not
+            # screen it automatically; running the chain here gates dispatched and
+            # direct-call creation alike. A short-circuit means a hook forbids this
+            # node type: raise so the error-proxy path below substitutes a
+            # placeholder carrying the explanation.
+            policy_denial = GriptapeNodes.EventManager().run_pre_dispatch_hooks(request)
+            if policy_denial is not None:
+                denial_detail = getattr(policy_denial, "result_details", None)
+                raise PermissionError(  # noqa: TRY301
+                    str(denial_detail)
+                    if denial_detail
+                    else f"Creating a node of type '{request.node_type}' is not permitted by the active policy."
+                )
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,

@@ -647,3 +647,63 @@ class TestPreDispatchHooks:
 
         assert event.result.failed()
         assert handler_calls == []
+
+    def test_run_pre_dispatch_hooks_runs_chain_explicitly(self) -> None:
+        event_manager = EventManager()
+
+        # No hooks registered: nothing to short-circuit.
+        assert event_manager.run_pre_dispatch_hooks(_ProbeRequest()) is None
+
+        def denier(_request: RequestPayload, _context: object) -> _DeniedResult:
+            return _DeniedResult(result_details="denied")
+
+        event_manager.add_pre_dispatch_hook(denier)
+
+        result = event_manager.run_pre_dispatch_hooks(_ProbeRequest())
+        assert isinstance(result, _DeniedResult)
+        assert "denied" in str(result.result_details)
+
+    def test_self_screened_type_is_not_auto_screened_by_dispatcher(self) -> None:
+        event_manager = EventManager()
+        handler_calls: list[RequestPayload] = []
+
+        def handler(request: _ProbeRequest) -> _ProbeResult:
+            handler_calls.append(request)
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.mark_request_type_self_screened(_ProbeRequest)
+
+        def denier(_request: RequestPayload, _context: object) -> _DeniedResult:
+            return _DeniedResult(result_details="denied")
+
+        event_manager.add_pre_dispatch_hook(denier)
+
+        # The dispatcher skips the automatic screen for a self-screened type, so a
+        # denying hook does not short-circuit; the handler runs and decides.
+        event = event_manager.handle_request(_ProbeRequest())
+        assert event.result.succeeded()
+        assert len(handler_calls) == 1
+        # The handler can still run the chain itself and observe the denial.
+        assert isinstance(event_manager.run_pre_dispatch_hooks(_ProbeRequest()), _DeniedResult)
+
+    @pytest.mark.asyncio
+    async def test_self_screened_type_is_not_auto_screened_async(self) -> None:
+        event_manager = EventManager()
+        handler_calls: list[RequestPayload] = []
+
+        async def handler(request: _ProbeRequest) -> _ProbeResult:
+            handler_calls.append(request)
+            return _ProbeResult(result_details="ok")
+
+        event_manager.assign_manager_to_request_type(_ProbeRequest, handler)
+        event_manager.mark_request_type_self_screened(_ProbeRequest)
+
+        def denier(_request: RequestPayload, _context: object) -> _DeniedResult:
+            return _DeniedResult(result_details="denied")
+
+        event_manager.add_pre_dispatch_hook(denier)
+
+        event = await event_manager.ahandle_request(_ProbeRequest())
+        assert event.result.succeeded()
+        assert len(handler_calls) == 1

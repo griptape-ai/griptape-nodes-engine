@@ -123,6 +123,12 @@ class EventManager:
         # chain is skipped so the hook can't keep re-triggering itself into
         # unbounded recursion.
         self._hook_evaluation = threading.local()
+        # Request types whose handler runs the pre-dispatch hook chain itself
+        # (via run_pre_dispatch_hooks) instead of being screened automatically by
+        # the dispatcher. Lets a handler shape a short-circuit outcome -- e.g.
+        # turn a denial into an error-proxy node -- and keeps a request gated
+        # identically whether it arrived through dispatch or a direct call.
+        self._self_screened_request_types: set[type[RequestPayload]] = set()
 
     @property
     def event_queue(self) -> asyncio.Queue:
@@ -316,6 +322,30 @@ class EventManager:
             return None
         finally:
             self._hook_evaluation.active = False
+
+    def mark_request_type_self_screened(self, request_type: type[RequestPayload]) -> None:
+        """Declare that `request_type`'s handler runs the pre-dispatch hook chain itself.
+
+        The dispatcher then skips its automatic pre-dispatch screen for this type
+        (in both `handle_request` and `ahandle_request`). The handler is expected
+        to call `run_pre_dispatch_hooks` and act on any short-circuit result. Use
+        this when a handler needs to shape the short-circuit outcome rather than
+        return it verbatim, or when the operation is also reached by direct calls
+        that never pass through the dispatcher.
+        """
+        self._self_screened_request_types.add(request_type)
+
+    def run_pre_dispatch_hooks(self, request: RequestPayload) -> ResultPayload | None:
+        """Run the registered pre-dispatch hook chain against `request`.
+
+        Public counterpart to the automatic screen the dispatcher performs.
+        Returns the first hook's short-circuit `ResultPayload`, or None when every
+        hook falls through. Intended for handlers of self-screened request types
+        (see `mark_request_type_self_screened`) and for operations invoked by
+        direct method call rather than through `handle_request`, which would
+        otherwise never see the chain.
+        """
+        return self._run_pre_dispatch_hooks(request, ResultContext())
 
     def assign_manager_to_request_type(
         self,
@@ -609,14 +639,18 @@ class EventManager:
             raise TypeError(msg)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
-        # the manager callback runs.
-        short_circuit = self._run_pre_dispatch_hooks(request, result_context)
-        if short_circuit is not None:
-            return self._handle_request_core(
-                request,
-                short_circuit,
-                context=result_context,
-            )
+        # the manager callback runs. A self-screened request type runs the hook
+        # chain from inside its own handler so it can shape the outcome (e.g.
+        # substitute an error proxy), so skip the automatic screen here to avoid
+        # running the chain twice.
+        if request_type not in self._self_screened_request_types:
+            short_circuit = self._run_pre_dispatch_hooks(request, result_context)
+            if short_circuit is not None:
+                return self._handle_request_core(
+                    request,
+                    short_circuit,
+                    context=result_context,
+                )
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
@@ -637,7 +671,7 @@ class EventManager:
         finally:
             _active_request_type.reset(token)
 
-    def handle_request(  # noqa: PLR0912
+    def handle_request(  # noqa: PLR0912, C901
         self,
         request: RP,
         *,
@@ -665,14 +699,18 @@ class EventManager:
             raise TypeError(msg)
 
         # Pre-dispatch hooks (e.g. PermissionManager) may short-circuit before
-        # the manager callback runs.
-        short_circuit = self._run_pre_dispatch_hooks(request, result_context)
-        if short_circuit is not None:
-            return self._handle_request_core(
-                request,
-                short_circuit,
-                context=result_context,
-            )
+        # the manager callback runs. A self-screened request type runs the hook
+        # chain from inside its own handler so it can shape the outcome (e.g.
+        # substitute an error proxy), so skip the automatic screen here to avoid
+        # running the chain twice.
+        if request_type not in self._self_screened_request_types:
+            short_circuit = self._run_pre_dispatch_hooks(request, result_context)
+            if short_circuit is not None:
+                return self._handle_request_core(
+                    request,
+                    short_circuit,
+                    context=result_context,
+                )
 
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)

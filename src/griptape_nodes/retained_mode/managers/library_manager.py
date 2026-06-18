@@ -211,6 +211,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
     OldXdgLocationWarningProblem,
+    PermissionDeniedLibraryProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
 )
@@ -4832,6 +4833,21 @@ class LibraryManager:
         """
         schema = request.schema
         problems: list[LibraryProblem] = []
+
+        # Screen the load through the registered pre-dispatch hook chain (the host
+        # application installs license-policy enforcement there). This handler is
+        # reached by direct call, not dispatch, so it runs the chain explicitly.
+        # A short-circuit means a hook forbids the library; treat it as unusable
+        # and surface the hook's explanation on the library's failure icon.
+        policy_denial = GriptapeNodes.EventManager().run_pre_dispatch_hooks(request)
+        if policy_denial is not None:
+            detail = getattr(policy_denial, "result_details", None)
+            problems.append(PermissionDeniedLibraryProblem(detail=str(detail) if detail else ""))
+            return EvaluateLibraryFitnessResultFailure(
+                result_details=f"Library '{schema.name}' is not permitted by the active policy.",
+                fitness=LibraryManager.LibraryFitness.UNUSABLE,
+                problems=problems,
+            )
 
         # Check for version-based compatibility issues
         version_issues = GriptapeNodes.VersionCompatibilityManager().check_library_version_compatibility(schema)
