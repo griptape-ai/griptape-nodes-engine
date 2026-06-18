@@ -274,6 +274,13 @@ class WorkerSettings(BaseModel):
     )
 
 
+class AgentSettings(BaseModel):
+    instructions: str = Field(
+        default="",
+        description="Additional instructions appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
+    )
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -429,8 +436,7 @@ class Settings(BaseModel):
         default_factory=dict,
         description="Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
     )
-    agent_instructions: str = Field(
+    agent: AgentSettings = Field(
         category=AGENT,
-        default="",
-        description="Additional instructions appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
+        default_factory=AgentSettings,
     )

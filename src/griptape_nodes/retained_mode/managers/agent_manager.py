@@ -91,7 +91,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
 )
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
 from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
@@ -179,7 +179,7 @@ class AgentManager:
         self._model_name: str = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
-        self._user_instructions: str = config_manager.get_config_value("agent_instructions", default="")
+        self._user_instructions: str = config_manager.get_config_value("agent.instructions", default="")
 
         self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
@@ -218,11 +218,23 @@ class AgentManager:
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
             )
+            event_manager.add_listener_to_app_event(
+                ConfigChanged,
+                self._on_config_changed,
+            )
 
     def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         sock = bind_free_socket(GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT)
         self._mcp_server_port = sock.getsockname()[1]
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
+
+    def _on_config_changed(self, event: ConfigChanged) -> None:
+        if event.key not in ("agent.instructions", "agent", ""):
+            return
+        new_value = config_manager.get_config_value("agent.instructions", default="")
+        if new_value != self._user_instructions:
+            self._user_instructions = new_value
+            self._runner_cache.clear()
 
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
         try:
@@ -444,12 +456,6 @@ class AgentManager:
                 new_image_model = str(request.image_generation_driver["model"])
                 if new_image_model != self._image_model_name:
                     self._image_model_name = new_image_model
-                    self._runner_cache.clear()
-            if request.instructions is not None:
-                new_instructions = request.instructions
-                if new_instructions != self._user_instructions:
-                    self._user_instructions = new_instructions
-                    config_manager.set_config_value("agent_instructions", new_instructions)
                     self._runner_cache.clear()
         except Exception as e:
             details = f"Error configuring agent: {e}"

@@ -176,15 +176,12 @@ class ConfigureAgentRequest(RequestPayload):
     Args:
         prompt_driver: Dictionary of prompt driver configuration options
         image_generation_driver: Dictionary of image generation driver configuration options
-        instructions: Additional instructions appended to the agent's built-in system prompt.
-            Pass an empty string to clear user instructions. Pass None to leave unchanged.
 
     Results: ConfigureAgentResultSuccess | ConfigureAgentResultFailure (configuration error)
     """
 
     prompt_driver: dict = field(default_factory=dict)
     image_generation_driver: dict = field(default_factory=dict)
-    instructions: str | None = None
 
 
 @dataclass
