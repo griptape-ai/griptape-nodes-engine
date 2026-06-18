@@ -335,8 +335,21 @@ def register_broadcast_handlers(
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
         # A worker boots like an engine off the same shared on-disk config, so the
-        # orchestrator's project id is already loaded in the worker's registry. Adopt
-        # it by id; no load-by-path step is needed. SYSTEM_DEFAULTS_KEY is a normal id.
+        # orchestrator's project id is usually already loaded in the worker's registry.
+        # But a worker's registry is frozen at boot: if the orchestrator switched to a
+        # project it registered AFTER this worker spawned, the id is absent here. Re-read
+        # the shared config and re-run registered-project discovery (engine-style) so the
+        # worker learns it. Fail loud if the id is still unknown -- silently landing on a
+        # stale project while reporting success is exactly the divergence we must avoid.
+        if not await project_manager.ensure_project_loaded(request.project_id):
+            details = (
+                f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                f"Failed because the id is absent from the worker's registry even after "
+                f"reloading config and re-running registered-project discovery."
+            )
+            logger.error(details)
+            return ActivateProjectResultFailure(result_details=details)
+
         set_result = await project_manager.on_set_current_project_request(
             SetCurrentProjectRequest(project_id=request.project_id)
         )

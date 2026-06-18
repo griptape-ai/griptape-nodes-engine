@@ -1546,6 +1546,25 @@ class ProjectManager:
 
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
+    async def ensure_project_loaded(self, project_id: ProjectID) -> bool:
+        """Ensure a project id is present in the in-memory registry, re-deriving if absent.
+
+        A worker boots like an engine and freezes its project registry at boot
+        (`_load_registered_projects` / `_load_workspace_project` run only from
+        `on_app_initialization_complete`). When the orchestrator switches to a project it
+        registered AFTER this worker spawned, the worker's registry lacks that id. This
+        re-reads the shared on-disk config and re-runs registered-project discovery (the
+        same derivation boot uses) so the worker learns projects registered after spawn.
+
+        Returns True if the id is present (already, or after re-derivation), False
+        otherwise. SYSTEM_DEFAULTS_KEY is loaded at boot and so is always present.
+        """
+        if project_id in self._successfully_loaded_project_templates:
+            return True
+        self._config_manager.load_configs()
+        await self._load_registered_projects()
+        return project_id in self._successfully_loaded_project_templates
+
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
     ) -> GetCurrentProjectResultSuccess | GetCurrentProjectResultFailure:
