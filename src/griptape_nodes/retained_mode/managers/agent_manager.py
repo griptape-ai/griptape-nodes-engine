@@ -179,7 +179,7 @@ class AgentManager:
         self._model_name: str = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
-        self._user_instructions: str = config_manager.get_config_value("agent.instructions", default="")
+        self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
 
         self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
         self._thread_storage: LocalThreadStorageDriver = LocalThreadStorageDriver(
@@ -229,11 +229,11 @@ class AgentManager:
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
-        if event.key not in ("agent.instructions", "agent", ""):
+        if event.key not in ("agent.system_prompt", "agent", ""):
             return
-        new_value = config_manager.get_config_value("agent.instructions", default="")
-        if new_value != self._user_instructions:
-            self._user_instructions = new_value
+        new_value = config_manager.get_config_value("agent.system_prompt", default="")
+        if new_value != self._system_prompt_extra:
+            self._system_prompt_extra = new_value
             self._runner_cache.clear()
 
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
@@ -540,8 +540,8 @@ class AgentManager:
         first so their non-negotiable behavioral rules cannot be overridden.
         """
         parts = [self._instructions]
-        if self._user_instructions.strip():
-            parts.append(self._user_instructions.strip())
+        if self._system_prompt_extra.strip():
+            parts.append(self._system_prompt_extra.strip())
         parts.extend(server_rules)
         return "\n\n".join(parts)
 

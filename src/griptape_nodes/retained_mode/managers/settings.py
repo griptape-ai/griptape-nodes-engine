@@ -44,7 +44,7 @@ MCP_SERVERS = Category(name="MCP Servers", description="Model Context Protocol s
 PROJECTS = Category(name="Projects", description="Project template configurations and registrations")
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
-AGENT = Category(name="Agent", description="Agent behavior and instructions")
+AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -275,9 +275,9 @@ class WorkerSettings(BaseModel):
 
 
 class AgentSettings(BaseModel):
-    instructions: str = Field(
+    system_prompt: str = Field(
         default="",
-        description="Additional instructions appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
+        description="Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
     )
 
 
