@@ -19,6 +19,7 @@ schema shape.
 
 from __future__ import annotations
 
+from collections import defaultdict
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
 
@@ -318,3 +319,58 @@ NodeDeclaration = Annotated[
     | ArbitraryPythonExecutionNodeProperty,
     Field(discriminator="type"),
 ]
+
+
+def _iter_referenced_models(
+    declaration: NodeDeclaration,
+    models_by_id: dict[str, ResolvedModel],
+    models_by_provider: dict[str, list[ResolvedModel]],
+) -> Iterator[ResolvedModel]:
+    """Yield the catalog models a single node declaration references.
+
+    Unresolved ids/providers yield nothing; the caller relies on library-load
+    validation to surface those as blocking problems.
+    """
+    if isinstance(declaration, ModelUsageNodeProperty):
+        for model_id in declaration.model_ids:
+            resolved = models_by_id.get(model_id)
+            if resolved is not None:
+                yield resolved
+    elif isinstance(declaration, ModelProviderUsageNodeProperty):
+        for provider_id in declaration.provider_ids:
+            yield from models_by_provider.get(provider_id, [])
+
+
+def resolve_node_models(
+    catalog: ModelCatalogLibraryProperty,
+    declarations: Sequence[NodeDeclaration],
+) -> list[ResolvedModel]:
+    """Resolve a node's model declarations against a catalog into concrete models.
+
+    Walks the node's ``model_usage`` (specific model ids) and
+    ``model_provider_usage`` (whole providers) declarations and returns the
+    matching models with their provider context. Results follow declaration
+    order, then catalog order within a ``model_provider_usage`` entry, and are
+    de-duplicated by ``(provider_id, model_id)`` so a model named both directly
+    and via its provider appears once.
+
+    References that do not resolve are skipped rather than raised: library load
+    already blocks unresolved references via ``validate_library_declarations``,
+    so a miss at runtime means the catalog shifted under a stale reference and
+    the node simply offers fewer models.
+    """
+    models_by_id: dict[str, ResolvedModel] = {}
+    models_by_provider: dict[str, list[ResolvedModel]] = defaultdict(list)
+    for resolved in iter_catalog_models(catalog):
+        models_by_id[resolved.model_id] = resolved
+        models_by_provider[resolved.provider_id].append(resolved)
+
+    ordered: list[ResolvedModel] = []
+    seen: set[tuple[str, str]] = set()
+    for declaration in declarations:
+        for resolved in _iter_referenced_models(declaration, models_by_id, models_by_provider):
+            key = (resolved.provider_id, resolved.model_id)
+            if key not in seen:
+                seen.add(key)
+                ordered.append(resolved)
+    return ordered
