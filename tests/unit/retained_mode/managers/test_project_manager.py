@@ -6691,6 +6691,95 @@ class TestExportProject:
         imported_config = json.loads((target / "griptape_nodes_config.json").read_text(encoding="utf-8"))
         assert get_dot_value(imported_config, LIBRARIES_TO_REGISTER_KEY) == [package_relative]
 
+    @pytest.mark.asyncio
+    async def test_export_drops_self_referential_workspace_directory(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A workspace_directory equal to the project's own base dir is dropped on export.
+
+        The source-machine absolute path would otherwise survive the round trip and
+        make the importing engine re-download referenced libraries into the source
+        workspace instead of the imported project's own libraries/ dir. Dropping it
+        lets decide_workspace auto-default the workspace to the import target.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            WORKSPACE_DIRECTORY_KEY,
+        )
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        # workspace_directory points at the project's own base dir (self-contained).
+        project_yaml = _write_project_base_dir(base_dir, {WORKSPACE_DIRECTORY_KEY: str(base_dir)})
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+        assert WORKSPACE_DIRECTORY_KEY not in bundled_config
+
+    @pytest.mark.asyncio
+    async def test_export_preserves_external_workspace_directory(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A workspace_directory pointing outside the project's base dir is preserved.
+
+        Such a value names a genuine external/shared workspace dependency we cannot
+        relocate, so it must survive export verbatim rather than being silently dropped.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            WORKSPACE_DIRECTORY_KEY,
+        )
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        external_workspace = tmp_path / "shared_workspace"
+        external_workspace.mkdir()
+        project_yaml = _write_project_base_dir(base_dir, {WORKSPACE_DIRECTORY_KEY: str(external_workspace)})
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+        assert bundled_config.get(WORKSPACE_DIRECTORY_KEY) == str(external_workspace)
+
 
 class TestPreviewImportProject:
     """Test on_preview_import_project_request reads a manifest without extracting."""
@@ -6959,9 +7048,7 @@ class TestImportProject:
         assert secrets_manager.get_secret(synthetic_key, should_error_on_not_found=False) is None
 
     @pytest.mark.asyncio
-    async def test_round_trip_with_string_paths_from_wire(
-        self, griptape_nodes: object, tmp_path: Path
-    ) -> None:  # noqa: ARG002
+    async def test_round_trip_with_string_paths_from_wire(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
         """Path fields arriving as wire strings are coerced, not crashed on.
 
         project_events declares destination_path/archive_path/target_directory as
@@ -6991,18 +7078,18 @@ class TestImportProject:
 
         destination = tmp_path / "out.zip"
         export_result = pm.on_export_project_request(
-            ExportProjectRequest(project_id=load_result.project_id, destination_path=str(destination))
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=str(destination))  # type: ignore[arg-type]
         )
         assert isinstance(export_result, ExportProjectResultSuccess)
 
         preview_result = pm.on_preview_import_project_request(
-            PreviewImportProjectRequest(archive_path=str(destination))
+            PreviewImportProjectRequest(archive_path=str(destination))  # type: ignore[arg-type]
         )
         assert isinstance(preview_result, PreviewImportProjectResultSuccess)
 
         target = tmp_path / "imported"
         import_result = await pm.on_import_project_request(
-            ImportProjectRequest(archive_path=str(destination), target_directory=str(target))
+            ImportProjectRequest(archive_path=str(destination), target_directory=str(target))  # type: ignore[arg-type]
         )
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates

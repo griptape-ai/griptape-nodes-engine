@@ -254,7 +254,7 @@ class ProjectPackager:
             self._prune_download_library_sink(staging_dir, project_info.project_base_dir, adjacent_config)
             self._write_self_contained_template(staging_dir, project_info.template)
             copied_rewrites = self._copy_local_libraries(staging_dir, classification)
-            self._rewrite_adjacent_config(staging_dir, adjacent_config, copied_rewrites)
+            self._rewrite_adjacent_config(staging_dir, adjacent_config, copied_rewrites, project_info.project_base_dir)
             manifest = self._build_manifest(
                 project_info, classification, copied_rewrites, required_secret_keys, warnings
             )
@@ -450,14 +450,26 @@ class ProjectPackager:
 
     @staticmethod
     def _rewrite_adjacent_config(
-        staging_dir: Path, adjacent_config: dict, copied_rewrites: list[_CopiedLibraryRewrite]
+        staging_dir: Path,
+        adjacent_config: dict,
+        copied_rewrites: list[_CopiedLibraryRewrite],
+        project_base_dir: Path,
     ) -> None:
         """Rewrite the staged config's libraries_to_register to package-relative paths.
 
-        libraries_to_download is left untouched (re-downloaded on import). Every
-        other config key is preserved verbatim. A register entry whose path was
-        missing on disk (no rewrite) is dropped so the imported config does not
-        carry an unresolvable absolute path.
+        libraries_to_download is left untouched (re-downloaded on import). A
+        register entry whose path was missing on disk (no rewrite) is dropped so
+        the imported config does not carry an unresolvable absolute path.
+
+        A self-referential workspace_directory (one canonicalizing to the project's
+        own base dir) is dropped so import falls to decide_workspace's auto-default
+        branch and re-points the workspace to the import target. Otherwise the
+        absolute source-machine path would survive the round trip and the importing
+        engine would re-download referenced libraries into the source workspace
+        instead of the imported project's own libraries/ dir. A workspace_directory
+        pointing somewhere else (a genuine external/shared workspace) is preserved
+        verbatim, since it names a real dependency we cannot relocate. Every other
+        config key is preserved verbatim.
         """
         rewrite_by_path = {rewrite.registered_path: rewrite.package_relative_path for rewrite in copied_rewrites}
 
@@ -477,6 +489,15 @@ class ProjectPackager:
 
         config_copy = json.loads(json.dumps(adjacent_config))
         set_dot_value(config_copy, LIBRARIES_TO_REGISTER_KEY, rewritten)
+
+        configured_workspace = get_dot_value(config_copy, WORKSPACE_DIRECTORY_KEY, default=None)
+        if isinstance(configured_workspace, str) and configured_workspace:
+            workspace_path = Path(configured_workspace)
+            if not workspace_path.is_absolute():
+                workspace_path = project_base_dir / workspace_path
+            if canonicalize_for_identity(workspace_path) == canonicalize_for_identity(project_base_dir):
+                config_copy.pop(WORKSPACE_DIRECTORY_KEY, None)
+
         (staging_dir / ADJACENT_CONFIG_FILENAME).write_text(json.dumps(config_copy, indent=2), encoding="utf-8")
 
     @staticmethod

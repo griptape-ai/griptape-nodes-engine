@@ -2440,6 +2440,7 @@ class ProjectManager:
             if isinstance(activation_result, SetCurrentProjectResultFailure):
                 warnings.append(f"Imported project was not activated: {activation_result.result_details}")
 
+        logger.info("Imported project package '%s' into '%s'", archive_path, target_directory)
         return ImportProjectResultSuccess(
             project_id=load_result.project_id,
             project_file_path=target_yaml,
