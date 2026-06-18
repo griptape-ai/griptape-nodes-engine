@@ -945,16 +945,19 @@ class TestWorkflowManager:
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
         workflow_manager = griptape_nodes.WorkflowManager()
-        abs_path = Path("/ext/new_name.py")
+        # Anchor to the current filesystem root so the path is absolute on Windows
+        # (which needs a drive letter) as well as POSIX.
+        abs_requested = Path(Path.cwd().anchor) / "ext" / "new_name"
+        abs_path = abs_requested.with_suffix(".py")
 
         with patch.object(
             workflow_manager,
             "_build_workflow_save_path",
             return_value=WorkflowManager.WorkflowSavePath(file_path=abs_path, relative_file_path=str(abs_path)),
         ) as mock_build:
-            resolved = workflow_manager._resolve_named_save_path("/ext/new_name")
+            resolved = workflow_manager._resolve_named_save_path(str(abs_requested))
 
-        mock_build.assert_called_once_with("/ext/new_name.py")
+        mock_build.assert_called_once_with(f"{abs_requested}.py")
         assert resolved.file_name == "new_name"
         assert resolved.relative_file_path == str(abs_path)
 
