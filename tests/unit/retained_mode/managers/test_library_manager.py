@@ -56,21 +56,55 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
 )
+from griptape_nodes.utils.library_utils import extract_library_path
 
 
-def _config_value_dispatcher(libraries_dir: Path, libraries: object) -> Callable[..., object]:
+def _config_value_dispatcher(
+    libraries_dir: Path, libraries: object, downloads: object | None = None
+) -> Callable[..., object]:
     """A `get_config_value` side_effect that dispatches by key.
 
-    `_discover_library_files` reads `libraries_to_register`; `libraries_directory`
-    is also served so callers that touch both keys share one mock.
+    `_discover_library_files` reads `libraries_to_register` and
+    `libraries_to_download`; `libraries_directory` is also served so callers that
+    touch all three keys share one mock. `downloads` defaults to an empty list so
+    discovery's download-sourcing pass finds nothing unless a test opts in.
     """
-    from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+    from griptape_nodes.retained_mode.managers.settings import (
+        LIBRARIES_TO_DOWNLOAD_KEY,
+        LIBRARIES_TO_REGISTER_KEY,
+    )
+
+    download_entries = downloads if downloads is not None else []
 
     def get_config_value(key: str, **_: object) -> object:
         if key == LIBRARIES_TO_REGISTER_KEY:
             return libraries
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return download_entries
         if key == "libraries_directory":
             return str(libraries_dir)
+        return None
+
+    return get_config_value
+
+
+def _register_only_config(libraries: object) -> Callable[..., object]:
+    """A `get_config_value` side_effect serving only `libraries_to_register`.
+
+    Discovery also reads `libraries_to_download`; this returns an empty list for it
+    so tests exercising register-only behavior do not have their register entries
+    misread as malformed download entries. Other keys return None.
+    """
+    from griptape_nodes.retained_mode.managers.settings import (
+        LIBRARIES_TO_DOWNLOAD_KEY,
+        LIBRARIES_TO_REGISTER_KEY,
+    )
+
+    def get_config_value(key: str, **_: object) -> object:
+        if key == LIBRARIES_TO_REGISTER_KEY:
+            return libraries
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return []
         return None
 
     return get_config_value
@@ -206,7 +240,9 @@ class TestLibraryManagerDisabledEntries:
             {"path": str(disabled_lib), "enabled": False},
         ]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config)
+        ):
             result = library_manager._discover_library_files()
 
         by_path = {
@@ -224,7 +260,9 @@ class TestLibraryManagerDisabledEntries:
         library_manager = griptape_nodes.LibraryManager()
         enabled_lib, _ = lib_files
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=[str(enabled_lib)]):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config([str(enabled_lib)])
+        ):
             result = library_manager._discover_library_files()
 
         assert len(result) == 1
@@ -244,7 +282,9 @@ class TestLibraryManagerDisabledEntries:
         # Reset tracking so this test does not depend on prior state.
         library_manager._library_file_path_to_info = {}
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config)
+        ):
             result = library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         from griptape_nodes.retained_mode.events.library_events import DiscoverLibrariesResultSuccess
@@ -299,7 +339,9 @@ class TestLibraryManagerDisabledEntries:
 
         # Initial discovery: first_lib enabled, second_lib disabled.
         initial_config = [str(first_lib), {"path": str(second_lib), "enabled": False}]
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=initial_config):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(initial_config)
+        ):
             library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
@@ -309,7 +351,9 @@ class TestLibraryManagerDisabledEntries:
 
         # User flips the config: first_lib disabled, second_lib enabled, then triggers refresh.
         toggled_config = [{"path": str(first_lib), "enabled": False}, str(second_lib)]
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=toggled_config):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(toggled_config)
+        ):
             library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state_after = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
@@ -2623,6 +2667,226 @@ class TestLibraryManagerInitializationFlag:
             await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
 
         assert library_manager.is_initializing() is False
+
+
+class TestDownloadLibraryRegisterPersistence:
+    """download_library_request must only persist to the GLOBAL config when registering now.
+
+    A project-reconcile download passes auto_register=False: the project's own
+    libraries_to_download is the per-activation source of truth, so the clone path
+    must NOT be appended to the global libraries_to_register (doing so leaks the
+    library into every other project's startup registration). The explicit CLI
+    download (auto_register=True) keeps persisting so it loads on future startups.
+    """
+
+    @staticmethod
+    def _make_clone(library_name: str) -> Callable[[str, Path, str | None], None]:
+        """Return a clone_repository stand-in that writes a minimal manifest into target_path."""
+
+        def fake_clone(_git_url: str, target_path: Path, _ref: str | None = None) -> None:
+            target_path.mkdir(parents=True, exist_ok=True)
+            (target_path / "griptape_nodes_library.json").write_text(
+                json.dumps({"name": library_name}), encoding="utf-8"
+            )
+
+        return fake_clone
+
+    @pytest.mark.asyncio
+    async def test_reconcile_download_does_not_persist_to_global_config(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """auto_register=False (the reconcile/provisioning path) leaves global libraries_to_register untouched."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            DownloadLibraryRequest,
+            DownloadLibraryResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+        before = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+            side_effect=self._make_clone("provisioned_lib"),
+        ):
+            result = await library_manager.download_library_request(
+                DownloadLibraryRequest(
+                    git_url="owner/provisioned_lib",
+                    download_directory=str(tmp_path / "libs"),
+                    auto_register=False,
+                )
+            )
+
+        assert isinstance(result, DownloadLibraryResultSuccess)
+        after = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        assert {extract_library_path(entry) for entry in after} == {extract_library_path(entry) for entry in before}
+        assert result.library_path not in {extract_library_path(entry) for entry in after}
+
+    @pytest.mark.asyncio
+    async def test_explicit_download_persists_to_global_config(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """auto_register=True (the explicit CLI download) appends the clone path to global libraries_to_register."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            DownloadLibraryRequest,
+            DownloadLibraryResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+            side_effect=self._make_clone("explicit_lib"),
+        ):
+            result = await library_manager.download_library_request(
+                DownloadLibraryRequest(
+                    git_url="owner/explicit_lib",
+                    download_directory=str(tmp_path / "libs"),
+                    auto_register=True,
+                )
+            )
+
+        assert isinstance(result, DownloadLibraryResultSuccess)
+        after = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        assert result.library_path in {extract_library_path(entry) for entry in after}
+
+
+class TestDiscoverDownloadedLibraries:
+    """A provisioned libraries_to_download entry must be discoverable from the workspace.
+
+    Reconcile clones each libraries_to_download entry into the workspace
+    libraries_directory; discovery resolves it there so the library loads scoped
+    to the workspace that declares it, WITHOUT any libraries_to_register entry.
+    This is the mechanism that replaces the global-config append, so projects that
+    pin a library only via libraries_to_download (e.g. the lib-swap fixtures) still
+    load it.
+    """
+
+    @staticmethod
+    def _install_manifest(libraries_dir: Path, repo_name: str, library_name: str) -> Path:
+        """Materialize a provisioned library manifest under <libraries_dir>/<repo_name>/."""
+        manifest_dir = libraries_dir / repo_name
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "griptape_nodes_library.json"
+        manifest_path.write_text(json.dumps({"name": library_name}), encoding="utf-8")
+        return manifest_path
+
+    def test_download_only_library_is_discovered_from_workspace(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A libraries_to_download entry with no libraries_to_register row is still discovered."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        libraries_dir = tmp_path / "libraries"
+        manifest_path = self._install_manifest(libraries_dir, "remote_lib", "remote_lib")
+
+        def get_config_value(key: str, **_: object) -> object:
+            if key == LIBRARIES_TO_REGISTER_KEY:
+                return []
+            if key == LIBRARIES_TO_DOWNLOAD_KEY:
+                return ["owner/remote_lib"]
+            if key == "libraries_directory":
+                return str(libraries_dir)
+            return None
+
+        with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):
+            entries = library_manager._discover_library_files()
+
+        discovered_paths = {Path(entry.registration.path) for entry in entries}
+        assert manifest_path in discovered_paths
+
+
+class TestPersistLibrarySettings:
+    """A library's declared settings must persist to global WITHOUT leaking project-layer values.
+
+    Library load injects each declared setting category into the user config. The
+    existing category must be read from the user_config layer, not the merged
+    config: the merged config folds in the active project's project/workspace/env
+    layers (e.g. libraries_to_download, requires_engine), and round-tripping that
+    through SetConfigCategory (which writes the GLOBAL user config) would leak the
+    active project's per-activation pins into every other project's startup. This
+    is the canonical repro for the duplicate-standard-library symptom seen when
+    switching from a download-pinned project to one that declares no download.
+    """
+
+    @staticmethod
+    def _library_with_settings(category: str, contents: dict[str, object]) -> LibrarySchema:
+        """Build a minimal LibrarySchema declaring a single settings category."""
+        from griptape_nodes.node_library.library_registry import Setting
+
+        return LibrarySchema(
+            name="settings_lib",
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="0.1.0",
+                engine_version="0.1.0",
+                tags=[],
+            ),
+            categories=[],
+            nodes=[],
+            settings=[Setting(category=category, contents=contents)],
+        )
+
+    def test_persist_does_not_leak_project_download_pin_to_global(
+        self, griptape_nodes: GriptapeNodes, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
+        """A project-layer libraries_to_download pin must NOT be written into the global user config."""
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        # Prime a project-adjacent config carrying a download pin, then load it as
+        # the project layer so the MERGED config sees the pin but the global user
+        # config file does not.
+        project_dir = tmp_path / "pinned_project"
+        project_dir.mkdir()
+        (project_dir / "griptape_nodes_config.json").write_text(
+            json.dumps(
+                {
+                    "app_events": {
+                        "on_app_initialization_complete": {
+                            "libraries_to_download": [{"git_url": "owner/standard@v0.79.0", "version": "==0.79.0"}]
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_mgr.load_project_config(project_dir)
+        assert config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) != []
+
+        library = self._library_with_settings(
+            "app_events.on_app_initialization_complete",
+            {"secrets_to_register": {"MY_LIB_KEY": ""}},
+        )
+        problems = library_manager._persist_library_settings(library)
+
+        assert problems == []
+        # The library's own declared setting persisted globally...
+        global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
+        init = global_config.get("app_events", {}).get("on_app_initialization_complete", {})
+        assert "MY_LIB_KEY" in init.get("secrets_to_register", {})
+        # ...but the project-layer download pin did NOT leak into the global config.
+        assert "libraries_to_download" not in init
+
+    def test_persist_creates_missing_category(self, griptape_nodes: GriptapeNodes, isolate_user_config: Path) -> None:
+        """A library declaring a brand-new category writes its contents verbatim to global."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        library = self._library_with_settings(
+            "my_library_category",
+            {"some_setting": "value"},
+        )
+        problems = library_manager._persist_library_settings(library)
+
+        assert problems == []
+        global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
+        assert global_config.get("my_library_category", {}).get("some_setting") == "value"
 
 
 class _ModelProbe(BaseNode):
