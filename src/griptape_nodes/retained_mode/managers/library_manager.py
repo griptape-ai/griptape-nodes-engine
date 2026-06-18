@@ -4840,7 +4840,10 @@ class LibraryManager:
         # A short-circuit means a hook forbids the library; treat it as unusable
         # and surface the hook's explanation on the library's failure icon.
         policy_denial = GriptapeNodes.EventManager().run_pre_dispatch_hooks(request)
-        if policy_denial is not None:
+        # Only a failure short-circuit forbids the library; a success short-circuit
+        # would be returned verbatim by the dispatcher rather than blocking, so it
+        # must not mark the library unusable.
+        if policy_denial is not None and policy_denial.failed():
             detail = getattr(policy_denial, "result_details", None)
             problems.append(PermissionDeniedLibraryProblem(detail=str(detail) if detail else ""))
             return EvaluateLibraryFitnessResultFailure(

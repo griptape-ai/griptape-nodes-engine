@@ -508,7 +508,10 @@ class NodeManager:
             # node type: raise so the error-proxy path below substitutes a
             # placeholder carrying the explanation.
             policy_denial = GriptapeNodes.EventManager().run_pre_dispatch_hooks(request)
-            if policy_denial is not None:
+            # A hook may short-circuit with a success result; only a failure
+            # result denies creation. This matches the dispatcher, which returns a
+            # success short-circuit verbatim rather than blocking the operation.
+            if policy_denial is not None and policy_denial.failed():
                 denial_detail = getattr(policy_denial, "result_details", None)
                 raise PermissionError(  # noqa: TRY301
                     str(denial_detail)
@@ -523,7 +526,13 @@ class NodeManager:
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            logger.error(err)
+            # A policy denial (PermissionError) is an expected, by-design outcome
+            # that the error-proxy path below substitutes with a placeholder node,
+            # so log it as info rather than as a node-creation error.
+            if isinstance(err, PermissionError):
+                logger.info("Creation of node type '%s' denied by active policy: %s", request.node_type, err)
+            else:
+                logger.error(err)
             details = f"Could not create Node '{final_node_name}' of type '{request.node_type}': {err}"
 
             # Check if we should create an Error Proxy node instead of failing
