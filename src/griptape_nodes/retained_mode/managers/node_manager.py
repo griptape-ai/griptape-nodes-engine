@@ -549,17 +549,22 @@ class NodeManager:
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
                 try:
-                    # Use fitness problem details if available for a more actionable error message
-                    library_metadata_result = GriptapeNodes.handle_request(
-                        GetLibraryMetadataRequest(library=request.specific_library_name or "")
-                    )
-                    if (
-                        isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
-                        and library_metadata_result.problems is not None
-                    ):
-                        failure_reason = library_metadata_result.problems
-                    else:
+                    if isinstance(err, _NodeCreationPolicyDeniedError):
+                        # A policy denial carries its own explanation; surface it
+                        # verbatim rather than the library's fitness problems.
                         failure_reason = str(err)
+                    else:
+                        # Use fitness problem details if available for a more actionable error message
+                        library_metadata_result = GriptapeNodes.handle_request(
+                            GetLibraryMetadataRequest(library=request.specific_library_name or "")
+                        )
+                        if (
+                            isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
+                            and library_metadata_result.problems is not None
+                        ):
+                            failure_reason = library_metadata_result.problems
+                        else:
+                            failure_reason = str(err)
 
                     # Create ErrorProxyNode directly since it needs special initialization
                     node = ErrorProxyNode(
