@@ -347,9 +347,7 @@ def register_broadcast_handlers(
             )
             logger.error(details)
             return ActivateProjectResultFailure(result_details=details)
-        return ActivateProjectResultSuccess(
-            result_details=f"Adopted project from orchestrator: {request.project_id}."
-        )
+        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
 
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)

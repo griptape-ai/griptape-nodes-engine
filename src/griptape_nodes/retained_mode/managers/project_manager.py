@@ -1180,6 +1180,24 @@ class ProjectManager:
     # project.yml, but we emit a warning so overrides are visible in logs.
     _DANGEROUS_ENV_KEYS: frozenset[str] = frozenset({"PATH", "HOME", "PYTHONPATH", "LD_LIBRARY_PATH"})
 
+    def get_pre_project_environ(self) -> dict[str, str]:
+        """Return a copy of os.environ with the active project's env mutations reverted.
+
+        A worker is spawned by the orchestrator, which has already applied its current
+        project's environment to os.environ. Inheriting that polluted environ would make
+        the worker snapshot a baseline that already contains project A's values, so on a
+        later switch to project B the worker could not unset the keys project A added.
+        Spawning with this reconstructed pre-project environ gives the worker the same
+        clean baseline a freshly launched engine would have. Does not mutate os.environ.
+        """
+        base = dict(os.environ)
+        for key, original in self._applied_env_snapshot.items():
+            if original is None:
+                base.pop(key, None)
+            else:
+                base[key] = original
+        return base
+
     def _restore_project_env(self) -> None:
         """Revert any os.environ entries mutated by the currently-active project."""
         for key, original in self._applied_env_snapshot.items():
@@ -1542,19 +1560,6 @@ class ProjectManager:
             project_info=project_info,
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
-
-    def get_current_project_file_path(self) -> Path | None:
-        """Return the current project's file path, or None for system defaults.
-
-        Used to thread the orchestrator's active project into a worker at spawn time
-        so the worker boots adopting the same project. Returns None when the current
-        project has no backing file (system defaults) or its id is not loaded, which
-        the caller treats as "spawn the worker without a project (system defaults)".
-        """
-        project_info = self._successfully_loaded_project_templates.get(self._current_project_id)
-        if project_info is None:
-            return None
-        return project_info.project_file_path
 
     def on_save_project_template_request(  # noqa: C901, PLR0911
         self, request: SaveProjectTemplateRequest
@@ -2044,7 +2049,7 @@ class ProjectManager:
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
 
-    async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+    async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Load system default project template when app initializes.
 
         Called by EventManager after all libraries are loaded.
@@ -2053,18 +2058,13 @@ class ProjectManager:
         already been explicitly selected before this event (e.g., by a CLI executor
         via --project-file-path), preserves that choice and skips workspace discovery.
 
-        A worker process NEVER runs workspace discovery: its project is dictated by the
-        orchestrator (pre-activated from the --project-file-path spawn arg, or system
-        defaults when that arg is absent). Discovering a workspace griptape-nodes-project.yml
-        here would let the worker diverge from the orchestrator, so it is skipped for workers.
+        A worker boots exactly like an orchestrator: it re-derives the current project
+        from the same shared on-disk config (project_file / workspace default), so it
+        lands on the orchestrator's project for free. The orchestrator persists the
+        SYSTEM_DEFAULTS_KEY sentinel when it deliberately stays on system defaults, so a
+        worker honoring project_file does not "discover" a workspace griptape-nodes-project.yml
+        the orchestrator chose to ignore.
         """
-        # A worker's project is owned by the orchestrator. Whatever was pre-activated at
-        # boot (a real project, or system defaults) stays as-is; skip workspace discovery.
-        if payload.is_worker:
-            await self._load_registered_projects()
-            self._initialization_complete = True
-            return
-
         # If an explicit project was selected before init completed (e.g., by
         # LocalWorkflowExecutor loading --project-file-path), keep it. Still load
         # registered projects for visibility and mark init complete.

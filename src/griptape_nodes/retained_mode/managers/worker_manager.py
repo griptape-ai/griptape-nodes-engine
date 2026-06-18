@@ -4,7 +4,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import re
 import sys
 import time
@@ -323,7 +322,12 @@ class WorkerManager:
         if worker_key in self._managed_worker_processes:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        proc = await asyncio.create_subprocess_exec(*args, env={**os.environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        # Spawn with the orchestrator's PRE-project environ so the worker boots with the
+        # same clean env baseline a fresh engine would have. Inheriting the live os.environ
+        # would bake the orchestrator's current-project env vars into the worker's restore
+        # baseline, leaving the worker unable to unset them on a later project switch.
+        base_environ = self._griptape_nodes.ProjectManager().get_pre_project_environ()
+        proc = await asyncio.create_subprocess_exec(*args, env={**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
         # Record the loop that owns this subprocess so termination can hop back to it.
         # All spawns run on the engine event-queue loop, so this is idempotent.
         self._spawn_loop = asyncio.get_running_loop()
@@ -592,12 +596,6 @@ class WorkerManager:
             "--library-name",
             library_name,
         ]
-        # Thread the orchestrator's current project into the worker so it boots adopting
-        # the same project instead of independently re-deriving one from shared on-disk
-        # config. Absent arg means system defaults (the worker skips workspace discovery).
-        project_file_path = self._griptape_nodes.ProjectManager().get_current_project_file_path()
-        if project_file_path is not None:
-            args.extend(["--project-file-path", str(project_file_path)])
         await self.spawn_worker(args, library_name)
 
     @staticmethod
