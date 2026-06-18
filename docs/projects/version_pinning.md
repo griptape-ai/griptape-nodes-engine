@@ -41,7 +41,7 @@ specifier or activation is blocked.
 
 - The specifier is matched against the running engine's version.
 - A mismatch **blocks activation**: the project does not load and the user is
-  told which version is required versus which is running.
+    told which version is required versus which is running.
 - Omit the key (or set it to `null`) to skip the engine check entirely.
 
 Use a bounded range (`>=0.80,<1.0`) rather than an open lower bound so the
@@ -71,11 +71,11 @@ version pin:
 }
 ```
 
-| Field     | Required | Meaning                                                                                                                                                       |
-| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Field     | Required | Meaning                                                                                                                                                            |
+| --------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `git_url` | Yes      | Git source in `url@ref` form: a full URL or `user/repo` shorthand, with an optional `@branch\|tag\|commit` suffix. No `@ref` uses the repository's default branch. |
-| `version` | No       | PEP 440 specifier the installed library must satisfy (e.g. `==0.79.0`, `>=1.2,<2`). Omit to pin by source only.                                                |
-| `name`    | No       | The library's manifest `name`. When set, the installed copy is matched by name to decide whether a re-download is needed.                                      |
+| `version` | No       | PEP 440 specifier the installed library must satisfy (e.g. `==0.79.0`, `>=1.2,<2`). Omit to pin by source only.                                                    |
+| `name`    | No       | The library's manifest `name`. When set, the installed copy is matched by name to decide whether a re-download is needed.                                          |
 
 Pin both the `git_url` ref **and** the `version` to the same release (e.g.
 `@v0.79.0` and `==0.79.0`) so the source you clone and the version you enforce
@@ -98,11 +98,11 @@ register list automatically, so the download-then-load chain works on its own.
 When a user activates a pinned project, the engine compares each
 `libraries_to_download` entry against what is installed and plans one of:
 
-| Plan          | When                                                              | Effect                                                          |
-| ------------- | ----------------------------------------------------------------- | --------------------------------------------------------------- |
-| **SKIP**      | The installed version already satisfies the pin                   | Nothing changes.                                                |
-| **INSTALL**   | The library is not installed yet                                  | Clones the pinned source. Non-destructive.                      |
-| **OVERWRITE** | A different, non-satisfying version is installed                  | Deletes the local library directory and re-clones the pin. **Destructive.** |
+| Plan          | When                                             | Effect                                                                      |
+| ------------- | ------------------------------------------------ | --------------------------------------------------------------------------- |
+| **SKIP**      | The installed version already satisfies the pin  | Nothing changes.                                                            |
+| **INSTALL**   | The library is not installed yet                 | Clones the pinned source. Non-destructive.                                  |
+| **OVERWRITE** | A different, non-satisfying version is installed | Deletes the local library directory and re-clones the pin. **Destructive.** |
 
 Before any destructive OVERWRITE runs, the editor shows a read-only **preview**
 of the full plan and waits for the user to approve it. A denial is a clean
@@ -145,28 +145,28 @@ A project that requires engine `>=0.80,<1.0` and pins the standard library to
 Activation behavior:
 
 1. **Engine check** — if the running engine is outside `>=0.80,<1.0`, activation
-   is blocked with a version-mismatch message.
-2. **First activation (clean machine)** — the standard library is absent, so the
-   plan is INSTALL: `v0.79.0` is cloned and registered.
-3. **Re-activation, `0.79.0` already present** — the pin is satisfied, so the
-   plan is SKIP.
-4. **A different version is installed** (say a prior project left `0.78.0`) —
-   `0.78.0` does not satisfy `==0.79.0`, so the plan is the destructive
-   OVERWRITE: the preview modal shows it, and on approval the local library
-   directory is deleted and `v0.79.0` is re-cloned.
+    is blocked with a version-mismatch message.
+1. **First activation (clean machine)** — the standard library is absent, so the
+    plan is INSTALL: `v0.79.0` is cloned and registered.
+1. **Re-activation, `0.79.0` already present** — the pin is satisfied, so the
+    plan is SKIP.
+1. **A different version is installed** (say a prior project left `0.78.0`) —
+    `0.78.0` does not satisfy `==0.79.0`, so the plan is the destructive
+    OVERWRITE: the preview modal shows it, and on approval the local library
+    directory is deleted and `v0.79.0` is re-cloned.
 
 ## Notes and gotchas
 
 - **Bare strings still work.** An existing `"libraries_to_download": ["user/repo"]`
-  list keeps cloning from source with no version enforcement. Only the object
-  form enforces a `version`.
+    list keeps cloning from source with no version enforcement. Only the object
+    form enforces a `version`.
 - **Per-user overrides win.** A user's workspace config layers above the
-  project-adjacent config (see [Workspace](workspace.md#config-resolution-order)).
-  A user can override your pins locally; the pins are defaults distributed with
-  the project, not a lock.
+    project-adjacent config (see [Workspace](workspace.md#config-resolution-order)).
+    A user can override your pins locally; the pins are defaults distributed with
+    the project, not a lock.
 - **CLI alternative.** Administrators automating headless engines can clone a
-  library with `griptape-nodes libraries download <git_url>` and update with
-  `griptape-nodes libraries sync`. See [Libraries](../libraries.md#cli-alternatives)
-  and the [Command Line Interface](../command_line_interface.md) reference. The
-  declarative config above is the portable way to ship the same pins with a
-  project.
+    library with `griptape-nodes libraries download <git_url>` and update with
+    `griptape-nodes libraries sync`. See [Libraries](../libraries.md#cli-alternatives)
+    and the [Command Line Interface](../command_line_interface.md) reference. The
+    declarative config above is the portable way to ship the same pins with a
+    project.
