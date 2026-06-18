@@ -13,7 +13,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     DiscoverLibrariesRequest,
     DiscoverLibrariesResultSuccess,
 )
-from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
@@ -21,18 +20,25 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
-def _config_value_side_effect(libraries: list[str]) -> Callable[..., object]:
-    """Return a get_config_value stub that only answers the libraries_to_register key.
+def _register_only_config(libraries: object) -> Callable[..., object]:
+    """A `get_config_value` side_effect serving only `libraries_to_register`.
 
-    find_files_recursive reads the discovery_max_depth setting through the same
-    ConfigManager, so a blanket return_value would feed it the library list. This
-    answers the library key with the provided list and defers every other key to
-    the caller's own `default` (so the depth read gets its int fallback).
+    Discovery also reads `libraries_to_download`; this returns an empty list for it
+    so these ordering tests, which only seed register entries, do not have their
+    register list misread as the download list. find_files_recursive reads the
+    discovery_max_depth setting through the same ConfigManager, so every other key
+    defers to the caller's own `default` (giving the depth read its int fallback).
     """
+    from griptape_nodes.retained_mode.managers.settings import (
+        LIBRARIES_TO_DOWNLOAD_KEY,
+        LIBRARIES_TO_REGISTER_KEY,
+    )
 
     def get_config_value(key: str, *, default: object = None, **_: object) -> object:
         if key == LIBRARIES_TO_REGISTER_KEY:
             return libraries
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return []
         return default
 
     return get_config_value
@@ -68,7 +74,9 @@ class TestLibraryManagerDeterministicOrdering:
         # Mock config to return libraries in specific order (z, a, m)
         config_order = [str(lib_z), str(lib_a), str(lib_m)]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config_order)
+        ):
             result = await library_manager._discover_library_files()
 
             # Should preserve config order, not alphabetical
@@ -104,9 +112,7 @@ class TestLibraryManagerDeterministicOrdering:
 
         # Mock config to point to the parent directory
         with patch.object(
-            griptape_nodes.ConfigManager(),
-            "get_config_value",
-            side_effect=_config_value_side_effect([str(lib_dir)]),
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config([str(lib_dir)])
         ):
             result = await library_manager._discover_library_files()
 
@@ -151,9 +157,7 @@ class TestLibraryManagerDeterministicOrdering:
         config_order = [str(direct_lib), str(lib_dir), str(another_direct)]
 
         with patch.object(
-            griptape_nodes.ConfigManager(),
-            "get_config_value",
-            side_effect=_config_value_side_effect(config_order),
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config_order)
         ):
             result = await library_manager._discover_library_files()
 
@@ -182,7 +186,9 @@ class TestLibraryManagerDeterministicOrdering:
         # Config lists same library twice
         config_order = [str(lib), str(lib)]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config_order)
+        ):
             result = await library_manager._discover_library_files()
 
             # Should only appear once
@@ -209,7 +215,9 @@ class TestLibraryManagerDeterministicOrdering:
         # Mock config to return libraries in specific order
         config_order = [str(lib1), str(lib2)]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config_order):
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config_order)
+        ):
             request = DiscoverLibrariesRequest(include_sandbox=False)
             result = await library_manager.discover_libraries_request(request)
 
@@ -236,7 +244,7 @@ class TestLibraryManagerDeterministicOrdering:
             lib.write_text("{}")
             libs.append(str(lib))
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=libs):
+        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(libs)):
             request = DiscoverLibrariesRequest(include_sandbox=False)
 
             result1 = await library_manager.discover_libraries_request(request)

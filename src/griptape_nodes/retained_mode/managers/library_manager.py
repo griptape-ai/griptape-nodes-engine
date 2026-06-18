@@ -2115,58 +2115,7 @@ class LibraryManager:
 
                         # Check the library's custom config settings
                         if library_data.settings is not None:
-                            for library_data_setting in library_data.settings:
-                                # Does the category exist?
-                                get_category_request = GetConfigCategoryRequest(
-                                    category=library_data_setting.category,
-                                    failure_log_level=logging.DEBUG,
-                                )
-                                get_category_result = GriptapeNodes.handle_request(get_category_request)
-                                if not isinstance(get_category_result, GetConfigCategoryResultSuccess):
-                                    # Create new category
-                                    create_new_category_request = SetConfigCategoryRequest(
-                                        category=library_data_setting.category, contents=library_data_setting.contents
-                                    )
-                                    create_new_category_result = GriptapeNodes.handle_request(
-                                        create_new_category_request
-                                    )
-                                    if not isinstance(create_new_category_result, SetConfigCategoryResultSuccess):
-                                        library_info.problems.append(
-                                            CreateConfigCategoryProblem(category_name=library_data_setting.category)
-                                        )
-                                        details = f"Failed attempting to create new config category '{library_data_setting.category}' for library '{library_data.name}'."
-                                        logger.error(details)
-                                        continue
-                                else:
-                                    # Normalize secrets_to_register before merge (handles list/dict format mismatch)
-                                    library_contents = dict(library_data_setting.contents)
-                                    existing_contents = dict(get_category_result.contents)
-                                    if "secrets_to_register" in library_contents:
-                                        library_contents["secrets_to_register"] = normalize_secrets_to_register(
-                                            library_contents["secrets_to_register"]
-                                        )
-                                    if "secrets_to_register" in existing_contents:
-                                        existing_contents["secrets_to_register"] = normalize_secrets_to_register(
-                                            existing_contents["secrets_to_register"]
-                                        )
-                                    # Merge with existing category
-                                    existing_category_contents = merge_dicts(
-                                        library_contents,
-                                        existing_contents,
-                                        add_keys=True,
-                                        merge_lists=True,
-                                    )
-                                    set_category_request = SetConfigCategoryRequest(
-                                        category=library_data_setting.category, contents=existing_category_contents
-                                    )
-                                    set_category_result = GriptapeNodes.handle_request(set_category_request)
-                                    if not isinstance(set_category_result, SetConfigCategoryResultSuccess):
-                                        library_info.problems.append(
-                                            UpdateConfigCategoryProblem(category_name=library_data_setting.category)
-                                        )
-                                        details = f"Failed attempting to update config category '{library_data_setting.category}' for library '{library_data.name}'."
-                                        logger.error(details)
-                                        continue
+                            library_info.problems.extend(self._persist_library_settings(library_data))
 
                         # For worker-delegated libraries on the orchestrator, skip node module
                         # imports entirely -- importing them would pull heavy deps (torch, triton,
@@ -2244,6 +2193,79 @@ class LibraryManager:
 
         # Success - progressed to LOADED state
         return None
+
+    def _persist_library_settings(self, library_data: LibrarySchema) -> list[LibraryProblem]:
+        """Inject a library's declared settings into the user config, returning any problems.
+
+        For each declared setting category: when the category does not yet exist,
+        write the library's contents as-is. When it does, persist only what THIS
+        library declares merged onto the GLOBAL user-config layer for the category.
+
+        The existing category is read from the `user_config` layer, NOT the merged
+        config. The merged config folds in the active project's
+        project/workspace/env layers (e.g. libraries_to_download, requires_engine);
+        writing that back through SetConfigCategory (which lands in the global user
+        config) would leak those per-project values into every other project's
+        startup. Reading user_config keeps the write scoped to what is genuinely
+        global plus the library's own declared settings.
+        """
+        if library_data.settings is None:
+            return []
+
+        problems: list[LibraryProblem] = []
+        config_mgr = GriptapeNodes.ConfigManager()
+        for library_data_setting in library_data.settings:
+            get_category_request = GetConfigCategoryRequest(
+                category=library_data_setting.category,
+                failure_log_level=logging.DEBUG,
+            )
+            get_category_result = GriptapeNodes.handle_request(get_category_request)
+            if not isinstance(get_category_result, GetConfigCategoryResultSuccess):
+                # Create new category
+                create_new_category_request = SetConfigCategoryRequest(
+                    category=library_data_setting.category, contents=library_data_setting.contents
+                )
+                create_new_category_result = GriptapeNodes.handle_request(create_new_category_request)
+                if not isinstance(create_new_category_result, SetConfigCategoryResultSuccess):
+                    problems.append(CreateConfigCategoryProblem(category_name=library_data_setting.category))
+                    details = f"Failed attempting to create new config category '{library_data_setting.category}' for library '{library_data.name}'."
+                    logger.error(details)
+                continue
+
+            # Normalize secrets_to_register before merge (handles list/dict format mismatch)
+            library_contents = dict(library_data_setting.contents)
+            existing_contents = dict(
+                config_mgr.get_config_value(
+                    library_data_setting.category,
+                    config_source="user_config",
+                    default={},
+                )
+            )
+            if "secrets_to_register" in library_contents:
+                library_contents["secrets_to_register"] = normalize_secrets_to_register(
+                    library_contents["secrets_to_register"]
+                )
+            if "secrets_to_register" in existing_contents:
+                existing_contents["secrets_to_register"] = normalize_secrets_to_register(
+                    existing_contents["secrets_to_register"]
+                )
+            # Merge with existing category
+            existing_category_contents = merge_dicts(
+                library_contents,
+                existing_contents,
+                add_keys=True,
+                merge_lists=True,
+            )
+            set_category_request = SetConfigCategoryRequest(
+                category=library_data_setting.category, contents=existing_category_contents
+            )
+            set_category_result = GriptapeNodes.handle_request(set_category_request)
+            if not isinstance(set_category_result, SetConfigCategoryResultSuccess):
+                problems.append(UpdateConfigCategoryProblem(category_name=library_data_setting.category))
+                details = f"Failed attempting to update config category '{library_data_setting.category}' for library '{library_data.name}'."
+                logger.error(details)
+
+        return problems
 
     async def register_library_from_requirement_specifier_request(
         self, request: RegisterLibraryFromRequirementSpecifierRequest
@@ -5036,6 +5058,17 @@ class LibraryManager:
             if resolved is not None:
                 await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
 
+        # Add provisioned git-sourced libraries. Each libraries_to_download entry is
+        # cloned into the workspace libraries_directory by reconcile; discovery
+        # resolves it to its installed manifest there so it loads scoped to the
+        # workspace that declares it, without ever being written into the global
+        # libraries_to_register config (which would leak it into every project).
+        download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        for download in normalize_library_downloads(download_libraries):
+            manifest_path = await self._installed_manifest_path_for_download(download)
+            if manifest_path is not None:
+                await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
+
         return discovered_entries
 
     @staticmethod
@@ -5044,10 +5077,10 @@ class LibraryManager:
 
         A register entry names an already-present local library by `path`, which
         resolves against the workspace. Libraries pinned to a git source live in
-        `libraries_to_download`; the download handler appends each provisioned
-        manifest path back into `libraries_to_register`, so they reach discovery
-        as ordinary path-backed entries. Returns None when the path does not exist
-        on disk.
+        `libraries_to_download` and are resolved separately in
+        `_discover_library_files` by locating their provisioned manifest under the
+        workspace libraries directory, so they never need a `libraries_to_register`
+        entry. Returns None when the path does not exist on disk.
         """
         # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
         library_path = resolve_workspace_path(Path(entry.path), workspace_path)
@@ -5557,14 +5590,23 @@ class LibraryManager:
             else:
                 logger.info("Library '%s' registered successfully", library_name)
 
-        # Add library JSON file path to config so it's registered on future startups
-        libraries_to_register = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
-        library_json_str = str(library_json_path)
-        existing_paths = {extract_library_path(entry) for entry in libraries_to_register}
-        if library_json_str not in existing_paths:
-            libraries_to_register.append(library_json_str)
-            config_mgr.set_config_value(LIBRARIES_TO_REGISTER_KEY, libraries_to_register)
-            logger.info("Added library '%s' to config for auto-registration on startup", library_name)
+        # Persist the path to libraries_to_register only when registering now. The
+        # write lands in the GLOBAL user config (set_config_value -> user config),
+        # so a project-reconcile download (auto_register=False) must NOT touch it:
+        # the project's own libraries_to_download is the per-activation source of
+        # truth, and persisting its clone path here would leak that library into
+        # every other project's startup registration. Reconcile-downloaded
+        # libraries instead reach discovery directly from libraries_to_download
+        # (see _discover_library_files), so they load scoped to the workspace that
+        # declares them without any global config write.
+        if request.auto_register:
+            libraries_to_register = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+            library_json_str = str(library_json_path)
+            existing_paths = {extract_library_path(entry) for entry in libraries_to_register}
+            if library_json_str not in existing_paths:
+                libraries_to_register.append(library_json_str)
+                config_mgr.set_config_value(LIBRARIES_TO_REGISTER_KEY, libraries_to_register)
+                logger.info("Added library '%s' to config for auto-registration on startup", library_name)
 
         if skip_clone:
             details = f"Library '{library_name}' already exists at {target_path} and has been registered"
