@@ -264,6 +264,12 @@ class _ProjectVariableResolver:
                     try:
                         bag[ref] = self._get_builtin(ref)
                     except (RuntimeError, NotImplementedError) as e:
+                        # An optional reference (e.g. `{workflow_dir?:/}`) degrades cleanly:
+                        # leave it out of the bag so parsed.resolve() drops it, mirroring the
+                        # situation-macro path in on_get_path_for_macro_request. A required
+                        # builtin that can't resolve is a genuine error.
+                        if not var_info.is_required:
+                            continue
                         msg = (
                             f"Cannot resolve {owner_kind} '{owner_name}': "
                             f"builtin '{ref}' unavailable in current context ({e})"
