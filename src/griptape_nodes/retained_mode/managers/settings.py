@@ -44,6 +44,7 @@ MCP_SERVERS = Category(name="MCP Servers", description="Model Context Protocol s
 PROJECTS = Category(name="Projects", description="Project template configurations and registrations")
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
+AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -273,6 +274,13 @@ class WorkerSettings(BaseModel):
     )
 
 
+class AgentSettings(BaseModel):
+    system_prompt: str = Field(
+        default="",
+        description="Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
+    )
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -427,4 +435,8 @@ class Settings(BaseModel):
         category=PROJECTS,
         default_factory=dict,
         description="Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
+    )
+    agent: AgentSettings = Field(
+        category=AGENT,
+        default_factory=AgentSettings,
     )

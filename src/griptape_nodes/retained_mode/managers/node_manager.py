@@ -3547,7 +3547,13 @@ class NodeManager:
                 # not listed here silently keeps pointing at the original node. Consider
                 # retargeting any element command that exposes a node_name attribute instead.
                 if isinstance(
-                    element_command, (AlterParameterDetailsRequest, AddParameterToNodeRequest)
+                    element_command,
+                    (
+                        AlterParameterDetailsRequest,
+                        AddParameterToNodeRequest,
+                        AddParameterGroupToNodeRequest,
+                        AlterParameterGroupDetailsRequest,
+                    ),
                 ):
                     element_command.node_name = node_name
                 element_result = GriptapeNodes().handle_request(element_command)
