@@ -1108,7 +1108,10 @@ class LibraryManager:
             result_details=details,
         )
 
-    def load_metadata_for_all_libraries_request(self, request: LoadMetadataForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def load_metadata_for_all_libraries_request(
+        self,
+        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
+    ) -> ResultPayload:
         """Load metadata for all libraries from configuration without loading node modules.
 
         This loads metadata from both library JSON files specified in configuration
@@ -1118,7 +1121,7 @@ class LibraryManager:
         failed_libraries = []
 
         # Discover library files for metadata loading
-        library_files = self._discover_library_files()
+        library_files = await self._discover_library_files()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
@@ -1898,7 +1901,7 @@ class LibraryManager:
 
         # If not found and discovery is allowed, try discovery
         if library_info is None and request.perform_discovery_if_not_found:
-            discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+            discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
             if isinstance(discover_result, DiscoverLibrariesResultSuccess):
                 library_info = self.get_library_info_by_library_name(library_name)
 
@@ -3138,7 +3141,7 @@ class LibraryManager:
         reconcile_failures = await self._reconcile_libraries_from_config()
 
         # Discover all available libraries (config + sandbox)
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             logger.error("Failed to discover libraries: %s", discover_result.result_details)
             self._libraries_loading_complete.set()
@@ -3179,7 +3182,7 @@ class LibraryManager:
         self._libraries_loading_complete.set()
         return reconcile_failures
 
-    def on_preview_project_provisioning_request(
+    async def on_preview_project_provisioning_request(
         self, request: PreviewProjectProvisioningRequest
     ) -> PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure:
         """Compute the library provisioning plan for a loaded project, read-only.
@@ -3233,7 +3236,9 @@ class LibraryManager:
             Path(get_dot_value(merged, "workspace_directory")),
         )
 
-        actions = [self._plan_one_library_provisioning(download, libraries_path) for download in downloads]
+        actions = await asyncio.gather(
+            *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
+        )
         destructive_count = sum(1 for action in actions if action.destructive)
         change_count = sum(1 for action in actions if action.kind != LibraryProvisioningActionKind.SKIP)
         return PreviewProjectProvisioningResultSuccess(
@@ -3283,7 +3288,7 @@ class LibraryManager:
         spec_string = GriptapeNodes.ConfigManager().get_config_value(REQUIRES_ENGINE_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
-    def _plan_one_library_provisioning(
+    async def _plan_one_library_provisioning(
         self, download: LibraryDownload, libraries_path: Path | None = None
     ) -> LibraryProvisioningAction:
         """Decide what provisioning will do to one download entry, reading only.
@@ -3312,7 +3317,7 @@ class LibraryManager:
         The action's `library_name` falls back to the repo name for display.
         """
         library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
-        installed_version = self._installed_download_version(download, libraries_path)
+        installed_version = await self._installed_download_version(download, libraries_path)
         parsed = parse_git_url_with_ref(download.git_url)
         satisfied = self._registration_satisfied_by_installed(download, installed_version)
         if satisfied:
@@ -3356,7 +3361,7 @@ class LibraryManager:
         wire payload is unchanged. Returns a failure detail string, or None on
         success/skip. A LibraryDownload always carries a `git_url`.
         """
-        action = self._plan_one_library_provisioning(download)
+        action = await self._plan_one_library_provisioning(download)
         if action.kind == LibraryProvisioningActionKind.SKIP:
             return None
 
@@ -3391,7 +3396,7 @@ class LibraryManager:
         download_directory: str | None = None
         target_directory_name: str | None = None
         if overwrite_existing and download.name is not None:
-            manifest_path = self._installed_library_manifest_path(download.name)
+            manifest_path = await self._installed_library_manifest_path(download.name)
             if manifest_path is not None:
                 download_directory = str(manifest_path.parent.parent)
                 target_directory_name = manifest_path.parent.name
@@ -3412,7 +3417,7 @@ class LibraryManager:
         return None
 
     @staticmethod
-    def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
+    async def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
@@ -3441,7 +3446,7 @@ class LibraryManager:
                 return None
             libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
 
-        for manifest_path in find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+        for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
                 manifest = json.loads(content)
@@ -3453,18 +3458,18 @@ class LibraryManager:
         return None
 
     @staticmethod
-    def _installed_library_version(library_name: str) -> str | None:
+    async def _installed_library_version(library_name: str) -> str | None:
         """Return the on-disk version of a library by manifest name, or None when absent.
 
         Locates the provisioned manifest via `_installed_library_manifest_path`
         (the shared resolver), then reads `metadata.library_version`. None when no
         manifest matches or the version is absent/unreadable.
         """
-        manifest_path = LibraryManager._installed_library_manifest_path(library_name)
+        manifest_path = await LibraryManager._installed_library_manifest_path(library_name)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
-    def _installed_manifest_path_for_download(
+    async def _installed_manifest_path_for_download(
         download: LibraryDownload, libraries_path: Path | None = None
     ) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
@@ -3482,7 +3487,7 @@ class LibraryManager:
         for the real reconcile, which runs post-activation).
         """
         if download.name is not None:
-            return LibraryManager._installed_library_manifest_path(download.name, libraries_path)
+            return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
 
         if libraries_path is None:
             config_mgr = GriptapeNodes.ConfigManager()
@@ -3496,7 +3501,7 @@ class LibraryManager:
         return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
 
     @staticmethod
-    def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
+    async def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
         """Return the on-disk version for a download entry, or None when absent.
 
         Resolves the installed manifest via `_installed_manifest_path_for_download`
@@ -3504,7 +3509,7 @@ class LibraryManager:
         `metadata.library_version`. `libraries_path` threads the TARGET project's
         libraries directory through for the preview; None resolves from live config.
         """
-        manifest_path = LibraryManager._installed_manifest_path_for_download(download, libraries_path)
+        manifest_path = await LibraryManager._installed_manifest_path_for_download(download, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
@@ -4773,17 +4778,16 @@ class LibraryManager:
             requires_worker=requires_worker,
         )
 
-    def discover_libraries_request(
+    async def discover_libraries_request(
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
         """Discover libraries from config and track them in discovered state.
 
-        This is the event handler for DiscoverLibrariesRequest.
         Scans configured library paths and creates LibraryInfo entries in DISCOVERED state.
         """
         try:
-            config_library_entries = self._discover_library_files()
+            config_library_entries = await self._discover_library_files()
         except Exception as e:
             logger.exception("Failed to discover library files")
             return DiscoverLibrariesResultFailure(
@@ -4895,7 +4899,7 @@ class LibraryManager:
         New code should use LoadLibraryRequest to load specific libraries instead.
         """
         # First, discover all available libraries
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             return LoadLibrariesResultFailure(result_details=f"Discovery failed: {discover_result.result_details}")
 
@@ -5016,7 +5020,7 @@ class LibraryManager:
 
         return LoadLibrariesResultSuccess(result_details=ResultDetails(message=message, level=logging.INFO))
 
-    def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
+    async def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
         """Discover library JSON files from config and workspace recursively.
 
         Returns:
@@ -5031,11 +5035,13 @@ class LibraryManager:
         discovered_entries: list[LibraryManager.DiscoveredLibraryEntry] = []
         seen_paths: set[Path] = set()
 
-        def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
+        async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
             """Process a path, handling both files and directories."""
-            if path.is_dir():
-                # Recursively find library files, skipping hidden directories
-                for lib_path in find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+            if await anyio.Path(path).is_dir():
+                # Recursively find library files. find_files_recursive skips hidden
+                # directories and bounds recursion depth so a deep or symlink-looped
+                # tree can't stall the boot scan.
+                for lib_path in await find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
                         discovered_entries.append(
@@ -5058,7 +5064,7 @@ class LibraryManager:
         for entry in normalize_library_registrations(config_libraries):
             resolved = self._resolve_discovery_path(entry, config_mgr.workspace_path)
             if resolved is not None:
-                process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
+                await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
 
         # Add provisioned git-sourced libraries. Each libraries_to_download entry is
         # cloned into the workspace libraries_directory by reconcile; discovery
@@ -5067,9 +5073,9 @@ class LibraryManager:
         # libraries_to_register config (which would leak it into every project).
         download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         for download in normalize_library_downloads(download_libraries):
-            manifest_path = self._installed_manifest_path_for_download(download)
+            manifest_path = await self._installed_manifest_path_for_download(download)
             if manifest_path is not None:
-                process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
+                await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
 
         return discovered_entries
 
