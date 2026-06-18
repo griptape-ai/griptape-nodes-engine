@@ -1608,11 +1608,16 @@ class TrackedParameterOutputValues(dict[str, Any]):
         self._node = node
 
     def __setitem__(self, key: str, value: Any) -> None:
+        had_key = key in self
         old_value = self.get(key)
         super().__setitem__(key, value)
 
-        # Only emit event if value actually changed
-        if old_value != value:
+        # Emit if the key is newly added, or if its value actually changed.
+        # `key in self` distinguishes an absent key from one already present as
+        # None -- self.get(key) returns None for both, so without the had_key
+        # check an unset -> None transition would be silently dropped and the UI
+        # would keep showing the stale prior value.
+        if not had_key or old_value != value:
             self._emit_parameter_change_event(key, value)
 
     def __delitem__(self, key: str) -> None:

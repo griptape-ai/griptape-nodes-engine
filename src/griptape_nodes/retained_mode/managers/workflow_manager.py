@@ -193,6 +193,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
+from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
@@ -5671,14 +5672,16 @@ class WorkflowManager:
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
 
-        def collect_workflow_files(path: Path) -> None:  # noqa: C901
+        async def collect_workflow_files(path: Path) -> None:  # noqa: C901
             """Collect workflow files from a path."""
-            if not path.exists():
+            apath = anyio.Path(path)
+            if not await apath.exists():
                 return
-            if path.is_dir():
-                for workflow_file in path.rglob("*.py"):
-                    if ".venv" in workflow_file.parts:
-                        continue
+            if await apath.is_dir():
+                # find_files_recursive skips hidden directories (.venv, .git) and
+                # bounds recursion depth, so a deep or symlink-looped tree can't stall
+                # the boot scan.
+                for workflow_file in await find_files_recursive(path, "*.py"):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
@@ -5711,7 +5714,7 @@ class WorkflowManager:
 
         # Collect all workflow files first
         for workflow_to_register in workflows_to_register:
-            collect_workflow_files(Path(workflow_to_register))
+            await collect_workflow_files(Path(workflow_to_register))
 
         # Track progress
         total_workflows = len(all_workflow_files)

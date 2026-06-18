@@ -35,6 +35,7 @@ plugins:
           - projects/index.md: Project system overview
           - projects/workspace.md: Workspace concepts
           - projects/projects.md: Projects
+          - projects/version_pinning.md: Pinning engine and library versions
           - projects/macros.md: Macros
           - projects/directories.md: Directories
           - projects/situations.md: Situations
@@ -158,6 +159,7 @@ nav:
           - Overview: projects/index.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
+          - Version Pinning: projects/version_pinning.md
           - Macros: projects/macros.md
           - Directories: projects/directories.md
           - Situations: projects/situations.md

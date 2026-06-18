@@ -56,21 +56,55 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
 )
+from griptape_nodes.utils.library_utils import extract_library_path
 
 
-def _config_value_dispatcher(libraries_dir: Path, libraries: object) -> Callable[..., object]:
+def _config_value_dispatcher(
+    libraries_dir: Path, libraries: object, downloads: object | None = None
+) -> Callable[..., object]:
     """A `get_config_value` side_effect that dispatches by key.
 
-    `_discover_library_files` reads `libraries_to_register`; `libraries_directory`
-    is also served so callers that touch both keys share one mock.
+    `_discover_library_files` reads `libraries_to_register` and
+    `libraries_to_download`; `libraries_directory` is also served so callers that
+    touch all three keys share one mock. `downloads` defaults to an empty list so
+    discovery's download-sourcing pass finds nothing unless a test opts in.
     """
-    from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+    from griptape_nodes.retained_mode.managers.settings import (
+        LIBRARIES_TO_DOWNLOAD_KEY,
+        LIBRARIES_TO_REGISTER_KEY,
+    )
+
+    download_entries = downloads if downloads is not None else []
 
     def get_config_value(key: str, **_: object) -> object:
         if key == LIBRARIES_TO_REGISTER_KEY:
             return libraries
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return download_entries
         if key == "libraries_directory":
             return str(libraries_dir)
+        return None
+
+    return get_config_value
+
+
+def _register_only_config(libraries: object) -> Callable[..., object]:
+    """A `get_config_value` side_effect serving only `libraries_to_register`.
+
+    Discovery also reads `libraries_to_download`; this returns an empty list for it
+    so tests exercising register-only behavior do not have their register entries
+    misread as malformed download entries. Other keys return None.
+    """
+    from griptape_nodes.retained_mode.managers.settings import (
+        LIBRARIES_TO_DOWNLOAD_KEY,
+        LIBRARIES_TO_REGISTER_KEY,
+    )
+
+    def get_config_value(key: str, **_: object) -> object:
+        if key == LIBRARIES_TO_REGISTER_KEY:
+            return libraries
+        if key == LIBRARIES_TO_DOWNLOAD_KEY:
+            return []
         return None
 
     return get_config_value
@@ -116,7 +150,7 @@ class TestLibraryManagerLoadLibraries:
         mock_library.name = "SomeLib"
         with (
             patch.object(library_manager, "_library_file_path_to_info", {"some_lib": mock_lib_info}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("some_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("some_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
             patch.object(LibraryRegistry, "get_library", return_value=mock_library),
         ):
@@ -139,7 +173,7 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock()
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("new_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
@@ -164,7 +198,7 @@ class TestLibraryManagerLoadLibraries:
         mock_load_config = AsyncMock(side_effect=Exception("Config error"))
         with (
             patch.object(library_manager, "_library_file_path_to_info", {}),
-            patch.object(library_manager, "_discover_library_files", return_value=[_discovered("new_lib")]),
+            patch.object(library_manager, "_discover_library_files", AsyncMock(return_value=[_discovered("new_lib")])),
             patch.object(library_manager, "load_all_libraries_from_config", mock_load_config),
         ):
             request = LoadLibrariesRequest()
@@ -194,7 +228,8 @@ class TestLibraryManagerDisabledEntries:
         disabled_lib.write_text("{}")
         return enabled_lib, disabled_lib
 
-    def test_discover_library_files_marks_disabled_entries(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_marks_disabled_entries(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Object-shaped entries with enabled=False produce disabled register entries."""
@@ -206,8 +241,10 @@ class TestLibraryManagerDisabledEntries:
             {"path": str(disabled_lib), "enabled": False},
         ]
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
-            result = library_manager._discover_library_files()
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config)
+        ):
+            result = await library_manager._discover_library_files()
 
         by_path = {
             Path(entry.registration.path): entry.registration.enabled
@@ -217,20 +254,24 @@ class TestLibraryManagerDisabledEntries:
         assert by_path[enabled_lib] is True
         assert by_path[disabled_lib] is False
 
-    def test_discover_library_files_bare_string_defaults_to_enabled(
+    @pytest.mark.asyncio
+    async def test_discover_library_files_bare_string_defaults_to_enabled(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Bare path strings continue to be treated as enabled."""
         library_manager = griptape_nodes.LibraryManager()
         enabled_lib, _ = lib_files
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=[str(enabled_lib)]):
-            result = library_manager._discover_library_files()
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config([str(enabled_lib)])
+        ):
+            result = await library_manager._discover_library_files()
 
         assert len(result) == 1
         assert result[0].registration.enabled is True
 
-    def test_discover_libraries_request_marks_disabled_lifecycle(
+    @pytest.mark.asyncio
+    async def test_discover_libraries_request_marks_disabled_lifecycle(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """discover_libraries_request creates LibraryInfo with DISABLED lifecycle for disabled entries."""
@@ -244,8 +285,10 @@ class TestLibraryManagerDisabledEntries:
         # Reset tracking so this test does not depend on prior state.
         library_manager._library_file_path_to_info = {}
 
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config):
-            result = library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(config)
+        ):
+            result = await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         from griptape_nodes.retained_mode.events.library_events import DiscoverLibrariesResultSuccess
 
@@ -261,7 +304,8 @@ class TestLibraryManagerDisabledEntries:
         assert flags[enabled_lib] is True
         assert flags[disabled_lib] is False
 
-    def test_invalid_entry_is_skipped_with_warning(
+    @pytest.mark.asyncio
+    async def test_invalid_entry_is_skipped_with_warning(
         self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
     ) -> None:
         """Entries that are neither strings nor dicts with a path are skipped."""
@@ -273,13 +317,14 @@ class TestLibraryManagerDisabledEntries:
             patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=config),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         assert result == []
         warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("libraries_to_register" in m for m in warnings)
 
-    def test_rediscovery_reconciles_toggled_enabled_flag(
+    @pytest.mark.asyncio
+    async def test_rediscovery_reconciles_toggled_enabled_flag(
         self, griptape_nodes: GriptapeNodes, lib_files: tuple[Path, Path]
     ) -> None:
         """Re-running discovery after a refresh updates lifecycle when the user toggles enabled.
@@ -299,8 +344,10 @@ class TestLibraryManagerDisabledEntries:
 
         # Initial discovery: first_lib enabled, second_lib disabled.
         initial_config = [str(first_lib), {"path": str(second_lib), "enabled": False}]
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=initial_config):
-            library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(initial_config)
+        ):
+            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
@@ -309,8 +356,10 @@ class TestLibraryManagerDisabledEntries:
 
         # User flips the config: first_lib disabled, second_lib enabled, then triggers refresh.
         toggled_config = [{"path": str(first_lib), "enabled": False}, str(second_lib)]
-        with patch.object(griptape_nodes.ConfigManager(), "get_config_value", return_value=toggled_config):
-            library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
+        with patch.object(
+            griptape_nodes.ConfigManager(), "get_config_value", side_effect=_register_only_config(toggled_config)
+        ):
+            await library_manager.discover_libraries_request(DiscoverLibrariesRequest(include_sandbox=False))
 
         first_state_after = library_manager._library_file_path_to_info[str(first_lib)].lifecycle_state
         second_state_after = library_manager._library_file_path_to_info[str(second_lib)].lifecycle_state
@@ -1506,6 +1555,29 @@ class _RaisingProbe(BaseNode):
         raise RuntimeError(msg)
 
 
+class _CatalogProbe(BaseNode):
+    """Probe whose __init__ sources a parameter default from the library model_catalog.
+
+    Exercises the describe/reference probes resolving library-backed __init__ data
+    via get_declared_models -- which only works when the node is constructed with
+    its library/node_type, the way create_node does it.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        resolved = ",".join(r.model.provider_model_id or "" for r in get_declared_models(self))
+        self.add_parameter(
+            Parameter(
+                name="resolved_models",
+                type="str",
+                input_types=["str"],
+                output_type="str",
+                default_value=resolved,
+                tooltip="Comma-joined provider model ids resolved from the catalog.",
+            )
+        )
+
+
 class TestDescribeNodeTypeRequest:
     """Exercise LibraryManager.describe_node_type_request."""
 
@@ -1547,6 +1619,60 @@ class TestDescribeNodeTypeRequest:
                 display_name="Probe",
             ),
         )
+
+    def test_probe_resolves_library_model_catalog(self, griptape_nodes: GriptapeNodes) -> None:
+        # The probe must be constructed with the node's library/type so __init__
+        # logic that resolves against the model_catalog (get_declared_models)
+        # works -- otherwise the catalog is invisible and the roster is empty.
+        library_manager = griptape_nodes.LibraryManager()
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="catalog probe library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=[
+                    ModelCatalogLibraryProperty(
+                        providers={
+                            "acme": ModelProvider(
+                                display_name="Acme",
+                                models={
+                                    "m1": Model(
+                                        display_name="M1",
+                                        provider_model_id="acme-m1",
+                                        key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                                    ),
+                                },
+                            ),
+                        },
+                    ),
+                ],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _CatalogProbe,
+            NodeMetadata(
+                category="test",
+                description="Catalog-backed probe",
+                display_name="CatalogProbe",
+                declarations=[ModelUsageNodeProperty(model_ids=["m1"])],
+            ),
+        )
+
+        result = library_manager.describe_node_type_request(
+            DescribeNodeTypeRequest(node_type=_CatalogProbe.__name__, library=self._LIBRARY_NAME),
+        )
+
+        assert isinstance(result, DescribeNodeTypeResultSuccess)
+        by_name = {param.name: param for param in result.parameters}
+        # Resolved from the catalog -> non-empty. Without library context it would be "".
+        assert by_name["resolved_models"].default_value == "acme-m1"
 
     def test_returns_parameter_schema_without_touching_object_manager(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
@@ -1818,41 +1944,47 @@ class TestLibraryManagerEngineVersionCheck:
 class TestLibraryManagerProvisioningPlan:
     """`_plan_one_library_provisioning` is a pure decision the preview and execution share."""
 
-    def test_satisfied_git_entry_plans_skip(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_satisfied_git_entry_plans_skip(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         download = LibraryDownload(name="git-lib", version=">=2.0,<3", git_url="griptape-ai/git-lib@v2")
-        with patch.object(library_manager, "_installed_download_version", return_value="2.1.0"):
-            action = library_manager._plan_one_library_provisioning(download)
+        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="2.1.0")):
+            action = await library_manager._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.SKIP
         assert action.destructive is False
 
-    def test_missing_git_entry_plans_install(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_missing_git_entry_plans_install(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         download = LibraryDownload(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", return_value=None):
-            action = library_manager._plan_one_library_provisioning(download)
+        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value=None)):
+            action = await library_manager._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.INSTALL
         assert action.destructive is False
 
-    def test_wrong_git_version_plans_destructive_overwrite(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_wrong_git_version_plans_destructive_overwrite(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.library_events import LibraryProvisioningActionKind
 
         library_manager = griptape_nodes.LibraryManager()
         download = LibraryDownload(name="git-lib", version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", return_value="1.0.0"):
-            action = library_manager._plan_one_library_provisioning(download)
+        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")):
+            action = await library_manager._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.OVERWRITE
         # A git overwrite deletes the local library directory before re-cloning.
         assert action.destructive is True
 
-    def test_version_pin_without_name_uses_repo_name_for_action_label(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_version_pin_without_name_uses_repo_name_for_action_label(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
         # A {git_url, version} entry with no `name` still enforces its pin: the installed
         # copy is found by its repo-name directory, so a wrong version plans OVERWRITE
         # rather than silently no-opping. The action's library_name falls back to the repo name.
@@ -1860,8 +1992,8 @@ class TestLibraryManagerProvisioningPlan:
 
         library_manager = griptape_nodes.LibraryManager()
         download = LibraryDownload(version=">=2.0", git_url="griptape-ai/git-lib@v2.0")
-        with patch.object(library_manager, "_installed_download_version", return_value="1.0.0"):
-            action = library_manager._plan_one_library_provisioning(download)
+        with patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")):
+            action = await library_manager._plan_one_library_provisioning(download)
 
         assert action.kind == LibraryProvisioningActionKind.OVERWRITE
         assert action.destructive is True
@@ -1885,37 +2017,43 @@ class TestInstalledLibraryVersion:
         config_manager.workspace_path = str(libraries_dir.parent)
         return config_manager
 
-    def test_returns_version_from_matching_manifest(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_version_from_matching_manifest(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert library_manager._installed_library_version("Griptape Nodes Library") == "0.78.0"
+            assert await library_manager._installed_library_version("Griptape Nodes Library") == "0.78.0"
 
-    def test_returns_none_when_no_manifest_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_manifest_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert library_manager._installed_library_version("Griptape Nodes Library") is None
+            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
-    def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         config_manager = MagicMock()
         config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = config_manager
-            assert library_manager._installed_library_version("Griptape Nodes Library") is None
+            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
-    def test_returns_none_when_manifest_has_no_version(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_manifest_has_no_version(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", None)
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert library_manager._installed_library_version("Griptape Nodes Library") is None
+            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
 
 class TestInstalledLibraryManifestPath:
@@ -1926,30 +2064,33 @@ class TestInstalledLibraryManifestPath:
     file the planner reasons about is exactly the file discovery loads.
     """
 
-    def test_returns_manifest_path_for_matching_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_manifest_path_for_matching_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            result = library_manager._installed_library_manifest_path("Griptape Nodes Library")
+            result = await library_manager._installed_library_manifest_path("Griptape Nodes Library")
         assert result == libraries_dir / "git-lib" / "griptape_nodes_library.json"
 
-    def test_returns_none_when_no_manifest_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_manifest_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
+            assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
-    def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         config_manager = MagicMock()
         config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = config_manager
-            assert library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
+            assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
 
 class TestInstalledDownloadVersion:
@@ -1961,7 +2102,8 @@ class TestInstalledDownloadVersion:
     `name` overrides the directory match and resolves by manifest name instead.
     """
 
-    def test_resolves_by_repo_name_directory_when_name_absent(
+    @pytest.mark.asyncio
+    async def test_resolves_by_repo_name_directory_when_name_absent(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         # The clone dir is the repo name from the git URL, while the manifest's own
@@ -1972,18 +2114,20 @@ class TestInstalledDownloadVersion:
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert library_manager._installed_download_version(download) == "1.2.3"
+            assert await library_manager._installed_download_version(download) == "1.2.3"
 
-    def test_returns_none_when_repo_directory_absent(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_repo_directory_absent(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other-lib", "Other", "1.0.0")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert library_manager._installed_download_version(download) is None
+            assert await library_manager._installed_download_version(download) is None
 
-    def test_name_overrides_directory_match(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_name_overrides_directory_match(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         # With an explicit `name`, resolve by manifest name even when the library lives
         # under a directory that does not match the repo name (e.g. legacy XDG layout).
         library_manager = griptape_nodes.LibraryManager()
@@ -1992,18 +2136,20 @@ class TestInstalledDownloadVersion:
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0", name="Griptape Nodes Library")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert library_manager._installed_download_version(download) == "0.9.0"
+            assert await library_manager._installed_download_version(download) == "0.9.0"
 
-    def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         config_manager = MagicMock()
         config_manager.get_config_value.return_value = None
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = config_manager
-            assert library_manager._installed_download_version(download) is None
+            assert await library_manager._installed_download_version(download) is None
 
-    def test_explicit_libraries_path_probes_target_not_live(
+    @pytest.mark.asyncio
+    async def test_explicit_libraries_path_probes_target_not_live(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         # The preview passes the TARGET project's libraries dir. The probe must read it,
@@ -2019,7 +2165,7 @@ class TestInstalledDownloadVersion:
         live_config.workspace_path = str(tmp_path / "live")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
-            assert library_manager._installed_download_version(download, target_libs) == "3.3.0"
+            assert await library_manager._installed_download_version(download, target_libs) == "3.3.0"
         live_config.get_config_value.assert_not_called()
 
 
@@ -2033,7 +2179,8 @@ class TestDiscoverProvisionedManifestPaths:
     after a project switch.
     """
 
-    def test_provisioned_manifest_path_is_discovered(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_provisioned_manifest_path_is_discovered(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         manifest_dir = libraries_dir / "griptape-nodes-library-standard"
@@ -2048,12 +2195,13 @@ class TestDiscoverProvisionedManifestPaths:
             config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
             config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
             mock_gn.ConfigManager.return_value = config_manager
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         discovered_paths = [Path(entry.registration.path) for entry in result if entry.registration.path is not None]
         assert expected_manifest in discovered_paths
 
-    def test_missing_register_path_is_skipped(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_missing_register_path_is_skipped(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         libraries_dir.mkdir(parents=True, exist_ok=True)
@@ -2065,7 +2213,7 @@ class TestDiscoverProvisionedManifestPaths:
             config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
             config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
             mock_gn.ConfigManager.return_value = config_manager
-            result = library_manager._discover_library_files()
+            result = await library_manager._discover_library_files()
 
         assert result == []
 
@@ -2216,7 +2364,8 @@ class TestPreviewProjectProvisioning:
         """
         mock_gn.ConfigManager.return_value.compute_system_defaults_provisioning_config.return_value = merged
 
-    def test_not_loaded_project_is_failure(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_not_loaded_project_is_failure(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
             PreviewProjectProvisioningRequest,
             PreviewProjectProvisioningResultFailure,
@@ -2225,13 +2374,14 @@ class TestPreviewProjectProvisioning:
         library_manager = griptape_nodes.LibraryManager()
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = None
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id="/nope/project.yml")
             )
 
         assert isinstance(result, PreviewProjectProvisioningResultFailure)
 
-    def test_no_download_entries_is_empty_success(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_no_download_entries_is_empty_success(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
             PreviewProjectProvisioningRequest,
             PreviewProjectProvisioningResultSuccess,
@@ -2241,7 +2391,7 @@ class TestPreviewProjectProvisioning:
         merged = self._merged_config([])
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2249,7 +2399,10 @@ class TestPreviewProjectProvisioning:
         assert result.actions == []
         assert result.engine_version_failure is None
 
-    def test_download_entries_preserve_order_and_flags(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_download_entries_preserve_order_and_flags(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
             LibraryProvisioningActionKind,
             PreviewProjectProvisioningRequest,
@@ -2270,11 +2423,11 @@ class TestPreviewProjectProvisioning:
             patch.object(
                 library_manager,
                 "_installed_download_version",
-                side_effect=lambda download, _libraries_path=None: installed[download.name],
+                new=AsyncMock(side_effect=lambda download, _libraries_path=None: installed[download.name]),
             ),
         ):
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2288,7 +2441,10 @@ class TestPreviewProjectProvisioning:
         # Only the git OVERWRITE is destructive.
         assert [a.destructive for a in result.actions] == [False, False, True]
 
-    def test_plan_reads_merged_config_for_resolved_dirs(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    @pytest.mark.asyncio
+    async def test_plan_reads_merged_config_for_resolved_dirs(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
         """The preview plans from the merged config (not the project-adjacent file).
 
         Guards defect #2: when a higher-priority layer supplies
@@ -2311,10 +2467,10 @@ class TestPreviewProjectProvisioning:
         merged = self._merged_config([{"name": "merged-lib", "git_url": "griptape-ai/merged-lib@v2", "version": ">=2"}])
         with (
             patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
-            patch.object(library_manager, "_installed_download_version", return_value=None),
+            patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value=None)),
         ):
             self._patch_managers(mock_gn, dirs=dirs, merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2324,7 +2480,8 @@ class TestPreviewProjectProvisioning:
         assert [a.library_name for a in result.actions] == ["merged-lib"]
         assert result.actions[0].kind == LibraryProvisioningActionKind.INSTALL
 
-    def test_probes_target_workspace_not_live_for_destructive_plan(
+    @pytest.mark.asyncio
+    async def test_probes_target_workspace_not_live_for_destructive_plan(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         """The installed-version probe reads the TARGET project's libraries dir.
@@ -2359,7 +2516,7 @@ class TestPreviewProjectProvisioning:
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2368,7 +2525,8 @@ class TestPreviewProjectProvisioning:
         assert result.actions[0].destructive is True
         assert result.actions[0].installed_version == "1.0.0"
 
-    def test_unsatisfiable_engine_version_populates_failure(
+    @pytest.mark.asyncio
+    async def test_unsatisfiable_engine_version_populates_failure(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
@@ -2383,7 +2541,7 @@ class TestPreviewProjectProvisioning:
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
@@ -2392,7 +2550,8 @@ class TestPreviewProjectProvisioning:
         # Same text the live gate produces: it names the running engine version.
         assert "0.5.3" in result.engine_version_failure
 
-    def test_satisfiable_engine_version_leaves_failure_none(
+    @pytest.mark.asyncio
+    async def test_satisfiable_engine_version_leaves_failure_none(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         from griptape_nodes.retained_mode.events.library_events import (
@@ -2407,14 +2566,17 @@ class TestPreviewProjectProvisioning:
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
         assert result.engine_version_failure is None
 
-    def test_system_defaults_plans_from_user_layer_without_resolving_dirs(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_system_defaults_plans_from_user_layer_without_resolving_dirs(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
         """System defaults is previewable: it plans from the defaults->user->env merge.
 
         Switching to system defaults activates that merge (no project-adjacent or
@@ -2433,10 +2595,10 @@ class TestPreviewProjectProvisioning:
         merged = self._merged_config([{"name": "user-pin", "git_url": "griptape-ai/user-pin@v2", "version": "==2.0.0"}])
         with (
             patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
-            patch.object(library_manager, "_installed_download_version", return_value="1.0.0"),
+            patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")),
         ):
             self._patch_system_defaults(mock_gn, merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -2446,7 +2608,8 @@ class TestPreviewProjectProvisioning:
         assert result.actions[0].kind == LibraryProvisioningActionKind.OVERWRITE
         assert result.actions[0].destructive is True
 
-    def test_system_defaults_unsatisfiable_engine_version_populates_failure(
+    @pytest.mark.asyncio
+    async def test_system_defaults_unsatisfiable_engine_version_populates_failure(
         self, griptape_nodes: GriptapeNodes
     ) -> None:
         """A user-config engine_version pin gates the system-defaults switch too."""
@@ -2462,7 +2625,7 @@ class TestPreviewProjectProvisioning:
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
             self._patch_system_defaults(mock_gn, merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -2470,7 +2633,8 @@ class TestPreviewProjectProvisioning:
         assert result.engine_version_failure is not None
         assert "0.5.3" in result.engine_version_failure
 
-    def test_system_defaults_no_pins_is_empty_success(self, griptape_nodes: GriptapeNodes) -> None:
+    @pytest.mark.asyncio
+    async def test_system_defaults_no_pins_is_empty_success(self, griptape_nodes: GriptapeNodes) -> None:
         """No user-config pins means nothing to provision: empty plan, no modal."""
         from griptape_nodes.retained_mode.events.library_events import (
             PreviewProjectProvisioningRequest,
@@ -2481,7 +2645,7 @@ class TestPreviewProjectProvisioning:
         merged = self._merged_config([])
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             self._patch_system_defaults(mock_gn, merged=merged)
-            result = library_manager.on_preview_project_provisioning_request(
+            result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
@@ -2521,7 +2685,9 @@ class TestProvisionGitLibraryOverwriteDir:
         ahandle = AsyncMock(return_value=success)
         with (
             patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
-            patch.object(library_manager, "_installed_library_manifest_path", return_value=manifest_path),
+            patch.object(
+                library_manager, "_installed_library_manifest_path", new=AsyncMock(return_value=manifest_path)
+            ),
         ):
             mock_gn.ahandle_request = ahandle
             failure = await library_manager._provision_git_library(
@@ -2557,7 +2723,7 @@ class TestProvisionGitLibraryOverwriteDir:
         ahandle = AsyncMock(return_value=success)
         with (
             patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
-            patch.object(library_manager, "_installed_library_manifest_path") as mock_resolve,
+            patch.object(library_manager, "_installed_library_manifest_path", new=AsyncMock()) as mock_resolve,
         ):
             mock_gn.ahandle_request = ahandle
             failure = await library_manager._provision_git_library(
@@ -2623,6 +2789,227 @@ class TestLibraryManagerInitializationFlag:
             await library_manager.reload_libraries_request(ReloadAllLibrariesRequest())
 
         assert library_manager.is_initializing() is False
+
+
+class TestDownloadLibraryRegisterPersistence:
+    """download_library_request must only persist to the GLOBAL config when registering now.
+
+    A project-reconcile download passes auto_register=False: the project's own
+    libraries_to_download is the per-activation source of truth, so the clone path
+    must NOT be appended to the global libraries_to_register (doing so leaks the
+    library into every other project's startup registration). The explicit CLI
+    download (auto_register=True) keeps persisting so it loads on future startups.
+    """
+
+    @staticmethod
+    def _make_clone(library_name: str) -> Callable[[str, Path, str | None], None]:
+        """Return a clone_repository stand-in that writes a minimal manifest into target_path."""
+
+        def fake_clone(_git_url: str, target_path: Path, _ref: str | None = None) -> None:
+            target_path.mkdir(parents=True, exist_ok=True)
+            (target_path / "griptape_nodes_library.json").write_text(
+                json.dumps({"name": library_name}), encoding="utf-8"
+            )
+
+        return fake_clone
+
+    @pytest.mark.asyncio
+    async def test_reconcile_download_does_not_persist_to_global_config(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """auto_register=False (the reconcile/provisioning path) leaves global libraries_to_register untouched."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            DownloadLibraryRequest,
+            DownloadLibraryResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+        before = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+            side_effect=self._make_clone("provisioned_lib"),
+        ):
+            result = await library_manager.download_library_request(
+                DownloadLibraryRequest(
+                    git_url="owner/provisioned_lib",
+                    download_directory=str(tmp_path / "libs"),
+                    auto_register=False,
+                )
+            )
+
+        assert isinstance(result, DownloadLibraryResultSuccess)
+        after = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        assert {extract_library_path(entry) for entry in after} == {extract_library_path(entry) for entry in before}
+        assert result.library_path not in {extract_library_path(entry) for entry in after}
+
+    @pytest.mark.asyncio
+    async def test_explicit_download_persists_to_global_config(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """auto_register=True (the explicit CLI download) appends the clone path to global libraries_to_register."""
+        from griptape_nodes.retained_mode.events.library_events import (
+            DownloadLibraryRequest,
+            DownloadLibraryResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        with patch(
+            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+            side_effect=self._make_clone("explicit_lib"),
+        ):
+            result = await library_manager.download_library_request(
+                DownloadLibraryRequest(
+                    git_url="owner/explicit_lib",
+                    download_directory=str(tmp_path / "libs"),
+                    auto_register=True,
+                )
+            )
+
+        assert isinstance(result, DownloadLibraryResultSuccess)
+        after = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        assert result.library_path in {extract_library_path(entry) for entry in after}
+
+
+class TestDiscoverDownloadedLibraries:
+    """A provisioned libraries_to_download entry must be discoverable from the workspace.
+
+    Reconcile clones each libraries_to_download entry into the workspace
+    libraries_directory; discovery resolves it there so the library loads scoped
+    to the workspace that declares it, WITHOUT any libraries_to_register entry.
+    This is the mechanism that replaces the global-config append, so projects that
+    pin a library only via libraries_to_download (e.g. the lib-swap fixtures) still
+    load it.
+    """
+
+    @staticmethod
+    def _install_manifest(libraries_dir: Path, repo_name: str, library_name: str) -> Path:
+        """Materialize a provisioned library manifest under <libraries_dir>/<repo_name>/."""
+        manifest_dir = libraries_dir / repo_name
+        manifest_dir.mkdir(parents=True)
+        manifest_path = manifest_dir / "griptape_nodes_library.json"
+        manifest_path.write_text(json.dumps({"name": library_name}), encoding="utf-8")
+        return manifest_path
+
+    @pytest.mark.asyncio
+    async def test_download_only_library_is_discovered_from_workspace(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A libraries_to_download entry with no libraries_to_register row is still discovered."""
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY
+
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        libraries_dir = tmp_path / "libraries"
+        manifest_path = self._install_manifest(libraries_dir, "remote_lib", "remote_lib")
+
+        def get_config_value(key: str, **_: object) -> object:
+            if key == LIBRARIES_TO_REGISTER_KEY:
+                return []
+            if key == LIBRARIES_TO_DOWNLOAD_KEY:
+                return ["owner/remote_lib"]
+            if key == "libraries_directory":
+                return str(libraries_dir)
+            return None
+
+        with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):
+            entries = await library_manager._discover_library_files()
+
+        discovered_paths = {Path(entry.registration.path) for entry in entries}
+        assert manifest_path in discovered_paths
+
+
+class TestPersistLibrarySettings:
+    """A library's declared settings must persist to global WITHOUT leaking project-layer values.
+
+    Library load injects each declared setting category into the user config. The
+    existing category must be read from the user_config layer, not the merged
+    config: the merged config folds in the active project's project/workspace/env
+    layers (e.g. libraries_to_download, requires_engine), and round-tripping that
+    through SetConfigCategory (which writes the GLOBAL user config) would leak the
+    active project's per-activation pins into every other project's startup. This
+    is the canonical repro for the duplicate-standard-library symptom seen when
+    switching from a download-pinned project to one that declares no download.
+    """
+
+    @staticmethod
+    def _library_with_settings(category: str, contents: dict[str, object]) -> LibrarySchema:
+        """Build a minimal LibrarySchema declaring a single settings category."""
+        from griptape_nodes.node_library.library_registry import Setting
+
+        return LibrarySchema(
+            name="settings_lib",
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="0.1.0",
+                engine_version="0.1.0",
+                tags=[],
+            ),
+            categories=[],
+            nodes=[],
+            settings=[Setting(category=category, contents=contents)],
+        )
+
+    def test_persist_does_not_leak_project_download_pin_to_global(
+        self, griptape_nodes: GriptapeNodes, isolate_user_config: Path, tmp_path: Path
+    ) -> None:
+        """A project-layer libraries_to_download pin must NOT be written into the global user config."""
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = griptape_nodes.ConfigManager()
+
+        # Prime a project-adjacent config carrying a download pin, then load it as
+        # the project layer so the MERGED config sees the pin but the global user
+        # config file does not.
+        project_dir = tmp_path / "pinned_project"
+        project_dir.mkdir()
+        (project_dir / "griptape_nodes_config.json").write_text(
+            json.dumps(
+                {
+                    "app_events": {
+                        "on_app_initialization_complete": {
+                            "libraries_to_download": [{"git_url": "owner/standard@v0.79.0", "version": "==0.79.0"}]
+                        }
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        config_mgr.load_project_config(project_dir)
+        assert config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]) != []
+
+        library = self._library_with_settings(
+            "app_events.on_app_initialization_complete",
+            {"secrets_to_register": {"MY_LIB_KEY": ""}},
+        )
+        problems = library_manager._persist_library_settings(library)
+
+        assert problems == []
+        # The library's own declared setting persisted globally...
+        global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
+        init = global_config.get("app_events", {}).get("on_app_initialization_complete", {})
+        assert "MY_LIB_KEY" in init.get("secrets_to_register", {})
+        # ...but the project-layer download pin did NOT leak into the global config.
+        assert "libraries_to_download" not in init
+
+    def test_persist_creates_missing_category(self, griptape_nodes: GriptapeNodes, isolate_user_config: Path) -> None:
+        """A library declaring a brand-new category writes its contents verbatim to global."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        library = self._library_with_settings(
+            "my_library_category",
+            {"some_setting": "value"},
+        )
+        problems = library_manager._persist_library_settings(library)
+
+        assert problems == []
+        global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
+        assert global_config.get("my_library_category", {}).get("some_setting") == "value"
 
 
 class _ModelProbe(BaseNode):

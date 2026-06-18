@@ -3259,11 +3259,22 @@ class NodeManager:
             # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
             # detector skips this ephemeral instance's declarative ``add_parameter``
             # calls (this construction bypasses ``LibraryRegistry.create_node``).
+            #
+            # Carry the node's library and type so the reference resolves the same
+            # library-backed ``__init__`` data the live node did (e.g. a model
+            # dropdown sourced from the ``model_catalog``); otherwise it would look
+            # mutated.
             if isinstance(node, ErrorProxyNode):
                 reference_node = None
             else:
                 with LibraryRegistry.constructing_node():
-                    reference_node = type(node)(name="REFERENCE NODE")
+                    reference_node = type(node)(
+                        name="REFERENCE NODE",
+                        metadata={
+                            "library": node.metadata.get("library"),
+                            "node_type": node.metadata.get("node_type"),
+                        },
+                    )
 
             # Now creation or alteration of all of the elements.
             element_modification_commands = []
@@ -3531,8 +3542,14 @@ class NodeManager:
         with GriptapeNodes.ContextManager().node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
                 if isinstance(
-                    element_command, (AlterParameterDetailsRequest, AddParameterToNodeRequest)
-                ):  # are there more types of requests we could encounter here?
+                    element_command,
+                    (
+                        AlterParameterDetailsRequest,
+                        AddParameterToNodeRequest,
+                        AddParameterGroupToNodeRequest,
+                        AlterParameterGroupDetailsRequest,
+                    ),
+                ):
                     element_command.node_name = node_name
                 element_result = GriptapeNodes().handle_request(element_command)
                 if element_result.failed():
