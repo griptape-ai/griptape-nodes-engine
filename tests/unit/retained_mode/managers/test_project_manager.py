@@ -6957,3 +6957,52 @@ class TestImportProject:
         assert synthetic_key in result.unset_secret_keys
         # Detection must not have created/written the secret value.
         assert secrets_manager.get_secret(synthetic_key, should_error_on_not_found=False) is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip_with_string_paths_from_wire(
+        self, griptape_nodes: object, tmp_path: Path
+    ) -> None:  # noqa: ARG002
+        """Path fields arriving as wire strings are coerced, not crashed on.
+
+        project_events declares destination_path/archive_path/target_directory as
+        Path, but its TYPE_CHECKING-only Path import makes cattrs fall back to a
+        no-coercion structure (get_type_hints raises NameError), so over the
+        WebSocket these fields land as plain str. The handlers must coerce at the
+        boundary; before that fix on_export_project_request raised
+        AttributeError: 'str' object has no attribute 'parent'. Build the requests
+        with str (not Path) to reproduce the wire form.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        export_result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=str(destination))
+        )
+        assert isinstance(export_result, ExportProjectResultSuccess)
+
+        preview_result = pm.on_preview_import_project_request(
+            PreviewImportProjectRequest(archive_path=str(destination))
+        )
+        assert isinstance(preview_result, PreviewImportProjectResultSuccess)
+
+        target = tmp_path / "imported"
+        import_result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=str(destination), target_directory=str(target))
+        )
+        assert isinstance(import_result, ImportProjectResultSuccess)
+        assert import_result.project_id in pm._successfully_loaded_project_templates

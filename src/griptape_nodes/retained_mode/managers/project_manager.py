@@ -2278,7 +2278,11 @@ class ProjectManager:
                 ),
             )
 
-        destination_path = request.destination_path
+        # The wire form is always a string: project_events declares this field as
+        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
+        # coercion (get_type_hints raises NameError, so it falls back to a raw
+        # constructor call). Coerce at the boundary, matching os_events handlers.
+        destination_path = Path(request.destination_path)
         if not destination_path.parent.is_dir():
             return ExportProjectResultFailure(
                 result_details=(
@@ -2318,17 +2322,23 @@ class ProjectManager:
         current environment, computed via get_secret(should_error_on_not_found=False)
         so nothing is written.
         """
+        # The wire form is always a string: project_events declares this field as
+        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
+        # coercion (get_type_hints raises NameError, so it falls back to a raw
+        # constructor call). Coerce at the boundary, matching os_events handlers.
+        archive_path = Path(request.archive_path)
+
         try:
-            manifest = ProjectPackager.read_manifest(request.archive_path)
+            manifest = ProjectPackager.read_manifest(archive_path)
         except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
             return PreviewImportProjectResultFailure(
-                result_details=(f"Attempted to preview project package '{request.archive_path}'. Failed because {err}"),
+                result_details=(f"Attempted to preview project package '{archive_path}'. Failed because {err}"),
             )
 
         if not ProjectPackager.is_manifest_schema_compatible(manifest):
             return PreviewImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to preview project package '{request.archive_path}'. "
+                    f"Attempted to preview project package '{archive_path}'. "
                     f"Failed because its manifest schema version "
                     f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
                 ),
@@ -2339,7 +2349,7 @@ class ProjectManager:
         return PreviewImportProjectResultSuccess(
             manifest=manifest,
             unset_secret_keys=unset_secret_keys,
-            result_details=f"Read manifest from project package '{request.archive_path}'.",
+            result_details=f"Read manifest from project package '{archive_path}'.",
         )
 
     async def on_import_project_request(
@@ -2353,41 +2363,48 @@ class ProjectManager:
         Macro-defined directories re-resolve against the new location automatically.
         Secrets are never auto-created; required/unset keys are returned for the GUI.
         """
+        # The wire form is always a string: project_events declares these fields as
+        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
+        # coercion (get_type_hints raises NameError, so it falls back to a raw
+        # constructor call). Coerce at the boundary, matching os_events handlers.
+        archive_path = Path(request.archive_path)
+        target_directory = Path(request.target_directory)
+
         try:
-            manifest = ProjectPackager.read_manifest(request.archive_path)
+            manifest = ProjectPackager.read_manifest(archive_path)
         except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
             return ImportProjectResultFailure(
-                result_details=f"Attempted to import project package '{request.archive_path}'. Failed because {err}",
+                result_details=f"Attempted to import project package '{archive_path}'. Failed because {err}",
             )
 
         if not ProjectPackager.is_manifest_schema_compatible(manifest):
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{request.archive_path}'. "
+                    f"Attempted to import project package '{archive_path}'. "
                     f"Failed because its manifest schema version "
                     f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
                 ),
             )
 
-        target_yaml = request.target_directory / WORKSPACE_PROJECT_FILE
+        target_yaml = target_directory / WORKSPACE_PROJECT_FILE
         if target_yaml.exists() and not request.overwrite_existing:
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{request.archive_path}' into "
-                    f"'{request.target_directory}'. Failed because a project file already exists at "
+                    f"Attempted to import project package '{archive_path}' into "
+                    f"'{target_directory}'. Failed because a project file already exists at "
                     f"'{target_yaml}' and overwrite_existing is False."
                 ),
             )
 
         try:
-            ProjectPackager.extract_archive(request.archive_path, request.target_directory)
+            ProjectPackager.extract_archive(archive_path, target_directory)
             if request.new_project_name is not None:
                 ProjectPackager.rename_project_template(target_yaml, request.new_project_name)
         except (zipfile.BadZipFile, OSError) as err:
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{request.archive_path}' into "
-                    f"'{request.target_directory}'. Failed during extraction because {err}"
+                    f"Attempted to import project package '{archive_path}' into "
+                    f"'{target_directory}'. Failed during extraction because {err}"
                 ),
             )
 
@@ -2395,8 +2412,8 @@ class ProjectManager:
         if isinstance(load_result, LoadProjectTemplateResultFailure):
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{request.archive_path}' into "
-                    f"'{request.target_directory}'. Extracted successfully but the project failed to load: "
+                    f"Attempted to import project package '{archive_path}' into "
+                    f"'{target_directory}'. Extracted successfully but the project failed to load: "
                     f"{load_result.result_details}"
                 ),
             )
@@ -2422,7 +2439,7 @@ class ProjectManager:
             required_secret_keys=required_secret_keys,
             unset_secret_keys=unset_secret_keys,
             warnings=warnings,
-            result_details=f"Imported project package '{request.archive_path}' into '{request.target_directory}'.",
+            result_details=f"Imported project package '{archive_path}' into '{target_directory}'.",
         )
 
     def _compute_unset_secret_keys(self, required_secret_keys: list[str]) -> list[str]:
