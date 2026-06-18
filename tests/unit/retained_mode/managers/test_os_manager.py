@@ -447,20 +447,45 @@ class TestListDirectoryRequest:
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
     def test_list_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """Test successfully listing a directory."""
+        """Test successfully listing a directory with sequence grouping disabled."""
         os_manager = griptape_nodes.OSManager()
         # Create some test files
         (temp_dir / "file1.txt").write_text("Content 1")
         (temp_dir / "file2.txt").write_text("Content 2")
         (temp_dir / "subdir").mkdir()
 
-        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False)
+        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=False)
         result = os_manager.on_list_directory_request(request)
 
         assert isinstance(result, ListDirectoryResultSuccess)
         assert len(result.entries) == 3  # noqa: PLR2004
         names = {entry.name for entry in result.entries}
         assert names == {"file1.txt", "file2.txt", "subdir"}
+        assert result.sequences == []
+
+    def test_list_directory_groups_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Test that numbered files are grouped into Sequence objects by default."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("frame 1")
+        (temp_dir / "render.0002.exr").write_text("frame 2")
+        (temp_dir / "render.0003.exr").write_text("frame 3")
+        (temp_dir / "readme.txt").write_text("notes")
+        (temp_dir / "subdir").mkdir()
+
+        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False)
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        # Non-sequence entries only
+        entry_names = {e.name for e in result.entries}
+        assert "readme.txt" in entry_names
+        assert "subdir" in entry_names
+        assert "render.0001.exr" not in entry_names
+        # Sequence detected
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 1
+        assert seq.last == 3  # noqa: PLR2004
 
     def test_list_directory_hidden_files(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Test listing directory with hidden files."""

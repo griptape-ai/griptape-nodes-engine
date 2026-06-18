@@ -37,6 +37,7 @@ from griptape_nodes.common.sequences.models import (
     MissingItemPolicy,
     NoTokenBehavior,
     Sequence,
+    SequenceScanOptions,
 )
 from griptape_nodes.common.sequences.policies import PolicyContext, apply_policy
 from griptape_nodes.retained_mode.events.os_events import (
@@ -494,6 +495,117 @@ def _compute_active_range(
     return _ActiveRange(first=active_first, last=active_last)
 
 
+def scan_sequences_from_filenames(
+    filenames: list[str],
+    directory: str,
+    options: SequenceScanOptions | None = None,
+) -> tuple[list[Sequence], set[str]]:
+    """Detect all sequences within a pre-existing list of bare filenames.
+
+    No filesystem I/O is performed — callers are responsible for supplying
+    the filenames themselves (e.g. from a prior directory listing). The
+    second return value is the set of bare filenames that were grouped into
+    at least one ``Sequence``; callers can use it to filter those entries
+    out of a directory listing.
+
+    Args:
+        filenames: Bare filenames (no directory prefix) to inspect.
+        directory: The directory string stored in emitted ``Sequence.directory``
+            and ``SequenceEntry.path`` fields. May be macro-form or absolute.
+        options: Detection and policy options. Defaults to
+            ``SequenceScanOptions()`` (SKIP policy, REJECT token-less files).
+
+    Returns:
+        ``(sequences, consumed_filenames)`` where ``consumed_filenames`` is
+        the set of bare filenames that belong to at least one returned
+        ``Sequence``.
+
+    Raises:
+        InvalidSubsetBoundsError: If ``options.start_number`` < 0 or
+            ``options.end_number`` < ``options.start_number``.
+        MissingItemError: If ``options.policy`` is ABORT and a gap is found
+            inside the active range.
+    """
+    if options is None:
+        options = SequenceScanOptions()
+
+    _validate_subset_bounds(options.start_number, options.end_number)
+
+    all_detected = FileSequence.findSequencesInList(filenames, pad_style=PAD_STYLE)
+
+    result_sequences: list[Sequence] = []
+    consumed_filenames: set[str] = set()
+
+    for fseq in all_detected:
+        frame_set = fseq.frameSet()
+        if frame_set is None or not list(frame_set):
+            continue
+        if options.no_token_behavior == NoTokenBehavior.REJECT and fseq.zfill() == 0:
+            continue
+        if options.padding is not None and fseq.zfill() != options.padding:
+            continue
+
+        present_numbers, dropped, bare_names = _collect_present_numbers_from_fseq(fseq, directory)
+        if not present_numbers:
+            continue
+
+        consumed_filenames.update(bare_names)
+
+        discovered_first = min(present_numbers)
+        discovered_last = max(present_numbers)
+        active = _compute_active_range(options.start_number, options.end_number, discovered_first, discovered_last)
+        if active.first > active.last:
+            continue
+
+        result_sequences.extend(
+            apply_policy(
+                PolicyContext(
+                    fseq=fseq,
+                    present_numbers=present_numbers,
+                    directory=directory,
+                    policy=options.policy,
+                    first=active.first,
+                    last=active.last,
+                    discovered_first=discovered_first,
+                    discovered_last=discovered_last,
+                    dropped_negative_number_count=dropped,
+                )
+            )
+        )
+
+    return result_sequences, consumed_filenames
+
+
+def _collect_present_numbers_from_fseq(
+    fseq: FileSequence,
+    directory: str,
+) -> tuple[dict[int, str], int, set[str]]:
+    """Build a present-numbers map from a ``FileSequence``'s frame set.
+
+    Returns ``(present_numbers, dropped_negative_count, bare_filenames)``
+    where ``present_numbers`` maps frame number to the full path string
+    (using ``directory`` as the prefix) and ``bare_filenames`` is the set
+    of bare names that were consumed.
+    """
+    present_numbers: dict[int, str] = {}
+    bare_filenames: set[str] = set()
+    dropped = 0
+    frame_set = fseq.frameSet()
+    if frame_set is None:
+        return present_numbers, dropped, bare_filenames
+    for n in frame_set:
+        if not isinstance(n, int):
+            continue
+        if n < 0:
+            dropped += 1
+            continue
+        bare = fseq.frame(n)
+        full = f"{directory}/{bare}" if directory else bare
+        present_numbers[n] = full
+        bare_filenames.add(bare)
+    return present_numbers, dropped, bare_filenames
+
+
 def _list_directory_filenames(directory: str) -> list[str]:
     """List `directory` via ListDirectoryRequest, returning bare filenames.
 
@@ -515,6 +627,7 @@ def _list_directory_filenames(directory: str) -> list[str]:
             include_mime_type=False,
             include_absolute_path=False,
             broadcast_result=False,
+            group_sequences=False,
         )
     )
     if not isinstance(result, ListDirectoryResultSuccess):

@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence
+from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence, SequenceScanOptions
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
@@ -165,6 +165,12 @@ class ListDirectoryRequest(RequestPayload):
         include_modified_time: If True, include modified time in results (default: True). Set to False for faster listing.
         include_mime_type: If True, include MIME type in results (default: True). Set to False for faster listing.
         include_absolute_path: If True, include absolute resolved path in results (default: True). Set to False for faster listing.
+        group_sequences: If True (default), files that form a numbered sequence are returned as
+            ``Sequence`` objects in the ``sequences`` field instead of individual ``FileSystemEntry``
+            objects in ``entries``. Set to False to suppress sequence detection and always return flat
+            ``FileSystemEntry`` objects.
+        sequence_options: Controls sequence detection behaviour (policy, padding filter, frame bounds).
+            Defaults to ``SequenceScanOptions()`` when ``group_sequences=True`` and this is None.
 
     Results: ListDirectoryResultSuccess (with entries) | ListDirectoryResultFailure (access denied, not found)
     """
@@ -177,16 +183,29 @@ class ListDirectoryRequest(RequestPayload):
     include_modified_time: bool = True
     include_mime_type: bool = True
     include_absolute_path: bool = True
+    group_sequences: bool = True
+    sequence_options: SequenceScanOptions | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class ListDirectoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Directory listing retrieved successfully."""
+    """Directory listing retrieved successfully.
+
+    Attributes:
+        entries: Files and directories that are not part of a detected sequence.
+            When ``group_sequences=False`` this contains all entries; when
+            ``group_sequences=True`` sequence-member files are moved to ``sequences``.
+        sequences: ``Sequence`` objects detected when ``group_sequences=True``.
+            Empty list when ``group_sequences=False``.
+        current_path: The directory path used for the listing.
+        is_workspace_path: True when the listed directory is inside the workspace.
+    """
 
     entries: list[FileSystemEntry]
     current_path: str
     is_workspace_path: bool
+    sequences: list[Sequence] = field(default_factory=list)
 
 
 @dataclass
@@ -197,6 +216,106 @@ class ListDirectoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     Attributes:
         failure_reason: Classification of why the listing failed
         result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesRequest(ListDirectoryRequest):
+    """List only file sequences in a directory.
+
+    Returns sequence objects only — non-sequence files and directories are
+    omitted from the result. Equivalent to issuing ``ListDirectoryRequest``
+    with ``group_sequences=True`` but with a dedicated result type and
+    without the flat-entry payload.
+
+    Inherits all filtering arguments from ``ListDirectoryRequest``
+    (``show_hidden``, ``pattern``, ``workspace_only``, etc.).
+
+    Results: ListDirectorySequencesResultSuccess | ListDirectorySequencesResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Directory sequence listing retrieved successfully.
+
+    Attributes:
+        sequences: All ``Sequence`` objects detected in the directory.
+            Empty list when the directory contains no sequences.
+        current_path: The directory path used for the listing.
+        is_workspace_path: True when the listed directory is inside the workspace.
+    """
+
+    sequences: list[Sequence]
+    current_path: str
+    is_workspace_path: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Directory sequence listing failed.
+
+    Attributes:
+        failure_reason: Classification of why the listing failed.
+        result_details: Human-readable error message (inherited from ResultPayloadFailure).
+    """
+
+    failure_reason: FileIOFailureReason
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListRequest(RequestPayload):
+    """Detect file sequences within a caller-supplied list of file paths.
+
+    No additional filesystem I/O is performed — pass paths already obtained
+    from a directory listing or any other source. Directories in the list are
+    silently ignored. Files from different parent directories are grouped
+    independently by their shared parent.
+
+    Use when: Sequence grouping is needed for a file list that has already
+    been collected, avoiding a redundant directory scan.
+
+    Args:
+        file_paths: Absolute (or workspace-relative) paths to inspect.
+            Bare filenames without a directory component are allowed but
+            result in ``Sequence.directory`` being an empty string.
+        sequence_options: Policy, padding filter, and frame-range bounds.
+            Defaults to ``SequenceScanOptions()`` when None.
+
+    Results: DeduceSequencesFromFileListResultSuccess | DeduceSequencesFromFileListResultFailure
+    """
+
+    file_paths: list[str] = field(default_factory=list)
+    sequence_options: SequenceScanOptions | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Sequence deduction from file list completed successfully.
+
+    Attributes:
+        sequences: All ``Sequence`` objects detected. Empty list when no
+            sequences were found in the provided file paths.
+    """
+
+    sequences: list[Sequence] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Sequence deduction from file list failed.
+
+    Attributes:
+        failure_reason: Classification of why the deduction failed.
+        result_details: Human-readable error message (inherited from ResultPayloadFailure).
     """
 
     failure_reason: FileIOFailureReason

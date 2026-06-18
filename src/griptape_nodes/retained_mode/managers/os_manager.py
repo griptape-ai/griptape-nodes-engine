@@ -34,8 +34,15 @@ from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
     InvalidTemplateError,
     MissingItemError,
+    Sequence,
+    SequenceScanOptions,
 )
-from griptape_nodes.common.sequences.scan import DirectoryListingError, PathMapping, scan_sequences
+from griptape_nodes.common.sequences.scan import (
+    DirectoryListingError,
+    PathMapping,
+    scan_sequences,
+    scan_sequences_from_filenames,
+)
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
@@ -63,6 +70,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
     CreateFileResultFailure,
     CreateFileResultSuccess,
+    DeduceSequencesFromFileListRequest,
+    DeduceSequencesFromFileListResultFailure,
+    DeduceSequencesFromFileListResultSuccess,
     DeleteFileRequest,
     DeleteFileResultFailure,
     DeleteFileResultSuccess,
@@ -83,6 +93,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
+    ListDirectorySequencesRequest,
+    ListDirectorySequencesResultFailure,
+    ListDirectorySequencesResultSuccess,
     MakeDirectoryRequest,
     MakeDirectoryResultFailure,
     MakeDirectoryResultSuccess,
@@ -311,6 +324,16 @@ class OSManager:
             )
             event_manager.assign_manager_to_request_type(
                 request_type=ListDirectoryRequest, callback=self.on_list_directory_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=ListDirectorySequencesRequest,
+                callback=self.on_list_directory_sequences_request,
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=DeduceSequencesFromFileListRequest,
+                callback=self.on_deduce_sequences_from_file_list_request,
             )
 
             event_manager.assign_manager_to_request_type(
@@ -1464,6 +1487,14 @@ class OSManager:
                 logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
+            # Group sequence files into Sequence objects when requested.
+            sequences: list[Sequence] = []
+            if request.group_sequences:
+                options = request.sequence_options or SequenceScanOptions()
+                bare_names = [e.name for e in entries if not e.is_dir]
+                sequences, consumed = scan_sequences_from_filenames(bare_names, str(directory), options)
+                entries = [e for e in entries if e.name not in consumed]
+
             # Return appropriate path format based on mode
             if request.workspace_only:
                 # In workspace mode, return relative path if within workspace, absolute if outside
@@ -1471,6 +1502,7 @@ class OSManager:
                     entries=entries,
                     current_path=str(relative_or_abs_path),
                     is_workspace_path=is_workspace_path,
+                    sequences=sequences,
                     result_details="Directory listing retrieved successfully.",
                 )
             # In system-wide mode, always return the full absolute path
@@ -1478,6 +1510,7 @@ class OSManager:
                 entries=entries,
                 current_path=str(directory),
                 is_workspace_path=is_workspace_path,
+                sequences=sequences,
                 result_details="Directory listing retrieved successfully.",
             )
 
@@ -1485,6 +1518,73 @@ class OSManager:
             msg = f"Unexpected error in list_directory: {type(e).__name__}: {e}"
             logger.error(msg)
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
+
+    def on_list_directory_sequences_request(self, request: ListDirectorySequencesRequest) -> ResultPayload:
+        """Handle a request to list only file sequences in a directory.
+
+        Delegates to `on_list_directory_request` with `group_sequences=True` and
+        re-wraps the result to expose only the detected sequences.
+        """
+        inner = ListDirectoryRequest(
+            directory_path=request.directory_path,
+            show_hidden=request.show_hidden,
+            workspace_only=request.workspace_only,
+            pattern=request.pattern,
+            include_size=request.include_size,
+            include_modified_time=request.include_modified_time,
+            include_mime_type=request.include_mime_type,
+            include_absolute_path=request.include_absolute_path,
+            group_sequences=True,
+            sequence_options=request.sequence_options,
+        )
+        result = self.on_list_directory_request(inner)
+        if isinstance(result, ListDirectoryResultSuccess):
+            return ListDirectorySequencesResultSuccess(
+                sequences=result.sequences,
+                current_path=result.current_path,
+                is_workspace_path=result.is_workspace_path,
+                result_details=result.result_details,
+            )
+        return ListDirectorySequencesResultFailure(
+            failure_reason=result.failure_reason,  # pyright: ignore[reportAttributeAccessIssue]
+            result_details=str(result.result_details),
+        )
+
+    def on_deduce_sequences_from_file_list_request(self, request: DeduceSequencesFromFileListRequest) -> ResultPayload:
+        """Handle a request to detect sequences from a caller-supplied file list.
+
+        Groups input paths by parent directory, then calls
+        `scan_sequences_from_filenames` per group. No directory I/O is
+        performed.
+        """
+        try:
+            options = request.sequence_options or SequenceScanOptions()
+            dir_groups: dict[str, list[str]] = {}
+            for fp in request.file_paths:
+                p = Path(fp)
+                if p.is_dir():
+                    continue
+                parent = str(p.parent)
+                if parent not in dir_groups:
+                    dir_groups[parent] = []
+                dir_groups[parent].append(p.name)
+
+            all_sequences: list[Sequence] = []
+            for parent_dir, bare_names in dir_groups.items():
+                seqs, _ = scan_sequences_from_filenames(bare_names, parent_dir, options)
+                all_sequences.extend(seqs)
+
+            return DeduceSequencesFromFileListResultSuccess(
+                sequences=all_sequences,
+                result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
+            )
+        except Exception as e:
+            msg = f"Attempted to deduce sequences from file list. Failed with {type(e).__name__}: {e}"
+            logger.error(msg)
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=FileIOFailureReason.UNKNOWN,
+                result_details=msg,
+            )
 
     async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to scan a path or pattern for file sequences.
