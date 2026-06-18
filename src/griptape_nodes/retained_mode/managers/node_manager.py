@@ -3541,6 +3541,11 @@ class NodeManager:
             return DeserializeNodeFromCommandsResultFailure(result_details=details)
         with GriptapeNodes.ContextManager().node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4862
+                # This isinstance allowlist must be updated by hand for every new
+                # element-modification request type that carries a node_name. Any type
+                # not listed here silently keeps pointing at the original node. Consider
+                # retargeting any element command that exposes a node_name attribute instead.
                 if isinstance(
                     element_command,
                     (
