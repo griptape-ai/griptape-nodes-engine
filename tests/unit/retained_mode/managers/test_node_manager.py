@@ -327,3 +327,81 @@ class TestNodeManagerCancelExecuteNode:
         # Should not raise; there is no entry for "ghost_node" and
         # WorkerManager.forward_event_to_worker should not be invoked.
         await node_manager.cancel_worker_execution("ghost_node")
+
+
+class TestDeserializeNodeFromCommandsRetargetsElementCommands:
+    """Deserializing a node (copy/paste) must retarget every element command at the new copy.
+
+    This includes ParameterGroup commands, not just parameter commands.
+    Previously the isinstance check only covered AddParameterToNodeRequest and
+    AlterParameterDetailsRequest, so AddParameterGroupToNodeRequest / AlterParameterGroupDetailsRequest
+    kept pointing at the original node. Copy-pasting a node with user-defined ParameterGroups then
+    failed with "an element with that name already exists" because the group was re-added to the
+    original node.
+    """
+
+    def test_group_commands_node_name_retargeted_to_copy(self) -> None:
+        from unittest.mock import MagicMock, patch
+
+        from griptape_nodes.exe_types.node_types import BaseNode
+        from griptape_nodes.retained_mode.events.base_events import ResultPayload
+        from griptape_nodes.retained_mode.events.node_events import (
+            CreateNodeRequest,
+            CreateNodeResultSuccess,
+            DeserializeNodeFromCommandsRequest,
+            DeserializeNodeFromCommandsResultSuccess,
+            SerializedNodeCommands,
+        )
+        from griptape_nodes.retained_mode.events.parameter_events import (
+            AddParameterGroupToNodeRequest,
+            AddParameterToNodeRequest,
+            AlterParameterGroupDetailsRequest,
+        )
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        original_name = "OriginalNode"
+        copy_name = "OriginalNode_1"
+
+        element_commands = [
+            AddParameterGroupToNodeRequest(node_name=original_name, group_name="exif_data"),
+            AddParameterToNodeRequest(node_name=original_name, parameter_name="width", type="int"),
+            AlterParameterGroupDetailsRequest(node_name=original_name, group_name="exif_data"),
+        ]
+        serialized = SerializedNodeCommands(
+            create_node_command=CreateNodeRequest(node_type="ReadImageMetadata", node_name=original_name),
+            element_modification_commands=element_commands,
+            node_dependencies=MagicMock(),
+            node_uuid=SerializedNodeCommands.NodeUUID("uuid-1"),
+        )
+        request = DeserializeNodeFromCommandsRequest(serialized_node_commands=serialized)
+
+        manager = NodeManager(MagicMock())
+
+        create_result = CreateNodeResultSuccess(
+            node_name=copy_name,
+            node_type="ReadImageMetadata",
+            specific_library_name=None,
+            parent_flow_name=None,
+            result_details=MagicMock(),
+        )
+
+        def fake_handle_request(req: object) -> ResultPayload:
+            success = MagicMock()
+            success.failed.return_value = False
+            return create_result if req is request.serialized_node_commands.create_node_command else success
+
+        mock_node = MagicMock(spec=BaseNode)
+        with (
+            patch("griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes") as mock_griptape_nodes,
+            patch.object(NodeManager, "_cleanup_node_on_failed_deserialization"),
+        ):
+            mock_griptape_nodes.return_value.handle_request.side_effect = fake_handle_request
+            mock_griptape_nodes.ObjectManager.return_value.attempt_get_object_by_name_as_type.return_value = mock_node
+
+            result = manager.on_deserialize_node_from_commands(request)
+
+        assert isinstance(result, DeserializeNodeFromCommandsResultSuccess)
+        assert result.node_name == copy_name
+        # Every element command must have been retargeted at the new copy, not the original node.
+        for command in element_commands:
+            assert command.node_name == copy_name
