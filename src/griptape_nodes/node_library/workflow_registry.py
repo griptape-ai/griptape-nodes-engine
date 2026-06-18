@@ -46,7 +46,7 @@ class WorkflowShape(BaseModel):
 
 
 class WorkflowMetadata(BaseModel):
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.19.1"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.19.2"
 
     name: str
     schema_version: str
@@ -58,6 +58,7 @@ class WorkflowMetadata(BaseModel):
     image: str | None = None
     is_griptape_provided: bool | None = False
     is_template: bool | None = False
+    is_private: bool | None = False
     creation_date: datetime | None = Field(default=None)
     last_modified_date: datetime | None = Field(default=None)
     branched_from: str | None = Field(default=None)
