@@ -6638,6 +6638,59 @@ class TestExportProject:
         rewritten = get_dot_value(bundled_config, LIBRARIES_TO_REGISTER_KEY)
         assert rewritten == ["libraries/external_lib/griptape_nodes_library.json"]
 
+    @pytest.mark.asyncio
+    async def test_import_copied_local_library_resolves_against_new_base_dir(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A COPY_LOCAL lib is extracted and its rewritten config path resolves at the target.
+
+        Closes the round-trip for the copied-library disposition: export rewrites
+        the register path to a package-relative one, and import must extract that
+        source under the new base dir AND leave the imported adjacent config
+        pointing at the package-relative path so it resolves at the new location.
+        """
+        import json
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = GriptapeNodes.ProjectManager()
+        lib_dir = tmp_path / "external_lib"
+        lib_dir.mkdir()
+        (lib_dir / "griptape_nodes_library.json").write_text('{"name": "external_lib"}', encoding="utf-8")
+        register_path = str(lib_dir / "griptape_nodes_library.json")
+        project_yaml = _write_project_base_dir(tmp_path / "proj", _register_config(register_path))
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "imported"
+        result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target)
+        )
+        assert isinstance(result, ImportProjectResultSuccess)
+
+        # The copied source landed under the new base dir, and the imported config
+        # points at the package-relative path so it resolves at the new location.
+        package_relative = "libraries/external_lib/griptape_nodes_library.json"
+        assert (target / package_relative).exists()
+        imported_config = json.loads((target / "griptape_nodes_config.json").read_text(encoding="utf-8"))
+        assert get_dot_value(imported_config, LIBRARIES_TO_REGISTER_KEY) == [package_relative]
+
 
 class TestPreviewImportProject:
     """Test on_preview_import_project_request reads a manifest without extracting."""
@@ -6715,8 +6768,11 @@ class TestImportProject:
     @pytest.mark.asyncio
     async def test_import_registers_new_project_with_assets(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
         """Importing into a fresh dir registers the project; macros resolve there."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
         from griptape_nodes.retained_mode.events.project_events import (
             ExportProjectRequest,
+            GetPathForMacroRequest,
+            GetPathForMacroResultSuccess,
             ImportProjectRequest,
             ImportProjectResultSuccess,
             LoadProjectTemplateRequest,
@@ -6735,7 +6791,7 @@ class TestImportProject:
 
         target = tmp_path / "imported"
         result = await pm.on_import_project_request(
-            ImportProjectRequest(archive_path=destination, target_directory=target)
+            ImportProjectRequest(archive_path=destination, target_directory=target, set_as_current=True)
         )
 
         assert isinstance(result, ImportProjectResultSuccess)
@@ -6744,6 +6800,15 @@ class TestImportProject:
         assert (target / "inputs" / "asset.txt").read_text(encoding="utf-8") == "asset-contents"
         imported_info = pm._successfully_loaded_project_templates[result.project_id]
         assert imported_info.project_base_dir.resolve() == target.resolve()
+
+        # The {outputs} directory macro re-resolves against the new location (the
+        # imported project is current), proving the macro layer follows the move
+        # rather than pointing back at the source dir.
+        macro_result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/result.txt"), variables={})
+        )
+        assert isinstance(macro_result, GetPathForMacroResultSuccess)
+        assert macro_result.absolute_path.resolve() == (target / "outputs" / "result.txt").resolve()
 
     @pytest.mark.asyncio
     async def test_import_with_new_name_renames_template(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002

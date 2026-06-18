@@ -2320,7 +2320,7 @@ class ProjectManager:
         """
         try:
             manifest = ProjectPackager.read_manifest(request.archive_path)
-        except (FileNotFoundError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
             return PreviewImportProjectResultFailure(
                 result_details=(f"Attempted to preview project package '{request.archive_path}'. Failed because {err}"),
             )
@@ -2355,7 +2355,7 @@ class ProjectManager:
         """
         try:
             manifest = ProjectPackager.read_manifest(request.archive_path)
-        except (FileNotFoundError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
             return ImportProjectResultFailure(
                 result_details=f"Attempted to import project package '{request.archive_path}'. Failed because {err}",
             )
@@ -2403,16 +2403,25 @@ class ProjectManager:
 
         required_secret_keys = manifest.get("required_secret_keys", [])
         unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
+        warnings = list(manifest.get("warnings", []))
 
+        # Activation can fail without raising (e.g. the imported config's
+        # requires_engine is incompatible). The project is still loaded and
+        # registered, so this is success-with-caveat: surface the activation
+        # failure as a warning rather than masking it behind a clean success.
         if request.set_as_current:
-            await self.on_set_current_project_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+            activation_result = await self.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id=load_result.project_id)
+            )
+            if isinstance(activation_result, SetCurrentProjectResultFailure):
+                warnings.append(f"Imported project was not activated: {activation_result.result_details}")
 
         return ImportProjectResultSuccess(
             project_id=load_result.project_id,
             project_file_path=target_yaml,
             required_secret_keys=required_secret_keys,
             unset_secret_keys=unset_secret_keys,
-            warnings=manifest.get("warnings", []),
+            warnings=warnings,
             result_details=f"Imported project package '{request.archive_path}' into '{request.target_directory}'.",
         )
 

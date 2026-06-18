@@ -75,6 +75,12 @@ COPIED_LIBRARIES_DIRNAME = "libraries"
 LIBRARIES_DIRECTORY_KEY = "libraries_directory"
 DEFAULT_LIBRARIES_DIRECTORY = "libraries"
 
+# Top-level config key for the project's workspace directory. The engine resolves
+# a relative libraries_directory against this (not the base dir); they coincide
+# for a self-contained project but diverge when the adjacent config re-points the
+# workspace. Absent here, the workspace is the project base dir.
+WORKSPACE_DIRECTORY_KEY = "workspace_directory"
+
 # Directory tree patterns never copied into the package. Secret values (.env),
 # VCS/venv/pycache cruft, and the regenerable hidden caches are all excluded so
 # the package is portable and small.
@@ -347,8 +353,10 @@ class ProjectPackager:
         """Remove the downloaded-library sink from the mirrored tree.
 
         The engine clones libraries_to_download into `libraries_directory`
-        (default 'libraries', relative to the project workspace). When that sink
-        sits inside the base dir, the plain mirror would bundle the referenced
+        (default 'libraries'), resolving a relative value against the project's
+        workspace directory (the adjacent config's workspace_directory, or the
+        base dir when unset) exactly as ConfigManager does at load time. When that
+        sink sits inside the base dir, the plain mirror would bundle the referenced
         libraries' source, which violates the reference-only contract. Drop the
         sink subtree here; register-only local libs are independently
         re-materialized by _copy_local_libraries, and referenced libs
@@ -357,9 +365,21 @@ class ProjectPackager:
         configured = get_dot_value(adjacent_config, LIBRARIES_DIRECTORY_KEY, default=DEFAULT_LIBRARIES_DIRECTORY)
         sink_setting = configured if isinstance(configured, str) and configured else DEFAULT_LIBRARIES_DIRECTORY
 
+        # A relative libraries_directory resolves against the workspace dir, which
+        # the engine derives from the adjacent config's workspace_directory and
+        # falls back to the base dir. A relative workspace_directory is itself
+        # base-dir-relative.
+        configured_workspace = get_dot_value(adjacent_config, WORKSPACE_DIRECTORY_KEY, default=None)
+        if isinstance(configured_workspace, str) and configured_workspace:
+            workspace_path = Path(configured_workspace)
+            if not workspace_path.is_absolute():
+                workspace_path = project_base_dir / workspace_path
+        else:
+            workspace_path = project_base_dir
+
         sink_path = Path(sink_setting)
         if not sink_path.is_absolute():
-            sink_path = project_base_dir / sink_path
+            sink_path = workspace_path / sink_path
 
         base_resolved = canonicalize_for_identity(project_base_dir)
         sink_resolved = canonicalize_for_identity(sink_path)
@@ -513,13 +533,10 @@ class ProjectPackager:
         Relative register paths resolve against the project base dir (the import
         target's workspace), matching how the engine resolves them at load time.
         A path to a JSON file copies the file's parent dir; a path to a directory
-        copies that directory.
+        copies that directory. canonicalize_for_identity expands ~/env vars so a
+        register path using either is resolved rather than wrongly reported missing.
         """
-        candidate = Path(registered_path)
-        if not candidate.is_absolute():
-            candidate = (project_base_dir / candidate).resolve()
-        else:
-            candidate = candidate.resolve()
+        candidate = canonicalize_for_identity(registered_path, base=project_base_dir)
 
         if not candidate.exists():
             return None
