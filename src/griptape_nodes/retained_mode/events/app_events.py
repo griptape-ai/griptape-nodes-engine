@@ -266,16 +266,17 @@ class CurrentProjectChanged(AppPayload):
     orchestrator's project even on a "shallow" switch (same workspace and
     library config) that would not otherwise restart them.
 
-    Boot-time activation is handled separately via the worker spawn arg, so
+    Boot-time activation is handled separately: a worker boots like any engine
+    and re-derives the orchestrator's project from shared on-disk config, so
     ProjectManager only emits this after _initialization_complete.
 
     Args:
-        project_file_path: Absolute path of the new project's file, or None when
-            the orchestrator switched to system defaults. Both processes share
-            the same machine, so the path is readable by every worker.
+        project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
+            for system defaults). A worker boots like the orchestrator, so the
+            same registry id resolves in both processes.
     """
 
-    project_file_path: str | None
+    project_id: str
 
 
 @dataclass

@@ -701,8 +701,8 @@ class WorkerManager:
 
         ProjectManager only emits ``CurrentProjectChanged`` from a successful
         post-init activation, so receiving it means workers should adopt the new
-        project. Carries the project's file path (None for system defaults); the
-        worker re-derives the project from it. Awaited inline for the same
+        project. Carries the new project's id; a worker boots like an engine, so
+        the same id is already loaded in its registry. Awaited inline for the same
         side-loop reason documented on ``_on_config_changed``; lazy import for
         the same circular-dependency reason.
         """
@@ -710,9 +710,7 @@ class WorkerManager:
 
         if self._transport is None or not self._workers:
             return
-        await self.broadcast_to_workers(
-            EventRequest(request=ActivateProjectRequest(project_file_path=event.project_file_path))
-        )
+        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.

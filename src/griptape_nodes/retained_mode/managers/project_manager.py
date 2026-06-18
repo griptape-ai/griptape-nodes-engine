@@ -1408,16 +1408,12 @@ class ProjectManager:
 
         # Push the switch to running workers so they adopt the orchestrator's project
         # even on a shallow switch (same workspace + library config) that would not
-        # restart them. Boot is handled separately by the worker spawn arg, so emit
-        # only post-init and only when the project actually changed. The worker's
-        # ActivateProjectRequest handler re-derives the path from the new project.
+        # restart them. Boot is handled separately (a worker boots like an engine and
+        # re-derives the same project), so emit only post-init and only when the
+        # project actually changed. A worker that boots like the orchestrator has the
+        # same registry, so the id resolves there too.
         if self._initialization_complete and previous_project_id != resolved_project_id:
-            new_project_file_path = self.get_current_project_file_path()
-            self._event_manager.broadcast_app_event(
-                CurrentProjectChanged(
-                    project_file_path=str(new_project_file_path) if new_project_file_path is not None else None
-                )
-            )
+            self._event_manager.broadcast_app_event(CurrentProjectChanged(project_id=resolved_project_id))
         return result
 
     async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
@@ -1505,14 +1501,18 @@ class ProjectManager:
             # on-disk config, so a worker write races the orchestrator's. The worker still
             # re-establishes its in-memory layers above; it just skips the persist.
             if not GriptapeNodes.LibraryManager().is_worker:
-                # Persist the active project's file path so the next engine restart
-                # restores it via _resolve_project_file_path(). System defaults has
-                # no file path, so persist None for that case and let startup fall
-                # back to the workspace default.
-                persisted_project_file: str | None = None
+                # Persist the active project so the next engine restart restores it via
+                # _resolve_project_file_path(). A file-backed project persists its path.
+                # System defaults persists the SYSTEM_DEFAULTS_KEY sentinel so that a
+                # deliberate "stay on system defaults" choice is honored on the next
+                # restart (and by a freshly spawned worker, which boots like an engine):
+                # the sentinel suppresses workspace discovery instead of re-adopting a
+                # workspace griptape-nodes-project.yml.
                 persisted_info = self._successfully_loaded_project_templates.get(resolved_project_id)
                 if persisted_info is not None and persisted_info.project_file_path is not None:
                     persisted_project_file = str(persisted_info.project_file_path)
+                else:
+                    persisted_project_file = SYSTEM_DEFAULTS_KEY
                 try:
                     self._config_manager.set_config_value("project_file", persisted_project_file)
                 except Exception:
@@ -2435,12 +2435,18 @@ class ProjectManager:
         """Resolve the path to the project file to load, or None if no file should be loaded.
 
         Checks config in the following order:
-        1. The path specified by the `project_file` config setting (if set)
+        1. The `project_file` config setting (if set). The SYSTEM_DEFAULTS_KEY sentinel
+           means "deliberately on system defaults": return None WITHOUT falling through
+           to workspace discovery, so a restart (or a freshly spawned worker booting like
+           an engine) stays on defaults instead of re-adopting a workspace file.
         2. griptape-nodes-project.yml in the workspace directory (default)
 
-        Returns None if no project file should be loaded (missing config, file not found).
+        Returns None if no project file should be loaded (explicit system defaults,
+        missing config, file not found).
         """
         project_file_value = self._config_manager.get_config_value("project_file")
+        if project_file_value == SYSTEM_DEFAULTS_KEY:
+            return None
         if project_file_value is not None:
             project_path = Path(project_file_value)
             if project_path.exists():
