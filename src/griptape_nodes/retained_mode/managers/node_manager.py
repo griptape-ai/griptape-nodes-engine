@@ -508,9 +508,11 @@ class NodeManager:
             # node type: raise so the error-proxy path below substitutes a
             # placeholder carrying the explanation.
             policy_denial = GriptapeNodes.EventManager().run_pre_dispatch_hooks(request)
-            # A hook may short-circuit with a success result; only a failure
-            # result denies creation. This matches the dispatcher, which returns a
-            # success short-circuit verbatim rather than blocking the operation.
+            # Only a failure short-circuit denies creation (a genuine policy
+            # denial, or a fail-closed result when a hook itself errors). A
+            # success short-circuit is ignored and creation proceeds; unlike the
+            # dispatcher it is not returned verbatim, but enforcement hooks only
+            # ever deny, so that case is not expected here.
             if policy_denial is not None and policy_denial.failed():
                 denial_detail = getattr(policy_denial, "result_details", None)
                 raise PermissionError(  # noqa: TRY301
