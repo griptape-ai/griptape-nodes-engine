@@ -1682,8 +1682,16 @@ class LibraryManager:
             # parameter-mutation detector skips this ephemeral probe's
             # declarative ``add_parameter`` calls (this construction
             # bypasses ``LibraryRegistry.create_node``).
+            #
+            # Pass the node's library and type so declarative ``__init__`` logic
+            # that resolves against the library -- e.g. ``get_declared_models``
+            # populating a model dropdown from the ``model_catalog`` -- works
+            # during the probe just as it does under ``create_node``.
             with LibraryRegistry.constructing_node():
-                probe_node = node_class(name=probe_name)
+                probe_node = node_class(
+                    name=probe_name,
+                    metadata={"library": library_name, "node_type": request.node_type},
+                )
         except Exception as err:
             probe_error = f"{type(err).__name__}: {err}"
             return DescribeNodeTypeResultSuccess(

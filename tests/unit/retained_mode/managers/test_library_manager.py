@@ -1506,6 +1506,29 @@ class _RaisingProbe(BaseNode):
         raise RuntimeError(msg)
 
 
+class _CatalogProbe(BaseNode):
+    """Probe whose __init__ sources a parameter default from the library model_catalog.
+
+    Exercises the describe/reference probes resolving library-backed __init__ data
+    via get_declared_models -- which only works when the node is constructed with
+    its library/node_type, the way create_node does it.
+    """
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        resolved = ",".join(r.model.provider_model_id or "" for r in get_declared_models(self))
+        self.add_parameter(
+            Parameter(
+                name="resolved_models",
+                type="str",
+                input_types=["str"],
+                output_type="str",
+                default_value=resolved,
+                tooltip="Comma-joined provider model ids resolved from the catalog.",
+            )
+        )
+
+
 class TestDescribeNodeTypeRequest:
     """Exercise LibraryManager.describe_node_type_request."""
 
@@ -1547,6 +1570,60 @@ class TestDescribeNodeTypeRequest:
                 display_name="Probe",
             ),
         )
+
+    def test_probe_resolves_library_model_catalog(self, griptape_nodes: GriptapeNodes) -> None:
+        # The probe must be constructed with the node's library/type so __init__
+        # logic that resolves against the model_catalog (get_declared_models)
+        # works -- otherwise the catalog is invisible and the roster is empty.
+        library_manager = griptape_nodes.LibraryManager()
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="catalog probe library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=[
+                    ModelCatalogLibraryProperty(
+                        providers={
+                            "acme": ModelProvider(
+                                display_name="Acme",
+                                models={
+                                    "m1": Model(
+                                        display_name="M1",
+                                        provider_model_id="acme-m1",
+                                        key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+                                    ),
+                                },
+                            ),
+                        },
+                    ),
+                ],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _CatalogProbe,
+            NodeMetadata(
+                category="test",
+                description="Catalog-backed probe",
+                display_name="CatalogProbe",
+                declarations=[ModelUsageNodeProperty(model_ids=["m1"])],
+            ),
+        )
+
+        result = library_manager.describe_node_type_request(
+            DescribeNodeTypeRequest(node_type=_CatalogProbe.__name__, library=self._LIBRARY_NAME),
+        )
+
+        assert isinstance(result, DescribeNodeTypeResultSuccess)
+        by_name = {param.name: param for param in result.parameters}
+        # Resolved from the catalog -> non-empty. Without library context it would be "".
+        assert by_name["resolved_models"].default_value == "acme-m1"
 
     def test_returns_parameter_schema_without_touching_object_manager(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
