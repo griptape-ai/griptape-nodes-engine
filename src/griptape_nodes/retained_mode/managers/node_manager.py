@@ -221,6 +221,15 @@ logger = logging.getLogger("griptape_nodes")
 _PARAM_MISSING = object()
 
 
+class _NodeCreationPolicyDeniedError(Exception):
+    """Internal signal that a pre-dispatch hook denied this node creation.
+
+    A distinct type so the creation handler can tell a denial it raised itself
+    apart from an organic exception (including a real PermissionError) bubbling
+    out of node construction, which must still be logged as an error.
+    """
+
+
 class SerializedParameterValues(NamedTuple):
     """Result of serializing parameter output values.
 
@@ -515,7 +524,7 @@ class NodeManager:
             # ever deny, so that case is not expected here.
             if policy_denial is not None and policy_denial.failed():
                 denial_detail = getattr(policy_denial, "result_details", None)
-                raise PermissionError(  # noqa: TRY301
+                raise _NodeCreationPolicyDeniedError(  # noqa: TRY301
                     str(denial_detail)
                     if denial_detail
                     else f"Creating a node of type '{request.node_type}' is not permitted by the active policy."
@@ -528,10 +537,10 @@ class NodeManager:
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            # A policy denial (PermissionError) is an expected, by-design outcome
-            # that the error-proxy path below substitutes with a placeholder node,
-            # so log it as info rather than as a node-creation error.
-            if isinstance(err, PermissionError):
+            # A policy denial (_NodeCreationPolicyDeniedError) is an expected, by-design
+            # outcome that the error-proxy path below substitutes with a placeholder
+            # node, so log it as info rather than as a node-creation error.
+            if isinstance(err, _NodeCreationPolicyDeniedError):
                 logger.info("Creation of node type '%s' denied by active policy: %s", request.node_type, err)
             else:
                 logger.error(err)
