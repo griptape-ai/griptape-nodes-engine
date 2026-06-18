@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.retained_mode.events import worker_events
-from griptape_nodes.retained_mode.events.app_events import ConfigChanged, SecretChanged
+from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
@@ -163,6 +163,7 @@ class WorkerManager:
         # a worker fan-out.
         event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
         event_manager.add_listener_to_app_event(SecretChanged, self._on_secret_changed)
+        event_manager.add_listener_to_app_event(CurrentProjectChanged, self._on_current_project_changed)
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -591,6 +592,12 @@ class WorkerManager:
             "--library-name",
             library_name,
         ]
+        # Thread the orchestrator's current project into the worker so it boots adopting
+        # the same project instead of independently re-deriving one from shared on-disk
+        # config. Absent arg means system defaults (the worker skips workspace discovery).
+        project_file_path = self._griptape_nodes.ProjectManager().get_current_project_file_path()
+        if project_file_path is not None:
+            args.extend(["--project-file-path", str(project_file_path)])
         await self.spawn_worker(args, library_name)
 
     @staticmethod
@@ -688,6 +695,24 @@ class WorkerManager:
         if self._transport is None or not self._workers:
             return
         await self.broadcast_to_workers(EventRequest(request=RefreshSecretsRequest()))
+
+    async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
+        """Fan out an ActivateProjectRequest after the orchestrator switched projects.
+
+        ProjectManager only emits ``CurrentProjectChanged`` from a successful
+        post-init activation, so receiving it means workers should adopt the new
+        project. Carries the project's file path (None for system defaults); the
+        worker re-derives the project from it. Awaited inline for the same
+        side-loop reason documented on ``_on_config_changed``; lazy import for
+        the same circular-dependency reason.
+        """
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        if self._transport is None or not self._workers:
+            return
+        await self.broadcast_to_workers(
+            EventRequest(request=ActivateProjectRequest(project_file_path=event.project_file_path))
+        )
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.

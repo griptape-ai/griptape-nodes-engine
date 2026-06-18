@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
@@ -74,6 +75,11 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.project_events import (
+    LoadProjectTemplateRequest,
+    LoadProjectTemplateResultSuccess,
+    SetCurrentProjectRequest,
+)
 from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueRequest,
     SetSecretValueRequest,
@@ -86,6 +92,7 @@ logger = logging.getLogger("griptape_nodes")
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 
@@ -185,6 +192,42 @@ class RefreshSecretsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure)
 
 
 @dataclass
+@PayloadRegistry.register
+class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator to each registered worker after it switches projects.
+
+    The orchestrator is the single source of truth for the current project, but a
+    worker re-derives its project independently at boot and is only restarted on a
+    switch that changes library config. A switch that keeps the same workspace and
+    library config (only environment / directories / situations differ) leaves the
+    worker on a stale project. This tells the worker to adopt the orchestrator's new
+    project so env vars, directory macros, and situation/path macros resolve against
+    the right project.
+
+    project_file_path is the absolute path of the new project's file, or None when
+    the orchestrator switched to system defaults. Both processes share the same
+    machine, so the path the orchestrator sends is readable by the worker.
+
+    Uses SkipTheLineMixin so the worker activates the new project immediately, ahead
+    of any queued ExecuteNodeRequest that would otherwise run against the stale one.
+    """
+
+    project_file_path: str | None
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker adopted the orchestrator's current project."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed to adopt the orchestrator's current project."""
+
+
+@dataclass
 class RemoteHandler:
     """Worker-side dispatch shim.
 
@@ -265,13 +308,15 @@ def register_broadcast_handlers(
     *,
     config_manager: ConfigManager,
     secrets_manager: SecretsManager,
+    project_manager: ProjectManager,
 ) -> None:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
-    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` from
-    the orchestrator and respond by re-reading the shared on-disk state. The
-    actual reload is delegated to the corresponding manager so domain logic
-    stays in the manager and routing decisions stay here.
+    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
+    ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
+    the shared on-disk state or adopting the orchestrator's current project. The
+    actual work is delegated to the corresponding manager so domain logic stays
+    in the manager and routing decisions stay here.
     """
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
@@ -292,5 +337,43 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
+    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
+        # No path means the orchestrator is on system defaults. SetCurrentProjectRequest
+        # treats project_id=None as the wire signal to land on system defaults, so the
+        # worker mirrors the orchestrator without a load step.
+        if request.project_file_path is None:
+            set_result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
+            if set_result.failed():
+                details = f"Attempted to activate system defaults. Failed with result: {set_result.result_details}"
+                logger.error(details)
+                return ActivateProjectResultFailure(result_details=details)
+            return ActivateProjectResultSuccess(result_details="Adopted system defaults from orchestrator.")
+
+        load_result = await project_manager.on_load_project_template_request(
+            LoadProjectTemplateRequest(project_path=Path(request.project_file_path))
+        )
+        if not isinstance(load_result, LoadProjectTemplateResultSuccess):
+            details = (
+                f"Attempted to load project template from {request.project_file_path}. "
+                f"Failed with result: {load_result.result_details}"
+            )
+            logger.error(details)
+            return ActivateProjectResultFailure(result_details=details)
+
+        set_result = await project_manager.on_set_current_project_request(
+            SetCurrentProjectRequest(project_id=load_result.project_id)
+        )
+        if set_result.failed():
+            details = (
+                f"Attempted to set project {load_result.project_id} as current. "
+                f"Failed with result: {set_result.result_details}"
+            )
+            logger.error(details)
+            return ActivateProjectResultFailure(result_details=details)
+        return ActivateProjectResultSuccess(
+            result_details=f"Adopted project from orchestrator: {request.project_file_path}."
+        )
+
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
+    event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)

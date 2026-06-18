@@ -41,7 +41,7 @@ from griptape_nodes.files.path_utils import (
     resolve_workspace_path,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
-from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
@@ -406,6 +406,7 @@ class ProjectManager:
             config_manager: ConfigManager instance for accessing configuration
             secrets_manager: SecretsManager instance for macro resolution
         """
+        self._event_manager = event_manager
         self._config_manager = config_manager
         self._secrets_manager = secrets_manager
 
@@ -1404,6 +1405,19 @@ class ProjectManager:
         )
         if outcome.workspace_changed and self._initialization_complete:
             result.altered_workflow_state = True
+
+        # Push the switch to running workers so they adopt the orchestrator's project
+        # even on a shallow switch (same workspace + library config) that would not
+        # restart them. Boot is handled separately by the worker spawn arg, so emit
+        # only post-init and only when the project actually changed. The worker's
+        # ActivateProjectRequest handler re-derives the path from the new project.
+        if self._initialization_complete and previous_project_id != resolved_project_id:
+            new_project_file_path = self.get_current_project_file_path()
+            self._event_manager.broadcast_app_event(
+                CurrentProjectChanged(
+                    project_file_path=str(new_project_file_path) if new_project_file_path is not None else None
+                )
+            )
         return result
 
     async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
@@ -1486,18 +1500,23 @@ class ProjectManager:
         library_config_changed = old_library_config != new_library_config
 
         if self._initialization_complete:
-            # Persist the active project's file path so the next engine restart
-            # restores it via _resolve_project_file_path(). System defaults has
-            # no file path, so persist None for that case and let startup fall
-            # back to the workspace default.
-            persisted_project_file: str | None = None
-            persisted_info = self._successfully_loaded_project_templates.get(resolved_project_id)
-            if persisted_info is not None and persisted_info.project_file_path is not None:
-                persisted_project_file = str(persisted_info.project_file_path)
-            try:
-                self._config_manager.set_config_value("project_file", persisted_project_file)
-            except Exception:
-                logger.warning("Failed to persist project_file '%s' to config", persisted_project_file)
+            # The orchestrator owns project_file in the shared config. A worker adopting
+            # the orchestrator's project must not write it back: both processes share the
+            # on-disk config, so a worker write races the orchestrator's. The worker still
+            # re-establishes its in-memory layers above; it just skips the persist.
+            if not GriptapeNodes.LibraryManager().is_worker:
+                # Persist the active project's file path so the next engine restart
+                # restores it via _resolve_project_file_path(). System defaults has
+                # no file path, so persist None for that case and let startup fall
+                # back to the workspace default.
+                persisted_project_file: str | None = None
+                persisted_info = self._successfully_loaded_project_templates.get(resolved_project_id)
+                if persisted_info is not None and persisted_info.project_file_path is not None:
+                    persisted_project_file = str(persisted_info.project_file_path)
+                try:
+                    self._config_manager.set_config_value("project_file", persisted_project_file)
+                except Exception:
+                    logger.warning("Failed to persist project_file '%s' to config", persisted_project_file)
 
             failure = await self._reload_after_project_switch(
                 resolved_project_id,
@@ -1523,6 +1542,19 @@ class ProjectManager:
             project_info=project_info,
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
+
+    def get_current_project_file_path(self) -> Path | None:
+        """Return the current project's file path, or None for system defaults.
+
+        Used to thread the orchestrator's active project into a worker at spawn time
+        so the worker boots adopting the same project. Returns None when the current
+        project has no backing file (system defaults) or its id is not loaded, which
+        the caller treats as "spawn the worker without a project (system defaults)".
+        """
+        project_info = self._successfully_loaded_project_templates.get(self._current_project_id)
+        if project_info is None:
+            return None
+        return project_info.project_file_path
 
     def on_save_project_template_request(  # noqa: C901, PLR0911
         self, request: SaveProjectTemplateRequest
@@ -2012,7 +2044,7 @@ class ProjectManager:
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
 
-    async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
+    async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
         """Load system default project template when app initializes.
 
         Called by EventManager after all libraries are loaded.
@@ -2020,7 +2052,19 @@ class ProjectManager:
         overlay file and sets it as the current project if found. If a project has
         already been explicitly selected before this event (e.g., by a CLI executor
         via --project-file-path), preserves that choice and skips workspace discovery.
+
+        A worker process NEVER runs workspace discovery: its project is dictated by the
+        orchestrator (pre-activated from the --project-file-path spawn arg, or system
+        defaults when that arg is absent). Discovering a workspace griptape-nodes-project.yml
+        here would let the worker diverge from the orchestrator, so it is skipped for workers.
         """
+        # A worker's project is owned by the orchestrator. Whatever was pre-activated at
+        # boot (a real project, or system defaults) stays as-is; skip workspace discovery.
+        if payload.is_worker:
+            await self._load_registered_projects()
+            self._initialization_complete = True
+            return
+
         # If an explicit project was selected before init completed (e.g., by
         # LocalWorkflowExecutor loading --project-file-path), keep it. Still load
         # registered projects for visibility and mark init complete.
@@ -2672,7 +2716,14 @@ class ProjectManager:
         reloads each file by path and re-derives its id. Appends the canonical
         path to the list if not already present. Errors are logged as warnings
         and do not affect the load result.
+
+        No-op on a worker: the orchestrator owns projects_to_register in the
+        shared on-disk config. A worker that loads a project to adopt the
+        orchestrator's switch must not write the shared file back, since both
+        processes share it and a worker write races the orchestrator's.
         """
+        if GriptapeNodes.LibraryManager().is_worker:
+            return
         try:
             registered: list[str | dict | PerPlatformProjectPath] = (
                 self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []

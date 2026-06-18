@@ -48,6 +48,7 @@ from griptape_nodes.app.worker_routing import (
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueRequest
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from tests.unit.worker.harness import InProcessWorkerHarness
 
@@ -110,10 +111,12 @@ class TestSecretPropagation:
             worker_config = ConfigManager()
             worker_config.workspace_path = shared_workspace
             worker_secrets = SecretsManager(worker_config, event_manager=harness.worker)
+            worker_project = ProjectManager(harness.worker, worker_config, worker_secrets)
             register_broadcast_handlers(
                 harness.worker,
                 config_manager=worker_config,
                 secrets_manager=worker_secrets,
+                project_manager=worker_project,
             )
 
             assert worker_secrets.get_secret(secret_key) == "boot_value"
@@ -162,10 +165,12 @@ class TestConfigPropagation:
             worker_config = ConfigManager(event_manager=harness.worker)
             worker_config.workspace_path = shared_workspace
             worker_secrets = SecretsManager(worker_config, event_manager=harness.worker)
+            worker_project = ProjectManager(harness.worker, worker_config, worker_secrets)
             register_broadcast_handlers(
                 harness.worker,
                 config_manager=worker_config,
                 secrets_manager=worker_secrets,
+                project_manager=worker_project,
             )
 
             # Both see boot value.
