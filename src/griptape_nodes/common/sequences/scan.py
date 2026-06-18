@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import NamedTuple, Protocol, runtime_checkable
 
 from fileseq.constants import PAD_STYLE_HASH1
@@ -549,14 +550,13 @@ def scan_sequences_from_filenames(
         if not present_numbers:
             continue
 
-        consumed_filenames.update(bare_names)
-
         discovered_first = min(present_numbers)
         discovered_last = max(present_numbers)
         active = _compute_active_range(options.start_number, options.end_number, discovered_first, discovered_last)
         if active.first > active.last:
             continue
 
+        consumed_filenames.update(bare_names)
         result_sequences.extend(
             apply_policy(
                 PolicyContext(
@@ -600,7 +600,7 @@ def _collect_present_numbers_from_fseq(
             dropped += 1
             continue
         bare = fseq.frame(n)
-        full = f"{directory}/{bare}" if directory else bare
+        full = str(Path(directory) / bare) if directory else bare
         present_numbers[n] = full
         bare_filenames.add(bare)
     return present_numbers, dropped, bare_filenames
