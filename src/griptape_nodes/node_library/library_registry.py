@@ -15,6 +15,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
+    resolve_node_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
     DuplicateNodeRegistrationProblem,
@@ -32,6 +33,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.node_library.library_declarations import ResolvedModel
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
 
 logger = logging.getLogger("griptape_nodes")
@@ -528,6 +530,29 @@ class Library:
     def get_library_data(self) -> LibrarySchema:
         return self._library_data
 
+    def get_models_for_node_type(self, node_type: str) -> list[ResolvedModel]:
+        """Resolve the catalog models a node type is declared to use.
+
+        Returns the models referenced by the node's ``model_usage`` /
+        ``model_provider_usage`` declarations, resolved against this library's
+        ``model_catalog`` declaration. Returns an empty list when the node
+        declares no model usage or the library declares no catalog.
+
+        Raises:
+            KeyError: if ``node_type`` is not registered in this library.
+        """
+        node_metadata = self._node_metadata.get(node_type)
+        if node_metadata is None:
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise KeyError(msg)
+        catalog = next(
+            (d for d in self._library_data.metadata.declarations if isinstance(d, ModelCatalogLibraryProperty)),
+            None,
+        )
+        if catalog is None:
+            return []
+        return resolve_node_models(catalog, node_metadata.declarations)
+
     def create_node(
         self,
         node_type: str,
@@ -613,3 +638,34 @@ class Library:
             if issubclass(node_class, base_type):
                 matching_nodes.append(node_type)
         return matching_nodes
+
+
+def get_declared_models(node: BaseNode) -> list[ResolvedModel]:
+    """Resolve the catalog models a node is declared to use.
+
+    Reads the ``library`` and ``node_type`` that ``Library.create_node`` injects
+    into the node's metadata, looks up that library, and resolves the node's
+    ``model_usage`` / ``model_provider_usage`` declarations against its
+    ``model_catalog``. A node calls this to build its model dropdown from the
+    catalog, passing only ``self`` -- it never restates its own library/type,
+    nothing is stored on the node, and nothing is serialized.
+
+    The catalog is library-local, so this is an in-process lookup that resolves
+    correctly in both the orchestrator and a worker subprocess, including from
+    ``__init__``. Each returned ``ResolvedModel`` carries the model descriptor
+    (``model.display_name``, ``model.provider_model_id``) the node needs to map
+    a dropdown selection back to the provider's model id.
+
+    Returns an empty list when the node declares no model usage, its library
+    declares no catalog, or the library/type cannot be resolved (e.g. a node
+    constructed outside the normal library path).
+    """
+    library_name = node.metadata.get("library")
+    node_type = node.metadata.get("node_type")
+    if not isinstance(library_name, str) or not isinstance(node_type, str):
+        return []
+    try:
+        library = LibraryRegistry.get_library(name=library_name)
+        return library.get_models_for_node_type(node_type)
+    except KeyError:
+        return []

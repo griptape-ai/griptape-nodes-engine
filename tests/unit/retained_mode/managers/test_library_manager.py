@@ -12,14 +12,21 @@ import pytest
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_declarations import (
+    KeySupport,
     LifecycleStage,
     LifecycleStageNodeProperty,
+    Model,
+    ModelCatalogLibraryProperty,
+    ModelProvider,
+    ModelProviderUsageNodeProperty,
+    ModelUsageNodeProperty,
 )
 from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryRegistry,
     LibrarySchema,
     NodeMetadata,
+    get_declared_models,
 )
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.library_events import (
@@ -2880,3 +2887,151 @@ class TestPersistLibrarySettings:
         assert problems == []
         global_config = json.loads(isolate_user_config.read_text(encoding="utf-8"))
         assert global_config.get("my_library_category", {}).get("some_setting") == "value"
+
+
+class _ModelProbe(BaseNode):
+    """Concrete BaseNode used to exercise model-catalog resolution end to end."""
+
+    def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+
+
+class TestModelCatalogResolution:
+    """Library.get_models_for_node_type and the get_declared_models helper against a registered catalog."""
+
+    _LIBRARY_NAME = "model-catalog-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self) -> Generator[None, None, None]:
+        LibraryRegistry._libraries.clear()
+        LibraryRegistry._node_aliases.clear()
+        LibraryRegistry._collision_node_names_to_library_names.clear()
+        LibraryRegistry._registered_widgets.clear()
+        yield
+        LibraryRegistry._libraries.clear()
+        LibraryRegistry._node_aliases.clear()
+        LibraryRegistry._collision_node_names_to_library_names.clear()
+        LibraryRegistry._registered_widgets.clear()
+
+    @staticmethod
+    def _catalog() -> ModelCatalogLibraryProperty:
+        return ModelCatalogLibraryProperty(
+            providers={
+                "anthropic": ModelProvider(
+                    display_name="Anthropic",
+                    models={
+                        "claude_opus_byok": Model(
+                            display_name="Claude Opus 4 (BYOK)",
+                            provider_model_id="claude-opus-4",
+                            key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+                        ),
+                        "claude_sonnet_byok": Model(
+                            display_name="Claude Sonnet 4 (BYOK)",
+                            provider_model_id="claude-sonnet-4",
+                            key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+                        ),
+                    },
+                ),
+                "ollama": ModelProvider(display_name="Ollama", key_support=KeySupport.NO_KEY_REQUIRED),
+            },
+        )
+
+    def _register_library(self, *, node_metadata: NodeMetadata, with_catalog: bool = True) -> None:
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test",
+                description="model catalog probe library",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=[self._catalog()] if with_catalog else [],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(_ModelProbe, node_metadata)
+
+    def _node_metadata(self, **kwargs: Any) -> NodeMetadata:
+        return NodeMetadata(category="test", description="probe", display_name="Probe", **kwargs)
+
+    def test_resolves_model_usage_against_catalog(self) -> None:
+        self._register_library(
+            node_metadata=self._node_metadata(
+                declarations=[ModelUsageNodeProperty(model_ids=["claude_opus_byok"])],
+            ),
+        )
+
+        library = LibraryRegistry.get_library(name=self._LIBRARY_NAME)
+        resolved = library.get_models_for_node_type(_ModelProbe.__name__)
+
+        assert [r.model_id for r in resolved] == ["claude_opus_byok"]
+        assert resolved[0].provider_id == "anthropic"
+
+    def test_resolves_provider_usage_against_catalog(self) -> None:
+        self._register_library(
+            node_metadata=self._node_metadata(
+                declarations=[ModelProviderUsageNodeProperty(provider_ids=["anthropic"])],
+            ),
+        )
+
+        library = LibraryRegistry.get_library(name=self._LIBRARY_NAME)
+        resolved = library.get_models_for_node_type(_ModelProbe.__name__)
+
+        assert [r.model_id for r in resolved] == ["claude_opus_byok", "claude_sonnet_byok"]
+
+    def test_no_catalog_returns_empty(self) -> None:
+        self._register_library(
+            node_metadata=self._node_metadata(
+                declarations=[ModelUsageNodeProperty(model_ids=["claude_opus_byok"])],
+            ),
+            with_catalog=False,
+        )
+
+        library = LibraryRegistry.get_library(name=self._LIBRARY_NAME)
+
+        assert library.get_models_for_node_type(_ModelProbe.__name__) == []
+
+    def test_unknown_node_type_raises_key_error(self) -> None:
+        self._register_library(node_metadata=self._node_metadata())
+
+        library = LibraryRegistry.get_library(name=self._LIBRARY_NAME)
+
+        with pytest.raises(KeyError, match="not found"):
+            library.get_models_for_node_type("NotARegisteredNode")
+
+    def test_get_declared_models_resolves_for_created_node(self) -> None:
+        # The headline path: a node hands itself to the helper and gets back the
+        # resolved models, carrying the display-name -> provider_model_id mapping
+        # it needs to build a dropdown. No request, no self-identification.
+        self._register_library(
+            node_metadata=self._node_metadata(
+                declarations=[ModelProviderUsageNodeProperty(provider_ids=["anthropic"])],
+            ),
+        )
+
+        node = LibraryRegistry.create_node(
+            node_type=_ModelProbe.__name__,
+            name="probe-helper",
+            specific_library_name=self._LIBRARY_NAME,
+        )
+
+        resolved = get_declared_models(node)
+
+        assert [r.model_id for r in resolved] == ["claude_opus_byok", "claude_sonnet_byok"]
+        assert resolved[0].model.display_name == "Claude Opus 4 (BYOK)"
+        assert resolved[0].model.provider_model_id == "claude-opus-4"
+
+    def test_get_declared_models_without_library_context_returns_empty(self) -> None:
+        # A node constructed outside the library path has no injected library/type,
+        # so the helper degrades to an empty list instead of raising.
+        node = _ModelProbe(name="orphan")
+
+        assert get_declared_models(node) == []
+
+    def test_get_declared_models_unknown_library_returns_empty(self) -> None:
+        node = _ModelProbe(name="stale", metadata={"library": "no-such-library", "node_type": _ModelProbe.__name__})
+
+        assert get_declared_models(node) == []
