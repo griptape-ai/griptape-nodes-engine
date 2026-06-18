@@ -44,6 +44,7 @@ workspace
 
 - [Workspace](workspace.md) — the root working context and how relative paths resolve
 - [Projects](projects.md) — the project file format and the merge model
+- [Version Pinning](version_pinning.md) — pin a project to an engine version and to specific library versions
 - [Macros](macros.md) — template syntax reference for generating file paths
 - [Sequences](sequences.md) — image-sequence patterns and how missing frames are handled
 - [Directories](directories.md) — logical name-to-path mappings
