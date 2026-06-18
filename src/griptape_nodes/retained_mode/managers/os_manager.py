@@ -1562,9 +1562,8 @@ class OSManager:
             dir_groups: dict[str, list[str]] = {}
             for fp in request.file_paths:
                 p = Path(fp)
-                if p.is_dir():
-                    continue
-                parent = str(p.parent)
+                raw_parent = str(p.parent)
+                parent = "" if raw_parent == "." else raw_parent
                 if parent not in dir_groups:
                     dir_groups[parent] = []
                 dir_groups[parent].append(p.name)

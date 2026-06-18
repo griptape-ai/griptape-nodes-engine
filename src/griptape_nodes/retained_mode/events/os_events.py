@@ -165,12 +165,11 @@ class ListDirectoryRequest(RequestPayload):
         include_modified_time: If True, include modified time in results (default: True). Set to False for faster listing.
         include_mime_type: If True, include MIME type in results (default: True). Set to False for faster listing.
         include_absolute_path: If True, include absolute resolved path in results (default: True). Set to False for faster listing.
-        group_sequences: If True (default), files that form a numbered sequence are returned as
+        group_sequences: If True, files that form a numbered sequence are returned as
             ``Sequence`` objects in the ``sequences`` field instead of individual ``FileSystemEntry``
-            objects in ``entries``. Set to False to suppress sequence detection and always return flat
-            ``FileSystemEntry`` objects.
+            objects in ``entries``. Defaults to False — sequence detection is opt-in.
         sequence_options: Controls sequence detection behaviour (policy, padding filter, frame bounds).
-            Defaults to ``SequenceScanOptions()`` when ``group_sequences=True`` and this is None.
+            Only used when ``group_sequences=True``. Defaults to ``SequenceScanOptions()`` when None.
 
     Results: ListDirectoryResultSuccess (with entries) | ListDirectoryResultFailure (access denied, not found)
     """
@@ -183,7 +182,7 @@ class ListDirectoryRequest(RequestPayload):
     include_modified_time: bool = True
     include_mime_type: bool = True
     include_absolute_path: bool = True
-    group_sequences: bool = True
+    group_sequences: bool = False
     sequence_options: SequenceScanOptions | None = None
 
 
@@ -193,11 +192,11 @@ class ListDirectoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Directory listing retrieved successfully.
 
     Attributes:
-        entries: Files and directories that are not part of a detected sequence.
-            When ``group_sequences=False`` this contains all entries; when
-            ``group_sequences=True`` sequence-member files are moved to ``sequences``.
+        entries: Files and directories. When ``group_sequences=True`` (opt-in),
+            sequence-member files are removed and appear in ``sequences`` instead;
+            when ``group_sequences=False`` (default) all entries are returned here.
         sequences: ``Sequence`` objects detected when ``group_sequences=True``.
-            Empty list when ``group_sequences=False``.
+            Always an empty list when ``group_sequences=False``.
         current_path: The directory path used for the listing.
         is_workspace_path: True when the listed directory is inside the workspace.
     """
@@ -274,9 +273,10 @@ class DeduceSequencesFromFileListRequest(RequestPayload):
     """Detect file sequences within a caller-supplied list of file paths.
 
     No additional filesystem I/O is performed — pass paths already obtained
-    from a directory listing or any other source. Directories in the list are
-    silently ignored. Files from different parent directories are grouped
-    independently by their shared parent.
+    from a directory listing or any other source. Callers are responsible for
+    supplying only file paths; directory paths in the list will not be
+    filtered out and may produce unexpected results. Files from different
+    parent directories are grouped independently by their shared parent.
 
     Use when: Sequence grouping is needed for a file list that has already
     been collected, avoiding a redundant directory scan.
