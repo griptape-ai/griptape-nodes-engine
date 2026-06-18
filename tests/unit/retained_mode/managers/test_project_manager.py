@@ -6780,6 +6780,90 @@ class TestExportProject:
             bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
         assert bundled_config.get(WORKSPACE_DIRECTORY_KEY) == str(external_workspace)
 
+    @pytest.mark.asyncio
+    async def test_export_same_basename_copied_libraries_stay_distinct(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """Two COPY_LOCAL libs whose containing dirs share a basename keep distinct paths.
+
+        The collision-suffix dirname (shared_lib, shared_lib_2) must flow through to
+        BOTH the rewritten config and the manifest's per-lib source_relative_path. A
+        basename-keyed manifest lookup would collapse the two onto one path and
+        mislabel one lib's provenance; this locks the positional pairing in place.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            MANIFEST_FILENAME,
+        )
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = GriptapeNodes.ProjectManager()
+        # Two libraries in same-basename containing dirs under different parents.
+        lib_dir_a = tmp_path / "a" / "shared_lib"
+        lib_dir_b = tmp_path / "b" / "shared_lib"
+        lib_dir_a.mkdir(parents=True)
+        lib_dir_b.mkdir(parents=True)
+        (lib_dir_a / "griptape_nodes_library.json").write_text('{"name": "lib_a"}', encoding="utf-8")
+        (lib_dir_b / "griptape_nodes_library.json").write_text('{"name": "lib_b"}', encoding="utf-8")
+        register_path_a = str(lib_dir_a / "griptape_nodes_library.json")
+        register_path_b = str(lib_dir_b / "griptape_nodes_library.json")
+        config = {
+            "app_events": {
+                "on_app_initialization_complete": {
+                    "libraries_to_download": [],
+                    "libraries_to_register": [register_path_a, register_path_b],
+                }
+            }
+        }
+        project_yaml = _write_project_base_dir(tmp_path / "proj", config)
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            members = set(archive.namelist())
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+            manifest = json.loads(archive.read(MANIFEST_FILENAME))
+
+        # Both sources are copied under distinct, collision-suffixed dirs.
+        assert "libraries/shared_lib/griptape_nodes_library.json" in members
+        assert "libraries/shared_lib_2/griptape_nodes_library.json" in members
+
+        # The rewritten config preserves order and gives each entry its own path.
+        rewritten = get_dot_value(bundled_config, LIBRARIES_TO_REGISTER_KEY)
+        assert rewritten == [
+            "libraries/shared_lib/griptape_nodes_library.json",
+            "libraries/shared_lib_2/griptape_nodes_library.json",
+        ]
+
+        # The manifest records a distinct source_relative_path per copied lib; a
+        # basename-keyed lookup would have collapsed these to a single path.
+        copied_paths = [
+            lib["source_relative_path"] for lib in manifest["libraries"] if lib["disposition"] == "COPY_LOCAL"
+        ]
+        assert copied_paths == [
+            "libraries/shared_lib/griptape_nodes_library.json",
+            "libraries/shared_lib_2/griptape_nodes_library.json",
+        ]
+
 
 class TestPreviewImportProject:
     """Test on_preview_import_project_request reads a manifest without extracting."""

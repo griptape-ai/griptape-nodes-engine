@@ -443,7 +443,6 @@ class ProjectPackager:
                 _CopiedLibraryRewrite(
                     registered_path=local.registered_path,
                     package_relative_path=package_relative,
-                    name=local.containing_dir.name,
                 )
             )
         return rewrites
@@ -509,8 +508,6 @@ class ProjectPackager:
         warnings: list[str],
     ) -> dict:
         """Assemble the manifest dict (provenance + flat summary, KEYS only)."""
-        rewrite_by_name = {rewrite.name: rewrite.package_relative_path for rewrite in copied_rewrites}
-
         referenced_entries = [
             {
                 "name": referenced.name,
@@ -520,13 +517,16 @@ class ProjectPackager:
             }
             for referenced in classification.referenced
         ]
+        # copied_rewrites is produced in lockstep with classification.copied, so
+        # pair them positionally; keying by containing-dir basename would collapse
+        # two same-basename libs onto one rewrite and mislabel their provenance.
         copied_entries = [
             {
                 "name": local.containing_dir.name,
                 "disposition": LibraryDisposition.COPY_LOCAL.value,
-                "source_relative_path": rewrite_by_name.get(local.containing_dir.name),
+                "source_relative_path": rewrite.package_relative_path,
             }
-            for local in classification.copied
+            for local, rewrite in zip(classification.copied, copied_rewrites, strict=True)
         ]
         libraries = referenced_entries + copied_entries
 
@@ -604,4 +604,3 @@ class _CopiedLibraryRewrite:
 
     registered_path: str
     package_relative_path: str
-    name: str
