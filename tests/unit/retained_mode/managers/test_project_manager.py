@@ -3235,6 +3235,88 @@ class TestProjectEnvironmentVariableRecursion:
         assert isinstance(result, GetPathForMacroResultFailure)
         assert result.failure_reason == PathResolutionFailureReason.MACRO_RESOLUTION_ERROR
 
+    def test_directory_optional_workflow_dir_degrades_when_no_workflow(self) -> None:
+        """A directory path_macro with optional {workflow_dir?:/} degrades to workspace-relative when unsaved."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._make_pm_with_template(
+            environment={},
+            directories={"inputs": "{workflow_dir?:/}inputs"},
+        )
+        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_context = Mock()
+            mock_context.has_current_workflow.return_value = False
+            mock_gn.ContextManager.return_value = mock_context
+
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
+            )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("inputs/img.png")
+
+    def test_directory_required_workflow_dir_still_fails_when_no_workflow(self) -> None:
+        """A directory path_macro with required {workflow_dir} still fails when unsaved (regression guard)."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._make_pm_with_template(
+            environment={},
+            directories={"inputs": "{workflow_dir}/inputs"},
+        )
+        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_context = Mock()
+            mock_context.has_current_workflow.return_value = False
+            mock_gn.ContextManager.return_value = mock_context
+
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
+            )
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert result.failure_reason == PathResolutionFailureReason.MACRO_RESOLUTION_ERROR
+
+    def test_directory_optional_workflow_dir_resolves_when_workflow_saved(self) -> None:
+        """A directory path_macro with optional {workflow_dir?:/} resolves under the workflow dir once saved."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._make_pm_with_template(
+            environment={},
+            directories={"inputs": "{workflow_dir?:/}inputs"},
+        )
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
+            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_registry,
+        ):
+            mock_context = Mock()
+            mock_context.has_current_workflow.return_value = True
+            mock_context.get_current_workflow_name.return_value = "my_workflow"
+            mock_gn.ContextManager.return_value = mock_context
+
+            mock_workflow = Mock()
+            mock_workflow.file_path = "my_project/my_workflow.json"
+            mock_registry.get_workflow_by_name.return_value = mock_workflow
+            mock_registry.get_complete_file_path.return_value = "/workspace/my_project/my_workflow.json"
+
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
+            )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/workspace/my_project/inputs/img.png")
+
+    def test_env_value_optional_workflow_dir_degrades_when_no_workflow(self) -> None:
+        """An env value with optional {workflow_dir?:/} degrades gracefully when unsaved."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._make_pm_with_template(environment={"WF": "{workflow_dir?:/}sub"})
+        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_context = Mock()
+            mock_context.has_current_workflow.return_value = False
+            mock_gn.ContextManager.return_value = mock_context
+
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{WF}/x.png"), variables={})
+            )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("outputs/sub/x.png")
+
     def test_apply_project_env_writes_resolved_values_to_os_environ(self) -> None:
         pm = self._make_pm_with_template(environment={"FOO": "{workspace_dir}/sub"})
         assert pm._current_project_id is not None
