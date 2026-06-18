@@ -226,7 +226,7 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
-from griptape_nodes.utils.file_utils import find_files_recursive, find_file_in_directory
+from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
     GitPullError,

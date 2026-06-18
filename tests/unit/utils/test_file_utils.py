@@ -10,10 +10,10 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.file_utils import (
-    find_files_recursive,
     atomic_write_bytes,
     find_all_files_in_directory,
     find_file_in_directory,
+    find_files_recursive,
 )
 
 if TYPE_CHECKING:
