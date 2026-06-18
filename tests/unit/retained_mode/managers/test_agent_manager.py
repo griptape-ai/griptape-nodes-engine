@@ -39,38 +39,20 @@ def agent_manager() -> AgentManager:
 
 
 class TestComposeInstructions:
-    """Per-MCP-server `rules` are folded into the system prompt, not dropped."""
+    """Per-MCP-server `rules` are folded into the instructions string, not dropped."""
 
     def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
         agent_manager._instructions = "BASE"
-        agent_manager._system_prompt_extra = ""
         assert agent_manager._compose_instructions([]) == "BASE"
 
     def test_rules_are_appended_to_base_instructions(self, agent_manager: AgentManager) -> None:
         agent_manager._instructions = "BASE"
-        agent_manager._system_prompt_extra = ""
         composed = agent_manager._compose_instructions(
             ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"]
         )
         assert composed.startswith("BASE")
         assert "be terse" in composed
         assert "be kind" in composed
-
-    def test_system_prompt_extra_are_included_between_base_and_server_rules(self, agent_manager: AgentManager) -> None:
-        agent_manager._instructions = "BASE"
-        agent_manager._system_prompt_extra = "USER"
-        composed = agent_manager._compose_instructions(["SERVER"])
-        assert composed.index("BASE") < composed.index("USER") < composed.index("SERVER")
-
-    def test_empty_system_prompt_extra_are_not_included(self, agent_manager: AgentManager) -> None:
-        agent_manager._instructions = "BASE"
-        agent_manager._system_prompt_extra = ""
-        assert agent_manager._compose_instructions([]) == "BASE"
-
-    def test_whitespace_only_system_prompt_extra_are_not_included(self, agent_manager: AgentManager) -> None:
-        agent_manager._instructions = "BASE"
-        agent_manager._system_prompt_extra = "   "
-        assert agent_manager._compose_instructions([]) == "BASE"
 
 
 class TestOnHandleListAgentModelsRequest:

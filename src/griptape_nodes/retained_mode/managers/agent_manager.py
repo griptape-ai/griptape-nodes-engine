@@ -522,6 +522,7 @@ class AgentManager:
             workspace_root=workspace_root,
             storage=self._thread_storage,
             instructions=self._compose_instructions(server_rules),
+            system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=ImageGenerationToolsetConfig(
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
@@ -533,15 +534,14 @@ class AgentManager:
         return runner
 
     def _compose_instructions(self, server_rules: list[str]) -> str:
-        """Compose the full system prompt from base, user, and per-server rules.
+        """Compose the instructions string from base rules and per-MCP-server rules.
 
-        Composition order: built-in base instructions → user instructions (if
-        set) → per-MCP-server rules (if any). The base instructions are always
-        first so their non-negotiable behavioral rules cannot be overridden.
+        Composition order: built-in base instructions → per-MCP-server rules (if
+        any). The base instructions are always first so their non-negotiable
+        behavioral rules cannot be overridden. User system prompt text is passed
+        separately via PydanticAgentRunner.system_prompt.
         """
         parts = [self._instructions]
-        if self._system_prompt_extra.strip():
-            parts.append(self._system_prompt_extra.strip())
         parts.extend(server_rules)
         return "\n\n".join(parts)
 
