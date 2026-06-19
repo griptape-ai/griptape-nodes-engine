@@ -1146,9 +1146,10 @@ class ProjectManager:
         provided_vars = set(resolution_bag.keys())
         missing = required_vars - provided_vars
 
-        # If _index is the only missing required variable, scan for the next available
-        # index and seed it so macros like {file_name_base}_v{_index:03}.{ext} resolve
-        # on the first write without the caller having to supply _index manually.
+        # _index is the only variable with auto-computed, filesystem-derived semantics:
+        # its value is determined by scanning for existing indexed files, not by user
+        # configuration. All other missing required variables are genuine errors (the user
+        # forgot to wire something up). So we seed _index here and only _index.
         if missing == {"_index"}:
             index_macro_path = MacroPath(request.parsed_macro, resolution_bag)
             index_result = GriptapeNodes.handle_request(GetNextVersionIndexRequest(macro_path=index_macro_path))
