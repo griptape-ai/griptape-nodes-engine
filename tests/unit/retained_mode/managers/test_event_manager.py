@@ -21,6 +21,11 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointDenial,
+    CheckpointFailure,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 
@@ -647,3 +652,55 @@ class TestPreDispatchHooks:
 
         assert event.result.failed()
         assert handler_calls == []
+
+
+class TestAuthorizationCheckpointHooks:
+    """The engine-side hook mechanism the app registers a policy into."""
+
+    @staticmethod
+    def _checkpoint() -> AuthorizationCheckpoint:
+        return AuthorizationCheckpoint(
+            action="LoadLibrary",
+            subject_type="Library",
+            subject_id="lib",
+            attributes={"lifecycle_stage": "LABS"},
+        )
+
+    def test_no_hooks_allows(self) -> None:
+        assert EventManager().evaluate_authorization_checkpoint(self._checkpoint()) is None
+
+    def test_hook_denial_is_returned(self) -> None:
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail="blocked", capability="cap"),))
+        manager = EventManager()
+        manager.add_authorization_hook(lambda _checkpoint: denial)
+        assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is denial
+
+    def test_first_denial_wins_and_allowing_hooks_fall_through(self) -> None:
+        denial = CheckpointDenial(failures=(CheckpointFailure(detail="second"),))
+        manager = EventManager()
+        manager.add_authorization_hook(lambda _checkpoint: None)
+        manager.add_authorization_hook(lambda _checkpoint: denial)
+        assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is denial
+
+    def test_hook_exception_fails_closed(self) -> None:
+        def boom(_checkpoint: AuthorizationCheckpoint) -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        manager = EventManager()
+        manager.add_authorization_hook(boom)
+        denial = manager.evaluate_authorization_checkpoint(self._checkpoint())
+        assert denial is not None
+        assert "boom" in denial.failures[0].detail
+
+    def test_remove_hook(self) -> None:
+        manager = EventManager()
+
+        def hook(_checkpoint: AuthorizationCheckpoint) -> None:
+            return None
+
+        manager.add_authorization_hook(hook)
+        manager.remove_authorization_hook(hook)
+        # Removing again is a no-op, not an error.
+        manager.remove_authorization_hook(hook)
+        assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is None

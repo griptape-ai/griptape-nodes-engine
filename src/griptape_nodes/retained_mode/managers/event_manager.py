@@ -32,6 +32,11 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.generic_events import GenericResultFailure
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointDenial,
+    CheckpointFailure,
+)
 from griptape_nodes.utils.async_utils import call_function
 
 if TYPE_CHECKING:
@@ -123,6 +128,14 @@ class EventManager:
         # chain is skipped so the hook can't keep re-triggering itself into
         # unbounded recursion.
         self._hook_evaluation = threading.local()
+        # Authorization checkpoint hooks. The engine calls
+        # evaluate_authorization_checkpoint at privileged operations (library
+        # load, node instantiation, ...); a hook returns a CheckpointDenial to
+        # block or None to allow. Separate from pre-dispatch hooks because a
+        # checkpoint carries a resolved domain subject rather than a raw request.
+        # The engine itself registers nothing here; the app installs the policy.
+        self._authorization_hooks: list[Callable[[AuthorizationCheckpoint], CheckpointDenial | None]] = []
+        self._authorization_hooks_lock = threading.Lock()
 
     @property
     def event_queue(self) -> asyncio.Queue:
@@ -316,6 +329,62 @@ class EventManager:
             return None
         finally:
             self._hook_evaluation.active = False
+
+    def add_authorization_hook(
+        self,
+        hook: Callable[[AuthorizationCheckpoint], CheckpointDenial | None],
+    ) -> None:
+        """Register an authorization-checkpoint hook.
+
+        The engine calls `evaluate_authorization_checkpoint` at privileged
+        operations; each registered hook returns a `CheckpointDenial` to block the
+        operation or `None` to allow it. Hooks run in registration order and the
+        first denial wins. The engine registers nothing itself -- this is how the
+        app installs license policy without the engine depending on it.
+        Registering the same hook twice is a no-op.
+        """
+        with self._authorization_hooks_lock:
+            if hook not in self._authorization_hooks:
+                self._authorization_hooks.append(hook)
+
+    def remove_authorization_hook(
+        self,
+        hook: Callable[[AuthorizationCheckpoint], CheckpointDenial | None],
+    ) -> None:
+        with self._authorization_hooks_lock:
+            try:
+                self._authorization_hooks.remove(hook)
+            except ValueError:
+                return
+
+    def evaluate_authorization_checkpoint(self, checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+        """Ask registered hooks whether a resolved operation is permitted.
+
+        Returns the first hook's `CheckpointDenial`, or `None` when every hook
+        allows (including when none are registered, so an engine with no policy
+        installed runs unrestricted). Fails closed: a hook that raises is treated
+        as a denial rather than letting the exception escape into the calling
+        operation, mirroring the pre-dispatch chain.
+        """
+        with self._authorization_hooks_lock:
+            hooks = list(self._authorization_hooks)
+        for hook in hooks:
+            try:
+                denial = hook(checkpoint)
+            except Exception as exc:
+                logging.getLogger("griptape_nodes").exception(
+                    "Authorization hook '%s' raised on checkpoint '%s'; denying.",
+                    getattr(hook, "__name__", hook),
+                    checkpoint.action,
+                )
+                return CheckpointDenial(
+                    failures=(
+                        CheckpointFailure(detail=f"Authorization could not be evaluated: {type(exc).__name__}: {exc}"),
+                    )
+                )
+            if denial is not None:
+                return denial
+        return None
 
     def assign_manager_to_request_type(
         self,
