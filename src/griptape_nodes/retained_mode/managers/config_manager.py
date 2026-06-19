@@ -316,8 +316,8 @@ class ConfigManager:
 
         `workspace_dir` and `apply_override` come from ProjectManager.decide_workspace,
         the same decision the live activation applies. The override is applied here only
-        when `apply_override` is True (the project_workspaces mapping, configured-root
-        inheritance, and auto-default branches), exactly as _activate_project calls
+        when `apply_override` is True (the project_workspaces mapping, parent-chain
+        inheritance, and global-default branches), exactly as _activate_project calls
         set_workspace_override; for an env/project-adjacent workspace_directory it is False
         so the workspace config layer can re-point workspace_directory, matching the live
         path. When applied, the value is resolved the same way set_workspace_override
@@ -345,9 +345,9 @@ class ConfigManager:
             merged = merge_dicts(merged, self._load_config_from_file(workspace_config_path, "workspace"))
 
         # Apply the runtime workspace override conditionally, mirroring _activate_project:
-        # only the project_workspaces and auto-default branches pin it (apply_override),
-        # and the value is resolved exactly as set_workspace_override would so preview and
-        # live agree. It sits above config files but below env vars.
+        # only the project_workspaces, parent-chain inheritance, and global-default branches
+        # pin it (apply_override), and the value is resolved exactly as set_workspace_override
+        # would so preview and live agree. It sits above config files but below env vars.
         if apply_override:
             merged["workspace_directory"] = str(Path(workspace_dir).expanduser().resolve())
 
