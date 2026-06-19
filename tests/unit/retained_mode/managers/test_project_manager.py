@@ -1780,13 +1780,19 @@ class TestDecideWorkspace:
         return ProjectManager(Mock(), mock_config, Mock())
 
     @staticmethod
-    def _pm_with_config(project_workspaces: dict[str, str], configured_root: str | None) -> ProjectManager:
+    def _pm_with_config(
+        project_workspaces: dict[str, str],
+        configured_root: str | None,
+        default_root: str | None = None,
+    ) -> ProjectManager:
         """Build a ProjectManager whose config distinguishes the branch-4 reads.
 
         The single-return _pm_with_project_workspaces helper can't tell apart the
         project_workspaces lookup from the configured-root workspace_directory reads (user_config
         then default_config), which the inheritance branch needs. This keys the mock on
-        (key, config_source) instead.
+        (key, config_source) instead. `configured_root` is the user_config layer value;
+        `default_root` is the default_config fallback the branch reads when user_config is None
+        (in production this is always populated by the Settings default).
         """
         mock_config = Mock()
 
@@ -1796,7 +1802,7 @@ class TestDecideWorkspace:
             if key == "workspace_directory" and config_source == "user_config":
                 return configured_root
             if key == "workspace_directory" and config_source == "default_config":
-                return default
+                return default_root
             return default
 
         mock_config.get_config_value.side_effect = fake_get
@@ -1918,10 +1924,29 @@ class TestDecideWorkspace:
         project_file = nested_dir / "project.yml"
         project_file.touch()
 
-        pm = self._pm_with_config(project_workspaces={}, configured_root=None)
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None, default_root=None)
         decision = pm.decide_workspace(project_file, project_config={}, env_config={})
 
         assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
+
+    def test_nested_inherits_default_config_root_when_user_config_unset(self, tmp_path: Path) -> None:
+        """When user_config has no workspace_directory, the branch falls back to default_config.
+
+        In production default_config always supplies the Settings default, so this fallback
+        (not the configured_root=None fallthrough) is the realistic path for a project under the
+        engine's default workspace.
+        """
+        workspace_root = tmp_path / "ws"
+        nested_dir = workspace_root / "test"
+        nested_dir.mkdir(parents=True)
+        project_file = nested_dir / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None, default_root=str(workspace_root))
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path(str(workspace_root))
         assert decision.apply_override is True
 
 
@@ -1953,6 +1978,8 @@ class TestProjectManagerProjectWorkspaces:
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
             if key == REQUIRES_ENGINE_KEY:
+                return None
+            if key == "workspace_directory":
                 return None
             return default if default is not None else {}
 
@@ -2211,6 +2238,8 @@ class TestProjectManagerProjectWorkspaces:
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
             if key == REQUIRES_ENGINE_KEY:
+                return None
+            if key == "workspace_directory":
                 return None
             return default if default is not None else {}
 

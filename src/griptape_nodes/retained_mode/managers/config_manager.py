@@ -316,12 +316,13 @@ class ConfigManager:
 
         `workspace_dir` and `apply_override` come from ProjectManager.decide_workspace,
         the same decision the live activation applies. The override is applied here only
-        when `apply_override` is True (the project_workspaces mapping and auto-default
-        branches), exactly as _activate_project calls set_workspace_override; for an
-        env/project-adjacent workspace_directory it is False so the workspace config layer
-        can re-point workspace_directory, matching the live path. When applied, the value
-        is resolved the same way set_workspace_override resolves it (expanduser + resolve),
-        so the merged workspace_directory matches the live merged config byte-for-byte.
+        when `apply_override` is True (the project_workspaces mapping, configured-root
+        inheritance, and auto-default branches), exactly as _activate_project calls
+        set_workspace_override; for an env/project-adjacent workspace_directory it is False
+        so the workspace config layer can re-point workspace_directory, matching the live
+        path. When applied, the value is resolved the same way set_workspace_override
+        resolves it (expanduser + resolve), so the merged workspace_directory matches the
+        live merged config byte-for-byte.
 
         Args:
             project_dir: Directory holding the project YAML and its adjacent config.

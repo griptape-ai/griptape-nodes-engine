@@ -853,7 +853,7 @@ class TestProvisioningPreviewMatchesActivation:
     Equality is asserted per-key, not as a blanket ==: the live merged config also carries
     unrelated layers (e.g. project_workspaces from the user config) that the preview legitimately
     includes too, so a blanket == would be hostage to that noise and to scalar normalization.
-    All four decide_workspace branches are covered, since each resolves the workspace layer
+    All five decide_workspace branches are covered, since each resolves the workspace layer
     differently and is the surface where preview and live could drift.
     """
 
@@ -1014,8 +1014,49 @@ class TestProvisioningPreviewMatchesActivation:
                 expected_engine_version=">=4.0",
             )
 
+    def test_configured_root_inheritance_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        """A project nested inside the configured workspace root inherits it (apply_override=True).
+
+        The user config sets workspace_directory to an enclosing root and the project lives in a
+        subdir of it with no workspace driver of its own, so decide_workspace's inheritance branch
+        fires and both paths must resolve the workspace layer to that root.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        project_dir = workspace_root / "nested"
+        project_dir.mkdir()
+        project_file = project_dir / "project.yml"
+        project_file.touch()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
+        )
+        self._write_config_file(
+            workspace_root / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["root-workspace-lib"], REQUIRES_ENGINE_KEY: ">=5.0"},
+        )
+        isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace_root)}), encoding="utf-8")
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["root-workspace-lib"],
+                expected_engine_version=">=5.0",
+            )
+
     def test_auto_default_branch(self, tmp_path: Path) -> None:
-        """No workspace driver: the project's own dir is the workspace (apply_override=True)."""
+        """Project outside the configured root: the project's own dir is the workspace (apply_override=True).
+
+        The real ConfigManager's default workspace_directory is CWD/GriptapeNodes; the tmp_path
+        project is not under it, so decide_workspace's inheritance branch is skipped and it falls
+        through to the auto-default branch.
+        """
         from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         project_dir = tmp_path / "project"
