@@ -9,8 +9,11 @@ from typing import TYPE_CHECKING
 from griptape_nodes.common.manifests.manifest import (
     LibraryManifestEntry,
     Manifest,
+    ModelManifestEntry,
+    ModelProviderManifestEntry,
     ProjectTemplateManifestEntry,
 )
+from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -60,14 +63,25 @@ class ManifestManager:
         self, request: GenerateManifestRequest
     ) -> GenerateManifestResultSuccess | GenerateManifestResultFailure:
         """Build a manifest from the engine's currently registered resources."""
-        libraries: list[LibraryManifestEntry] = []
-        if request.include_libraries:
+        # Libraries are listed once when either the library entries or the model
+        # catalog (aggregated from library declarations) is requested.
+        library_names: list[str] = []
+        if request.include_libraries or request.include_model_catalog:
             list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
             if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
                 return GenerateManifestResultFailure(
                     result_details=f"Attempted to generate manifest. Failed to list registered libraries: {list_result.result_details}"
                 )
-            libraries = await self._build_library_entries(list_result.libraries)
+            library_names = list_result.libraries
+
+        libraries: list[LibraryManifestEntry] = []
+        if request.include_libraries:
+            libraries = await self._build_library_entries(library_names)
+
+        model_providers: list[ModelProviderManifestEntry] = []
+        models: list[ModelManifestEntry] = []
+        if request.include_model_catalog:
+            model_providers, models = await self._build_model_catalog_entries(library_names)
 
         projects: list[ProjectTemplateManifestEntry] = []
         if request.include_project_templates:
@@ -89,11 +103,16 @@ class ManifestManager:
             engine_version=await self._resolve_engine_version(),
             libraries=libraries,
             project_templates=projects,
+            model_providers=model_providers,
+            models=models,
         )
 
         return GenerateManifestResultSuccess(
             manifest=manifest,
-            result_details=f"Successfully generated manifest with {len(libraries)} library/libraries and {len(projects)} project template(s).",
+            result_details=(
+                f"Successfully generated manifest with {len(libraries)} library/libraries, "
+                f"{len(projects)} project template(s), and {len(model_providers)} model provider(s)."
+            ),
         )
 
     async def _build_library_entries(self, library_names: list[str]) -> list[LibraryManifestEntry]:
@@ -142,6 +161,54 @@ class ManifestManager:
                 )
             )
         return entries
+
+    async def _build_model_catalog_entries(
+        self, library_names: list[str]
+    ) -> tuple[list[ModelProviderManifestEntry], list[ModelManifestEntry]]:
+        """Aggregate the model catalog declared across the registered libraries.
+
+        Each library may declare a ``ModelCatalogLibraryProperty`` (providers ->
+        models). Providers are deduplicated by ``provider_id`` and models by
+        ``model_id`` (first declaration wins), so the manifest carries one entry
+        per handle even when several libraries declare overlapping catalogs. A
+        library whose metadata cannot be resolved is skipped with a warning
+        rather than failing the whole manifest. Entries are sorted by id for
+        stable output.
+        """
+        providers: dict[str, ModelProviderManifestEntry] = {}
+        models: dict[str, ModelManifestEntry] = {}
+        for name in library_names:
+            metadata_result = await GriptapeNodes.ahandle_request(
+                GetLibraryMetadataRequest(library=name, broadcast_result=False)
+            )
+            if not isinstance(metadata_result, GetLibraryMetadataResultSuccess):
+                logger.warning(
+                    "Could not load metadata for library '%s' while aggregating the model catalog: %s",
+                    name,
+                    metadata_result.result_details,
+                )
+                continue
+            for declaration in metadata_result.metadata.declarations:
+                if not isinstance(declaration, ModelCatalogLibraryProperty):
+                    continue
+                for provider_id, provider in declaration.providers.items():
+                    providers.setdefault(
+                        provider_id,
+                        ModelProviderManifestEntry(provider_id=provider_id, display_name=provider.display_name),
+                    )
+                    for model_id, model in provider.models.items():
+                        models.setdefault(
+                            model_id,
+                            ModelManifestEntry(
+                                model_id=model_id,
+                                provider_id=provider_id,
+                                display_name=model.display_name,
+                                family=model.family,
+                            ),
+                        )
+        sorted_providers = [providers[key] for key in sorted(providers)]
+        sorted_models = [models[key] for key in sorted(models)]
+        return sorted_providers, sorted_models
 
     def _build_project_template_entries(
         self, project_infos: list[ProjectTemplateInfo]

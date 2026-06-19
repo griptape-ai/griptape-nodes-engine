@@ -81,7 +81,9 @@ class TestManifestManager:
                 ]
             )
 
-            result = await manifest_manager.on_generate_manifest_request(GenerateManifestRequest())
+            result = await manifest_manager.on_generate_manifest_request(
+                GenerateManifestRequest(include_model_catalog=False)
+            )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         manifest = result.manifest
@@ -119,7 +121,9 @@ class TestManifestManager:
                 side_effect=[ListRegisteredLibrariesResultFailure(result_details="registry down")]
             )
 
-            result = await manifest_manager.on_generate_manifest_request(GenerateManifestRequest())
+            result = await manifest_manager.on_generate_manifest_request(
+                GenerateManifestRequest(include_model_catalog=False)
+            )
 
         assert isinstance(result, GenerateManifestResultFailure)
 
@@ -149,7 +153,9 @@ class TestManifestManager:
                 ]
             )
 
-            result = await manifest_manager.on_generate_manifest_request(GenerateManifestRequest())
+            result = await manifest_manager.on_generate_manifest_request(
+                GenerateManifestRequest(include_model_catalog=False)
+            )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         assert len(result.manifest.libraries) == 1
@@ -183,7 +189,7 @@ class TestManifestManager:
             )
 
             result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_libraries=False)
+                GenerateManifestRequest(include_libraries=False, include_model_catalog=False)
             )
 
         assert isinstance(result, GenerateManifestResultSuccess)
@@ -203,7 +209,9 @@ class TestManifestManager:
             )
 
             result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_libraries=False, include_project_templates=False)
+                GenerateManifestRequest(
+                    include_libraries=False, include_project_templates=False, include_model_catalog=False
+                )
             )
 
         assert isinstance(result, GenerateManifestResultSuccess)
@@ -211,3 +219,60 @@ class TestManifestManager:
         assert result.manifest.project_templates == []
         assert result.manifest.engine_version == "2.0.0"
         assert mock_gn.ahandle_request.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_generate_manifest_aggregates_model_catalog(self, manifest_manager: ManifestManager) -> None:
+        """The model catalog is aggregated from loaded libraries' declarations."""
+        from griptape_nodes.node_library.library_declarations import (
+            KeySupport,
+            Model,
+            ModelCatalogLibraryProperty,
+            ModelProvider,
+        )
+
+        metadata = LibraryMetadata(
+            author="a",
+            description="d",
+            library_version="1.0.0",
+            engine_version="0.86.0",
+            tags=[],
+            declarations=[
+                ModelCatalogLibraryProperty(
+                    providers={
+                        "anthropic": ModelProvider(
+                            display_name="Anthropic",
+                            models={
+                                "claude-opus-4": Model(
+                                    display_name="Claude Opus 4",
+                                    family="Claude 4",
+                                    key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+                                )
+                            },
+                        )
+                    }
+                )
+            ],
+        )
+
+        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
+            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
+            mock_gn.ahandle_request = AsyncMock(
+                side_effect=[
+                    ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
+                    GetLibraryMetadataResultSuccess(metadata=metadata, result_details="ok"),
+                    GetEngineVersionResultSuccess(major=1, minor=0, patch=0, result_details="ok"),
+                ]
+            )
+
+            result = await manifest_manager.on_generate_manifest_request(
+                GenerateManifestRequest(include_libraries=False, include_project_templates=False)
+            )
+
+        assert isinstance(result, GenerateManifestResultSuccess)
+        assert [provider.provider_id for provider in result.manifest.model_providers] == ["anthropic"]
+        assert result.manifest.model_providers[0].display_name == "Anthropic"
+        assert [model.model_id for model in result.manifest.models] == ["claude-opus-4"]
+        model = result.manifest.models[0]
+        assert model.provider_id == "anthropic"
+        assert model.display_name == "Claude Opus 4"
+        assert model.family == "Claude 4"

@@ -64,6 +64,39 @@ class ProjectTemplateManifestEntry(BaseModel):
     path: str | None = None
 
 
+class ModelProviderManifestEntry(BaseModel):
+    """A model provider declared by a library's model catalog.
+
+    Attributes:
+        provider_id: Catalog handle for the provider (matched by policies as
+            ``ModelProvider::"<provider_id>"`` and declared by a node's
+            ``provider_id``). Consumers must not parse or construct it.
+        display_name: Human-readable provider name, when declared.
+    """
+
+    provider_id: str
+    display_name: str | None = None
+
+
+class ModelManifestEntry(BaseModel):
+    """A single model declared by a library's model catalog.
+
+    Attributes:
+        model_id: Catalog handle for the model (matched by policies as
+            ``resource.id`` and declared by a node's ``model``). Unique within a
+            library; consumers must not parse or construct it.
+        provider_id: The provider this model is served by, matchable against a
+            ``ModelProviderManifestEntry.provider_id``.
+        display_name: Human-readable model name, when declared.
+        family: Optional grouping tag (e.g. "Claude 4"), when declared.
+    """
+
+    model_id: str
+    provider_id: str
+    display_name: str | None = None
+    family: str | None = None
+
+
 class Manifest(BaseModel):
     """A snapshot of the engine's registered libraries and project templates.
 
@@ -75,6 +108,10 @@ class Manifest(BaseModel):
         engine_version: Engine version string (``major.minor.patch``), when known.
         libraries: Registered libraries included in this manifest.
         project_templates: Loaded project templates included in this manifest.
+        model_providers: Model providers aggregated from loaded libraries' model
+            catalogs, deduplicated by ``provider_id``.
+        models: Models aggregated from loaded libraries' model catalogs,
+            deduplicated by ``model_id``.
     """
 
     schema_version: str = MANIFEST_SCHEMA_VERSION
@@ -83,3 +120,5 @@ class Manifest(BaseModel):
     engine_version: str | None = None
     libraries: list[LibraryManifestEntry] = Field(default_factory=list)
     project_templates: list[ProjectTemplateManifestEntry] = Field(default_factory=list)
+    model_providers: list[ModelProviderManifestEntry] = Field(default_factory=list)
+    models: list[ModelManifestEntry] = Field(default_factory=list)
