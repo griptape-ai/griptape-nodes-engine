@@ -1268,10 +1268,20 @@ class ProjectManager:
         1. project_workspaces user-config override -> (override dir, apply_override=True)
         2. workspace_directory from env vars -> (env dir, apply_override=False)
         3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
-        4. the project's own directory (auto-default) -> (project dir, apply_override=True)
+        4. configured workspace root, when the project file lives inside it ->
+           (configured root, apply_override=True)
+        5. the project's own directory (auto-default) -> (project dir, apply_override=True)
 
-        `apply_override` is True only for the override-mapping and auto-default branches,
-        because those are the cases where activation calls set_workspace_override. For env
+        Branch 4 makes a project nested inside the configured workspace inherit that enclosing
+        workspace instead of treating its own subdir as a fresh workspace (which would resolve
+        libraries_directory to an empty libraries/ tree and wrongly prompt to reinstall already
+        downloaded libraries). It only fires when no explicit workspace was named above, so a
+        project-adjacent workspace_directory (branch 3) still wins and a sidecar config remains a
+        full opt-out. A project outside the configured root falls through to branch 5, preserving
+        the portability of imported standalone projects.
+
+        `apply_override` is True only for the override-mapping, configured-root, and auto-default
+        branches, because those are the cases where activation calls set_workspace_override. For env
         or project-adjacent workspace_directory, activation leaves the override unset so the
         workspace config layer can re-point the final workspace_path; a forced override
         would mask that. Both _activate_project (live) and the provisioning preview drive
@@ -1294,6 +1304,23 @@ class ProjectManager:
         project_workspace = project_config.get("workspace_directory")
         if project_workspace is not None:
             return WorkspaceDecision(Path(project_workspace), apply_override=False)
+
+        configured_root = self._config_manager.get_config_value(
+            "workspace_directory",
+            config_source="user_config",
+            default=None,
+        )
+        if configured_root is None:
+            configured_root = self._config_manager.get_config_value(
+                "workspace_directory",
+                config_source="default_config",
+                default=None,
+            )
+        if configured_root is not None:
+            project_dir = canonicalize_for_identity(project_file_path.parent)
+            root_dir = canonicalize_for_identity(Path(configured_root))
+            if project_dir.is_relative_to(root_dir):
+                return WorkspaceDecision(Path(configured_root), apply_override=True)
 
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 

@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1779,6 +1779,29 @@ class TestDecideWorkspace:
         mock_config.get_config_value.return_value = project_workspaces
         return ProjectManager(Mock(), mock_config, Mock())
 
+    @staticmethod
+    def _pm_with_config(project_workspaces: dict[str, str], configured_root: str | None) -> ProjectManager:
+        """Build a ProjectManager whose config distinguishes the branch-4 reads.
+
+        The single-return _pm_with_project_workspaces helper can't tell apart the
+        project_workspaces lookup from the configured-root workspace_directory reads (user_config
+        then default_config), which the inheritance branch needs. This keys the mock on
+        (key, config_source) instead.
+        """
+        mock_config = Mock()
+
+        def fake_get(key: str, *, config_source: str = "merged_config", default: Any = None, **_: Any) -> Any:
+            if key == "project_workspaces":
+                return project_workspaces
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            if key == "workspace_directory" and config_source == "default_config":
+                return default
+            return default
+
+        mock_config.get_config_value.side_effect = fake_get
+        return ProjectManager(Mock(), mock_config, Mock())
+
     def test_project_workspaces_override_wins(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
@@ -1826,7 +1849,76 @@ class TestDecideWorkspace:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
-        pm = self._pm_with_project_workspaces({})
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None)
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
+
+    def test_nested_project_inherits_configured_root(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        nested_dir = workspace_root / "test"
+        nested_dir.mkdir(parents=True)
+        project_file = nested_dir / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=str(workspace_root))
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path(str(workspace_root))
+        assert decision.apply_override is True
+
+    def test_nested_with_sidecar_keeps_own(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        nested_dir = workspace_root / "test"
+        nested_dir.mkdir(parents=True)
+        project_file = nested_dir / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=str(workspace_root))
+        decision = pm.decide_workspace(
+            project_file,
+            project_config={"workspace_directory": "/explicit/ws"},
+            env_config={},
+        )
+
+        assert decision.workspace_dir == Path("/explicit/ws")
+        assert decision.apply_override is False
+
+    def test_outside_root_auto_defaults(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        project_file = other_dir / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=str(workspace_root))
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
+
+    def test_base_dir_equals_root(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        workspace_root.mkdir()
+        project_file = workspace_root / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=str(workspace_root))
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path(str(workspace_root))
+        assert decision.apply_override is True
+
+    def test_configured_root_unset_auto_defaults(self, tmp_path: Path) -> None:
+        workspace_root = tmp_path / "ws"
+        nested_dir = workspace_root / "test"
+        nested_dir.mkdir(parents=True)
+        project_file = nested_dir / "project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None)
         decision = pm.decide_workspace(project_file, project_config={}, env_config={})
 
         assert decision.workspace_dir == project_file.parent
