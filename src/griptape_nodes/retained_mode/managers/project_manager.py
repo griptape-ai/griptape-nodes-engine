@@ -46,7 +46,12 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
-from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
+from griptape_nodes.retained_mode.events.os_events import (
+    GetNextVersionIndexRequest,
+    GetNextVersionIndexResultSuccess,
+    ReadFileRequest,
+    ReadFileResultSuccess,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -1140,6 +1145,16 @@ class ProjectManager:
         required_vars = {v.name for v in variable_infos if v.is_required}
         provided_vars = set(resolution_bag.keys())
         missing = required_vars - provided_vars
+
+        # If _index is the only missing required variable, scan for the next available
+        # index and seed it so macros like {file_name_base}_v{_index:03}.{ext} resolve
+        # on the first write without the caller having to supply _index manually.
+        if missing == {"_index"}:
+            index_macro_path = MacroPath(request.parsed_macro, resolution_bag)
+            index_result = GriptapeNodes.handle_request(GetNextVersionIndexRequest(macro_path=index_macro_path))
+            if isinstance(index_result, GetNextVersionIndexResultSuccess):
+                resolution_bag["_index"] = index_result.index if index_result.index is not None else 1
+                missing.discard("_index")
 
         if missing:
             return GetPathForMacroResultFailure(

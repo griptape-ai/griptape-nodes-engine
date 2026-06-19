@@ -1101,8 +1101,7 @@ class OSManager:
         existing_indices = []
 
         for filepath in existing_files:
-            filename = Path(filepath).name
-            extracted_index = self._extract_index_from_filename(filename, parsed_macro, index_var_name, variables)
+            extracted_index = self._extract_index_from_filename(str(filepath), parsed_macro, index_var_name, variables)
             if extracted_index is not None:
                 existing_indices.append(extracted_index)
 
@@ -1955,13 +1954,12 @@ class OSManager:
         final_file_path: Path | None = None
         final_bytes_written: int | None = None
         used_indexed_fallback = False
-
         # COMMON SETUP: Resolve path for all policies
         # Resolve MacroPath → str
         if isinstance(request.file_path, MacroPath):
             resolution_result = self._resolve_macro_path_to_string(request.file_path)
+            path_display = f"{request.file_path.parsed_macro}"
             if isinstance(resolution_result, MacroResolutionFailure):
-                path_display = f"{request.file_path.parsed_macro}"
                 msg = f"Attempted to write to file '{path_display}'. Failed due to missing variables: {resolution_result.error_details}"
                 return WriteFileResultFailure(
                     failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
@@ -1969,13 +1967,11 @@ class OSManager:
                     result_details=msg,
                 )
             resolved_path_str = resolution_result
-            path_display = f"{request.file_path.parsed_macro}"
         else:
             # Sanitize string path (removes shell escapes, quotes, etc.)
             resolved_path_str = sanitize_path_string(request.file_path)
             path_display = resolved_path_str
 
-        # Convert str → Path
         try:
             file_path = self._resolve_file_path(resolved_path_str, workspace_only=False)
         except (ValueError, RuntimeError) as e:
@@ -2009,10 +2005,9 @@ class OSManager:
                 result_details=msg,
             )
 
-        # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
 
-        # Inject workflow metadata into file content if applicable
+        # Inject workflow metadata into file content if applicable.
         content = request.content
         if (
             isinstance(content, bytes)
@@ -2054,9 +2049,8 @@ class OSManager:
                 final_bytes_written = result.bytes_written
 
             case ExistingFilePolicy.CREATE_NEW:
-                # Path already validated and ready to use (handled at method top)
-
-                # TRY-FIRST: Attempt to write to the requested path
+                attempted_count = 0
+                # TRY-FIRST: Attempt to write to the requested path without an index.
                 result = self._attempt_file_write(
                     normalized_path=Path(normalized_path),
                     content=content,
@@ -2076,20 +2070,14 @@ class OSManager:
                     # Success on first try!
                     final_file_path = file_path
                     final_bytes_written = result.bytes_written
-                else:
-                    # FILE EXISTS OR IS LOCKED. ATTEMPT TO FIND THE NEXT AVAILABLE.
-                    # Convert to indexed MacroPath for scanning. If the user didn't give us a macro to start with,
-                    # we'll take their file name and turn it into a macro that appends _<index> to it.
-                    # (e.g., if they gave us "output.png" we'll convert that to a macro that tries "output_1.png", "output_2.png", etc.)
-                    # For MacroPath inputs, the path is already fully resolved at this point,
-                    # so convert the resolved path string to inject {_index} as well.
+
+                if final_file_path is None:
+                    # File already exists — use an indexed path.
                     macro_path = self._convert_str_path_to_macro_with_index(str(file_path))
-                    parsed_macro = macro_path.parsed_macro
-                    variables = macro_path.variables
 
                     # Identify index variable
                     try:
-                        index_info = self._identify_index_variable(parsed_macro, variables)
+                        index_info = self._identify_index_variable(macro_path.parsed_macro, macro_path.variables)
                     except ValueError as e:
                         msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
                         return WriteFileResultFailure(
@@ -2111,20 +2099,22 @@ class OSManager:
                             result_details=msg,
                         )
 
+                    parsed_macro = macro_path.parsed_macro
+                    variables = macro_path.variables
+
                     # We have a macro with one and only one index variable on it. The heuristic here is:
-                    # 1. Find the FIRST available file name with our index. We'll start there, but someone else may have
-                    #    ganked it while we were attempting to write to it.
-                    # 2. Try candidates in sequence until we find one that works, or fail if we've tried too many times.
+                    # 1. Find the FIRST available file name with our index. We'll start there, but someone
+                    #    else may have ganked it while we were attempting to write to it.
+                    # 2. Try candidates in sequence until we find one that works, or fail if we've tried
+                    #    too many times.
                     # Note: The user could have specified using the index value as a DIRECTORY,
-                    # so it's not always output_1, output_2, etc. It could be run_1/output.png, run_2/output.png, etc.
+                    # so it's not always output_1, output_2, etc. It could be run_1/output.png, etc.
 
                     # Scan for starting index
                     starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
 
-                    # Try indexed candidates on-demand (up to max attempts)
                     secrets_manager = GriptapeNodes.SecretsManager()
                     start_idx = starting_index if starting_index is not None else 1
-                    attempted_count = 0
 
                     for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
                         attempted_count += 1
@@ -2196,13 +2186,13 @@ class OSManager:
                             break
                         # else: continue to next candidate
 
-                    # Check if we exhausted all indexed candidates
-                    if final_file_path is None:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to could not find available filename after trying {attempted_count} candidates"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.IO_ERROR,
-                            result_details=msg,
-                        )
+                # Check if we exhausted all indexed candidates
+                if final_file_path is None:
+                    msg = f"Attempted to write to file '{path_display}'. Failed due to could not find available filename after trying {attempted_count} candidates"
+                    return WriteFileResultFailure(
+                        failure_reason=FileIOFailureReason.IO_ERROR,
+                        result_details=msg,
+                    )
 
         # SUCCESS PATH: All three policies converge here
         if final_file_path is None or final_bytes_written is None:
