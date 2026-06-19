@@ -334,6 +334,13 @@ def register_broadcast_handlers(
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
     async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
+        # A ReloadConfigRequest may land concurrently: a post-init orchestrator switch
+        # persists project_file, which emits ConfigChanged -> ReloadConfigRequest to every
+        # worker, right alongside this activation. Both are SkipTheLine and run as separate
+        # tasks, so they interleave. It is safe because _activate_project below does
+        # clear_project_layers() + a full re-merge, so a concurrent load_configs() only
+        # refreshes the user layer idempotently and cannot leave layers half-applied.
+        #
         # A worker boots like an engine off the same shared on-disk config, so the
         # orchestrator's project id is usually already loaded in the worker's registry.
         # But a worker's registry is frozen at boot: if the orchestrator switched to a
