@@ -4,6 +4,7 @@ import logging
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
     BatchSetNodeMetadataResultFailure,
@@ -405,3 +406,129 @@ class TestDeserializeNodeFromCommandsRetargetsElementCommands:
         # Every element command must have been retargeted at the new copy, not the original node.
         for command in element_commands:
             assert command.node_name == copy_name
+
+
+class _GateProbe(BaseNode):
+    """Concrete BaseNode used to exercise node-instantiation checkpoint resolution."""
+
+    def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
+        super().__init__(name=name, metadata=metadata)
+
+
+class TestNodeInstantiationAuthorizationCheckpoint:
+    """The license-policy checkpoint wired into node instantiation."""
+
+    _LIBRARY_NAME = "node-checkpoint-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        stores = ("_libraries", "_node_aliases", "_collision_node_names_to_library_names", "_registered_widgets")
+        for store in stores:
+            getattr(LibraryRegistry, store).clear()
+        yield
+        for store in stores:
+            getattr(LibraryRegistry, store).clear()
+
+    def _register(self, node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN202
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=list(library_declarations),
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _GateProbe,
+            NodeMetadata(category="t", description="d", display_name="Probe", declarations=list(node_declarations)),
+        )
+        return LibraryRegistry.get_library_for_node_type(_GateProbe.__name__, self._LIBRARY_NAME)
+
+    def test_node_override_stage_wins(self) -> None:
+        from griptape_nodes.node_library.library_declarations import (
+            LifecycleStage,
+            LifecycleStageLibraryProperty,
+            LifecycleStageNodeProperty,
+        )
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        library = self._register(
+            node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)],
+            library_declarations=[LifecycleStageLibraryProperty(stage=LifecycleStage.STABLE)],
+        )
+        attrs = NodeManager._node_checkpoint_attributes(library, _GateProbe.__name__)
+        assert attrs["lifecycle_stage"] == "LABS"
+        assert attrs["executes_arbitrary_code"] is False
+
+    def test_inherits_library_stage_then_unstated(self) -> None:
+        from griptape_nodes.node_library.library_declarations import (
+            LifecycleStage,
+            LifecycleStageLibraryProperty,
+        )
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        inherit = self._register(library_declarations=[LifecycleStageLibraryProperty(stage=LifecycleStage.BETA)])
+        assert NodeManager._node_checkpoint_attributes(inherit, _GateProbe.__name__)["lifecycle_stage"] == "BETA"
+
+        # Re-register with neither stated -> lifecycle_stage omitted entirely.
+        for store in ("_libraries", "_node_aliases", "_collision_node_names_to_library_names", "_registered_widgets"):
+            from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+            getattr(LibraryRegistry, store).clear()
+        unstated = self._register()
+        assert "lifecycle_stage" not in NodeManager._node_checkpoint_attributes(unstated, _GateProbe.__name__)
+
+    def test_arbitrary_code_flag(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ArbitraryPythonExecutionNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        library = self._register(
+            node_declarations=[ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=True)]
+        )
+        assert NodeManager._node_checkpoint_attributes(library, _GateProbe.__name__)["executes_arbitrary_code"] is True
+
+    def test_enforce_raises_on_denial(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, _NodeInstantiationDeniedError
+
+        self._register(node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)])
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: object) -> CheckpointDenial:
+            seen["action"] = checkpoint.action  # type: ignore[attr-defined]
+            seen["stage"] = checkpoint.attributes.get("lifecycle_stage")  # type: ignore[attr-defined]
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to enable Labs nodes."),))
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        with pytest.raises(_NodeInstantiationDeniedError, match="Ask your admin to enable Labs nodes"):
+            NodeManager._enforce_instantiation_checkpoint(
+                node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME
+            )
+        assert seen == {"action": "InstantiateNode", "stage": "LABS"}
+
+    def test_enforce_allows_without_hook(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        self._register()
+        # No hook registered -> no denial, no raise.
+        NodeManager._enforce_instantiation_checkpoint(
+            node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME
+        )

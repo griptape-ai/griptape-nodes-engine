@@ -48,7 +48,12 @@ from griptape_nodes.exe_types.node_types import (
     aprocess_scope,
     sanctioned_parameter_mutation,
 )
-from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.node_library.library_declarations import (
+    ArbitraryPythonExecutionNodeProperty,
+    LifecycleStageLibraryProperty,
+    LifecycleStageNodeProperty,
+)
+from griptape_nodes.node_library.library_registry import Library, LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     ResultDetails,
@@ -212,6 +217,7 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint, CheckpointDenial
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -268,6 +274,16 @@ class SerializedGroupResult:
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
     child_uuids: list[SerializedNodeCommands.NodeUUID]
+
+
+class _NodeInstantiationDeniedError(Exception):
+    """Raised inside node creation when the license policy denies the node type.
+
+    Caught by the same handler path that substitutes an Error Proxy for a node
+    whose library failed to load, so a denied node surfaces identically: a proxy
+    carrying the missing-permission detail, or a failure result when the caller
+    opted out of proxy substitution.
+    """
 
 
 class NodeManager:
@@ -445,6 +461,79 @@ class NodeManager:
         for node_name in node_names:
             self._cleanup_node_on_failed_deserialization(node_name)
 
+    @staticmethod
+    def _node_checkpoint_attributes(library: Library, node_type: str) -> dict[str, Any]:
+        """Resolve the facts a hook may gate node instantiation on.
+
+        `lifecycle_stage` is the node's effective stage: its own override when
+        declared, else the library stage it inherits, omitted when neither states
+        one. `executes_arbitrary_code` is the node's declared flag (absent means
+        False). The engine supplies what it resolved; a policy reads what it wants.
+        """
+        node_declarations = library.get_node_metadata(node_type).declarations
+        attributes: dict[str, Any] = {}
+        node_stage = next(
+            (
+                declaration.stage
+                for declaration in node_declarations
+                if isinstance(declaration, LifecycleStageNodeProperty)
+            ),
+            None,
+        )
+        if node_stage is not None:
+            attributes["lifecycle_stage"] = node_stage.value
+        else:
+            library_stage = next(
+                (
+                    declaration.stage
+                    for declaration in library.get_metadata().declarations
+                    if isinstance(declaration, LifecycleStageLibraryProperty)
+                ),
+                None,
+            )
+            if library_stage is not None:
+                attributes["lifecycle_stage"] = library_stage.value
+        arbitrary = next(
+            (
+                declaration
+                for declaration in node_declarations
+                if isinstance(declaration, ArbitraryPythonExecutionNodeProperty)
+            ),
+            None,
+        )
+        attributes["executes_arbitrary_code"] = bool(arbitrary.executes_arbitrary_python) if arbitrary else False
+        return attributes
+
+    @staticmethod
+    def _evaluate_instantiation_checkpoint(
+        *, node_type: str, specific_library_name: str | None
+    ) -> CheckpointDenial | None:
+        """Ask any registered authorization hook whether this node type may be instantiated."""
+        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action="InstantiateNode",
+                subject_type="NodeType",
+                subject_id=node_type,
+                attributes=NodeManager._node_checkpoint_attributes(library, node_type),
+            )
+        )
+
+    @staticmethod
+    def _enforce_instantiation_checkpoint(*, node_type: str, specific_library_name: str | None) -> None:
+        """Raise `_NodeInstantiationDeniedError` when the policy denies this node type.
+
+        Raised rather than returned so a denial joins the Error Proxy substitution
+        path in `on_create_node_request`, identical to a node whose library failed
+        to load. The message lists every missing permission.
+        """
+        denial = NodeManager._evaluate_instantiation_checkpoint(
+            node_type=node_type, specific_library_name=specific_library_name
+        )
+        if denial is not None:
+            message = "\n".join(denial.messages()) or "Denied by the license policy."
+            raise _NodeInstantiationDeniedError(message)
+
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
@@ -495,6 +584,15 @@ class NodeManager:
         # OK, let's try and create the Node.
         node = None
         try:
+            # License-policy checkpoint: gate instantiating this node type on its
+            # effective lifecycle stage and arbitrary-code flag. A denial raises
+            # (from inside the helper) so it flows into the Error Proxy
+            # substitution below -- the same surface a node whose library failed
+            # to load uses -- and the proxy carries every missing permission.
+            self._enforce_instantiation_checkpoint(
+                node_type=request.node_type,
+                specific_library_name=request.specific_library_name,
+            )
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
