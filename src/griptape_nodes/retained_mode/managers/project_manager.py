@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
@@ -96,6 +96,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
@@ -1374,6 +1375,15 @@ class ProjectManager:
             await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
         return None
 
+    def _project_checkpoint_attributes(self, project_id: ProjectID) -> dict[str, Any]:
+        """Resolve the facts a hook may gate project activation on: id and (best-effort) name."""
+        attributes: dict[str, Any] = {"id": project_id}
+        info = self._successfully_loaded_project_templates.get(project_id)
+        name = getattr(getattr(info, "template", None), "name", None)
+        if name:
+            attributes["name"] = str(name)
+        return attributes
+
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -1399,6 +1409,26 @@ class ProjectManager:
         # string were already canonicalized at load time, so a verbatim lookup
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
+
+        # License-policy checkpoint: gate activating a user project on its id. The
+        # system-defaults rest state is always allowed -- it is the fallback a
+        # failed activation rolls back to. A denial rejects the switch with the
+        # missing permissions and leaves the current project untouched (the
+        # activation below never runs).
+        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
+            denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+                AuthorizationCheckpoint(
+                    action="ActivateProject",
+                    subject_type="Project",
+                    subject_id=resolved_project_id,
+                    attributes=self._project_checkpoint_attributes(resolved_project_id),
+                )
+            )
+            if denial is not None:
+                reason = "; ".join(denial.messages())
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
+                )
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:

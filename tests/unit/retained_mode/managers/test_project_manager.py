@@ -2147,6 +2147,7 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = Mock()
 
@@ -2192,6 +2193,7 @@ class TestProjectManagerProjectWorkspaces:
         pm._initialization_complete = True
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
 
@@ -2219,6 +2221,7 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
             mock_gn.ahandle_request.assert_not_called()
@@ -2251,6 +2254,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_workflow_manager = Mock()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = mock_workflow_manager
 
@@ -2292,6 +2296,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_workflow_manager = Mock()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = mock_workflow_manager
 
@@ -2336,6 +2341,7 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReloadAllLibrariesResultFailure(result_details="reload failed")
             )
@@ -5822,3 +5828,58 @@ parent_project_id: "ghost-parent-id"
         assert "shared_outputs" in child_info.template.directories
         # The transient boot index is cleared once loading finishes.
         assert pm._boot_id_to_file_path == {}
+
+
+class TestProjectActivationAuthorizationCheckpoint:
+    """The license-policy checkpoint wired into project activation."""
+
+    @pytest.fixture
+    def project_manager(self) -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_denied_activation_is_rejected_and_leaves_current_project(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=(CheckpointFailure(detail="Ask your admin to grant access to acme-prod."),)
+        )
+        # A denying activation must roll nowhere: _activate_project never runs.
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id="acme-prod")
+            )
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "acme-prod" in str(result.result_details)
+        assert "Ask your admin to grant access to acme-prod." in str(result.result_details)
+        assert project_manager._current_project_id == SYSTEM_DEFAULTS_KEY
+        activate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_system_defaults_bypasses_checkpoint(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import _ProjectActivationOutcome
+
+        outcome = _ProjectActivationOutcome(failure=None, workspace_changed=False)
+        with patch.object(project_manager, "_activate_project", new=AsyncMock(return_value=outcome)):
+            result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
+
+        assert isinstance(result, SetCurrentProjectResultSuccess)
+        # The rest state is always allowed; the checkpoint is never consulted.
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.assert_not_called()
