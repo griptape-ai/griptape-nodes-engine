@@ -2,7 +2,7 @@ import logging
 import re
 from abc import ABC, abstractmethod
 
-from griptape_nodes.exe_types.core_types import BadgeData, NodeMessageResult, ParameterMode
+from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
@@ -10,7 +10,7 @@ from griptape_nodes.traits.options import Options
 
 logger = logging.getLogger("griptape_nodes")
 
-_NO_MODELS_PLACEHOLDER = "No models downloaded — see badge"
+_NO_MODELS_PLACEHOLDER = "No models downloaded — visit Model Manager"
 
 
 class HuggingFaceModelParameter(ABC):
@@ -33,6 +33,7 @@ class HuggingFaceModelParameter(ABC):
         self._node = node
         self._parameter_name = parameter_name
         self._repo_revisions = []
+        self._download_button: Button | None = None
 
     def refresh_parameters(self) -> None:
         parameter = self._node.get_parameter_by_name(self._parameter_name)
@@ -60,21 +61,11 @@ class HuggingFaceModelParameter(ABC):
 
         self._node.set_parameter_value(self._parameter_name, default_value)
 
-        badge = self._build_model_badge()
-        if badge is None:
-            parameter.clear_badge()
-        else:
-            parameter.set_badge(
-                variant=badge.variant,
-                title=badge.title,
-                message=badge.message,
-                icon=badge.icon,
-                hide_clear_button=badge.hide_clear_button,
-            )
+        parameter.ui_options["data"] = self._build_data_choices()
+        self._update_download_button(default_value, parameter)
 
     def add_input_parameters(self) -> None:
         choices = self.get_choices()
-        badge = self._build_model_badge()
 
         display_choices = choices or [_NO_MODELS_PLACEHOLDER]
         default_value = choices[0] if choices else _NO_MODELS_PLACEHOLDER
@@ -95,11 +86,13 @@ class HuggingFaceModelParameter(ABC):
             tooltip=self._parameter_name,
             allowed_modes={ParameterMode.PROPERTY},
             accept_any=False,
-            badge=badge,
         )
 
         self._node.add_parameter(parameter)
         self._node.set_parameter_value(self._parameter_name, default_value, initial_setup=True)
+
+        parameter.ui_options["data"] = self._build_data_choices()
+        self._update_download_button(default_value, parameter)
 
     def remove_input_parameters(self) -> None:
         self._node.remove_parameter_element_by_name(self._parameter_name)
@@ -107,23 +100,50 @@ class HuggingFaceModelParameter(ABC):
     def get_choices(self) -> list[str]:
         # Ensure the latest repo revisions are fetched
         self._repo_revisions = self.fetch_repo_revisions()
-        # Count occurrences of each model name
-        model_counts = {}
+
+        # Count occurrences of each model name to detect duplicates
+        model_counts: dict[str, int] = {}
         for repo_id, _ in self.list_repo_revisions():
             model_counts[repo_id] = model_counts.get(repo_id, 0) + 1
 
-        # Generate choices with hash only when there are duplicates
-        choices = []
+        # Generate keys for downloaded models (hash only when there are duplicates)
+        downloaded_choices = []
         for repo_revision in self.list_repo_revisions():
             repo_id, _ = repo_revision
             if model_counts[repo_id] > 1:
-                # Multiple versions exist, show hash for disambiguation
-                choices.append(self._repo_revision_to_key(repo_revision))
+                downloaded_choices.append(self._repo_revision_to_key(repo_revision))
             else:
-                # Only one version, show just the model name
-                choices.append(repo_id)
-        logger.debug("Available choices for parameter '%s': %s", self._parameter_name, choices)
-        return choices
+                downloaded_choices.append(repo_id)
+
+        not_downloaded = self.get_not_downloaded_choices()
+
+        all_choices = downloaded_choices + not_downloaded
+        logger.debug("Available choices for parameter '%s': %s", self._parameter_name, all_choices)
+        return all_choices
+
+    def get_not_downloaded_choices(self) -> list[str]:
+        downloaded_repo_ids = {repo_id for repo_id, _ in self.list_repo_revisions()}
+        return [m for m in self.get_download_models() if m not in downloaded_repo_ids]
+
+    def _build_data_choices(self) -> list[dict]:
+        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
+        not_downloaded = set(self.get_not_downloaded_choices())
+        choices = self.get_choices()
+
+        data = []
+        for choice in choices:
+            repo_id, _ = self._key_to_repo_revision(choice)
+            if repo_id in downloaded_keys or choice in downloaded_keys:
+                data.append({"name": choice, "args": {}, "icon": "check-circle", "subtitle": "Downloaded"})
+            elif choice in not_downloaded or repo_id in not_downloaded:
+                data.append({"name": choice, "args": {}, "icon": "download", "subtitle": "Not downloaded"})
+            else:
+                data.append({"name": choice, "args": {}})
+        return data
+
+    def _get_model_search_term(self, choice: str) -> str:
+        repo_id, _ = self._key_to_repo_revision(choice)
+        return repo_id
 
     def validate_before_node_run(self) -> list[Exception] | None:
         self.refresh_parameters()
@@ -159,42 +179,47 @@ class HuggingFaceModelParameter(ABC):
         # If revision was provided, return it directly
         return repo_id, revision
 
+    def after_value_set(self, parameter: Parameter, value: object) -> None:
+        if parameter.name != self._parameter_name:
+            return
+        self._update_download_button(value, parameter)
+
+    def _update_download_button(self, value: object, parameter: Parameter) -> None:
+        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
+
+        # Determine if the selected value is a downloaded model
+        is_downloaded = value in downloaded_keys or str(value) in downloaded_keys
+        if not is_downloaded:
+            repo_id, _ = self._key_to_repo_revision(str(value)) if value else ("", "")
+            is_downloaded = repo_id in downloaded_keys
+
+        value_is_placeholder = value == _NO_MODELS_PLACEHOLDER or value is None
+
+        if not is_downloaded and not value_is_placeholder:
+            # Remove old button if present
+            if self._download_button is not None:
+                parameter.remove_trait(self._download_button)
+                self._download_button = None
+
+            search_term = self._get_model_search_term(str(value))
+            button = Button(
+                icon="download",
+                size="icon",
+                variant="secondary",
+                tooltip="Open in Model Manager to download",
+                button_link=f"#model-management?search={search_term}",
+            )
+            parameter.add_trait(button)
+            self._download_button = button
+        elif self._download_button is not None:
+            parameter.remove_trait(self._download_button)
+            self._download_button = None
+
     def _on_refresh_click(
         self, _button: Button, _button_details: ButtonDetailsMessagePayload
     ) -> NodeMessageResult | None:
         self.refresh_parameters()
         return None
-
-    def _build_model_badge(self) -> BadgeData | None:
-        download_models = self.get_download_models()
-        downloaded_repo_ids = {repo_id for repo_id, _ in self.list_repo_revisions()}
-
-        missing = [m for m in download_models if m not in downloaded_repo_ids]
-        if not missing:
-            return None
-
-        model_lines = []
-        for model in download_models:
-            hf_link = f"[↗](https://huggingface.co/{model})"
-            if model in downloaded_repo_ids:
-                model_lines.append(f"✓ {model} {hf_link}")
-            else:
-                model_lines.append(f"[↓ {model}](#model-management?search={model}) {hf_link}")
-
-        message = (
-            "Model download required to continue.\n\n"
-            "Click a model name below to open it in Model Management, then click the download button:\n\n"
-            + "\n\n".join(model_lines)
-            + "\n\nAfter downloading, a dropdown with available models will appear."
-        )
-
-        return BadgeData(
-            variant="warning",
-            title="Download Required",
-            message=message,
-            icon="hard-drive",
-            hide_clear_button=True,
-        )
 
     @abstractmethod
     def fetch_repo_revisions(self) -> list[tuple[str, str]]: ...
