@@ -79,6 +79,7 @@ class HuggingFaceModelParameter(ABC):
                     size="icon",
                     variant="secondary",
                     on_click=self._on_refresh_click,
+                    get_button_state=self._get_button_state,
                 ),
             },
             tooltip=self._parameter_name,
@@ -178,20 +179,40 @@ class HuggingFaceModelParameter(ABC):
 
         return repo_id, revision
 
+    def _is_current_value_downloaded(self) -> bool:
+        value = self._node.get_parameter_value(self._parameter_name)
+        if value is None or value == _NO_MODELS_PLACEHOLDER:
+            return True
+        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
+        if value in downloaded_keys:
+            return True
+        repo_id, _ = self._key_to_repo_revision(str(value))
+        return repo_id in downloaded_keys
+
+    def _get_button_state(
+        self, _button: Button, button_details: ButtonDetailsMessagePayload
+    ) -> NodeMessageResult | None:
+        if self._is_current_value_downloaded():
+            return None
+        return NodeMessageResult(
+            success=True,
+            details="Button state retrieved",
+            response=ButtonDetailsMessagePayload(
+                label=button_details.label,
+                variant="destructive",
+                size=button_details.size,
+                state=button_details.state,
+                icon="download",
+                tooltip="Open Model Manager to download this model",
+            ),
+            altered_workflow_state=False,
+        )
+
     def _on_refresh_click(
         self, _button: Button, button_details: ButtonDetailsMessagePayload
     ) -> NodeMessageResult | None:
-        value = self._node.get_parameter_value(self._parameter_name)
-        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
-
-        is_downloaded = value in downloaded_keys
-        if not is_downloaded and value is not None:
-            repo_id, _ = self._key_to_repo_revision(str(value))
-            is_downloaded = repo_id in downloaded_keys
-
-        value_is_placeholder = value == _NO_MODELS_PLACEHOLDER or value is None
-
-        if not is_downloaded and not value_is_placeholder:
+        if not self._is_current_value_downloaded():
+            value = self._node.get_parameter_value(self._parameter_name)
             search_term = self._get_model_search_term(str(value))
             return NodeMessageResult(
                 success=True,
