@@ -61,7 +61,7 @@ class HuggingFaceModelParameter(ABC):
 
         self._node.set_parameter_value(self._parameter_name, default_value)
 
-        parameter.update_ui_options_key("data", self._build_data_choices())
+        self._apply_data_choices(parameter)
         self._update_download_button(default_value, parameter)
 
     def add_input_parameters(self) -> None:
@@ -91,7 +91,7 @@ class HuggingFaceModelParameter(ABC):
         self._node.add_parameter(parameter)
         self._node.set_parameter_value(self._parameter_name, default_value, initial_setup=True)
 
-        parameter.update_ui_options_key("data", self._build_data_choices())
+        self._apply_data_choices(parameter)
         self._update_download_button(default_value, parameter)
 
     def remove_input_parameters(self) -> None:
@@ -134,12 +134,21 @@ class HuggingFaceModelParameter(ABC):
         for choice in choices:
             repo_id, _ = self._key_to_repo_revision(choice)
             if repo_id in downloaded_keys or choice in downloaded_keys:
-                data.append({"name": choice, "args": {}, "icon": "check-circle", "subtitle": "Downloaded"})
+                data.append({"name": choice, "icon": "check-circle", "subtitle": "Downloaded"})
             elif choice in not_downloaded or repo_id in not_downloaded:
-                data.append({"name": choice, "args": {}, "icon": "download", "subtitle": "Not downloaded"})
+                data.append({"name": choice, "icon": "download", "subtitle": "Not downloaded"})
             else:
-                data.append({"name": choice, "args": {}})
+                data.append({"name": choice})
         return data
+
+    def _apply_data_choices(self, parameter: Parameter) -> None:
+        parameter.update_ui_options(
+            {
+                "data": self._build_data_choices(),
+                "dropdown_row_icons": True,
+                "dropdown_row_subtitles": True,
+            }
+        )
 
     def _get_model_search_term(self, choice: str) -> str:
         repo_id, _ = self._key_to_repo_revision(choice)
