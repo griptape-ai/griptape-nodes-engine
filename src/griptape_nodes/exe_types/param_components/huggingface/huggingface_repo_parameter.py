@@ -8,6 +8,8 @@ from griptape_nodes.exe_types.param_components.huggingface.huggingface_utils imp
 )
 from griptape_nodes.traits.options import Options
 
+
+
 logger = logging.getLogger("griptape_nodes")
 
 
@@ -91,18 +93,8 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         else:
             parameter.add_trait(Options(choices=filtered_choices))
 
-        # Update badge to reflect current download status
-        badge = self._build_model_badge()
-        if badge is None:
-            parameter.clear_badge()
-        else:
-            parameter.set_badge(
-                variant=badge.variant,
-                title=badge.title,
-                message=badge.message,
-                icon=badge.icon,
-                hide_clear_button=badge.hide_clear_button,
-            )
+        parameter.ui_options["data"] = self._build_data_choices()
+        self._update_download_button(default_value, parameter)
 
     def add_input_parameters(self) -> None:
         """Override to apply deprecated model filtering after parameter creation."""
