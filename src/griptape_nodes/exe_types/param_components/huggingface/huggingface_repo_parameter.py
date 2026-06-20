@@ -92,6 +92,7 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
             parameter.add_trait(Options(choices=filtered_choices))
 
         self._apply_data_choices(parameter)
+        self._update_download_button_visibility(default_value)
 
     def add_input_parameters(self) -> None:
         """Override to apply deprecated model filtering after parameter creation."""

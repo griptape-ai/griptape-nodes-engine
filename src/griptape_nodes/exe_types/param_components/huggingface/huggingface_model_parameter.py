@@ -34,6 +34,10 @@ class HuggingFaceModelParameter(ABC):
         self._parameter_name = parameter_name
         self._repo_revisions = []
 
+    @property
+    def _download_param_name(self) -> str:
+        return f"{self._parameter_name}_download"
+
     def refresh_parameters(self) -> None:
         parameter = self._node.get_parameter_by_name(self._parameter_name)
         if parameter is None:
@@ -61,6 +65,7 @@ class HuggingFaceModelParameter(ABC):
         self._node.set_parameter_value(self._parameter_name, default_value)
 
         self._apply_data_choices(parameter)
+        self._update_download_button_visibility(default_value)
 
     def add_input_parameters(self) -> None:
         choices = self.get_choices()
@@ -79,7 +84,6 @@ class HuggingFaceModelParameter(ABC):
                     size="icon",
                     variant="secondary",
                     on_click=self._on_refresh_click,
-                    get_button_state=self._get_button_state,
                 ),
             },
             tooltip=self._parameter_name,
@@ -92,8 +96,29 @@ class HuggingFaceModelParameter(ABC):
 
         self._apply_data_choices(parameter)
 
+        download_button = ParameterString(
+            name=self._download_param_name,
+            default_value="",
+            display_name="",
+            traits={
+                Button(
+                    label="Open Model Manager to Download",
+                    icon="download",
+                    variant="secondary",
+                    full_width=True,
+                    on_click=self._on_download_click,
+                ),
+            },
+            tooltip="Open Model Manager to download the selected model",
+            allowed_modes={ParameterMode.PROPERTY},
+            accept_any=False,
+        )
+        self._node.add_parameter(download_button)
+        self._node.hide_parameter_by_name(self._download_param_name)
+
     def remove_input_parameters(self) -> None:
         self._node.remove_parameter_element_by_name(self._parameter_name)
+        self._node.remove_parameter_element_by_name(self._download_param_name)
 
     def get_choices(self) -> list[str]:
         self._repo_revisions = self.fetch_repo_revisions()
@@ -149,6 +174,28 @@ class HuggingFaceModelParameter(ABC):
         repo_id, _ = self._key_to_repo_revision(choice)
         return repo_id
 
+    def _is_value_downloaded(self, value: object) -> bool:
+        if value is None or value == _NO_MODELS_PLACEHOLDER:
+            return True
+        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
+        if value in downloaded_keys:
+            return True
+        repo_id, _ = self._key_to_repo_revision(str(value))
+        return repo_id in downloaded_keys
+
+    def _update_download_button_visibility(self, value: object) -> None:
+        if self._node.get_parameter_by_name(self._download_param_name) is None:
+            return
+        if self._is_value_downloaded(value):
+            self._node.hide_parameter_by_name(self._download_param_name)
+        else:
+            self._node.show_parameter_by_name(self._download_param_name)
+
+    def after_value_set(self, parameter: Parameter, value: object) -> None:
+        if parameter.name != self._parameter_name:
+            return
+        self._update_download_button_visibility(value)
+
     def validate_before_node_run(self) -> list[Exception] | None:
         self.refresh_parameters()
         try:
@@ -179,53 +226,26 @@ class HuggingFaceModelParameter(ABC):
 
         return repo_id, revision
 
-    def _is_current_value_downloaded(self) -> bool:
-        value = self._node.get_parameter_value(self._parameter_name)
-        if value is None or value == _NO_MODELS_PLACEHOLDER:
-            return True
-        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
-        if value in downloaded_keys:
-            return True
-        repo_id, _ = self._key_to_repo_revision(str(value))
-        return repo_id in downloaded_keys
+    def _on_refresh_click(
+        self, _button: Button, _button_details: ButtonDetailsMessagePayload
+    ) -> NodeMessageResult | None:
+        self.refresh_parameters()
+        return None
 
-    def _get_button_state(
+    def _on_download_click(
         self, _button: Button, button_details: ButtonDetailsMessagePayload
     ) -> NodeMessageResult | None:
-        if self._is_current_value_downloaded():
-            return None
+        value = self._node.get_parameter_value(self._parameter_name)
+        search_term = self._get_model_search_term(str(value))
         return NodeMessageResult(
             success=True,
-            details="Button state retrieved",
-            response=ButtonDetailsMessagePayload(
-                label=button_details.label,
-                variant="destructive",
-                size=button_details.size,
-                state=button_details.state,
-                icon="download",
-                tooltip="Open Model Manager to download this model",
+            details="Opening Model Manager",
+            response=OnClickMessageResultPayload(
+                button_details=button_details,
+                href=f"#model-management?search={search_term}",
             ),
             altered_workflow_state=False,
         )
-
-    def _on_refresh_click(
-        self, _button: Button, button_details: ButtonDetailsMessagePayload
-    ) -> NodeMessageResult | None:
-        if not self._is_current_value_downloaded():
-            value = self._node.get_parameter_value(self._parameter_name)
-            search_term = self._get_model_search_term(str(value))
-            return NodeMessageResult(
-                success=True,
-                details="Opening Model Manager",
-                response=OnClickMessageResultPayload(
-                    button_details=button_details,
-                    href=f"#model-management?search={search_term}",
-                ),
-                altered_workflow_state=False,
-            )
-
-        self.refresh_parameters()
-        return None
 
     @abstractmethod
     def fetch_repo_revisions(self) -> list[tuple[str, str]]: ...

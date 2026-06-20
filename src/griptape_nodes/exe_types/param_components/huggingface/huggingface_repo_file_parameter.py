@@ -88,6 +88,7 @@ class HuggingFaceRepoFileParameter(HuggingFaceModelParameter):
             parameter.add_trait(Options(choices=filtered_choices))
 
         self._apply_data_choices(parameter)
+        self._update_download_button_visibility(default_value)
 
     def get_download_commands(self) -> list[str]:
         return [
