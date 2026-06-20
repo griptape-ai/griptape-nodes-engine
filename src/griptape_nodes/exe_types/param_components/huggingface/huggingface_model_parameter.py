@@ -65,7 +65,7 @@ class HuggingFaceModelParameter(ABC):
         self._node.set_parameter_value(self._parameter_name, default_value)
 
         self._apply_data_choices(parameter)
-        self._update_download_button_visibility(default_value)
+        self._update_download_button_visibility()
 
     def add_input_parameters(self) -> None:
         choices = self.get_choices()
@@ -174,27 +174,14 @@ class HuggingFaceModelParameter(ABC):
         repo_id, _ = self._key_to_repo_revision(choice)
         return repo_id
 
-    def _is_value_downloaded(self, value: object) -> bool:
-        if value is None or value == _NO_MODELS_PLACEHOLDER:
-            return True
-        downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
-        if value in downloaded_keys:
-            return True
-        repo_id, _ = self._key_to_repo_revision(str(value))
-        return repo_id in downloaded_keys
-
-    def _update_download_button_visibility(self, value: object) -> None:
+    def _update_download_button_visibility(self) -> None:
         if self._node.get_parameter_by_name(self._download_param_name) is None:
             return
-        if self._is_value_downloaded(value):
-            self._node.hide_parameter_by_name(self._download_param_name)
-        else:
+        has_missing = bool(self.get_not_downloaded_choices())
+        if has_missing:
             self._node.show_parameter_by_name(self._download_param_name)
-
-    def after_value_set(self, parameter: Parameter, value: object) -> None:
-        if parameter.name != self._parameter_name:
-            return
-        self._update_download_button_visibility(value)
+        else:
+            self._node.hide_parameter_by_name(self._download_param_name)
 
     def validate_before_node_run(self) -> list[Exception] | None:
         self.refresh_parameters()
