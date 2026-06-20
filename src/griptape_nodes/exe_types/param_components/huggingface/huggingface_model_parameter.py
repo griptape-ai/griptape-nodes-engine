@@ -61,7 +61,7 @@ class HuggingFaceModelParameter(ABC):
 
         self._node.set_parameter_value(self._parameter_name, default_value)
 
-        parameter.ui_options["data"] = self._build_data_choices()
+        parameter._ui_options["data"] = self._build_data_choices()
         self._update_download_button(default_value, parameter)
 
     def add_input_parameters(self) -> None:
@@ -91,7 +91,7 @@ class HuggingFaceModelParameter(ABC):
         self._node.add_parameter(parameter)
         self._node.set_parameter_value(self._parameter_name, default_value, initial_setup=True)
 
-        parameter.ui_options["data"] = self._build_data_choices()
+        parameter._ui_options["data"] = self._build_data_choices()
         self._update_download_button(default_value, parameter)
 
     def remove_input_parameters(self) -> None:
