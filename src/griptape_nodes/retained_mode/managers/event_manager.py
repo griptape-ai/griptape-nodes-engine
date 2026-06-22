@@ -372,8 +372,10 @@ class EventManager:
         # Bypass the chain when a hook is already evaluating on this thread. A
         # hook that re-enters an engine operation guarded by a checkpoint would
         # otherwise re-trigger itself and recurse without bound. Mirrors the
-        # pre-dispatch chain's recursion guard; returning None allows the nested
-        # operation, which is already running inside an authorized outer one.
+        # pre-dispatch chain's recursion guard. Returning None allows the nested
+        # operation unconditionally -- the bypass is coarse and permits a nested
+        # checkpoint with a different subject too -- which is acceptable because
+        # the policy code itself triggered it; the alternative is the recursion.
         if getattr(self._hook_evaluation, "authorizing", False):
             return None
 

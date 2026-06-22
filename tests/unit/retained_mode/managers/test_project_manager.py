@@ -5867,6 +5867,33 @@ class TestProjectActivationAuthorizationCheckpoint:
 
     @pytest.mark.asyncio
     @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_empty_failure_denial_still_yields_a_reason(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        # A hook that misuses the contract by returning a denial with no failures
+        # (it should return None to allow) must still produce a reason, not an
+        # empty "Failed because: " tail.
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=()
+        )
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id="acme-prod")
+            )
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "Denied by the license policy." in str(result.result_details)
+        activate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     async def test_system_defaults_bypasses_checkpoint(
         self, mock_griptape_nodes: Mock, project_manager: ProjectManager
     ) -> None:

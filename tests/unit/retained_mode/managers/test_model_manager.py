@@ -269,6 +269,27 @@ class TestOnHandleDeclareModelInvocationRequest:
         )
         assert isinstance(allowed, DeclareModelInvocationResultSuccess)
 
+    def test_empty_failure_denial_still_yields_a_reason(self) -> None:
+        # A hook that misuses the contract by returning a denial with no failures
+        # (it should return None to allow) must not produce a reason-less message.
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        def deny(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial:
+            return CheckpointDenial(failures=())
+
+        GriptapeNodes.EventManager().add_authorization_hook(deny)
+        manager = ModelManager.__new__(ModelManager)
+
+        denied = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model="claude-opus-4", provider_id="anthropic")
+        )
+        assert isinstance(denied, DeclareModelInvocationResultFailure)
+        assert "Denied by the license policy." in str(denied.result_details)
+
 
 # ---------------------------------------------------------------------------
 # _download_model_task — subprocess entry point

@@ -1425,7 +1425,7 @@ class ProjectManager:
                 )
             )
             if denial is not None:
-                reason = "; ".join(denial.messages())
+                reason = "; ".join(denial.messages()) or "Denied by the license policy."
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
                 )
