@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout actions
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Delete existing release
