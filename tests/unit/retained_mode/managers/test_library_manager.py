@@ -3334,3 +3334,51 @@ class TestLibraryFitnessAuthorizationCheckpoint:
                 EvaluateLibraryFitnessRequest(schema=self._schema("ok-lib"))
             )
         assert isinstance(result, EvaluateLibraryFitnessResultSuccess)
+
+    def test_denied_node_is_a_library_problem_but_library_stays_usable(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.node_library.library_registry import NodeDefinition, NodeMetadata
+        from griptape_nodes.retained_mode.events.library_events import (
+            EvaluateLibraryFitnessRequest,
+            EvaluateLibraryFitnessResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.fitness_problems.libraries import NodePermissionDeniedProblem
+
+        # Deny only the node (by lifecycle stage); the library itself is allowed.
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.action == "InstantiateNode":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to enable Labs nodes."),))
+            return None
+
+        schema = self._schema("mixed-lib")
+        schema.nodes.append(
+            NodeDefinition(
+                class_name="LabsNode",
+                file_path="labs.py",
+                metadata=NodeMetadata(
+                    category="t",
+                    description="d",
+                    display_name="Labs",
+                    declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)],
+                ),
+            )
+        )
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        with patch(
+            "griptape_nodes.retained_mode.managers.version_compatibility_manager.VersionCompatibilityManager.check_library_version_compatibility",
+            return_value=[],
+        ):
+            result = griptape_nodes.LibraryManager().evaluate_library_fitness_request(
+                EvaluateLibraryFitnessRequest(schema=schema)
+            )
+
+        # The library is permitted, so it stays usable (registered), but the denied
+        # node is surfaced as a library problem rather than silently dropped.
+        assert isinstance(result, EvaluateLibraryFitnessResultSuccess)
+        assert result.fitness == _LibraryManager.LibraryFitness.FLAWED
+        problems = [p for p in result.problems if isinstance(p, NodePermissionDeniedProblem)]
+        assert len(problems) == 1
+        assert problems[0].node_type == "LabsNode"
+        assert "Ask your admin to enable Labs nodes." in problems[0].collate_problems_for_display(problems)

@@ -215,6 +215,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
+    NodePermissionDeniedProblem,
     OldXdgLocationWarningProblem,
     PermissionDeniedProblem,
     RequestHandlerRegistrationProblem,
@@ -5131,6 +5132,17 @@ class LibraryManager:
                 fitness=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=problems,
             )
+
+        # Per-node license-policy preview. A library may be permitted to load while
+        # still declaring node types the policy forbids (by lifecycle stage or the
+        # arbitrary-code flag). Surface each denied node type as a library problem
+        # now -- so the GUI failure icon lists them and what to ask an admin for --
+        # without blocking the library, which stays usable for its permitted nodes.
+        # Instantiating a denied node later substitutes an Error Proxy via the same
+        # checkpoint. Runs on the schema, so no library module is imported here.
+        node_denials = GriptapeNodes.NodeManager().evaluate_schema_node_instantiation_denials(schema)
+        for node_type, node_denial in node_denials.items():
+            problems.append(NodePermissionDeniedProblem(node_type=node_type, messages=node_denial.messages()))
 
         # Determine fitness based on whether we have any non-disqualifying issues
         fitness = LibraryManager.LibraryFitness.FLAWED if problems else LibraryManager.LibraryFitness.GOOD

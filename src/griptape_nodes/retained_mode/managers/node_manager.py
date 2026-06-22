@@ -17,6 +17,10 @@ from griptape_nodes.common.strict_mode import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
+    from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -53,7 +57,7 @@ from griptape_nodes.node_library.library_declarations import (
     LifecycleStageLibraryProperty,
     LifecycleStageNodeProperty,
 )
-from griptape_nodes.node_library.library_registry import Library, LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     ResultDetails,
@@ -462,7 +466,12 @@ class NodeManager:
             self._cleanup_node_on_failed_deserialization(node_name)
 
     @staticmethod
-    def _node_checkpoint_attributes(library: Library, node_type: str) -> dict[str, Any]:
+    def _node_checkpoint_attributes(
+        *,
+        node_type: str,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
+    ) -> dict[str, Any]:
         """Resolve the facts a hook may gate node instantiation on.
 
         `id` is the node type (so a policy can match a specific node type).
@@ -470,8 +479,11 @@ class NodeManager:
         declared, else the library stage it inherits, omitted when neither states
         one. `executes_arbitrary_code` is the node's declared flag (absent means
         False). The engine supplies what it resolved; a policy reads what it wants.
+
+        Takes declaration lists rather than a registered `Library` so the identical
+        gate runs from a loaded library (node instantiation) and from a library
+        schema (library-load fitness preview), before any module is imported.
         """
-        node_declarations = library.get_node_metadata(node_type).declarations
         attributes: dict[str, Any] = {"id": node_type}
         node_stage = next(
             (
@@ -487,7 +499,7 @@ class NodeManager:
             library_stage = next(
                 (
                     declaration.stage
-                    for declaration in library.get_metadata().declarations
+                    for declaration in library_declarations
                     if isinstance(declaration, LifecycleStageLibraryProperty)
                 ),
                 None,
@@ -506,18 +518,41 @@ class NodeManager:
         return attributes
 
     @staticmethod
-    def _evaluate_instantiation_checkpoint(
-        *, node_type: str, specific_library_name: str | None
+    def _evaluate_node_instantiation_checkpoint(
+        *,
+        node_type: str,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
     ) -> CheckpointDenial | None:
-        """Ask any registered authorization hook whether this node type may be instantiated."""
-        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        """Ask any registered authorization hook whether this node type may be instantiated.
+
+        Single source for the `InstantiateNode` checkpoint, shared by the
+        instantiation path (CreateNode) and the library-load fitness preview so both
+        resolve the same action and facts from whatever declarations they hold.
+        """
         return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action="InstantiateNode",
                 subject_type="NodeType",
                 subject_id=node_type,
-                attributes=NodeManager._node_checkpoint_attributes(library, node_type),
+                attributes=NodeManager._node_checkpoint_attributes(
+                    node_type=node_type,
+                    node_declarations=node_declarations,
+                    library_declarations=library_declarations,
+                ),
             )
+        )
+
+    @staticmethod
+    def _evaluate_instantiation_checkpoint(
+        *, node_type: str, specific_library_name: str | None
+    ) -> CheckpointDenial | None:
+        """Ask any registered authorization hook whether this node type may be instantiated."""
+        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        return NodeManager._evaluate_node_instantiation_checkpoint(
+            node_type=node_type,
+            node_declarations=library.get_node_metadata(node_type).declarations,
+            library_declarations=library.get_metadata().declarations,
         )
 
     @staticmethod
@@ -534,6 +569,28 @@ class NodeManager:
         if denial is not None:
             message = denial.reason(separator="\n")
             raise _NodeInstantiationDeniedError(message)
+
+    @staticmethod
+    def evaluate_schema_node_instantiation_denials(schema: LibrarySchema) -> dict[str, CheckpointDenial]:
+        """Denials that would block instantiating each node type a library schema declares.
+
+        Lets library-load fitness preview the node-instantiation gate without
+        importing the library's modules: a denied node type becomes a library
+        problem now and, when later instantiated, an Error Proxy. Returns one entry
+        per denied node type (class name -> denial); permitted node types are
+        omitted. With no authorization hook installed every node is permitted, so
+        the result is empty.
+        """
+        denials: dict[str, CheckpointDenial] = {}
+        for node in schema.nodes:
+            denial = NodeManager._evaluate_node_instantiation_checkpoint(
+                node_type=node.class_name,
+                node_declarations=node.metadata.declarations,
+                library_declarations=schema.metadata.declarations,
+            )
+            if denial is not None:
+                denials[node.class_name] = denial
+        return denials
 
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
