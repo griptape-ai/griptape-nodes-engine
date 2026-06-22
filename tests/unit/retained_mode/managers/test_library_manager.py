@@ -2852,14 +2852,29 @@ class TestDownloadLibraryRegisterPersistence:
         from griptape_nodes.retained_mode.events.library_events import (
             DownloadLibraryRequest,
             DownloadLibraryResultSuccess,
+            RegisterLibraryFromFileResultSuccess,
         )
 
         library_manager = griptape_nodes.LibraryManager()
         config_mgr = griptape_nodes.ConfigManager()
 
-        with patch(
-            "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
-            side_effect=self._make_clone("explicit_lib"),
+        # download_library_request routes registration through GriptapeNodes.ahandle_request;
+        # the minimal fake manifest can't pass full LibrarySchema validation, so mock the
+        # registration step to return success so the test stays focused on config persistence.
+        mock_register_result = RegisterLibraryFromFileResultSuccess(
+            library_name="explicit_lib",
+            result_details=ResultDetails(message="OK", level=20),
+        )
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.clone_repository",
+                side_effect=self._make_clone("explicit_lib"),
+            ),
+            patch.object(
+                GriptapeNodes,
+                "ahandle_request",
+                new=AsyncMock(return_value=mock_register_result),
+            ),
         ):
             result = await library_manager.download_library_request(
                 DownloadLibraryRequest(
