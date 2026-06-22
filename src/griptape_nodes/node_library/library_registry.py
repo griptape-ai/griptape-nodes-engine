@@ -47,11 +47,7 @@ class LibraryNameAndVersion(NamedTuple):
 
 
 class Dependencies(BaseModel):
-    """Dependencies for the library.
-
-    This can include other libraries, as well as external packages that need to
-    be installed with pip.
-    """
+    """Pip packages that need to be installed for this library."""
 
     pip_dependencies: list[str] | None = None
     pip_install_flags: list[str] | None = None
