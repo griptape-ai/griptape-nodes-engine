@@ -556,22 +556,25 @@ def scan_sequences_from_filenames(
         if active.first > active.last:
             continue
 
-        consumed_filenames.update(fseq.frame(n) for n in present_numbers if active.first <= n <= active.last)
-        result_sequences.extend(
-            apply_policy(
-                PolicyContext(
-                    fseq=fseq,
-                    present_numbers=present_numbers,
-                    directory=directory,
-                    policy=options.policy,
-                    first=active.first,
-                    last=active.last,
-                    discovered_first=discovered_first,
-                    discovered_last=discovered_last,
-                    dropped_negative_number_count=dropped,
-                )
+        new_sequences = apply_policy(
+            PolicyContext(
+                fseq=fseq,
+                present_numbers=present_numbers,
+                directory=directory,
+                policy=options.policy,
+                first=active.first,
+                last=active.last,
+                discovered_first=discovered_first,
+                discovered_last=discovered_last,
+                dropped_negative_number_count=dropped,
             )
         )
+        # A single matching file is not a sequence — leave it as a flat entry.
+        kept = [s for s in new_sequences if len(s.present_numbers) > 1]
+        if kept:
+            kept_numbers = set().union(*(s.present_numbers for s in kept))
+            consumed_filenames.update(fseq.frame(n) for n in kept_numbers)
+            result_sequences.extend(kept)
 
     return result_sequences, consumed_filenames
 

@@ -549,6 +549,21 @@ class TestListDirectoryRequest:
         assert seq.first == 1
         assert seq.last == 3  # noqa: PLR2004
 
+    def test_single_sequence_file_stays_in_entries(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A lone file that looks like a sequence pattern must not be grouped into a Sequence."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("frame 1")
+        (temp_dir / "readme.txt").write_text("notes")
+
+        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=True)
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        assert result.sequences == []
+        entry_names = {e.name for e in result.entries}
+        assert "render.0001.exr" in entry_names
+        assert "readme.txt" in entry_names
+
     def test_list_directory_hidden_files(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Test listing directory with hidden files."""
         os_manager = griptape_nodes.OSManager()
