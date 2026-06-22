@@ -194,7 +194,11 @@ class ManifestManager:
                 for provider_id, provider in declaration.providers.items():
                     providers.setdefault(
                         provider_id,
-                        ModelProviderManifestEntry(provider_id=provider_id, display_name=provider.display_name),
+                        ModelProviderManifestEntry(
+                            provider_id=provider_id,
+                            display_name=provider.display_name,
+                            terms_url=provider.terms_url,
+                        ),
                     )
                     for model_id, model in provider.models.items():
                         models.setdefault(
@@ -204,6 +208,7 @@ class ManifestManager:
                                 provider_id=provider_id,
                                 display_name=model.display_name,
                                 family=model.family,
+                                terms_url=model.terms_url,
                             ),
                         )
         sorted_providers = [providers[key] for key in sorted(providers)]

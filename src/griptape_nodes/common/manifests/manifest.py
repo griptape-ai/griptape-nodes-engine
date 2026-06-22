@@ -72,10 +72,12 @@ class ModelProviderManifestEntry(BaseModel):
             ``ModelProvider::"<provider_id>"`` and declared by a node's
             ``provider_id``). Consumers must not parse or construct it.
         display_name: Human-readable provider name, when declared.
+        terms_url: Link to the provider's terms of service, when declared.
     """
 
     provider_id: str
     display_name: str | None = None
+    terms_url: str | None = None
 
 
 class ModelManifestEntry(BaseModel):
@@ -89,12 +91,14 @@ class ModelManifestEntry(BaseModel):
             ``ModelProviderManifestEntry.provider_id``.
         display_name: Human-readable model name, when declared.
         family: Optional grouping tag (e.g. "Claude 4"), when declared.
+        terms_url: Link to the model's terms of service, when declared.
     """
 
     model_id: str
     provider_id: str
     display_name: str | None = None
     family: str | None = None
+    terms_url: str | None = None
 
 
 class Manifest(BaseModel):

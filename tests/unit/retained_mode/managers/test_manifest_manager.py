@@ -241,11 +241,13 @@ class TestManifestManager:
                     providers={
                         "anthropic": ModelProvider(
                             display_name="Anthropic",
+                            terms_url="https://anthropic.com/terms",
                             models={
                                 "claude-opus-4": Model(
                                     display_name="Claude Opus 4",
                                     family="Claude 4",
                                     key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+                                    terms_url="https://anthropic.com/model-terms",
                                 )
                             },
                         )
@@ -271,8 +273,10 @@ class TestManifestManager:
         assert isinstance(result, GenerateManifestResultSuccess)
         assert [provider.provider_id for provider in result.manifest.model_providers] == ["anthropic"]
         assert result.manifest.model_providers[0].display_name == "Anthropic"
+        assert result.manifest.model_providers[0].terms_url == "https://anthropic.com/terms"
         assert [model.model_id for model in result.manifest.models] == ["claude-opus-4"]
         model = result.manifest.models[0]
         assert model.provider_id == "anthropic"
         assert model.display_name == "Claude Opus 4"
         assert model.family == "Claude 4"
+        assert model.terms_url == "https://anthropic.com/model-terms"
