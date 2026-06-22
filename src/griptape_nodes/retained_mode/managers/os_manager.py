@@ -1493,7 +1493,33 @@ class OSManager:
                 options = request.sequence_options or SequenceScanOptions()
                 bare_names = [e.name for e in entries if not e.is_dir]
                 seq_directory = str(relative_or_abs_path) if request.workspace_only else str(directory)
-                sequences, consumed = scan_sequences_from_filenames(bare_names, seq_directory, options)
+                try:
+                    sequences, consumed = scan_sequences_from_filenames(bare_names, seq_directory, options)
+                except InvalidSubsetBoundsError as e:
+                    return ListDirectoryResultFailure(
+                        failure_reason=SequenceScanFailureReason.INVALID_BOUNDS,
+                        result_details=str(e),
+                    )
+                except MissingItemError as e:
+                    gap_count = len(e.numbers)
+                    if gap_count == 1:
+                        summary = f"the sequence has a gap at item {e.numbers[0]}"
+                    else:
+                        sample = ", ".join(str(n) for n in e.numbers[:ABORTED_AT_GAP_PREVIEW_COUNT])
+                        suffix = (
+                            ""
+                            if gap_count <= ABORTED_AT_GAP_PREVIEW_COUNT
+                            else f" (+ {gap_count - ABORTED_AT_GAP_PREVIEW_COUNT} more)"
+                        )
+                        summary = f"the sequence has {gap_count} gaps: items {sample}{suffix}"
+                    return ListDirectoryResultFailure(
+                        failure_reason=SequenceScanFailureReason.ABORTED_AT_GAP,
+                        missing_item_numbers=e.numbers,
+                        result_details=(
+                            f"Attempted to list directory {str(directory)!r} with group_sequences=True, "
+                            f"policy=ABORT. Failed because {summary}."
+                        ),
+                    )
                 entries = [e for e in entries if e.name not in consumed]
 
             # Return appropriate path format based on mode
@@ -1546,9 +1572,15 @@ class OSManager:
                 is_workspace_path=result.is_workspace_path,
                 result_details=result.result_details,
             )
+        if isinstance(result, ListDirectoryResultFailure):
+            return ListDirectorySequencesResultFailure(
+                failure_reason=result.failure_reason,
+                missing_item_numbers=result.missing_item_numbers,
+                result_details=str(result.result_details),
+            )
         return ListDirectorySequencesResultFailure(
-            failure_reason=result.failure_reason,  # pyright: ignore[reportAttributeAccessIssue]
-            result_details=str(result.result_details),
+            failure_reason=FileIOFailureReason.UNKNOWN,
+            result_details="Unexpected result type from on_list_directory_request.",
         )
 
     def on_deduce_sequences_from_file_list_request(self, request: DeduceSequencesFromFileListRequest) -> ResultPayload:
@@ -1577,6 +1609,30 @@ class OSManager:
             return DeduceSequencesFromFileListResultSuccess(
                 sequences=all_sequences,
                 result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
+            )
+        except InvalidSubsetBoundsError as e:
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_BOUNDS,
+                result_details=str(e),
+            )
+        except MissingItemError as e:
+            gap_count = len(e.numbers)
+            if gap_count == 1:
+                summary = f"the sequence has a gap at item {e.numbers[0]}"
+            else:
+                sample = ", ".join(str(n) for n in e.numbers[:ABORTED_AT_GAP_PREVIEW_COUNT])
+                suffix = (
+                    ""
+                    if gap_count <= ABORTED_AT_GAP_PREVIEW_COUNT
+                    else f" (+ {gap_count - ABORTED_AT_GAP_PREVIEW_COUNT} more)"
+                )
+                summary = f"the sequence has {gap_count} gaps: items {sample}{suffix}"
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=SequenceScanFailureReason.ABORTED_AT_GAP,
+                missing_item_numbers=e.numbers,
+                result_details=(
+                    f"Attempted to deduce sequences from file list with policy=ABORT. Failed because {summary}."
+                ),
             )
         except Exception as e:
             msg = f"Attempted to deduce sequences from file list. Failed with {type(e).__name__}: {e}"

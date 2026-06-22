@@ -213,11 +213,17 @@ class ListDirectoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Directory listing failed.
 
     Attributes:
-        failure_reason: Classification of why the listing failed
+        failure_reason: Classification of why the listing failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
         result_details: Human-readable error message (inherited from ResultPayloadFailure)
     """
 
-    failure_reason: FileIOFailureReason
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -260,11 +266,17 @@ class ListDirectorySequencesResultFailure(WorkflowNotAlteredMixin, ResultPayload
     """Directory sequence listing failed.
 
     Attributes:
-        failure_reason: Classification of why the listing failed.
+        failure_reason: Classification of why the listing failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
         result_details: Human-readable error message (inherited from ResultPayloadFailure).
     """
 
-    failure_reason: FileIOFailureReason
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
 
 
 @dataclass
@@ -314,11 +326,17 @@ class DeduceSequencesFromFileListResultFailure(WorkflowNotAlteredMixin, ResultPa
     """Sequence deduction from file list failed.
 
     Attributes:
-        failure_reason: Classification of why the deduction failed.
+        failure_reason: Classification of why the deduction failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
         result_details: Human-readable error message (inherited from ResultPayloadFailure).
     """
 
-    failure_reason: FileIOFailureReason
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
 
 
 @dataclass
