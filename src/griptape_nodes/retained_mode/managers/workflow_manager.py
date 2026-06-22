@@ -5304,7 +5304,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=source_workflow.metadata.is_griptape_provided,
                 is_template=source_workflow.metadata.is_template,
-                is_private=source_workflow.metadata.is_private,
+                is_internal=source_workflow.metadata.is_internal,
                 creation_date=source_workflow.metadata.creation_date,
                 last_modified_date=datetime.now(tz=UTC),
                 branched_from=source_workflow.metadata.branched_from,  # Preserve original source chain
@@ -5404,7 +5404,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=branch_workflow.metadata.is_griptape_provided,
                 is_template=branch_workflow.metadata.is_template,
-                is_private=branch_workflow.metadata.is_private,
+                is_internal=branch_workflow.metadata.is_internal,
                 creation_date=branch_workflow.metadata.creation_date,
                 last_modified_date=source_workflow.metadata.last_modified_date,
                 branched_from=source_workflow_name,  # Preserve branch relationship

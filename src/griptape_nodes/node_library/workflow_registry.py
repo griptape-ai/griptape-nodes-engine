@@ -60,7 +60,7 @@ class WorkflowMetadata(BaseModel):
     is_template: bool | None = False
     # Hidden from the GUI workflow picker. Set on library-internal workflows (e.g. integration tests)
     # that ship inside a library directory but should never surface to users.
-    is_private: bool | None = False
+    is_internal: bool | None = False
     creation_date: datetime | None = Field(default=None)
     last_modified_date: datetime | None = Field(default=None)
     branched_from: str | None = Field(default=None)
