@@ -591,6 +591,31 @@ class ProjectManager:
                 result_details=f"Attempted to load project template from '{project_file_path}'. Failed because template is not usable (status: {validation.status})",
             )
 
+        # License-policy checkpoint: gate loading this project on its resolved
+        # identity. A denial blocks the load -- the project is not cached as usable
+        # and the failure carries the missing permissions -- so a project the policy
+        # forbids never enters the engine, whether reached by explicit load or
+        # directory discovery. Mirrors the activation gate, which resolves the same
+        # facts; the name is passed in because the project is not cached yet.
+        load_denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action="LoadProject",
+                subject_type="Project",
+                subject_id=project_id,
+                attributes=self._project_checkpoint_attributes(project_id, name=template.name),
+            )
+        )
+        if load_denial is not None:
+            reason = load_denial.reason()
+            validation.add_error(field_path="permission", message=reason)
+            self._registered_template_status[project_file_path] = validation
+            return LoadProjectTemplateResultFailure(
+                validation=validation,
+                result_details=(
+                    f"Attempted to load project template from '{project_file_path}'. Failed because: {reason}"
+                ),
+            )
+
         # Create consolidated ProjectInfo with fully populated macro caches
         project_info = ProjectInfo(
             project_id=project_id,
@@ -1375,14 +1400,22 @@ class ProjectManager:
             await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
         return None
 
-    def _project_checkpoint_attributes(self, project_id: ProjectID) -> dict[str, Any]:
-        """Resolve the facts a hook may gate project activation on: id and (best-effort) name."""
+    def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:
+        """The facts a hook may gate project load/activation on: id and (best-effort) name.
+
+        `name` is the resolved template name when the caller already holds it (load
+        time, before the project is cached); at activation it falls back to the
+        cached template so the load and activation gates resolve the same facts.
+        """
         attributes: dict[str, Any] = {"id": project_id}
-        info = self._successfully_loaded_project_templates.get(project_id)
-        name = getattr(getattr(info, "template", None), "name", None)
-        if name:
-            attributes["name"] = str(name)
+        resolved_name = name if name is not None else self._cached_project_name(project_id)
+        if resolved_name:
+            attributes["name"] = str(resolved_name)
         return attributes
+
+    def _cached_project_name(self, project_id: ProjectID) -> str | None:
+        info = self._successfully_loaded_project_templates.get(project_id)
+        return getattr(getattr(info, "template", None), "name", None)
 
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
