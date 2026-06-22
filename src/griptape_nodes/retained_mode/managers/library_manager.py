@@ -241,6 +241,7 @@ from griptape_nodes.utils.git_utils import (
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
+    get_git_info,
     get_git_remote,
     get_local_commit_sha,
     is_git_url,
@@ -1015,7 +1016,7 @@ class LibraryManager:
         result = GetLibraryMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
-    def load_library_metadata_from_file_request(  # noqa: PLR0911, PLR0915, C901
+    def load_library_metadata_from_file_request(  # noqa: PLR0911, C901
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
         """Load library metadata from a JSON file without loading the actual node modules.
@@ -1142,19 +1143,10 @@ class LibraryManager:
                 result_details=details,
             )
 
-        # Get git remote and ref if this library is in a git repository
+        # Use get_git_info (not get_git_remote + get_current_ref) to open the repo once
+        # instead of three times — this is called for every library on every metadata load.
         library_dir = json_path.parent.absolute()
-        try:
-            git_remote = get_git_remote(library_dir)
-        except GitRemoteError as e:
-            logger.debug("Failed to get git remote for %s: %s", library_dir, e)
-            git_remote = None
-
-        try:
-            git_ref = get_current_ref(library_dir)
-        except GitRefError as e:
-            logger.debug("Failed to get git ref for %s: %s", library_dir, e)
-            git_ref = None
+        git_remote, git_ref = get_git_info(library_dir)
 
         existing_info = self._library_file_path_to_info.get(file_path)
         enabled = existing_info.enabled if existing_info is not None else True

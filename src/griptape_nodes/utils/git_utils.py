@@ -246,6 +246,66 @@ def is_git_repository(path: Path) -> bool:
     return False
 
 
+def _find_tag_for_commit(repo: pygit2.Repository, head_commit: object) -> str | None:
+    for tag_name in repo.references:
+        if not tag_name.startswith("refs/tags/"):
+            continue
+        tag_ref = repo.references[tag_name]
+        tag_target = tag_ref.peel(pygit2.Commit).id if hasattr(tag_ref, "peel") else tag_ref.target
+        if tag_target == head_commit:
+            return tag_name.replace("refs/tags/", "")
+    return None
+
+
+def _get_ref_from_repo(repo: pygit2.Repository, library_path: Path) -> str | None:
+    # Called from get_git_info to reuse an already-open repo — do not open a new one here.
+    try:
+        if repo.head_is_unborn:
+            return None
+        if repo.head_is_detached:
+            tag = _find_tag_for_commit(repo, repo.head.target)
+            if tag is not None:
+                return tag
+            return str(repo.head.target)
+        shorthand = repo.head.shorthand
+    except pygit2.GitError as e:
+        logger.debug("Failed to get current git reference for %s: %s", library_path, e)
+        return None
+    else:
+        return shorthand
+
+
+def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
+    """Get both the git remote URL and current ref for a library in a single repo open.
+
+    Prefer this over calling get_git_remote() + get_current_ref() separately when both
+    values are needed: those functions each call is_git_repository(), discover_repository(),
+    and Repository() independently, which triples the I/O cost per library.
+
+    Returns:
+        tuple[str | None, str | None]: (git_remote, git_ref), each None if unavailable.
+    """
+    if not is_git_repository(library_path):
+        return None, None
+
+    try:
+        repo_path = pygit2.discover_repository(str(library_path))
+        if repo_path is None:
+            return None, None
+        repo = pygit2.Repository(repo_path)
+    except pygit2.GitError as e:
+        logger.debug("Failed to open git repository at %s: %s", library_path, e)
+        return None, None
+
+    git_remote: str | None = None
+    try:
+        git_remote = repo.remotes["origin"].url
+    except (KeyError, IndexError, pygit2.GitError) as e:
+        logger.debug("Failed to get git remote for %s: %s", library_path, e)
+
+    return git_remote, _get_ref_from_repo(repo, library_path)
+
+
 def get_git_remote(library_path: Path) -> str | None:
     """Get the git remote URL for a library directory.
 
