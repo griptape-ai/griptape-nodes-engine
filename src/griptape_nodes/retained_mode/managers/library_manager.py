@@ -211,6 +211,8 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
     OldXdgLocationWarningProblem,
+    RequestHandlerRegistrationProblem,
+    RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
 )
@@ -459,6 +461,18 @@ class LibraryManager:
         self._dynamic_to_stable_module_mapping = {}
         self._stable_to_dynamic_module_mapping = {}
         self._library_to_stable_modules = {}
+        # Two separate handler registration systems exist in this manager:
+        #
+        # 1. EventManager.assign_manager_to_request_type() — singleton (one handler per
+        #    type globally), populated via AdvancedNodeLibrary.get_request_handlers().
+        #    For library-owned services where exactly one library is the provider.
+        #
+        # 2. _library_event_handler_mappings / on_register_event_handler() — multi-provider
+        #    (many libraries can handle the same type, selected by name at dispatch).
+        #    Used by publishing libraries registering PublishWorkflowRequest handlers.
+        #    Libraries call on_register_event_handler() in after_library_nodes_loaded().
+        #
+        # The two systems coexist without conflict. TODO(GH#4785): https://github.com/griptape-ai/griptape-nodes-engine/issues/4785
         self._library_event_handler_mappings: dict[
             type[Payload], dict[str, LibraryManager.RegisteredEventHandler[Any]]
         ] = {}
@@ -4155,6 +4169,43 @@ class LibraryManager:
                 library_info.problems.append(AfterLibraryCallbackProblem(error_message=str(err)))
                 details = f"Failed to call after_library_nodes_loaded callback for library '{library_data.name}': {err}"
                 logger.error(details)
+
+        # Register request/response handlers declared by the library
+        if advanced_library:
+            try:
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4744 revisit per-entry error granularity
+                handlers = advanced_library.get_request_handlers()
+                if handlers and library_info.requires_worker:
+                    library_info.problems.append(
+                        RequestHandlersWorkerIncompatibleProblem(
+                            library_name=library_data.name,
+                            handler_count=len(handlers),
+                        )
+                    )
+                    logger.warning(
+                        "Library '%s' declares %d request handler(s) via get_request_handlers() but requires "
+                        "worker mode. Handlers are only registered in the worker process and cannot be reached "
+                        "from the orchestrator. See https://github.com/griptape-ai/griptape-nodes-engine/issues/4748",
+                        library_data.name,
+                        len(handlers),
+                    )
+                for request_type, handler in handlers:
+                    event_manager = GriptapeNodes.EventManager()
+                    event_manager.assign_manager_to_request_type(request_type, handler)
+                    library._registered_request_handler_types.append(request_type)
+                if handlers:
+                    logger.debug(
+                        "Registered %d request handler(s) for library '%s'",
+                        len(handlers),
+                        library_data.name,
+                    )
+            except Exception as err:
+                library_info.problems.append(RequestHandlerRegistrationProblem(error_message=str(err)))
+                logger.error(
+                    "Failed to register request handlers for library '%s': %s",
+                    library_data.name,
+                    err,
+                )
 
         # Update library_info fitness based on load successes and problem count
         if not any_nodes_loaded_successfully:
