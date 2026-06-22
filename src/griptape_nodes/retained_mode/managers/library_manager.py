@@ -43,6 +43,7 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io, resolve_workspace_path
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
+    LibraryDependencyDeclaration,
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
@@ -52,6 +53,7 @@ from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     Library,
     LibraryMetadata,
+    LibraryNameAndVersion,
     LibraryRegistry,
     LibrarySchema,
     NodeDefinition,
@@ -201,6 +203,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     EngineVersionErrorProblem,
     IncompatibleRequirementsProblem,
     InvalidVersionStringProblem,
+    LibraryDependencyProblem,
     LibraryJsonDecodeProblem,
     LibraryLoadExceptionProblem,
     LibraryNotFoundProblem,
@@ -219,8 +222,10 @@ from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULT
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
+    LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
     REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
+    LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
 )
@@ -767,6 +772,61 @@ class LibraryManager:
             if library_info.library_name == library_name:
                 return library_info
         return None
+
+    def resolve_transitive_library_deps(
+        self,
+        initial: list[LibraryNameAndVersion],
+    ) -> list[LibraryNameAndVersion]:
+        """Expand an initial library set by following each library's library_dependencies.
+
+        BFS walks declared library_dependencies until no new libraries are found.
+        Unregistered deps are logged and skipped. Cycle-safe via a visited set.
+        """
+        resolved: dict[str, LibraryNameAndVersion] = {ref.library_name: ref for ref in initial}
+        queue = list(initial)
+
+        while queue:
+            library_ref = queue.pop(0)
+            try:
+                library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
+            except KeyError:
+                logger.warning(
+                    "Library '%s' not found in registry during transitive dep resolution, skipping",
+                    library_ref.library_name,
+                )
+                continue
+
+            if not library_data.metadata:
+                continue
+            lib_deps = [
+                d for d in (library_data.metadata.declarations or []) if isinstance(d, LibraryDependencyDeclaration)
+            ]
+            if not lib_deps:
+                continue
+
+            for dep in lib_deps:
+                repo_name = extract_repo_name_from_url(dep.url)
+                dep_info = self.get_library_info_by_library_name(repo_name)
+                if dep_info is None:
+                    logger.warning(
+                        "Library dependency '%s' (resolved as '%s') is not registered; skipping",
+                        dep.url,
+                        repo_name,
+                    )
+                    continue
+                dep_library_name = dep_info.library_name
+                if dep_library_name is None:
+                    logger.warning("Library dependency '%s' has no library_name; skipping", dep.url)
+                    continue
+                if dep_library_name not in resolved:
+                    lib_nav = LibraryNameAndVersion(
+                        library_name=dep_library_name,
+                        library_version=dep_info.library_version or "unknown",
+                    )
+                    resolved[dep_library_name] = lib_nav
+                    queue.append(lib_nav)
+
+        return list(resolved.values())
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
         """Return a collated display string for a LibraryInfo's problems, or None if there are none."""
@@ -2043,7 +2103,92 @@ class LibraryManager:
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.EVALUATED
 
                 case LibraryManager.LibraryLifecycleState.EVALUATED:
-                    # EVALUATED → DEPENDENCIES_INSTALLED or WORKER_DELEGATED
+                    # EVALUATED -> DEPENDENCIES_INSTALLED or WORKER_DELEGATED
+                    # Resolve library_dependencies before node imports: each dependency library must be
+                    # fully loaded (including its venv added to sys.path via _add_library_paths_to_sys_path)
+                    # before this library's nodes are imported in the LOADED phase. Venvs are completely
+                    # isolated - dependency packages are not accessible to this library's pip install
+                    # subprocess.
+                    dep_metadata_result = self.load_library_metadata_from_file_request(
+                        LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
+                    )
+                    if not isinstance(dep_metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                        dep_schema = dep_metadata_result.library_schema
+                        griptape_library_deps = [
+                            d
+                            for d in (dep_schema.metadata.declarations or [])
+                            if isinstance(d, LibraryDependencyDeclaration)
+                        ] or None
+
+                        # Download and install any griptape libraries this library depends on.
+                        if griptape_library_deps:
+                            config_mgr = GriptapeNodes.ConfigManager()
+                            install_behavior = config_mgr.get_config_value(
+                                LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
+                                default=LibraryDependencyInstallBehavior.ALWAYS,
+                                cast_type=str,
+                            )
+                            for dep in griptape_library_deps:
+                                parsed = parse_git_url_with_ref(dep.url)
+                                normalized_url = normalize_github_url(parsed.url)
+                                repo_name = extract_repo_name_from_url(normalized_url)
+                                already_registered = any(
+                                    (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
+                                    and info.lifecycle_state != LibraryManager.LibraryLifecycleState.FAILURE
+                                    and info.fitness
+                                    not in (
+                                        LibraryManager.LibraryFitness.UNUSABLE,
+                                        LibraryManager.LibraryFitness.MISSING,
+                                    )
+                                    for info in self._library_file_path_to_info.values()
+                                )
+                                if already_registered:
+                                    logger.debug(
+                                        "Library dependency '%s' is already registered, skipping download",
+                                        dep.url,
+                                    )
+                                    continue
+                                if install_behavior == LibraryDependencyInstallBehavior.NEVER:
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message="Automatic dependency installation is disabled (library_dependency_install_behavior=never).",
+                                            )
+                                        )
+                                        library_info.fitness = LibraryManager.LibraryFitness.FLAWED
+                                    logger.debug(
+                                        "Skipping download of library dependency '%s' (library_dependency_install_behavior=never)",
+                                        dep.url,
+                                    )
+                                    continue
+                                dep_result = await self.download_library_request(
+                                    DownloadLibraryRequest(
+                                        git_url=normalized_url,
+                                        branch_tag_commit=parsed.ref,
+                                        fail_on_exists=False,
+                                        auto_register=True,
+                                    )
+                                )
+                                if isinstance(dep_result, DownloadLibraryResultFailure):
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message=str(dep_result.result_details),
+                                            )
+                                        )
+                                        library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+                                        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+                                        self._library_file_path_to_info[library_info.library_path] = library_info
+                                        details = f"Attempted to load Library '{library_info.library_name}'. Failed to load required library dependency '{dep.url}': {dep_result.result_details}"
+                                        return RegisterLibraryFromFileResultFailure(result_details=details)
+                                    logger.warning(
+                                        "Optional library dependency '%s' failed to load: %s",
+                                        dep.url,
+                                        dep_result.result_details,
+                                    )
+
                     # On the orchestrator (_is_worker is False), skip venv creation and pip
                     # install for libraries that require a dedicated worker. The lifecycle still
                     # completes through LOADED so the library is registered in LibraryRegistry
@@ -5590,13 +5735,10 @@ class LibraryManager:
             register_request = RegisterLibraryFromFileRequest(file_path=str(library_json_path))
             register_result = await GriptapeNodes.ahandle_request(register_request)
             if not register_result.succeeded():
-                logger.warning(
-                    "Library '%s' was downloaded but registration failed: %s",
-                    library_name,
-                    register_result.result_details,
+                return DownloadLibraryResultFailure(
+                    result_details=f"Library '{library_name}' downloaded but failed to register: {register_result.result_details}"
                 )
-            else:
-                logger.info("Library '%s' registered successfully", library_name)
+            logger.info("Library '%s' registered successfully", library_name)
 
         # Persist the path to libraries_to_register only when registering now. The
         # write lands in the GLOBAL user config (set_config_value -> user config),

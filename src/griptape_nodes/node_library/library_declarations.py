@@ -190,6 +190,18 @@ class ModelCatalogLibraryProperty(BaseModel):
     providers: dict[str, ModelProvider] = Field(default_factory=dict)
 
 
+class LibraryDependencyDeclaration(BaseModel):
+    """Declares another Griptape Node Library that this library depends on.
+
+    Placed in ``metadata.declarations`` so consumers can inspect inter-library
+    dependencies before committing to install anything.
+    """
+
+    type: Literal["library_dependency"] = "library_dependency"
+    url: str
+    required: bool = True
+
+
 # `Annotated[X | Y, Field(discriminator="type")]` is Pydantic v2's discriminated-union
 # idiom. Breakdown:
 #   - `X | Y` is the union of valid member classes.
@@ -201,7 +213,11 @@ class ModelCatalogLibraryProperty(BaseModel):
 #     ValidationError (strict validation).
 # This is the canonical Pydantic v2 way to round-trip "one of several shapes" through JSON.
 LibraryDeclaration = Annotated[
-    LifecycleStageLibraryProperty | WorkerModeCompatibility | SuggestedWorkerMode | ModelCatalogLibraryProperty,
+    LifecycleStageLibraryProperty
+    | WorkerModeCompatibility
+    | SuggestedWorkerMode
+    | ModelCatalogLibraryProperty
+    | LibraryDependencyDeclaration,
     Field(discriminator="type"),
 ]
 
