@@ -426,12 +426,17 @@ class LoadLibraryMetadataFromFileResultFailure(WorkflowNotAlteredMixin, ResultPa
                (MISSING, UNUSABLE, etc.).
         problems: List of specific problems encountered during loading
                  (file not found, JSON parse errors, validation failures, etc.).
+        library_version: Version of the library if it could be extracted from the raw JSON,
+                        None if it couldn't be determined (e.g. invalid JSON). Surfaced so
+                        status output can show the real version even when the schema failed to
+                        validate.
     """
 
     library_path: str
     library_name: str | None
     status: LibraryManager.LibraryFitness
     problems: list[LibraryProblem]
+    library_version: str | None = None
 
 
 @dataclass

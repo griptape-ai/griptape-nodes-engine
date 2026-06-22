@@ -133,6 +133,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
+    RefreshWorkflowRegistryRequest,
+    RefreshWorkflowRegistryResultFailure,
+    RefreshWorkflowRegistryResultSuccess,
     RegisterWorkflowRequest,
     RegisterWorkflowResultFailure,
     RegisterWorkflowResultSuccess,
@@ -201,6 +204,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -430,6 +434,10 @@ class WorkflowManager:
         event_manager.assign_manager_to_request_type(
             CompareWorkflowsRequest,
             self.on_compare_workflows_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            RefreshWorkflowRegistryRequest,
+            self.on_refresh_workflow_registry_request,
         )
         event_manager.assign_manager_to_request_type(
             RegisterWorkflowsFromConfigRequest,
@@ -2529,11 +2537,14 @@ class WorkflowManager:
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
+        all_libs = GriptapeNodes.LibraryManager().resolve_transitive_library_deps(direct_libs)
+
         return WorkflowMetadata(
             name=metadata_name,
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with=engine_version,
-            node_libraries_referenced=list(serialized_flow_commands.node_dependencies.libraries),
+            node_libraries_referenced=all_libs,
             node_types_used=serialized_flow_commands.node_types_used,
             workflows_referenced=workflows_referenced,
             creation_date=creation_date,
@@ -5667,6 +5678,13 @@ class WorkflowManager:
                     import_recorder.add_from_import(module.__name__, class_type.__name__)
 
         self._walk_object_tree(obj, collect_class_import)
+
+    async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
+        try:
+            await self.refresh_workflow_registry()
+        except Exception as e:
+            return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
+        return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
