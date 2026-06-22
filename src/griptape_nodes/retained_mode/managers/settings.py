@@ -287,6 +287,7 @@ class Settings(BaseModel):
     workspace_directory: str = Field(
         category=FILE_SYSTEM,
         default=str(Path().cwd() / "GriptapeNodes"),
+        description="Root directory for projects, workflows, and generated assets. Defaults to a GriptapeNodes folder under the current working directory. The other File System paths (libraries_directory, static_files_directory, sandbox_library_directory, synced_workflows_directory) are interpreted relative to this directory unless they are set to absolute paths.",
     )
     static_files_directory: str = Field(
         category=FILE_SYSTEM,
@@ -307,7 +308,11 @@ class Settings(BaseModel):
         category=APPLICATION_EVENTS,
         default_factory=AppEvents,
     )
-    log_level: LogLevel = Field(category=EXECUTION, default=LogLevel.INFO)
+    log_level: LogLevel = Field(
+        category=EXECUTION,
+        default=LogLevel.INFO,
+        description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,
         default=WorkflowExecutionMode.SEQUENTIAL,
@@ -355,7 +360,11 @@ class Settings(BaseModel):
         category=EXECUTION,
         default_factory=WorkerSettings,
     )
-    storage_backend: Literal["local", "gtc"] = Field(category=STORAGE, default="local")
+    storage_backend: Literal["local", "gtc"] = Field(
+        category=STORAGE,
+        default="local",
+        description="Backend used to persist workflow data and generated assets. 'local' stores files on the local filesystem under the workspace; 'gtc' uses Griptape Cloud storage.",
+    )
     auto_inject_workflow_metadata: bool = Field(
         category=STORAGE,
         default=True,
