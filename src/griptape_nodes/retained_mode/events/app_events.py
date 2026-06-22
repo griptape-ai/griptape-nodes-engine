@@ -257,6 +257,30 @@ class SecretChanged(AppPayload):
 
 @dataclass
 @PayloadRegistry.register
+class CurrentProjectChanged(AppPayload):
+    """Current project switched notification.
+
+    Emitted by the orchestrator's ProjectManager after a post-init project
+    activation succeeds. WorkerManager listens for this and fans out an
+    ActivateProjectRequest to every registered worker so they adopt the
+    orchestrator's project even on a "shallow" switch (same workspace and
+    library config) that would not otherwise restart them.
+
+    Boot-time activation is handled separately: a worker boots like any engine
+    and re-derives the orchestrator's project from shared on-disk config, so
+    ProjectManager only emits this after _initialization_complete.
+
+    Args:
+        project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
+            for system defaults). A worker boots like the orchestrator, so the
+            same registry id resolves in both processes.
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
 class GetEngineVersionRequest(RequestPayload):
     """Get the engine version information.
 

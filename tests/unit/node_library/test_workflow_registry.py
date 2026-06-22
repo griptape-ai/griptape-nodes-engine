@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.files.path_utils import derive_registry_key
-from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowRegistry
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
@@ -229,3 +229,63 @@ class TestWorkflowRegistryOperations:
             pytest.raises(ValueError, match="requires a file_path"),
         ):
             WorkflowRegistry.generate_new_workflow(registry_key="my_workflow", metadata=mock_metadata)
+
+
+class TestGetWorkflowMetadata:
+    """Test Workflow.get_workflow_metadata path optimization.
+
+    When synced_path and workspace_path are pre-computed by list_workflows(),
+    get_workflow_metadata must use them directly instead of calling is_synced,
+    which would instantiate ConfigManager per workflow.
+    """
+
+    def _make_workflow(self, file_path: str | None = "workflows/test.json") -> Workflow:
+        mock_metadata = MagicMock()
+        mock_metadata.model_dump.return_value = {"name": "test"}
+        return Workflow(
+            registry_key=WorkflowRegistry._RegistryKey(),
+            metadata=mock_metadata,
+            file_path=file_path,
+        )
+
+    def test_uses_precomputed_paths_instead_of_is_synced_property(self) -> None:
+        workflow = self._make_workflow()
+        synced_path = Path("/synced")
+        workspace_path = Path("/workspace")
+
+        with (
+            patch.object(
+                type(workflow),
+                "is_synced",
+                new_callable=lambda: property(
+                    lambda _: (_ for _ in ()).throw(
+                        AssertionError("is_synced must not be called when paths are pre-computed")
+                    )
+                ),
+            ),
+            patch(
+                "griptape_nodes.node_library.workflow_registry.resolve_workspace_path",
+                return_value=Path("/workspace/workflows/test.json"),
+            ),
+        ):
+            result = workflow.get_workflow_metadata(synced_path=synced_path, workspace_path=workspace_path)
+
+        assert "is_synced" in result
+
+    def test_falls_back_to_is_synced_when_paths_not_provided(self) -> None:
+        workflow = self._make_workflow()
+
+        with patch.object(type(workflow), "is_synced", new_callable=lambda: property(lambda _: True)):
+            result = workflow.get_workflow_metadata()
+
+        assert result["is_synced"] is True
+
+    def test_falls_back_to_is_synced_when_file_path_is_none(self) -> None:
+        workflow = self._make_workflow(file_path=None)
+        synced_path = Path("/synced")
+        workspace_path = Path("/workspace")
+
+        with patch.object(type(workflow), "is_synced", new_callable=lambda: property(lambda _: False)):
+            result = workflow.get_workflow_metadata(synced_path=synced_path, workspace_path=workspace_path)
+
+        assert result["is_synced"] is False
