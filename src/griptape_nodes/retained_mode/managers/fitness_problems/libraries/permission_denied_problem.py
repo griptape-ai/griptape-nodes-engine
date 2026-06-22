@@ -11,8 +11,7 @@ class PermissionDeniedProblem(LibraryProblem):
 
     `messages` is one human-readable sentence per missing permission, so the
     failure icon can list every reason the library is blocked rather than the
-    first. Capabilities/advice are carried verbatim from the authorization
-    denial.
+    first.
     """
 
     library_name: str
