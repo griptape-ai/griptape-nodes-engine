@@ -52,6 +52,7 @@ class HuggingFaceRepoFileParameter(HuggingFaceModelParameter):
             )
             return
 
+        self._refresh_downloading_model_ids()
         # Get all cached models
         all_choices = self.get_choices()
         if not all_choices:

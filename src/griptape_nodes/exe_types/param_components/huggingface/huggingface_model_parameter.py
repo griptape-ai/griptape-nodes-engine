@@ -4,7 +4,10 @@ from abc import ABC, abstractmethod
 
 from griptape_nodes.exe_types.core_types import NodeMessageResult, Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
+from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest, ListModelDownloadsResultSuccess
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload, OnClickMessageResultPayload
 from griptape_nodes.traits.options import Options
 
@@ -14,25 +17,39 @@ _NO_MODELS_PLACEHOLDER = "No models downloaded — visit Model Manager"
 
 
 class HuggingFaceModelParameter(ABC):
+    """Mixin component that adds an inline model-selection dropdown to a node.
+
+    The dropdown shows all models — downloaded and not yet downloaded — with
+    per-row icons and subtitles ("Downloaded", "Downloading…", "Not downloaded").
+    A secondary button appears below the dropdown when the selected model needs
+    attention (not downloaded, or currently downloading) and navigates the user
+    to the Model Manager.
+
+    Subclasses implement fetch_repo_revisions(), get_download_commands(), and
+    get_download_models() to define which models appear in the list.
+    """
+
     @classmethod
     def _repo_revision_to_key(cls, repo_revision: tuple[str, str]) -> str:
         return f"{repo_revision[0]} ({repo_revision[1]})"
 
     @classmethod
     def _key_to_repo_revision(cls, key: str) -> tuple[str, str]:
-        # Check if key has hash format using regex
+        # Keys with multiple cached revisions embed a 40-char hash: "owner/repo (deadbeef…)"
         hash_pattern = r"^(.+) \(([a-f0-9]{40})\)$"
         match = re.match(hash_pattern, key)
         if match:
             return match.group(1), match.group(2)
 
-        # Key is just the model name (no hash)
         return key, ""
 
     def __init__(self, node: BaseNode, parameter_name: str):
         self._node = node
         self._parameter_name = parameter_name
-        self._repo_revisions = []
+        self._repo_revisions: list[tuple[str, str]] = []
+        # Cached at refresh time only — never fetched from inside a callback to
+        # avoid nested GriptapeNodes.handle_request() calls that cause recursion.
+        self._downloading_model_ids: set[str] = set()
 
     @property
     def _download_param_name(self) -> str:
@@ -48,6 +65,9 @@ class HuggingFaceModelParameter(ABC):
             )
             return
 
+        # Snapshot active downloads before rebuilding choices so the dropdown
+        # subtitles and button visibility reflect the current download state.
+        self._refresh_downloading_model_ids()
         choices = self.get_choices()
 
         if choices:
@@ -73,6 +93,10 @@ class HuggingFaceModelParameter(ABC):
         display_choices = choices or [_NO_MODELS_PLACEHOLDER]
         default_value = choices[0] if choices else _NO_MODELS_PLACEHOLDER
 
+        # Main model dropdown. The refresh button (list-restart) sits inline
+        # inside the dropdown row via the Button trait alongside Options.
+        # The converter fires on every value change so the download button
+        # visibility updates immediately when the user picks a different model.
         parameter = ParameterString(
             name=self._parameter_name,
             default_value=default_value,
@@ -88,6 +112,7 @@ class HuggingFaceModelParameter(ABC):
             },
             tooltip=self._parameter_name,
             allowed_modes={ParameterMode.PROPERTY},
+            converters=[self._on_selection_changed],
             accept_any=False,
         )
 
@@ -96,25 +121,20 @@ class HuggingFaceModelParameter(ABC):
 
         self._apply_data_choices(parameter)
 
-        download_button = ParameterString(
+        # Download button starts hidden; _update_download_button_visibility()
+        # shows it when the selected model is not downloaded or is downloading.
+        download_button = ParameterButton(
             name=self._download_param_name,
-            default_value="",
-            display_name="",
-            traits={
-                Button(
-                    label="Open Model Manager to Download",
-                    icon="download",
-                    variant="secondary",
-                    full_width=True,
-                    on_click=self._on_download_click,
-                ),
-            },
+            label="Open Model Manager to Download",
+            icon="download",
+            variant="secondary",
+            full_width=True,
+            on_click=self._on_download_click,
             tooltip="Open Model Manager to download the selected model",
+            hide=True,
             allowed_modes={ParameterMode.PROPERTY},
-            accept_any=False,
         )
         self._node.add_parameter(download_button)
-        self._node.hide_parameter_by_name(self._download_param_name)
 
     def remove_input_parameters(self) -> None:
         self._node.remove_parameter_element_by_name(self._parameter_name)
@@ -123,6 +143,9 @@ class HuggingFaceModelParameter(ABC):
     def get_choices(self) -> list[str]:
         self._repo_revisions = self.fetch_repo_revisions()
 
+        # When the same repo has multiple cached revisions, show "repo (hash)"
+        # so the user can distinguish them. If there's only one, show just the
+        # repo ID for a cleaner display.
         model_counts: dict[str, int] = {}
         for repo_id, _ in self.list_repo_revisions():
             model_counts[repo_id] = model_counts.get(repo_id, 0) + 1
@@ -145,15 +168,31 @@ class HuggingFaceModelParameter(ABC):
         downloaded_repo_ids = {repo_id for repo_id, _ in self.list_repo_revisions()}
         return [m for m in self.get_download_models() if m not in downloaded_repo_ids]
 
+    def _refresh_downloading_model_ids(self) -> None:
+        # Only called from refresh_parameters() — never from inside a button
+        # callback — to avoid nested handle_request() calls that cause recursion.
+        result = GriptapeNodes.handle_request(ListModelDownloadsRequest())
+        if not isinstance(result, ListModelDownloadsResultSuccess):
+            self._downloading_model_ids = set()
+            return
+        self._downloading_model_ids = {s.model_id for s in result.downloads if s.status == "downloading"}
+
     def _build_data_choices(self) -> list[dict]:
         downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
         not_downloaded = set(self.get_not_downloaded_choices())
+        downloading = self._downloading_model_ids
         choices = self.get_choices()
 
         data = []
         for choice in choices:
             repo_id, _ = self._key_to_repo_revision(choice)
-            if repo_id in downloaded_keys or choice in downloaded_keys:
+            # Downloading check must come before downloaded: HuggingFace creates
+            # cache entries as soon as a download starts, so a partially-downloaded
+            # model appears in fetch_repo_revisions() and would otherwise show
+            # as "Downloaded" while still in progress.
+            if repo_id in downloading or choice in downloading:
+                data.append({"name": choice, "icon": "loader", "subtitle": "Downloading…"})
+            elif repo_id in downloaded_keys or choice in downloaded_keys:
                 data.append({"name": choice, "icon": "check-circle", "subtitle": "Downloaded"})
             elif choice in not_downloaded or repo_id in not_downloaded:
                 data.append({"name": choice, "icon": "download", "subtitle": "Not downloaded"})
@@ -174,12 +213,30 @@ class HuggingFaceModelParameter(ABC):
         repo_id, _ = self._key_to_repo_revision(choice)
         return repo_id
 
-    def _update_download_button_visibility(self) -> None:
+    def _on_selection_changed(self, value: object) -> object:
+        # Converter attached to the model parameter; fires on every value change
+        # so the download button shows/hides as the user switches models.
+        self._update_download_button_visibility(str(value))
+        return value
+
+    def _update_download_button_visibility(self, value: str | None = None) -> None:
         if self._node.get_parameter_by_name(self._download_param_name) is None:
             return
-        has_missing = bool(self.get_not_downloaded_choices())
-        if has_missing:
+        if value is None:
+            value = str(self._node.get_parameter_value(self._parameter_name) or "")
+
+        not_downloaded = set(self.get_not_downloaded_choices())
+        search_term = self._get_model_search_term(value)
+        is_downloading = search_term in self._downloading_model_ids
+        should_show = value in not_downloaded or is_downloading
+
+        if should_show:
             self._node.show_parameter_by_name(self._download_param_name)
+            # Update the button label to match context so the call-to-action
+            # makes sense whether the model is queued to download or already downloading.
+            download_param = self._node.get_parameter_by_name(self._download_param_name)
+            if isinstance(download_param, ParameterButton):
+                download_param.label = "View Download Progress" if is_downloading else "Open Model Manager to Download"
         else:
             self._node.hide_parameter_by_name(self._download_param_name)
 
@@ -224,12 +281,20 @@ class HuggingFaceModelParameter(ABC):
     ) -> NodeMessageResult | None:
         value = self._node.get_parameter_value(self._parameter_name)
         search_term = self._get_model_search_term(str(value))
+        # Use the cached downloading state — calling handle_request() here would
+        # create a nested request inside the button-click handler and cause recursion.
+        if search_term in self._downloading_model_ids:
+            # Already downloading: open the downloads view pre-filtered to this model.
+            href = f"#model-management?filter={search_term}"
+        else:
+            # Not yet downloaded: open model search so the user can start the download.
+            href = f"#model-management?search={search_term}"
         return NodeMessageResult(
             success=True,
             details="Opening Model Manager",
             response=OnClickMessageResultPayload(
                 button_details=button_details,
-                href=f"#model-management?search={search_term}",
+                href=href,
             ),
             altered_workflow_state=False,
         )
