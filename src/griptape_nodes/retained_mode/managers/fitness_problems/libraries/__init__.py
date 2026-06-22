@@ -15,6 +15,7 @@ from .engine_version_error_problem import EngineVersionErrorProblem
 from .incompatible_requirements_problem import IncompatibleRequirementsProblem
 from .insufficient_disk_space_problem import InsufficientDiskSpaceProblem
 from .invalid_version_string_problem import InvalidVersionStringProblem
+from .library_dependency_problem import LibraryDependencyProblem
 from .library_json_decode_problem import LibraryJsonDecodeProblem
 from .library_load_exception_problem import LibraryLoadExceptionProblem
 from .library_not_found_problem import LibraryNotFoundProblem
@@ -55,6 +56,7 @@ __all__ = [
     "IncompatibleRequirementsProblem",
     "InsufficientDiskSpaceProblem",
     "InvalidVersionStringProblem",
+    "LibraryDependencyProblem",
     "LibraryJsonDecodeProblem",
     "LibraryLoadExceptionProblem",
     "LibraryNotFoundProblem",
