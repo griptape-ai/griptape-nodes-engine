@@ -704,3 +704,42 @@ class TestAuthorizationCheckpointHooks:
         # Removing again is a no-op, not an error.
         manager.remove_authorization_hook(hook)
         assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is None
+
+    def test_reentrant_hook_is_bypassed_not_recursive(self) -> None:
+        manager = EventManager()
+        hook_calls: list[AuthorizationCheckpoint] = []
+
+        def hook(checkpoint: AuthorizationCheckpoint) -> None:
+            hook_calls.append(checkpoint)
+            # Re-enter the checkpoint from inside the hook. The nested call must
+            # bypass the chain rather than re-trigger this hook and recurse.
+            if len(hook_calls) == 1:
+                assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is None
+
+        manager.add_authorization_hook(hook)
+
+        assert manager.evaluate_authorization_checkpoint(self._checkpoint()) is None
+        # Hook ran only for the outer checkpoint; the re-entrant call skipped it.
+        assert len(hook_calls) == 1
+
+    def test_hook_error_does_not_wedge_later_evaluation(self) -> None:
+        manager = EventManager()
+        calls: list[int] = []
+
+        def hook(_checkpoint: AuthorizationCheckpoint) -> None:
+            calls.append(1)
+            if len(calls) == 1:
+                msg = "boom"
+                raise RuntimeError(msg)
+
+        manager.add_authorization_hook(hook)
+
+        # First evaluation is denied by the erroring hook...
+        first = manager.evaluate_authorization_checkpoint(self._checkpoint())
+        assert first is not None
+
+        # ...and the thread-local guard is cleared, so the next evaluation still
+        # runs the chain and allows.
+        second = manager.evaluate_authorization_checkpoint(self._checkpoint())
+        assert second is None
+        assert len(calls) == 2  # noqa: PLR2004

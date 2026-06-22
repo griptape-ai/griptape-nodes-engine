@@ -124,9 +124,10 @@ class EventManager:
         # handle_request runs on arbitrary threads, so guard the list and snapshot
         # it before iteration.
         self._pre_dispatch_hooks_lock = threading.Lock()
-        # Thread-local flag: if a hook re-enters handle_request on this thread, the
-        # chain is skipped so the hook can't keep re-triggering itself into
-        # unbounded recursion.
+        # Thread-local flags: if a hook re-enters an engine operation on this
+        # thread, the corresponding chain is skipped so the hook can't keep
+        # re-triggering itself into unbounded recursion. `active` guards the
+        # pre-dispatch chain; `authorizing` guards the authorization chain.
         self._hook_evaluation = threading.local()
         # Authorization checkpoint hooks. The engine calls
         # evaluate_authorization_checkpoint at privileged operations (library
@@ -364,27 +365,47 @@ class EventManager:
         allows (including when none are registered, so an engine with no policy
         installed runs unrestricted). Fails closed: a hook that raises is treated
         as a denial rather than letting the exception escape into the calling
-        operation, mirroring the pre-dispatch chain.
+        operation, mirroring the pre-dispatch chain. A re-entrant call on the same
+        thread (a hook that triggers another guarded operation) bypasses the chain
+        and allows, so the chain cannot recurse without bound.
         """
+        # Bypass the chain when a hook is already evaluating on this thread. A
+        # hook that re-enters an engine operation guarded by a checkpoint would
+        # otherwise re-trigger itself and recurse without bound. Mirrors the
+        # pre-dispatch chain's recursion guard; returning None allows the nested
+        # operation, which is already running inside an authorized outer one.
+        if getattr(self._hook_evaluation, "authorizing", False):
+            return None
+
         with self._authorization_hooks_lock:
             hooks = list(self._authorization_hooks)
-        for hook in hooks:
-            try:
-                denial = hook(checkpoint)
-            except Exception as exc:
-                logging.getLogger("griptape_nodes").exception(
-                    "Authorization hook '%s' raised on checkpoint '%s'; denying.",
-                    getattr(hook, "__name__", hook),
-                    checkpoint.action,
-                )
-                return CheckpointDenial(
-                    failures=(
-                        CheckpointFailure(detail=f"Authorization could not be evaluated: {type(exc).__name__}: {exc}"),
+
+        if not hooks:
+            return None
+
+        self._hook_evaluation.authorizing = True
+        try:
+            for hook in hooks:
+                try:
+                    denial = hook(checkpoint)
+                except Exception as exc:
+                    logging.getLogger("griptape_nodes").exception(
+                        "Authorization hook '%s' raised on checkpoint '%s'; denying.",
+                        getattr(hook, "__name__", hook),
+                        checkpoint.action,
                     )
-                )
-            if denial is not None:
-                return denial
-        return None
+                    return CheckpointDenial(
+                        failures=(
+                            CheckpointFailure(
+                                detail=f"Authorization could not be evaluated: {type(exc).__name__}: {exc}"
+                            ),
+                        )
+                    )
+                if denial is not None:
+                    return denial
+            return None
+        finally:
+            self._hook_evaluation.authorizing = False
 
     def assign_manager_to_request_type(
         self,
