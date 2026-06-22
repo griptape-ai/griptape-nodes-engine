@@ -84,7 +84,7 @@ class HuggingFaceModelParameter(ABC):
 
         self._node.set_parameter_value(self._parameter_name, default_value)
 
-        self._apply_data_choices(parameter)
+        self._apply_data_choices(parameter, display_choices)
         self._update_download_button_visibility()
 
     def add_input_parameters(self) -> None:
@@ -120,7 +120,7 @@ class HuggingFaceModelParameter(ABC):
         self._node.add_parameter(parameter)
         self._node.set_parameter_value(self._parameter_name, default_value, initial_setup=True)
 
-        self._apply_data_choices(parameter)
+        self._apply_data_choices(parameter, display_choices)
 
         # Download button starts hidden; _update_download_button_visibility()
         # shows it when the selected model is not downloaded or is downloading.
@@ -178,11 +178,10 @@ class HuggingFaceModelParameter(ABC):
             return
         self._downloading_model_ids = {s.model_id for s in result.downloads if s.status == "downloading"}
 
-    def _build_data_choices(self) -> list[dict]:
+    def _build_data_choices(self, choices: list[str]) -> list[dict]:
         downloaded_keys = {repo_id for repo_id, _ in self.list_repo_revisions()}
         not_downloaded = set(self.get_not_downloaded_choices())
         downloading = self._downloading_model_ids
-        choices = self.get_choices()
 
         data = []
         for choice in choices:
@@ -201,10 +200,10 @@ class HuggingFaceModelParameter(ABC):
                 data.append({"name": choice})
         return data
 
-    def _apply_data_choices(self, parameter: Parameter) -> None:
+    def _apply_data_choices(self, parameter: Parameter, choices: list[str]) -> None:
         parameter.update_ui_options(
             {
-                "data": self._build_data_choices(),
+                "data": self._build_data_choices(choices),
                 "dropdown_row_icons": True,
                 "dropdown_row_subtitles": True,
             }

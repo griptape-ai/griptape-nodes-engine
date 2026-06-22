@@ -92,7 +92,7 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         else:
             parameter.add_trait(Options(choices=filtered_choices))
 
-        self._apply_data_choices(parameter)
+        self._apply_data_choices(parameter, filtered_choices)
         self._update_download_button_visibility()
 
     def add_input_parameters(self) -> None:
