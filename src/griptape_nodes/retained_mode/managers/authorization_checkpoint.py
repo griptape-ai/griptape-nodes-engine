@@ -69,3 +69,13 @@ class CheckpointDenial:
     def messages(self) -> list[str]:
         """The per-failure detail sentences, for plain-text rendering."""
         return [failure.detail for failure in self.failures]
+
+    def reason(self, *, separator: str = "; ", default: str = "Denied by the license policy.") -> str:
+        """The denial as one display string: every failure detail joined, or `default`.
+
+        A hook returns `None` (not an empty denial) to allow, so empty `failures` is
+        a contract violation; `default` keeps the surfaced message coherent if one
+        slips through. Callers pass `separator` to match their surrounding format
+        (inline `"; "` in a failure result, a newline in a multi-line node error).
+        """
+        return separator.join(self.messages()) or default

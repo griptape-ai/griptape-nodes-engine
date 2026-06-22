@@ -532,7 +532,7 @@ class NodeManager:
             node_type=node_type, specific_library_name=specific_library_name
         )
         if denial is not None:
-            message = "\n".join(denial.messages()) or "Denied by the license policy."
+            message = denial.reason(separator="\n")
             raise _NodeInstantiationDeniedError(message)
 
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915

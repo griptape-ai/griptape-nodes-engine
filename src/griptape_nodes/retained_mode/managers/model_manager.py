@@ -767,7 +767,7 @@ class ModelManager:
             )
         )
         if denial is not None:
-            reason = "; ".join(denial.messages()) or "Denied by the license policy."
+            reason = denial.reason()
             return DeclareModelInvocationResultFailure(
                 result_details=f"Model invocation denied for '{request.model}'. {reason}"
             )
