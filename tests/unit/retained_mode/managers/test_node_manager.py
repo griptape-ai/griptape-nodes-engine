@@ -473,6 +473,7 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             library_declarations=[LifecycleStageLibraryProperty(stage=LifecycleStage.STABLE)],
         )
         attrs = NodeManager._node_checkpoint_attributes(library, _GateProbe.__name__)
+        assert attrs["id"] == _GateProbe.__name__
         assert attrs["lifecycle_stage"] == "LABS"
         assert attrs["executes_arbitrary_code"] is False
 

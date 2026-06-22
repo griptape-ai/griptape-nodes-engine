@@ -465,13 +465,14 @@ class NodeManager:
     def _node_checkpoint_attributes(library: Library, node_type: str) -> dict[str, Any]:
         """Resolve the facts a hook may gate node instantiation on.
 
+        `id` is the node type (so a policy can match a specific node type).
         `lifecycle_stage` is the node's effective stage: its own override when
         declared, else the library stage it inherits, omitted when neither states
         one. `executes_arbitrary_code` is the node's declared flag (absent means
         False). The engine supplies what it resolved; a policy reads what it wants.
         """
         node_declarations = library.get_node_metadata(node_type).declarations
-        attributes: dict[str, Any] = {}
+        attributes: dict[str, Any] = {"id": node_type}
         node_stage = next(
             (
                 declaration.stage
