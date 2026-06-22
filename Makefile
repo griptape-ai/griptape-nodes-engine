@@ -121,12 +121,16 @@ test/integration: ## Run integration tests.
 test/e2e: ## Run end-to-end tests (spawns subprocesses; slower than unit/integration).
 	@uv run pytest tests/e2e
 
+.PHONY: docs/settings-reference
+docs/settings-reference: ## Generate the configuration reference doc from the Settings model.
+	@uv run python scripts/generate_settings_reference.py
+
 .PHONY: docs
-docs: ## Build documentation.
-	@uv run python -m mkdocs build --clean --strict 
+docs: docs/settings-reference ## Build documentation.
+	@uv run python -m mkdocs build --clean --strict
 
 .PHONY: docs/serve
-docs/serve: ## Serve documentation.
+docs/serve: docs/settings-reference ## Serve documentation.
 	@uv run python -m mkdocs serve
 	
 .DEFAULT_GOAL := help
