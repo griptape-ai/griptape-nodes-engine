@@ -251,7 +251,10 @@ def _find_tag_for_commit(repo: pygit2.Repository, head_commit: object) -> str | 
         if not tag_name.startswith("refs/tags/"):
             continue
         tag_ref = repo.references[tag_name]
-        tag_target = tag_ref.peel(pygit2.Commit).id if hasattr(tag_ref, "peel") else tag_ref.target
+        if hasattr(tag_ref, "peel"):
+            tag_target = tag_ref.peel(pygit2.Commit).id
+        else:
+            tag_target = tag_ref.target
         if tag_target == head_commit:
             return tag_name.replace("refs/tags/", "")
     return None
