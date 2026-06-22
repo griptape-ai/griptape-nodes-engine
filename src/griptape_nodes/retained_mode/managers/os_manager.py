@@ -1492,7 +1492,8 @@ class OSManager:
             if request.group_sequences:
                 options = request.sequence_options or SequenceScanOptions()
                 bare_names = [e.name for e in entries if not e.is_dir]
-                sequences, consumed = scan_sequences_from_filenames(bare_names, str(directory), options)
+                seq_directory = str(relative_or_abs_path) if request.workspace_only else str(directory)
+                sequences, consumed = scan_sequences_from_filenames(bare_names, seq_directory, options)
                 entries = [e for e in entries if e.name not in consumed]
 
             # Return appropriate path format based on mode
