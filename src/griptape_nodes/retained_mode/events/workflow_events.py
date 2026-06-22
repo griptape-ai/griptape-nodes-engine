@@ -990,6 +990,30 @@ class SetWorkflowMetadataResultFailure(ResultPayloadFailure):
 
 @dataclass
 @PayloadRegistry.register
+class RefreshWorkflowRegistryRequest(RequestPayload):
+    """Rescan the workspace and config for workflow files and refresh the in-memory registry.
+
+    Use when: Workflows have been added or removed on disk outside of the engine,
+    forcing a re-discovery without changing the workspace.
+
+    Results: RefreshWorkflowRegistryResultSuccess | RefreshWorkflowRegistryResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class RefreshWorkflowRegistryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workflow registry refreshed successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class RefreshWorkflowRegistryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Workflow registry refresh failed."""
+
+
+@dataclass
+@PayloadRegistry.register
 class RegisterWorkflowsFromConfigRequest(RequestPayload):
     """Register workflows from configuration section.
 

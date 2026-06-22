@@ -133,6 +133,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
+    RefreshWorkflowRegistryRequest,
+    RefreshWorkflowRegistryResultFailure,
+    RefreshWorkflowRegistryResultSuccess,
     RegisterWorkflowRequest,
     RegisterWorkflowResultFailure,
     RegisterWorkflowResultSuccess,
@@ -429,6 +432,10 @@ class WorkflowManager:
         event_manager.assign_manager_to_request_type(
             CompareWorkflowsRequest,
             self.on_compare_workflows_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            RefreshWorkflowRegistryRequest,
+            self.on_refresh_workflow_registry_request,
         )
         event_manager.assign_manager_to_request_type(
             RegisterWorkflowsFromConfigRequest,
@@ -5615,6 +5622,13 @@ class WorkflowManager:
                     import_recorder.add_from_import(module.__name__, class_type.__name__)
 
         self._walk_object_tree(obj, collect_class_import)
+
+    async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
+        try:
+            await self.refresh_workflow_registry()
+        except Exception as e:
+            return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
+        return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
