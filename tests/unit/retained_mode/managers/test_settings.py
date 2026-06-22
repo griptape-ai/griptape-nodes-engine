@@ -7,7 +7,6 @@ from pydantic import ValidationError
 
 from griptape_nodes.retained_mode.managers.settings import (
     AppInitializationComplete,
-    LibraryDependencyInstallBehavior,
     LibraryDownload,
     LibraryRegistration,
     Settings,
@@ -99,24 +98,3 @@ class TestThreadStorageBackend:
 
     def test_default_is_local(self) -> None:
         assert Settings().thread_storage_backend == "local"
-
-
-class TestLibraryDependencyInstallBehavior:
-    """The library.dependency_install_behavior field coerces bad persisted values to ALWAYS.
-
-    A typo or stale value in a persisted config must not fail whole-config
-    validation and reset every other user setting to defaults.
-    """
-
-    @pytest.mark.parametrize("value", ["typo", "", None, 123, "ALWAYS"])
-    def test_unknown_values_coerce_to_always(self, value: object) -> None:
-        result = Settings.model_validate({"library": {"dependency_install_behavior": value}})
-        assert result.library.dependency_install_behavior == LibraryDependencyInstallBehavior.ALWAYS
-
-    @pytest.mark.parametrize("value", ["always", "never"])
-    def test_valid_string_values_are_preserved(self, value: str) -> None:
-        result = Settings.model_validate({"library": {"dependency_install_behavior": value}})
-        assert result.library.dependency_install_behavior == LibraryDependencyInstallBehavior(value)
-
-    def test_default_is_always(self) -> None:
-        assert Settings().library.dependency_install_behavior == LibraryDependencyInstallBehavior.ALWAYS

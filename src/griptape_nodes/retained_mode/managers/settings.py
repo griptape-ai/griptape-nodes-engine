@@ -21,7 +21,6 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
-LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 
 
 class Category(BaseModel):
@@ -46,7 +45,6 @@ PROJECTS = Category(name="Projects", description="Project template configuration
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
-LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -283,34 +281,6 @@ class AgentSettings(BaseModel):
     )
 
 
-class LibraryDependencyInstallBehavior(StrEnum):
-    ALWAYS = "always"
-    NEVER = "never"
-
-
-class LibrarySettings(BaseModel):
-    dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
-        default=LibraryDependencyInstallBehavior.ALWAYS,
-        description=(
-            "Controls automatic installation of library dependencies declared in library manifests. "
-            "'always' downloads and installs them on registration. "
-            "'never' skips installation and marks the library as degraded if required dependencies are missing."
-        ),
-    )
-
-    @field_validator("dependency_install_behavior", mode="before")
-    @classmethod
-    def validate_dependency_install_behavior(cls, v: Any) -> LibraryDependencyInstallBehavior:
-        if isinstance(v, str):
-            try:
-                return LibraryDependencyInstallBehavior(v.lower())
-            except ValueError:
-                return LibraryDependencyInstallBehavior.ALWAYS
-        elif isinstance(v, LibraryDependencyInstallBehavior):
-            return v
-        return LibraryDependencyInstallBehavior.ALWAYS
-
-
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
@@ -469,8 +439,4 @@ class Settings(BaseModel):
     agent: AgentSettings = Field(
         category=AGENT,
         default_factory=AgentSettings,
-    )
-    library: LibrarySettings = Field(
-        category=LIBRARIES,
-        default_factory=LibrarySettings,
     )
