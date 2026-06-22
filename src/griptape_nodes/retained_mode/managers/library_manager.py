@@ -1019,6 +1019,13 @@ class LibraryManager:
         # Try to extract library name from JSON for better error reporting
         library_name = library_json.get("name") if isinstance(library_json, dict) else None
 
+        # Extract the declared version straight from the raw JSON too, so a library whose
+        # schema fails to validate can still report its version in status output instead of
+        # showing '*UNKNOWN*'.
+        raw_metadata = library_json.get("metadata") if isinstance(library_json, dict) else None
+        raw_version = raw_metadata.get("library_version") if isinstance(raw_metadata, dict) else None
+        raw_library_version = raw_version if isinstance(raw_version, str) else None
+
         # Surface retired declaration types with migration guidance before the
         # discriminated-union validator rejects them with an opaque message.
         if isinstance(library_json, dict):
@@ -1034,6 +1041,7 @@ class LibraryManager:
                     library_name=library_name,
                     status=LibraryManager.LibraryFitness.UNUSABLE,
                     problems=retired_problems,
+                    library_version=raw_library_version,
                     result_details=details,
                 )
 
@@ -1055,6 +1063,7 @@ class LibraryManager:
                 library_name=library_name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=problems,
+                library_version=raw_library_version,
                 result_details=details,
             )
         except Exception as err:
@@ -1064,6 +1073,7 @@ class LibraryManager:
                 library_name=library_name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=[LibrarySchemaExceptionProblem(error_message=str(err))],
+                library_version=raw_library_version,
                 result_details=details,
             )
 
@@ -1076,6 +1086,7 @@ class LibraryManager:
                 library_name=library_data.name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=[InvalidVersionStringProblem(version_string=str(library_data.metadata.library_version))],
+                library_version=raw_library_version,
                 result_details=details,
             )
 
@@ -1093,6 +1104,7 @@ class LibraryManager:
                 library_name=library_data.name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=list(declaration_problems),
+                library_version=raw_library_version,
                 result_details=details,
             )
 
@@ -1871,6 +1883,8 @@ class LibraryManager:
                 )
 
                 if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                    if lib_info is not None:
+                        self._apply_metadata_load_failure(lib_info, metadata_result)
                     return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                 library_name = metadata_result.library_schema.name
@@ -1998,7 +2012,7 @@ class LibraryManager:
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                        self._library_file_path_to_info[library_info.library_path] = library_info
+                        self._apply_metadata_load_failure(library_info, metadata_result)
                         return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                     # Update library_info with metadata results
@@ -2018,7 +2032,7 @@ class LibraryManager:
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                        self._library_file_path_to_info[library_info.library_path] = library_info
+                        self._apply_metadata_load_failure(library_info, metadata_result)
                         return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                     evaluate_result = self.evaluate_library_fitness_request(
@@ -2089,7 +2103,7 @@ class LibraryManager:
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                            self._library_file_path_to_info[library_info.library_path] = library_info
+                            self._apply_metadata_load_failure(library_info, metadata_result)
                             return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                         library_data = metadata_result.library_schema
@@ -2187,7 +2201,7 @@ class LibraryManager:
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                            self._library_file_path_to_info[library_info.library_path] = library_info
+                            self._apply_metadata_load_failure(library_info, metadata_result)
                             return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                         # Add sandbox directory and venv site-packages to sys.path
@@ -2215,6 +2229,29 @@ class LibraryManager:
 
         # Success - progressed to LOADED state
         return None
+
+    def _apply_metadata_load_failure(
+        self,
+        library_info: LibraryManager.LibraryInfo,
+        metadata_result: LoadLibraryMetadataFromFileResultFailure,
+    ) -> None:
+        """Mirror a metadata-load failure onto a LibraryInfo so it surfaces in status output.
+
+        A failed metadata load (e.g. a top-level schema ValidationError) carries the real
+        fitness, library name, version, and problem list. Without copying those onto the
+        LibraryInfo, it stays at its pre-load defaults (NOT_EVALUATED fitness, no name, no
+        version, empty problems) and renders as '*UNKNOWN* v*UNKNOWN* (PENDING) - No problems
+        detected.' even though the load clearly failed. Record the failure's detail and mark
+        the library FAILURE.
+        """
+        if library_info.library_name is None and metadata_result.library_name is not None:
+            library_info.library_name = metadata_result.library_name
+        if library_info.library_version is None and metadata_result.library_version is not None:
+            library_info.library_version = metadata_result.library_version
+        library_info.fitness = metadata_result.status
+        library_info.problems.extend(metadata_result.problems)
+        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+        self._library_file_path_to_info[library_info.library_path] = library_info
 
     def _persist_library_settings(self, library_data: LibrarySchema) -> list[LibraryProblem]:
         """Inject a library's declared settings into the user config, returning any problems.
