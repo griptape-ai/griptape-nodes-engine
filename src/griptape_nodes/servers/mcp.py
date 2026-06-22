@@ -387,6 +387,16 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     on uvicorn's loop, concurrent with the engine instead of serialized onto it). run_coroutine_
     threadsafe schedules the work on the engine loop; wrap_future binds the cross-thread future
     back to the MCP server's loop so it can be awaited and timed out here without blocking.
+
+    The wrapped future is wrapped again in ``asyncio.shield`` so that a client-side timeout
+    (the ``wait_for`` below) or a sibling cancellation in a batch ``gather`` cancels only this
+    coroutine's wait, never the engine-side operation already running on the engine loop. A
+    bare ``wait_for(response_future)`` would, on timeout, cancel ``response_future`` and thereby
+    cancel the engine coroutine mid-flight; for a multi-node resolve that strands the node it
+    was executing in ``RESOLVING`` forever while the orphaned execution task keeps running
+    (griptape-nodes-engine#4883). The pre-in-process WebSocket transport let the engine run a
+    request to completion even after the client stopped waiting, and shielding preserves that
+    contract: the caller still sees a ``TimeoutError`` and can poll for state afterwards.
     """
     engine_loop = GriptapeNodes.EventManager().event_loop
     if engine_loop is None:
@@ -399,8 +409,8 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
         asyncio.run_coroutine_threadsafe(_handle_request_on_engine_loop(request_payload), engine_loop)
     )
     if timeout_ms:
-        return await asyncio.wait_for(response_future, timeout=timeout_ms / 1000)
-    return await response_future
+        return await asyncio.wait_for(asyncio.shield(response_future), timeout=timeout_ms / 1000)
+    return await asyncio.shield(response_future)
 
 
 async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:
