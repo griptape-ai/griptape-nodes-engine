@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.servers import mcp as mcp_module
 from griptape_nodes.servers.mcp import (
     _BATCH_MAX_AUTO_TIMEOUT_MS,
@@ -260,6 +261,12 @@ class TestDispatchToEngineShield:
     """
 
     @staticmethod
+    def _a_request_payload() -> RequestPayload:
+        # _handle_request_on_engine_loop is patched in these tests, so the payload is never
+        # dispatched; any real RequestPayload satisfies the signature.
+        return SUPPORTED_REQUEST_EVENTS["ListRegisteredLibrariesRequest"]()
+
+    @staticmethod
     def _run_engine_loop_in_thread() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
         engine_loop = asyncio.new_event_loop()
         thread = threading.Thread(target=engine_loop.run_forever, daemon=True, name="test-engine-loop")
@@ -295,7 +302,7 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module, "_handle_request_on_engine_loop", slow_engine_handler),
             ):
                 with pytest.raises(TimeoutError):
-                    await _dispatch_to_engine(object(), timeout_ms=50)
+                    await _dispatch_to_engine(self._a_request_payload(), timeout_ms=50)
 
                 # The shielded engine coroutine keeps running on its own loop after the
                 # wait times out; wait long enough for its 0.5s body to finish.
@@ -320,7 +327,7 @@ class TestDispatchToEngineShield:
                 patch.object(mcp_module.GriptapeNodes, "EventManager", return_value=event_manager),
                 patch.object(mcp_module, "_handle_request_on_engine_loop", fast_engine_handler),
             ):
-                result = await _dispatch_to_engine(object(), timeout_ms=5000)
+                result = await _dispatch_to_engine(self._a_request_payload(), timeout_ms=5000)
 
             assert result == {"ok": True}
         finally:
