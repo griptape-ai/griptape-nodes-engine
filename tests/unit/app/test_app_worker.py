@@ -67,6 +67,9 @@ def worker_manager() -> WorkerManager:
     # WorkerManager reads several float config values at construction; hand back
     # the declared default so asyncio.wait_for / time arithmetic gets a real number.
     gtn._config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+    # spawn_worker builds the child env from the orchestrator's pre-project environ;
+    # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
+    gtn.ProjectManager().get_pre_project_environ.return_value = {}
     wm = WorkerManager(griptape_nodes=gtn, event_manager=MagicMock())
     wm.attach_transport(
         ws_outgoing_queue=asyncio.Queue(),

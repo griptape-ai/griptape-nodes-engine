@@ -152,6 +152,7 @@ nav:
               - 4. Compare Prompts: ftue/03_compare_prompts/FTUE_03_compare_prompts.md
               - 5. Build a Photography Team: ftue/04_photography_team/FTUE_04_photography_team.md
       - Engine Configuration: configuration.md
+      - Configuration Reference: configuration_reference.md
       - Libraries: libraries.md
       - Command Line Interface: command_line_interface.md
       - Scripting: retained_mode.md

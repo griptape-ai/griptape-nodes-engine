@@ -21,6 +21,7 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 
 
 class Category(BaseModel):
@@ -45,6 +46,7 @@ PROJECTS = Category(name="Projects", description="Project template configuration
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
+LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -281,12 +283,41 @@ class AgentSettings(BaseModel):
     )
 
 
+class LibraryDependencyInstallBehavior(StrEnum):
+    ALWAYS = "always"
+    NEVER = "never"
+
+
+class LibrarySettings(BaseModel):
+    dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
+        default=LibraryDependencyInstallBehavior.ALWAYS,
+        description=(
+            "Controls automatic installation of library dependencies declared in library manifests. "
+            "'always' downloads and installs them on registration. "
+            "'never' skips installation and marks the library as degraded if required dependencies are missing."
+        ),
+    )
+
+    @field_validator("dependency_install_behavior", mode="before")
+    @classmethod
+    def validate_dependency_install_behavior(cls, v: Any) -> LibraryDependencyInstallBehavior:
+        if isinstance(v, str):
+            try:
+                return LibraryDependencyInstallBehavior(v.lower())
+            except ValueError:
+                return LibraryDependencyInstallBehavior.ALWAYS
+        elif isinstance(v, LibraryDependencyInstallBehavior):
+            return v
+        return LibraryDependencyInstallBehavior.ALWAYS
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     workspace_directory: str = Field(
         category=FILE_SYSTEM,
         default=str(Path().cwd() / "GriptapeNodes"),
+        description="Root directory for projects, workflows, and generated assets. Defaults to a GriptapeNodes folder under the current working directory. The other File System paths (libraries_directory, static_files_directory, sandbox_library_directory, synced_workflows_directory) are interpreted relative to this directory unless they are set to absolute paths.",
     )
     static_files_directory: str = Field(
         category=FILE_SYSTEM,
@@ -307,7 +338,11 @@ class Settings(BaseModel):
         category=APPLICATION_EVENTS,
         default_factory=AppEvents,
     )
-    log_level: LogLevel = Field(category=EXECUTION, default=LogLevel.INFO)
+    log_level: LogLevel = Field(
+        category=EXECUTION,
+        default=LogLevel.INFO,
+        description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,
         default=WorkflowExecutionMode.SEQUENTIAL,
@@ -355,7 +390,11 @@ class Settings(BaseModel):
         category=EXECUTION,
         default_factory=WorkerSettings,
     )
-    storage_backend: Literal["local", "gtc"] = Field(category=STORAGE, default="local")
+    storage_backend: Literal["local", "gtc"] = Field(
+        category=STORAGE,
+        default="local",
+        description="Backend used to persist workflow data and generated assets. 'local' stores files on the local filesystem under the workspace; 'gtc' uses Griptape Cloud storage.",
+    )
     auto_inject_workflow_metadata: bool = Field(
         category=STORAGE,
         default=True,
@@ -429,7 +468,7 @@ class Settings(BaseModel):
     project_file: str | None = Field(
         category=PROJECTS,
         default=None,
-        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default.",
+        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults.",
     )
     project_workspaces: dict[str, str] = Field(
         category=PROJECTS,
@@ -439,4 +478,8 @@ class Settings(BaseModel):
     agent: AgentSettings = Field(
         category=AGENT,
         default_factory=AgentSettings,
+    )
+    library: LibrarySettings = Field(
+        category=LIBRARIES,
+        default_factory=LibrarySettings,
     )

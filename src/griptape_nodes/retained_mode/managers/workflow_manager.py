@@ -204,6 +204,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -2536,11 +2537,14 @@ class WorkflowManager:
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
+        all_libs = GriptapeNodes.LibraryManager().resolve_transitive_library_deps(direct_libs)
+
         return WorkflowMetadata(
             name=metadata_name,
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with=engine_version,
-            node_libraries_referenced=list(serialized_flow_commands.node_dependencies.libraries),
+            node_libraries_referenced=all_libs,
             node_types_used=serialized_flow_commands.node_types_used,
             workflows_referenced=workflows_referenced,
             creation_date=creation_date,
@@ -5311,6 +5315,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=source_workflow.metadata.is_griptape_provided,
                 is_template=source_workflow.metadata.is_template,
+                is_internal=source_workflow.metadata.is_internal,
                 creation_date=source_workflow.metadata.creation_date,
                 last_modified_date=datetime.now(tz=UTC),
                 branched_from=source_workflow.metadata.branched_from,  # Preserve original source chain
@@ -5410,6 +5415,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=branch_workflow.metadata.is_griptape_provided,
                 is_template=branch_workflow.metadata.is_template,
+                is_internal=branch_workflow.metadata.is_internal,
                 creation_date=branch_workflow.metadata.creation_date,
                 last_modified_date=source_workflow.metadata.last_modified_date,
                 branched_from=source_workflow_name,  # Preserve branch relationship

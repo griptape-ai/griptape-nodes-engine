@@ -67,6 +67,25 @@ def _register_unsaved_workflow(key: str, name: str) -> None:
 class TestWorkflowManager:
     """Test WorkflowManager functionality including parameter serialization."""
 
+    def test_workflow_metadata_is_internal_round_trip(self) -> None:
+        """is_internal defaults to False, parses from headers, and survives model_dump()."""
+        base_kwargs = {
+            "name": "wf",
+            "schema_version": WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            "engine_version_created_with": "",
+            "node_libraries_referenced": [],
+        }
+
+        # Absent key -> default False (old headers without the line stay visible).
+        assert WorkflowMetadata(**base_kwargs).is_internal is False
+
+        # Parsed from a header table (mirrors the TOML [tool.griptape-nodes] path).
+        parsed = WorkflowMetadata.model_validate({**base_kwargs, "is_internal": True})
+        assert parsed.is_internal is True
+
+        # Survives model_dump() so it reaches list_workflows() -> the GUI.
+        assert parsed.model_dump()["is_internal"] is True
+
     def test_convert_parameter_to_minimal_dict_serializes_settable_correctly(self) -> None:
         """Test that _convert_parameter_to_minimal_dict properly serializes settable as boolean."""
         # Create a test parameter
@@ -2445,3 +2464,65 @@ class TestWorkflowsLoadingGate:
         result = asyncio.run(gated())
 
         assert isinstance(result, ListAllWorkflowsResultSuccess)
+
+
+class TestWorkflowMetadataTransitiveDeps:
+    """node_libraries_referenced in saved workflow metadata includes transitive library_dependencies."""
+
+    def test_transitive_library_dep_included_in_metadata(self, griptape_nodes: GriptapeNodes) -> None:
+        """When lib-a has library_dependency on lib-b, generated metadata lists both in node_libraries_referenced."""
+        from datetime import UTC, datetime
+
+        from griptape_nodes.node_library.library_declarations import LibraryDependencyDeclaration
+        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        lib_mgr = griptape_nodes.LibraryManager()
+
+        commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=NodeDependencies(),
+            node_types_used=set(),
+        )
+        commands.node_dependencies.libraries.add(LibraryNameAndVersion("lib-a", "1.0.0"))
+
+        dep_b = LibraryDependencyDeclaration(url="griptape-ai/lib-b@v1.0.0", required=True)
+        lib_a_mock = MagicMock()
+        lib_a_mock.get_library_data.return_value.metadata.declarations = [dep_b]
+        lib_b_mock = MagicMock()
+        lib_b_mock.get_library_data.return_value.metadata.declarations = []
+        info_b = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            library_path="/workspace/libraries/lib-b/griptape_nodes_library.json",
+            is_sandbox=False,
+            library_name="lib-b",
+            library_version="1.0.0",
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            problems=[],
+        )
+
+        with (
+            patch(
+                "griptape_nodes.node_library.library_registry.LibraryRegistry.get_library",
+                side_effect=lambda name: {"lib-a": lib_a_mock, "lib-b": lib_b_mock}[name],
+            ),
+            patch.object(
+                lib_mgr, "get_library_info_by_library_name", side_effect=lambda n: info_b if n == "lib-b" else None
+            ),
+        ):
+            metadata = workflow_manager._generate_workflow_metadata_from_commands(
+                serialized_flow_commands=commands,
+                file_name="test_workflow.py",
+                creation_date=datetime.now(UTC),
+            )
+
+        names = {lib.library_name for lib in metadata.node_libraries_referenced}
+        assert "lib-a" in names
+        assert "lib-b" in names, "Transitive library dependency must appear in node_libraries_referenced"
