@@ -108,6 +108,7 @@ class HuggingFaceModelParameter(ABC):
                     size="icon",
                     variant="secondary",
                     on_click=self._on_refresh_click,
+                    tooltip="Refresh model list",
                 ),
             },
             tooltip=self._parameter_name,
