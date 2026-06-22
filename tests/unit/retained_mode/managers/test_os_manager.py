@@ -495,6 +495,36 @@ class TestListDirectoryRequest:
         assert "render.0001.exr" in entry_names
         assert "render.0002.exr" in entry_names
 
+    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Files outside the active range remain in entries even when a Sequence is returned.
+
+        Regression: consumed_filenames was populated from the full bare_names set
+        (all frames in the FileSequence) rather than only the frames within
+        [active.first, active.last]. Files clipped by start_number/end_number were
+        silently dropped from entries despite never appearing in any Sequence.
+        """
+        os_manager = griptape_nodes.OSManager()
+        for i in range(1, 6):
+            (temp_dir / f"render.{i:04d}.exr").write_text(f"f{i}")
+
+        request = ListDirectoryRequest(
+            directory_path=str(temp_dir),
+            workspace_only=False,
+            group_sequences=True,
+            sequence_options=SequenceScanOptions(start_number=2),
+        )
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 2  # noqa: PLR2004
+        entry_names = {e.name for e in result.entries}
+        # Frame 1 is outside the active range — it must not be consumed
+        assert "render.0001.exr" in entry_names
+
     def test_list_directory_groups_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Test that numbered files are grouped into Sequence objects by default."""
         os_manager = griptape_nodes.OSManager()

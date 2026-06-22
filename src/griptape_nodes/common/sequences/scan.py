@@ -546,7 +546,7 @@ def scan_sequences_from_filenames(
         if options.padding is not None and fseq.zfill() != options.padding:
             continue
 
-        present_numbers, dropped, bare_names = _collect_present_numbers_from_fseq(fseq, directory)
+        present_numbers, dropped = _collect_present_numbers_from_fseq(fseq, directory)
         if not present_numbers:
             continue
 
@@ -556,7 +556,7 @@ def scan_sequences_from_filenames(
         if active.first > active.last:
             continue
 
-        consumed_filenames.update(bare_names)
+        consumed_filenames.update(fseq.frame(n) for n in present_numbers if active.first <= n <= active.last)
         result_sequences.extend(
             apply_policy(
                 PolicyContext(
@@ -579,20 +579,18 @@ def scan_sequences_from_filenames(
 def _collect_present_numbers_from_fseq(
     fseq: FileSequence,
     directory: str,
-) -> tuple[dict[int, str], int, set[str]]:
+) -> tuple[dict[int, str], int]:
     """Build a present-numbers map from a ``FileSequence``'s frame set.
 
-    Returns ``(present_numbers, dropped_negative_count, bare_filenames)``
+    Returns ``(present_numbers, dropped_negative_count)``
     where ``present_numbers`` maps frame number to the full path string
-    (using ``directory`` as the prefix) and ``bare_filenames`` is the set
-    of bare names that were consumed.
+    (using ``directory`` as the prefix).
     """
     present_numbers: dict[int, str] = {}
-    bare_filenames: set[str] = set()
     dropped = 0
     frame_set = fseq.frameSet()
     if frame_set is None:
-        return present_numbers, dropped, bare_filenames
+        return present_numbers, dropped
     for n in frame_set:
         if not isinstance(n, int):
             continue
@@ -602,8 +600,7 @@ def _collect_present_numbers_from_fseq(
         bare = fseq.frame(n)
         full = str(Path(directory) / bare) if directory else bare
         present_numbers[n] = full
-        bare_filenames.add(bare)
-    return present_numbers, dropped, bare_filenames
+    return present_numbers, dropped
 
 
 def _list_directory_filenames(directory: str) -> list[str]:
