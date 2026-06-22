@@ -3259,9 +3259,14 @@ class TestLibraryFitnessAuthorizationCheckpoint:
 
     @staticmethod
     def _schema(name: str, stage: "LifecycleStage | None" = None) -> "LibrarySchema":
-        from griptape_nodes.node_library.library_declarations import LifecycleStageLibraryProperty
+        from griptape_nodes.node_library.library_declarations import (
+            LibraryDeclaration,
+            LifecycleStageLibraryProperty,
+        )
 
-        declarations = [LifecycleStageLibraryProperty(stage=stage)] if stage is not None else []
+        declarations: list[LibraryDeclaration] = (
+            [LifecycleStageLibraryProperty(stage=stage)] if stage is not None else []
+        )
         return LibrarySchema(
             name=name,
             library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
