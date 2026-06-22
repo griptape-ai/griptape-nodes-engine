@@ -3,7 +3,6 @@ import os
 import platform
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 import pytest
@@ -11,9 +10,7 @@ import pytest
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-
-if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
 
 @pytest.mark.skipif(
@@ -878,7 +875,7 @@ class TestProvisioningPreviewMatchesActivation:
         *,
         expected_libraries: list,
         expected_engine_version: str,
-        pm: "ProjectManager | None" = None,
+        pm: ProjectManager | None = None,
     ) -> None:
         """Compute the preview and live-activation merged configs and assert they agree.
 
@@ -891,7 +888,6 @@ class TestProvisioningPreviewMatchesActivation:
         `pm` lets a caller pass a ProjectManager whose registry already models a parent chain (the
         branch-4 walk needs registered ancestors); when None a fresh, registry-less manager is built.
         """
-        from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
         from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value
 
@@ -1032,7 +1028,7 @@ class TestProvisioningPreviewMatchesActivation:
         """
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo, ProjectManager
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
         from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
         workspace_root = tmp_path / "workspace"
