@@ -1107,6 +1107,36 @@ class OSManager:
 
         return self._find_next_index_with_gap_fill(existing_indices)
 
+    def _seed_index_for_create_new(self, macro_path: MacroPath) -> MacroPath:
+        """Seed the next available index into a CREATE_NEW MacroPath's variables, if applicable.
+
+        Treats an unresolved required variable as an auto-index slot ONLY when it carries a
+        ``NumericPaddingFormat`` (e.g. ``{x:03}``). The padding spec is the macro author's
+        opt-in: it says "this slot is a zero-padded number," which is the only realistic
+        shape an auto-index takes. Without it, an unresolved ``{shot}`` could just as easily
+        be a variable the user forgot to bind, and silently filling it with 1, 2, 3, … would
+        write data the user never intended. Any non-matching shape (no unresolved var, no
+        padding, multiple unresolved) returns the input unchanged and lets the standard
+        resolve raise MISSING_REQUIRED_VARIABLES so the user sees a loud error.
+        """
+        try:
+            index_var = self._identify_index_variable(macro_path.parsed_macro, macro_path.variables)
+        except ValueError:
+            return macro_path
+
+        if index_var is None:
+            return macro_path
+
+        if not any(isinstance(spec, NumericPaddingFormat) for spec in index_var.format_specs):
+            return macro_path
+
+        next_index = self._scan_for_next_available_index(macro_path.parsed_macro, macro_path.variables, index_var)
+        if next_index is None:
+            return macro_path
+
+        seeded_vars = {**macro_path.variables, index_var.info.name: next_index}
+        return MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
+
     @staticmethod
     def platform() -> str:
         return sys.platform
@@ -1957,8 +1987,21 @@ class OSManager:
         # COMMON SETUP: Resolve path for all policies
         # Resolve MacroPath → str
         if isinstance(request.file_path, MacroPath):
-            resolution_result = self._resolve_macro_path_to_string(request.file_path)
+            macro_path_to_resolve = request.file_path
             path_display = f"{request.file_path.parsed_macro}"
+
+            # CREATE_NEW with a macro carrying an unresolved required `{x:NN}` slot is the
+            # macro author opting into "index every save from the first one." The standard
+            # resolve would fail with MISSING_REQUIRED. Pre-seed the unresolved variable by
+            # scanning the filesystem for the next free index so resolution succeeds and the
+            # first write lands as v001 (not v_). If the scan-then-write race loses (someone
+            # else takes our slot between scan and open) the existing convert-on-collision
+            # fallback in the CREATE_NEW match arm picks up — same code path as a fully-
+            # resolved MacroPath that collides.
+            if request.existing_file_policy == ExistingFilePolicy.CREATE_NEW:
+                macro_path_to_resolve = self._seed_index_for_create_new(request.file_path)
+
+            resolution_result = self._resolve_macro_path_to_string(macro_path_to_resolve)
             if isinstance(resolution_result, MacroResolutionFailure):
                 msg = f"Attempted to write to file '{path_display}'. Failed due to missing variables: {resolution_result.error_details}"
                 return WriteFileResultFailure(

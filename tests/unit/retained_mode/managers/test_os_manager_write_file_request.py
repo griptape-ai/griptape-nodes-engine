@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultSuccess,
+    MacroPath,
     SetCurrentProjectRequest,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
@@ -776,3 +777,122 @@ class TestExtensionCoercion:
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
+
+
+class TestCreateNewMacroIndexSeed:
+    """CREATE_NEW + MacroPath with a required `{x:NN}` slot auto-allocates the next index.
+
+    The padding spec (`NumericPaddingFormat`) is the macro author's opt-in: a single
+    unresolved required variable WITH padding is treated as an auto-index slot. Without
+    padding the request must fail loudly so callers can't silently auto-fill a variable
+    they forgot to bind (e.g. `{shot}` on its own).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_first_save_with_padded_required_index_writes_v001(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Bug #4875: the first save must produce v001, not fail with MISSING_REQUIRED."""
+        os_manager = griptape_nodes.OSManager()
+        macro_path = MacroPath(
+            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
+            variables={},
+        )
+
+        request = WriteFileRequest(
+            file_path=macro_path,
+            content=b"first",
+            existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+        )
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert (temp_dir / "render_v001.png").exists()
+
+    def test_subsequent_saves_increment_with_padding_preserved(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Three saves in a row must produce v001, v002, v003 — not v001, v001_1, v001_2."""
+        os_manager = griptape_nodes.OSManager()
+        macro_path = MacroPath(
+            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
+            variables={},
+        )
+
+        for _ in range(3):
+            result = os_manager.on_write_file_request(
+                WriteFileRequest(
+                    file_path=macro_path,
+                    content=b"x",
+                    existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+                )
+            )
+            assert isinstance(result, WriteFileResultSuccess)
+
+        assert (temp_dir / "render_v001.png").exists()
+        assert (temp_dir / "render_v002.png").exists()
+        assert (temp_dir / "render_v003.png").exists()
+
+    def test_gap_fill_picks_lowest_unused_padded_index(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """If v001 and v003 exist, next save must take v002 (gap-fill)."""
+        (temp_dir / "render_v001.png").write_bytes(b"existing")
+        (temp_dir / "render_v003.png").write_bytes(b"existing")
+
+        os_manager = griptape_nodes.OSManager()
+        macro_path = MacroPath(
+            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
+            variables={},
+        )
+
+        result = os_manager.on_write_file_request(
+            WriteFileRequest(
+                file_path=macro_path,
+                content=b"new",
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert (temp_dir / "render_v002.png").exists()
+        assert (temp_dir / "render_v002.png").read_bytes() == b"new"
+
+    def test_unbound_required_var_without_padding_fails_loudly(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Safety: an unbound `{shot}` must NOT silently auto-allocate as 1, 2, 3, ….
+
+        Without the `:NN` padding marker the macro author hasn't opted into auto-index
+        semantics. A single unresolved required var here is a configuration mistake (the
+        user forgot to wire `{shot}` to a node parameter), and we must surface it as
+        MISSING_MACRO_VARIABLES rather than write `1_render.png`, `2_render.png`, … to
+        disk under a name the user never intended.
+        """
+        os_manager = griptape_nodes.OSManager()
+        macro_path = MacroPath(
+            parsed_macro=ParsedMacro(f"{temp_dir}/{{shot}}_render.png"),
+            variables={},
+        )
+
+        result = os_manager.on_write_file_request(
+            WriteFileRequest(
+                file_path=macro_path,
+                content=b"should not write",
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+        # And nothing was silently auto-allocated.
+        assert not any(temp_dir.iterdir())

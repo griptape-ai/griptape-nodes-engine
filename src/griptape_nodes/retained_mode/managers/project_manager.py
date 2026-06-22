@@ -46,12 +46,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
-from griptape_nodes.retained_mode.events.os_events import (
-    GetNextVersionIndexRequest,
-    GetNextVersionIndexResultSuccess,
-    ReadFileRequest,
-    ReadFileResultSuccess,
-)
+from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -1146,17 +1141,6 @@ class ProjectManager:
         required_vars = {v.name for v in variable_infos if v.is_required}
         provided_vars = set(resolution_bag.keys())
         missing = required_vars - provided_vars
-
-        # _index is the only variable with auto-computed, filesystem-derived semantics:
-        # its value is determined by scanning for existing indexed files, not by user
-        # configuration. All other missing required variables are genuine errors (the user
-        # forgot to wire something up). So we seed _index here and only _index.
-        if missing == {"_index"}:
-            index_macro_path = MacroPath(request.parsed_macro, resolution_bag)
-            index_result = GriptapeNodes.handle_request(GetNextVersionIndexRequest(macro_path=index_macro_path))
-            if isinstance(index_result, GetNextVersionIndexResultSuccess):
-                resolution_bag["_index"] = index_result.index if index_result.index is not None else 1
-                missing.discard("_index")
 
         if missing:
             return GetPathForMacroResultFailure(

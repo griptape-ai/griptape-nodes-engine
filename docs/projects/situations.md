@@ -10,11 +10,11 @@ When a node needs to save a file, it names the situation it's in (for example, `
 
 ## Collision policies
 
-| Policy       | Behavior                                                                                                    |
-| ------------ | ----------------------------------------------------------------------------------------------------------- |
-| `create_new` | Increment a counter in the filename until a non-colliding name is found. Requires `{_index?}` in the macro. |
-| `overwrite`  | Replace the existing file without asking.                                                                   |
-| `fail`       | Stop and report an error if the file already exists.                                                        |
+| Policy       | Behavior                                                                                                                                                                                                                                                                                                                            |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_new` | Increment a counter in the filename until a non-colliding name is found. The macro can include `{_index?:NN}` (optional — absent on the first save, indexed on collision) or `{_index:NN}` (required — indexed from the first save). If neither is present, the system appends `_1`, `_2`, … to the resolved filename on collision. |
+| `overwrite`  | Replace the existing file without asking.                                                                                                                                                                                                                                                                                           |
+| `fail`       | Stop and report an error if the file already exists.                                                                                                                                                                                                                                                                                |
 
 The `create_dirs` field controls whether intermediate parent directories are created automatically (`true`, like `mkdir -p`) or whether a missing parent directory causes an error (`false`).
 
