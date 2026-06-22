@@ -56,6 +56,10 @@ from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
     LifecycleStageNodeProperty,
+    ModelCatalogLibraryProperty,
+    ModelProviderUsageNodeProperty,
+    ModelUsageNodeProperty,
+    resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
@@ -478,7 +482,10 @@ class NodeManager:
         `lifecycle_stage` is the node's effective stage: its own override when
         declared, else the library stage it inherits, omitted when neither states
         one. `executes_arbitrary_code` is the node's declared flag (absent means
-        False). The engine supplies what it resolved; a policy reads what it wants.
+        False). `model_ids` / `provider_ids` / `model_families` are the catalog
+        handles a node binds to (see `_node_model_checkpoint_facts`), present only
+        when the node declares model usage. The engine supplies what it resolved; a
+        policy reads what it wants.
 
         Takes declaration lists rather than a registered `Library` so the identical
         gate runs from a loaded library (node instantiation) and from a library
@@ -515,7 +522,74 @@ class NodeManager:
             None,
         )
         attributes["executes_arbitrary_code"] = bool(arbitrary.executes_arbitrary_python) if arbitrary else False
+        attributes.update(
+            NodeManager._node_model_checkpoint_facts(
+                node_declarations=node_declarations, library_declarations=library_declarations
+            )
+        )
         return attributes
+
+    @staticmethod
+    def _node_model_checkpoint_facts(
+        *,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
+    ) -> dict[str, Any]:
+        """The model facts a node binds to, resolved against the library's model catalog.
+
+        A node declares its models via `model_usage` (specific catalog ids) or
+        `model_provider_usage` (whole providers). Resolving those against the
+        library's `model_catalog` yields the concrete provider/model/family handles
+        a policy gates on, so a provider/family/model-specific node is denied by the
+        same `InstantiateNode` checkpoint that gates lifecycle and arbitrary code
+        (and its reasons join the same denial). Returns `model_ids`, `provider_ids`,
+        and `model_families`, each omitted when empty. A node that declares no model
+        usage contributes nothing, so non-model nodes skip catalog resolution.
+        """
+        declared_provider_ids = [
+            provider_id
+            for declaration in node_declarations
+            if isinstance(declaration, ModelProviderUsageNodeProperty)
+            for provider_id in declaration.provider_ids
+        ]
+        declared_model_ids = [
+            model_id
+            for declaration in node_declarations
+            if isinstance(declaration, ModelUsageNodeProperty)
+            for model_id in declaration.model_ids
+        ]
+        if not declared_provider_ids and not declared_model_ids:
+            return {}
+
+        # Directly declared handles match a policy even when the catalog is absent
+        # or a provider declares no concrete models. The catalog enriches them with
+        # the provider a `model_usage` id belongs to and each model's family.
+        model_ids = list(declared_model_ids)
+        provider_ids = list(declared_provider_ids)
+        families: list[str] = []
+        catalog = next(
+            (
+                declaration
+                for declaration in library_declarations
+                if isinstance(declaration, ModelCatalogLibraryProperty)
+            ),
+            None,
+        )
+        if catalog is not None:
+            for resolved in resolve_node_models(catalog, node_declarations):
+                model_ids.append(resolved.model_id)
+                provider_ids.append(resolved.provider_id)
+                if resolved.model.family:
+                    families.append(resolved.model.family)
+
+        facts: dict[str, Any] = {}
+        if model_ids:
+            facts["model_ids"] = list(dict.fromkeys(model_ids))
+        if provider_ids:
+            facts["provider_ids"] = list(dict.fromkeys(provider_ids))
+        if families:
+            facts["model_families"] = list(dict.fromkeys(families))
+        return facts
 
     @staticmethod
     def _evaluate_node_instantiation_checkpoint(

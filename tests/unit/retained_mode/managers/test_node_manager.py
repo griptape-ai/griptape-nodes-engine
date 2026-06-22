@@ -564,6 +564,108 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         # No hook -> nothing denied.
         assert NodeManager.evaluate_schema_node_instantiation_denials(self._schema_with_node()) == {}
 
+    def test_model_usage_resolves_catalog_facts(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ModelNode",
+            node_declarations=[ModelUsageNodeProperty(model_ids=["claude-opus-4"])],
+            library_declarations=[self._catalog()],
+        )
+        assert attrs["model_ids"] == ["claude-opus-4"]
+        assert attrs["provider_ids"] == ["anthropic"]
+        assert attrs["model_families"] == ["Claude 4"]
+
+    def test_provider_usage_resolves_provider_and_its_models(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelProviderUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ProviderNode",
+            node_declarations=[ModelProviderUsageNodeProperty(provider_ids=["anthropic"])],
+            library_declarations=[self._catalog()],
+        )
+        assert attrs["provider_ids"] == ["anthropic"]
+        # The whole provider expands to its catalog models.
+        assert attrs["model_ids"] == ["claude-opus-4", "claude-sonnet-4"]
+        assert attrs["model_families"] == ["Claude 4"]
+
+    def test_provider_usage_without_catalog_models_still_gates_provider(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelProviderUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        # No catalog declared: the directly declared provider id is still surfaced
+        # so a provider-level policy can match, but no model ids or families exist.
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ProviderNode",
+            node_declarations=[ModelProviderUsageNodeProperty(provider_ids=["ollama"])],
+            library_declarations=[],
+        )
+        assert attrs["provider_ids"] == ["ollama"]
+        assert "model_ids" not in attrs
+        assert "model_families" not in attrs
+
+    def test_non_model_node_has_no_model_facts(self) -> None:
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="Plain", node_declarations=[], library_declarations=[self._catalog()]
+        )
+        assert "model_ids" not in attrs
+        assert "provider_ids" not in attrs
+        assert "model_families" not in attrs
+
+    def test_model_facts_reach_the_checkpoint_and_can_be_denied(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        schema = self._schema_with_node(
+            node_declarations=[ModelUsageNodeProperty(model_ids=["claude-opus-4"])],
+            library_declarations=[self._catalog()],
+        )
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            seen["provider_ids"] = checkpoint.attributes.get("provider_ids")  # type: ignore[attr-defined]
+            seen["model_families"] = checkpoint.attributes.get("model_families")  # type: ignore[attr-defined]
+            if "anthropic" in (checkpoint.attributes.get("provider_ids") or []):  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic is not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        denials = NodeManager.evaluate_schema_node_instantiation_denials(schema)
+        assert seen == {"provider_ids": ["anthropic"], "model_families": ["Claude 4"]}
+        assert set(denials) == {_GateProbe.__name__}
+        assert denials[_GateProbe.__name__].messages() == ["Anthropic is not enabled."]
+
+    @staticmethod
+    def _catalog():  # noqa: ANN205
+        from griptape_nodes.node_library.library_declarations import (
+            KeySupport,
+            Model,
+            ModelCatalogLibraryProperty,
+            ModelProvider,
+        )
+
+        return ModelCatalogLibraryProperty(
+            providers={
+                "anthropic": ModelProvider(
+                    display_name="Anthropic",
+                    models={
+                        "claude-opus-4": Model(
+                            display_name="Opus", family="Claude 4", key_support=KeySupport.REQUIRES_CUSTOMER_KEY
+                        ),
+                        "claude-sonnet-4": Model(
+                            display_name="Sonnet", family="Claude 4", key_support=KeySupport.REQUIRES_CUSTOMER_KEY
+                        ),
+                    },
+                )
+            }
+        )
+
     @staticmethod
     def _schema_with_node(node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN205
         from griptape_nodes.node_library.library_registry import (
