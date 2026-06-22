@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -533,6 +534,149 @@ class TestResetWorkers:
         unsubscribed = {call.args[0] for call in worker_manager._tx.unsubscribe_from_topic.call_args_list}  # type: ignore[union-attr]
         assert f"sessions/{_SESSION}/workers/eng-1/response" in unsubscribed
         assert f"sessions/{_SESSION}/workers/eng-2/response" in unsubscribed
+
+
+class TestTerminateViaSpawnLoop:
+    """Cross-loop worker termination.
+
+    The subprocess binds to its spawning loop, but eviction can run on another
+    loop. _terminate_via_spawn_loop must hop termination back to the spawning loop
+    so proc.wait() never crosses loops, and fall back to a synchronous signal when
+    the spawning loop is gone (shutdown).
+    """
+
+    @pytest.mark.asyncio
+    async def test_hops_termination_to_spawn_loop(self, worker_manager: WorkerManager) -> None:
+        """Termination is hopped onto the spawn loop when it differs from the running loop.
+
+        Avoids awaiting proc.wait() across loops, which would raise.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            # Runs on the test's loop, which is NOT spawn_loop: the hop must engage.
+            await worker_manager.reset_workers()
+
+            proc.terminate.assert_called_once()
+            assert worker_manager._managed_worker_processes == {}
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_sync_signal_when_spawn_loop_closed(self, worker_manager: WorkerManager) -> None:
+        """A closed spawn loop forces the synchronous-signal fallback.
+
+        run_coroutine_threadsafe raises on a closed loop; the dispatcher must
+        swallow it and signal the worker synchronously.
+        """
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        worker_manager._spawn_loop = closed_loop
+        proc = _managed_proc_mock()
+        worker_manager._managed_worker_processes["Lib A"] = proc
+
+        await worker_manager.reset_workers()
+
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert worker_manager._managed_worker_processes == {}
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_sync_signal_when_hop_times_out(self, worker_manager: WorkerManager) -> None:
+        """A hop that is scheduled but never completes triggers the sync fallback.
+
+        Simulates the spawning loop closing after the hop is scheduled but before
+        it drains: the hopped termination never finishes, so the evicting loop must
+        stop waiting at DEFAULT_TERMINATE_HOP_TIMEOUT_S and signal the worker.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+
+            async def _never_exits() -> None:
+                await asyncio.Event().wait()
+
+            proc.wait = _never_exits  # the hopped termination hangs forever
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            with patch.object(WorkerManager, "DEFAULT_TERMINATE_HOP_TIMEOUT_S", 0.1):
+                await worker_manager.reset_workers()
+
+            # Fallback signalled the worker without awaiting the stuck exit Future.
+            proc.kill.assert_called_once()
+            assert worker_manager._managed_worker_processes == {}
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_signals_worker_then_propagates(self, worker_manager: WorkerManager) -> None:
+        """A cancelled hop must signal the worker AND re-raise the cancellation.
+
+        Both hop callers run under TaskGroup-driven teardown; swallowing the
+        CancelledError would let cleanup resume in a context that was meant to
+        stop. The fallback kill still fires, but the cancel must propagate.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+
+            async def _never_exits() -> None:
+                await asyncio.Event().wait()
+
+            proc.wait = _never_exits  # keep the hop pending so we can cancel it
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            task = asyncio.ensure_future(worker_manager._terminate_via_spawn_loop("Lib A", proc))
+            # Let the hop reach the await before cancelling.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            proc.kill.assert_called_once()
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
 
 
 class TestSetSessionReady:

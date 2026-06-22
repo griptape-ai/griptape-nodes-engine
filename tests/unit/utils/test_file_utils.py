@@ -241,8 +241,8 @@ class TestFindAllFilesInDirectory:
         assert set(result) == {file1, file2}
 
 
-class TestFindFilesRecursive:
-    """Test find_files_recursive function for deterministic ordering."""
+class TestAfindFilesRecursive:
+    """Test find_files_recursive: the async, depth-bounded finder."""
 
     @pytest.fixture
     def temp_dir(self) -> Generator[Path, None, None]:
@@ -250,33 +250,36 @@ class TestFindFilesRecursive:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
-    def test_find_files_recursive_when_directory_does_not_exist(self) -> None:
-        """Test that empty list is returned when directory doesn't exist."""
-        non_existent = Path("/non/existent/directory")
-        result = find_files_recursive(non_existent, "*.json")
+    @pytest.mark.asyncio
+    async def test_when_directory_does_not_exist(self) -> None:
+        """Empty list is returned when directory doesn't exist."""
+        result = await find_files_recursive(Path("/non/existent/directory"), "*.json")
 
         assert result == []
 
-    def test_find_files_recursive_when_path_is_not_directory(self, temp_dir: Path) -> None:
-        """Test that empty list is returned when path is a file, not a directory."""
+    @pytest.mark.asyncio
+    async def test_when_path_is_not_directory(self, temp_dir: Path) -> None:
+        """Empty list is returned when path is a file, not a directory."""
         test_file = temp_dir / "test.txt"
         test_file.write_text("content")
 
-        result = find_files_recursive(test_file, "*.json")
+        result = await find_files_recursive(test_file, "*.json")
 
         assert result == []
 
-    def test_find_files_recursive_when_no_files_match_pattern(self, temp_dir: Path) -> None:
-        """Test that empty list is returned when no files match the pattern."""
+    @pytest.mark.asyncio
+    async def test_when_no_files_match_pattern(self, temp_dir: Path) -> None:
+        """Empty list is returned when no files match the pattern."""
         (temp_dir / "test.txt").write_text("content")
         (temp_dir / "another.py").write_text("content")
 
-        result = find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == []
 
-    def test_find_files_recursive_returns_sorted_results(self, temp_dir: Path) -> None:
-        """Test that results are returned in sorted order."""
+    @pytest.mark.asyncio
+    async def test_returns_sorted_results(self, temp_dir: Path) -> None:
+        """Results are returned in sorted order."""
         file3 = temp_dir / "zebra.json"
         file1 = temp_dir / "apple.json"
         file2 = temp_dir / "banana.json"
@@ -284,12 +287,13 @@ class TestFindFilesRecursive:
         file1.write_text("{}")
         file2.write_text("{}")
 
-        result = find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [file1, file2, file3]
 
-    def test_find_files_recursive_returns_sorted_results_with_subdirectories(self, temp_dir: Path) -> None:
-        """Test that results from subdirectories are also sorted."""
+    @pytest.mark.asyncio
+    async def test_returns_sorted_results_with_subdirectories(self, temp_dir: Path) -> None:
+        """Results from subdirectories are also sorted."""
         subdir_z = temp_dir / "z_dir"
         subdir_a = temp_dir / "a_dir"
         subdir_z.mkdir()
@@ -302,24 +306,13 @@ class TestFindFilesRecursive:
         file2.write_text("{}")
         file3.write_text("{}")
 
-        result = find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
-        # Should be sorted: a_dir/config.json, root.json, z_dir/config.json
         assert result == [file1, file3, file2]
 
-    def test_find_files_recursive_deterministic_across_multiple_calls(self, temp_dir: Path) -> None:
-        """Test that multiple calls return the same order."""
-        for i in [5, 2, 8, 1, 9, 3]:
-            (temp_dir / f"file{i}.json").write_text("{}")
-
-        result1 = find_files_recursive(temp_dir, "*.json")
-        result2 = find_files_recursive(temp_dir, "*.json")
-        result3 = find_files_recursive(temp_dir, "*.json")
-
-        assert result1 == result2 == result3
-
-    def test_find_files_recursive_skips_hidden_directories_by_default(self, temp_dir: Path) -> None:
-        """Test that hidden directories are skipped by default."""
+    @pytest.mark.asyncio
+    async def test_skips_hidden_directories_by_default(self, temp_dir: Path) -> None:
+        """Hidden directories are skipped by default."""
         hidden_dir = temp_dir / ".hidden"
         hidden_dir.mkdir()
         hidden_file = hidden_dir / "config.json"
@@ -327,13 +320,13 @@ class TestFindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = find_files_recursive(temp_dir, "*.json")
+        result = await find_files_recursive(temp_dir, "*.json")
 
         assert result == [visible_file]
-        assert hidden_file not in result
 
-    def test_find_files_recursive_includes_hidden_directories_when_requested(self, temp_dir: Path) -> None:
-        """Test that hidden directories are included when skip_hidden=False."""
+    @pytest.mark.asyncio
+    async def test_includes_hidden_directories_when_requested(self, temp_dir: Path) -> None:
+        """Hidden directories are included when skip_hidden=False."""
         hidden_dir = temp_dir / ".hidden"
         hidden_dir.mkdir()
         hidden_file = hidden_dir / "config.json"
@@ -341,42 +334,60 @@ class TestFindFilesRecursive:
         hidden_file.write_text("{}")
         visible_file.write_text("{}")
 
-        result = find_files_recursive(temp_dir, "*.json", skip_hidden=False)
+        result = await find_files_recursive(temp_dir, "*.json", skip_hidden=False)
 
-        assert len(result) == 2  # noqa: PLR2004
         assert set(result) == {hidden_file, visible_file}
 
-    def test_find_files_recursive_matches_glob_pattern(self, temp_dir: Path) -> None:
-        """Test that function matches files using glob patterns."""
+    @pytest.mark.asyncio
+    async def test_matches_glob_pattern(self, temp_dir: Path) -> None:
+        """Files are matched using glob patterns."""
         file1 = temp_dir / "my_library.json"
         file2 = temp_dir / "your_library.json"
-        file3 = temp_dir / "config.json"
+        (temp_dir / "config.json").write_text("{}")
         file1.write_text("{}")
         file2.write_text("{}")
-        file3.write_text("{}")
 
-        result = find_files_recursive(temp_dir, "*library*.json")
+        result = await find_files_recursive(temp_dir, "*library*.json")
 
         assert result == sorted([file1, file2])
 
-    def test_find_files_recursive_nested_directories_sorted(self, temp_dir: Path) -> None:
-        """Test that deeply nested directory structures are sorted."""
-        subdir1 = temp_dir / "b_dir" / "nested"
-        subdir2 = temp_dir / "a_dir" / "nested"
-        subdir1.mkdir(parents=True)
-        subdir2.mkdir(parents=True)
+    @pytest.mark.asyncio
+    async def test_depth_zero_setting_scans_only_top_level(self, temp_dir: Path) -> None:
+        """A discovery_max_depth setting of 0 returns only matches directly in the directory."""
+        root_file = temp_dir / "root.json"
+        nested_file = temp_dir / "sub" / "nested.json"
+        nested_file.parent.mkdir()
+        root_file.write_text("{}")
+        nested_file.write_text("{}")
 
-        file1 = subdir2 / "config.json"
-        file2 = subdir1 / "config.json"
-        file3 = temp_dir / "root.json"
-        file1.write_text("{}")
-        file2.write_text("{}")
-        file3.write_text("{}")
+        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=0):
+            result = await find_files_recursive(temp_dir, "*.json")
 
-        result = find_files_recursive(temp_dir, "*.json")
+        assert result == [root_file]
 
-        # Should be sorted: a_dir/nested/config.json, b_dir/nested/config.json, root.json
-        assert result == [file1, file2, file3]
+    @pytest.mark.asyncio
+    async def test_depth_setting_excludes_files_below_cap(self, temp_dir: Path) -> None:
+        """Files at the depth cap are included; deeper files are excluded."""
+        at_cap = temp_dir / "a" / "at_cap.json"
+        below_cap = temp_dir / "a" / "b" / "below_cap.json"
+        below_cap.parent.mkdir(parents=True)
+        at_cap.write_text("{}")
+        below_cap.write_text("{}")
+
+        with patch("griptape_nodes.utils.file_utils._resolve_discovery_max_depth", return_value=1):
+            result = await find_files_recursive(temp_dir, "*.json")
+
+        assert result == [at_cap]
+
+    @pytest.mark.asyncio
+    async def test_max_files_limits_results(self, temp_dir: Path) -> None:
+        """At most max_files matches are returned."""
+        for name in ["a.json", "b.json", "c.json", "d.json"]:
+            (temp_dir / name).write_text("{}")
+
+        result = await find_files_recursive(temp_dir, "*.json", max_files=2)
+
+        assert len(result) == 2  # noqa: PLR2004
 
 
 class TestAtomicWriteBytes:

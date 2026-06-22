@@ -273,5 +273,9 @@ full reference.
 - **Sandbox library**: the sandbox directory is configured
     separately in your settings; defaults vary by platform.
 
+To pin a project to specific library versions (so activating it provisions
+and, if needed, overwrites libraries to match), see
+[Pinning engine and library versions](projects/version_pinning.md).
+
 For library authors: see [Custom Nodes](developing_nodes/index.md)
 and [Node Isolation with Workers](developing_nodes/node_isolation_with_workers.md).

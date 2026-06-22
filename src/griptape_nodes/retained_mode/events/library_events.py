@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.node_library.library_registry import (
@@ -1328,3 +1329,85 @@ class GetEngineSourceInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class GetEngineSourceInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Engine source info retrieval failed. Common causes: package path could not be resolved."""
+
+
+class LibraryProvisioningActionKind(StrEnum):
+    """What provisioning will do to a single sourced library."""
+
+    SKIP = "SKIP"  # installed version already satisfies the entry
+    INSTALL = "INSTALL"  # not installed -> fresh install (non-destructive)
+    OVERWRITE = "OVERWRITE"  # wrong version installed -> replace
+
+
+@dataclass
+class LibraryProvisioningAction:
+    """The planned provisioning outcome for one libraries_to_download entry.
+
+    Computed by a pure registry-read + PEP 440 compare so the preview and the
+    real execution derive from the same decision. `destructive` is True ONLY for
+    a git OVERWRITE, the path that deletes the local library directory before
+    re-cloning; INSTALL/SKIP never are.
+
+    Fields:
+        library_name: Library name, matching the download entry's `name`.
+        kind: SKIP / INSTALL / OVERWRITE.
+        installed_version: Currently registered version, or None when not installed.
+        pinned_version: The download entry's PEP 440 version specifier, or None for a source-only entry.
+        git_url: The download entry's git source (url@ref form).
+        git_ref: The branch/tag/commit parsed from `git_url`, when present.
+        destructive: True only for a git OVERWRITE (deletes the local dir).
+        reason: Human-readable explanation of the decision.
+    """
+
+    library_name: str
+    kind: LibraryProvisioningActionKind
+    installed_version: str | None
+    pinned_version: str | None
+    git_url: str | None
+    git_ref: str | None
+    destructive: bool
+    reason: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningRequest(RequestPayload):
+    """Compute, without touching disk, what activating a project would provision.
+
+    Use when: the UI wants to show the user which libraries_to_download entries
+    will be installed or overwritten before committing to a project switch.
+    Read-only: a registry read plus a PEP 440 compare, no clone/venv/delete work.
+    Reads the target project's project-adjacent config without mutating the live config layers.
+
+    Args:
+        project_id: Identifier of an already-loaded project to preview.
+
+    Results: PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provisioning plan computed.
+
+    Args:
+        actions: One action per libraries_to_download entry, in config order. Empty when the
+            project declares no libraries to download/provision.
+        engine_version_failure: Non-None when the project's pinned `requires_engine`
+            cannot be satisfied by the running engine. The same text the live
+            reconcile would surface, computed on the same merged config the preview
+            reads, so the UI can warn before the user approves a plan that would
+            fail the engine_version gate on activation.
+    """
+
+    actions: list[LibraryProvisioningAction]
+    engine_version_failure: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provisioning plan could not be computed (project not loaded)."""

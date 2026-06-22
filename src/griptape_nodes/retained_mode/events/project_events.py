@@ -67,7 +67,9 @@ class LoadProjectTemplateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     """Project template loaded successfully.
 
     Args:
-        project_id: The identifier for the loaded project
+        project_id: The opaque id for the loaded project (the registry key).
+            Echoed back so callers can activate/preview by id rather than path.
+            Consumers must not parse or construct it.
         template: The merged ProjectTemplate (system defaults + user customizations)
         validation: Validation info with status and any problems encountered
     """
@@ -97,7 +99,8 @@ class GetProjectTemplateRequest(RequestPayload):
     Use when: Querying current project configuration, checking validation status.
 
     Args:
-        project_id: Identifier of the project
+        project_id: Opaque id of the project (the registry key). Consumers must
+            not parse or construct it.
 
     Results: GetProjectTemplateResultSuccess | GetProjectTemplateResultFailure
     """
@@ -130,19 +133,40 @@ class ProjectTemplateInfo:
     """Information about a loaded or failed project template.
 
     Fields:
-        project_id: Canonical absolute path identifying this template in the registry.
+        project_id: The opaque id identifying this template in the registry.
+            Consumers must not parse or construct it. Legacy projects with no id
+            use their canonical file path string as the id (the legacy bridge).
         validation: Outcome of loading + parsing this template.
         name: Display name from the template body, when available.
-        parent_project_path: The parent's canonical absolute path, suitable for
-            direct equality matching against another entry's project_id when
-            reconstructing the parent/child hierarchy. None means no parent
-            (system defaults are the only base).
+        project_file_path: Canonical file path locating this template on disk, or
+            None for templates that are not file-backed (e.g. the system
+            defaults). Carried separately from project_id so consumers never have
+            to assume the id is a path.
+        parent_project_id: The parent's id, suitable for direct equality matching
+            against another entry's project_id when reconstructing the
+            parent/child hierarchy. For a legacy child linked by
+            parent_project_path, this is resolved to the parent's id (its
+            canonical path string when the parent itself is legacy). None means no
+            parent (system defaults are the only base).
+        engine_version_compatible: False when the project's project-adjacent
+            config declares a `requires_engine` specifier the running engine
+            fails (or that is malformed). The GUI disables activation for such a
+            project. True when compatible or when no requires_engine is declared.
+        required_engine_version: The declared `requires_engine` specifier, when any.
+        current_engine_version: The running engine version, for display.
+        engine_version_reason: Human-readable detail explaining an incompatibility,
+            None when compatible.
     """
 
     project_id: ProjectID
     validation: ProjectValidationInfo
     name: str | None = None
-    parent_project_path: str | None = None
+    project_file_path: str | None = None
+    parent_project_id: str | None = None
+    engine_version_compatible: bool = True
+    required_engine_version: str | None = None
+    current_engine_version: str | None = None
+    engine_version_reason: str | None = None
 
 
 @dataclass
@@ -276,8 +300,9 @@ class SetCurrentProjectRequest(RequestPayload):
     and re-registers workflows from config and the new workspace.
 
     Args:
-        project_id: Identifier of the project to set as current. None lands the
-            engine on the system defaults rather than a "no project" state.
+        project_id: Opaque id of the project to set as current (matched verbatim
+            against the registry; not parsed as a path). None lands the engine on
+            the system defaults rather than a "no project" state.
 
     Results: SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure
     """
@@ -600,7 +625,8 @@ class UnregisterProjectTemplateRequest(RequestPayload):
     Use when: User wants to remove a stale or unwanted project template reference.
 
     Args:
-        project_id: Identifier of the project template to unregister
+        project_id: Opaque id of the project template to unregister (the registry
+            key). Consumers must not parse or construct it.
 
     Results: UnregisterProjectTemplateResultSuccess | UnregisterProjectTemplateResultFailure
     """

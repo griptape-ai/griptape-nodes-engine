@@ -24,10 +24,20 @@ if TYPE_CHECKING:
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.3.3"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.4.0"
 
     project_template_schema_version: str = Field(description="Schema version for the project template")
     name: str = Field(description="Name of the project")
+    id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque identifier for the template, unique per engine. The UI sets a GUID by default, but a "
+            "user may set any unique string. It is the identifier used by project events and referenced by "
+            "external consumers such as policies; consumers must not parse or construct it. Absent on legacy "
+            "projects that predate this field, in which case the engine derives the id from the canonicalized "
+            "project file path. Set once at creation and immutable thereafter."
+        ),
+    )
     description: str | None = Field(default=None, description="Description of the project")
     parent_project_path: str | PerPlatformProjectPath | None = Field(
         default=None,
@@ -42,6 +52,16 @@ class ProjectTemplate(BaseModel):
             "preferred when the parent lives on shared storage mounted at different paths per OS. "
             "Macro tokens are not allowed: they would resolve against runtime state (e.g. the active "
             "workspace) that can change while the project is loaded, which would corrupt parent/child links."
+        ),
+    )
+    parent_project_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional id of a parent project. When set, the parent's merged template is the base for this "
+            "template, located via the engine registry rather than a filesystem path, so the link survives "
+            "moving the file between machines. Mutually exclusive with parent_project_path: when this is set "
+            "the engine ignores parent_project_path. parent_project_path is retained only as a backwards-compat "
+            "fallback for legacy projects that have no parent_project_id."
         ),
     )
     situations: dict[str, SituationTemplate] = Field(description="Situation templates (situation_name -> template)")
@@ -85,14 +105,27 @@ class ProjectTemplate(BaseModel):
             "name": self_dump["name"],
         }
 
+        # id is identity, never diffed against base: emit it whenever present so
+        # the saved file always declares its own id. Absent only for templates
+        # with no file-backed id (e.g. the in-memory default base).
+        if self_dump.get("id") is not None:
+            output["id"] = self_dump.get("id")
+
         # description: emit only when it diverges from base. Explicit null
         # tombstones a previously-set base description.
         if self_dump.get("description") != base_dump.get("description"):
             output["description"] = self_dump.get("description")
 
-        # parent_project_path: emit only when it diverges from base. Explicit null
+        # Parent link: parent_project_id and parent_project_path are mutually
+        # exclusive, and parent_project_id is preferred (it is what new saves
+        # emit). parent_project_path is emitted only for a legacy template that
+        # has no parent_project_id, preserving backwards-compat round-trips.
+        # Each is emitted only when it diverges from base; an explicit null
         # tombstones an inherited link.
-        if self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
+        if self_dump.get("parent_project_id") is not None:
+            if self_dump.get("parent_project_id") != base_dump.get("parent_project_id"):
+                output["parent_project_id"] = self_dump.get("parent_project_id")
+        elif self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
             output["parent_project_path"] = self_dump.get("parent_project_path")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
@@ -394,22 +427,29 @@ class ProjectTemplate(BaseModel):
         else:
             merged_description = base.description
 
-        # parent_project_path: overlay wins; absent inherits base. Explicit null in
-        # overlay clears the inherited value (treated like a tombstone). The
-        # parent has already been merged into `base` by the time we get here, but
-        # the field is preserved on the result so the saved YAML round-trips the
-        # child's declared inheritance link.
-        if overlay.clears_parent_project_path:
-            merged_parent_project_path = None
-        elif overlay.parent_project_path is not None:
-            merged_parent_project_path = overlay.parent_project_path
-        else:
-            merged_parent_project_path = base.parent_project_path
+        # id is identity, not inherited: the child's own id (which may be None for
+        # a legacy overlay) always wins. The engine derives the effective registry
+        # id from this value or the file path; merge never copies base.id down.
+        merged_id = overlay.id
+
+        # Parent links describe the child's OWN tree edge and are never inherited
+        # from the (already-merged) base: a project does not adopt its parent's
+        # parent. Each is taken from the overlay alone, so the merged result
+        # round-trips exactly the child's declared link. An explicit null or an
+        # omitted field both yield None (the clears_* tombstone is preserved for
+        # parity with the loader but collapses to None here). This also keeps
+        # parent_project_path and parent_project_id mutually exclusive on the
+        # result: a legacy path-linked child never inherits an id-linked parent's
+        # parent_project_id, and vice versa.
+        merged_parent_project_path = None if overlay.clears_parent_project_path else overlay.parent_project_path
+        merged_parent_project_id = None if overlay.clears_parent_project_id else overlay.parent_project_id
 
         return ProjectTemplate(
             project_template_schema_version=overlay.project_template_schema_version,
             name=overlay.name,
+            id=merged_id,
             parent_project_path=merged_parent_project_path,
+            parent_project_id=merged_parent_project_id,
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,

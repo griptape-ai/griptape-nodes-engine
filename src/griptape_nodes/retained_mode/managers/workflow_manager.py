@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from inspect import getmodule, isclass, iscoroutinefunction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
 import anyio
@@ -193,6 +193,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
+from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
@@ -200,6 +201,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -898,6 +900,23 @@ class WorkflowManager:
         result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
 
+    def _persist_external_workflow_registration(self, full_path: str) -> None:
+        """Persist an out-of-workspace workflow path to global config so it survives restarts.
+
+        Self-guarding: paths inside the workspace are discovered by directory scan and need
+        no config entry, so this is a no-op for them.
+        """
+        config_manager = GriptapeNodes.ConfigManager()
+        try:
+            canonicalize_for_identity(full_path).relative_to(canonicalize_for_identity(config_manager.workspace_path))
+        except ValueError:
+            existing_workflows = config_manager.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
+            if not existing_workflows:
+                existing_workflows = []
+            if full_path not in existing_workflows:
+                existing_workflows.append(full_path)
+            config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
+
     def on_register_workflow_request(self, request: RegisterWorkflowRequest) -> ResultPayload:
         # The registry key is derived from the file path (minus extension), independent of the display name.
         registry_key = derive_registry_key(request.file_name)
@@ -947,16 +966,7 @@ class WorkflowManager:
         # Persist external workflows to global config so they survive restarts and appear in all projects.
         # Workspace workflows are discovered by directory scan and don't need an explicit entry.
         full_path = WorkflowRegistry.get_complete_file_path(request.file_path)
-        config_manager = GriptapeNodes.ConfigManager()
-        try:
-            canonicalize_for_identity(full_path).relative_to(canonicalize_for_identity(config_manager.workspace_path))
-        except ValueError:
-            existing_workflows = config_manager.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
-            if not existing_workflows:
-                existing_workflows = []
-            if full_path not in existing_workflows:
-                existing_workflows.append(full_path)
-            config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
+        self._persist_external_workflow_registration(full_path)
 
         return ImportWorkflowResultSuccess(
             workflow_name=register_result.workflow_name,
@@ -1041,27 +1051,50 @@ class WorkflowManager:
         # Preserve the raw user input as the display name (metadata.name).
         display_name = request.requested_name
         # Sanitize to a Python module-friendly name for the file stem (registry key).
-        sanitized_name = normalize_display_name(request.requested_name)
-        if not sanitized_name:
+        sanitized_stem = normalize_display_name(request.requested_name)
+        if not sanitized_stem:
             details = f"Attempted to rename workflow '{request.workflow_name}'. The requested name '{request.requested_name}' produced an empty file name after sanitization."
             return RenameWorkflowResultFailure(result_details=details)
 
+        # Rename keeps the workflow's location (unlike Move). Inherit the source workflow's
+        # directory and prepend it to the sanitized stem so the renamed file stays put:
+        # a workspace sub-dir ("bar/new_name") or an external absolute path ("/ext/new_name").
+        # The combined name is NOT re-run through normalize_display_name, so its "/" survives.
+        requested_file_name = sanitized_stem
+        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
+            source = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            if source.file_path:
+                source_dir = PurePosixPath(source.file_path.replace("\\", "/")).parent
+                if str(source_dir) not in ("", "."):
+                    requested_file_name = f"{source_dir}/{sanitized_stem}"
+
         save_workflow_request = await GriptapeNodes.ahandle_request(
-            SaveWorkflowRequest(file_name=sanitized_name, display_name=display_name)
+            SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name)
         )
 
-        if isinstance(save_workflow_request, SaveWorkflowResultFailure):
-            details = f"Attempted to rename workflow '{request.workflow_name}' to '{sanitized_name}'. Failed while attempting to save."
+        if not isinstance(save_workflow_request, SaveWorkflowResultSuccess):
+            details = f"Attempted to rename workflow '{request.workflow_name}' to '{requested_file_name}'. Failed while attempting to save."
             return RenameWorkflowResultFailure(result_details=details)
 
-        # If the original workflow isn't registered, treat this as a Save As and skip deletion
-        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
+        new_workflow_name = save_workflow_request.workflow_name
+
+        # If the renamed file landed outside the workspace, keep it registered at its new path
+        # (the old path's registration is stripped by the delete below).
+        self._persist_external_workflow_registration(str(save_workflow_request.file_path))
+
+        # If the original workflow isn't registered, treat this as a Save As and skip deletion.
+        # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
+        # don't delete the file we just saved.
+        if (
+            WorkflowRegistry.has_workflow_with_name(request.workflow_name)
+            and new_workflow_name != request.workflow_name
+        ):
             delete_workflow_result = await GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=request.workflow_name)
             )
             if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
                 details = (
-                    f"Attempted to rename workflow '{request.workflow_name}' to '{sanitized_name}'. "
+                    f"Attempted to rename workflow '{request.workflow_name}' to '{new_workflow_name}'. "
                     "Failed while attempting to remove the original file name from the registry."
                 )
                 return RenameWorkflowResultFailure(result_details=details)
@@ -1073,12 +1106,12 @@ class WorkflowManager:
             context_manager.has_current_workflow()
             and context_manager.get_current_workflow_name() == request.workflow_name
         ):
-            context_manager.set_current_workflow_name(sanitized_name)
+            context_manager.set_current_workflow_name(new_workflow_name)
 
         return RenameWorkflowResultSuccess(
-            new_workflow_name=sanitized_name,
+            new_workflow_name=new_workflow_name,
             result_details=ResultDetails(
-                message=f"Successfully renamed workflow to: {sanitized_name}", level=logging.INFO
+                message=f"Successfully renamed workflow to: {new_workflow_name}", level=logging.INFO
             ),
         )
 
@@ -1883,6 +1916,13 @@ class WorkflowManager:
         file_path: Path
         relative_file_path: str
 
+    class NamedSavePath(NamedTuple):
+        """Resolved save path for a user-supplied name, plus the bare file stem."""
+
+        file_name: str
+        file_path: Path
+        relative_file_path: str
+
     def _build_workflow_save_path(self, file_name: str, sub_dirs: str | None = None) -> WorkflowSavePath:
         """Resolve a workflow save path via the ``save_workflow`` situation.
 
@@ -1926,6 +1966,25 @@ class WorkflowManager:
             return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(resolved))
 
         return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(workspace_relative))
+
+    def _resolve_named_save_path(self, requested_file_name: str) -> NamedSavePath:
+        """Resolve a user-supplied save name (possibly carrying a directory) to a save path.
+
+        A relative name like "episode/my_wf" splits into sub-directory + stem and routes
+        through the workspace save situation. An absolute name like "/ext/my_wf" (produced
+        when renaming an externally-registered workflow) is honored verbatim:
+        ProjectFileDestination.from_situation bypasses the workspace macro for absolute
+        filenames, so _build_workflow_save_path keys it by its absolute path.
+        """
+        parts = FilenameParts.from_filename(f"{requested_file_name}.py")
+        if parts.directory.is_absolute():
+            file_path, relative_file_path = self._build_workflow_save_path(f"{requested_file_name}.py")
+        else:
+            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
+            file_path, relative_file_path = self._build_workflow_save_path(f"{parts.stem}.py", sub_dirs=sub_dirs)
+        return WorkflowManager.NamedSavePath(
+            file_name=parts.stem, file_path=file_path, relative_file_path=relative_file_path
+        )
 
     def _write_workflow_file(self, file_path: Path, content: str, file_name: str) -> WriteWorkflowFileResult:
         """Write workflow content to file with proper validation and error handling.
@@ -2176,7 +2235,7 @@ class WorkflowManager:
                 return candidate_name
             curr_idx += 1
 
-    def _determine_save_target(  # noqa: PLR0915
+    def _determine_save_target(
         self, requested_file_name: str | None, current_workflow_name: str | None
     ) -> SaveWorkflowTargetInfo:
         """Determine the target file path, name, and metadata for saving a workflow.
@@ -2251,10 +2310,7 @@ class WorkflowManager:
             scenario = WorkflowManager.SaveWorkflowScenario.SAVE_AS
             creation_date = current_workflow.metadata.creation_date
             branched_from = current_workflow.metadata.branched_from
-            parts = FilenameParts.from_filename(f"{requested_file_name}.py")
-            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            file_name = parts.stem
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py", sub_dirs=sub_dirs)
+            file_name, file_path, relative_file_path = self._resolve_named_save_path(requested_file_name)
 
         else:
             # No requested name or no current workflow → first save.
@@ -2270,12 +2326,9 @@ class WorkflowManager:
                 raw_name = sanitized or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
             else:
                 raw_name = requested_file_name or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
-            parts = FilenameParts.from_filename(f"{raw_name}.py")
-            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            file_name = parts.stem
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py", sub_dirs=sub_dirs)
+            file_name, file_path, relative_file_path = self._resolve_named_save_path(raw_name)
 
         # Ensure creation date is valid (backcompat)
         if (creation_date is None) or (creation_date == WorkflowManager.EPOCH_START):
@@ -2477,11 +2530,14 @@ class WorkflowManager:
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
+        all_libs = GriptapeNodes.LibraryManager().resolve_transitive_library_deps(direct_libs)
+
         return WorkflowMetadata(
             name=metadata_name,
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with=engine_version,
-            node_libraries_referenced=list(serialized_flow_commands.node_dependencies.libraries),
+            node_libraries_referenced=all_libs,
             node_types_used=serialized_flow_commands.node_types_used,
             workflows_referenced=workflows_referenced,
             creation_date=creation_date,
@@ -5671,14 +5727,16 @@ class WorkflowManager:
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
 
-        def collect_workflow_files(path: Path) -> None:  # noqa: C901
+        async def collect_workflow_files(path: Path) -> None:  # noqa: C901
             """Collect workflow files from a path."""
-            if not path.exists():
+            apath = anyio.Path(path)
+            if not await apath.exists():
                 return
-            if path.is_dir():
-                for workflow_file in path.rglob("*.py"):
-                    if ".venv" in workflow_file.parts:
-                        continue
+            if await apath.is_dir():
+                # find_files_recursive skips hidden directories (.venv, .git) and
+                # bounds recursion depth, so a deep or symlink-looped tree can't stall
+                # the boot scan.
+                for workflow_file in await find_files_recursive(path, "*.py"):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
@@ -5711,7 +5769,7 @@ class WorkflowManager:
 
         # Collect all workflow files first
         for workflow_to_register in workflows_to_register:
-            collect_workflow_files(Path(workflow_to_register))
+            await collect_workflow_files(Path(workflow_to_register))
 
         # Track progress
         total_workflows = len(all_workflow_files)

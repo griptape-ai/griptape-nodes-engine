@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass, field
@@ -25,6 +26,7 @@ from griptape_nodes.common.project_templates import (
     ProjectOverlayData,
     ProjectTemplate,
     ProjectValidationInfo,
+    ProjectValidationProblemSeverity,
     ProjectValidationStatus,
     SituationTemplate,
     load_partial_project_template,
@@ -32,7 +34,12 @@ from griptape_nodes.common.project_templates import (
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileLoadError, FileWriteError
-from griptape_nodes.files.path_utils import canonicalize_for_identity, resolve_file_path, resolve_path_safely
+from griptape_nodes.files.path_utils import (
+    canonicalize_for_identity,
+    resolve_file_path,
+    resolve_path_safely,
+    resolve_workspace_path,
+)
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.library_events import (
@@ -89,7 +96,14 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_TO_DOWNLOAD_KEY,
+    LIBRARIES_TO_REGISTER_KEY,
+    PROJECTS_TO_REGISTER_KEY,
+    REQUIRES_ENGINE_KEY,
+)
+from griptape_nodes.utils.file_utils import find_files_recursive
+from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -101,8 +115,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
-# Type alias for project identifiers
-# Usually constructed from file path, but kept opaque to prevent abuse
+# Type alias for project identifiers.
+#
+# A ProjectID is an opaque, unique-per-engine identifier. The UI sets a GUID by
+# default, but a user may set any unique string. Consumers must NOT parse or
+# construct it (e.g. by canonicalizing it as a path): it is matched verbatim
+# against the registry. Legacy projects that predate the explicit `id` field use
+# the canonicalized project file path string as their id (the legacy bridge), so
+# the id-space is mixed (GUID/custom ids, legacy path-string ids, and the
+# synthetic SYSTEM_DEFAULTS_KEY). The on-disk file path is a separate locator.
 ProjectID = str
 
 # Synthetic identifier for the system default project template
@@ -243,6 +264,12 @@ class _ProjectVariableResolver:
                     try:
                         bag[ref] = self._get_builtin(ref)
                     except (RuntimeError, NotImplementedError) as e:
+                        # An optional reference (e.g. `{workflow_dir?:/}`) degrades cleanly:
+                        # leave it out of the bag so parsed.resolve() drops it, mirroring the
+                        # situation-macro path in on_get_path_for_macro_request. A required
+                        # builtin that can't resolve is a genuine error.
+                        if not var_info.is_required:
+                            continue
                         msg = (
                             f"Cannot resolve {owner_kind} '{owner_name}': "
                             f"builtin '{ref}' unavailable in current context ({e})"
@@ -304,6 +331,50 @@ class ProjectInfo:
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
 
 
+class _ProjectActivationOutcome(NamedTuple):
+    """Result of establishing a project's config/workspace/env layers and reloading.
+
+    `failure` is the reload failure (None on success). `workspace_changed` reports
+    whether the workspace directory changed, so the caller can flag
+    `altered_workflow_state` on the success result.
+    """
+
+    failure: SetCurrentProjectResultFailure | None
+    workspace_changed: bool
+
+
+class WorkspaceDecision(NamedTuple):
+    """The workspace dir a project resolves to, plus whether activation pins it.
+
+    `workspace_dir` is the directory whose griptape_nodes_config.json supplies the
+    workspace config layer. `apply_override` is True only when activation calls
+    set_workspace_override(workspace_dir): the project_workspaces mapping and the
+    auto-default-to-project-dir branches. It is False when env vars or the
+    project-adjacent config supply workspace_directory, because activation then
+    leaves the override unset so the workspace config layer can re-point it.
+    """
+
+    workspace_dir: Path
+    apply_override: bool
+
+
+class _ProvisioningConfigDirs(NamedTuple):
+    """The two directories that determine a project's merged provisioning config.
+
+    `project_dir` holds the project-adjacent griptape_nodes_config.json;
+    `workspace_dir` is the directory whose config supplies the workspace layer
+    (decided read-only by decide_workspace). `apply_override` carries that
+    decision's pin bit so the preview applies the workspace_directory override
+    exactly when (and only when) activation would. The provisioning preview feeds
+    all three into ConfigManager.compute_project_provisioning_config so the plan it
+    shows matches what activation would reconcile.
+    """
+
+    project_dir: Path
+    workspace_dir: Path
+    apply_override: bool
+
+
 class ProjectManager:
     """Manages project templates, validation, and file path resolution.
 
@@ -357,6 +428,12 @@ class ProjectManager:
         # Restored on project switch so each project's env is isolated.
         self._applied_env_snapshot: dict[str, str | None] = {}
 
+        # Transient id -> file path index used during boot to resolve id-based
+        # parents whose child may load before the parent. Populated by a pre-pass
+        # in _load_registered_projects and consulted by _resolve_parent_chain;
+        # empty (and ignored) outside boot, where the live registry suffices.
+        self._boot_id_to_file_path: dict[str, Path] = {}
+
         # Register event handlers
         event_manager.assign_manager_to_request_type(LoadProjectTemplateRequest, self.on_load_project_template_request)
         event_manager.assign_manager_to_request_type(GetProjectTemplateRequest, self.on_get_project_template_request)
@@ -405,6 +482,16 @@ class ProjectManager:
     ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
         """Load user's project.yml and merge with system defaults.
 
+        Thin wrapper over _load_and_cache_project_template. Explicit loads
+        persist the path so the project survives engine restarts.
+        """
+        return await self._load_and_cache_project_template(request.project_path, persist_path=True)
+
+    async def _load_and_cache_project_template(
+        self, project_path: Path, *, persist_path: bool
+    ) -> LoadProjectTemplateResultSuccess | LoadProjectTemplateResultFailure:
+        """Load a project.yml, merge with system defaults, and cache the result.
+
         Flow:
         1. Issue ReadFileRequest to OSManager (for proper Windows long path handling)
         2. Parse YAML and load partial template (overlay) using load_partial_project_template()
@@ -412,20 +499,51 @@ class ProjectManager:
         4. Merge the overlay onto that base using ProjectTemplate.merge()
         5. Cache validation in registered_template_status
         6. If usable, cache template in successful_templates
-        7. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+        7. If persist_path, append the path to projects_to_register config
+        8. Return LoadProjectTemplateResultSuccess or LoadProjectTemplateResultFailure
+
+        persist_path is False for directory-discovered project files: the
+        directory entry stays in config and is re-scanned each startup, so the
+        individual files must not be persisted alongside it.
         """
-        # Expand ~/env vars and resolve to absolute so the same file always
-        # produces the same project_id regardless of how the caller spelled
-        # the path (relative vs absolute, ~/ prefix, symlinks, etc.). Both
-        # _registered_template_status (keyed by Path) and
-        # _successfully_loaded_project_templates (keyed by str project_id) must
-        # use the canonical form so dedupe checks line up.
-        project_file_path = canonicalize_for_identity(request.project_path)
+        # Expand ~/env vars and resolve to absolute so the same file is always
+        # located the same way regardless of how the caller spelled the path
+        # (relative vs absolute, ~/ prefix, symlinks, etc.). The canonical path
+        # is the file locator; _registered_template_status is keyed by it.
+        project_file_path = canonicalize_for_identity(project_path)
 
         read_load = await self._read_overlay(project_file_path)
         if isinstance(read_load, LoadProjectTemplateResultFailure):
             return read_load
         validation, overlay = read_load
+
+        # Derive the project id (the registry key). An explicit overlay id wins;
+        # a legacy project with no id falls back to the canonical file path
+        # string so it keeps a stable identity without a file rewrite. From here
+        # on the id identifies the project and the path is only a locator.
+        project_id = overlay.id if overlay.id is not None else str(project_file_path)
+
+        # Fail closed on an id collision: a *different* file already holds this
+        # id. Reloading the same file (same id, same path) is a no-op refresh and
+        # must not collide.
+        existing = self._successfully_loaded_project_templates.get(project_id)
+        if existing is not None and existing.project_file_path != project_file_path:
+            validation.add_error(
+                field_path="id",
+                message=(
+                    f"Project id '{project_id}' is already used by a different project at "
+                    f"'{existing.project_file_path}'. Project ids must be unique per engine."
+                ),
+            )
+            self._registered_template_status[project_file_path] = validation
+            return LoadProjectTemplateResultFailure(
+                validation=validation,
+                result_details=(
+                    f"Attempted to load project template from '{project_file_path}'. "
+                    f"Failed because its id '{project_id}' is already used by a different project at "
+                    f"'{existing.project_file_path}'."
+                ),
+            )
 
         # Resolve the parent chain (if declared) into a base ProjectTemplate.
         # Cycle detection seeds the visited set with the current project's path
@@ -437,15 +555,26 @@ class ProjectManager:
             visited={project_file_path},
         )
         if base_template is None:
+            # _resolve_parent_chain records the specific cause (e.g. an
+            # unregistered parent_project_id, or a cycle) on validation before
+            # returning None. Surface that detail in result_details so the boot
+            # warning names it, matching the collision case above.
+            parent_chain_errors = [
+                problem.message
+                for problem in validation.problems
+                if problem.severity == ProjectValidationProblemSeverity.ERROR
+            ]
+            failure_detail = "Failed because parent chain could not be resolved"
+            if parent_chain_errors:
+                failure_detail = f"{failure_detail}: {parent_chain_errors[-1]}"
             self._registered_template_status[project_file_path] = validation
             return LoadProjectTemplateResultFailure(
                 validation=validation,
-                result_details=f"Attempted to load project template from '{project_file_path}'. Failed because parent chain could not be resolved",
+                result_details=f"Attempted to load project template from '{project_file_path}'. {failure_detail}",
             )
 
         template = ProjectTemplate.merge(base_template, overlay, validation)
 
-        project_id = str(project_file_path)
         project_base_dir = project_file_path.parent
 
         # Parse all macros BEFORE creating ProjectInfo - collect ALL errors
@@ -477,8 +606,12 @@ class ProjectManager:
         # Track validation status for all load attempts (for UI display)
         self._registered_template_status[project_file_path] = validation
 
-        # Persist path so the project survives engine restarts
-        self._register_project_path(project_id)
+        # Persist the file path (the locator) so the project survives engine
+        # restarts. PROJECTS_TO_REGISTER_KEY stores paths, not ids: boot reloads
+        # each file by path and re-derives its id. Skipped for directory-discovered
+        # files, which are covered by their directory entry.
+        if persist_path:
+            self._register_project_path(str(project_file_path))
 
         return LoadProjectTemplateResultSuccess(
             project_id=project_id,
@@ -538,7 +671,7 @@ class ProjectManager:
 
         return validation, overlay
 
-    async def _resolve_parent_chain(  # noqa: PLR0911
+    async def _resolve_parent_chain(  # noqa: C901, PLR0911
         self,
         overlay: ProjectOverlayData,
         project_file_path: Path,
@@ -547,53 +680,80 @@ class ProjectManager:
     ) -> ProjectTemplate | None:
         """Resolve the parent chain declared by an overlay into a base ProjectTemplate.
 
-        When `overlay.parent_project_path` is None, the base is `DEFAULT_PROJECT_TEMPLATE`.
-        Otherwise the parent YAML is read, recursively resolved, merged onto its own
-        ancestors, and returned as the base for the caller.
+        Parent links have two forms, checked in this precedence order:
+
+        1. `parent_project_id` (preferred, portable): the parent is located via the
+           engine registry (id -> file path), so the link survives moving the file
+           between machines. If the id is not registered on this engine, resolution
+           fails closed (records an error and returns None). `parent_project_path` is
+           ignored entirely when an id is present.
+        2. `parent_project_path` (legacy, back-compat): the parent YAML is located by
+           filesystem path. A relative path resolves against the directory of
+           `project_file_path` so a child can name its parent with a relative path
+           (e.g. `parent_project_path: ../base/griptape-nodes-project.yml`). A
+           per-platform mapping is reduced to the active OS's path first; a mapping
+           with no key for this OS and no `default` is treated as no parent on this
+           platform.
+        3. Neither set: the base is `DEFAULT_PROJECT_TEMPLATE`.
+
+        Once the parent file path is located, the parent YAML is read, recursively
+        resolved, merged onto its own ancestors, and returned as the base for the
+        caller. Macro tokens are rejected by the loader; only absolute or relative
+        paths reach the path-based branch.
 
         Cycle detection: `visited` carries the canonical Paths of every project file
         that is currently being resolved further down the chain. A cycle records an
         error on `validation` and returns None.
 
-        Relative `parent_project_path` paths resolve against the directory of
-        `project_file_path` so a child project can name its parent with a relative
-        path (e.g. `parent_project_path: ../base/griptape-nodes-project.yml`).
-        Macro tokens are rejected by the loader; only absolute or relative
-        paths reach this resolver. A per-platform mapping is reduced to the
-        active OS's path first; a mapping with no key for this OS and no
-        `default` is treated as no parent on this platform.
-
-        Errors during parent resolution (missing file, unparsable YAML, cycle)
-        are recorded on the child's `validation` and surfaced to the caller as
-        a None return.
+        Errors during parent resolution (missing file, unregistered id, unparsable
+        YAML, cycle) are recorded on the child's `validation` and surfaced to the
+        caller as a None return.
         """
-        if overlay.parent_project_path is None:
+        # Precedence: an explicit parent_project_id (portable, registry-located)
+        # wins and the path is ignored. parent_project_path is the legacy
+        # fallback only when no id is present.
+        if overlay.parent_project_id is not None:
+            parent_link_field = "parent_project_id"
+            parent_label = overlay.parent_project_id
+            parent_file_path = self._locate_parent_file_path_by_id(overlay.parent_project_id)
+            if parent_file_path is None:
+                validation.add_error(
+                    field_path=parent_link_field,
+                    message=(
+                        f"Parent project id '{overlay.parent_project_id}' is not registered on this engine. "
+                        "Register the parent project before loading this child."
+                    ),
+                    line_number=overlay.line_info.get_line(parent_link_field),
+                )
+                return None
+        elif overlay.parent_project_path is not None:
+            parent_link_field = "parent_project_path"
+            # Reduce the (possibly per-platform) value to a single string for the
+            # active platform. A per-platform mapping with no key matching the
+            # active OS and no `default` returns None — treat that as "no parent
+            # on this platform" and fall back to the system default base.
+            selected_parent = select_project_path(overlay.parent_project_path)
+            if selected_parent is None:
+                logger.debug(
+                    "parent_project_path %r has no entry for the active platform and no default; "
+                    "treating as no parent on this OS",
+                    overlay.parent_project_path,
+                )
+                return DEFAULT_PROJECT_TEMPLATE
+            parent_label = selected_parent
+            parent_path_raw = Path(selected_parent)
+            if not parent_path_raw.is_absolute():
+                parent_path_raw = project_file_path.parent / parent_path_raw
+            parent_file_path = canonicalize_for_identity(parent_path_raw)
+        else:
             return DEFAULT_PROJECT_TEMPLATE
-
-        # Reduce the (possibly per-platform) value to a single string for the
-        # active platform. A per-platform mapping with no key matching the
-        # active OS and no `default` returns None — treat that as "no parent
-        # on this platform" and fall back to the system default base.
-        selected_parent = select_project_path(overlay.parent_project_path)
-        if selected_parent is None:
-            logger.debug(
-                "parent_project_path %r has no entry for the active platform and no default; "
-                "treating as no parent on this OS",
-                overlay.parent_project_path,
-            )
-            return DEFAULT_PROJECT_TEMPLATE
-
-        parent_path_raw = Path(selected_parent)
-        if not parent_path_raw.is_absolute():
-            parent_path_raw = project_file_path.parent / parent_path_raw
-        parent_file_path = canonicalize_for_identity(parent_path_raw)
 
         if parent_file_path in visited:
             cycle = " -> ".join(str(p) for p in [*sorted(visited, key=str), parent_file_path])
             validation.add_error(
-                field_path="parent_project_path",
+                field_path=parent_link_field,
                 message=f"Cycle detected in project parent chain: {cycle}",
-                line_number=overlay.line_info.get_line("parent_project_path"),
+                line_number=overlay.line_info.get_line(parent_link_field),
             )
             return None
 
@@ -602,20 +762,18 @@ class ProjectManager:
             # Surface the parent's failure as a child-level error pointing at the link.
             parent_status = parent_load.validation.status
             validation.add_error(
-                field_path="parent_project_path",
-                message=(f"Parent project '{selected_parent}' could not be loaded (status: {parent_status})"),
-                line_number=overlay.line_info.get_line("parent_project_path"),
+                field_path=parent_link_field,
+                message=(f"Parent project '{parent_label}' could not be loaded (status: {parent_status})"),
+                line_number=overlay.line_info.get_line(parent_link_field),
             )
             return None
         parent_validation, parent_overlay = parent_load
 
         if not parent_validation.is_usable():
             validation.add_error(
-                field_path="parent_project_path",
-                message=(
-                    f"Parent project '{selected_parent}' has validation errors (status: {parent_validation.status})"
-                ),
-                line_number=overlay.line_info.get_line("parent_project_path"),
+                field_path=parent_link_field,
+                message=(f"Parent project '{parent_label}' has validation errors (status: {parent_validation.status})"),
+                line_number=overlay.line_info.get_line(parent_link_field),
             )
             return None
 
@@ -637,12 +795,40 @@ class ProjectManager:
         if not parent_merge_validation.is_usable():
             for problem in parent_merge_validation.problems:
                 validation.add_error(
-                    field_path=f"parent_project_path.{problem.field_path}",
-                    message=f"Parent '{selected_parent}': {problem.message}",
-                    line_number=overlay.line_info.get_line("parent_project_path"),
+                    field_path=f"{parent_link_field}.{problem.field_path}",
+                    message=f"Parent '{parent_label}': {problem.message}",
+                    line_number=overlay.line_info.get_line(parent_link_field),
                 )
             return None
         return parent_template
+
+    def get_loaded_project_dir(self, project_id: str) -> Path | None:
+        """Return the directory of a loaded, file-backed project, or None.
+
+        The directory holds the project YAML and its adjacent
+        griptape_nodes_config.json. Returns None when the project is not loaded
+        or has no backing file (e.g. system defaults), so callers can treat both
+        as "no project-adjacent config to read".
+        """
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return None
+        if project_info.project_file_path is None:
+            return None
+        return project_info.project_file_path.parent
+
+    def _locate_parent_file_path_by_id(self, parent_project_id: str) -> Path | None:
+        """Locate a parent project's file path from its opaque id.
+
+        Checks the live registry first (the parent is normally already loaded at
+        runtime), then the transient boot index built by _load_registered_projects
+        for the child-before-parent case during startup. Returns None when the id
+        is not registered on this engine, which the caller treats as fail-closed.
+        """
+        existing = self._successfully_loaded_project_templates.get(parent_project_id)
+        if existing is not None and existing.project_file_path is not None:
+            return existing.project_file_path
+        return self._boot_id_to_file_path.get(parent_project_id)
 
     def on_get_project_template_request(
         self, request: GetProjectTemplateRequest
@@ -671,45 +857,33 @@ class ProjectManager:
         successfully_loaded: list[ProjectTemplateInfo] = []
         failed_to_load: list[ProjectTemplateInfo] = []
 
+        # Map each loaded project's canonical file path to its id so a legacy
+        # child's parent_project_path can be resolved to the parent's actual id
+        # (the registry key), and so the failed-templates pass can correlate
+        # Path-keyed status entries against the id-keyed registry by path.
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
         # Gather successfully loaded templates from _successfully_loaded_project_templates
         for project_id, project_info in self._successfully_loaded_project_templates.items():
             # Skip system builtins unless requested
             if not request.include_system_builtins and project_id == SYSTEM_DEFAULTS_KEY:
                 continue
 
-            # Resolve parent_project_path to a canonical absolute string that
-            # matches another entry's project_id, so consumers can reconstruct
-            # the parent/child hierarchy with a string-equality lookup. Parent
-            # links are either absolute or relative to the child YAML's
-            # directory (the loader rejects macro tokens); both forms canonicalize
-            # to the same result here regardless of which workspace is active.
-            # Per-platform mappings are reduced to the active platform's value
-            # before resolving so the GUI sees a single resolved string.
-            selected_parent = select_project_path(project_info.template.parent_project_path)
-            resolved_parent: str | None = None
-            if selected_parent is not None:
-                parent_path = Path(selected_parent)
-                if not parent_path.is_absolute() and project_info.project_file_path is not None:
-                    parent_path = project_info.project_file_path.parent / parent_path
-                resolved_parent = str(canonicalize_for_identity(parent_path))
+            successfully_loaded.append(self._build_loaded_template_info(project_id, project_info, file_path_to_id))
 
-            successfully_loaded.append(
-                ProjectTemplateInfo(
-                    project_id=project_id,
-                    validation=project_info.validation,
-                    name=project_info.template.name,
-                    parent_project_path=resolved_parent,
-                )
-            )
-
-        # Gather failed templates from _registered_template_status
-        # These are tracked by Path, not ProjectID
+        # Gather failed templates from _registered_template_status.
+        # These are tracked by Path, so correlate against the id-keyed registry
+        # by file path rather than by string-casting the path to an id.
         for template_path, validation in self._registered_template_status.items():
-            project_id = str(template_path)
-
-            # Skip if already in successfully loaded (validation status might be FLAWED but still loaded)
-            if project_id in self._successfully_loaded_project_templates:
+            # Skip if already loaded successfully (status might be FLAWED but still loaded)
+            if template_path in file_path_to_id:
                 continue
+
+            project_id = str(template_path)
 
             # Skip system builtins unless requested
             if not request.include_system_builtins and project_id == SYSTEM_DEFAULTS_KEY:
@@ -723,6 +897,63 @@ class ProjectManager:
             successfully_loaded=successfully_loaded,
             failed_to_load=failed_to_load,
             result_details=f"Successfully listed project templates. Loaded: {len(successfully_loaded)}, Failed: {len(failed_to_load)}",
+        )
+
+    def _build_loaded_template_info(
+        self,
+        project_id: ProjectID,
+        project_info: ProjectInfo,
+        file_path_to_id: dict[Path, ProjectID],
+    ) -> ProjectTemplateInfo:
+        """Build the ProjectTemplateInfo for a successfully loaded template.
+
+        Resolves the parent's id and the project-adjacent engine-version
+        compatibility for the listing emitted to the GUI.
+        """
+        # Emit the parent's id so the GUI can reconstruct the hierarchy by
+        # matching it against another entry's project_id. An explicit
+        # parent_project_id is already an id and is emitted as-is. A legacy
+        # parent_project_path is resolved to a canonical path, then mapped to
+        # the parent's actual id via the registry; if the parent is not
+        # registered, its id is its canonical path string (the legacy bridge),
+        # so the canonical string is the correct fallback. Per-platform
+        # mappings are reduced to the active platform's value first.
+        resolved_parent_id: str | None = None
+        if project_info.template.parent_project_id is not None:
+            resolved_parent_id = project_info.template.parent_project_id
+        else:
+            selected_parent = select_project_path(project_info.template.parent_project_path)
+            if selected_parent is not None:
+                parent_path = Path(selected_parent)
+                if not parent_path.is_absolute() and project_info.project_file_path is not None:
+                    parent_path = project_info.project_file_path.parent / parent_path
+                canonical_parent = canonicalize_for_identity(parent_path)
+                resolved_parent_id = file_path_to_id.get(canonical_parent, str(canonical_parent))
+
+        # Read the project-adjacent config's requires_engine specifier without
+        # merging it into the live config, so the GUI can disable activation
+        # for a project the running engine can't satisfy. A project with no
+        # backing file (or no specifier) is compatible by default.
+        required_engine_version: str | None = None
+        if project_info.project_file_path is not None:
+            config_path = project_info.project_file_path.parent / "griptape_nodes_config.json"
+            required_engine_version = self._config_manager.read_config_file_value(
+                config_path, REQUIRES_ENGINE_KEY, default=None
+            )
+        engine_version_reason = engine_version_failure_detail(required_engine_version)
+
+        return ProjectTemplateInfo(
+            project_id=project_id,
+            validation=project_info.validation,
+            name=project_info.template.name,
+            project_file_path=(
+                str(project_info.project_file_path) if project_info.project_file_path is not None else None
+            ),
+            parent_project_id=resolved_parent_id,
+            engine_version_compatible=engine_version_reason is None,
+            required_engine_version=required_engine_version,
+            current_engine_version=engine_version,
+            engine_version_reason=engine_version_reason,
         )
 
     def on_get_situation_request(
@@ -997,6 +1228,75 @@ class ProjectManager:
             secrets_manager=self._secrets_manager,
         )
 
+    def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
+        """Resolve the project-adjacent and workspace dirs for a provisioning preview.
+
+        Looks up `project_id` verbatim as the registry key, the same way
+        on_set_current_project_request does: the id is opaque and must NOT be
+        canonicalized, or a GUID (or custom string) would be treated as a relative
+        path against the CWD and miss the registry. Legacy projects whose id is a
+        canonical path string were already canonicalized at load time, so a verbatim
+        lookup still hits. Finds the loaded file-backed project, then decides its
+        workspace dir + override bit read-only via decide_workspace. Returns None when
+        the project is not loaded or has no backing file, mirroring
+        get_loaded_project_dir's "nothing to preview" contract. Mutates no config state.
+        """
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return None
+        if project_info.project_file_path is None:
+            return None
+
+        project_file_path = project_info.project_file_path
+        project_dir = project_file_path.parent
+        project_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
+        env_config = self._config_manager.read_env_config()
+        decision = self.decide_workspace(project_file_path, project_config, env_config)
+        return _ProvisioningConfigDirs(
+            project_dir=project_dir,
+            workspace_dir=decision.workspace_dir,
+            apply_override=decision.apply_override,
+        )
+
+    def decide_workspace(self, project_file_path: Path, project_config: dict, env_config: dict) -> WorkspaceDecision:
+        """Decide a project's workspace dir and override bit read-only, mutating nothing.
+
+        Returns the directory whose griptape_nodes_config.json activation loads as the
+        workspace layer, plus whether activation pins it via set_workspace_override.
+        Priority, highest first (matching _activate_project's block):
+
+        1. project_workspaces user-config override -> (override dir, apply_override=True)
+        2. workspace_directory from env vars -> (env dir, apply_override=False)
+        3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
+        4. the project's own directory (auto-default) -> (project dir, apply_override=True)
+
+        `apply_override` is True only for the override-mapping and auto-default branches,
+        because those are the cases where activation calls set_workspace_override. For env
+        or project-adjacent workspace_directory, activation leaves the override unset so the
+        workspace config layer can re-point the final workspace_path; a forced override
+        would mask that. Both _activate_project (live) and the provisioning preview drive
+        off this one decision, so the previewed library/engine_version plan and what
+        _reconcile_libraries_from_config actually does cannot drift.
+        """
+        project_workspaces = self._config_manager.get_config_value(
+            "project_workspaces",
+            config_source="user_config",
+            default={},
+        )
+        workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
+        if workspace_override is not None:
+            return WorkspaceDecision(Path(workspace_override), apply_override=True)
+
+        env_workspace = env_config.get("workspace_directory")
+        if env_workspace is not None:
+            return WorkspaceDecision(Path(env_workspace), apply_override=False)
+
+        project_workspace = project_config.get("workspace_directory")
+        if project_workspace is not None:
+            return WorkspaceDecision(Path(project_workspace), apply_override=False)
+
+        return WorkspaceDecision(project_file_path.parent, apply_override=True)
+
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
         """Return the user-configured workspace override for a project file, or None if not mapped."""
         resolved_project_path = str(canonicalize_for_identity(project_file_path))
@@ -1005,62 +1305,140 @@ class ProjectManager:
             None,
         )
 
+    def _snapshot_library_config(self) -> str:
+        """Return a stable string of the merged library-affecting config for change detection.
+
+        Captures the merged `libraries_to_register`, `libraries_to_download`, and
+        `requires_engine` values plus the RESOLVED libraries directory as one
+        sorted-key JSON string so two snapshots can be compared with `==`.
+        Including `requires_engine` ensures a pure requires_engine change still trips
+        `library_config_changed`, which is what re-runs the reload (and so the
+        engine_version gate) on activation. Including the resolved libraries dir
+        catches a workspace-only switch: `libraries_directory` is workspace-relative
+        by default, so two projects with identical config strings but different
+        workspaces resolve to different on-disk `libraries/` trees and must still
+        reload, even though the three values above are unchanged.
+        """
+        libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
+        resolved_libraries_dir = str(resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path))
+        snapshot = {
+            LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
+            LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
+            REQUIRES_ENGINE_KEY: self._config_manager.get_config_value(REQUIRES_ENGINE_KEY, default=None),
+            "resolved_libraries_directory": resolved_libraries_dir,
+        }
+        return json.dumps(snapshot, sort_keys=True, default=str)
+
     async def _reload_after_project_switch(
-        self, project_id: str, *, workspace_changed: bool
+        self, project_id: str, *, workspace_changed: bool, library_config_changed: bool
     ) -> SetCurrentProjectResultFailure | None:
         """Reload libraries and optionally re-register workflows after a project switch.
 
-        Always reloads libraries (project config can affect env vars and library behavior).
-        Only re-registers workflows when the workspace directory actually changed.
+        Only reloads libraries when the project's library-affecting config
+        actually changed: the reload triggers LibraryManager's reconcile, which
+        provisions sourced libraries and enforces the engine_version gate. A
+        switch that leaves library config untouched (e.g. default project to
+        default workspace) skips the deep reset. Workflows are re-registered only
+        when the workspace directory changed.
 
-        Returns a failure result if library reload fails, otherwise None.
+        Returns a failure result if the library reload (reconcile/engine_version
+        gate included) fails, otherwise None.
         """
-        reload_result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
-        if isinstance(reload_result, ReloadAllLibrariesResultFailure):
-            return SetCurrentProjectResultFailure(
-                result_details=f"Attempted to set project '{project_id}'. "
-                f"Config updated but library reload failed: {reload_result.result_details}",
-            )
+        if library_config_changed:
+            reload_result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
+            if isinstance(reload_result, ReloadAllLibrariesResultFailure):
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set project '{project_id}'. "
+                    f"Config updated but library reload failed: {reload_result.result_details}",
+                )
         if workspace_changed:
             await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
         return None
 
-    async def on_set_current_project_request(  # noqa: C901
+    async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
         """Set which project user has selected.
+
+        Establishes the target project's config/workspace/env layers and reloads
+        libraries. When the reload fails (e.g. an engine_version mismatch or a
+        failed provisioning), the previously active project is re-established so
+        the engine is never left adopting a broken project: the user can keep
+        working in the project they had. Re-establishment runs only after startup
+        (interactive switches); during boot the failure is returned as-is.
+        """
+        # Remember the project that was active before this switch so a failed
+        # activation can roll back to it. SYSTEM_DEFAULTS_KEY is a valid target.
+        previous_project_id = self._current_project_id
+
+        # `None` is the wire-level "no project specified" signal -- normalize to
+        # SYSTEM_DEFAULTS_KEY so the engine lands on system defaults instead of
+        # a phantom "no project" state. Any other value is an opaque project id
+        # and is the registry key verbatim: do NOT canonicalize it. Canonicalizing
+        # would treat a GUID (or custom string) as a relative path against the CWD
+        # and miss the registry. Legacy projects whose id is a canonical path
+        # string were already canonicalized at load time, so a verbatim lookup
+        # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
+        resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
+
+        outcome = await self._activate_project(resolved_project_id)
+        if outcome.failure is not None:
+            # During boot, leave the failure to the caller (soft handling); there is
+            # no prior interactive project to fall back to. After startup, restore the
+            # previously active project so the engine stays in a working state, then
+            # surface the original failure to the GUI.
+            if self._initialization_complete and previous_project_id != resolved_project_id:
+                rollback = await self._activate_project(previous_project_id)
+                if rollback.failure is not None:
+                    logger.error(
+                        "Attempted to roll back to previous project '%s' after activation of '%s' failed. "
+                        "Rollback also failed: %s",
+                        previous_project_id,
+                        resolved_project_id,
+                        rollback.failure.result_details,
+                    )
+            return outcome.failure
+
+        result = SetCurrentProjectResultSuccess(
+            result_details=f"Successfully set current project. ID: {resolved_project_id}",
+        )
+        if outcome.workspace_changed and self._initialization_complete:
+            result.altered_workflow_state = True
+        return result
+
+    async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
+        """Establish a project's config/workspace/env layers and reload libraries.
 
         Captures workspace path before and after config layer changes. If the
         workspace actually changed and startup is complete, performs an expensive
         workspace switch: reloads all libraries and re-registers workflows.
         During startup, LibraryManager handles library loading concurrently, so
         the workspace switch is skipped.
+
+        `resolved_project_id` is already canonicalized. Returns the reload failure
+        (None on success) and whether the workspace changed. This is the shared
+        body used both for the requested switch and for rolling back to the
+        previously active project when a switch fails.
         """
         # Restore os.environ entries mutated by the outgoing project before any config
         # layer changes. Workspace resolution below may consult env vars, so the old
         # project's values must not leak into the new project's workspace decision.
         self._restore_project_env()
 
-        # Capture workspace BEFORE config changes for comparison after
+        # Capture workspace and library-affecting config BEFORE config changes for comparison after
         old_workspace = self._config_manager.workspace_path
-
-        # `None` is the wire-level "no project specified" signal -- normalize to
-        # SYSTEM_DEFAULTS_KEY so the engine lands on system defaults instead of
-        # a phantom "no project" state.
-        # Canonicalize a real project_id to the same form used as the registry
-        # key when the project was loaded (`canonicalize_for_identity` in
-        # on_load_project_template_request). Without this, callers passing the
-        # raw path they received from the user (e.g. a Windows
-        # `C:\\Users\\Me\\project.yml`, an unexpanded `~/project.yml`, or a
-        # symlinked `/var/...` path on macOS) miss the registry lookup, leaving
-        # `_current_project_id` set to a phantom string that no GetCurrentProject
-        # response can resolve. SYSTEM_DEFAULTS_KEY is a synthetic ID, not a
-        # path, and is preserved verbatim.
-        resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
-        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
-            resolved_project_id = str(canonicalize_for_identity(resolved_project_id))
+        old_library_config = self._snapshot_library_config()
 
         self._current_project_id = resolved_project_id
+
+        # Each activation re-decides its config layers from scratch. Drop the prior
+        # project's per-activation state (workspace override + project-adjacent and
+        # workspace config-file paths) so none of it leaks into the new project. Without
+        # this, a rollback to a project whose config supplies workspace_directory keeps
+        # the failed project's override, and switching to system defaults re-merges the
+        # prior project's griptape_nodes_config.json (re-applying its pins). The branches
+        # below remerge via load_project_config()/load_workspace_config()/load_configs().
+        self._config_manager.clear_project_layers()
 
         project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
         if project_info is not None and project_info.project_file_path is not None:
@@ -1068,34 +1446,30 @@ class ProjectManager:
             project_dir = project_file_path.parent
             self._config_manager.load_project_config(project_dir)
 
-            # Determine workspace directory using the following priority:
-            # 1. project_workspaces in user config (per-user, per-project override)
-            # 2. workspace_directory in project-adjacent config (shared project default)
-            # 3. env vars
-            # 4. Auto-default to project directory
-            project_workspaces = self._config_manager.get_config_value(
-                "project_workspaces",
-                config_source="user_config",
-                default={},
+            # Decide the workspace dir + override bit once (shared with the provisioning
+            # preview via decide_workspace, so the two cannot drift). apply_override is
+            # True only for the project_workspaces mapping and the auto-default-to-project
+            # branches; for an env/project-adjacent workspace_directory it is False, so the
+            # override stays unset and the workspace config layer can re-point workspace_path.
+            decision = self.decide_workspace(
+                project_file_path,
+                self._config_manager.project_config,
+                self._config_manager.env_config,
             )
-            workspace_override = self._find_workspace_override(project_file_path, project_workspaces)
-
-            if workspace_override is not None:
-                self._config_manager.set_workspace_override(Path(workspace_override))
-            elif (
-                "workspace_directory" not in self._config_manager.project_config
-                and "workspace_directory" not in self._config_manager.env_config
-            ):
-                # If neither the project-adjacent config nor env vars explicitly set
-                # workspace_directory, default the workspace to the project directory itself.
-                self._config_manager.set_workspace_override(project_dir)
+            if decision.apply_override:
+                self._config_manager.set_workspace_override(decision.workspace_dir)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
         elif project_info is not None and project_info.project_file_path is None:
-            # Switching to system defaults: clear any project-specific workspace override
-            # and reload configs so workspace_path resolves from default config layers.
-            self._config_manager.set_workspace_override(None)
+            # Switching to system defaults: clear_project_layers() above already dropped
+            # the prior project's override and config-file paths, so reloading configs now
+            # resolves workspace_path and all config layers from defaults only.
+            self._config_manager.load_configs()
+        else:
+            # Unknown project id (no loaded template): clear_project_layers() above already
+            # dropped the prior project's layers, so remerge from defaults rather than leave
+            # config in the cleared, unmerged state.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after
@@ -1108,6 +1482,8 @@ class ProjectManager:
 
         new_workspace = self._config_manager.workspace_path
         workspace_changed = old_workspace != new_workspace
+        new_library_config = self._snapshot_library_config()
+        library_config_changed = old_library_config != new_library_config
 
         if self._initialization_complete:
             # Persist the active project's file path so the next engine restart
@@ -1123,16 +1499,15 @@ class ProjectManager:
             except Exception:
                 logger.warning("Failed to persist project_file '%s' to config", persisted_project_file)
 
-            failure = await self._reload_after_project_switch(resolved_project_id, workspace_changed=workspace_changed)
+            failure = await self._reload_after_project_switch(
+                resolved_project_id,
+                workspace_changed=workspace_changed,
+                library_config_changed=library_config_changed,
+            )
             if failure is not None:
-                return failure
+                return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
-        result = SetCurrentProjectResultSuccess(
-            result_details=f"Successfully set current project. ID: {resolved_project_id}",
-        )
-        if workspace_changed and self._initialization_complete:
-            result.altered_workflow_state = True
-        return result
+        return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
     def on_get_current_project_request(
         self, _request: GetCurrentProjectRequest
@@ -1149,7 +1524,7 @@ class ProjectManager:
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
 
-    def on_save_project_template_request(
+    def on_save_project_template_request(  # noqa: C901, PLR0911
         self, request: SaveProjectTemplateRequest
     ) -> SaveProjectTemplateResultSuccess | SaveProjectTemplateResultFailure:
         """Save user customizations to project.yml.
@@ -1160,6 +1535,11 @@ class ProjectManager:
         3. Write to disk via File.write_text
         4. Invalidate cache (force reload on next access)
         """
+        # Canonical file path: the identity locator for cache keys below and the
+        # legacy bridge id for an id-less save. The write itself uses
+        # request.project_path directly (the OS boundary canonicalizes it).
+        canonical_path = canonicalize_for_identity(request.project_path)
+
         # Step 1: Validate and parse template_data
         try:
             template = ProjectTemplate.model_validate(request.template_data)
@@ -1168,39 +1548,62 @@ class ProjectManager:
                 result_details=f"Attempted to save project template to '{request.project_path}'. Failed because template data is invalid: {e}",
             )
 
+        # A legacy (id-less) file being saved gets its derived path-string id
+        # written explicitly, so the file becomes id'd on disk. This is the only
+        # place a derived id is persisted, and only on an explicit Save.
+        if template.id is None:
+            template.id = str(canonical_path)
+
         # Step 2: Choose the diff base. When the child declares a parent, the overlay
         # must diff against the parent's fully-merged template so values inherited
         # from the parent don't redundantly appear in the child's YAML. The parent
         # must already be in the registry; if not, fail loudly rather than silently
         # diffing against system defaults (which would emit inherited values into
-        # the child's overlay). Per-platform mappings are reduced to the active
-        # platform's path before lookup; a mapping with no matching key and no
-        # `default` falls back to system defaults (no parent on this OS).
+        # the child's overlay).
+        #
+        # Precedence mirrors load: an explicit parent_project_id (portable) wins
+        # and is looked up directly in the registry; otherwise the legacy
+        # parent_project_path is resolved by filesystem path. Per-platform path
+        # mappings are reduced to the active platform's value first; a mapping
+        # with no matching key and no `default` falls back to system defaults
+        # (no parent on this OS).
         base_template: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE
-        selected_parent = select_project_path(template.parent_project_path)
-        if selected_parent is not None:
-            parent_id = self._resolve_parent_path_for_lookup(
-                selected_parent,
-                anchor=request.project_path,
-            )
-            if parent_id is None:
-                return SaveProjectTemplateResultFailure(
-                    result_details=(
-                        f"Attempted to save project template to '{request.project_path}'. "
-                        f"Failed because parent_project_path '{selected_parent}' "
-                        f"is relative and no anchor could be resolved."
-                    ),
-                )
-            parent_info = self._successfully_loaded_project_templates.get(parent_id)
+        if template.parent_project_id is not None:
+            parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
             if parent_info is None:
                 return SaveProjectTemplateResultFailure(
                     result_details=(
                         f"Attempted to save project template to '{request.project_path}'. "
-                        f"Failed because parent project '{selected_parent}' "
-                        f"(resolved to '{parent_id}') is not loaded. Load the parent before saving the child."
+                        f"Failed because parent project id '{template.parent_project_id}' is not loaded. "
+                        f"Load the parent before saving the child."
                     ),
                 )
             base_template = parent_info.template
+        else:
+            selected_parent = select_project_path(template.parent_project_path)
+            if selected_parent is not None:
+                parent_id = self._resolve_parent_path_for_lookup(
+                    selected_parent,
+                    anchor=request.project_path,
+                )
+                if parent_id is None:
+                    return SaveProjectTemplateResultFailure(
+                        result_details=(
+                            f"Attempted to save project template to '{request.project_path}'. "
+                            f"Failed because parent_project_path '{selected_parent}' "
+                            f"is relative and no anchor could be resolved."
+                        ),
+                    )
+                parent_info = self._successfully_loaded_project_templates.get(parent_id)
+                if parent_info is None:
+                    return SaveProjectTemplateResultFailure(
+                        result_details=(
+                            f"Attempted to save project template to '{request.project_path}'. "
+                            f"Failed because parent project '{selected_parent}' "
+                            f"(resolved to '{parent_id}') is not loaded. Load the parent before saving the child."
+                        ),
+                    )
+                base_template = parent_info.template
 
         # Step 3: Serialize to YAML
         try:
@@ -1218,10 +1621,14 @@ class ProjectManager:
                 result_details=f"Attempted to save project template to '{request.project_path}'. Failed because file write failed: {e}",
             )
 
-        # Step 4: Invalidate cache so next LoadProjectTemplateRequest reads from disk
-        project_id: ProjectID = str(request.project_path)
-        self._successfully_loaded_project_templates.pop(project_id, None)
-        self._registered_template_status.pop(request.project_path, None)
+        # Step 4: Invalidate the cache so the next LoadProjectTemplateRequest reads
+        # from disk. The registry is id-keyed, so locate the loaded entry by its
+        # file path (a path string is not its id) and pop that id; the status map
+        # is path-keyed, so pop it by the canonical path.
+        for loaded_id, loaded_info in list(self._successfully_loaded_project_templates.items()):
+            if loaded_info.project_file_path == canonical_path:
+                self._successfully_loaded_project_templates.pop(loaded_id, None)
+        self._registered_template_status.pop(canonical_path, None)
 
         return SaveProjectTemplateResultSuccess(
             result_details=f"Successfully saved project template to '{request.project_path}'",
@@ -1266,50 +1673,97 @@ class ProjectManager:
         validation: ProjectValidationInfo,
         editing_project_id: str | None,
     ) -> None:
-        """Walk parent_project_path through the registry and report any cycle.
+        """Walk the parent chain through the registry and report any cycle.
 
         Only consults `_successfully_loaded_project_templates` (no disk I/O), so
         it catches the common GUI scenario where the user picks a parent whose
         own ancestry transitively points back to itself. A parent that isn't
         registered yet is silently allowed; the load path catches truly missing
-        parents.
+        parents and cycles.
 
-        When `editing_project_id` is provided, it is canonicalized and seeded
-        into the visited set so a cycle that includes "myself" (e.g. the user
-        picks a parent that already points back at the project being edited)
+        The walk is conducted in id-space: every parent link is reduced to the
+        parent's project id before comparison, so an opaque GUID id and a legacy
+        path-string id are compared consistently. `editing_project_id` (the id of
+        the project being edited) seeds the visited set *verbatim* (not
+        canonicalized -- an id is not a path) so a cycle that includes "myself"
+        (the user picks a parent that points back at the project being edited)
         is detected.
 
-        `parent_project_path` values are stored as absolute or relative paths
-        (macro tokens are rejected by the loader). Each hop resolves relative
-        paths against the *containing* template's file path before looking up
-        the registry key.
+        A `parent_project_id` link is already an id. A legacy `parent_project_path`
+        is resolved to a canonical path -- relative paths against the *containing*
+        project's file path, taken from the registry, not from the opaque id --
+        and then mapped to the parent's registered id; an unregistered legacy
+        parent uses its canonical path string as its id (the legacy bridge).
         """
         visited: set[str] = set()
         if editing_project_id is not None:
-            visited.add(str(canonicalize_for_identity(Path(editing_project_id))))
+            visited.add(editing_project_id)
 
-        # Reduce the (possibly per-platform) parent value to a string for the
-        # active OS at every hop. A per-platform mapping with no key matching
-        # this OS and no `default` ends the walk on this platform — the cycle
-        # only exists on platforms whose selections all land in the same chain.
-        current_parent_raw = select_project_path(template.parent_project_path)
-        current_anchor: Path | None = Path(editing_project_id) if editing_project_id is not None else None
-        while current_parent_raw is not None:
-            resolved = self._resolve_parent_path_for_lookup(current_parent_raw, current_anchor)
-            if resolved is None:
+        # Reverse map so a legacy parent_project_path link resolves to the
+        # parent's real (id-keyed) registry key rather than its path string.
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
+        # Anchor for resolving the first hop's relative legacy path is the
+        # editing project's own file path from the registry. A brand-new project
+        # being validated is not registered yet, so the anchor is None and a
+        # relative parent_project_path simply can't be resolved here (load-time
+        # detection still applies). The opaque id is never used as a path anchor.
+        editing_info = (
+            self._successfully_loaded_project_templates.get(editing_project_id)
+            if editing_project_id is not None
+            else None
+        )
+        current_template: ProjectTemplate | None = template
+        current_anchor: Path | None = editing_info.project_file_path if editing_info is not None else None
+        while current_template is not None:
+            parent_id = self._reduce_parent_link_to_id(current_template, current_anchor, file_path_to_id)
+            if parent_id is None:
                 return
-            if resolved in visited:
+            if parent_id in visited:
+                field_path = (
+                    "parent_project_id" if current_template.parent_project_id is not None else "parent_project_path"
+                )
                 validation.add_error(
-                    field_path="parent_project_path",
-                    message=f"Cycle detected in parent chain at '{resolved}'",
+                    field_path=field_path,
+                    message=f"Cycle detected in parent chain at '{parent_id}'",
                 )
                 return
-            visited.add(resolved)
-            parent_info = self._successfully_loaded_project_templates.get(resolved)
+            visited.add(parent_id)
+            parent_info = self._successfully_loaded_project_templates.get(parent_id)
             if parent_info is None:
                 return
-            current_parent_raw = select_project_path(parent_info.template.parent_project_path)
+            current_template = parent_info.template
             current_anchor = parent_info.project_file_path
+
+    def _reduce_parent_link_to_id(
+        self,
+        template: ProjectTemplate,
+        anchor: Path | None,
+        file_path_to_id: dict[Path, ProjectID],
+    ) -> str | None:
+        """Reduce a template's parent link to the parent's project id.
+
+        `parent_project_id` wins and is returned verbatim. Otherwise the legacy
+        `parent_project_path` is reduced to the active platform's value, resolved
+        against `anchor` (canonicalized), and mapped to the parent's registered id;
+        an unregistered legacy parent uses its canonical path string as its id
+        (the legacy bridge). Returns None when there is no parent link, when a
+        per-platform path has no entry for this OS, or when a relative path has no
+        anchor to resolve against.
+        """
+        if template.parent_project_id is not None:
+            return template.parent_project_id
+        selected_parent = select_project_path(template.parent_project_path)
+        if selected_parent is None:
+            return None
+        resolved_path = self._resolve_parent_path_for_lookup(selected_parent, anchor)
+        if resolved_path is None:
+            return None
+        return file_path_to_id.get(Path(resolved_path), resolved_path)
 
     def _resolve_parent_path_for_lookup(self, raw_parent: str, anchor: Path | str | None) -> str | None:
         """Resolve a stored parent_project_path to a canonical registry key.
@@ -1330,7 +1784,7 @@ class ProjectManager:
             parent_path = Path(anchor).parent / parent_path
         return str(canonicalize_for_identity(parent_path))
 
-    def on_unregister_project_template_request(
+    def on_unregister_project_template_request(  # noqa: C901, PLR0912
         self, request: UnregisterProjectTemplateRequest
     ) -> UnregisterProjectTemplateResultSuccess | UnregisterProjectTemplateResultFailure:
         """Remove a registered project template from in-memory caches and persisted config.
@@ -1343,25 +1797,53 @@ class ProjectManager:
         """
         project_id = request.project_id
 
-        if (
-            project_id not in self._successfully_loaded_project_templates
-            and Path(project_id) not in self._registered_template_status
-        ):
+        # Locate the project's file path (the locator) from its id. A loaded
+        # project carries its path in ProjectInfo; a legacy / failed-load entry
+        # is only tracked in the Path-keyed status map, where its id IS its path
+        # string. Either way we resolve to the canonical file path so the
+        # path-keyed status map and the path-list persistence can be cleaned up.
+        loaded_info = self._successfully_loaded_project_templates.get(project_id)
+        file_path: Path | None = None
+        if loaded_info is not None:
+            file_path = loaded_info.project_file_path
+        elif Path(project_id) in self._registered_template_status:
+            file_path = Path(project_id)
+
+        if project_id not in self._successfully_loaded_project_templates and file_path is None:
             return UnregisterProjectTemplateResultFailure(
                 result_details=f"Attempted to unregister project template '{project_id}'. Failed because it is not registered.",
             )
 
-        # Remove from in-memory caches
+        # Remove from in-memory caches: the registry is id-keyed, the status map
+        # is path-keyed.
         self._successfully_loaded_project_templates.pop(project_id, None)
-        self._registered_template_status.pop(Path(project_id), None)
+        if file_path is not None:
+            self._registered_template_status.pop(file_path, None)
 
-        # Remove from persisted config so it is not reloaded on restart
-        try:
-            registered: list[str] = self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
-            updated = [p for p in registered if p != project_id]
-            self._config_manager.set_config_value(PROJECTS_TO_REGISTER_KEY, updated)
-        except Exception:
-            logger.warning("Failed to remove project path '%s' from persisted config", project_id)
+        # Remove from persisted config so it is not reloaded on restart.
+        # PROJECTS_TO_REGISTER_KEY stores file paths, so filter by canonical-path
+        # equality rather than comparing against the (possibly non-path) id.
+        if file_path is not None:
+            try:
+                registered: list[str | dict | PerPlatformProjectPath] = (
+                    self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
+                )
+                updated: list[str | dict | PerPlatformProjectPath] = []
+                for entry in registered:
+                    if isinstance(entry, dict):
+                        try:
+                            selected = select_project_path(PerPlatformProjectPath.model_validate(entry))
+                        except ValidationError:
+                            updated.append(entry)
+                            continue
+                    else:
+                        selected = select_project_path(entry)
+                    if selected is not None and canonicalize_for_identity(selected) == file_path:
+                        continue
+                    updated.append(entry)
+                self._config_manager.set_config_value(PROJECTS_TO_REGISTER_KEY, updated)
+            except Exception:
+                logger.warning("Failed to remove project path '%s' from persisted config", file_path)
 
         # If this was the active project, fall back to system defaults (in-memory
         # and persisted) so the next restart doesn't try to restore a project
@@ -1932,7 +2414,7 @@ class ProjectManager:
 
         return workspace_project_path
 
-    async def _load_workspace_project(self) -> str | None:
+    async def _load_workspace_project(self) -> str | None:  # noqa: PLR0911
         """Load workspace-level project template overlay if present.
 
         Checks for a project file using _resolve_project_file_path. If found, loads
@@ -1971,6 +2453,24 @@ class ProjectManager:
             )
             return "the project YAML could not be parsed"
 
+        # Derive the project id (the registry key). An explicit overlay id wins;
+        # a legacy project with no id falls back to the file path string. From
+        # here on the id identifies the project and the path is only a locator.
+        project_id = overlay.id if overlay.id is not None else str(workspace_project_path)
+
+        # Fail closed on an id collision: a *different* file already holds this
+        # id. Reloading the same file (same id, same path) is a no-op refresh.
+        existing = self._successfully_loaded_project_templates.get(project_id)
+        if existing is not None and existing.project_file_path != workspace_project_path:
+            logger.error(
+                "Attempted to load workspace project from '%s'. Failed because its id '%s' is already used by a "
+                "different project at '%s'.",
+                workspace_project_path,
+                project_id,
+                existing.project_file_path,
+            )
+            return f"its id '{project_id}' is already used by a different project at '{existing.project_file_path}'"
+
         template = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
 
         if not validation.is_usable():
@@ -1988,7 +2488,6 @@ class ProjectManager:
             )
             return f"the project template is not usable (status: {validation.status}). Problems: {problem_details}"
 
-        project_id = str(workspace_project_path)
         situation_schemas = self._parse_situation_macros(template.situations, validation)
         directory_schemas = self._parse_directory_macros(template.directories, validation)
 
@@ -2025,14 +2524,80 @@ class ProjectManager:
         are available in the template list. Paths already loaded (e.g., the
         workspace project) are skipped. Missing or invalid files are skipped
         with a warning rather than raising.
+
+        A pre-pass reads each registered file's overlay id to build a transient
+        id -> file path index, so an id-based parent can be located even when its
+        child is registered (and loaded) before it. The index is cleared once the
+        load loop finishes; at runtime the live registry serves single-file loads.
         """
         registered_entries: list[str | dict | PerPlatformProjectPath] = (
             self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
         )
+        resolved_paths = self._resolve_registered_entry_paths(registered_entries)
+
+        # A directory entry is recursively scanned for project files (each loaded
+        # without persisting), mirroring how libraries_to_register expands a
+        # folder. Split directories from individual file entries so the id pre-pass
+        # and the per-file load loop only see files; directories are scanned after.
+        directory_paths = [path for path in resolved_paths if path.is_dir()]
+        file_paths = [path for path in resolved_paths if not path.is_dir()]
+
+        # Pre-pass: index id -> canonical path so child-before-parent ordering
+        # still resolves id-based parents (which carry no path) during the load
+        # loop below.
+        self._boot_id_to_file_path = {}
+        for canonical_path in file_paths:
+            read_load = await self._read_overlay(canonical_path)
+            if isinstance(read_load, LoadProjectTemplateResultFailure):
+                continue
+            _, overlay = read_load
+            if overlay.id is not None:
+                self._boot_id_to_file_path[overlay.id] = canonical_path
+
+        try:
+            for canonical_path in file_paths:
+                # Skip files already loaded (e.g. the workspace project). Correlate
+                # by the file path locator, not by id: the registry is id-keyed, so
+                # a path string would never match an explicitly-id'd project's key.
+                already_loaded = any(
+                    info.project_file_path == canonical_path
+                    for info in self._successfully_loaded_project_templates.values()
+                )
+                if already_loaded:
+                    continue
+                load_request = LoadProjectTemplateRequest(project_path=canonical_path)
+                result = await self.on_load_project_template_request(load_request)
+                if result.failed():
+                    logger.warning(
+                        "Failed to load registered project '%s' on startup: %s",
+                        canonical_path,
+                        result.result_details,
+                    )
+                else:
+                    logger.debug("Reloaded registered project from '%s'", canonical_path)
+
+            for directory in directory_paths:
+                await self._load_projects_from_directory(directory)
+        finally:
+            # The index is only meaningful during boot.
+            self._boot_id_to_file_path = {}
+
+    def _resolve_registered_entry_paths(
+        self, registered_entries: list[str | dict | PerPlatformProjectPath]
+    ) -> list[Path]:
+        """Resolve persisted projects_to_register entries to canonical file paths.
+
+        Coerces raw dicts (from JSON/YAML config) into the per-platform model so
+        select_project_path can apply the active-platform key and `default`
+        fallback uniformly, selects the active-platform path, then canonicalizes
+        it (expand ~/env vars + absolutize + follow symlinks) so different
+        spellings of the same file collide. Entries with no path for the active
+        platform, or that fail validation, are skipped with a warning. Duplicate
+        canonical paths are de-duplicated so each file is processed once.
+        """
+        resolved: list[Path] = []
+        seen: set[Path] = set()
         for entry in registered_entries:
-            # Coerce raw dicts (from JSON/YAML config) into the per-platform
-            # model so select_project_path can apply the active-platform key
-            # and `default` fallback uniformly.
             if isinstance(entry, dict):
                 try:
                     selectable: str | PerPlatformProjectPath | None = PerPlatformProjectPath.model_validate(entry)
@@ -2053,29 +2618,60 @@ class ProjectManager:
                     entry,
                 )
                 continue
-            # Project IDs are canonicalized absolute paths, so expand ~/env
-            # vars and resolve the persisted string before checking for an
-            # existing load (prevents duplicate entries when the same file
-            # was persisted under different spellings).
-            resolved_id = str(canonicalize_for_identity(path_str))
-            if resolved_id in self._successfully_loaded_project_templates:
+            canonical_path = canonicalize_for_identity(path_str)
+            if canonical_path in seen:
                 continue
-            load_request = LoadProjectTemplateRequest(project_path=Path(path_str))
-            result = await self.on_load_project_template_request(load_request)
+            seen.add(canonical_path)
+            resolved.append(canonical_path)
+        return resolved
+
+    async def _load_projects_from_directory(self, directory: Path) -> None:
+        """Discover and load every project file under a registered directory.
+
+        Recursively scans for WORKSPACE_PROJECT_FILE, loading each match into
+        memory without persisting it. The directory entry is the unit of
+        registration, so discovered files cannot be individually unregistered;
+        they are re-discovered on each startup. The scan is depth-bounded by the
+        `discovery_max_depth` setting and hidden directories (e.g. .venv, .git)
+        are skipped by find_files_recursive.
+        """
+        discovered = await find_files_recursive(directory, WORKSPACE_PROJECT_FILE)
+        if not discovered:
+            logger.warning(
+                "projects_to_register directory '%s' contains no '%s' files; skipping",
+                directory,
+                WORKSPACE_PROJECT_FILE,
+            )
+            return
+        for project_file in discovered:
+            # Correlate by the file path locator, not by id: the registry is
+            # id-keyed, so a path string would never match an explicitly-id'd
+            # project's key.
+            canonical_path = canonicalize_for_identity(project_file)
+            already_loaded = any(
+                info.project_file_path == canonical_path
+                for info in self._successfully_loaded_project_templates.values()
+            )
+            if already_loaded:
+                continue
+            result = await self._load_and_cache_project_template(project_file, persist_path=False)
             if result.failed():
                 logger.warning(
-                    "Failed to load registered project '%s' on startup: %s",
-                    path_str,
+                    "Failed to load discovered project '%s' from directory '%s': %s",
+                    project_file,
+                    directory,
                     result.result_details,
                 )
             else:
-                logger.debug("Reloaded registered project from '%s'", path_str)
+                logger.debug("Loaded discovered project '%s' from directory '%s'", project_file, directory)
 
-    def _register_project_path(self, project_id: str) -> None:
+    def _register_project_path(self, project_file_path: str) -> None:
         """Persist a project file path so it is loaded on the next engine restart.
 
-        Appends the path to the projects_to_register config list if not already
-        present. Errors are logged as warnings and do not affect the load result.
+        PROJECTS_TO_REGISTER_KEY stores file paths (locators), not ids: boot
+        reloads each file by path and re-derives its id. Appends the canonical
+        path to the list if not already present. Errors are logged as warnings
+        and do not affect the load result.
         """
         try:
             registered: list[str | dict | PerPlatformProjectPath] = (
@@ -2098,7 +2694,7 @@ class ProjectManager:
                 if selected is None:
                     continue
                 resolved_existing.add(str(canonicalize_for_identity(selected)))
-            if project_id not in resolved_existing:
-                self._config_manager.set_config_value(PROJECTS_TO_REGISTER_KEY, [*registered, project_id])
+            if project_file_path not in resolved_existing:
+                self._config_manager.set_config_value(PROJECTS_TO_REGISTER_KEY, [*registered, project_file_path])
         except Exception:
-            logger.warning("Failed to persist project path '%s' to config", project_id)
+            logger.warning("Failed to persist project path '%s' to config", project_file_path)
