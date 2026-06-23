@@ -19,23 +19,69 @@ model it likes.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any
+
+
+class CheckpointAction(StrEnum):
+    """The semantic operations the engine gates at a checkpoint.
+
+    Carried by `AuthorizationCheckpoint.action` so a hook branches on a named
+    member rather than a bare string literal. Each value is the wire string the
+    app's policy matches on.
+    """
+
+    LOAD_LIBRARY = "LoadLibrary"
+    INSTANTIATE_NODE = "InstantiateNode"
+    INVOKE_MODEL = "InvokeModel"
+    LOAD_PROJECT = "LoadProject"
+    ACTIVATE_PROJECT = "ActivateProject"
+
+
+class CheckpointSubjectType(StrEnum):
+    """The kinds of subject a checkpoint acts on, paired with `subject_id`."""
+
+    LIBRARY = "Library"
+    NODE_TYPE = "NodeType"
+    MODEL = "Model"
+    PROJECT = "Project"
+
+
+class CheckpointAttribute(StrEnum):
+    """The attribute keys the engine fills on a checkpoint's `attributes`.
+
+    Centralizing the keys keeps the engine's producer side and the app's policy
+    hook reading the same names, so a typo cannot silently drop a fact. The engine
+    fills only the keys it has resolved for a given checkpoint; a hook reads
+    whichever it cares about. Members are `str` values, so they serve as dict keys
+    that compare equal to their literal spelling on the reading side.
+    """
+
+    ID = "id"
+    LIFECYCLE_STAGE = "lifecycle_stage"
+    PROVIDER_ID = "provider_id"
+    EXECUTES_ARBITRARY_CODE = "executes_arbitrary_code"
+    NAME = "name"
+    MODEL_IDS = "model_ids"
+    PROVIDER_IDS = "provider_ids"
+    MODEL_FAMILIES = "model_families"
 
 
 @dataclass(frozen=True)
 class AuthorizationCheckpoint:
     """One point where the engine asks whether a resolved operation is permitted.
 
-    `action` is the semantic operation (e.g. ``"LoadLibrary"``, ``"InstantiateNode"``).
+    `action` is the semantic operation (e.g. ``CheckpointAction.LOAD_LIBRARY``).
     `subject_type` / `subject_id` identify the thing being acted on (e.g.
-    ``"Library"`` and the library name). `attributes` are the facts the engine
-    owns about that subject (e.g. ``{"lifecycle_stage": "EXPERIMENTAL"}``); a hook
-    decides which it cares about. The engine fills only what it has resolved; it
-    does not know which attributes a policy will read.
+    ``CheckpointSubjectType.LIBRARY`` and the library name). `attributes` are the
+    facts the engine owns about that subject (e.g.
+    ``{CheckpointAttribute.LIFECYCLE_STAGE: "EXPERIMENTAL"}``); a hook decides
+    which it cares about. The engine fills only what it has resolved; it does not
+    know which attributes a policy will read.
     """
 
-    action: str
-    subject_type: str
+    action: CheckpointAction
+    subject_type: CheckpointSubjectType
     subject_id: str
     attributes: dict[str, Any] = field(default_factory=dict)
 

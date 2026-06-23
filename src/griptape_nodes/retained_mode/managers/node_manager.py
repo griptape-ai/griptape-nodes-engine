@@ -225,7 +225,13 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint, CheckpointDenial
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointDenial,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -491,7 +497,7 @@ class NodeManager:
         gate runs from a loaded library (node instantiation) and from a library
         schema (library-load fitness preview), before any module is imported.
         """
-        attributes: dict[str, Any] = {"id": node_type}
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: node_type}
         node_stage = next(
             (
                 declaration.stage
@@ -501,7 +507,7 @@ class NodeManager:
             None,
         )
         if node_stage is not None:
-            attributes["lifecycle_stage"] = node_stage.value
+            attributes[CheckpointAttribute.LIFECYCLE_STAGE] = node_stage.value
         else:
             library_stage = next(
                 (
@@ -512,7 +518,7 @@ class NodeManager:
                 None,
             )
             if library_stage is not None:
-                attributes["lifecycle_stage"] = library_stage.value
+                attributes[CheckpointAttribute.LIFECYCLE_STAGE] = library_stage.value
         arbitrary = next(
             (
                 declaration
@@ -521,7 +527,9 @@ class NodeManager:
             ),
             None,
         )
-        attributes["executes_arbitrary_code"] = bool(arbitrary.executes_arbitrary_python) if arbitrary else False
+        attributes[CheckpointAttribute.EXECUTES_ARBITRARY_CODE] = (
+            bool(arbitrary.executes_arbitrary_python) if arbitrary else False
+        )
         attributes.update(
             NodeManager._node_model_checkpoint_facts(
                 node_declarations=node_declarations, library_declarations=library_declarations
@@ -584,11 +592,11 @@ class NodeManager:
 
         facts: dict[str, Any] = {}
         if model_ids:
-            facts["model_ids"] = list(dict.fromkeys(model_ids))
+            facts[CheckpointAttribute.MODEL_IDS] = list(dict.fromkeys(model_ids))
         if provider_ids:
-            facts["provider_ids"] = list(dict.fromkeys(provider_ids))
+            facts[CheckpointAttribute.PROVIDER_IDS] = list(dict.fromkeys(provider_ids))
         if families:
-            facts["model_families"] = list(dict.fromkeys(families))
+            facts[CheckpointAttribute.MODEL_FAMILIES] = list(dict.fromkeys(families))
         return facts
 
     @staticmethod
@@ -606,8 +614,8 @@ class NodeManager:
         """
         return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
-                action="InstantiateNode",
-                subject_type="NodeType",
+                action=CheckpointAction.INSTANTIATE_NODE,
+                subject_type=CheckpointSubjectType.NODE_TYPE,
                 subject_id=node_type,
                 attributes=NodeManager._node_checkpoint_attributes(
                     node_type=node_type,

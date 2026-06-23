@@ -96,7 +96,12 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
@@ -599,8 +604,8 @@ class ProjectManager:
         # facts; the name is passed in because the project is not cached yet.
         load_denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
-                action="LoadProject",
-                subject_type="Project",
+                action=CheckpointAction.LOAD_PROJECT,
+                subject_type=CheckpointSubjectType.PROJECT,
                 subject_id=project_id,
                 attributes=self._project_checkpoint_attributes(project_id, name=template.name),
             )
@@ -1407,10 +1412,10 @@ class ProjectManager:
         time, before the project is cached); at activation it falls back to the
         cached template so the load and activation gates resolve the same facts.
         """
-        attributes: dict[str, Any] = {"id": project_id}
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: project_id}
         resolved_name = name if name is not None else self._cached_project_name(project_id)
         if resolved_name:
-            attributes["name"] = str(resolved_name)
+            attributes[CheckpointAttribute.NAME] = str(resolved_name)
         return attributes
 
     def _cached_project_name(self, project_id: ProjectID) -> str | None:
@@ -1451,8 +1456,8 @@ class ProjectManager:
         if resolved_project_id != SYSTEM_DEFAULTS_KEY:
             denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
                 AuthorizationCheckpoint(
-                    action="ActivateProject",
-                    subject_type="Project",
+                    action=CheckpointAction.ACTIVATE_PROJECT,
+                    subject_type=CheckpointSubjectType.PROJECT,
                     subject_id=resolved_project_id,
                     attributes=self._project_checkpoint_attributes(resolved_project_id),
                 )

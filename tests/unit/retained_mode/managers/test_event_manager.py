@@ -23,8 +23,11 @@ from griptape_nodes.retained_mode.events.generic_events import GenericResultFail
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
     CheckpointDenial,
     CheckpointFailure,
+    CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -660,10 +663,10 @@ class TestAuthorizationCheckpointHooks:
     @staticmethod
     def _checkpoint() -> AuthorizationCheckpoint:
         return AuthorizationCheckpoint(
-            action="LoadLibrary",
-            subject_type="Library",
+            action=CheckpointAction.LOAD_LIBRARY,
+            subject_type=CheckpointSubjectType.LIBRARY,
             subject_id="lib",
-            attributes={"lifecycle_stage": "LABS"},
+            attributes={CheckpointAttribute.LIFECYCLE_STAGE: "LABS"},
         )
 
     def test_no_hooks_allows(self) -> None:

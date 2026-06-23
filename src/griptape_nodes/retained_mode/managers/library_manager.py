@@ -195,7 +195,12 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
@@ -5119,8 +5124,8 @@ class LibraryManager:
         # permission on the failure icon. With no hook installed this allows.
         denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
-                action="LoadLibrary",
-                subject_type="Library",
+                action=CheckpointAction.LOAD_LIBRARY,
+                subject_type=CheckpointSubjectType.LIBRARY,
                 subject_id=schema.name,
                 attributes=self._library_checkpoint_attributes(schema),
             )
@@ -5162,7 +5167,7 @@ class LibraryManager:
         The engine supplies what it has resolved and does not know which a policy
         will read.
         """
-        attributes: dict[str, Any] = {"id": schema.name}
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: schema.name}
         stage = next(
             (
                 declaration.stage
@@ -5172,7 +5177,7 @@ class LibraryManager:
             None,
         )
         if stage is not None:
-            attributes["lifecycle_stage"] = stage.value
+            attributes[CheckpointAttribute.LIFECYCLE_STAGE] = stage.value
         return attributes
 
     async def load_libraries_request(self, request: LoadLibrariesRequest) -> ResultPayload:  # noqa: ARG002, C901, PLR0912

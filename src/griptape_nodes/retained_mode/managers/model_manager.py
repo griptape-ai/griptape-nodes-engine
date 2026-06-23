@@ -49,7 +49,12 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.authorization_checkpoint import AuthorizationCheckpoint
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.utils.async_utils import cancel_subprocess
 
@@ -733,9 +738,9 @@ class ModelManager:
         routes to (when the node declared one). The app maps `provider_id` onto
         the `Model in ModelProvider` hierarchy a policy walks via `in`.
         """
-        attributes: dict[str, Any] = {"id": request.model}
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: request.model}
         if request.provider_id:
-            attributes["provider_id"] = request.provider_id
+            attributes[CheckpointAttribute.PROVIDER_ID] = request.provider_id
         return attributes
 
     def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
@@ -760,8 +765,8 @@ class ModelManager:
         # is resolved app-side from the declared provider_id.
         denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
-                action="InvokeModel",
-                subject_type="Model",
+                action=CheckpointAction.INVOKE_MODEL,
+                subject_type=CheckpointSubjectType.MODEL,
                 subject_id=request.model,
                 attributes=self._model_checkpoint_attributes(request),
             )
