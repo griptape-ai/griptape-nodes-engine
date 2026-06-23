@@ -754,7 +754,7 @@ class ModelManager:
         inference itself; this handler does not run any backend.
 
         Args:
-            request: The declared invocation, identifying the model and task
+            request: The declared invocation, identifying the catalog model
 
         Returns:
             ResultPayload: Success, meaning the node is cleared to proceed
@@ -777,8 +777,8 @@ class ModelManager:
                 result_details=f"Model invocation denied for '{request.model}'. {reason}"
             )
         return DeclareModelInvocationResultSuccess(
-            model=request.model,
-            result_details=f"Model invocation permitted for '{request.model}'.",
+            model_id=request.model_id,
+            result_details=f"Model invocation permitted for '{request.model_id}'.",
         )
 
     def _search_models(self, request: SearchModelsRequest) -> SearchResultsData:

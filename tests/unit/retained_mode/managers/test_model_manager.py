@@ -197,41 +197,38 @@ class TestOnHandleDeclareModelInvocationRequest:
         # declaration, so the node is cleared to invoke the model itself.
         result = model_manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(
-                model="claude-opus-4-7",
-                provider_id="anthropic",
+                model_id="gtc_claude_opus_4_7",
                 node_name="Agent_1",
             )
         )
 
         assert isinstance(result, DeclareModelInvocationResultSuccess)
-        assert result.model == "claude-opus-4-7"
+        assert result.model_id == "gtc_claude_opus_4_7"
 
     def test_a_denying_pre_dispatch_hook_short_circuits_before_the_handler(self) -> None:
         # End to end: enforcement lives in the pre-dispatch chain, not the
         # handler. A hook that denies the declaration short-circuits with its
         # own failure; an allowed declaration reaches the handler and comes
-        # back as a clear-to-proceed success. Policies gate the shared catalog
-        # handles (here, the provider), not the concrete model string.
+        # back as a clear-to-proceed success. Policies gate the stable catalog
+        # model key, the only handle the declaration carries.
         event_manager = EventManager()
         ModelManager(event_manager)
 
         def deny(request: RequestPayload, _context: object) -> DeclareModelInvocationResultFailure | None:
-            if isinstance(request, DeclareModelInvocationRequest) and request.provider_id == "blocked_provider":
-                return DeclareModelInvocationResultFailure(result_details="This provider is blocked by your license.")
+            if isinstance(request, DeclareModelInvocationRequest) and request.model_id == "blocked_model":
+                return DeclareModelInvocationResultFailure(result_details="This model is blocked by your license.")
             return None
 
         event_manager.add_pre_dispatch_hook(deny)
 
-        denied = event_manager.handle_request(
-            DeclareModelInvocationRequest(model="blocked-model", provider_id="blocked_provider")
-        )
-        allowed = event_manager.handle_request(DeclareModelInvocationRequest(model="gpt-ok", provider_id="openai"))
+        denied = event_manager.handle_request(DeclareModelInvocationRequest(model_id="blocked_model"))
+        allowed = event_manager.handle_request(DeclareModelInvocationRequest(model_id="gtc_gpt_5"))
 
         assert isinstance(denied.result, DeclareModelInvocationResultFailure)
         assert "blocked by your license" in str(denied.result.result_details)
         # The allowed declaration reached the handler, which cleared it.
         assert isinstance(allowed.result, DeclareModelInvocationResultSuccess)
-        assert allowed.result.model == "gpt-ok"
+        assert allowed.result.model_id == "gtc_gpt_5"
 
     def test_authorization_checkpoint_denial_blocks_invocation(self) -> None:
         # The InvokeModel checkpoint gates the declared invocation: a denial from
