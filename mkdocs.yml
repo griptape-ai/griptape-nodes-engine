@@ -35,6 +35,7 @@ plugins:
           - projects/index.md: Project system overview
           - projects/workspace.md: Workspace concepts
           - projects/projects.md: Projects
+          - projects/version_pinning.md: Pinning engine and library versions
           - projects/macros.md: Macros
           - projects/directories.md: Directories
           - projects/situations.md: Situations
@@ -151,6 +152,7 @@ nav:
               - 4. Compare Prompts: ftue/03_compare_prompts/FTUE_03_compare_prompts.md
               - 5. Build a Photography Team: ftue/04_photography_team/FTUE_04_photography_team.md
       - Engine Configuration: configuration.md
+      - Configuration Reference: configuration_reference.md
       - Libraries: libraries.md
       - Command Line Interface: command_line_interface.md
       - Scripting: retained_mode.md
@@ -158,6 +160,7 @@ nav:
           - Overview: projects/index.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
+          - Version Pinning: projects/version_pinning.md
           - Macros: projects/macros.md
           - Directories: projects/directories.md
           - Situations: projects/situations.md

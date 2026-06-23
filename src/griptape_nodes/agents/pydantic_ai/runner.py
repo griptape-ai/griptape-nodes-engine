@@ -151,6 +151,7 @@ class PydanticAgentRunner:
     workspace_root: Path
     storage: BaseThreadStorageDriver
     instructions: str | None = None
+    system_prompt: str | None = None
     base_url: str | None = None
     mcp_servers: list[AbstractToolset[Any]] = field(default_factory=list)
     image_config: ImageGenerationToolsetConfig | None = None
@@ -166,11 +167,16 @@ class PydanticAgentRunner:
         toolsets: list[Any] = list(self.mcp_servers)
         instructions = self._build_instructions()
         capabilities = self._build_skills_capabilities()
+        agent_kwargs: dict[str, Any] = {
+            "instructions": instructions,
+            "toolsets": toolsets or None,
+            "capabilities": capabilities or None,
+        }
+        if self.system_prompt:
+            agent_kwargs["system_prompt"] = self.system_prompt
         self._agent = Agent(
             build_griptape_cloud_model(self.model_name, api_key=self.api_key, base_url=self.base_url),
-            instructions=instructions,
-            toolsets=toolsets or None,
-            capabilities=capabilities or None,
+            **agent_kwargs,
         )
         if self.image_config is not None:
             if self.static_files_manager is None:

@@ -4,7 +4,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import re
 import sys
 import time
@@ -14,7 +13,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.retained_mode.events import worker_events
-from griptape_nodes.retained_mode.events.app_events import ConfigChanged, SecretChanged
+from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
@@ -163,6 +162,7 @@ class WorkerManager:
         # a worker fan-out.
         event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
         event_manager.add_listener_to_app_event(SecretChanged, self._on_secret_changed)
+        event_manager.add_listener_to_app_event(CurrentProjectChanged, self._on_current_project_changed)
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -322,7 +322,12 @@ class WorkerManager:
         if worker_key in self._managed_worker_processes:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        proc = await asyncio.create_subprocess_exec(*args, env={**os.environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        # Spawn with the orchestrator's PRE-project environ so the worker boots with the
+        # same clean env baseline a fresh engine would have. Inheriting the live os.environ
+        # would bake the orchestrator's current-project env vars into the worker's restore
+        # baseline, leaving the worker unable to unset them on a later project switch.
+        base_environ = self._griptape_nodes.ProjectManager().get_pre_project_environ()
+        proc = await asyncio.create_subprocess_exec(*args, env={**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
         # Record the loop that owns this subprocess so termination can hop back to it.
         # All spawns run on the engine event-queue loop, so this is idempotent.
         self._spawn_loop = asyncio.get_running_loop()
@@ -688,6 +693,22 @@ class WorkerManager:
         if self._transport is None or not self._workers:
             return
         await self.broadcast_to_workers(EventRequest(request=RefreshSecretsRequest()))
+
+    async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
+        """Fan out an ActivateProjectRequest after the orchestrator switched projects.
+
+        ProjectManager only emits ``CurrentProjectChanged`` from a successful
+        post-init activation, so receiving it means workers should adopt the new
+        project. Carries the new project's id; a worker boots like an engine, so
+        the same id is already loaded in its registry. Awaited inline for the same
+        side-loop reason documented on ``_on_config_changed``; lazy import for
+        the same circular-dependency reason.
+        """
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        if self._transport is None or not self._workers:
+            return
+        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
 
     def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
         """Tell every registered worker to handle ``request_type`` locally.
