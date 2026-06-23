@@ -158,6 +158,7 @@ nav:
       - Scripting: retained_mode.md
       - Project System:
           - Overview: projects/index.md
+          - Managing Projects (GUI): projects/gui_guide.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
           - Version Pinning: projects/version_pinning.md

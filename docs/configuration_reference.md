@@ -85,10 +85,10 @@ Settings for artifact providers and preview generation
 
 Project template configurations and registrations
 
-| Setting              | Type   | Default | Environment variable           | Description                                                                                                                                                                                                                                                               |
-| -------------------- | ------ | ------- | ------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `project_file`       | string | `null`  | `GTN_CONFIG_PROJECT_FILE`      | Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of \<workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. |
-| `project_workspaces` | object | `{}`    | n/a (nested; edit config file) | Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.                     |
+| Setting              | Type   | Default | Environment variable           | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| -------------------- | ------ | ------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project_file`       | string | `null`  | `GTN_CONFIG_PROJECT_FILE`      | Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of \<workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults. |
+| `project_workspaces` | object | `{}`    | n/a (nested; edit config file) | Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.                                                                                                                                                                                                                                                                                                                   |
 
 ## Agent
 
@@ -97,3 +97,11 @@ Agent behavior and system prompt
 | Setting | Type   | Default         | Environment variable           | Description                                                   |
 | ------- | ------ | --------------- | ------------------------------ | ------------------------------------------------------------- |
 | `agent` | object | (nested object) | n/a (nested; edit config file) | Nested settings; edit the sub-keys directly in a config file. |
+
+## Libraries
+
+Settings for library management and dependency installation
+
+| Setting   | Type   | Default         | Environment variable           | Description                                                   |
+| --------- | ------ | --------------- | ------------------------------ | ------------------------------------------------------------- |
+| `library` | object | (nested object) | n/a (nested; edit config file) | Nested settings; edit the sub-keys directly in a config file. |
