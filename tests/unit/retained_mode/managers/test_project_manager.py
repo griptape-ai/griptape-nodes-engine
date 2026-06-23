@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1779,6 +1779,100 @@ class TestDecideWorkspace:
         mock_config.get_config_value.return_value = project_workspaces
         return ProjectManager(Mock(), mock_config, Mock())
 
+    @staticmethod
+    def _pm_with_config(
+        project_workspaces: dict[str, str],
+        configured_root: str | None,
+        default_root: str | None = None,
+    ) -> ProjectManager:
+        """Build a ProjectManager whose config distinguishes the branch-4 reads.
+
+        The single-return _pm_with_project_workspaces helper can't tell apart the
+        project_workspaces lookup from the configured-root workspace_directory reads (user_config
+        then default_config), which the inheritance branch needs. This keys the mock on
+        (key, config_source) instead. `configured_root` is the user_config layer value;
+        `default_root` is the default_config fallback the branch reads when user_config is None
+        (in production this is always populated by the Settings default).
+        """
+        mock_config = Mock()
+
+        def fake_get(key: str, *, config_source: str = "merged_config", default: Any = None, **_: Any) -> Any:
+            if key == "project_workspaces":
+                return project_workspaces
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            if key == "workspace_directory" and config_source == "default_config":
+                return default_root
+            return default
+
+        mock_config.get_config_value.side_effect = fake_get
+        return ProjectManager(Mock(), mock_config, Mock())
+
+    @staticmethod
+    def _pm_with_chain(
+        specs: list[dict[str, Any]],
+        *,
+        project_workspaces: dict[str, str] | None = None,
+        configured_root: str | None = None,
+        default_root: str | None = None,
+    ) -> ProjectManager:
+        """Build a ProjectManager whose registry models an explicit parent chain.
+
+        Each spec is a dict with keys `id` (registry key / parent link target),
+        `file` (Path to the project YAML, or None for a file-less project like system
+        defaults), `parent_id` (the spec's parent_project_id, or None), and an optional
+        `config` dict standing in for that project's adjacent griptape_nodes_config.json.
+        The mock `read_config_file` returns a spec's `config` keyed on the directory of
+        its file; `get_config_value` resolves project_workspaces and the global
+        workspace_directory (user_config then default_config) so the branch-4 walk and
+        branch-5 fallback both have realistic inputs.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        project_workspaces = project_workspaces or {}
+        mock_config = Mock()
+
+        def fake_get(key: str, *, config_source: str = "merged_config", default: Any = None, **_: Any) -> Any:
+            if key == "project_workspaces":
+                return project_workspaces
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            if key == "workspace_directory" and config_source == "default_config":
+                return default_root
+            return default
+
+        mock_config.get_config_value.side_effect = fake_get
+
+        dir_to_config: dict[Path, dict] = {
+            Path(spec["file"]).parent: spec["config"]
+            for spec in specs
+            if spec.get("file") is not None and "config" in spec
+        }
+
+        def fake_read_config_file(path: Path) -> dict:
+            return dir_to_config.get(Path(path).parent, {})
+
+        mock_config.read_config_file.side_effect = fake_read_config_file
+
+        pm = ProjectManager(Mock(), mock_config, Mock())
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        for spec in specs:
+            file_path = spec.get("file")
+            base_dir = Path(file_path).parent if file_path is not None else Path("/")
+            template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": spec.get("parent_id")})
+            pm._successfully_loaded_project_templates[spec["id"]] = ProjectInfo(
+                project_id=spec["id"],
+                project_file_path=Path(file_path) if file_path is not None else None,
+                project_base_dir=base_dir,
+                template=template,
+                validation=validation,
+                parsed_situation_schemas={},
+                parsed_directory_schemas={},
+            )
+        return pm
+
     def test_project_workspaces_override_wins(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
@@ -1826,10 +1920,169 @@ class TestDecideWorkspace:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
-        pm = self._pm_with_project_workspaces({})
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None)
         decision = pm.decide_workspace(project_file, project_config={}, env_config={})
 
         assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
+
+    def test_three_level_inherits_nearest_ancestor_workspace(self, tmp_path: Path) -> None:
+        """C inherits B's workspace when B (the nearest ancestor) defines one, not A's."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {"workspace_directory": "/ws/b"}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/ws/b")
+        assert decision.apply_override is True
+
+    def test_three_level_skips_to_grandparent_when_parent_has_none(self, tmp_path: Path) -> None:
+        """C inherits A's workspace when B (its parent) defines none but A does."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/ws/a")
+        assert decision.apply_override is True
+
+    def test_chain_exhausted_uses_global_default(self, tmp_path: Path) -> None:
+        """A project derived from the file-less default inherits the global workspace (Jason's case)."""
+        c_file = tmp_path / "test" / "griptape-nodes-project.yml"
+        c_file.parent.mkdir(parents=True)
+        c_file.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "<system-defaults>", "file": None, "parent_id": None},
+                {"id": "C", "file": c_file, "parent_id": "<system-defaults>", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_ancestor_override_mapping_wins(self, tmp_path: Path) -> None:
+        """An ancestor keyed in project_workspaces is inherited over its adjacent config."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "C", "file": c_file, "parent_id": "A", "config": {}},
+            ],
+            project_workspaces={str(a_file): "/mapped/a"},
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/mapped/a")
+        assert decision.apply_override is True
+
+    def test_start_project_sidecar_still_wins(self, tmp_path: Path) -> None:
+        """C's own project-adjacent workspace_directory (branch 3) wins and the walk never runs."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "C", "file": c_file, "parent_id": "A", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(
+            c_file,
+            project_config={"workspace_directory": "/explicit/ws"},
+            env_config={},
+        )
+
+        assert decision.workspace_dir == Path("/explicit/ws")
+        assert decision.apply_override is False
+
+    def test_imported_standalone_uses_global_default(self, tmp_path: Path) -> None:
+        """A parentless project outside the configured root adopts the global workspace, not its own dir."""
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        project_file = other_dir / "griptape-nodes-project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_chain(
+            [{"id": "C", "file": project_file, "parent_id": None, "config": {}}],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_cyclic_chain_falls_back_to_global_default(self, tmp_path: Path) -> None:
+        """A cyclic parent chain terminates via the visited set and falls back to the global default."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": "B", "config": {}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(a_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_global_default_unset_falls_back_to_own_dir(self, tmp_path: Path) -> None:
+        """Chain exhausted AND workspace_directory unset in both layers falls back to the project's own dir."""
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        c_file.parent.mkdir(parents=True)
+        c_file.touch()
+
+        pm = self._pm_with_chain(
+            [{"id": "C", "file": c_file, "parent_id": None, "config": {}}],
+            configured_root=None,
+            default_root=None,
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == c_file.parent
         assert decision.apply_override is True
 
 
@@ -1861,6 +2114,8 @@ class TestProjectManagerProjectWorkspaces:
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
             if key == REQUIRES_ENGINE_KEY:
+                return None
+            if key == "workspace_directory":
                 return None
             return default if default is not None else {}
 
@@ -2119,6 +2374,8 @@ class TestProjectManagerProjectWorkspaces:
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
             if key == REQUIRES_ENGINE_KEY:
+                return None
+            if key == "workspace_directory":
                 return None
             return default if default is not None else {}
 

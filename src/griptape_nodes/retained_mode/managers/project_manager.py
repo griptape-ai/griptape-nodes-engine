@@ -348,10 +348,10 @@ class WorkspaceDecision(NamedTuple):
 
     `workspace_dir` is the directory whose griptape_nodes_config.json supplies the
     workspace config layer. `apply_override` is True only when activation calls
-    set_workspace_override(workspace_dir): the project_workspaces mapping and the
-    auto-default-to-project-dir branches. It is False when env vars or the
-    project-adjacent config supply workspace_directory, because activation then
-    leaves the override unset so the workspace config layer can re-point it.
+    set_workspace_override(workspace_dir): the project_workspaces mapping, the
+    parent-chain inheritance, and the global-default branches. It is False when env
+    vars or the project-adjacent config supply workspace_directory, because activation
+    then leaves the override unset so the workspace config layer can re-point it.
     """
 
     workspace_dir: Path
@@ -1287,10 +1287,30 @@ class ProjectManager:
         1. project_workspaces user-config override -> (override dir, apply_override=True)
         2. workspace_directory from env vars -> (env dir, apply_override=False)
         3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
-        4. the project's own directory (auto-default) -> (project dir, apply_override=True)
+        4. the nearest ancestor's resolved workspace, walking the explicit parent-project chain ->
+           (ancestor workspace, apply_override=True)
+        5. the global configured workspace_directory, else the project's own directory (auto-default)
+           -> (configured root or project dir, apply_override=True)
 
-        `apply_override` is True only for the override-mapping and auto-default branches,
-        because those are the cases where activation calls set_workspace_override. For env
+        Branch 4 walks the project's explicit parent chain (parent_project_id / legacy
+        parent_project_path, resolved through the registry) and inherits the first ancestor that
+        resolves a workspace via its own override mapping or project-adjacent config. This makes a
+        derived project with no workspace of its own inherit its parent's workspace instead of
+        treating its own subdir as a fresh workspace (which would resolve libraries_directory to an
+        empty libraries/ tree and wrongly prompt to reinstall already downloaded libraries). It only
+        fires when no explicit workspace was named above, so a project-adjacent workspace_directory
+        (branch 3) still wins and a sidecar config remains a full opt-out at every level of the
+        chain. See _inherit_workspace_from_parents.
+
+        Branch 5's global default is unconditional: when the chain is exhausted with no ancestor
+        workspace, the configured workspace_directory is used regardless of where the project file
+        sits on disk, so an imported standalone project with no ancestor workspace adopts the global
+        workspace. The final own-directory fallback only fires when workspace_directory is unset in
+        both config layers; in a real engine the Settings default always populates default_config, so
+        this is a defensive path exercised only by tests that mock both layers to None.
+
+        `apply_override` is True only for the override-mapping, parent-inheritance, and global-default
+        branches, because those are the cases where activation calls set_workspace_override. For env
         or project-adjacent workspace_directory, activation leaves the override unset so the
         workspace config layer can re-point the final workspace_path; a forced override
         would mask that. Both _activate_project (live) and the provisioning preview drive
@@ -1314,6 +1334,24 @@ class ProjectManager:
         if project_workspace is not None:
             return WorkspaceDecision(Path(project_workspace), apply_override=False)
 
+        inherited = self._inherit_workspace_from_parents(project_file_path)
+        if inherited is not None:
+            return WorkspaceDecision(Path(inherited), apply_override=True)
+
+        configured_root = self._config_manager.get_config_value(
+            "workspace_directory",
+            config_source="user_config",
+            default=None,
+        )
+        if configured_root is None:
+            configured_root = self._config_manager.get_config_value(
+                "workspace_directory",
+                config_source="default_config",
+                default=None,
+            )
+        if configured_root is not None:
+            return WorkspaceDecision(Path(configured_root), apply_override=True)
+
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
@@ -1323,6 +1361,70 @@ class ProjectManager:
             (v for k, v in project_workspaces.items() if str(canonicalize_for_identity(k)) == resolved_project_path),
             None,
         )
+
+    def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:  # noqa: PLR0911
+        """Walk the explicit parent-project chain for the nearest ancestor's workspace.
+
+        Returns the workspace_directory the nearest ancestor would resolve to (its
+        project_workspaces override, else its adjacent griptape_nodes_config.json),
+        or None when no ancestor in the chain defines one. The walk is conducted in
+        id-space through the registry (no disk template loads); each ancestor's
+        adjacent config is read read-only. A visited id-set guards against a cyclic
+        parent chain. The starting project's OWN explicit sources are handled by the
+        earlier branches of decide_workspace, so the walk begins at the parent.
+        """
+        project_workspaces = self._config_manager.get_config_value(
+            "project_workspaces",
+            config_source="user_config",
+            default={},
+        )
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
+        resolved_start_path = canonicalize_for_identity(project_file_path)
+        start_id = next(
+            (
+                pid
+                for pid, info in self._successfully_loaded_project_templates.items()
+                if info.project_file_path is not None
+                and canonicalize_for_identity(info.project_file_path) == resolved_start_path
+            ),
+            None,
+        )
+        if start_id is None:
+            return None
+
+        visited: set[ProjectID] = {start_id}
+        current_info = self._successfully_loaded_project_templates.get(start_id)
+        while current_info is not None:
+            parent_id = self._reduce_parent_link_to_id(
+                current_info.template,
+                current_info.project_file_path,
+                file_path_to_id,
+            )
+            if parent_id is None:
+                return None
+            if parent_id in visited:
+                return None
+            visited.add(parent_id)
+            parent_info = self._successfully_loaded_project_templates.get(parent_id)
+            if parent_info is None:
+                return None
+            if parent_info.project_file_path is not None:
+                override = self._find_workspace_override(parent_info.project_file_path, project_workspaces)
+                if override is not None:
+                    return override
+                parent_config = self._config_manager.read_config_file(
+                    parent_info.project_file_path.parent / "griptape_nodes_config.json"
+                )
+                parent_workspace = parent_config.get("workspace_directory")
+                if parent_workspace is not None:
+                    return parent_workspace
+            current_info = parent_info
+        return None
 
     def _snapshot_library_config(self) -> str:
         """Return a stable string of the merged library-affecting config for change detection.
@@ -1476,9 +1578,10 @@ class ProjectManager:
 
             # Decide the workspace dir + override bit once (shared with the provisioning
             # preview via decide_workspace, so the two cannot drift). apply_override is
-            # True only for the project_workspaces mapping and the auto-default-to-project
-            # branches; for an env/project-adjacent workspace_directory it is False, so the
-            # override stays unset and the workspace config layer can re-point workspace_path.
+            # True for the project_workspaces mapping, parent-chain inheritance, and
+            # global-default branches; for an env/project-adjacent workspace_directory it is
+            # False, so the override stays unset and the workspace config layer can re-point
+            # workspace_path.
             decision = self.decide_workspace(
                 project_file_path,
                 self._config_manager.project_config,
