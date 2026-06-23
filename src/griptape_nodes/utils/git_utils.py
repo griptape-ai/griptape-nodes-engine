@@ -1327,3 +1327,82 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> tuple[st
 
     logger.debug("Git CLI not available, using pygit2 shallow clone from %s", remote_url)
     return _shallow_clone_with_pygit2(remote_url, ref)
+
+
+def _remote_ref_exists_with_git_cli(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag ref exists on a remote using the git CLI.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    result = subprocess.run(  # noqa: S603
+        ["git", "ls-remote", "--heads", "--tags", remote_url, ref],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = f"Failed to query remote refs from {remote_url}: {result.stderr.strip()}"
+        raise GitRemoteError(msg)
+
+    return bool(result.stdout.strip())
+
+
+def _remote_ref_exists_with_pygit2(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag ref exists on a remote using pygit2.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    candidate_names = {f"refs/heads/{ref}", f"refs/tags/{ref}"}
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = pygit2.init_repository(temp_dir, bare=True)
+        try:
+            remote = repo.remotes.create("origin", remote_url)
+            remote_refs = remote.ls_remotes(callbacks=_CredentialCallbacks())
+        except pygit2.GitError as e:
+            msg = f"Failed to query remote refs from {remote_url}: {e}"
+            raise GitRemoteError(msg) from e
+        finally:
+            repo.free()
+
+    return any(remote_ref.get("name") in candidate_names for remote_ref in remote_refs)
+
+
+def remote_ref_exists(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag named ``ref`` exists on a git remote.
+
+    Uses the git CLI when available and falls back to pygit2 otherwise, mirroring
+    sparse_checkout_library_json. Commit SHAs are not advertised as named refs, so a
+    detached HEAD pointing at a bare commit reports False.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    if _is_git_available():
+        logger.debug("Using git CLI to check remote ref '%s' on %s", ref, remote_url)
+        return _remote_ref_exists_with_git_cli(remote_url, ref)
+
+    logger.debug("Git CLI not available, using pygit2 to check remote ref '%s' on %s", ref, remote_url)
+    return _remote_ref_exists_with_pygit2(remote_url, ref)
