@@ -541,6 +541,45 @@ class TestNodeInstantiationAuthorizationCheckpoint:
             node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME
         )
 
+    def test_worker_materialize_denied_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
+        """Worker-side construction from caller-supplied metadata is gated by the same checkpoint."""
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.retained_mode.events.execution_events import (
+            ExecuteNodeRequest,
+            ExecuteNodeResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        self._register(node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)])
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.action == "InstantiateNode":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Labs nodes are disabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        request = ExecuteNodeRequest(
+            node_name="probe-1",
+            node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+        )
+        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "Labs nodes are disabled." in str(result.result_details)
+
+    def test_worker_materialize_allows_without_hook(self, griptape_nodes: GriptapeNodes) -> None:
+        """With no policy hook the worker path builds the node, matching the no-denial contract."""
+        from griptape_nodes.exe_types.node_types import BaseNode
+        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+
+        self._register()
+        request = ExecuteNodeRequest(
+            node_name="probe-1",
+            node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+        )
+        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        assert isinstance(result, BaseNode)
+        assert result.name == "probe-1"
+
     def test_schema_preview_returns_denied_node_types(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure

@@ -3062,6 +3062,24 @@ class NodeManager:
             return ExecuteNodeResultFailure(
                 result_details=f"Node '{node_name}' node_metadata is missing 'node_type'.",
             )
+        # Gate worker-side construction on the same InstantiateNode checkpoint
+        # CreateNode enforces. node_metadata is caller-supplied, so without this
+        # a node the policy denies could be instantiated and executed by sending
+        # ExecuteNodeRequest straight to a worker, never passing through the
+        # gated CreateNode path.
+        try:
+            denial = self._evaluate_instantiation_checkpoint(node_type=node_type, specific_library_name=library_name)
+        except KeyError:
+            # Node type/library not registered here; let create_node below
+            # surface the clearer "node type not found" failure rather than
+            # masking it with a checkpoint-resolution error.
+            denial = None
+        if denial is not None:
+            return ExecuteNodeResultFailure(
+                result_details=(
+                    f"Node '{node_name}' of type '{node_type}' denied by license policy: {denial.reason()}"
+                ),
+            )
         try:
             return LibraryRegistry.create_node(
                 node_type=node_type,
