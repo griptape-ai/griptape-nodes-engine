@@ -50,6 +50,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_DEPRECATED_MODELS,
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
+    PROVIDER_PRESETS,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import (
@@ -72,11 +73,16 @@ from griptape_nodes.retained_mode.events.agent_events import (
     DeleteThreadRequest,
     DeleteThreadResultFailure,
     DeleteThreadResultSuccess,
+    GetAgentConfigRequest,
+    GetAgentConfigResultSuccess,
     GetConversationMemoryRequest,
     GetConversationMemoryResultFailure,
     GetConversationMemoryResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
+    ListProviderModelsRequest,
+    ListProviderModelsResultFailure,
+    ListProviderModelsResultSuccess,
     ListThreadsRequest,
     ListThreadsResultFailure,
     ListThreadsResultSuccess,
@@ -176,7 +182,14 @@ class AgentManager:
     def __init__(self, static_files_manager: StaticFilesManager, event_manager: EventManager | None = None) -> None:
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
-        self._model_name: str = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
+        provider_config = config_manager.get_config_value("agent.provider") or {}
+        if isinstance(provider_config, str):
+            # Flat legacy value — treat the string as the provider id.
+            provider_config = {"id": provider_config}
+        self._provider: str = provider_config.get("id", "griptape_cloud")
+        self._model_name: str = provider_config.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")
+        self._custom_base_url: str = provider_config.get("base_url", "")
+        self._custom_api_key: str = provider_config.get("api_key", "")
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
         self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
@@ -186,8 +199,8 @@ class AgentManager:
             self._threads_dir, config_manager, secrets_manager
         )
 
-        # Cache one runner per (model, image-model, mcp-set) tuple; rebuild when any changes.
-        self._runner_cache: dict[tuple[str, str, tuple[str, ...]], PydanticAgentRunner] = {}
+        # Cache one runner per (provider, model, image-model, base-url, mcp-set); rebuild when any changes.
+        self._runner_cache: dict[tuple[str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
 
         # Cancel handles for in-flight runs, keyed by thread_id. A CancelAgentRequest
         # signals the event; the run races it and unwinds. Populated for the duration
@@ -212,6 +225,10 @@ class AgentManager:
             )
             event_manager.assign_manager_to_request_type(
                 ListAgentModelsRequest, self.on_handle_list_agent_models_request
+            )
+            event_manager.assign_manager_to_request_type(GetAgentConfigRequest, self.on_handle_get_agent_config_request)
+            event_manager.assign_manager_to_request_type(
+                ListProviderModelsRequest, self.on_handle_list_provider_models_request
             )
 
             event_manager.add_listener_to_app_event(
@@ -440,36 +457,101 @@ class AgentManager:
     def on_handle_configure_agent_request(self, request: ConfigureAgentRequest) -> ResultPayload:
         """Update agent configuration from the chat sidebar.
 
-        Honors ``model`` on the prompt driver and ``model`` on the image
-        generation driver. Other ``image_generation_driver`` keys (size,
-        quality, background, output_format) are accepted but not yet plumbed
-        through to the runner's image config; changing the model rebuilds the
-        cached runners so the next run picks up the new image tool.
+        Prompt driver keys honored: ``provider``, ``model``, ``base_url``,
+        ``api_key``. Image generation driver key honored: ``model``. Other
+        keys are accepted but ignored. Any change that affects the runner
+        flushes the runner cache so the next run picks up the new settings.
         """
         try:
-            if "model" in request.prompt_driver:
-                new_model = str(request.prompt_driver["model"])
-                if new_model != self._model_name:
-                    self._model_name = new_model
-                    self._runner_cache.clear()
+            changed = self._apply_prompt_driver_config(request.prompt_driver)
             if "model" in request.image_generation_driver:
                 new_image_model = str(request.image_generation_driver["model"])
                 if new_image_model != self._image_model_name:
                     self._image_model_name = new_image_model
-                    self._runner_cache.clear()
+                    changed = True
+            if changed:
+                self._runner_cache.clear()
         except Exception as e:
             details = f"Error configuring agent: {e}"
             logger.exception(details)
             return ConfigureAgentResultFailure(result_details=details)
         return ConfigureAgentResultSuccess(result_details="Agent configured successfully.")
 
+    def _apply_prompt_driver_config(self, pd: dict) -> bool:
+        """Apply prompt driver config fields, return True if any value changed."""
+        changed = False
+        if "provider" in pd:
+            new_value = str(pd["provider"])
+            if new_value != self._provider:
+                self._provider = new_value
+                changed = True
+        if "model" in pd:
+            new_value = str(pd["model"])
+            if new_value != self._model_name:
+                self._model_name = new_value
+                changed = True
+        if "base_url" in pd:
+            new_value = str(pd["base_url"])
+            if new_value != self._custom_base_url:
+                self._custom_base_url = new_value
+                changed = True
+        if "api_key" in pd:
+            new_value = str(pd["api_key"])
+            if new_value != self._custom_api_key:
+                self._custom_api_key = new_value
+                changed = True
+        return changed
+
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
         return ListAgentModelsResultSuccess(
             prompt_models=list(MODEL_CHOICES),
             image_models=list(IMAGE_MODEL_CHOICES),
             deprecated_models={**DEPRECATED_MODELS, **IMAGE_DEPRECATED_MODELS},
+            provider_presets=list(PROVIDER_PRESETS),
             result_details="Agent model lists retrieved successfully.",
         )
+
+    def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
+        return GetAgentConfigResultSuccess(
+            provider=self._provider,
+            model_name=self._model_name,
+            image_model_name=self._image_model_name,
+            base_url=self._custom_base_url,
+            result_details="Agent config retrieved successfully.",
+        )
+
+    async def on_handle_list_provider_models_request(self, request: ListProviderModelsRequest) -> ResultPayload:
+        try:
+            if request.provider == "griptape_cloud":
+                return ListProviderModelsResultSuccess(
+                    models=list(MODEL_CHOICES),
+                    result_details="Griptape Cloud model list retrieved.",
+                )
+
+            base_url = request.base_url.rstrip("/")
+            if not base_url:
+                return ListProviderModelsResultFailure(
+                    result_details="Attempted to list provider models. Failed because base_url is required for non-Griptape-Cloud providers."
+                )
+
+            headers: dict[str, str] = {}
+            if request.api_key:
+                headers["Authorization"] = f"Bearer {request.api_key}"
+
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(f"{base_url}/models", headers=headers)
+                response.raise_for_status()
+
+            data = response.json()
+            models = sorted(entry["id"] for entry in data.get("data", []) if "id" in entry)
+            return ListProviderModelsResultSuccess(
+                models=models,
+                result_details=f"Retrieved {len(models)} models from {base_url}.",
+            )
+        except Exception as e:
+            details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
+            logger.warning(details)
+            return ListProviderModelsResultFailure(result_details=details)
 
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
         try:
@@ -486,19 +568,16 @@ class AgentManager:
             return GetConversationMemoryResultFailure(result_details=details)
 
     def _build_runner(self, additional_mcp_servers: list[str]) -> PydanticAgentRunner:
-        cache_key = (self._model_name, self._image_model_name, tuple(sorted(additional_mcp_servers)))
+        cache_key = (
+            self._provider,
+            self._model_name,
+            self._image_model_name,
+            self._custom_base_url,
+            tuple(sorted(additional_mcp_servers)),
+        )
         if (cached := self._runner_cache.get(cache_key)) is not None:
             return cached
 
-        api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
-        if not api_key:
-            msg = f"Secret '{API_KEY_ENV_VAR}' not found"
-            raise ValueError(msg)
-
-        # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
-        # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
-        # malformed endpoint, so the chat and image paths agree.
-        cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
         workspace_root = Path(config_manager.workspace_path)
         mcp_servers: list[AbstractToolset[Any]] = [
             streamable_http_local(
@@ -515,18 +594,36 @@ class AgentManager:
             if isinstance(rules, str) and rules.strip():
                 server_rules.append(f"Rules for MCP server '{cfg['name']}':\n{rules.strip()}")
 
+        if self._provider == "griptape_cloud":
+            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
+            if not api_key:
+                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
+                raise ValueError(msg)
+            # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
+            # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
+            # malformed endpoint, so the chat and image paths agree.
+            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
+            model_base_url: str | None = cloud_base_url
+            image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
+                api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
+            )
+        else:
+            api_key = self._custom_api_key
+            model_base_url = self._custom_base_url or None
+            # Image generation is Griptape Cloud-specific; disable for other providers.
+            image_config = None
+
         runner = PydanticAgentRunner(
             model_name=self._model_name,
+            provider=self._provider,
             api_key=api_key,
-            base_url=cloud_base_url,
+            base_url=model_base_url,
             workspace_root=workspace_root,
             storage=self._thread_storage,
             instructions=self._compose_instructions(server_rules),
             system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
-            image_config=ImageGenerationToolsetConfig(
-                api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
-            ),
+            image_config=image_config,
             static_files_manager=self.static_files_manager,
             usage_limits=DEFAULT_AGENT_USAGE_LIMITS,
         )

@@ -103,3 +103,40 @@ IMAGE_DEPRECATED_MODELS = {
 # Model IDs whose backend does not accept top_p (the OpenAI o-series).
 # Kept in sync with the o-entries in MODEL_CHOICES_ARGS.
 O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
+
+
+OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
+
+# Provider presets for the chat sidebar agent.
+# id: internal key used in ConfigureAgentRequest / GetAgentConfigResultSuccess
+# name: human-readable label shown in the UI
+# default_base_url: pre-filled URL (None = use engine default for that provider)
+# requires_api_key: whether the UI should show an API key field
+# has_model_list: True = show the curated MODEL_CHOICES dropdown; False = freetext
+# default_model: value to populate when the user first selects this provider
+PROVIDER_PRESETS: list[dict] = [
+    {
+        "id": "griptape_cloud",
+        "name": "Griptape Cloud",
+        "default_base_url": None,
+        "requires_api_key": False,
+        "has_model_list": True,
+        "default_model": MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
+    },
+    {
+        "id": "ollama",
+        "name": "Ollama (local)",
+        "default_base_url": OLLAMA_DEFAULT_BASE_URL,
+        "requires_api_key": False,
+        "has_model_list": False,
+        "default_model": "llama3.2",
+    },
+    {
+        "id": "custom",
+        "name": "Custom (OpenAI-compatible)",
+        "default_base_url": "",
+        "requires_api_key": True,
+        "has_model_list": False,
+        "default_model": "",
+    },
+]

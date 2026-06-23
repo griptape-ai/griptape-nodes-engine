@@ -17,6 +17,8 @@ import os
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from griptape_nodes.drivers.cloud_models import OLLAMA_DEFAULT_BASE_URL
+
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
 """Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
 
@@ -50,4 +52,51 @@ def build_griptape_cloud_model(
     return OpenAIChatModel(
         model_name,
         provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
+    )
+
+
+def build_model(
+    model_name: str,
+    *,
+    provider: str = "griptape_cloud",
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> OpenAIChatModel:
+    """Return an :class:`OpenAIChatModel` for the given provider.
+
+    Args:
+        model_name: Model identifier sent to the API.
+        provider: One of ``"griptape_cloud"``, ``"ollama"``, or ``"custom"``.
+        api_key: API key for the target endpoint. Required for
+            ``"griptape_cloud"`` (falls back to ``GT_CLOUD_API_KEY``) and
+            ``"custom"``. Ignored for ``"ollama"`` (no auth needed).
+        base_url: Base URL of the endpoint. For ``"griptape_cloud"`` the
+            ``/api/v1`` suffix is appended automatically. For ``"ollama"``
+            defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. Required for
+            ``"custom"``.
+
+    Raises:
+        ValueError: If required credentials or URLs are missing.
+    """
+    if provider == "griptape_cloud":
+        return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
+
+    if provider == "ollama":
+        resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
+        # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
+        return OpenAIChatModel(
+            model_name,
+            provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+        )
+
+    # "custom" or any future provider: caller must supply both url and key.
+    if not base_url:
+        msg = f"base_url is required for provider '{provider}'."
+        raise ValueError(msg)
+    if not api_key:
+        msg = f"api_key is required for provider '{provider}'."
+        raise ValueError(msg)
+    return OpenAIChatModel(
+        model_name,
+        provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
     )

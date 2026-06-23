@@ -525,18 +525,100 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     """Agent model lists retrieved successfully.
 
     Args:
-        prompt_models: Ordered list of prompt-model IDs.
-        image_models: Ordered list of image-model IDs.
+        prompt_models: Ordered list of prompt-model IDs available on Griptape Cloud.
+        image_models: Ordered list of image-model IDs available on Griptape Cloud.
         deprecated_models: Mapping of deprecated model ID to live replacement
             (covers both the prompt and image namespaces).
+        provider_presets: List of provider preset dicts, each with keys:
+            ``id``, ``name``, ``default_base_url``, ``requires_api_key``,
+            ``has_model_list``, ``default_model``.
     """
 
     prompt_models: list[str] = field(default_factory=list)
     image_models: list[str] = field(default_factory=list)
     deprecated_models: dict[str, str] = field(default_factory=dict)
+    provider_presets: list[dict] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
 class ListAgentModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Agent model list retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsRequest(RequestPayload):
+    """List models available from a specific provider endpoint.
+
+    For ``griptape_cloud`` returns the static curated catalog. For all other
+    providers makes a ``GET {base_url}/models`` call (OpenAI-compatible) and
+    returns whatever models the server reports. Use this to populate a model
+    picker when the user has selected a non-Griptape-Cloud provider.
+
+    Args:
+        provider: Provider id — ``"griptape_cloud"``, ``"ollama"``, or ``"custom"``.
+        base_url: Base URL of the endpoint (required for non-Griptape-Cloud providers).
+        api_key: API key sent as ``Authorization: Bearer`` (optional; omit for Ollama).
+
+    Results: ListProviderModelsResultSuccess | ListProviderModelsResultFailure
+    """
+
+    provider: str = "griptape_cloud"
+    base_url: str = ""
+    api_key: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider model list retrieved successfully.
+
+    Args:
+        models: Ordered list of model IDs reported by the provider.
+    """
+
+    models: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider model list retrieval failed. Common causes: provider unreachable, bad URL."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigRequest(RequestPayload):
+    """Get the current agent configuration.
+
+    Use when: Populating the agent settings panel with the current provider,
+    model, and endpoint values so the UI reflects live engine state.
+
+    Results: GetAgentConfigResultSuccess | GetAgentConfigResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Current agent configuration retrieved successfully.
+
+    Args:
+        provider: Active provider id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"custom"``).
+        model_name: Active prompt model id.
+        image_model_name: Active image generation model id.
+        base_url: Custom base URL in use for non-Griptape-Cloud providers.
+            Empty string when the provider manages its own URL.
+    """
+
+    provider: str
+    model_name: str
+    image_model_name: str
+    base_url: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent config retrieval failed."""
