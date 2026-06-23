@@ -21,6 +21,25 @@ if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
 
 
+def build_project_yaml() -> YAML:
+    """Build a YAML serializer with the shared project-template dump conventions.
+
+    Single-sources the quoting/width rules every project YAML is written with, so
+    standalone dumps (ProjectTemplate._dump_yaml) and in-place edits (the export
+    package's template rename) stay byte-compatible. Callers add their own
+    pre-processing (e.g. nested-key filtering) on top.
+    """
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.width = 4096
+    # Double-quote all strings; bools and ints are left untagged: https://yaml.org/spec/1.2.2/
+    yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
+    # Emit explicit "null" for None (deletion tombstones) so bare keys like `save_file:`
+    # don't look truncated in a hand-read of the file.
+    yaml.representer.add_representer(type(None), lambda r, _d: r.represent_scalar("tag:yaml.org,2002:null", "null"))
+    return yaml
+
+
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
@@ -180,14 +199,7 @@ class ProjectTemplate(BaseModel):
         Loader injects `name` into nested objects from their dict keys, so
         nested `name` keys are filtered out to avoid duplication on round-trip.
         """
-        yaml = YAML()
-        yaml.default_flow_style = False
-        yaml.width = 4096
-        # Double-quote all strings; bools and ints are left untagged: https://yaml.org/spec/1.2.2/
-        yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
-        # Emit explicit "null" for None (deletion tombstones) so bare keys like `save_file:`
-        # don't look truncated in a hand-read of the file.
-        yaml.representer.add_representer(type(None), lambda r, _d: r.represent_scalar("tag:yaml.org,2002:null", "null"))
+        yaml = build_project_yaml()
 
         nested_skip = frozenset({"name"})
 

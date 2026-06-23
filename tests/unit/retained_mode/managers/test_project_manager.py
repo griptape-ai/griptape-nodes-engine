@@ -6330,14 +6330,14 @@ def _register_config(register_path: str) -> dict:
 
 
 class TestClassifyLibraries:
-    """Test ProjectPackager.classify_libraries partitions download vs register libs."""
+    """Test classify_libraries partitions download vs register libs."""
 
     def test_download_entry_is_referenced(self, tmp_path: Path) -> None:
         """A libraries_to_download entry is REFERENCE: pin kept, no source copy."""
-        from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
 
         config = _download_config("https://example.com/lib.git", "v1.2.3", "remote_lib")
-        classification = ProjectPackager.classify_libraries(config, tmp_path)
+        classification = classify_libraries(config, tmp_path)
 
         assert len(classification.referenced) == 1
         referenced = classification.referenced[0]
@@ -6348,13 +6348,13 @@ class TestClassifyLibraries:
 
     def test_register_directory_entry_is_copied(self, tmp_path: Path) -> None:
         """A libraries_to_register dir entry is COPY_LOCAL with its dir recorded."""
-        from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
 
         lib_dir = tmp_path / "mylib"
         lib_dir.mkdir()
         (lib_dir / "griptape_nodes_library.json").write_text('{"name": "mylib"}', encoding="utf-8")
 
-        classification = ProjectPackager.classify_libraries(_register_config(str(lib_dir)), tmp_path)
+        classification = classify_libraries(_register_config(str(lib_dir)), tmp_path)
 
         assert classification.referenced == []
         assert len(classification.copied) == 1
@@ -6365,14 +6365,14 @@ class TestClassifyLibraries:
 
     def test_register_json_file_entry_records_containing_dir(self, tmp_path: Path) -> None:
         """A libraries_to_register JSON-file entry copies its parent dir, tracking the file."""
-        from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
 
         lib_dir = tmp_path / "mylib"
         lib_dir.mkdir()
         library_json = lib_dir / "griptape_nodes_library.json"
         library_json.write_text('{"name": "mylib"}', encoding="utf-8")
 
-        classification = ProjectPackager.classify_libraries(_register_config(str(library_json)), tmp_path)
+        classification = classify_libraries(_register_config(str(library_json)), tmp_path)
 
         assert len(classification.copied) == 1
         local = classification.copied[0]
@@ -6381,12 +6381,15 @@ class TestClassifyLibraries:
 
     def test_missing_register_entry_is_skipped_and_reported(self, tmp_path: Path) -> None:
         """A register entry whose source is missing is not copied but is reported."""
-        from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            classify_libraries,
+            find_missing_local_libraries,
+        )
 
         config = _register_config(str(tmp_path / "does_not_exist.json"))
 
-        classification = ProjectPackager.classify_libraries(config, tmp_path)
-        missing = ProjectPackager.find_missing_local_libraries(config, tmp_path)
+        classification = classify_libraries(config, tmp_path)
+        missing = find_missing_local_libraries(config, tmp_path)
 
         assert classification.copied == []
         assert missing == [str(tmp_path / "does_not_exist.json")]
@@ -6619,6 +6622,9 @@ class TestExportProject:
         lib_dir = tmp_path / "external_lib"
         lib_dir.mkdir()
         (lib_dir / "griptape_nodes_library.json").write_text('{"name": "external_lib"}', encoding="utf-8")
+        # A secret-bearing .env inside the local library dir must not be true-copied
+        # into the package: the copy path shares the base-dir mirror's exclusion set.
+        (lib_dir / ".env").write_text("LIB_SECRET=copied-lib-secret-value", encoding="utf-8")
         register_path = str(lib_dir / "griptape_nodes_library.json")
         project_yaml = _write_project_base_dir(tmp_path / "proj", _register_config(register_path))
         load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
@@ -6634,6 +6640,10 @@ class TestExportProject:
         with zipfile.ZipFile(destination) as archive:
             members = set(archive.namelist())
             assert "libraries/external_lib/griptape_nodes_library.json" in members
+            # The local library's .env (and its secret value) never travels.
+            assert "libraries/external_lib/.env" not in members
+            archive_bytes = b"".join(archive.read(name) for name in members if not name.endswith("/"))
+            assert b"copied-lib-secret-value" not in archive_bytes
             bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
         rewritten = get_dot_value(bundled_config, LIBRARIES_TO_REGISTER_KEY)
         assert rewritten == ["libraries/external_lib/griptape_nodes_library.json"]
@@ -6898,6 +6908,43 @@ class TestPreviewImportProject:
         assert isinstance(result, PreviewImportProjectResultFailure)
 
     @pytest.mark.asyncio
+    async def test_non_dict_manifest_fails_cleanly(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """A valid-JSON-but-non-dict manifest returns a clean Failure, not a traceback.
+
+        A tampered package whose manifest.json parses to a list/number/string would
+        otherwise reach is_manifest_schema_compatible(...).get(...) and raise an
+        uncaught AttributeError. read_manifest rejects the non-dict as a
+        JSONDecodeError (already in the handlers' caught set) so both preview and
+        import surface a Failure instead of crashing.
+        """
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ImportProjectRequest,
+            ImportProjectResultFailure,
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import MANIFEST_FILENAME
+
+        bad_manifest_zip = tmp_path / "bad-manifest.zip"
+        with zipfile.ZipFile(bad_manifest_zip, "w") as archive:
+            archive.writestr(MANIFEST_FILENAME, "[]")
+
+        pm = GriptapeNodes.ProjectManager()
+
+        preview_result = pm.on_preview_import_project_request(
+            PreviewImportProjectRequest(archive_path=bad_manifest_zip)
+        )
+        assert isinstance(preview_result, PreviewImportProjectResultFailure)
+
+        import_result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=bad_manifest_zip, target_directory=tmp_path / "imported")
+        )
+        assert isinstance(import_result, ImportProjectResultFailure)
+
+    @pytest.mark.asyncio
     async def test_preview_valid_archive_returns_manifest_and_unset_secrets(
         self,
         griptape_nodes: object,  # noqa: ARG002
@@ -7133,16 +7180,21 @@ class TestImportProject:
 
     @pytest.mark.asyncio
     async def test_round_trip_with_string_paths_from_wire(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
-        """Path fields arriving as wire strings are coerced, not crashed on.
+        """Path-typed request fields arriving as wire strings round-trip cleanly.
 
         project_events declares destination_path/archive_path/target_directory as
-        Path, but its TYPE_CHECKING-only Path import makes cattrs fall back to a
-        no-coercion structure (get_type_hints raises NameError), so over the
-        WebSocket these fields land as plain str. The handlers must coerce at the
-        boundary; before that fix on_export_project_request raised
-        AttributeError: 'str' object has no attribute 'parent'. Build the requests
-        with str (not Path) to reproduce the wire form.
+        Path. Over the WebSocket they arrive as plain JSON strings. Because
+        project_events imports Path at runtime, cattrs coerces those fields to Path
+        for the preview/import requests (verified below). ExportProjectRequest is
+        the exception: it also carries project_id: ProjectID, a TYPE_CHECKING-only
+        forward reference (project_events cannot import project_manager at runtime
+        without a cycle), so get_type_hints() raises NameError for the whole class
+        and cattrs falls back to a no-coercion structure. destination_path stays a
+        str there, so on_export_project_request coerces it at the boundary. Either
+        way the handler must not crash on a wire string; this exercises the real
+        converter path end to end.
         """
+        from griptape_nodes.retained_mode.events.event_converter import converter
         from griptape_nodes.retained_mode.events.project_events import (
             ExportProjectRequest,
             ExportProjectResultSuccess,
@@ -7161,19 +7213,27 @@ class TestImportProject:
         assert isinstance(load_result, LoadProjectTemplateResultSuccess)
 
         destination = tmp_path / "out.zip"
-        export_result = pm.on_export_project_request(
-            ExportProjectRequest(project_id=load_result.project_id, destination_path=str(destination))  # type: ignore[arg-type]
+        export_request = converter.structure(
+            {"project_id": load_result.project_id, "destination_path": str(destination)},
+            ExportProjectRequest,
         )
+        # ProjectID forward ref blocks coercion for this class; the field stays str.
+        assert isinstance(export_request.destination_path, str)
+        export_result = pm.on_export_project_request(export_request)
         assert isinstance(export_result, ExportProjectResultSuccess)
 
-        preview_result = pm.on_preview_import_project_request(
-            PreviewImportProjectRequest(archive_path=str(destination))  # type: ignore[arg-type]
-        )
+        preview_request = converter.structure({"archive_path": str(destination)}, PreviewImportProjectRequest)
+        assert isinstance(preview_request.archive_path, Path)
+        preview_result = pm.on_preview_import_project_request(preview_request)
         assert isinstance(preview_result, PreviewImportProjectResultSuccess)
 
         target = tmp_path / "imported"
-        import_result = await pm.on_import_project_request(
-            ImportProjectRequest(archive_path=str(destination), target_directory=str(target))  # type: ignore[arg-type]
+        import_request = converter.structure(
+            {"archive_path": str(destination), "target_directory": str(target)},
+            ImportProjectRequest,
         )
+        assert isinstance(import_request.archive_path, Path)
+        assert isinstance(import_request.target_directory, Path)
+        import_result = await pm.on_import_project_request(import_request)
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates

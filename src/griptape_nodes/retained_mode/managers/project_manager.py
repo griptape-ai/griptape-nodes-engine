@@ -118,7 +118,13 @@ from griptape_nodes.retained_mode.managers.settings import (
     PROJECTS_TO_REGISTER_KEY,
     REQUIRES_ENGINE_KEY,
 )
-from griptape_nodes.retained_mode.publishing.project_packager import ProjectPackager
+from griptape_nodes.retained_mode.publishing.project_packager import (
+    extract_archive,
+    is_manifest_schema_compatible,
+    package_project_to_zip,
+    read_manifest,
+    rename_project_template,
+)
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -390,6 +396,19 @@ class _ProvisioningConfigDirs(NamedTuple):
     project_dir: Path
     workspace_dir: Path
     apply_override: bool
+
+
+class _ManifestValidation(NamedTuple):
+    """Outcome of reading and schema-checking a project package's manifest.
+
+    On success `manifest` is the parsed dict and `failure_reason` is None. On
+    failure `manifest` is None and `failure_reason` holds the user-facing reason
+    fragment (no "Attempted to ..." prefix), so each handler can prepend its own
+    preview/import wording.
+    """
+
+    manifest: dict | None
+    failure_reason: str | None
 
 
 class ProjectManager:
@@ -2262,14 +2281,14 @@ class ProjectManager:
 
         Validates that the project is loaded and file-backed and that the
         destination's parent directory exists, then hands the project base dir and
-        its adjacent griptape_nodes_config.json to ProjectPackager. Secret VALUES
-        never leave the machine: only required secret KEY names travel.
+        its adjacent griptape_nodes_config.json to package_project_to_zip. Secret
+        VALUES never leave the machine: only required secret KEY names travel.
 
         Any loaded project may be exported, active or not. The library/asset
         content is read from the exported project's own files and is correct
         regardless. The required-secret-KEY list, however, is derived from the
         engine's merged global config and is most accurate when the exported
-        project is the active one (see ProjectPackager.collect_required_secret_keys).
+        project is the active one (see _collect_required_secret_keys).
         """
         project_info = self._successfully_loaded_project_templates.get(request.project_id)
         if project_info is None:
@@ -2284,10 +2303,13 @@ class ProjectManager:
                 ),
             )
 
-        # The wire form is always a string: project_events declares this field as
-        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
-        # coercion (get_type_hints raises NameError, so it falls back to a raw
-        # constructor call). Coerce at the boundary, matching os_events handlers.
+        # Coerce destination_path at the boundary. Unlike the preview/import
+        # requests, cattrs does NOT coerce this field from its wire string: this
+        # request also carries project_id: ProjectID, and ProjectID is a
+        # TYPE_CHECKING-only forward reference (project_events cannot import
+        # project_manager at runtime without a cycle). get_type_hints() therefore
+        # raises NameError for the whole class and cattrs falls back to a
+        # no-coercion structure, so destination_path arrives as str.
         destination_path = Path(request.destination_path)
         if not destination_path.parent.is_dir():
             return ExportProjectResultFailure(
@@ -2299,9 +2321,10 @@ class ProjectManager:
 
         project_dir = project_info.project_file_path.parent
         adjacent_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
+        required_secret_keys = self._collect_required_secret_keys()
 
         try:
-            result = ProjectPackager().package_project_to_zip(project_info, adjacent_config, destination_path)
+            result = package_project_to_zip(project_info, adjacent_config, destination_path, required_secret_keys)
         except (RuntimeError, OSError) as err:
             return ExportProjectResultFailure(
                 result_details=(
@@ -2329,34 +2352,22 @@ class ProjectManager:
         current environment, computed via get_secret(should_error_on_not_found=False)
         so nothing is written.
         """
-        # The wire form is always a string: project_events declares this field as
-        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
-        # coercion (get_type_hints raises NameError, so it falls back to a raw
-        # constructor call). Coerce at the boundary, matching os_events handlers.
-        archive_path = Path(request.archive_path)
-
-        try:
-            manifest = ProjectPackager.read_manifest(archive_path)
-        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
-            return PreviewImportProjectResultFailure(
-                result_details=(f"Attempted to preview project package '{archive_path}'. Failed because {err}"),
-            )
-
-        if not ProjectPackager.is_manifest_schema_compatible(manifest):
+        validation = self._read_and_validate_manifest(request.archive_path)
+        if validation.manifest is None:
             return PreviewImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to preview project package '{archive_path}'. "
-                    f"Failed because its manifest schema version "
-                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                    f"Attempted to preview project package '{request.archive_path}'. "
+                    f"Failed because {validation.failure_reason}"
                 ),
             )
+        manifest = validation.manifest
 
         required_secret_keys = manifest.get("required_secret_keys", [])
         unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
         return PreviewImportProjectResultSuccess(
             manifest=manifest,
             unset_secret_keys=unset_secret_keys,
-            result_details=f"Read manifest from project package '{archive_path}'.",
+            result_details=f"Read manifest from project package '{request.archive_path}'.",
         )
 
     async def on_import_project_request(
@@ -2370,48 +2381,35 @@ class ProjectManager:
         Macro-defined directories re-resolve against the new location automatically.
         Secrets are never auto-created; required/unset keys are returned for the GUI.
         """
-        # The wire form is always a string: project_events declares these fields as
-        # Path, but its TYPE_CHECKING-only Path import makes cattrs skip Path
-        # coercion (get_type_hints raises NameError, so it falls back to a raw
-        # constructor call). Coerce at the boundary, matching os_events handlers.
-        archive_path = Path(request.archive_path)
-        target_directory = Path(request.target_directory)
-
-        try:
-            manifest = ProjectPackager.read_manifest(archive_path)
-        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
-            return ImportProjectResultFailure(
-                result_details=f"Attempted to import project package '{archive_path}'. Failed because {err}",
-            )
-
-        if not ProjectPackager.is_manifest_schema_compatible(manifest):
+        validation = self._read_and_validate_manifest(request.archive_path)
+        if validation.manifest is None:
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{archive_path}'. "
-                    f"Failed because its manifest schema version "
-                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                    f"Attempted to import project package '{request.archive_path}'. "
+                    f"Failed because {validation.failure_reason}"
                 ),
             )
+        manifest = validation.manifest
 
-        target_yaml = target_directory / WORKSPACE_PROJECT_FILE
+        target_yaml = request.target_directory / WORKSPACE_PROJECT_FILE
         if target_yaml.exists() and not request.overwrite_existing:
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{archive_path}' into "
-                    f"'{target_directory}'. Failed because a project file already exists at "
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed because a project file already exists at "
                     f"'{target_yaml}' and overwrite_existing is False."
                 ),
             )
 
         try:
-            ProjectPackager.extract_archive(archive_path, target_directory)
+            extract_archive(request.archive_path, request.target_directory)
             if request.new_project_name is not None:
-                ProjectPackager.rename_project_template(target_yaml, request.new_project_name)
+                rename_project_template(target_yaml, request.new_project_name)
         except (zipfile.BadZipFile, OSError) as err:
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{archive_path}' into "
-                    f"'{target_directory}'. Failed during extraction because {err}"
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed during extraction because {err}"
                 ),
             )
 
@@ -2419,8 +2417,8 @@ class ProjectManager:
         if isinstance(load_result, LoadProjectTemplateResultFailure):
             return ImportProjectResultFailure(
                 result_details=(
-                    f"Attempted to import project package '{archive_path}' into "
-                    f"'{target_directory}'. Extracted successfully but the project failed to load: "
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Extracted successfully but the project failed to load: "
                     f"{load_result.result_details}"
                 ),
             )
@@ -2440,15 +2438,59 @@ class ProjectManager:
             if isinstance(activation_result, SetCurrentProjectResultFailure):
                 warnings.append(f"Imported project was not activated: {activation_result.result_details}")
 
-        logger.info("Imported project package '%s' into '%s'", archive_path, target_directory)
+        logger.info("Imported project package '%s' into '%s'", request.archive_path, request.target_directory)
         return ImportProjectResultSuccess(
             project_id=load_result.project_id,
             project_file_path=target_yaml,
             required_secret_keys=required_secret_keys,
             unset_secret_keys=unset_secret_keys,
             warnings=warnings,
-            result_details=f"Imported project package '{archive_path}' into '{target_directory}'.",
+            result_details=f"Imported project package '{request.archive_path}' into '{request.target_directory}'.",
         )
+
+    def _read_and_validate_manifest(self, archive_path: Path) -> _ManifestValidation:
+        """Read a project package's manifest and check its schema compatibility.
+
+        Returns the parsed manifest on success. On failure returns only the reason
+        fragment (no handler prefix) so the preview and import handlers can supply
+        their own user-facing wording.
+        """
+        try:
+            manifest = read_manifest(archive_path)
+        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+            return _ManifestValidation(manifest=None, failure_reason=str(err))
+
+        if not is_manifest_schema_compatible(manifest):
+            return _ManifestValidation(
+                manifest=None,
+                failure_reason=(
+                    f"its manifest schema version "
+                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                ),
+            )
+
+        return _ManifestValidation(manifest=manifest, failure_reason=None)
+
+    def _collect_required_secret_keys(self) -> list[str]:
+        """Return the names of secrets the project needs, with NO values.
+
+        Sourced from SecretsManager.secrets_to_register, which is core secrets
+        plus library-declared secrets (a config read returning a name->default
+        dict). The template.environment field resolves builtins/dirs/shell-env,
+        not secrets, so it is not a secret source. GetAllSecretValuesRequest is
+        never used: no secret VALUE ever leaves the machine.
+
+        Scoping caveat: secrets_to_register reflects the engine's MERGED GLOBAL
+        config (the currently-active project plus its LOADED libraries' declared
+        secrets), not the exported project's own adjacent config. Exporting a
+        project that is not the active one can therefore both over-report (keys
+        the active project's libraries need but the exported one does not) and
+        under-report (the exported project's own libraries are not loaded, so
+        their declared secrets never reach the global config). Exporting the
+        active project yields the closest-to-correct list. Scoping the key list
+        to the exported project specifically is deferred.
+        """
+        return sorted(self._secrets_manager.secrets_to_register.keys())
 
     def _compute_unset_secret_keys(self, required_secret_keys: list[str]) -> list[str]:
         """Return the subset of required keys with no value in the current environment.

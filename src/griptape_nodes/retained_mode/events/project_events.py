@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+
+# Runtime import (not TYPE_CHECKING): the Path-typed request fields below rely on
+# cattrs coercing wire-form strings to Path. cattrs resolves field types via
+# get_type_hints, which needs Path importable at runtime; under TYPE_CHECKING it
+# raises NameError and cattrs silently skips coercion, handing handlers raw strings.
+from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.common.macro_parser import MacroMatchFailure, MacroVariables, ParsedMacro, VariableInfo
@@ -17,8 +23,6 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
 
