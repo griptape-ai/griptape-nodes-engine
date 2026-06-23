@@ -1125,7 +1125,15 @@ class OSManager:
         existing_indices = []
 
         for filepath in existing_files:
-            extracted_index = self._extract_index_from_filename(str(filepath), parsed_macro, index_var_name, variables)
+            # Use POSIX form for the round-trip match. The macro template's static
+            # segments are `/`-separated, but on Windows ``str(WindowsPath(...))`` uses
+            # backslashes — the byte-for-byte compare in ``extract_variables`` would
+            # mismatch every separator and the scan would return 1 every call.
+            # ``Path.as_posix()`` is the codebase's established idiom and handles UNC
+            # roots correctly.
+            extracted_index = self._extract_index_from_filename(
+                filepath.as_posix(), parsed_macro, index_var_name, variables
+            )
             if extracted_index is not None:
                 existing_indices.append(extracted_index)
 
@@ -2019,7 +2027,10 @@ class OSManager:
                 wrapper = ParsedMacro(path_macro)
             resolve_result = GriptapeNodes.handle_request(GetPathForMacroRequest(parsed_macro=wrapper, variables={}))
             if isinstance(resolve_result, GetPathForMacroResultSuccess):
-                augmented[name] = str(resolve_result.absolute_path)
+                # Use POSIX form so the partial-resolved template stays separator-clean
+                # for the byte-for-byte compare in ``extract_variables``. A native
+                # ``WindowsPath`` here would mix `\` and `/` in the template segments.
+                augmented[name] = resolve_result.absolute_path.as_posix()
 
         return augmented
 
