@@ -350,7 +350,7 @@ class GetModelInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 @dataclass
 @PayloadRegistry.register
 class DeclareModelInvocationRequest(RequestPayload):
-    """Declare that a node is about to invoke a model, so the call is subject to entitlements.
+    """Declare that a node is about to invoke a catalog model, so the call is subject to entitlements.
 
     This is how a well-intentioned node opts into the permission system: before
     invoking a model it declares the invocation, and the pre-dispatch hook chain
@@ -360,35 +360,30 @@ class DeclareModelInvocationRequest(RequestPayload):
     and the node should not run it.
 
     Enforcement is advisory in the sense that it relies on the node to declare.
-    It is the engine-side point that sees every model invocation a node
-    performs, whatever the routing: a call routed through the Griptape cloud
-    proxy, a locally-run model, or a third-party API called directly. The proxy
-    independently enforces the calls that flow through it; this declaration is
-    the engine's own gate, seeing and recording every invocation uniformly
-    regardless of how it is routed, and the natural place to meter or audit.
+    It is the engine-side gate the permission system sees and records every
+    declared invocation through, and the natural place to meter or audit. The
+    proxy independently enforces the calls that flow through it; this is the
+    engine's own gate.
 
-    The declaration carries the two facts the node owns at call time: the
-    concrete `model` being invoked and the `provider_id` it routes to. Coarser
-    catalog structure (family, offering, key support) is not declared here — the
-    permission evaluator owns the model catalog and resolves those from
-    `(provider_id, model)` itself. `provider_id` is included because it is not
-    derivable from `model`: the same model is served by multiple providers
-    (e.g. Groq, NVIDIA NIM, and Ollama all serve Llama 3.3), and only the node
-    knows which one it actually called.
+    The declaration identifies the model by its `model_id`: the stable catalog
+    key, unique across the whole library. That key alone resolves to a single
+    catalog entry, so the permission evaluator (which owns the catalog) derives
+    the provider, family, and key support from it -- nothing coarser is
+    declared here. Only catalog models can be declared; the stable key is the
+    contract, and a concrete provider model id or `(provider, model)` pair is
+    deliberately not accepted.
 
-    Use when: A node is about to invoke a model and wants the call gated by
-    (and visible to) the permission system.
+    Use when: A node is about to invoke a catalog model and wants the call
+    gated by (and visible to) the permission system.
 
     Args:
-        model: Concrete model being invoked (e.g., "claude-opus-4-7")
-        provider_id: Catalog provider handle the call routes to (e.g., "anthropic", "ollama")
+        model_id: Stable catalog key of the model being invoked (e.g., "gtc_claude_opus_4_7")
         node_name: Name of the node instance declaring the invocation, when invoked from a node
 
     Results: DeclareModelInvocationResultSuccess (cleared to proceed) | DeclareModelInvocationResultFailure (not permitted)
     """
 
-    model: str
-    provider_id: str | None = None
+    model_id: str
     node_name: str | None = None
 
 
@@ -398,10 +393,10 @@ class DeclareModelInvocationResultSuccess(WorkflowNotAlteredMixin, ResultPayload
     """The declared model invocation is permitted; the node may proceed.
 
     Args:
-        model: The concrete upstream model cleared for invocation
+        model_id: The stable catalog key cleared for invocation
     """
 
-    model: str
+    model_id: str
 
 
 @dataclass
