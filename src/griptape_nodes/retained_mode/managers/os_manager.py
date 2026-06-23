@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import ctypes
+import glob
 import logging
 import mimetypes
 import os
@@ -107,6 +108,8 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
+    GetCurrentProjectRequest,
+    GetCurrentProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
     MacroPath,
@@ -818,24 +821,34 @@ class OSManager:
         secrets_manager = GriptapeNodes.SecretsManager()
         partial = partial_resolve(parsed_macro.template, parsed_macro.segments, variables, secrets_manager)
 
-        # Get unresolved variables (optional variables already filtered out)
+        # Get unresolved variables (optional variables already filtered out). The same
+        # variable name may appear in multiple template slots (e.g. ``{x:03}/render_v{x:03}``);
+        # those bind to a single value and aren't ambiguous, so dedupe by name before the
+        # count check. Keep the first occurrence so format_specs come from the first slot.
         unresolved = partial.get_unresolved_variables()
+        seen_names: set[str] = set()
+        unique_unresolved: list[ParsedVariable] = []
+        for var in unresolved:
+            if var.info.name in seen_names:
+                continue
+            seen_names.add(var.info.name)
+            unique_unresolved.append(var)
 
-        if len(unresolved) == 0:
+        if len(unique_unresolved) == 0:
             # All variables resolved - use suffix injection fallback
             return None
 
-        if len(unresolved) > 1:
-            # Multiple unresolved - ambiguous which to auto-increment
-            unresolved_names = [var.info.name for var in unresolved]
+        if len(unique_unresolved) > 1:
+            # Multiple distinct names unresolved - ambiguous which to auto-increment
+            unresolved_names = [var.info.name for var in unique_unresolved]
             msg = (
                 f"CREATE_NEW policy requires at most one unresolved variable for auto-increment, "
-                f"found {len(unresolved)}: {', '.join(unresolved_names)}"
+                f"found {len(unique_unresolved)}: {', '.join(unresolved_names)}"
             )
             raise ValueError(msg)
 
-        # Exactly one unresolved variable - return it directly
-        return unresolved[0]
+        # Exactly one distinct unresolved variable - return its first ParsedVariable
+        return unique_unresolved[0]
 
     def _build_glob_pattern_from_partially_resolved(self, partial_segments: list, index_var_name: str) -> str:
         """Build glob pattern by replacing index variable with wildcards.
@@ -864,8 +877,12 @@ class OSManager:
 
         for segment in partial_segments:
             if isinstance(segment, ParsedStaticValue):
-                # Keep static text as-is
-                pattern_parts.append(segment.text)
+                # Escape glob metacharacters (`*?[`) in user-supplied static segments —
+                # otherwise a `file_name_base="render[final]"` would inject a glob class
+                # and the scan would match unintended siblings (`renderf_v001.png` etc.).
+                # `glob.escape` only touches the three metacharacters; path separators
+                # and other characters pass through unchanged.
+                pattern_parts.append(glob.escape(segment.text))
             elif isinstance(segment, ParsedVariable):
                 if segment.info.name == index_var_name:
                     # Replace index variable with wildcards based on padding
@@ -1091,8 +1108,15 @@ class OSManager:
         partial = partial_resolve(parsed_macro.template, parsed_macro.segments, variables, secrets_manager)
         glob_pattern = self._build_glob_pattern_from_partially_resolved(partial.segments, index_var_name)
 
-        # Scan existing files matching pattern
+        # Scan existing files matching pattern. Anchor relative patterns to the
+        # workspace before walking — project directory variables (`{outputs}`,
+        # `{inputs}`, …) resolve to workspace-relative strings, so a relative
+        # `glob_path` would point at the process CWD instead of `<workspace>/outputs`
+        # and the scan would silently miss every existing file.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/4908
         glob_path = Path(glob_pattern)
+        if not glob_path.is_absolute():
+            glob_path = self._get_workspace_path() / glob_path
         if not glob_path.parent.exists():
             # Parent directory doesn't exist - start at index 1
             return 1
@@ -1106,36 +1130,6 @@ class OSManager:
                 existing_indices.append(extracted_index)
 
         return self._find_next_index_with_gap_fill(existing_indices)
-
-    def _seed_index_for_create_new(self, macro_path: MacroPath) -> MacroPath:
-        """Seed the next available index into a CREATE_NEW MacroPath's variables, if applicable.
-
-        Treats an unresolved required variable as an auto-index slot ONLY when it carries a
-        ``NumericPaddingFormat`` (e.g. ``{x:03}``). The padding spec is the macro author's
-        opt-in: it says "this slot is a zero-padded number," which is the only realistic
-        shape an auto-index takes. Without it, an unresolved ``{shot}`` could just as easily
-        be a variable the user forgot to bind, and silently filling it with 1, 2, 3, … would
-        write data the user never intended. Any non-matching shape (no unresolved var, no
-        padding, multiple unresolved) returns the input unchanged and lets the standard
-        resolve raise MISSING_REQUIRED_VARIABLES so the user sees a loud error.
-        """
-        try:
-            index_var = self._identify_index_variable(macro_path.parsed_macro, macro_path.variables)
-        except ValueError:
-            return macro_path
-
-        if index_var is None:
-            return macro_path
-
-        if not any(isinstance(spec, NumericPaddingFormat) for spec in index_var.format_specs):
-            return macro_path
-
-        next_index = self._scan_for_next_available_index(macro_path.parsed_macro, macro_path.variables, index_var)
-        if next_index is None:
-            return macro_path
-
-        seeded_vars = {**macro_path.variables, index_var.info.name: next_index}
-        return MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
 
     @staticmethod
     def platform() -> str:
@@ -1949,7 +1943,15 @@ class OSManager:
     def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
         """Handle a request to find the next available version index via a single glob pass."""
         parsed_macro = request.macro_path.parsed_macro
-        variables = request.macro_path.variables
+
+        # Resolve any project directory variables the macro references into the scan's
+        # variables dict. The handler's contract says callers must resolve everything
+        # other than the index variable, but project directories are workspace-relative
+        # strings only the project resolver knows how to absolutize, so we do it here
+        # rather than make every caller (file.py, build_versioned_sequence_destination,
+        # …) replicate the same absolutize step. _identify_index_variable then sees the
+        # directory as resolved and the index slot as the only unresolved required var.
+        variables = self._inject_referenced_project_directories(parsed_macro, request.macro_path.variables)
 
         try:
             index_info = self._identify_index_variable(parsed_macro, variables)
@@ -1978,6 +1980,49 @@ class OSManager:
             else "Base path is available (no index needed)",
         )
 
+    def _inject_referenced_project_directories(
+        self, parsed_macro: ParsedMacro, variables: MacroVariables
+    ) -> MacroVariables:
+        """Augment ``variables`` with absolute paths for any project directories the macro uses.
+
+        The macro-resolution layer absolutizes project directory variables only at the
+        very end of ``on_get_path_for_macro_request`` (via ``resolve_file_path``) — they
+        live in ``ProjectInfo.template.directories`` as workspace-relative ``path_macro``
+        strings. ``GetNextVersionIndexRequest`` needs absolute paths for the glob, so we
+        round-trip each referenced directory through ``GetPathForMacroRequest`` (which
+        knows how to resolve nested macros and apply the workspace prefix) and seed the
+        results back into a copy of the variables dict.
+
+        Caller-supplied values win — if the caller already bound ``outputs`` to something
+        explicit, we honor it. Directories not referenced by the macro are skipped to
+        avoid N pointless lookups.
+        """
+        current_project = GriptapeNodes.handle_request(GetCurrentProjectRequest())
+        if not isinstance(current_project, GetCurrentProjectResultSuccess):
+            return variables
+
+        directory_map = current_project.project_info.template.directories
+        referenced_names = {var.name for var in parsed_macro.get_variables()}
+        directories_to_resolve = referenced_names & directory_map.keys() - variables.keys()
+        if not directories_to_resolve:
+            return variables
+
+        augmented: MacroVariables = dict(variables)
+        for name in directories_to_resolve:
+            path_macro = directory_map[name].path_macro
+            if not isinstance(path_macro, str):
+                # Per-platform directory shape — defer to GetPathForMacroRequest by way
+                # of a single-variable wrapper macro `{name}`, letting ProjectManager
+                # pick the right platform branch.
+                wrapper = ParsedMacro("{" + name + "}")
+            else:
+                wrapper = ParsedMacro(path_macro)
+            resolve_result = GriptapeNodes.handle_request(GetPathForMacroRequest(parsed_macro=wrapper, variables={}))
+            if isinstance(resolve_result, GetPathForMacroResultSuccess):
+                augmented[name] = str(resolve_result.absolute_path)
+
+        return augmented
+
     def on_write_file_request(self, request: WriteFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Handle a request to write content to a file with exclusive locking."""
         # Initialize success tracking variables
@@ -1987,21 +2032,8 @@ class OSManager:
         # COMMON SETUP: Resolve path for all policies
         # Resolve MacroPath → str
         if isinstance(request.file_path, MacroPath):
-            macro_path_to_resolve = request.file_path
+            resolution_result = self._resolve_macro_path_to_string(request.file_path)
             path_display = f"{request.file_path.parsed_macro}"
-
-            # CREATE_NEW with a macro carrying an unresolved required `{x:NN}` slot is the
-            # macro author opting into "index every save from the first one." The standard
-            # resolve would fail with MISSING_REQUIRED. Pre-seed the unresolved variable by
-            # scanning the filesystem for the next free index so resolution succeeds and the
-            # first write lands as v001 (not v_). If the scan-then-write race loses (someone
-            # else takes our slot between scan and open) the existing convert-on-collision
-            # fallback in the CREATE_NEW match arm picks up — same code path as a fully-
-            # resolved MacroPath that collides.
-            if request.existing_file_policy == ExistingFilePolicy.CREATE_NEW:
-                macro_path_to_resolve = self._seed_index_for_create_new(request.file_path)
-
-            resolution_result = self._resolve_macro_path_to_string(macro_path_to_resolve)
             if isinstance(resolution_result, MacroResolutionFailure):
                 msg = f"Attempted to write to file '{path_display}'. Failed due to missing variables: {resolution_result.error_details}"
                 return WriteFileResultFailure(

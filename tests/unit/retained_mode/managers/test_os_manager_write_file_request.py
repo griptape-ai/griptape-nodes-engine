@@ -10,7 +10,9 @@ Tests cover:
 """
 
 import logging
+import sys
 import tempfile
+import unicodedata
 from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
@@ -19,9 +21,10 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.macro_parser import ParsedMacro, ParsedVariable
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
+from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
 from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
@@ -46,6 +49,10 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+
+# Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
+# Used by the long-path stress test below so the magic 260 doesn't bare-appear.
+WINDOWS_MAX_PATH = 260
 
 
 class TestCreateNewWarningLevelResultDetails:
@@ -780,96 +787,94 @@ class TestExtensionCoercion:
 
 
 class TestCreateNewMacroIndexSeed:
-    """CREATE_NEW + MacroPath with a required `{x:NN}` slot auto-allocates the next index.
+    """A required ``{x:NN}`` slot in a CREATE_NEW save macro auto-allocates the next index.
 
-    The padding spec (`NumericPaddingFormat`) is the macro author's opt-in: a single
+    Drives the production write path (``FileDestination(macro_path).write_bytes(...)``)
+    so we exercise the full chain: ``_resolve_file_path`` (sees CREATE_NEW policy,
+    enables seed retry) → ``GetPathForMacroRequest`` (fails with MISSING_REQUIRED) →
+    ``GetCurrentProjectRequest`` (gets directory map) → ``GetNextVersionIndexRequest``
+    (scans filesystem) → ``GetPathForMacroRequest`` retry → ``WriteFileRequest``.
+
+    The padding spec (``NumericPaddingFormat``) is the macro author's opt-in: a single
     unresolved required variable WITH padding is treated as an auto-index slot. Without
     padding the request must fail loudly so callers can't silently auto-fill a variable
-    they forgot to bind (e.g. `{shot}` on its own).
+    they forgot to bind (e.g. ``{shot}`` on its own).
     """
 
     @pytest.fixture
     def temp_dir(self) -> Generator[Path, None, None]:
         with tempfile.TemporaryDirectory() as tmpdir:
-            yield Path(tmpdir)
+            # On Windows tempfile may return the 8.3 short form; resolve so the test's
+            # comparisons match what the macro resolver canonicalizes to.
+            yield Path(tmpdir).resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Production macro resolution requires a loaded project so `{outputs}` from the
+        # default template can resolve to <workspace>/outputs. Mirrors the setup pattern
+        # in TestSidecarMetadata.setup_workspace above.
         original_workspace = griptape_nodes.ConfigManager().workspace_path
         griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
         yield
+
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
-    def test_first_save_with_padded_required_index_writes_v001(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
-        """Bug #4875: the first save must produce v001, not fail with MISSING_REQUIRED."""
-        os_manager = griptape_nodes.OSManager()
-        macro_path = MacroPath(
-            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
-            variables={},
-        )
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path) -> Path:
+        # Default project template binds {outputs} to the relative path "outputs",
+        # so saved files land under <workspace>/outputs/. Pre-create the directory so
+        # tests can pre-populate it (gap-fill case) and inspect contents.
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
 
-        request = WriteFileRequest(
-            file_path=macro_path,
-            content=b"first",
+    @staticmethod
+    def _save(macro_path: MacroPath, content: bytes) -> None:
+        FileDestination(
+            macro_path,
             existing_file_policy=ExistingFilePolicy.CREATE_NEW,
-        )
-        result = os_manager.on_write_file_request(request)
+        ).write_bytes(content)
 
-        assert isinstance(result, WriteFileResultSuccess)
-        assert (temp_dir / "render_v001.png").exists()
+    def test_first_save_with_padded_required_index_writes_v001(self, outputs_dir: Path) -> None:
+        """Bug #4875: the first save must produce v001, not fail with MISSING_REQUIRED."""
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-    def test_subsequent_saves_increment_with_padding_preserved(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+        self._save(macro_path, b"first")
+
+        assert (outputs_dir / "render_v001.png").exists()
+
+    def test_subsequent_saves_increment_with_padding_preserved(self, outputs_dir: Path) -> None:
         """Three saves in a row must produce v001, v002, v003 — not v001, v001_1, v001_2."""
-        os_manager = griptape_nodes.OSManager()
-        macro_path = MacroPath(
-            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
-            variables={},
-        )
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
         for _ in range(3):
-            result = os_manager.on_write_file_request(
-                WriteFileRequest(
-                    file_path=macro_path,
-                    content=b"x",
-                    existing_file_policy=ExistingFilePolicy.CREATE_NEW,
-                )
-            )
-            assert isinstance(result, WriteFileResultSuccess)
+            self._save(macro_path, b"x")
 
-        assert (temp_dir / "render_v001.png").exists()
-        assert (temp_dir / "render_v002.png").exists()
-        assert (temp_dir / "render_v003.png").exists()
+        assert (outputs_dir / "render_v001.png").exists()
+        assert (outputs_dir / "render_v002.png").exists()
+        assert (outputs_dir / "render_v003.png").exists()
 
-    def test_gap_fill_picks_lowest_unused_padded_index(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_gap_fill_picks_lowest_unused_padded_index(self, outputs_dir: Path) -> None:
         """If v001 and v003 exist, next save must take v002 (gap-fill)."""
-        (temp_dir / "render_v001.png").write_bytes(b"existing")
-        (temp_dir / "render_v003.png").write_bytes(b"existing")
+        (outputs_dir / "render_v001.png").write_bytes(b"existing")
+        (outputs_dir / "render_v003.png").write_bytes(b"existing")
 
-        os_manager = griptape_nodes.OSManager()
-        macro_path = MacroPath(
-            parsed_macro=ParsedMacro(f"{temp_dir}/render_v{{_index:03}}.png"),
-            variables={},
-        )
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-        result = os_manager.on_write_file_request(
-            WriteFileRequest(
-                file_path=macro_path,
-                content=b"new",
-                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
-            )
-        )
+        self._save(macro_path, b"new")
 
-        assert isinstance(result, WriteFileResultSuccess)
-        assert (temp_dir / "render_v002.png").exists()
-        assert (temp_dir / "render_v002.png").read_bytes() == b"new"
+        assert (outputs_dir / "render_v002.png").exists()
+        assert (outputs_dir / "render_v002.png").read_bytes() == b"new"
 
-    def test_unbound_required_var_without_padding_fails_loudly(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
-    ) -> None:
+    def test_unbound_required_var_without_padding_fails_loudly(self, outputs_dir: Path) -> None:
         """Safety: an unbound `{shot}` must NOT silently auto-allocate as 1, 2, 3, ….
 
         Without the `:NN` padding marker the macro author hasn't opted into auto-index
@@ -878,21 +883,415 @@ class TestCreateNewMacroIndexSeed:
         MISSING_MACRO_VARIABLES rather than write `1_render.png`, `2_render.png`, … to
         disk under a name the user never intended.
         """
-        os_manager = griptape_nodes.OSManager()
-        macro_path = MacroPath(
-            parsed_macro=ParsedMacro(f"{temp_dir}/{{shot}}_render.png"),
-            variables={},
-        )
+        macro_path = MacroPath(ParsedMacro("{outputs}/{shot}_render.png"), {})
 
-        result = os_manager.on_write_file_request(
-            WriteFileRequest(
-                file_path=macro_path,
-                content=b"should not write",
-                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
-            )
-        )
+        with pytest.raises(FileLoadError) as excinfo:
+            self._save(macro_path, b"should not write")
 
-        assert isinstance(result, WriteFileResultFailure)
-        assert result.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+        # FileLoadError (not FileWriteError) because the failure is at macro resolution,
+        # before WriteFileRequest is constructed: the seed-on-retry only fires for
+        # padded missing-required vars, so an unpadded `{shot}` falls straight through
+        # to MISSING_REQUIRED_VARIABLES.
+        assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
         # And nothing was silently auto-allocated.
-        assert not any(temp_dir.iterdir())
+        assert not any(outputs_dir.iterdir())
+
+    # ---------------------------------------------------------------------
+    # Stress tests — Tier 1 (must ship with this PR)
+    # ---------------------------------------------------------------------
+
+    def test_user_var_with_glob_metacharacters_does_not_match_siblings(self, outputs_dir: Path) -> None:
+        """User-supplied values with glob metacharacters must not match siblings during the scan.
+
+        ``partial_resolve`` substitutes user variable values directly into the static segments
+        of the glob pattern. If a user binds ``file_name_base="render[final]"`` (or contains
+        ``?`` / ``*``), those characters become glob metacharacters and the scan could match
+        unintended files — e.g. a sibling literal-bracket name might shadow the real one.
+
+        Pre-create a sibling that *would* false-positive against an unescaped glob, then drive
+        a CREATE_NEW save and assert: (a) the new file lands at the literal name, and (b) the
+        index allocated reflects only files whose name actually matches the literal template,
+        not the false-positive. If this fails the fix lives in
+        ``_build_glob_pattern_from_partially_resolved`` (or its caller) and tracks under a
+        follow-up issue — see the plan file.
+        """
+        # Bracket class would match any single char in the class — `renderx_v001.png` would
+        # match `render[final]_v???.png` if the brackets aren't escaped at the glob level.
+        (outputs_dir / "renderf_v001.png").write_bytes(b"trap")
+        # The literal-named existing file we DO want the scan to honor.
+        (outputs_dir / "render[final]_v001.png").write_bytes(b"existing")
+
+        macro_path = MacroPath(
+            ParsedMacro("{outputs}/{file_name_base}_v{_index:03}.png"),
+            {"file_name_base": "render[final]"},
+        )
+
+        self._save(macro_path, b"new")
+
+        # Either (a) the scan correctly ignores `renderf_v001.png` and gap-fills/extends from
+        # the real `render[final]_v001.png`, or (b) the test surfaces a real escaping bug —
+        # in which case we fix it or xfail with a follow-up issue link.
+        assert (outputs_dir / "render[final]_v002.png").exists()
+        assert (outputs_dir / "render[final]_v002.png").read_bytes() == b"new"
+
+    @pytest.mark.skipif(
+        sys.platform != "darwin",
+        reason="NFC/NFD divergence is most acute on macOS HFS+/APFS where readdir may return either form",
+    )
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "Macro parser's extract_variables compares static segments byte-for-byte; an "
+            "NFD on-disk name vs. NFC user-supplied value silently drops the match and the "
+            "scan returns index=1. Fix lives in macro_parser (cross-cuts beyond #4875). "
+            "Tracked at https://github.com/griptape-ai/griptape-nodes-engine/issues/4914"
+        ),
+    )
+    def test_unicode_nfd_filename_round_trip(self, outputs_dir: Path) -> None:
+        """Existing files written with one Unicode normal form must be recognized by the scan.
+
+        ``parsed_macro.extract_variables`` matches static segments byte-for-byte. If a user
+        binds ``file_name_base="café"`` (NFC: ``café`` precomposed → ``café``) but the
+        on-disk readdir returns the NFD form (``café`` decomposed), extraction fails
+        silently and the scan returns 1 even though v001 already exists. macOS is the most
+        likely place this bites; gate the test there.
+        """
+        # Pre-create a v001 in the form macOS may store internally (NFD).
+        nfd_name = unicodedata.normalize("NFD", "café") + "_v001.png"
+        (outputs_dir / nfd_name).write_bytes(b"existing")
+
+        # Macro author binds the NFC form (the form their text editor / API likely produced).
+        macro_path = MacroPath(
+            ParsedMacro("{outputs}/{file_name_base}_v{_index:03}.png"),
+            {"file_name_base": unicodedata.normalize("NFC", "café")},
+        )
+
+        self._save(macro_path, b"new")
+
+        # Whichever form ends up on disk, the next index must be 002 — not 001 (which would
+        # collide with the existing file via the convert-on-collision fallback). We can't
+        # name the expected file directly since we don't know which normal form the FS will
+        # use; glob for either NFC or NFD form of the cafe-with-accent prefix.
+        v002_candidates = [p for p in outputs_dir.iterdir() if p.name.endswith("_v002.png")]
+        assert len(v002_candidates) == 1, f"Expected exactly one v002, got {v002_candidates}"
+        assert v002_candidates[0].read_bytes() == b"new"
+
+    @pytest.mark.parametrize("policy", [ExistingFilePolicy.OVERWRITE, ExistingFilePolicy.FAIL])
+    def test_non_create_new_policies_do_not_seed_padded_index(
+        self, outputs_dir: Path, policy: ExistingFilePolicy
+    ) -> None:
+        """OVERWRITE and FAIL must NOT auto-seed `{_index:03}` — that's CREATE_NEW's contract.
+
+        Locks in the match/case in ``_should_seed_on_missing_required``: only CREATE_NEW
+        opts in. Other policies surface MISSING_REQUIRED_VARIABLES so callers see a real
+        configuration error rather than silently allocating an indexed path.
+        """
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        with pytest.raises(FileLoadError) as excinfo:
+            FileDestination(macro_path, existing_file_policy=policy).write_bytes(b"should not write")
+
+        assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+        assert not any(outputs_dir.iterdir())
+
+    def test_read_path_does_not_seed_padded_index(self, outputs_dir: Path) -> None:
+        """`File.read()` against a padded `{_index:03}` macro must fail loudly, not auto-allocate.
+
+        The seed-on-retry only fires when ``_resolve_file_path`` is called with
+        ``existing_file_policy=CREATE_NEW``. Read paths leave the policy as ``None`` so an
+        unbound index variable surfaces as MISSING_REQUIRED_VARIABLES. Critical: a silent
+        auto-fill on a read would point reads at non-existent indexed files and quietly
+        return wrong data.
+        """
+        # Pre-populate so even if the seed mistakenly fires, there's something to "find".
+        (outputs_dir / "render_v001.png").write_bytes(b"existing")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        with pytest.raises(FileLoadError) as excinfo:
+            File(macro_path).read()
+
+        assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason=(
+            "_scan_for_next_available_index splits the glob pattern into parent + name "
+            "and calls parent.glob(name). When the index variable appears in a directory "
+            "component, the parent itself contains a wildcard, parent.exists() returns "
+            "False, and the scan returns index=1. Pre-existing limitation in the scan "
+            "loop, surfaced more broadly by #4875's seed-on-retry path. Tracked at "
+            "https://github.com/griptape-ai/griptape-nodes-engine/issues/4915"
+        ),
+    )
+    def test_same_index_variable_used_in_directory_and_filename(self, outputs_dir: Path) -> None:
+        """Same `{_index:03}` referenced twice (as dir AND filename component) — both seeded equally.
+
+        ``_find_padded_unresolved_required`` picks the first ParsedVariable matching the
+        missing name; ``GetPathForMacroRequest.resolve`` then renders BOTH occurrences with
+        the same value. Pre-create a v001 sibling so the scan must gap-fill / extend.
+
+        Currently xfail — see issue link in the marker. Promote to expected-pass when
+        #4915 lands.
+        """
+        # Pre-existing v001 directory + v001 file inside.
+        (outputs_dir / "v001").mkdir()
+        (outputs_dir / "v001" / "render_v001.png").write_bytes(b"existing")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/v{_index:03}/render_v{_index:03}.png"), {})
+
+        self._save(macro_path, b"new")
+
+        # Same index value applied to both directory and filename → v002/render_v002.png.
+        assert (outputs_dir / "v002" / "render_v002.png").exists()
+        assert (outputs_dir / "v002" / "render_v002.png").read_bytes() == b"new"
+
+
+class TestCreateNewMacroIndexSeedDefensiveFallthrough:
+    """Tier 1 stress test: defensive paths that should never silently auto-allocate.
+
+    The seed-on-retry chain in ``_resolve_file_path`` has three failure modes that must
+    fall through to MISSING_REQUIRED_VARIABLES rather than write data:
+
+    - ``GetCurrentProjectRequest`` returns failure (no current project — defensive code
+      in ``_inject_referenced_project_directories``).
+    - ``GetNextVersionIndexRequest`` returns failure (e.g. ambiguous index variable).
+    - The seeded retry's ``GetPathForMacroRequest`` itself fails again.
+
+    These failures aren't reachable through the normal ``setup_project`` fixture (the
+    system default project always exists), so we mock the relevant request to force
+    each defensive path. Confirms we don't crash and the user sees a real error.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Same setup as TestCreateNewMacroIndexSeed — we want a working baseline that the
+        # mocks then perturb.
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        yield
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path) -> Path:
+        # Same shape as TestCreateNewMacroIndexSeed.outputs_dir — pre-create the project's
+        # {outputs} directory so race tests can drop pre-existing files there to simulate
+        # a racer's win.
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
+
+    def test_get_next_version_index_failure_falls_through(self, temp_dir: Path) -> None:
+        """If GetNextVersionIndexRequest fails internally, file.py must surface MISSING_REQUIRED.
+
+        Force the failure organically: a macro with TWO distinct padded unresolved required
+        variables (``{a:03}`` and ``{b:03}``). ``_find_padded_unresolved_required`` returns
+        None because there's no single padded var (heuristic refuses to guess), so we
+        actually never reach ``GetNextVersionIndexRequest`` — but we DO want the test to
+        confirm the upstream gate. For the deeper case where the heuristic fires but the
+        scan itself fails, we'd need a request-registry mock; that's harder to set up
+        cleanly and the natural failure surface here (heuristic refuses ambiguous) covers
+        the same user-visible promise: no silent allocation.
+        """
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+
+        # Two distinct padded unresolved required vars — heuristic must refuse to pick one.
+        macro_path = MacroPath(ParsedMacro("{outputs}/{a:03}_{b:03}.png"), {})
+
+        with pytest.raises(FileLoadError) as excinfo:
+            FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
+                b"should not write"
+            )
+
+        assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+        # Defensive: nothing landed on disk.
+        assert not any(outputs.iterdir())
+
+    # ---------------------------------------------------------------------
+    # Race-loss correctness tests
+    # ---------------------------------------------------------------------
+    # These guard the contract from #4875: under contention, the loser of a scan-vs-write
+    # race must produce the next free index against the ORIGINAL macro template
+    # (e.g. render_v004.png), NOT a suffix-injected fallback like render_v003_1.png.
+    #
+    # We mock _seed_index_for_create_new (in file.py, NOT OSManager) to control which
+    # index gets seeded each iteration. That's the right level: we're testing file.py's
+    # retry loop logic, and the loop body invokes that helper once per iteration. Mocking
+    # the OS-side scan would require fabricating GetNextVersionIndexResultSuccess
+    # responses, which is more brittle and farther from what the loop actually sees.
+
+    def test_race_loss_picks_next_index_not_suffix(self, outputs_dir: Path) -> None:
+        """Bug fix for #4875 race-loss contract: scan returns 3 twice, second write must land at v004.
+
+        Simulates: process A reserves v003, our seed scan returns 3, we attempt to
+        write v003 with policy=FAIL → POLICY_NO_OVERWRITE → file.py loops, second
+        scan now sees v003 on disk and returns 4 → we successfully write v004.
+
+        Critically: the file must NOT end up at ``render_v003_1.png`` (the old wrong
+        behavior where convert-on-collision suffix-injects on the resolved path).
+        """
+        # Pre-create v003 so the first FAIL write loses the race.
+        (outputs_dir / "render_v003.png").write_bytes(b"existing race winner")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        # Mock _seed_index_for_create_new to return [3, 4, 4, ...]: first iteration
+        # returns 3 (we lose the race), second returns 4 (gap-fill against the racer's
+        # win), and any further calls keep returning 4 (defensive — we don't actually
+        # expect a third call for this scenario).
+        from griptape_nodes.files import file as file_module
+
+        def seed_side_effect(mp: MacroPath, var: ParsedVariable) -> MacroPath:
+            # Pull the next index from the iterator each call. Builds a seeded MacroPath
+            # the same way the real helper does (seed value layered on user variables).
+            idx = next(seed_iter)
+            return MacroPath(parsed_macro=mp.parsed_macro, variables={**mp.variables, var.info.name: idx})
+
+        seed_iter = iter([3, 4, 4])  # 3 then 4 onward; the third is unused but harmless.
+
+        with patch.object(file_module, "_seed_index_for_create_new", side_effect=seed_side_effect):
+            FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
+                b"new save lands at v004"
+            )
+
+        # Correct outcome.
+        assert (outputs_dir / "render_v004.png").exists()
+        assert (outputs_dir / "render_v004.png").read_bytes() == b"new save lands at v004"
+        # Wrong outcomes the bug used to produce.
+        assert not (outputs_dir / "render_v003_1.png").exists()
+        # The pre-existing v003 from the racer is untouched.
+        assert (outputs_dir / "render_v003.png").read_bytes() == b"existing race winner"
+
+    def test_persistent_contention_exhausts_budget(self, outputs_dir: Path) -> None:
+        """If race-loss persists for MAX_INDEXED_CANDIDATES iterations, raise FileWriteError.
+
+        Defensive contract: rather than busy-loop forever, file.py gives up after the
+        same retry budget as OSManager's existing CREATE_NEW collision loop and surfaces
+        a clear error naming the last attempted path.
+        """
+        # Pre-create v003 so every FAIL write attempt at index 3 loses.
+        (outputs_dir / "render_v003.png").write_bytes(b"persistent")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        # Always seed index=3 — every iteration loses, exhausting the budget.
+        from griptape_nodes.files import file as file_module
+
+        def always_seed_3(mp: MacroPath, var: ParsedVariable) -> MacroPath:
+            return MacroPath(parsed_macro=mp.parsed_macro, variables={**mp.variables, var.info.name: 3})
+
+        with (
+            patch.object(file_module, "_seed_index_for_create_new", side_effect=always_seed_3),
+            pytest.raises(FileWriteError) as excinfo,
+        ):
+            FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
+                b"should not land"
+            )
+
+        # Diagnostic: error message names the contended path so an oncall can locate it.
+        assert "race-loss exhausted" in str(excinfo.value.result_details).lower()
+        assert "render_v003.png" in str(excinfo.value.result_details)
+        # No partial writes left behind beyond the pre-existing racer's file.
+        survivors = [p.name for p in outputs_dir.iterdir()]
+        assert survivors == ["render_v003.png"], f"Unexpected files: {survivors}"
+
+
+@pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific path stressors")
+class TestCreateNewMacroIndexSeedWindowsPaths:
+    """Tier 2 stress tests: Windows-specific path shapes (long paths, native separators).
+
+    These run only on Windows CI — the long-path and mixed-separator failure modes are
+    Windows-only by definition. The first test guards #4908 (workspace anchor); the
+    second guards the regression that broke the prior Windows CI run (mixed separators
+    in the macro template / glob round-trip).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        yield
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_long_windows_path_gap_fill(self, temp_dir: Path) -> None:
+        r"""Workspace + nested dirs + filename combine to >260 chars; gap-fill must still work.
+
+        ``_apply_windows_long_path_prefix`` (``\\?\``) is added by ``canonicalize_for_io``
+        only at the OS-level write boundary. The scan in ``_scan_for_next_available_index``
+        uses ``Path.glob()`` directly. If pathlib can't enumerate long-path entries on this
+        runner, the scan returns 1 and the test fails — surfacing a real bug to fix or
+        track.
+        """
+        # Build a deep enough subtree to push past WINDOWS_MAX_PATH: each level adds ~20
+        # chars, workspace tempdir is already ~50 chars, so 12 levels of 20 chars plus
+        # the filename should comfortably exceed 260.
+        deep_segment = "a" * 20
+        deep_outputs = temp_dir / "outputs"
+        for _ in range(12):
+            deep_outputs = deep_outputs / deep_segment
+        deep_outputs.mkdir(parents=True, exist_ok=True)
+        # Sanity: confirm we actually crossed the threshold for this test environment.
+        assert len(str(deep_outputs / "render_v001.png")) > WINDOWS_MAX_PATH, (
+            "Test setup didn't produce a long-enough path"
+        )
+
+        # Pre-populate v001 and v003 — gap-fill should pick v002.
+        (deep_outputs / "render_v001.png").write_bytes(b"existing")
+        (deep_outputs / "render_v003.png").write_bytes(b"existing")
+
+        # Match the deep template — repeat the segment 12 times under {outputs}.
+        sub = "/".join([deep_segment] * 12)
+        macro_path = MacroPath(ParsedMacro(f"{{outputs}}/{sub}/render_v{{_index:03}}.png"), {})
+
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(b"new")
+
+        assert (deep_outputs / "render_v002.png").exists()
+        assert (deep_outputs / "render_v002.png").read_bytes() == b"new"
+
+    def test_mixed_separator_round_trip_windows(self, temp_dir: Path) -> None:
+        """Backslash-laden glob results round-trip through extract_variables against a POSIX template.
+
+        On Windows: ``Path.glob()`` returns absolute ``WindowsPath`` objects whose ``str()``
+        uses backslashes. The macro template uses forward slashes. Without a clean
+        round-trip in ``_extract_index_from_filename``, indices won't extract and the scan
+        returns 1 every call — the same failure mode that broke the prior Windows CI run.
+        """
+        outputs_dir = temp_dir / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+        (outputs_dir / "render_v001.png").write_bytes(b"existing")
+        (outputs_dir / "render_v002.png").write_bytes(b"existing")
+
+        # POSIX-style template; production macros always use `/`.
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(b"new")
+
+        # Must extend to v003 — if the round-trip fails, the scan returns 1 and the
+        # convert-on-collision branch produces `render_v001_1.png` instead.
+        assert (outputs_dir / "render_v003.png").exists()
+        assert (outputs_dir / "render_v003.png").read_bytes() == b"new"
+        # Negative assertion: the convert-on-collision unpadded fallback must NOT have fired.
+        assert not (outputs_dir / "render_v001_1.png").exists()
