@@ -4371,6 +4371,11 @@ class FlowManager:
                 await self._global_control_flow_machine.start_flow(
                     start_node=node, end_node=node, debug_mode=debug_mode
                 )
+            except asyncio.CancelledError:
+                logger.warning("Single node resolution cancelled externally")
+                if self.check_for_existing_running_flow():
+                    await self.cancel_flow_run()
+                raise
             except Exception as e:
                 logger.exception("Exception during single node resolution")
                 if self.check_for_existing_running_flow():
