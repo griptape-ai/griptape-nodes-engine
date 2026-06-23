@@ -258,6 +258,7 @@ from griptape_nodes.utils.git_utils import (
     is_git_url,
     normalize_github_url,
     parse_git_url_with_ref,
+    remote_ref_exists,
     sparse_checkout_library_json,
     switch_branch_or_tag,
     update_library_git,
@@ -5454,6 +5455,33 @@ class LibraryManager:
 
         # Get local commit SHA
         local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+
+        # If the current ref does not exist on the remote (e.g. a local-only branch that has
+        # not been pushed, or a detached HEAD on a bare commit), there is nothing on the remote
+        # to compare against. Report no update available instead of failing the check.
+        if git_ref is not None:
+            try:
+                ref_on_remote = await asyncio.to_thread(remote_ref_exists, git_remote, git_ref)
+            except GitRemoteError as e:
+                details = f"Failed to query git remote for Library '{library_name}': {e}"
+                return CheckLibraryUpdateResultFailure(result_details=details)
+
+            if not ref_on_remote:
+                details = (
+                    f"Library '{library_name}' is on git ref '{git_ref}', which does not exist on remote "
+                    f"'{git_remote}'. Updates can only be checked against refs that exist on the remote."
+                )
+                logger.info(details)
+                return CheckLibraryUpdateResultSuccess(
+                    has_update=False,
+                    current_version=current_version,
+                    latest_version=current_version,
+                    git_remote=git_remote,
+                    git_ref=git_ref,
+                    local_commit=local_commit,
+                    remote_commit=None,
+                    result_details=details,
+                )
 
         # Clone remote and get latest version and commit SHA (using current ref or HEAD if detached)
         try:
