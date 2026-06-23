@@ -233,6 +233,63 @@ class TestOnHandleDeclareModelInvocationRequest:
         assert isinstance(allowed.result, DeclareModelInvocationResultSuccess)
         assert allowed.result.model == "gpt-ok"
 
+    def test_authorization_checkpoint_denial_blocks_invocation(self) -> None:
+        # The InvokeModel checkpoint gates the declared invocation: a denial from
+        # a registered authorization hook turns into a failure so the node does
+        # not invoke the model. The handler resolves the model + provider facts.
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["action"] = checkpoint.action
+            seen["subject_id"] = checkpoint.subject_id
+            seen["provider_id"] = checkpoint.attributes.get("provider_id")
+            if checkpoint.attributes.get("provider_id") == "anthropic":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic models are not enabled."),))
+            return None
+
+        GriptapeNodes.EventManager().add_authorization_hook(deny)
+        manager = ModelManager.__new__(ModelManager)
+
+        denied = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model="claude-opus-4", provider_id="anthropic")
+        )
+        assert isinstance(denied, DeclareModelInvocationResultFailure)
+        assert "Anthropic models are not enabled." in str(denied.result_details)
+        assert seen == {"action": "InvokeModel", "subject_id": "claude-opus-4", "provider_id": "anthropic"}
+
+        allowed = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model="gpt-4o", provider_id="openai")
+        )
+        assert isinstance(allowed, DeclareModelInvocationResultSuccess)
+
+    def test_empty_failure_denial_still_yields_a_reason(self) -> None:
+        # A hook that misuses the contract by returning a denial with no failures
+        # (it should return None to allow) must not produce a reason-less message.
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        def deny(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial:
+            return CheckpointDenial(failures=())
+
+        GriptapeNodes.EventManager().add_authorization_hook(deny)
+        manager = ModelManager.__new__(ModelManager)
+
+        denied = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model="claude-opus-4", provider_id="anthropic")
+        )
+        assert isinstance(denied, DeclareModelInvocationResultFailure)
+        assert "Denied by the license policy." in str(denied.result_details)
+
 
 # ---------------------------------------------------------------------------
 # _download_model_task — subprocess entry point

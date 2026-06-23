@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from huggingface_hub import get_token, list_models, scan_cache_dir, snapshot_download
@@ -21,6 +21,7 @@ from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
+    DeclareModelInvocationResultFailure,
     DeclareModelInvocationResultSuccess,
     DeleteModelDownloadRequest,
     DeleteModelDownloadResultFailure,
@@ -48,6 +49,12 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.utils.async_utils import cancel_subprocess
 
@@ -723,6 +730,19 @@ class ModelManager:
             result_details=f"Retrieved info for '{request.model_id}'",
         )
 
+    @staticmethod
+    def _model_checkpoint_attributes(request: DeclareModelInvocationRequest) -> dict[str, Any]:
+        """Resolve the facts a hook may gate a model invocation on.
+
+        `id` is the concrete model; `provider_id` is the catalog provider the call
+        routes to (when the node declared one). The app maps `provider_id` onto
+        the `Model in ModelProvider` hierarchy a policy walks via `in`.
+        """
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: request.model}
+        if request.provider_id:
+            attributes[CheckpointAttribute.PROVIDER_ID] = request.provider_id
+        return attributes
+
     def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
         """Acknowledge a node's declaration that it is about to invoke a model.
 
@@ -739,6 +759,23 @@ class ModelManager:
         Returns:
             ResultPayload: Success, meaning the node is cleared to proceed
         """
+        # License-policy checkpoint: gate the declared invocation on the model and
+        # its provider. The node already opted in by declaring; a denial returns a
+        # failure so the node does not invoke the model. Provider/family hierarchy
+        # is resolved app-side from the declared provider_id.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.INVOKE_MODEL,
+                subject_type=CheckpointSubjectType.MODEL,
+                subject_id=request.model,
+                attributes=self._model_checkpoint_attributes(request),
+            )
+        )
+        if denial is not None:
+            reason = denial.reason()
+            return DeclareModelInvocationResultFailure(
+                result_details=f"Model invocation denied for '{request.model}'. {reason}"
+            )
         return DeclareModelInvocationResultSuccess(
             model=request.model,
             result_details=f"Model invocation permitted for '{request.model}'.",

@@ -44,6 +44,7 @@ from griptape_nodes.files.path_utils import canonicalize_for_identity, canonical
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
     LibraryDependencyDeclaration,
+    LifecycleStageLibraryProperty,
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
@@ -194,6 +195,12 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
@@ -213,7 +220,9 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
+    NodePermissionDeniedProblem,
     OldXdgLocationWarningProblem,
+    PermissionDeniedProblem,
     RequestHandlerRegistrationProblem,
     RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
@@ -5108,6 +5117,38 @@ class LibraryManager:
                 problems=problems,
             )
 
+        # License-policy checkpoint: ask any registered authorization hook (the
+        # app installs one) whether this library may load past its metadata
+        # stage. A denial is rendered as a fitness problem and marks the library
+        # UNUSABLE, so it is not registered and the GUI shows every missing
+        # permission on the failure icon. With no hook installed this allows.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.LOAD_LIBRARY,
+                subject_type=CheckpointSubjectType.LIBRARY,
+                subject_id=schema.name,
+                attributes=self._library_checkpoint_attributes(schema),
+            )
+        )
+        if denial is not None:
+            problems.append(PermissionDeniedProblem(library_name=schema.name, messages=denial.messages()))
+            return EvaluateLibraryFitnessResultFailure(
+                result_details=f"Library '{schema.name}' is not permitted by the license policy",
+                fitness=LibraryManager.LibraryFitness.UNUSABLE,
+                problems=problems,
+            )
+
+        # Per-node license-policy preview. A library may be permitted to load while
+        # still declaring node types the policy forbids (by lifecycle stage or the
+        # arbitrary-code flag). Surface each denied node type as a library problem
+        # now -- so the GUI failure icon lists them and what to ask an admin for --
+        # without blocking the library, which stays usable for its permitted nodes.
+        # Instantiating a denied node later substitutes an Error Proxy via the same
+        # checkpoint. Runs on the schema, so no library module is imported here.
+        node_denials = GriptapeNodes.NodeManager().evaluate_schema_node_instantiation_denials(schema)
+        for node_type, node_denial in node_denials.items():
+            problems.append(NodePermissionDeniedProblem(node_type=node_type, messages=node_denial.messages()))
+
         # Determine fitness based on whether we have any non-disqualifying issues
         fitness = LibraryManager.LibraryFitness.FLAWED if problems else LibraryManager.LibraryFitness.GOOD
 
@@ -5116,6 +5157,28 @@ class LibraryManager:
             fitness=fitness,
             problems=problems,
         )
+
+    @staticmethod
+    def _library_checkpoint_attributes(schema: LibrarySchema) -> dict[str, Any]:
+        """Resolve the facts an authorization hook may gate a library load on.
+
+        `id` is the library name (so a policy can match a specific library);
+        `lifecycle_stage` is the library's declared stage when one is present.
+        The engine supplies what it has resolved and does not know which a policy
+        will read.
+        """
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: schema.name}
+        stage = next(
+            (
+                declaration.stage
+                for declaration in schema.metadata.declarations
+                if isinstance(declaration, LifecycleStageLibraryProperty)
+            ),
+            None,
+        )
+        if stage is not None:
+            attributes[CheckpointAttribute.LIFECYCLE_STAGE] = stage.value
+        return attributes
 
     async def load_libraries_request(self, request: LoadLibrariesRequest) -> ResultPayload:  # noqa: ARG002, C901, PLR0912
         """Load all libraries from configuration (backward compatibility wrapper).
