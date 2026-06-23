@@ -734,14 +734,11 @@ class ModelManager:
     def _model_checkpoint_attributes(request: DeclareModelInvocationRequest) -> dict[str, Any]:
         """Resolve the facts a hook may gate a model invocation on.
 
-        `id` is the concrete model; `provider_id` is the catalog provider the call
-        routes to (when the node declared one). The app maps `provider_id` onto
-        the `Model in ModelProvider` hierarchy a policy walks via `in`.
+        `id` is the stable catalog key the node declared. The app owns the model
+        catalog and resolves the provider, family, and key support from that key,
+        mapping it onto the `Model in ModelProvider` hierarchy a policy walks via `in`.
         """
-        attributes: dict[str, Any] = {CheckpointAttribute.ID: request.model}
-        if request.provider_id:
-            attributes[CheckpointAttribute.PROVIDER_ID] = request.provider_id
-        return attributes
+        return {CheckpointAttribute.ID: request.model_id}
 
     def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
         """Acknowledge a node's declaration that it is about to invoke a model.
@@ -759,22 +756,22 @@ class ModelManager:
         Returns:
             ResultPayload: Success, meaning the node is cleared to proceed
         """
-        # License-policy checkpoint: gate the declared invocation on the model and
-        # its provider. The node already opted in by declaring; a denial returns a
+        # License-policy checkpoint: gate the declared invocation on the stable
+        # catalog key. The node already opted in by declaring; a denial returns a
         # failure so the node does not invoke the model. Provider/family hierarchy
-        # is resolved app-side from the declared provider_id.
+        # is resolved app-side from the declared model_id.
         denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.INVOKE_MODEL,
                 subject_type=CheckpointSubjectType.MODEL,
-                subject_id=request.model,
+                subject_id=request.model_id,
                 attributes=self._model_checkpoint_attributes(request),
             )
         )
         if denial is not None:
             reason = denial.reason()
             return DeclareModelInvocationResultFailure(
-                result_details=f"Model invocation denied for '{request.model}'. {reason}"
+                result_details=f"Model invocation denied for '{request.model_id}'. {reason}"
             )
         return DeclareModelInvocationResultSuccess(
             model_id=request.model_id,

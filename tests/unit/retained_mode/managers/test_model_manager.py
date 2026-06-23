@@ -233,7 +233,8 @@ class TestOnHandleDeclareModelInvocationRequest:
     def test_authorization_checkpoint_denial_blocks_invocation(self) -> None:
         # The InvokeModel checkpoint gates the declared invocation: a denial from
         # a registered authorization hook turns into a failure so the node does
-        # not invoke the model. The handler resolves the model + provider facts.
+        # not invoke the model. The handler passes the stable catalog key; the app
+        # resolves the provider and family from it.
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
@@ -246,8 +247,8 @@ class TestOnHandleDeclareModelInvocationRequest:
         def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             seen["action"] = checkpoint.action
             seen["subject_id"] = checkpoint.subject_id
-            seen["provider_id"] = checkpoint.attributes.get("provider_id")
-            if checkpoint.attributes.get("provider_id") == "anthropic":
+            seen["id"] = checkpoint.attributes.get("id")
+            if checkpoint.subject_id == "gtc_claude_opus_4_7":
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic models are not enabled."),))
             return None
 
@@ -255,14 +256,14 @@ class TestOnHandleDeclareModelInvocationRequest:
         manager = ModelManager.__new__(ModelManager)
 
         denied = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model="claude-opus-4", provider_id="anthropic")
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
         )
         assert isinstance(denied, DeclareModelInvocationResultFailure)
         assert "Anthropic models are not enabled." in str(denied.result_details)
-        assert seen == {"action": "InvokeModel", "subject_id": "claude-opus-4", "provider_id": "anthropic"}
+        assert seen == {"action": "InvokeModel", "subject_id": "gtc_claude_opus_4_7", "id": "gtc_claude_opus_4_7"}
 
         allowed = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model="gpt-4o", provider_id="openai")
+            DeclareModelInvocationRequest(model_id="gtc_gpt_5")
         )
         assert isinstance(allowed, DeclareModelInvocationResultSuccess)
 
@@ -282,7 +283,7 @@ class TestOnHandleDeclareModelInvocationRequest:
         manager = ModelManager.__new__(ModelManager)
 
         denied = manager.on_handle_declare_model_invocation_request(
-            DeclareModelInvocationRequest(model="claude-opus-4", provider_id="anthropic")
+            DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
         )
         assert isinstance(denied, DeclareModelInvocationResultFailure)
         assert "Denied by the license policy." in str(denied.result_details)
