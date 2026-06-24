@@ -1034,6 +1034,125 @@ class TestCreateNewMacroIndexSeed:
         assert (outputs_dir / "v002" / "render_v002.png").read_bytes() == b"new"
 
 
+class TestOptionalPaddedIndexCollision:
+    """Regression tests for #4544 / #4092: `{_index?:03}` padding preserved on collision.
+
+    Optional padded slots (`{x?:NN}`) were rendering as `_1`, `_2`, … on collision
+    because the convert-on-collision branch synthesized `{stem}_{_index}` from the
+    resolved string — losing the format spec. The fix walks the user's ORIGINAL
+    macro's padded slot (any padding, required OR optional) so the format spec is
+    preserved across the entire sequence.
+
+    Tests cover the required `{x:03}` and optional `{x?:03}` shapes side-by-side so
+    regressions in either direction are caught.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Same load-then-force ordering as TestCreateNewMacroIndexSeed: SetCurrentProject
+        # remerges workspace_path from project config layers, so we set it AFTER.
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
+
+    @staticmethod
+    def _save(macro_path: MacroPath, content: bytes) -> None:
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(content)
+
+    # --- Required `{x:03}` shape ----------------------------------------------------
+
+    def test_required_padded_first_save_writes_001(self, outputs_dir: Path) -> None:
+        """Required `{_index:03}` first save: seed assigns 1, lands at v001."""
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        self._save(macro_path, b"first")
+        assert (outputs_dir / "render_v001.png").exists()
+
+    def test_required_padded_collision_walks_to_002(self, outputs_dir: Path) -> None:
+        """Required `{_index:03}` second save: walks to v002 with padding preserved."""
+        (outputs_dir / "render_v001.png").write_bytes(b"existing")
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        self._save(macro_path, b"second")
+        assert (outputs_dir / "render_v002.png").exists()
+        # Negative: the buggy convert-on-collision shape produced this name.
+        assert not (outputs_dir / "render_v001_1.png").exists()
+
+    # --- Optional `{x?:03}` shape (the #4544 / #4092 regression tests) --------------
+
+    def test_optional_padded_first_save_writes_unindexed(self, outputs_dir: Path) -> None:
+        """Optional `{_index?:03}` first save: index slot is OMITTED (no padding rendered).
+
+        This is the optional-`?` contract: the slot disappears entirely when no value
+        is supplied. The auto-index seed only fires for REQUIRED missing vars, so the
+        first save resolves with `_index` simply not present in the output.
+        """
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        self._save(macro_path, b"first")
+        # No padded suffix on the first save — the optional slot vanishes.
+        assert (outputs_dir / "file.png").exists()
+        # Specifically, NO index-bearing variants exist.
+        index_files = sorted(
+            p.name for p in outputs_dir.iterdir() if p.name.startswith("file") and p.name != "file.png"
+        )
+        assert index_files == [], f"Unexpected index files: {index_files}"
+
+    def test_optional_padded_collision_walks_to_001_padded(self, outputs_dir: Path) -> None:
+        """Optional `{_index?:03}` SECOND save: walks to padded `_001`, NOT unpadded `_1`.
+
+        This is the bug #4544 / #4092 regression test. Pre-fix behavior:
+        `_convert_str_path_to_macro_with_index("file.png")` synthesized
+        `file_{_index}.png` (no format spec) → produced `file_1.png`. The fix walks
+        the user's ORIGINAL macro's `{_index?:03}` slot, preserving the `:03` format.
+        """
+        # Pre-create the un-indexed base so the next save MUST walk to a padded index.
+        (outputs_dir / "file.png").write_bytes(b"existing un-indexed")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        self._save(macro_path, b"second")
+
+        # Correct outcome with the fix: padded index from the original macro.
+        assert (outputs_dir / "file001.png").exists()
+        assert (outputs_dir / "file001.png").read_bytes() == b"second"
+        # Buggy outcomes (#4544 / #4092): unpadded suffix injection.
+        assert not (outputs_dir / "file_1.png").exists()
+        assert not (outputs_dir / "file_001.png").exists()  # different separator shape
+
+    def test_optional_padded_third_save_walks_to_002(self, outputs_dir: Path) -> None:
+        """Optional `{_index?:03}` THIRD save: continues padded — 002, not _1 or _2."""
+        (outputs_dir / "file.png").write_bytes(b"existing un-indexed")
+        (outputs_dir / "file001.png").write_bytes(b"existing v001")
+
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        self._save(macro_path, b"third")
+
+        assert (outputs_dir / "file002.png").exists()
+        assert (outputs_dir / "file002.png").read_bytes() == b"third"
+        assert not (outputs_dir / "file_1.png").exists()
+        assert not (outputs_dir / "file_2.png").exists()
+
+    # Note: the separator-then-padding stack `{_index?:_:03}` is mentioned in the
+    # macros.md docs but currently fails in the macro parser (NumericPaddingFormat
+    # tries to apply `:03` to the separator-prepended string `1_` and errors). That's
+    # a parser-level bug, not the collision-walk bug this PR fixes — out of scope here.
+
+
 class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     """Defensive paths around the auto-index seed and the collision-walk loop.
 

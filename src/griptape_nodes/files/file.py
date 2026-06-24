@@ -634,10 +634,10 @@ class File:
             FileWriteError: If the file cannot be written.
         """
         # Pass the original file path (str or MacroPath) through to the request.
-        # OSManager.on_write_file_request resolves macros internally, forwarding
-        # `existing_file_policy` to the macro resolver so the auto-index seed only
-        # fires for CREATE_NEW saves. Pre-resolving here would strip the policy
-        # context the resolver needs to make that decision (#4875).
+        # OSManager.on_write_file_request resolves macros internally so it can apply
+        # the auto-index seed for CREATE_NEW saves and walk the original macro on
+        # collision. Pre-resolving here would lose both pieces of context.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/4875
         request = WriteFileRequest(
             file_path=self._file_path,
             content=content,

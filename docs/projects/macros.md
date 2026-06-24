@@ -78,9 +78,9 @@ Zero-pads the value to the specified width. The variable must hold an integer va
 {_index:04}   with _index = 12  → "0012"
 ```
 
-Used for auto-incrementing filenames under the `create_new` collision policy. Numeric padding (`:NN`) on a single unresolved variable is the opt-in: the system scans the directory for existing matches and seeds the next available index.
+Used for auto-incrementing filenames under the `create_new` collision policy. Numeric padding (`:NN`) on a single unresolved variable is the opt-in: the first save lands at index `1` (or omitted, for the optional form), and subsequent saves walk forward against the same template — the padding format is preserved across the whole sequence.
 
-- **Optional form** `{_index?:03}` — absent on the first save, then `_001`, `_002`, … on collision.
+- **Optional form** `{_index?:03}` — absent on the first save, then `_001`, `_002`, … on collision (padded width preserved).
 - **Required form** `{_index:03}` — present from the first save: `_001`, `_002`, `_003`, … with consistent zero-padded width across the whole sequence.
 
 ```

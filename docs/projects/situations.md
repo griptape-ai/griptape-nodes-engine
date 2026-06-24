@@ -31,7 +31,7 @@ macro:  {file_name_base}{_index?:03}.{file_extension}
 policy: create_new, create_dirs: true
 ```
 
-Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{_index?:03}` variable is zero-padded and optional — omitted on the first save, then incremented to avoid overwriting existing files.
+Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{_index?:03}` variable is zero-padded and optional — omitted on the first save, then `001`, `002`, … on collision (padded width preserved across the sequence).
 
 ### `copy_external_file`
 
