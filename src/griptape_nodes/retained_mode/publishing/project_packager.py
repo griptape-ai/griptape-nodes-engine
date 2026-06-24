@@ -404,11 +404,12 @@ class ProjectExporter:
     def _write_self_contained_template(self) -> None:
         """Write a parent-less standalone project YAML at the staging root.
 
-        Nulls parent_project_path/parent_project_id (no link back to the source
+        Clears parent_project_path/parent_project_id (no link back to the source
         machine) and id (so the imported project takes a fresh, path-derived id at
         its new location instead of colliding with the still-loaded source on the
-        same engine). Directory paths stay as macro strings, so they re-resolve at
-        import.
+        same engine); since to_yaml() dumps with exclude_none=True, these cleared
+        fields are omitted from the written template rather than serialized as null.
+        Directory paths stay as macro strings, so they re-resolve at import.
         """
         standalone = self._project_info.template.model_copy(deep=True)
         standalone.parent_project_path = None
