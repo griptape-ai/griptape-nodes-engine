@@ -21,7 +21,7 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from griptape_nodes.common.macro_parser import ParsedMacro, ParsedVariable
+from griptape_nodes.common.macro_parser import ParsedMacro
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
@@ -789,11 +789,10 @@ class TestExtensionCoercion:
 class TestCreateNewMacroIndexSeed:
     """A required ``{x:NN}`` slot in a CREATE_NEW save macro auto-allocates the next index.
 
-    Drives the production write path (``FileDestination(macro_path).write_bytes(...)``)
-    so we exercise the full chain: ``_resolve_file_path`` (sees CREATE_NEW policy,
-    enables seed retry) → ``GetPathForMacroRequest`` (fails with MISSING_REQUIRED) →
-    ``GetCurrentProjectRequest`` (gets directory map) → ``GetNextVersionIndexRequest``
-    (scans filesystem) → ``GetPathForMacroRequest`` retry → ``WriteFileRequest``.
+    Drives the production write path (``FileDestination(macro_path).write_bytes(...)``).
+    The seed assigns ``1`` to the padded slot in ``on_get_path_for_macro_request`` (gated
+    on ``existing_file_policy=CREATE_NEW``); on collision OSManager walks forward against
+    the user's original macro through the project resolver each iteration.
 
     The padding spec (``NumericPaddingFormat``) is the macro author's opt-in: a single
     unresolved required variable WITH padding is treated as an auto-index slot. Without
@@ -885,13 +884,11 @@ class TestCreateNewMacroIndexSeed:
         """
         macro_path = MacroPath(ParsedMacro("{outputs}/{shot}_render.png"), {})
 
-        with pytest.raises(FileLoadError) as excinfo:
+        # Macro resolution happens inside OSManager during WriteFileRequest, so the
+        # missing-variables failure surfaces as FileWriteError (not FileLoadError).
+        with pytest.raises(FileWriteError) as excinfo:
             self._save(macro_path, b"should not write")
 
-        # FileLoadError (not FileWriteError) because the failure is at macro resolution,
-        # before WriteFileRequest is constructed: the seed-on-retry only fires for
-        # padded missing-required vars, so an unpadded `{shot}` falls straight through
-        # to MISSING_REQUIRED_VARIABLES.
         assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
         # And nothing was silently auto-allocated.
         assert not any(outputs_dir.iterdir())
@@ -938,15 +935,6 @@ class TestCreateNewMacroIndexSeed:
         sys.platform != "darwin",
         reason="NFC/NFD divergence is most acute on macOS HFS+/APFS where readdir may return either form",
     )
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "Macro parser's extract_variables compares static segments byte-for-byte; an "
-            "NFD on-disk name vs. NFC user-supplied value silently drops the match and the "
-            "scan returns index=1. Fix lives in macro_parser (cross-cuts beyond #4875). "
-            "Tracked at https://github.com/griptape-ai/griptape-nodes-engine/issues/4914"
-        ),
-    )
     def test_unicode_nfd_filename_round_trip(self, outputs_dir: Path) -> None:
         """Existing files written with one Unicode normal form must be recognized by the scan.
 
@@ -982,13 +970,16 @@ class TestCreateNewMacroIndexSeed:
     ) -> None:
         """OVERWRITE and FAIL must NOT auto-seed `{_index:03}` — that's CREATE_NEW's contract.
 
-        Locks in the match/case in ``_should_seed_on_missing_required``: only CREATE_NEW
-        opts in. Other policies surface MISSING_REQUIRED_VARIABLES so callers see a real
-        configuration error rather than silently allocating an indexed path.
+        ``GetPathForMacroRequest`` only fires the auto-seed when ``existing_file_policy``
+        is ``CREATE_NEW``. Other policies surface MISSING_REQUIRED_VARIABLES so callers
+        see a real configuration error rather than silently allocating an indexed path.
         """
         macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-        with pytest.raises(FileLoadError) as excinfo:
+        # Write surfaces the macro-resolution failure as a FileWriteError (the failure
+        # happens inside OSManager during WriteFileRequest, not in file.py's resolver).
+        # Same failure_reason either way: MISSING_MACRO_VARIABLES.
+        with pytest.raises(FileWriteError) as excinfo:
             FileDestination(macro_path, existing_file_policy=policy).write_bytes(b"should not write")
 
         assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
@@ -1013,17 +1004,6 @@ class TestCreateNewMacroIndexSeed:
 
         assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason=(
-            "_scan_for_next_available_index splits the glob pattern into parent + name "
-            "and calls parent.glob(name). When the index variable appears in a directory "
-            "component, the parent itself contains a wildcard, parent.exists() returns "
-            "False, and the scan returns index=1. Pre-existing limitation in the scan "
-            "loop, surfaced more broadly by #4875's seed-on-retry path. Tracked at "
-            "https://github.com/griptape-ai/griptape-nodes-engine/issues/4915"
-        ),
-    )
     def test_same_index_variable_used_in_directory_and_filename(self, outputs_dir: Path) -> None:
         """Same `{_index:03}` referenced twice (as dir AND filename component) — both seeded equally.
 
@@ -1048,19 +1028,11 @@ class TestCreateNewMacroIndexSeed:
 
 
 class TestCreateNewMacroIndexSeedDefensiveFallthrough:
-    """Tier 1 stress test: defensive paths that should never silently auto-allocate.
+    """Defensive paths around the auto-index seed and the collision-walk loop.
 
-    The seed-on-retry chain in ``_resolve_file_path`` has three failure modes that must
-    fall through to MISSING_REQUIRED_VARIABLES rather than write data:
-
-    - ``GetCurrentProjectRequest`` returns failure (no current project — defensive code
-      in ``_inject_referenced_project_directories``).
-    - ``GetNextVersionIndexRequest`` returns failure (e.g. ambiguous index variable).
-    - The seeded retry's ``GetPathForMacroRequest`` itself fails again.
-
-    These failures aren't reachable through the normal ``setup_project`` fixture (the
-    system default project always exists), so we mock the relevant request to force
-    each defensive path. Confirms we don't crash and the user sees a real error.
+    Covers the heuristic refusing ambiguous macros, race-loss correctness (the walk
+    increments the user's ORIGINAL macro's padded slot — never suffix-injects ``_1``
+    on the resolved string), and budget exhaustion when the candidate space is full.
     """
 
     @pytest.fixture
@@ -1092,120 +1064,94 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         outputs.mkdir(parents=True, exist_ok=True)
         return outputs
 
-    def test_get_next_version_index_failure_falls_through(self, temp_dir: Path) -> None:
-        """If GetNextVersionIndexRequest fails internally, file.py must surface MISSING_REQUIRED.
+    def test_two_distinct_padded_required_vars_fail_loudly(self, temp_dir: Path) -> None:
+        """Macro with TWO distinct padded unresolved required vars must fail, not auto-pick.
 
-        Force the failure organically: a macro with TWO distinct padded unresolved required
-        variables (``{a:03}`` and ``{b:03}``). ``_find_padded_unresolved_required`` returns
-        None because there's no single padded var (heuristic refuses to guess), so we
-        actually never reach ``GetNextVersionIndexRequest`` — but we DO want the test to
-        confirm the upstream gate. For the deeper case where the heuristic fires but the
-        scan itself fails, we'd need a request-registry mock; that's harder to set up
-        cleanly and the natural failure surface here (heuristic refuses ambiguous) covers
-        the same user-visible promise: no silent allocation.
+        ``_find_padded_unresolved_required`` only fires for a SINGLE missing required
+        variable. With two (``{a:03}`` and ``{b:03}``), the heuristic refuses to guess —
+        the user sees ``MISSING_REQUIRED_VARIABLES`` naming both, no silent allocation.
         """
         outputs = temp_dir / "outputs"
         outputs.mkdir(parents=True, exist_ok=True)
 
-        # Two distinct padded unresolved required vars — heuristic must refuse to pick one.
         macro_path = MacroPath(ParsedMacro("{outputs}/{a:03}_{b:03}.png"), {})
 
-        with pytest.raises(FileLoadError) as excinfo:
+        with pytest.raises(FileWriteError) as excinfo:
             FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
                 b"should not write"
             )
 
         assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
-        # Defensive: nothing landed on disk.
         assert not any(outputs.iterdir())
 
     # ---------------------------------------------------------------------
-    # Race-loss correctness tests
+    # Race-loss correctness — collision-walk against the ORIGINAL macro
     # ---------------------------------------------------------------------
-    # These guard the contract from #4875: under contention, the loser of a scan-vs-write
-    # race must produce the next free index against the ORIGINAL macro template
-    # (e.g. render_v004.png), NOT a suffix-injected fallback like render_v003_1.png.
+    # The "assign 1, walk on collision" model means race-loss is handled inside
+    # OSManager's CREATE_NEW collision-fallback: when the seeded write at v001 fails
+    # (because a racer wrote that slot, or because a previous save in the same series
+    # used it), the candidate loop increments the user's ORIGINAL macro's padded slot
+    # forward (v002, v003, …) and re-resolves through the project resolver each
+    # iteration — never synthesizing a `_1` suffix on the resolved string.
     #
-    # We mock _seed_index_for_create_new (in file.py, NOT OSManager) to control which
-    # index gets seeded each iteration. That's the right level: we're testing file.py's
-    # retry loop logic, and the loop body invokes that helper once per iteration. Mocking
-    # the OS-side scan would require fabricating GetNextVersionIndexResultSuccess
-    # responses, which is more brittle and farther from what the loop actually sees.
+    # The natural CREATE_NEW save path produces these outcomes; no helper-level mocking
+    # required.
 
     def test_race_loss_picks_next_index_not_suffix(self, outputs_dir: Path) -> None:
-        """Bug fix for #4875 race-loss contract: scan returns 3 twice, second write must land at v004.
-
-        Simulates: process A reserves v003, our seed scan returns 3, we attempt to
-        write v003 with policy=FAIL → POLICY_NO_OVERWRITE → file.py loops, second
-        scan now sees v003 on disk and returns 4 → we successfully write v004.
-
-        Critically: the file must NOT end up at ``render_v003_1.png`` (the old wrong
-        behavior where convert-on-collision suffix-injects on the resolved path).
-        """
-        # Pre-create v003 so the first FAIL write loses the race.
+        """A pre-existing v003 must steer the next save to v004, not v003_1."""
+        # Pre-create v003 to simulate a racer's win (or a prior save in this series).
         (outputs_dir / "render_v003.png").write_bytes(b"existing race winner")
 
         macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-        # Mock _seed_index_for_create_new to return [3, 4, 4, ...]: first iteration
-        # returns 3 (we lose the race), second returns 4 (gap-fill against the racer's
-        # win), and any further calls keep returning 4 (defensive — we don't actually
-        # expect a third call for this scenario).
-        from griptape_nodes.files import file as file_module
+        # The seed assigns 1 → resolves to v001 → write succeeds (no v001 yet).
+        # To exercise the collision-walk we need to land on a slot that already exists.
+        # Pre-creating v001 forces the seed-then-fail path → walk increments to v002,
+        # which is also free, so v002 lands. Pre-creating up to v003 leaves v004 as the
+        # first free slot → that's what should land.
+        (outputs_dir / "render_v001.png").write_bytes(b"earlier save")
+        (outputs_dir / "render_v002.png").write_bytes(b"earlier save")
 
-        def seed_side_effect(mp: MacroPath, var: ParsedVariable) -> MacroPath:
-            # Pull the next index from the iterator each call. Builds a seeded MacroPath
-            # the same way the real helper does (seed value layered on user variables).
-            idx = next(seed_iter)
-            return MacroPath(parsed_macro=mp.parsed_macro, variables={**mp.variables, var.info.name: idx})
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
+            b"new save lands at v004"
+        )
 
-        seed_iter = iter([3, 4, 4])  # 3 then 4 onward; the third is unused but harmless.
-
-        with patch.object(file_module, "_seed_index_for_create_new", side_effect=seed_side_effect):
-            FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
-                b"new save lands at v004"
-            )
-
-        # Correct outcome.
         assert (outputs_dir / "render_v004.png").exists()
         assert (outputs_dir / "render_v004.png").read_bytes() == b"new save lands at v004"
-        # Wrong outcomes the bug used to produce.
+        # Wrong outcome from the previous suffix-injection bug.
         assert not (outputs_dir / "render_v003_1.png").exists()
-        # The pre-existing v003 from the racer is untouched.
+        # The pre-existing v003 is untouched.
         assert (outputs_dir / "render_v003.png").read_bytes() == b"existing race winner"
 
     def test_persistent_contention_exhausts_budget(self, outputs_dir: Path) -> None:
-        """If race-loss persists for MAX_INDEXED_CANDIDATES iterations, raise FileWriteError.
+        """If every candidate up to MAX_INDEXED_CANDIDATES is taken, raise FileWriteError.
 
-        Defensive contract: rather than busy-loop forever, file.py gives up after the
-        same retry budget as OSManager's existing CREATE_NEW collision loop and surfaces
-        a clear error naming the last attempted path.
+        Defensive contract: rather than busy-loop forever, the candidate loop gives up
+        and the caller sees a real error.
         """
-        # Pre-create v003 so every FAIL write attempt at index 3 loses.
-        (outputs_dir / "render_v003.png").write_bytes(b"persistent")
+        from griptape_nodes.retained_mode.managers.os_manager import MAX_INDEXED_CANDIDATES
+
+        # Pre-create v001..vMAX so every candidate the walk tries is taken. The walk
+        # starts at 2 (the seed already tried 1 and saw it exist), so we need
+        # MAX_INDEXED_CANDIDATES + 1 files to fully exhaust.
+        for i in range(1, MAX_INDEXED_CANDIDATES + 2):
+            (outputs_dir / f"render_v{i:03}.png").write_bytes(b"taken")
 
         macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
 
-        # Always seed index=3 — every iteration loses, exhausting the budget.
-        from griptape_nodes.files import file as file_module
-
-        def always_seed_3(mp: MacroPath, var: ParsedVariable) -> MacroPath:
-            return MacroPath(parsed_macro=mp.parsed_macro, variables={**mp.variables, var.info.name: 3})
-
-        with (
-            patch.object(file_module, "_seed_index_for_create_new", side_effect=always_seed_3),
-            pytest.raises(FileWriteError) as excinfo,
-        ):
+        with pytest.raises(FileWriteError) as excinfo:
             FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
                 b"should not land"
             )
 
-        # Diagnostic: error message names the contended path so an oncall can locate it.
-        assert "race-loss exhausted" in str(excinfo.value.result_details).lower()
-        assert "render_v003.png" in str(excinfo.value.result_details)
-        # No partial writes left behind beyond the pre-existing racer's file.
-        survivors = [p.name for p in outputs_dir.iterdir()]
-        assert survivors == ["render_v003.png"], f"Unexpected files: {survivors}"
+        # Diagnostic: error message describes the exhaustion so an oncall can locate it.
+        # OSManager's existing collision-loop exhaustion message names the candidate count.
+        details = str(excinfo.value.result_details).lower()
+        assert "could not find available filename" in details or "exhausted" in details
+        # No new files were created — the pre-populated set is exactly what's there.
+        survivors = sorted(p.name for p in outputs_dir.iterdir())
+        expected = sorted(f"render_v{i:03}.png" for i in range(1, MAX_INDEXED_CANDIDATES + 2))
+        assert survivors == expected, f"Unexpected files: {set(survivors) - set(expected)}"
 
 
 @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific path stressors")

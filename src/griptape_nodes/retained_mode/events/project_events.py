@@ -19,6 +19,10 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 if TYPE_CHECKING:
     from pathlib import Path
 
+    # Circular import: project_events -> os_events -> project_events (MacroPath).
+    # Type-only import for the same reason as ProjectInfo below.
+    from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
+
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
 
@@ -250,12 +254,21 @@ class GetPathForMacroRequest(RequestPayload):
     Args:
         parsed_macro: The parsed macro to resolve
         variables: Variable values for macro substitution (e.g., {"file_name": "output", "file_ext": "png"})
+        existing_file_policy: When set to ``CREATE_NEW``, the resolver may seed an
+            unresolved required ``{x:NN}``-padded variable to ``1`` so the macro
+            resolves to the first candidate path (e.g. ``render_v001.png``); the
+            caller is then expected to walk forward against the same macro on
+            collision. Reads and other policies leave this ``None`` (the default)
+            and an unresolved padded variable surfaces as
+            ``MISSING_REQUIRED_VARIABLES`` — never silently allocate a path the
+            caller did not intend.
 
     Results: GetPathForMacroResultSuccess | GetPathForMacroResultFailure
     """
 
     parsed_macro: ParsedMacro
     variables: MacroVariables
+    existing_file_policy: ExistingFilePolicy | None = None
 
 
 @dataclass

@@ -898,25 +898,20 @@ class GetNextVersionIndexRequest(RequestPayload):
 
     Args:
         macro_path: MacroPath whose template contains ``{_index}`` (required or optional).
-            All non-index variables must resolve before the scan can build a concrete
-            glob. Project directory variables (``{outputs}``, ``{inputs}``, …) are
-            resolved automatically against the current project — callers may leave them
-            out of ``macro_path.variables``. Other variables (``file_name_base``,
-            user-defined vars, etc.) must be supplied by the caller.
+            All variables other than ``_index`` must be resolved in ``macro_path.variables``
+            so the manager can build a concrete glob pattern.
 
     Results: GetNextVersionIndexResultSuccess | GetNextVersionIndexResultFailure
 
     Examples:
-        MacroPath with required ``{_index:03}`` and a project ``{outputs}`` directory:
+        MacroPath with required ``{_index:03}``:
             Template: ``"{outputs}/render_v{_index:03}"``
-            Variables: ``{}``  # {outputs} resolved from the current project
+            Variables: ``{"outputs": "/abs/path"}``
             Existing dirs: ``render_v001``, ``render_v002``, ``render_v004``
             Returns: ``GetNextVersionIndexResultSuccess(index=3)``  # fills the gap
 
-        MacroPath with caller-supplied absolute path:
-            Template: ``"{outputs}/render_v{_index:03}"``
-            Variables: ``{"outputs": "/abs/path"}``  # caller-supplied wins over project
-            Returns: ``GetNextVersionIndexResultSuccess(index=1)``  # if no matches
+        MacroPath with no existing entries:
+            Returns: ``GetNextVersionIndexResultSuccess(index=1)``
 
         MacroPath with optional ``{_index?:_}`` and base path free:
             Returns: ``GetNextVersionIndexResultSuccess(index=None)``

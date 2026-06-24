@@ -17,7 +17,9 @@ from griptape_nodes.common.macro_parser import (
     MacroResolutionError,
     MacroResolutionFailureReason,
     MacroVariables,
+    NumericPaddingFormat,
     ParsedMacro,
+    ParsedVariable,
 )
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
@@ -46,7 +48,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
-from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
+from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, ReadFileRequest, ReadFileResultSuccess
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -373,6 +375,48 @@ class _ProvisioningConfigDirs(NamedTuple):
     project_dir: Path
     workspace_dir: Path
     apply_override: bool
+
+
+def _find_padded_unresolved_required(parsed_macro: ParsedMacro, missing_required: set[str]) -> ParsedVariable | None:
+    """Return the unresolved required variable that opts into auto-index seeding, else None.
+
+    A macro author opts into auto-indexing by writing a single unresolved required
+    variable with a ``NumericPaddingFormat`` (``{x:NN}``). The padding spec is the signal
+    that this slot holds an auto-allocated zero-padded number — without it, an unresolved
+    ``{shot}`` could just as plausibly be a variable the user forgot to bind, and silently
+    filling it with ``1`` would write data under a name the user never intended.
+
+    Debugging: a ``None`` return is the most common reason a CREATE_NEW save with what
+    looks like a valid auto-index macro instead surfaces ``MISSING_REQUIRED_VARIABLES``.
+    Walk the gates below in order.
+    """
+    # Gate 1: heuristic only fires when there is exactly ONE missing required variable.
+    # Two or more → ambiguous which is the index slot; refuse and let
+    # MISSING_REQUIRED_VARIABLES name every unbound var.
+    if len(missing_required) != 1:
+        return None
+    [name] = missing_required
+
+    # Gate 2: walk the parsed segments to recover the variable's full ParsedVariable
+    # (we need its format_specs; the caller only has the name string from the failure
+    # set). The same name can appear in multiple slots; first occurrence is fine since
+    # they all bind to the same value.
+    matching_variables: list[ParsedVariable] = []
+    for segment in parsed_macro.segments:
+        if isinstance(segment, ParsedVariable) and segment.info.name == name:
+            matching_variables.append(segment)  # noqa: PERF401  # explicit loop for breakpoint debugging
+    if not matching_variables:
+        # Shouldn't happen — name came from the parser's own missing set — but guard
+        # so a corrupt failure result can't crash.
+        return None
+    candidate = matching_variables[0]
+
+    # Gate 3: padding (`:NN`) is the safety contract. Without it, an unbound `{shot}`
+    # would be auto-allocated; with it, the macro author has opted in.
+    if not any(isinstance(spec, NumericPaddingFormat) for spec in candidate.format_specs):
+        return None
+
+    return candidate
 
 
 class ProjectManager:
@@ -1141,6 +1185,20 @@ class ProjectManager:
         required_vars = {v.name for v in variable_infos if v.is_required}
         provided_vars = set(resolution_bag.keys())
         missing = required_vars - provided_vars
+
+        # Auto-index seed: when the caller's policy is CREATE_NEW and the macro has a
+        # single unresolved required `{x:NN}`-padded variable, assign it `1` so the
+        # macro resolves to the first candidate path (e.g. `render_v001.png`). The
+        # caller (OSManager.on_write_file_request) walks forward against the same
+        # macro on collision — incrementing the value here, not the resolved string —
+        # which is what makes `v001 → v002 → v003` work correctly under contention
+        # and across the whole sequence.
+        # See https://github.com/griptape-ai/griptape-nodes-engine/issues/4875.
+        if missing and request.existing_file_policy is ExistingFilePolicy.CREATE_NEW:
+            candidate = _find_padded_unresolved_required(request.parsed_macro, missing)
+            if candidate is not None:
+                resolution_bag[candidate.info.name] = 1
+                missing.discard(candidate.info.name)
 
         if missing:
             return GetPathForMacroResultFailure(
