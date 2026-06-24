@@ -526,37 +526,36 @@ class OSManager:
             raise
 
     def _resolve_macro_path_to_string(self, macro_path: MacroPath) -> str | MacroResolutionFailure:
-        """Resolve MacroPath to string, handling missing variables.
+        """Resolve MacroPath to absolute string via ProjectManager.
+
+        Pure resolver: routes through ``GetPathForMacroRequest`` so project
+        directories, builtins, and env vars are applied uniformly. No
+        write-policy awareness lives here — auto-index seeding for CREATE_NEW
+        writes happens in ``on_write_file_request`` instead, where the policy
+        is in scope.
 
         Args:
             macro_path: MacroPath containing parsed macro and variables
 
         Returns:
-            str: Successfully resolved path string
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
-
-        Examples:
-            # Success case
-            macro_path = MacroPath(ParsedMacro("{outputs}/file.png"), {"outputs": "/path"})
-            result = self._resolve_macro_path_to_string(macro_path)
-            # Returns: "/path/file.png"
-
-            # Missing variable case
-            macro_path = MacroPath(ParsedMacro("{outputs}/{frame}.png"), {"outputs": "/path"})
-            result = self._resolve_macro_path_to_string(macro_path)
-            # Returns: MacroResolutionFailure(missing_variables={"frame"}, ...)
+            str: Successfully resolved absolute path string (success path; last)
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
-
-        try:
-            return macro_path.parsed_macro.resolve(macro_path.variables, secrets_manager)
-        except MacroResolutionError as e:
-            return MacroResolutionFailure(
-                failure_reason=e.failure_reason or MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
-                variable_name=e.variable_name,
-                missing_variables=e.missing_variables,
-                error_details=str(e),
+        result = GriptapeNodes.handle_request(
+            GetPathForMacroRequest(
+                parsed_macro=macro_path.parsed_macro,
+                variables=macro_path.variables,
             )
+        )
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            missing = getattr(result, "missing_variables", None)
+            return MacroResolutionFailure(
+                failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                variable_name=None,
+                missing_variables=missing,
+                error_details=str(getattr(result, "result_details", "")),
+            )
+        return str(result.absolute_path)
 
     def _validate_file_path_for_write(
         self,
@@ -1050,6 +1049,90 @@ class OSManager:
 
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
+    @staticmethod
+    def _find_padded_unresolved_required(
+        parsed_macro: ParsedMacro, missing_required: set[str]
+    ) -> ParsedVariable | None:
+        """Find the single missing required variable that opts into auto-index seeding.
+
+        A macro author opts in by writing a single unresolved required variable with a
+        ``NumericPaddingFormat`` (``{x:NN}``). The padding spec is the safety contract:
+        without it, an unresolved ``{shot}`` could just as plausibly be a variable the
+        user forgot to bind, and silently filling it with ``1`` would write data under
+        a name the user never intended.
+
+        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
+        first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
+        that gets ``1`` stuffed into it for the retry.
+
+        Debugging: a ``None`` return is the most common reason a CREATE_NEW save with
+        what looks like a valid auto-index macro instead surfaces ``MISSING_REQUIRED``.
+        Walk the gates in order.
+        """
+        # Gate 1: heuristic only fires when there is exactly ONE missing required var.
+        # Two or more → ambiguous which is the index slot; refuse and let the caller
+        # surface MISSING_REQUIRED naming every unbound var.
+        if len(missing_required) != 1:
+            return None
+        [name] = missing_required
+
+        # Gate 2: walk the parsed segments to recover the variable's full ParsedVariable
+        # (we need its format_specs; the caller only has the name string from the
+        # failure). The same name can appear in multiple slots; first occurrence is
+        # fine since they all bind to the same value.
+        matching: list[ParsedVariable] = []
+        for segment in parsed_macro.segments:
+            if isinstance(segment, ParsedVariable) and segment.info.name == name:
+                matching.append(segment)  # noqa: PERF401  # explicit loop for breakpoint debugging
+        if not matching:
+            # Shouldn't happen — name came from the parser's own missing set — but
+            # guard so a corrupt failure result can't crash.
+            return None
+        candidate = matching[0]
+
+        # Gate 3: padding (`:NN`) is the safety contract. Without it the macro author
+        # didn't opt in.
+        if not any(isinstance(spec, NumericPaddingFormat) for spec in candidate.format_specs):
+            return None
+
+        return candidate
+
+    def _select_collision_walk_macro(
+        self, request: WriteFileRequest, file_path: Path
+    ) -> tuple[MacroPath, ParsedVariable | None]:
+        """Pick the MacroPath the CREATE_NEW collision loop walks forward.
+
+        Returns ``(macro_path, padded_index_var)``. When ``padded_index_var`` is not
+        None, the caller walks *its* slot (using ProjectManager so unresolved project
+        directories like ``{outputs}`` get substituted each iteration).
+
+        When the caller passed a MacroPath whose unresolved variable carries a
+        ``NumericPaddingFormat`` — required ``{x:NN}`` OR optional ``{x?:NN}`` — we
+        walk that slot against the user's ORIGINAL macro. Incrementing it produces
+        consistent zero-padded width across the sequence (``v001 → v002 → v003``).
+
+        The ``is_required`` distinction matters for the SEED step (we only seed required
+        slots; optional slots happily resolve as omitted on the first attempt). It does
+        NOT matter for the walk: by the time we're in collision-fallback the first
+        attempt has already failed via "file exists," and the user's intent for either
+        shape is "give me a padded index here." Walking either kind closes #4544 and
+        #4092 — optional ``{_index?:03}`` collisions previously rendered as ``_1``
+        (unpadded suffix injection) instead of ``_001`` (padded walk).
+
+        Otherwise (plain string path, or a MacroPath without ANY padded slot), fall
+        back to ``_convert_str_path_to_macro_with_index`` which synthesizes
+        ``{stem}_{_index}{ext}`` — original behavior preserved.
+        """
+        if isinstance(request.file_path, MacroPath):
+            for segment in request.file_path.parsed_macro.segments:
+                if (
+                    isinstance(segment, ParsedVariable)
+                    and segment.info.name not in request.file_path.variables
+                    and any(isinstance(spec, NumericPaddingFormat) for spec in segment.format_specs)
+                ):
+                    return request.file_path, segment
+        return self._convert_str_path_to_macro_with_index(str(file_path)), None
+
     def _scan_for_next_available_index(
         self,
         parsed_macro: ParsedMacro,
@@ -1124,8 +1207,10 @@ class OSManager:
         existing_indices = []
 
         for filepath in existing_files:
-            filename = Path(filepath).name
-            extracted_index = self._extract_index_from_filename(filename, parsed_macro, index_var_name, variables)
+            # Pass the full path string. _extract_index_from_filename matches against the
+            # FULL template (parent-directory segments and all), so the basename never
+            # matches and the scan would return 1 every call.
+            extracted_index = self._extract_index_from_filename(str(filepath), parsed_macro, index_var_name, variables)
             if extracted_index is not None:
                 existing_indices.append(extracted_index)
 
@@ -2112,12 +2197,32 @@ class OSManager:
         final_bytes_written: int | None = None
         used_indexed_fallback = False
 
-        # COMMON SETUP: Resolve path for all policies
-        # Resolve MacroPath → str
+        # COMMON SETUP: Resolve path for all policies. For MacroPath inputs we may
+        # auto-seed a single padded missing-required slot — but only for CREATE_NEW
+        # writes, and only if the macro author opted in via `:NN` padding.
         if isinstance(request.file_path, MacroPath):
-            resolution_result = self._resolve_macro_path_to_string(request.file_path)
+            macro_path = request.file_path
+            path_display = f"{macro_path.parsed_macro}"
+            resolution_result = self._resolve_macro_path_to_string(macro_path)
+
+            # Seed-and-retry: ONLY for CREATE_NEW + a single padded missing-required
+            # slot. Anything else (other policies, multiple missing, no padding) falls
+            # through to the failure return below.
+            # https://github.com/griptape-ai/griptape-nodes-engine/issues/4875
+            if (
+                isinstance(resolution_result, MacroResolutionFailure)
+                and resolution_result.missing_variables
+                and request.existing_file_policy is ExistingFilePolicy.CREATE_NEW
+            ):
+                candidate = self._find_padded_unresolved_required(
+                    macro_path.parsed_macro, resolution_result.missing_variables
+                )
+                if candidate is not None:
+                    seeded_vars = {**macro_path.variables, candidate.info.name: 1}
+                    seeded_macro = MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
+                    resolution_result = self._resolve_macro_path_to_string(seeded_macro)
+
             if isinstance(resolution_result, MacroResolutionFailure):
-                path_display = f"{request.file_path.parsed_macro}"
                 msg = f"Attempted to write to file '{path_display}'. Failed due to missing variables: {resolution_result.error_details}"
                 return WriteFileResultFailure(
                     failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
@@ -2125,7 +2230,6 @@ class OSManager:
                     result_details=msg,
                 )
             resolved_path_str = resolution_result
-            path_display = f"{request.file_path.parsed_macro}"
         else:
             # Sanitize string path (removes shell escapes, quotes, etc.)
             resolved_path_str = sanitize_path_string(request.file_path)
@@ -2234,65 +2338,40 @@ class OSManager:
                     final_bytes_written = result.bytes_written
                 else:
                     # FILE EXISTS OR IS LOCKED. ATTEMPT TO FIND THE NEXT AVAILABLE.
-                    # Convert to indexed MacroPath for scanning. If the user didn't give us a macro to start with,
-                    # we'll take their file name and turn it into a macro that appends _<index> to it.
-                    # (e.g., if they gave us "output.png" we'll convert that to a macro that tries "output_1.png", "output_2.png", etc.)
-                    # For MacroPath inputs, the path is already fully resolved at this point,
-                    # so convert the resolved path string to inject {_index} as well.
-                    macro_path = self._convert_str_path_to_macro_with_index(str(file_path))
+                    # Two ways to discover the index variable to walk:
+                    #
+                    # 1. If the caller passed a MacroPath that already opted into the
+                    #    auto-index seed (one unresolved required `{x:NN}` slot bound to
+                    #    `1` by ProjectManager's seed gate), walk THAT slot — incrementing
+                    #    `_index` against the user's original macro produces consistent
+                    #    zero-padded width across the sequence (`v001 → v002 → v003`).
+                    # 2. Otherwise, synthesize an `{stem}_{_index}{ext}` macro from the
+                    #    resolved string. This is the original behavior for plain string
+                    #    paths (`output.png` → `output_1.png`). For seeded MacroPaths it
+                    #    would lose padding (`v003 → v003_1`), which is why path 1 above
+                    #    catches them first.
+                    macro_path, padded_index_var = self._select_collision_walk_macro(request, file_path)
                     parsed_macro = macro_path.parsed_macro
                     variables = macro_path.variables
 
-                    # Identify index variable
-                    try:
-                        index_info = self._identify_index_variable(parsed_macro, variables)
-                    except ValueError as e:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.INVALID_PATH,
-                            result_details=msg,
-                        )
-                    except Exception as e:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.IO_ERROR,
-                            result_details=msg,
-                        )
-
-                    if index_info is None:
-                        # This should not happen since we always inject {_index} above
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.INVALID_PATH,
-                            result_details=msg,
-                        )
-
-                    # We have a macro with one and only one index variable on it. The heuristic here is:
-                    # 1. Find the FIRST available file name with our index. We'll start there, but someone else may have
-                    #    ganked it while we were attempting to write to it.
-                    # 2. Try candidates in sequence until we find one that works, or fail if we've tried too many times.
-                    # Note: The user could have specified using the index value as a DIRECTORY,
-                    # so it's not always output_1, output_2, etc. It could be run_1/output.png, run_2/output.png, etc.
-
-                    # Scan for starting index
-                    starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
-
-                    # Try indexed candidates on-demand (up to max attempts)
-                    secrets_manager = GriptapeNodes.SecretsManager()
-                    start_idx = starting_index if starting_index is not None else 1
-                    attempted_count = 0
-
-                    for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
-                        attempted_count += 1
-
-                        # Step 1: Resolve macro with current index
+                    # For the synthesized-macro case (padded_index_var is None) we still
+                    # use _identify_index_variable to find the slot — its variables dict
+                    # is empty by construction so the call is unambiguous. For the
+                    # original-macro case the caller already knows the slot from
+                    # _select_collision_walk_macro, so we skip the call entirely
+                    # (running it against `{outputs}/render_v{_index:NN}.png` with empty
+                    # variables would falsely report ambiguity since `{outputs}` is also
+                    # unresolved at that level — it gets substituted by ProjectManager
+                    # during the per-iteration resolve).
+                    if padded_index_var is not None:
+                        index_info = padded_index_var
+                    else:
                         try:
-                            index_vars = {**variables, index_info.info.name: idx}
-                            candidate_str = parsed_macro.resolve(index_vars, secrets_manager)
-                        except MacroResolutionError as e:
-                            msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
+                            index_info = self._identify_index_variable(parsed_macro, variables)
+                        except ValueError as e:
+                            msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
                             return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                failure_reason=FileIOFailureReason.INVALID_PATH,
                                 result_details=msg,
                             )
                         except Exception as e:
@@ -2301,6 +2380,83 @@ class OSManager:
                                 failure_reason=FileIOFailureReason.IO_ERROR,
                                 result_details=msg,
                             )
+
+                        if index_info is None:
+                            # This should not happen since we always inject {_index} above
+                            msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
+                            return WriteFileResultFailure(
+                                failure_reason=FileIOFailureReason.INVALID_PATH,
+                                result_details=msg,
+                            )
+
+                    # We have a macro with one and only one index variable on it. Two
+                    # walking strategies, picked in `_select_collision_walk_macro`:
+                    #
+                    # A. Original MacroPath with a padded slot — `request.file_path` is
+                    #    the same MacroPath the caller sent. We re-resolve each iteration
+                    #    via `_resolve_macro_path_to_string` so project directories get
+                    #    substituted. Skip the filesystem scan; just walk forward.
+                    #
+                    #    Starting index depends on whether the seed already tried index=1:
+                    #    - Required `{x:NN}`: seed in COMMON SETUP assigned 1 → start at 2.
+                    #    - Optional `{x?:NN}`: seed didn't fire (it's gated on required);
+                    #      the first attempt resolved with the slot OMITTED → start at 1
+                    #      so this loop is the FIRST place we try a value.
+                    # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
+                    #    — variables is empty, template is fully static except `{_index}`.
+                    #    Run the existing scan to find a starting index (`output.png`
+                    #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
+                    walking_original = padded_index_var is not None
+                    if walking_original:
+                        # padded_index_var is the var the walk targets. is_required tells
+                        # us whether the seed already tried 1 in COMMON SETUP.
+                        start_idx = 2 if padded_index_var.info.is_required else 1
+                    else:
+                        starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
+                        start_idx = starting_index if starting_index is not None else 1
+
+                    # Try indexed candidates on-demand (up to max attempts)
+                    secrets_manager = GriptapeNodes.SecretsManager()
+                    attempted_count = 0
+
+                    for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
+                        attempted_count += 1
+
+                        # Step 1: Resolve macro with current index
+                        index_vars = {**variables, index_info.info.name: idx}
+                        if walking_original:
+                            # Original MacroPath: route through ProjectManager so project
+                            # directories (`{outputs}`, …) get substituted along with our
+                            # incremented index. The variable is already bound (we just
+                            # set it ourselves), so the resolver doesn't need any policy
+                            # context — it'll succeed without invoking any seed logic.
+                            resolution = self._resolve_macro_path_to_string(
+                                MacroPath(parsed_macro=parsed_macro, variables=index_vars),
+                            )
+                            if isinstance(resolution, MacroResolutionFailure):
+                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {resolution.error_details}"
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                    result_details=msg,
+                                )
+                            candidate_str = resolution
+                        else:
+                            try:
+                                candidate_str = parsed_macro.resolve(index_vars, secrets_manager)
+                            except MacroResolutionError as e:
+                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                    result_details=msg,
+                                )
+                            except Exception as e:
+                                msg = (
+                                    f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
+                                )
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.IO_ERROR,
+                                    result_details=msg,
+                                )
 
                         # Step 2: Resolve file path
                         try:

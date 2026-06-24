@@ -633,9 +633,13 @@ class File:
         Raises:
             FileWriteError: If the file cannot be written.
         """
-        resolved_path = _resolve_file_path(self._file_path)
+        # Pass the original file path (str or MacroPath) through to the request.
+        # OSManager.on_write_file_request resolves macros internally so it can apply
+        # the auto-index seed for CREATE_NEW saves and walk the original macro on
+        # collision. Pre-resolving here would lose both pieces of context.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/4875
         request = WriteFileRequest(
-            file_path=resolved_path,
+            file_path=self._file_path,
             content=content,
             encoding=encoding,
             existing_file_policy=existing_file_policy,
@@ -685,9 +689,9 @@ class File:
         Raises:
             FileWriteError: If the file cannot be written.
         """
-        resolved_path = await _aresolve_file_path(self._file_path)
+        # See `_write_content` for the rationale; this is the async mirror.
         request = WriteFileRequest(
-            file_path=resolved_path,
+            file_path=self._file_path,
             content=content,
             encoding=encoding,
             existing_file_policy=existing_file_policy,
