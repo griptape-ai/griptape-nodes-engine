@@ -118,7 +118,7 @@ A project that requires engine `>=0.80,<1.0` and pins the standard library to
 `/MyProject/griptape-nodes-project.yml`
 
 ```yaml
-"project_template_schema_version": "0.4.0"
+"project_template_schema_version": "0.5.0"
 "name": "my-pinned-project"
 "description": "Runs on engine 0.80-0.x with the standard library pinned to 0.79.0."
 ```

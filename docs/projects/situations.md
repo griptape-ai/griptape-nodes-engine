@@ -10,11 +10,11 @@ When a node needs to save a file, it names the situation it's in (for example, `
 
 ## Collision policies
 
-| Policy       | Behavior                                                                                                    |
-| ------------ | ----------------------------------------------------------------------------------------------------------- |
-| `create_new` | Increment a counter in the filename until a non-colliding name is found. Requires `{_index?}` in the macro. |
-| `overwrite`  | Replace the existing file without asking.                                                                   |
-| `fail`       | Stop and report an error if the file already exists.                                                        |
+| Policy       | Behavior                                                                                                                                                                                                                                                                                                                            |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `create_new` | Increment a counter in the filename until a non-colliding name is found. The macro can include `{_index?:NN}` (optional — absent on the first save, indexed on collision) or `{_index:NN}` (required — indexed from the first save). If neither is present, the system appends `_1`, `_2`, … to the resolved filename on collision. |
+| `overwrite`  | Replace the existing file without asking.                                                                                                                                                                                                                                                                                           |
+| `fail`       | Stop and report an error if the file already exists.                                                                                                                                                                                                                                                                                |
 
 The `create_dirs` field controls whether intermediate parent directories are created automatically (`true`, like `mkdir -p`) or whether a missing parent directory causes an error (`false`).
 
@@ -31,7 +31,7 @@ macro:  {file_name_base}{_index?:03}.{file_extension}
 policy: create_new, create_dirs: true
 ```
 
-Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{_index?:03}` variable is zero-padded and optional — omitted on the first save, then incremented to avoid overwriting existing files.
+Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{_index?:03}` variable is zero-padded and optional — omitted on the first save, then `001`, `002`, … on collision (padded width preserved across the sequence).
 
 ### `copy_external_file`
 

@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
@@ -96,6 +96,12 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
@@ -588,6 +594,31 @@ class ProjectManager:
             return LoadProjectTemplateResultFailure(
                 validation=validation,
                 result_details=f"Attempted to load project template from '{project_file_path}'. Failed because template is not usable (status: {validation.status})",
+            )
+
+        # License-policy checkpoint: gate loading this project on its resolved
+        # identity. A denial blocks the load -- the project is not cached as usable
+        # and the failure carries the missing permissions -- so a project the policy
+        # forbids never enters the engine, whether reached by explicit load or
+        # directory discovery. Mirrors the activation gate, which resolves the same
+        # facts; the name is passed in because the project is not cached yet.
+        load_denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.LOAD_PROJECT,
+                subject_type=CheckpointSubjectType.PROJECT,
+                subject_id=project_id,
+                attributes=self._project_checkpoint_attributes(project_id, name=template.name),
+            )
+        )
+        if load_denial is not None:
+            reason = load_denial.reason()
+            validation.add_error(field_path="permission", message=reason)
+            self._registered_template_status[project_file_path] = validation
+            return LoadProjectTemplateResultFailure(
+                validation=validation,
+                result_details=(
+                    f"Attempted to load project template from '{project_file_path}'. Failed because: {reason}"
+                ),
             )
 
         # Create consolidated ProjectInfo with fully populated macro caches
@@ -1284,7 +1315,8 @@ class ProjectManager:
         workspace layer, plus whether activation pins it via set_workspace_override.
         Priority, highest first (matching _activate_project's block):
 
-        1. project_workspaces user-config override -> (override dir, apply_override=True)
+        1. project_workspaces user-config override, keyed by project ID or path ->
+           (override dir, apply_override=True)
         2. workspace_directory from env vars -> (env dir, apply_override=False)
         3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
         4. the nearest ancestor's resolved workspace, walking the explicit parent-project chain ->
@@ -1355,12 +1387,32 @@ class ProjectManager:
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
-        """Return the user-configured workspace override for a project file, or None if not mapped."""
+        """Return the user-configured workspace override for a project, or None if not mapped.
+
+        A project_workspaces key may be either an opaque project ID or a project
+        file path. Each key is resolved to a canonical project path and compared
+        against the target's canonical path. See _resolve_workspace_key for the
+        ID-then-path resolution order.
+        """
         resolved_project_path = str(canonicalize_for_identity(project_file_path))
         return next(
-            (v for k, v in project_workspaces.items() if str(canonicalize_for_identity(k)) == resolved_project_path),
+            (v for k, v in project_workspaces.items() if self._resolve_workspace_key(k) == resolved_project_path),
             None,
         )
+
+    def _resolve_workspace_key(self, key: str) -> str:
+        """Canonical project path for a project_workspaces key (a project ID or a path).
+
+        Tries the key as a loaded project's ID first: when a loaded project carries
+        that id (and has a backing file), its file path is the resolved path. When no
+        loaded project matches the id (or it has no backing file), the key is treated
+        as a file path instead. IDs are looked up verbatim, never canonicalized, the
+        same way the registry is keyed.
+        """
+        info = self._successfully_loaded_project_templates.get(key)
+        if info is not None and info.project_file_path is not None:
+            return str(canonicalize_for_identity(info.project_file_path))
+        return str(canonicalize_for_identity(key))
 
     def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:  # noqa: PLR0911
         """Walk the explicit parent-project chain for the nearest ancestor's workspace.
@@ -1476,6 +1528,23 @@ class ProjectManager:
             await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
         return None
 
+    def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:
+        """The facts a hook may gate project load/activation on: id and (best-effort) name.
+
+        `name` is the resolved template name when the caller already holds it (load
+        time, before the project is cached); at activation it falls back to the
+        cached template so the load and activation gates resolve the same facts.
+        """
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: project_id}
+        resolved_name = name if name is not None else self._cached_project_name(project_id)
+        if resolved_name:
+            attributes[CheckpointAttribute.NAME] = str(resolved_name)
+        return attributes
+
+    def _cached_project_name(self, project_id: ProjectID) -> str | None:
+        info = self._successfully_loaded_project_templates.get(project_id)
+        return getattr(getattr(info, "template", None), "name", None)
+
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -1501,6 +1570,26 @@ class ProjectManager:
         # string were already canonicalized at load time, so a verbatim lookup
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
+
+        # License-policy checkpoint: gate activating a user project on its id. The
+        # system-defaults rest state is always allowed -- it is the fallback a
+        # failed activation rolls back to. A denial rejects the switch with the
+        # missing permissions and leaves the current project untouched (the
+        # activation below never runs).
+        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
+            denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+                AuthorizationCheckpoint(
+                    action=CheckpointAction.ACTIVATE_PROJECT,
+                    subject_type=CheckpointSubjectType.PROJECT,
+                    subject_id=resolved_project_id,
+                    attributes=self._project_checkpoint_attributes(resolved_project_id),
+                )
+            )
+            if denial is not None:
+                reason = denial.reason()
+                return SetCurrentProjectResultFailure(
+                    result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
+                )
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:

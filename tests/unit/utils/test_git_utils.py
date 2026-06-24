@@ -28,6 +28,7 @@ from griptape_nodes.utils.git_utils import (
     is_git_url,
     normalize_github_url,
     parse_git_url_with_ref,
+    remote_ref_exists,
     switch_branch,
 )
 
@@ -1153,3 +1154,67 @@ class TestGetGitInfo:
             get_git_info(temp_dir)
 
         mock_repo_class.assert_called_once()
+
+
+class TestRemoteRefExists:
+    """Tests for remote_ref_exists."""
+
+    def test_returns_true_when_git_cli_lists_matching_ref(self) -> None:
+        completed = Mock(returncode=0, stdout="abc123\trefs/heads/main\n", stderr="")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed) as mock_run,
+        ):
+            assert remote_ref_exists("git@github.com:owner/repo.git", "main") is True
+
+        args = mock_run.call_args.args[0]
+        assert args == ["git", "ls-remote", "--heads", "--tags", "git@github.com:owner/repo.git", "main"]
+
+    def test_returns_false_when_git_cli_lists_no_matching_ref(self) -> None:
+        completed = Mock(returncode=0, stdout="\n", stderr="")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
+        ):
+            assert remote_ref_exists("git@github.com:owner/repo.git", "local-only-branch") is False
+
+    def test_raises_git_remote_error_when_git_cli_fails(self) -> None:
+        completed = Mock(returncode=128, stdout="", stderr="fatal: could not read from remote\n")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
+            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
+        ):
+            remote_ref_exists("git@github.com:owner/repo.git", "main")
+
+    def test_returns_true_when_pygit2_lists_matching_ref(self) -> None:
+        mock_remote = Mock()
+        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/feature/foo"}, {"name": "refs/heads/main"}]
+        mock_repo = Mock()
+        mock_repo.remotes.create.return_value = mock_remote
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+        ):
+            assert remote_ref_exists("https://github.com/owner/repo.git", "feature/foo") is True
+
+    def test_returns_false_when_pygit2_lists_no_matching_ref(self) -> None:
+        mock_remote = Mock()
+        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/main"}]
+        mock_repo = Mock()
+        mock_repo.remotes.create.return_value = mock_remote
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+        ):
+            assert remote_ref_exists("https://github.com/owner/repo.git", "local-only-branch") is False
+
+    def test_raises_git_remote_error_when_pygit2_fails(self) -> None:
+        mock_repo = Mock()
+        mock_repo.remotes.create.side_effect = pygit2.GitError("auth failed")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
+        ):
+            remote_ref_exists("https://github.com/owner/repo.git", "main")
