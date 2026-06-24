@@ -1939,6 +1939,44 @@ class TestDecideWorkspace:
         assert decision.workspace_dir == Path(str(mapped_workspace))
         assert decision.apply_override is True
 
+    def test_project_workspaces_override_by_id_wins(self, tmp_path: Path) -> None:
+        """A project_workspaces key may be the project's opaque ID, not just its path."""
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        mapped_workspace = tmp_path / "mapped"
+
+        pm = self._pm_with_chain(
+            [{"id": "my-guid", "file": project_file, "parent_id": None}],
+            project_workspaces={"my-guid": str(mapped_workspace)},
+        )
+        decision = pm.decide_workspace(
+            project_file,
+            project_config={"workspace_directory": "/ignored/project"},
+            env_config={"workspace_directory": "/ignored/env"},
+        )
+
+        assert decision.workspace_dir == Path(str(mapped_workspace))
+        assert decision.apply_override is True
+
+    def test_project_workspaces_unmatched_id_falls_back_to_path_key(self, tmp_path: Path) -> None:
+        """A key that is not a loaded ID is still honored as a project file path."""
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        mapped_workspace = tmp_path / "mapped"
+
+        pm = self._pm_with_chain(
+            [{"id": "my-guid", "file": project_file, "parent_id": None}],
+            project_workspaces={str(project_file): str(mapped_workspace)},
+        )
+        decision = pm.decide_workspace(
+            project_file,
+            project_config={"workspace_directory": "/ignored/project"},
+            env_config={"workspace_directory": "/ignored/env"},
+        )
+
+        assert decision.workspace_dir == Path(str(mapped_workspace))
+        assert decision.apply_override is True
+
     def test_env_workspace_wins_over_project_adjacent(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
