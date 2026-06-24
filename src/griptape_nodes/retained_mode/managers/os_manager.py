@@ -1605,11 +1605,6 @@ class OSManager:
             for parent_dir, bare_names in dir_groups.items():
                 seqs, _ = scan_sequences_from_filenames(bare_names, parent_dir, options)
                 all_sequences.extend(seqs)
-
-            return DeduceSequencesFromFileListResultSuccess(
-                sequences=all_sequences,
-                result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
-            )
         except InvalidSubsetBoundsError as e:
             return DeduceSequencesFromFileListResultFailure(
                 failure_reason=SequenceScanFailureReason.INVALID_BOUNDS,
@@ -1641,6 +1636,11 @@ class OSManager:
                 failure_reason=FileIOFailureReason.UNKNOWN,
                 result_details=msg,
             )
+
+        return DeduceSequencesFromFileListResultSuccess(
+            sequences=all_sequences,
+            result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
+        )
 
     async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:  # noqa: PLR0911
         """Handle a request to scan a path or pattern for file sequences.
