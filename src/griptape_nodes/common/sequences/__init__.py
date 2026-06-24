@@ -33,6 +33,7 @@ from griptape_nodes.common.sequences.models import (
     NoTokenBehavior,
     Sequence,
     SequenceEntry,
+    SequenceScanOptions,
 )
 
 __all__ = [
@@ -43,4 +44,5 @@ __all__ = [
     "NoTokenBehavior",
     "Sequence",
     "SequenceEntry",
+    "SequenceScanOptions",
 ]
