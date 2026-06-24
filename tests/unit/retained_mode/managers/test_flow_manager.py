@@ -495,9 +495,9 @@ class TestListNodesInFlowRequest:
 
 def _make_cancelled_machine() -> object:
     """Return a mock ControlFlowMachine whose start_flow always raises CancelledError."""
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
 
-    async def raise_cancelled(*args, **kwargs) -> None:
+    async def raise_cancelled(*_args, **_kwargs) -> None:
         raise asyncio.CancelledError
 
     fake_machine = MagicMock()
@@ -550,15 +550,13 @@ class TestResolveSingularNodeCancelledError:
         cancel_mock.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_single_node_resolution_flag_reset_after_cancellation(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
+    async def test_single_node_resolution_flag_reset_after_cancellation(self, griptape_nodes: GriptapeNodes) -> None:
         """_global_single_node_resolution must be False after a CancelledError.
 
         cancel_flow_run() resets it; this test verifies the reset actually happens
         by using a side-effect that mirrors the real cancel_flow_run behaviour.
         """
-        from unittest.mock import AsyncMock, MagicMock, patch
+        from unittest.mock import MagicMock, patch
 
         from griptape_nodes.exe_types.node_types import BaseNode
 
