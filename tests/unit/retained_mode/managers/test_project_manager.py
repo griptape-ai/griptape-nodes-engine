@@ -6987,7 +6987,7 @@ class TestImportProject:
 
     @pytest.mark.asyncio
     async def test_import_registers_new_project_with_assets(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
-        """Importing into a fresh dir registers the project; macros resolve there."""
+        """Importing into a fresh dir registers the project and activates it; macros follow the active workspace."""
         from griptape_nodes.common.macro_parser import ParsedMacro
         from griptape_nodes.retained_mode.events.project_events import (
             ExportProjectRequest,
@@ -7021,14 +7021,22 @@ class TestImportProject:
         imported_info = pm._successfully_loaded_project_templates[result.project_id]
         assert imported_info.project_base_dir.resolve() == target.resolve()
 
-        # The {outputs} directory macro re-resolves against the new location (the
-        # imported project is current), proving the macro layer follows the move
-        # rather than pointing back at the source dir.
+        # set_as_current took effect: the imported project is the active one.
+        assert pm._current_project_id == result.project_id
+
+        # {outputs} resolves against the active project's workspace, proving the
+        # macro layer follows the import rather than pointing back at the source
+        # dir. A standalone import with no workspace_directory of its own adopts
+        # the global configured workspace (decide_workspace branch 5), so the
+        # macro anchors there rather than under the export source.
+        active_workspace = pm._config_manager.workspace_path
         macro_result = pm.on_get_path_for_macro_request(
             GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/result.txt"), variables={})
         )
         assert isinstance(macro_result, GetPathForMacroResultSuccess)
-        assert macro_result.absolute_path.resolve() == (target / "outputs" / "result.txt").resolve()
+        assert macro_result.absolute_path.resolve() == (active_workspace / "outputs" / "result.txt").resolve()
+        source_dir = (tmp_path / "proj").resolve()
+        assert source_dir not in macro_result.absolute_path.resolve().parents
 
     @pytest.mark.asyncio
     async def test_import_with_new_name_renames_template(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
