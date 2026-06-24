@@ -546,12 +546,12 @@ def scan_sequences_from_filenames(
         if options.padding is not None and fseq.zfill() != options.padding:
             continue
 
-        present_numbers, dropped = _collect_present_numbers_from_fseq(fseq, directory)
-        if not present_numbers:
+        collected = _collect_present_numbers_from_fseq(fseq, directory)
+        if not collected.by_number:
             continue
 
-        discovered_first = min(present_numbers)
-        discovered_last = max(present_numbers)
+        discovered_first = min(collected.by_number)
+        discovered_last = max(collected.by_number)
         active = _compute_active_range(options.start_number, options.end_number, discovered_first, discovered_last)
         if active.first > active.last:
             continue
@@ -559,14 +559,14 @@ def scan_sequences_from_filenames(
         new_sequences = apply_policy(
             PolicyContext(
                 fseq=fseq,
-                present_numbers=present_numbers,
+                present_numbers=collected.by_number,
                 directory=directory,
                 policy=options.policy,
                 first=active.first,
                 last=active.last,
                 discovered_first=discovered_first,
                 discovered_last=discovered_last,
-                dropped_negative_number_count=dropped,
+                dropped_negative_number_count=collected.dropped_negatives,
             )
         )
         # A single matching file is not a sequence — leave it as a flat entry.
@@ -582,28 +582,28 @@ def scan_sequences_from_filenames(
 def _collect_present_numbers_from_fseq(
     fseq: FileSequence,
     directory: str,
-) -> tuple[dict[int, str], int]:
+) -> _PresentNumbers:
     """Build a present-numbers map from a ``FileSequence``'s frame set.
 
-    Returns ``(present_numbers, dropped_negative_count)``
-    where ``present_numbers`` maps frame number to the full path string
-    (using ``directory`` as the prefix).
+    Returns a ``_PresentNumbers`` where ``by_number`` maps frame number to the
+    full path string (using ``directory`` as the prefix) and
+    ``dropped_negatives`` is the count of negative frame numbers skipped.
     """
-    present_numbers: dict[int, str] = {}
-    dropped = 0
+    by_number: dict[int, str] = {}
+    dropped_negatives = 0
     frame_set = fseq.frameSet()
     if frame_set is None:
-        return present_numbers, dropped
+        return _PresentNumbers(by_number=by_number, dropped_negatives=dropped_negatives)
     for n in frame_set:
         if not isinstance(n, int):
             continue
         if n < 0:
-            dropped += 1
+            dropped_negatives += 1
             continue
         bare = fseq.frame(n)
         full = str(Path(directory) / bare) if directory else bare
-        present_numbers[n] = full
-    return present_numbers, dropped
+        by_number[n] = full
+    return _PresentNumbers(by_number=by_number, dropped_negatives=dropped_negatives)
 
 
 def _list_directory_filenames(directory: str) -> list[str]:
