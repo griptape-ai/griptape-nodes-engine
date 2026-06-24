@@ -9158,3 +9158,119 @@ class TestImportProject:
         import_result = await pm.on_import_project_request(import_request)
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates
+
+
+class TestProjectManagerGetProjectChain:
+    """`get_project_chain` resolves a project and its ancestors, leaf-first."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    @staticmethod
+    def _register(
+        pm: ProjectManager,
+        project_id: str,
+        *,
+        name: str | None = None,
+        parent_id: str | None = None,
+        file: Path | None = None,
+    ) -> None:
+        """Register an id-linked project directly in the in-memory registry.
+
+        The parent link is an explicit `parent_project_id`, so the walk resolves it
+        through the registry without touching disk; `name` rides on the template so
+        each chain entry can assert a distinct display name.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        update: dict[str, Any] = {"id": project_id, "parent_project_id": parent_id}
+        if name is not None:
+            update["name"] = name
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(update=update)
+        pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+            project_id=project_id,
+            project_file_path=file,
+            project_base_dir=file.parent if file is not None else Path("/"),
+            template=template,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+    def test_chain_for_parentless_project_is_just_itself(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "solo", name="Solo")
+        pm._current_project_id = "solo"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="solo", name="Solo")]
+
+    def test_chain_walks_parents_leaf_first(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "mid", name="Mid", parent_id="root")
+        self._register(pm, "leaf", name="Leaf", parent_id="mid")
+        pm._current_project_id = "leaf"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="mid", name="Mid"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_accepts_explicit_project_id_overriding_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "leaf", name="Leaf", parent_id="root")
+        pm._current_project_id = "root"
+        assert pm.get_project_chain("leaf") == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_breaks_on_cycle_without_repeating(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        # a -> b -> a: the walk must terminate at the first repeated id.
+        self._register(pm, "a", name="A", parent_id="b")
+        self._register(pm, "b", name="B", parent_id="a")
+        pm._current_project_id = "a"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="a", name="A"),
+            ProjectChainEntry(id="b", name="B"),
+        ]
+
+    def test_chain_surfaces_unregistered_parent_by_id_then_stops(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "leaf", name="Leaf", parent_id="ghost")
+        pm._current_project_id = "leaf"
+        # The unregistered parent's id is surfaced (so a policy can still match it),
+        # but it has no template to walk further and no resolved name.
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="ghost", name=None),
+        ]
+
+    def test_chain_for_unregistered_start_is_just_its_id(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        pm._current_project_id = "missing"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="missing", name=None)]
+
+    def test_chain_defaults_to_current_project(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = self._pm()
+        # __init__ registers system defaults and points the current id at them.
+        chain = pm.get_project_chain()
+        assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
