@@ -4324,42 +4324,83 @@ class NodeManager:
             or (parameter.default_value is not None and effective_value == parameter.default_value)
         ):
             internal_value = effective_value
-        # A parameter can have BOTH an internal (set) value and an output value, and each is
-        # serialized independently against the same tracker/uniques map. The two passes share
-        # identical handling — hash the value, emit a command, or warn on genuine failure — so
-        # we iterate over (value, is_output, value_kind) rather than duplicating the body.
-        # value_kind is the human-readable label ("set" / "output") used only in the warning text.
+        # A parameter can have BOTH an internal (set) value and an output value; each is
+        # serialized independently against the same tracker/uniques map.
         commands = []
-        for value, is_output, value_kind in (
-            (internal_value, False, "set"),
-            (output_value, True, "output"),
-        ):
-            # No value of this kind was set on the node — nothing to serialize.
-            if value is None:
-                continue
-            command = NodeManager._handle_value_hashing(
-                value=value,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                parameter=parameter,
-                is_output=is_output,
-                parameter_name=parameter.name,
-                node_name=node.name,
-                use_pickling=use_pickling,
-            )
-            if command is None:
-                # Author opted out via serializable=False — silently skip; not a failure.
-                if not parameter.serializable:
-                    continue
-                # Genuine serialization failure — warn and mark unresolved.
-                details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
-                logger.warning(details)
-                if isinstance(create_node_request, CreateNodeRequest):
-                    create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
-                # Failure already handled above — move on to the next value kind.
-                continue
-            commands.append(command)
+        internal_command = NodeManager._serialize_one_parameter_value_for_save(
+            value=internal_value,
+            value_kind="set",
+            is_output=False,
+            parameter=parameter,
+            node=node,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            create_node_request=create_node_request,
+            use_pickling=use_pickling,
+        )
+        if internal_command is not None:
+            commands.append(internal_command)
+        output_command = NodeManager._serialize_one_parameter_value_for_save(
+            value=output_value,
+            value_kind="output",
+            is_output=True,
+            parameter=parameter,
+            node=node,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            create_node_request=create_node_request,
+            use_pickling=use_pickling,
+        )
+        if output_command is not None:
+            commands.append(output_command)
         return commands or None
+
+    @staticmethod
+    def _serialize_one_parameter_value_for_save(  # noqa: PLR0913
+        *,
+        value: Any,
+        value_kind: str,
+        is_output: bool,
+        parameter: Parameter,
+        node: BaseNode,
+        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
+        serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        create_node_request: CreateNodeRequest,
+        use_pickling: bool,
+    ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
+        """Serialize one of a parameter's values (internal-set or output) for workflow save.
+
+        Returns the command to record on success. Returns None when there is nothing to record:
+        either no value was present, the author opted out via serializable=False, or serialization
+        genuinely failed. In the genuine-failure case, also emits a warning and marks the node
+        UNRESOLVED — opt-outs are silent.
+
+        value_kind is "set" or "output" and is used only in the warning text.
+        """
+        # No value of this kind was set on the node.
+        if value is None:
+            return None
+        command = NodeManager._handle_value_hashing(
+            value=value,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            parameter=parameter,
+            is_output=is_output,
+            parameter_name=parameter.name,
+            node_name=node.name,
+            use_pickling=use_pickling,
+        )
+        if command is not None:
+            return command
+        # Author opted out via serializable=False — silently skip; not a failure.
+        if not parameter.serializable:
+            return None
+        # Genuine serialization failure — warn and mark unresolved.
+        details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
+        logger.warning(details)
+        if isinstance(create_node_request, CreateNodeRequest):
+            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+        return None
 
     @staticmethod
     def serialize_parameter_output_values(node: BaseNode, *, use_pickling: bool = False) -> SerializedParameterValues:
