@@ -1,5 +1,6 @@
 """Tests for FlowManager.on_extract_flow_commands_from_image_metadata."""
 
+import asyncio
 import base64
 import itertools
 import pickle
@@ -490,6 +491,138 @@ class TestListNodesInFlowRequest:
 
         assert isinstance(result, ListNodesInFlowResultSuccess)
         assert set(result.node_names) == {"note_1", "agent_1"}
+
+
+def _make_cancelled_machine() -> object:
+    """Return a mock ControlFlowMachine whose start_flow always raises CancelledError."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    async def raise_cancelled(*args, **kwargs) -> None:
+        raise asyncio.CancelledError
+
+    fake_machine = MagicMock()
+    fake_machine.resolution_machine = MagicMock()
+    fake_machine.context = MagicMock()
+    fake_machine.context.current_nodes = []
+    fake_machine.start_flow = raise_cancelled
+    return fake_machine
+
+
+class TestResolveSingularNodeCancelledError:
+    """Tests that resolve_singular_node runs cleanup when cancelled externally.
+
+    Issue #4906 — CancelledError is a BaseException, so the old `except Exception` block
+    silently skipped cancel_flow_run() and left _global_single_node_resolution=True,
+    causing every subsequent resolve to fail with "Cannot start flow. Flow is already running."
+    """
+
+    @pytest.mark.asyncio
+    async def test_cancel_flow_run_called_when_start_flow_is_cancelled(self, griptape_nodes: GriptapeNodes) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from griptape_nodes.exe_types.node_types import BaseNode
+
+        flow_manager = griptape_nodes.FlowManager()
+
+        fake_flow = MagicMock()
+        fake_flow.name = "cancel_flow"
+        fake_flow.nodes = {}
+        fake_node = MagicMock(spec=BaseNode)
+        fake_node.name = "cancel_node"
+
+        cancel_mock = AsyncMock()
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.flow_manager.ControlFlowMachine",
+                return_value=_make_cancelled_machine(),
+            ),
+            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=[False, True]),
+            patch.object(flow_manager, "_global_dag_builder") as mock_dag_builder,
+            patch.object(flow_manager, "cancel_flow_run", cancel_mock),
+        ):
+            mock_dag_builder.add_node_with_dependencies = MagicMock()
+            mock_dag_builder.node_to_reference = {}
+
+            with pytest.raises(asyncio.CancelledError):
+                await flow_manager.resolve_singular_node(fake_flow, fake_node)
+
+        cancel_mock.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_single_node_resolution_flag_reset_after_cancellation(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """_global_single_node_resolution must be False after a CancelledError.
+
+        cancel_flow_run() resets it; this test verifies the reset actually happens
+        by using a side-effect that mirrors the real cancel_flow_run behaviour.
+        """
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from griptape_nodes.exe_types.node_types import BaseNode
+
+        flow_manager = griptape_nodes.FlowManager()
+
+        fake_flow = MagicMock()
+        fake_flow.name = "sticky_flag_flow"
+        fake_flow.nodes = {}
+        fake_node = MagicMock(spec=BaseNode)
+        fake_node.name = "sticky_flag_node"
+
+        async def fake_cancel_flow_run() -> None:
+            flow_manager._global_single_node_resolution = False
+
+        # First False: entry gate (no flow running, go down the else branch).
+        # True: flow IS still running when cancelled, so cancel_flow_run() is called.
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.flow_manager.ControlFlowMachine",
+                return_value=_make_cancelled_machine(),
+            ),
+            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=[False, True]),
+            patch.object(flow_manager, "_global_dag_builder") as mock_dag_builder,
+            patch.object(flow_manager, "cancel_flow_run", side_effect=fake_cancel_flow_run),
+        ):
+            mock_dag_builder.add_node_with_dependencies = MagicMock()
+            mock_dag_builder.node_to_reference = {}
+
+            with pytest.raises(asyncio.CancelledError):
+                await flow_manager.resolve_singular_node(fake_flow, fake_node)
+
+        assert flow_manager._global_single_node_resolution is False
+
+    @pytest.mark.asyncio
+    async def test_cancelled_error_is_reraised_not_wrapped_in_runtime_error(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        from unittest.mock import AsyncMock, MagicMock, patch
+
+        from griptape_nodes.exe_types.node_types import BaseNode
+
+        flow_manager = griptape_nodes.FlowManager()
+
+        fake_flow = MagicMock()
+        fake_flow.name = "reraise_flow"
+        fake_flow.nodes = {}
+        fake_node = MagicMock(spec=BaseNode)
+        fake_node.name = "reraise_node"
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.flow_manager.ControlFlowMachine",
+                return_value=_make_cancelled_machine(),
+            ),
+            patch.object(flow_manager, "check_for_existing_running_flow", side_effect=[False, False]),
+            patch.object(flow_manager, "_global_dag_builder") as mock_dag_builder,
+            patch.object(flow_manager, "cancel_flow_run", AsyncMock()),
+        ):
+            mock_dag_builder.add_node_with_dependencies = MagicMock()
+            mock_dag_builder.node_to_reference = {}
+
+            # Must propagate as CancelledError, not be swallowed or re-wrapped in RuntimeError.
+            with pytest.raises(asyncio.CancelledError):
+                await flow_manager.resolve_singular_node(fake_flow, fake_node)
 
 
 class TestAutoLayoutFlowRequest:
