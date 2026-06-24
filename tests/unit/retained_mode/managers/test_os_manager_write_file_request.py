@@ -810,10 +810,14 @@ class TestCreateNewMacroIndexSeed:
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
         # Production macro resolution requires a loaded project so `{outputs}` from the
-        # default template can resolve to <workspace>/outputs. Mirrors the setup pattern
-        # in TestSidecarMetadata.setup_workspace above.
+        # default template can resolve to <workspace>/outputs.
+        #
+        # Critical ordering: Load the project FIRST, activate it, THEN force the
+        # workspace_path. SetCurrentProjectRequest internally re-derives workspace_path
+        # from the project/workspace config layers (see ProjectManager._activate_project),
+        # which would clobber any earlier workspace_path assignment. Setting it AFTER
+        # activation makes our temp_dir stick for the duration of the test.
         original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
 
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
@@ -821,16 +825,19 @@ class TestCreateNewMacroIndexSeed:
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
             GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
 
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
         yield
 
         GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
     @pytest.fixture
-    def outputs_dir(self, temp_dir: Path) -> Path:
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
         # Default project template binds {outputs} to the relative path "outputs",
-        # so saved files land under <workspace>/outputs/. Pre-create the directory so
-        # tests can pre-populate it (gap-fill case) and inspect contents.
+        # so saved files land under <workspace>/outputs/. Pre-create AFTER setup_project
+        # has finished mutating workspace_path, so the directory we create matches the
+        # workspace the resolver will use during the test.
         outputs = temp_dir / "outputs"
         outputs.mkdir(parents=True, exist_ok=True)
         return outputs
@@ -1042,24 +1049,24 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
-        # Same setup as TestCreateNewMacroIndexSeed — we want a working baseline that the
-        # mocks then perturb.
+        # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
+        # FIRST, then force workspace_path. SetCurrentProjectRequest re-derives the
+        # workspace from project config layers and would otherwise clobber temp_dir.
         original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
         load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
             GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
         yield
         GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
     @pytest.fixture
-    def outputs_dir(self, temp_dir: Path) -> Path:
-        # Same shape as TestCreateNewMacroIndexSeed.outputs_dir — pre-create the project's
-        # {outputs} directory so race tests can drop pre-existing files there to simulate
-        # a racer's win.
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
+        # Pre-create AFTER setup_project so the {outputs} directory matches the
+        # workspace_path that resolver will see during the test.
         outputs = temp_dir / "outputs"
         outputs.mkdir(parents=True, exist_ok=True)
         return outputs
@@ -1171,13 +1178,16 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
 
     @pytest.fixture(autouse=True)
     def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Same ordering as TestCreateNewMacroIndexSeed.setup_project — load + activate
+        # FIRST, then force workspace_path so SetCurrentProject's project-config remerge
+        # doesn't clobber temp_dir.
         original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
         project_yml = temp_dir / "project_template.yml"
         project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
         load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
         if isinstance(load_result, LoadProjectTemplateResultSuccess):
             GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
         yield
         GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
         griptape_nodes.ConfigManager().workspace_path = original_workspace
