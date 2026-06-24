@@ -131,6 +131,90 @@ class TestNodeManagerResolutionStateSerialization:
         # Resolution should be reset to UNRESOLVED due to serialization failure
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
+    def test_serializable_false_param_does_not_warn_or_unresolve(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A parameter explicitly opting out via serializable=False must not trigger the warning or UNRESOLVED transition."""
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, SerializedParameterValueTracker
+
+        mock_parameter = MagicMock(spec=Parameter)
+        mock_parameter.name = "session"
+        mock_parameter.serializable = False
+
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.parameter_values = {}
+        mock_node.parameter_output_values = {"session": object()}
+        mock_node.get_parameter_value.return_value = None
+
+        create_node_request = CreateNodeRequest(
+            node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
+        )
+
+        # Tracker reports NOT_IN_TRACKER so _handle_value_hashing enters the opt-out branch
+        # (parameter.serializable is False) and returns None.
+        mock_tracker = MagicMock()
+        mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
+
+        caplog.clear()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        NodeManager.handle_parameter_value_saving(
+            parameter=mock_parameter,
+            node=mock_node,
+            unique_parameter_uuid_to_values={},
+            serialized_parameter_value_tracker=mock_tracker,
+            create_node_request=create_node_request,
+        )
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("Attempted to serialize" in msg for msg in warning_messages)
+        assert create_node_request.resolution == NodeResolutionState.RESOLVED.value
+
+    def test_serializable_true_param_with_pickle_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Genuine serialization failures (serializable=True) must still emit the warning."""
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, SerializedParameterValueTracker
+
+        mock_parameter = MagicMock(spec=Parameter)
+        mock_parameter.name = "test_param"
+        mock_parameter.serializable = True
+
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.parameter_values = {"test_param": "has_value"}
+        mock_node.parameter_output_values = {}
+        mock_node.get_parameter_value.return_value = "some_value"
+
+        create_node_request = CreateNodeRequest(
+            node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
+        )
+
+        mock_tracker = MagicMock()
+        mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
+
+        caplog.clear()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        NodeManager.handle_parameter_value_saving(
+            parameter=mock_parameter,
+            node=mock_node,
+            unique_parameter_uuid_to_values={},
+            serialized_parameter_value_tracker=mock_tracker,
+            create_node_request=create_node_request,
+        )
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Attempted to serialize set value for parameter 'test_param'" in msg for msg in warning_messages)
+        assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
+
 
 class TestNodeManagerAlterParameterDetailsClearDefaultValue:
     """Test AlterParameterDetailsRequest behavior when clear_default_value and default_value are both set."""
