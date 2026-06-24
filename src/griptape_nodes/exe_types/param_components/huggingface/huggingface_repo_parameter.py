@@ -54,6 +54,7 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
             )
             return
 
+        self._refresh_downloading_model_ids()
         # Get all cached models
         all_choices = self.get_choices()
         if not all_choices:
@@ -91,18 +92,8 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         else:
             parameter.add_trait(Options(choices=filtered_choices))
 
-        # Update badge to reflect current download status
-        badge = self._build_model_badge()
-        if badge is None:
-            parameter.clear_badge()
-        else:
-            parameter.set_badge(
-                variant=badge.variant,
-                title=badge.title,
-                message=badge.message,
-                icon=badge.icon,
-                hide_clear_button=badge.hide_clear_button,
-            )
+        self._apply_data_choices(parameter, filtered_choices)
+        self._update_download_button_visibility()
 
     def add_input_parameters(self) -> None:
         """Override to apply deprecated model filtering after parameter creation."""

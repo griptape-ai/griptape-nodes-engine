@@ -67,6 +67,25 @@ def _register_unsaved_workflow(key: str, name: str) -> None:
 class TestWorkflowManager:
     """Test WorkflowManager functionality including parameter serialization."""
 
+    def test_workflow_metadata_is_internal_round_trip(self) -> None:
+        """is_internal defaults to False, parses from headers, and survives model_dump()."""
+        base_kwargs = {
+            "name": "wf",
+            "schema_version": WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            "engine_version_created_with": "",
+            "node_libraries_referenced": [],
+        }
+
+        # Absent key -> default False (old headers without the line stay visible).
+        assert WorkflowMetadata(**base_kwargs).is_internal is False
+
+        # Parsed from a header table (mirrors the TOML [tool.griptape-nodes] path).
+        parsed = WorkflowMetadata.model_validate({**base_kwargs, "is_internal": True})
+        assert parsed.is_internal is True
+
+        # Survives model_dump() so it reaches list_workflows() -> the GUI.
+        assert parsed.model_dump()["is_internal"] is True
+
     def test_convert_parameter_to_minimal_dict_serializes_settable_correctly(self) -> None:
         """Test that _convert_parameter_to_minimal_dict properly serializes settable as boolean."""
         # Create a test parameter
