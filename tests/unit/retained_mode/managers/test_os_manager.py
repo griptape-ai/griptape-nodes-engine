@@ -10,7 +10,7 @@ import pytest
 import send2trash
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.common.sequences import MissingItemPolicy, SequenceScanOptions
+from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
@@ -18,6 +18,7 @@ from griptape_nodes.retained_mode.events.os_events import (
     CreateFileResultFailure,
     CreateFileResultSuccess,
     DeduceSequencesFromFileListRequest,
+    DeduceSequencesFromFileListResultFailure,
     DeduceSequencesFromFileListResultSuccess,
     DeleteFileRequest,
     DeleteFileResultFailure,
@@ -49,6 +50,7 @@ from griptape_nodes.retained_mode.events.os_events import (
     RenameFileRequest,
     RenameFileResultFailure,
     RenameFileResultSuccess,
+    SequenceScanFailureReason,
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
@@ -922,6 +924,116 @@ class TestDeduceSequencesFromFileListRequest:
 
         assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
         assert result.sequences == []
+
+    def test_invalid_bounds_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A negative start_number surfaces as INVALID_BOUNDS failure."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(start_number=-1),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.INVALID_BOUNDS
+
+    def test_abort_policy_with_single_gap_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """ABORT policy with exactly one gap returns ABORTED_AT_GAP with a single-gap message."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3])  # gap at 2
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "gap at item 2" in result.result_details.result_details[0].message
+
+    def test_abort_policy_with_multiple_gaps_returns_failure(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """ABORT policy with multiple gaps lists all gap positions in the message."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5])  # gaps at 2, 4
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "2 gaps" in result.result_details.result_details[0].message
+
+    def test_abort_policy_with_many_gaps_truncates_preview(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """ABORT with more gaps than ABORTED_AT_GAP_PREVIEW_COUNT appends a '+ N more' suffix."""
+        os_manager = griptape_nodes.OSManager()
+        # 6 gaps: missing 2, 4, 6, 8, 10, 12 — exceeds the preview count of 5
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5, 7, 9, 11, 13])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "more" in result.result_details.result_details[0].message
+
+    def test_unexpected_exception_returns_unknown_failure(self, griptape_nodes: GriptapeNodes) -> None:
+        """An unexpected exception from the scan is caught and returned as UNKNOWN failure."""
+        os_manager = griptape_nodes.OSManager()
+
+        request = DeduceSequencesFromFileListRequest(file_paths=["render.0001.exr"])
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.scan_sequences_from_filenames",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == FileIOFailureReason.UNKNOWN
+        assert isinstance(result.result_details, ResultDetails)
+        assert "boom" in result.result_details.result_details[0].message
+
+    def test_single_frame_sequence_not_returned(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A sequence with only one present frame is not included in the result."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1])
+
+        request = DeduceSequencesFromFileListRequest(file_paths=paths)
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert result.sequences == []
+
+    def test_reject_no_token_behavior_skips_token_less_sequences(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """NoTokenBehavior.REJECT causes token-less files to be silently skipped."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(
+                no_token_behavior=NoTokenBehavior.REJECT,
+                padding=0,  # only match zero-padded (token-less) sequences
+            ),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
 
 
 class TestNormalizePathPartsForSpecialFolder:
