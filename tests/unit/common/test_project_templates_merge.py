@@ -322,6 +322,114 @@ directories:
         # Check base directories are still there
         assert len(merged.directories) == len(default_template.directories) + 1
 
+    def test_merge_directory_description_overrides_base(self) -> None:
+        """Overlay description on an existing directory replaces the base description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    description: "Custom description for outputs."
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        # Description was overridden
+        assert merged.directories["outputs"].description == "Custom description for outputs."
+        # Path was inherited from base (overlay didn't set it)
+        assert merged.directories["outputs"].path_macro == default_template.directories["outputs"].path_macro
+
+    def test_merge_directory_description_inherited_when_omitted(self) -> None:
+        """Overlay that omits description preserves the base description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    path_macro: "renders"
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        # Path was overridden, description was inherited from base
+        assert merged.directories["outputs"].path_macro == "renders"
+        assert merged.directories["outputs"].description == default_template.directories["outputs"].description
+
+    def test_merge_directory_description_explicit_null_clears(self) -> None:
+        """Explicit null description in overlay clears an inherited description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    description: null
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        # Sanity-check: base has a description for outputs, otherwise this test
+        # would not actually exercise the clear path.
+        assert default_template.directories["outputs"].description is not None
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        assert merged.directories["outputs"].description is None
+        assert merged.directories["outputs"].path_macro == default_template.directories["outputs"].path_macro
+
+    def test_merge_new_directory_with_description(self) -> None:
+        """A new overlay directory carries its description through to the merged result."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  deliverables:
+    path_macro: "client_deliverables"
+    description: "Files staged for client delivery."
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        assert merged.directories["deliverables"].path_macro == "client_deliverables"
+        assert merged.directories["deliverables"].description == "Files staged for client delivery."
+
     def test_merge_environment_variables(self) -> None:
         """Test merging environment variables."""
         yaml_text = """
