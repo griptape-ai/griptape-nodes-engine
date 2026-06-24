@@ -538,8 +538,14 @@ class TestSidecarMetadata:
     @pytest.fixture(autouse=True)
     def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
         """Set workspace to temp_dir and load a project template for sidecar path resolution."""
-        original_workspace = griptape_nodes.ConfigManager().workspace_path
-        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        config_manager = griptape_nodes.ConfigManager()
+        original_workspace = config_manager.workspace_path
+        # Set the *configured* workspace_directory, not just the workspace_path property.
+        # The project loaded below is parentless, so activation resolves its workspace via
+        # decide_workspace's global-default branch (the configured workspace_directory) and
+        # pins it with set_workspace_override. A bare workspace_path assignment would be
+        # clobbered by that pin; setting the configured value makes the pin land on temp_dir.
+        config_manager.set_config_value("workspace_directory", str(temp_dir))
 
         # Create a project template file so sidecar path resolution has a project to use
         project_yml = temp_dir / "project_template.yml"
@@ -551,7 +557,7 @@ class TestSidecarMetadata:
         yield
 
         GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
-        griptape_nodes.ConfigManager().workspace_path = original_workspace
+        config_manager.set_config_value("workspace_directory", str(original_workspace))
 
     def test_sidecar_not_written_without_file_metadata(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Test that no sidecar is written when file_metadata is not provided."""

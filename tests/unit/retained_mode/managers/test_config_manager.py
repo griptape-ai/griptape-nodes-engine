@@ -10,6 +10,7 @@ import pytest
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
+from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
 
 @pytest.mark.skipif(
@@ -853,7 +854,7 @@ class TestProvisioningPreviewMatchesActivation:
     Equality is asserted per-key, not as a blanket ==: the live merged config also carries
     unrelated layers (e.g. project_workspaces from the user config) that the preview legitimately
     includes too, so a blanket == would be hostage to that noise and to scalar normalization.
-    All four decide_workspace branches are covered, since each resolves the workspace layer
+    All five decide_workspace branches are covered, since each resolves the workspace layer
     differently and is the surface where preview and live could drift.
     """
 
@@ -867,13 +868,14 @@ class TestProvisioningPreviewMatchesActivation:
         path.write_text(json.dumps(config), encoding="utf-8")
 
     @staticmethod
-    def _assert_preview_matches_live(
+    def _assert_preview_matches_live(  # noqa: PLR0913
         cm: ConfigManager,
         project_dir: Path,
         project_file: Path,
         *,
         expected_libraries: list,
         expected_engine_version: str,
+        pm: ProjectManager | None = None,
     ) -> None:
         """Compute the preview and live-activation merged configs and assert they agree.
 
@@ -882,12 +884,15 @@ class TestProvisioningPreviewMatchesActivation:
         block for the live path, then cross-checks the consumed keys + workspace_directory. The
         expected-winner assertions prove the workspace layer was actually consumed, so a bug that
         made BOTH paths ignore it (preview == live but both wrong) still fails.
+
+        `pm` lets a caller pass a ProjectManager whose registry already models a parent chain (the
+        branch-4 walk needs registered ancestors); when None a fresh, registry-less manager is built.
         """
-        from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
         from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
         from griptape_nodes.utils.dict_utils import get_dot_value
 
-        pm = ProjectManager(Mock(), cm, Mock())
+        if pm is None:
+            pm = ProjectManager(Mock(), cm, Mock())
 
         # Preview path, read-only and before any live mutation.
         preview_project_config = cm.read_config_file(project_dir / "griptape_nodes_config.json")
@@ -1014,10 +1019,80 @@ class TestProvisioningPreviewMatchesActivation:
                 expected_engine_version=">=4.0",
             )
 
-    def test_auto_default_branch(self, tmp_path: Path) -> None:
-        """No workspace driver: the project's own dir is the workspace (apply_override=True)."""
+    def test_parent_chain_inheritance_branch(self, tmp_path: Path) -> None:
+        """A child with no workspace inherits its registered parent's resolved workspace (apply_override=True).
+
+        The child declares parent_project_id pointing at a registered parent whose project-adjacent
+        config sets workspace_directory; decide_workspace's parent-chain walk inherits that workspace,
+        and both paths must resolve the workspace layer to it.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
         from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
 
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_file = parent_dir / "griptape-nodes-project.yml"
+        parent_file.touch()
+        project_dir = tmp_path / "child"
+        project_dir.mkdir()
+        project_file = project_dir / "griptape-nodes-project.yml"
+        project_file.touch()
+
+        self._write_config_file(
+            project_dir / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
+        )
+        # The parent's adjacent config points its workspace at workspace_root.
+        self._write_config_file(
+            parent_dir / "griptape_nodes_config.json",
+            {"workspace_directory": str(workspace_root)},
+        )
+        self._write_config_file(
+            workspace_root / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["root-workspace-lib"], REQUIRES_ENGINE_KEY: ">=5.0"},
+        )
+
+        with patch.dict(os.environ, {}, clear=True):
+            cm = ConfigManager()
+            pm = ProjectManager(Mock(), cm, Mock())
+            validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+            for project_id, file_path, parent_id in (
+                ("parent", parent_file, None),
+                ("child", project_file, "parent"),
+            ):
+                pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+                    project_id=project_id,
+                    project_file_path=file_path,
+                    project_base_dir=file_path.parent,
+                    template=DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": parent_id}),
+                    validation=validation,
+                    parsed_situation_schemas={},
+                    parsed_directory_schemas={},
+                )
+            self._assert_preview_matches_live(
+                cm,
+                project_dir,
+                project_file,
+                expected_libraries=["root-workspace-lib"],
+                expected_engine_version=">=5.0",
+                pm=pm,
+            )
+
+    def test_global_default_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
+        """Chain exhausted: the global configured workspace_directory is used unconditionally (apply_override=True).
+
+        The user config sets workspace_directory to a root the parentless project does NOT live under,
+        so decide_workspace's global-default branch (no containment guard) fires and both paths must
+        resolve the workspace layer to that root rather than the project's own dir.
+        """
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY, REQUIRES_ENGINE_KEY
+
+        workspace_root = tmp_path / "global_ws"
+        workspace_root.mkdir()
         project_dir = tmp_path / "project"
         project_dir.mkdir()
         project_file = project_dir / "project.yml"
@@ -1027,6 +1102,11 @@ class TestProvisioningPreviewMatchesActivation:
             project_dir / "griptape_nodes_config.json",
             {LIBRARIES_TO_REGISTER_KEY: ["project-lib"], REQUIRES_ENGINE_KEY: ">=1.0"},
         )
+        self._write_config_file(
+            workspace_root / "griptape_nodes_config.json",
+            {LIBRARIES_TO_REGISTER_KEY: ["global-workspace-lib"], REQUIRES_ENGINE_KEY: ">=5.0"},
+        )
+        isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace_root)}), encoding="utf-8")
 
         with patch.dict(os.environ, {}, clear=True):
             cm = ConfigManager()
@@ -1034,8 +1114,8 @@ class TestProvisioningPreviewMatchesActivation:
                 cm,
                 project_dir,
                 project_file,
-                expected_libraries=["project-lib"],
-                expected_engine_version=">=1.0",
+                expected_libraries=["global-workspace-lib"],
+                expected_engine_version=">=5.0",
             )
 
     def test_system_defaults_branch(self, isolate_user_config: Path) -> None:
