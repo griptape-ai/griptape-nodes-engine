@@ -50,6 +50,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_DEPRECATED_MODELS,
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
+    PROVIDER_CATALOG,
     PROVIDER_PRESETS,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
@@ -132,9 +133,9 @@ logger = logging.getLogger("griptape_nodes")
 
 API_KEY_ENV_VAR = "GT_CLOUD_API_KEY"
 
-# Valid type values for provider configs (derived from PROVIDER_PRESETS so it
+# Valid type values for provider configs (derived from PROVIDER_CATALOG so it
 # stays in sync automatically when new presets are added).
-_VALID_PROVIDER_TYPES: frozenset[str] = frozenset(p["id"] for p in PROVIDER_PRESETS)
+_VALID_PROVIDER_TYPES: frozenset[str] = frozenset(PROVIDER_CATALOG.providers)
 
 # The built-in provider that is always present and may never be deleted.
 _PROTECTED_PROVIDER_NAME = "griptape_cloud"

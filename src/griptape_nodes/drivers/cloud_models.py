@@ -12,6 +12,12 @@ Griptape Cloud's ServiceModelConfig table. When Cloud's catalog changes
 every consumer picks up the change.
 """
 
+from griptape_nodes.node_library.library_declarations import (
+    KeySupport,
+    ModelCatalogLibraryProperty,
+    ModelProvider,
+)
+
 # --- Per-family arg presets ---
 
 _CLAUDE_ARGS = {"stream": True, "structured_output_strategy": "tool", "max_tokens": 64000}
@@ -108,44 +114,71 @@ O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
 LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
 
-# Provider presets for the chat sidebar agent.
-# id: internal key used in ConfigureAgentRequest / GetAgentConfigResultSuccess
-# name: human-readable label shown in the UI
+# Source of truth for the sidebar's provider catalog.
+# Provider IDs here must match the model_catalog declaration keys used in
+# griptape-nodes-library-standard so that admin enforcement applies uniformly
+# when the enforcement PR lands.
+PROVIDER_CATALOG = ModelCatalogLibraryProperty(
+    providers={
+        "griptape_cloud": ModelProvider(
+            display_name="Griptape Cloud",
+            terms_url="https://www.griptape.ai/legal/terms",
+            notes="Routes upstream models through Griptape's hosted proxy.",
+            key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+        ),
+        "ollama": ModelProvider(
+            display_name="Ollama (local)",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            notes="Models are dynamically discovered from the local Ollama installation.",
+        ),
+        "lmstudio": ModelProvider(
+            display_name="LM Studio (local)",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            notes="Models are dynamically discovered from the local LM Studio installation.",
+        ),
+        "custom": ModelProvider(
+            display_name="Custom (OpenAI-compatible)",
+            key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+        ),
+    }
+)
+
+# Sidebar-specific fields that have no ModelProvider equivalent.
 # default_base_url: pre-filled URL (None = use engine default for that provider)
-# requires_api_key: whether the UI should show an API key field
 # has_model_list: True = show the curated MODEL_CHOICES dropdown; False = freetext
 # default_model: value to populate when the user first selects this provider
-PROVIDER_PRESETS: list[dict] = [
-    {
-        "id": "griptape_cloud",
-        "name": "Griptape Cloud",
+_SIDEBAR_EXTRA: dict[str, dict] = {
+    "griptape_cloud": {
         "default_base_url": None,
-        "requires_api_key": False,
         "has_model_list": True,
         "default_model": MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
     },
-    {
-        "id": "ollama",
-        "name": "Ollama (local)",
+    "ollama": {
         "default_base_url": OLLAMA_DEFAULT_BASE_URL,
-        "requires_api_key": False,
         "has_model_list": False,
         "default_model": "llama3.2",
     },
-    {
-        "id": "lmstudio",
-        "name": "LM Studio (local)",
+    "lmstudio": {
         "default_base_url": LM_STUDIO_DEFAULT_BASE_URL,
-        "requires_api_key": False,
         "has_model_list": False,
         "default_model": "",
     },
-    {
-        "id": "custom",
-        "name": "Custom (OpenAI-compatible)",
+    "custom": {
         "default_base_url": "",
-        "requires_api_key": True,
         "has_model_list": False,
         "default_model": "",
     },
+}
+
+# Derived list for UI consumption and backward compatibility.
+# requires_api_key is derived from key_support; all other sidebar-specific
+# fields come from _SIDEBAR_EXTRA.
+PROVIDER_PRESETS: list[dict] = [
+    {
+        "id": provider_id,
+        "name": provider.display_name,
+        "requires_api_key": provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
+        **_SIDEBAR_EXTRA[provider_id],
+    }
+    for provider_id, provider in PROVIDER_CATALOG.providers.items()
 ]
