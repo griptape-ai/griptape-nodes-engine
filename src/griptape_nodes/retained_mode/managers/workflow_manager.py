@@ -1398,6 +1398,13 @@ class WorkflowManager:
         if updated_content is None:
             return "Failed to update metadata header."
 
+        # Metadata-header rewrite: we already have the absolute on-disk path of an
+        # existing workflow file. _write_workflow_file's single-destination contract
+        # (so macro-driven saves can thread their unresolved MacroPath through to
+        # OSManager) means we wrap the literal path here. File's constructor stores
+        # non-macro strings verbatim, so the write goes through OSManager's
+        # sanitize-and-write branch with no macro resolution. OVERWRITE matches the
+        # in-place semantics this caller needs.
         destination = ProjectFileDestination(
             str(file_path),
             existing_file_policy=ExistingFilePolicy.OVERWRITE,
@@ -2188,6 +2195,11 @@ class WorkflowManager:
                 request.pickle_control_flow_result if request.pickle_control_flow_result is not None else False
             ),
         )
+        # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
+        # (its native result family). on_save_workflow_request's public contract
+        # returns SaveWorkflowResult*. The check here translates between the two
+        # failure types — it stays outside the helper because the helper is called
+        # from two handlers with different outer result families.
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             details = (
                 f"Attempted to save workflow '{relative_file_path}'. "
