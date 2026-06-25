@@ -2188,7 +2188,6 @@ class WorkflowManager:
             image_path=request.image_path if request.image_path is not None else existing.image,
             description=existing.description,
             is_template=existing.is_template,
-            execution_flow_name=top_level_flow_name,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
             pickle_control_flow_result=(
@@ -2463,7 +2462,6 @@ class WorkflowManager:
             image_path=request.image_path,
             description=request.description,
             is_template=request.is_template,
-            execution_flow_name=request.execution_flow_name,
             branched_from=request.branched_from,
             workflow_shape=request.workflow_shape,
             pickle_control_flow_result=request.pickle_control_flow_result,
@@ -2480,7 +2478,6 @@ class WorkflowManager:
         image_path: str | None,
         description: str | None,
         is_template: bool | None,
-        execution_flow_name: str | None,
         branched_from: str | None,
         workflow_shape: WorkflowShape | None,
         pickle_control_flow_result: bool,
@@ -2510,9 +2507,6 @@ class WorkflowManager:
         except Exception as err:
             details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during metadata generation: {err}"
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=details)
-
-        if execution_flow_name is None:
-            execution_flow_name = file_name
 
         try:
             final_code_output = self._generate_workflow_file_content(
@@ -2625,7 +2619,6 @@ class WorkflowManager:
             description=existing.description,
             image_path=existing.image,
             is_template=existing.is_template,
-            execution_flow_name=file_name,
             workflow_shape=workflow_shape,
         )
         save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
