@@ -24,7 +24,7 @@ if TYPE_CHECKING:
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.4.0"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.4.1"
 
     project_template_schema_version: str = Field(description="Schema version for the project template")
     name: str = Field(description="Name of the project")
@@ -64,6 +64,19 @@ class ProjectTemplate(BaseModel):
             "fallback for legacy projects that have no parent_project_id."
         ),
     )
+    workspace_dir: str | PerPlatformProjectPath | None = Field(
+        default=None,
+        description=(
+            "Optional workspace directory this project uses. When set, it is the highest-priority workspace "
+            "source: it overrides the per-user project_workspaces mapping, the GTN_CONFIG_WORKSPACE_DIRECTORY "
+            "env var, the project-adjacent config, parent inheritance, and the global default. The directory "
+            "need not contain a config file; an empty directory is valid. The value may be: (1) a string — "
+            "absolute, or relative to the directory of this project's YAML (e.g. `./workspace`); or (2) a "
+            "per-platform mapping with optional `linux`, `darwin`, `windows`, and `default` string fields. "
+            "The raw string is stored verbatim and only resolved to an absolute path at workspace-resolution "
+            "time, so a relative value keeps the project portable across machines."
+        ),
+    )
     situations: dict[str, SituationTemplate] = Field(description="Situation templates (situation_name -> template)")
     directories: dict[str, DirectoryDefinition] = Field(
         description="Directory definitions (logical_name -> definition)",
@@ -82,7 +95,7 @@ class ProjectTemplate(BaseModel):
         """Get a directory definition by logical name."""
         return self.directories.get(directory_name)
 
-    def to_overlay_yaml(self, base: ProjectTemplate) -> str:
+    def to_overlay_yaml(self, base: ProjectTemplate) -> str:  # noqa: C901
         """Export only user customizations relative to a base template as YAML.
 
         Per-item atomicity: if a situation or directory differs from the base
@@ -127,6 +140,12 @@ class ProjectTemplate(BaseModel):
                 output["parent_project_id"] = self_dump.get("parent_project_id")
         elif self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
             output["parent_project_path"] = self_dump.get("parent_project_path")
+
+        # workspace_dir: emit only when it diverges from base. The stored value is the
+        # raw string or per-platform mapping (never absolutized), so a relative path
+        # round-trips verbatim. An explicit null tombstones an inherited value.
+        if self_dump.get("workspace_dir") != base_dump.get("workspace_dir"):
+            output["workspace_dir"] = self_dump.get("workspace_dir")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
         if situations_overlay:
@@ -444,12 +463,20 @@ class ProjectTemplate(BaseModel):
         merged_parent_project_path = None if overlay.clears_parent_project_path else overlay.parent_project_path
         merged_parent_project_id = None if overlay.clears_parent_project_id else overlay.parent_project_id
 
+        # workspace_dir describes the child's OWN workspace and is never inherited from
+        # the base: a child does not adopt its parent's workspace_dir (cross-project
+        # workspace inheritance is handled by the resolution ladder's parent-chain branch,
+        # not by merge). Taken from the overlay alone; an explicit null or omitted field
+        # both yield None.
+        merged_workspace_dir = None if overlay.clears_workspace_dir else overlay.workspace_dir
+
         return ProjectTemplate(
             project_template_schema_version=overlay.project_template_schema_version,
             name=overlay.name,
             id=merged_id,
             parent_project_path=merged_parent_project_path,
             parent_project_id=merged_parent_project_id,
+            workspace_dir=merged_workspace_dir,
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,

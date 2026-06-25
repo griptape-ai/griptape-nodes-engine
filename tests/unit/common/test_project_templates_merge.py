@@ -1045,3 +1045,114 @@ parent_project_id: null
         # to_yaml uses exclude_none, so a template with no id (the default) must not
         # emit an id key.
         assert '"id":' not in DEFAULT_PROJECT_TEMPLATE.to_yaml()
+
+
+class TestWorkspaceDir:
+    """Round-trip, tombstone, and merge behavior for the per-project `workspace_dir` field.
+
+    `workspace_dir` declares the workspace a project uses. It is the highest-priority
+    workspace source at resolution time, but as a template field it has OWN-node merge
+    semantics (never inherited from base, mirroring the parent link) and the stored value
+    is the raw string/per-platform mapping (never absolutized) so a relative path stays
+    portable across machines.
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_string_workspace_dir_survives_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/abs/workspace"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.workspace_dir == "/abs/workspace"
+
+    def test_relative_workspace_dir_stored_verbatim(self) -> None:
+        # A relative value is persisted as-is (never absolutized): resolution to an
+        # absolute path happens only at resolve time, keeping the project portable.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./workspace"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        assert "workspace_dir" in overlay_yaml
+
+        merged = self._roundtrip(modified)
+        assert merged.workspace_dir == "./workspace"
+
+    def test_per_platform_workspace_dir_survives_round_trip(self) -> None:
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        per_platform = PerPlatformProjectPath(linux="/ws/linux", darwin="/ws/darwin", windows="C:\\ws", default="/ws")
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": per_platform})
+
+        merged = self._roundtrip(modified)
+
+        assert isinstance(merged.workspace_dir, PerPlatformProjectPath)
+        assert merged.workspace_dir.linux == "/ws/linux"
+        assert merged.workspace_dir.darwin == "/ws/darwin"
+        assert merged.workspace_dir.windows == "C:\\ws"
+        assert merged.workspace_dir.default == "/ws"
+
+    def test_unset_workspace_dir_not_emitted(self) -> None:
+        # The default has workspace_dir=None; an unset field must not be written.
+        assert "workspace_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_explicit_null_tombstones_inherited_workspace_dir(self) -> None:
+        # An explicit `workspace_dir: null` overlay clears an inherited value.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/inherited/ws"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+workspace_dir: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_workspace_dir is True
+        assert overlay_data.workspace_dir is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.workspace_dir is None
+
+    def test_child_does_not_inherit_base_workspace_dir(self) -> None:
+        # OWN-node semantics: a child whose overlay omits workspace_dir does NOT
+        # adopt the base's value (cross-project inheritance is the resolution
+        # ladder's job, not merge's).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/base/ws"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.workspace_dir is None
+        assert overlay_data.clears_workspace_dir is False
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.workspace_dir is None
+
+    def test_invalid_workspace_dir_type_records_error(self) -> None:
+        # A non-string, non-mapping workspace_dir is a structural error.
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Bad"
+workspace_dir: 42
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        load_partial_project_template(yaml_text, validation)
+
+        assert validation.status != ProjectValidationStatus.GOOD
+        assert any("workspace_dir" in problem.field_path for problem in validation.problems)
