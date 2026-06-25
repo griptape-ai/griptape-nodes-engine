@@ -222,8 +222,8 @@ class AgentManager:
             self._threads_dir, config_manager, secrets_manager
         )
 
-        # Cache one runner per (provider-type, model, image-model, base-url, mcp-set).
-        self._runner_cache: dict[tuple[str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
+        # Cache one runner per (provider-type, model, image-model, base-url, api-key, mcp-set).
+        self._runner_cache: dict[tuple[str, str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
 
         # Cancel handles for in-flight runs, keyed by thread_id.
         self._active_runs: dict[str, _ActiveRun] = {}
@@ -592,7 +592,7 @@ class AgentManager:
                 models=models,
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
-        except Exception as e:
+        except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
             details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             logger.warning(details)
             return ListProviderModelsResultFailure(result_details=details)
@@ -628,6 +628,7 @@ class AgentManager:
             model_name,
             self._image_model_name,
             base_url,
+            api_key,
             tuple(sorted(additional_mcp_servers)),
         )
         if (cached := self._runner_cache.get(cache_key)) is not None:
