@@ -139,7 +139,7 @@ class ResolveProjectWorkspaceRequest(RequestPayload):
     Args:
         project_id: Opaque id of the project (the registry key). Consumers must not parse it.
 
-    Results: ResolveProjectWorkspaceResultSuccess | ResolveProjectWorkspaceResultFailure
+    Results: ResolveProjectWorkspaceResultSuccess
     """
 
     project_id: ProjectID
@@ -156,12 +156,6 @@ class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
     """
 
     workspace_dir: str | None = None
-
-
-@dataclass
-@PayloadRegistry.register
-class ResolveProjectWorkspaceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Resolving the project workspace failed."""
 
 
 @dataclass
