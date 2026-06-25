@@ -353,7 +353,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                     file_name=file_name,
                     file_path=target_path,
                     description=description,
-                    execution_flow_name=top_level_flow_result.flow_name,
                 )
             )
             if isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess):

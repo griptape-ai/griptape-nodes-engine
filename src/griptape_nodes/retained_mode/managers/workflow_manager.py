@@ -26,7 +26,7 @@ from rich.text import Text
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
-from griptape_nodes.files.file import FileLoadError
+from griptape_nodes.files.file import File, FileLoadError, FileWriteError
 from griptape_nodes.files.path_utils import (
     FilenameParts,
     canonicalize_for_identity,
@@ -77,8 +77,6 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     GetFileInfoResultSuccess,
-    WriteFileRequest,
-    WriteFileResultFailure,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -309,11 +307,25 @@ class WorkflowManager:
 
     @dataclass
     class SaveWorkflowTargetInfo:
-        """Target information for saving a workflow."""
+        """Target information for saving a workflow.
+
+        Exactly one of ``destination`` or ``file_path`` is populated:
+
+        - ``destination`` is set for FIRST_SAVE, SAVE_AS, and SAVE_FROM_TEMPLATE
+          scenarios. It carries the unresolved ``ProjectFileDestination`` from
+          the ``save_workflow`` situation so the macro resolves inside
+          ``OSManager.on_write_file_request`` (seed-and-retry for unresolved
+          required ``{x:NN}`` slots; situation policy honored).
+        - ``file_path`` is set for OVERWRITE_EXISTING. The registry already
+          knows the workflow's on-disk location, so an in-place overwrite is
+          the correct behavior — the situation macro does NOT re-resolve when
+          updating an existing file.
+        """
 
         scenario: WorkflowManager.SaveWorkflowScenario  # Which save scenario we're in
         file_name: str  # Final resolved name to use
-        file_path: Path  # Absolute path where file will be written
+        destination: ProjectFileDestination | None  # Unresolved destination for new saves
+        file_path: Path | None  # Absolute path for in-place overwrite (OVERWRITE_EXISTING)
         relative_file_path: str  # Relative path for registry
         creation_date: datetime  # When workflow was originally created
         branched_from: str | None  # Workflow this was branched from (if any)
@@ -1386,8 +1398,19 @@ class WorkflowManager:
         if updated_content is None:
             return "Failed to update metadata header."
 
+        # Metadata-header rewrite: we already have the absolute on-disk path of an
+        # existing workflow file. _write_workflow_file's single-destination contract
+        # (so macro-driven saves can thread their unresolved MacroPath through to
+        # OSManager) means we wrap the literal path here. File's constructor stores
+        # non-macro strings verbatim, so the write goes through OSManager's
+        # sanitize-and-write branch with no macro resolution. OVERWRITE matches the
+        # in-place semantics this caller needs.
+        destination = ProjectFileDestination(
+            str(file_path),
+            existing_file_policy=ExistingFilePolicy.OVERWRITE,
+        )
         write_result = self._write_workflow_file(
-            file_path=file_path, content=updated_content, file_name=workflow_metadata.name
+            destination=destination, content=updated_content, file_name=workflow_metadata.name
         )
         if not write_result.success:
             return write_result.error_details
@@ -1912,33 +1935,47 @@ class WorkflowManager:
         return True
 
     class WriteWorkflowFileResult(NamedTuple):
-        """Result of writing a workflow file."""
+        """Result of writing a workflow file.
+
+        ``written_file`` is populated on success and carries the post-write
+        location (which may differ from the requested path when CREATE_NEW
+        seeded an index slot or walked past a collision).
+        """
 
         success: bool
         error_details: str
+        written_file: File | None = None
 
     class WorkflowSavePath(NamedTuple):
-        """Absolute save path and its registry-relative form."""
+        """Unresolved workflow save destination plus its registry-relative form.
 
-        file_path: Path
+        ``destination`` carries the unresolved ``MacroPath`` so it can be passed
+        through to the OSManager write handler intact. The handler seeds and
+        walks an unresolved required ``{x:NN}`` slot on CREATE_NEW writes —
+        pre-resolving here would strip that context.
+        """
+
+        destination: ProjectFileDestination
         relative_file_path: str
 
     class NamedSavePath(NamedTuple):
-        """Resolved save path for a user-supplied name, plus the bare file stem."""
+        """Save destination for a user-supplied name, plus the bare file stem."""
 
         file_name: str
-        file_path: Path
+        destination: ProjectFileDestination
         relative_file_path: str
 
     def _build_workflow_save_path(self, file_name: str, sub_dirs: str | None = None) -> WorkflowSavePath:
-        """Resolve a workflow save path via the ``save_workflow`` situation.
+        """Build a workflow save destination via the ``save_workflow`` situation.
 
-        Returns the absolute save path plus a registry-relative form. When the
-        resolved path lives inside the workspace the relative form stays
-        workspace-relative; otherwise it falls back to the absolute path string
-        so registry lookups land at the same location. If the situation cannot
-        resolve (e.g., no project loaded), we fall through to the plain
-        workspace path.
+        Returns an unresolved ``ProjectFileDestination`` plus a registry-relative
+        display string. The destination's macro is resolved inside
+        ``OSManager.on_write_file_request`` so the seed-and-retry contract for
+        unresolved required ``{x:NN}`` slots applies (see issue #4941).
+
+        ``relative_file_path`` is computed from the user-supplied name and
+        sub-directory directly; out-of-workspace handling and macro-form
+        portability happen post-write via ``ProjectFileDestination._map_to_macro_file``.
         """
         extra_vars: dict[str, str | int] = {}
         if sub_dirs:
@@ -1946,107 +1983,123 @@ class WorkflowManager:
 
         destination = ProjectFileDestination.from_situation(file_name, "save_workflow", **extra_vars)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
-        try:
-            resolved = canonicalize_for_identity(destination.resolve())
-        except FileLoadError as err:
-            workspace_path = GriptapeNodes.ConfigManager().workspace_path
-            fallback_path = workspace_path.joinpath(relative_file_path)
-            logger.debug(
-                "save_workflow situation unavailable for '%s' (%s); falling back to workspace path %s",
-                file_name,
-                err,
-                fallback_path,
-            )
-            return WorkflowManager.WorkflowSavePath(
-                file_path=fallback_path,
-                relative_file_path=relative_file_path,
-            )
+        return WorkflowManager.WorkflowSavePath(
+            destination=destination,
+            relative_file_path=relative_file_path,
+        )
 
+    @staticmethod
+    def _workspace_relative_path(absolute_or_relative_path: str) -> str:
+        """Return the workspace-relative form of a path, or the absolute path if outside.
+
+        Used post-write to reconcile registry state with the actual on-disk
+        location (e.g. when CREATE_NEW seeded an index slot, the written file
+        is ``foo_v001.py`` while the request asked for ``foo.py``).
+        """
+        path = Path(absolute_or_relative_path)
         workspace_path = GriptapeNodes.ConfigManager().workspace_path
         try:
-            workspace_relative = resolved.relative_to(workspace_path)
+            relative = canonicalize_for_identity(path).relative_to(canonicalize_for_identity(workspace_path))
         except ValueError:
             # TODO: store the macro form (e.g. "{workspace_dir}/foo.py") in the
             # registry so out-of-workspace save locations stay portable across
             # machines. Tracked in
             # https://github.com/griptape-ai/griptape-nodes/issues/2047.
-            return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(resolved))
-
-        return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(workspace_relative))
+            return str(path)
+        return str(relative)
 
     def _resolve_named_save_path(self, requested_file_name: str) -> NamedSavePath:
-        """Resolve a user-supplied save name (possibly carrying a directory) to a save path.
+        """Resolve a user-supplied save name (possibly carrying a directory) to a save destination.
 
         A relative name like "episode/my_wf" splits into sub-directory + stem and routes
         through the workspace save situation. An absolute name like "/ext/my_wf" (produced
         when renaming an externally-registered workflow) is honored verbatim:
         ProjectFileDestination.from_situation bypasses the workspace macro for absolute
-        filenames, so _build_workflow_save_path keys it by its absolute path.
+        filenames.
         """
         parts = FilenameParts.from_filename(f"{requested_file_name}.py")
         if parts.directory.is_absolute():
-            file_path, relative_file_path = self._build_workflow_save_path(f"{requested_file_name}.py")
+            destination, relative_file_path = self._build_workflow_save_path(f"{requested_file_name}.py")
         else:
             sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            file_path, relative_file_path = self._build_workflow_save_path(f"{parts.stem}.py", sub_dirs=sub_dirs)
+            destination, relative_file_path = self._build_workflow_save_path(f"{parts.stem}.py", sub_dirs=sub_dirs)
         return WorkflowManager.NamedSavePath(
-            file_name=parts.stem, file_path=file_path, relative_file_path=relative_file_path
+            file_name=parts.stem, destination=destination, relative_file_path=relative_file_path
         )
 
-    def _write_workflow_file(self, file_path: Path, content: str, file_name: str) -> WriteWorkflowFileResult:
-        """Write workflow content to file with proper validation and error handling.
+    def _write_workflow_file(
+        self, destination: ProjectFileDestination, content: str, file_name: str
+    ) -> WriteWorkflowFileResult:
+        """Write workflow content via a ``ProjectFileDestination``.
 
-        Uses OSManager's WriteFileRequest for file writing with exclusive locking.
-        First write wins - if another process is writing, this call fails immediately.
-
-        Args:
-            file_path: Path where to write the file
-            content: Content to write
-            file_name: Name for error messages
-
-        Returns:
-            WriteWorkflowFileResult with success status and error details if failed
+        The unresolved macro (when the destination carries one) is threaded
+        through to the OSManager write handler so the seed-and-retry contract
+        for unresolved required ``{x:NN}`` slots applies (#4941) and the
+        situation's collision policy is honored. Callers with a plain on-disk
+        path wrap it as ``ProjectFileDestination(str(path), ...)`` — the
+        ``File`` constructor stores literal paths verbatim, so the write
+        behaves as an in-place overwrite (used by header-only metadata
+        updates).
         """
-        # Check disk space before any file system operations
-        config_manager = GriptapeNodes.ConfigManager()
-        min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_workflows")
-        if not OSManager.check_available_disk_space(file_path.parent, min_space_gb):
-            error_msg = OSManager.format_disk_space_error(file_path.parent)
-            details = f"Attempted to save workflow '{file_name}' (requires {min_space_gb:.1f} GB). Failed due to insufficient disk space: {error_msg}"
+        # Best-effort disk-space probe. When the destination's macro can't yet
+        # resolve (e.g. an unresolved required `{_index:03}` slot is waiting to
+        # be seeded inside OSManager), skip the proactive check and let any
+        # actual disk-full surface as IO_ERROR from the write.
+        check_dir = self._probe_parent_for_disk_check(destination)
+        if check_dir is not None:
+            config_manager = GriptapeNodes.ConfigManager()
+            min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_workflows")
+            if not OSManager.check_available_disk_space(check_dir, min_space_gb):
+                error_msg = OSManager.format_disk_space_error(check_dir)
+                details = f"Attempted to save workflow '{file_name}' (requires {min_space_gb:.1f} GB). Failed due to insufficient disk space: {error_msg}"
+                return self.WriteWorkflowFileResult(success=False, error_details=details)
+
+        try:
+            written_file = destination.write_text(content, encoding="utf-8")
+        except FileWriteError as err:
+            details = self._format_workflow_write_error(file_name, err.failure_reason, err.result_details)
             return self.WriteWorkflowFileResult(success=False, error_details=details)
+        return self.WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
-        # Write file using OSManager's centralized file writing API
-        os_manager = GriptapeNodes.OSManager()
-        write_request = WriteFileRequest(
-            file_path=str(file_path),
-            content=content,
-            encoding="utf-8",
-            append=False,
-            existing_file_policy=ExistingFilePolicy.OVERWRITE,
-            create_parents=True,
-        )
+    @staticmethod
+    def _probe_parent_for_disk_check(destination: ProjectFileDestination) -> Path | None:
+        """Return the parent directory to use for the pre-write disk-space probe.
 
-        result = os_manager.on_write_file_request(write_request)
+        Returns ``None`` when the destination's macro can't be resolved without
+        seeding (we'd be duplicating OSManager's seed logic here). The actual
+        write will surface a disk-full as IO_ERROR.
+        """
+        try:
+            # Resolve only to learn the target *directory* for the disk-space probe.
+            # The macro may still carry unresolved seed-eligible slots (e.g.
+            # `{_index:03}`); those get seeded later inside OSManager during the
+            # actual write. We don't want to duplicate that seed logic here just
+            # to satisfy a best-effort capacity check.
+            resolved = destination.resolve()
+        except FileLoadError:
+            # Macro couldn't resolve (typically because a required `{x:NN}` slot
+            # is waiting for OSManager's seed-and-retry). Skip the proactive
+            # check and let the write itself raise IO_ERROR if the volume is
+            # actually full — the user still gets a clear failure, just without
+            # the "X.X GB required" pre-flight message.
+            return None
+        return Path(resolved).parent
 
-        if isinstance(result, WriteFileResultFailure):
-            # Map failure reasons to workflow-specific error messages
-            match result.failure_reason:
-                case FileIOFailureReason.IO_ERROR:
-                    # Could be lock exception or other I/O error
-                    error_msg = str(result.result_details)
-                case FileIOFailureReason.PERMISSION_DENIED:
-                    error_msg = f"Permission denied: {result.result_details}"
-                case FileIOFailureReason.IS_DIRECTORY:
-                    error_msg = "Path is a directory, not a file"
-                case FileIOFailureReason.ENCODING_ERROR:
-                    error_msg = f"Content encoding error: {result.result_details}"
-                case _:
-                    error_msg = str(result.result_details)
-
-            details = f"Attempted to save workflow '{file_name}'. {error_msg}"
-            return self.WriteWorkflowFileResult(success=False, error_details=details)
-
-        return self.WriteWorkflowFileResult(success=True, error_details="")
+    @staticmethod
+    def _format_workflow_write_error(file_name: str, failure_reason: FileIOFailureReason, details: str) -> str:
+        """Build the user-facing error string for a workflow write failure."""
+        match failure_reason:
+            case FileIOFailureReason.IO_ERROR:
+                error_msg = details
+            case FileIOFailureReason.PERMISSION_DENIED:
+                error_msg = f"Permission denied: {details}"
+            case FileIOFailureReason.IS_DIRECTORY:
+                error_msg = "Path is a directory, not a file"
+            case FileIOFailureReason.ENCODING_ERROR:
+                error_msg = f"Content encoding error: {details}"
+            case _:
+                error_msg = details
+        return f"Attempted to save workflow '{file_name}'. {error_msg}"
 
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
@@ -2064,17 +2117,35 @@ class WorkflowManager:
             return SaveWorkflowResultFailure(result_details=details)
 
         file_name = save_target.file_name
-        file_path = save_target.file_path
         relative_file_path = save_target.relative_file_path
         creation_date = save_target.creation_date
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
+        # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
+        # (in-place overwrite) wrapped in a ProjectFileDestination. All other
+        # scenarios carry an unresolved destination so the save_workflow
+        # situation macro resolves at write time, preserving the seed-and-retry
+        # contract for unresolved required `{x:NN}` slots.
+        if save_target.destination is not None:
+            destination = save_target.destination
+        elif save_target.file_path is not None:
+            destination = ProjectFileDestination(
+                str(save_target.file_path),
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
+        else:
+            msg = (
+                f"Save target for '{relative_file_path}' has neither a destination nor a file_path; "
+                "this is a programming error in _determine_save_target."
+            )
+            return SaveWorkflowResultFailure(result_details=msg)
+
         logger.debug(
-            "Save workflow: scenario=%s, file_name=%s, file_path=%s, branched_from=%s",
+            "Save workflow: scenario=%s, file_name=%s, destination=%s, branched_from=%s",
             save_target.scenario.value,
             file_name,
-            str(file_path),
+            destination.location,
             branched_from or "None",
         )
 
@@ -2108,7 +2179,8 @@ class WorkflowManager:
         # Prefer an explicitly provided display_name over the preserved existing value.
         resolved_display_name = request.display_name if request.display_name is not None else existing.display_name
 
-        save_file_request = SaveWorkflowFileFromSerializedFlowRequest(
+        save_file_result = self._save_workflow_file_inline(
+            destination=destination,
             serialized_flow_commands=commands,
             file_name=file_name,
             creation_date=creation_date,
@@ -2116,17 +2188,17 @@ class WorkflowManager:
             image_path=request.image_path if request.image_path is not None else existing.image,
             description=existing.description,
             is_template=existing.is_template,
-            execution_flow_name=top_level_flow_name,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
-            file_path=str(file_path),
             pickle_control_flow_result=(
                 request.pickle_control_flow_result if request.pickle_control_flow_result is not None else False
             ),
         )
-
-        # Execute save and update registry inline
-        save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
+        # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
+        # (its native result family). on_save_workflow_request's public contract
+        # returns SaveWorkflowResult*. The check here translates between the two
+        # failure types — it stays outside the helper because the helper is called
+        # from two handlers with different outer result families.
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             details = (
                 f"Attempted to save workflow '{relative_file_path}'. "
@@ -2135,6 +2207,16 @@ class WorkflowManager:
             return SaveWorkflowResultFailure(result_details=details)
 
         workflow_metadata = save_file_result.workflow_metadata
+
+        # Reconcile registry key / relative_file_path with the actual written path
+        # for macro-driven saves. CREATE_NEW + `{_index:03}` may produce
+        # `foo_v001.py` from a `foo.py` request; the registry must key by what
+        # ended up on disk, not what was asked for.
+        if save_target.destination is not None:
+            written_relative = self._workspace_relative_path(save_file_result.file_path)
+            if written_relative != relative_file_path:
+                relative_file_path = written_relative
+                registry_key = derive_registry_key(relative_file_path)
 
         # Handle the unsaved -> saved transition: if the current-context workflow is an
         # unsaved entry, swap its registry key to the path-derived key and update its
@@ -2283,6 +2365,8 @@ class WorkflowManager:
             and current_workflow.metadata.is_template
             and current_workflow.metadata.is_griptape_provided
         )
+        destination: ProjectFileDestination | None = None
+        file_path: Path | None = None
         if target_is_griptape_template or current_is_griptape_template:
             # Griptape-provided template workflows always create new copies with unique names.
             # Griptape-provided templates are always disk-backed, so file_path is guaranteed.
@@ -2296,7 +2380,7 @@ class WorkflowManager:
             file_name = self._generate_unique_filename(base_name)
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py")
+            destination, relative_file_path = self._build_workflow_save_path(f"{file_name}.py")
 
         elif target_workflow and target_workflow.file_path is not None:
             # Requested name exists in registry as a saved workflow → overwrite it.
@@ -2317,7 +2401,7 @@ class WorkflowManager:
             scenario = WorkflowManager.SaveWorkflowScenario.SAVE_AS
             creation_date = current_workflow.metadata.creation_date
             branched_from = current_workflow.metadata.branched_from
-            file_name, file_path, relative_file_path = self._resolve_named_save_path(requested_file_name)
+            file_name, destination, relative_file_path = self._resolve_named_save_path(requested_file_name)
 
         else:
             # No requested name or no current workflow → first save.
@@ -2335,7 +2419,7 @@ class WorkflowManager:
                 raw_name = requested_file_name or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_name, file_path, relative_file_path = self._resolve_named_save_path(raw_name)
+            file_name, destination, relative_file_path = self._resolve_named_save_path(raw_name)
 
         # Ensure creation date is valid (backcompat)
         if (creation_date is None) or (creation_date == WorkflowManager.EPOCH_START):
@@ -2344,6 +2428,7 @@ class WorkflowManager:
         return WorkflowManager.SaveWorkflowTargetInfo(
             scenario=scenario,
             file_name=file_name,
+            destination=destination,
             file_path=file_path,
             relative_file_path=relative_file_path,
             creation_date=creation_date,
@@ -2354,60 +2439,112 @@ class WorkflowManager:
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
         """Save a workflow file from serialized flow commands without registry overhead."""
-        # Determine file path
+        # Determine write destination
         if request.file_path:
-            # Use provided file path
-            file_path = Path(request.file_path)
+            # Callers that pre-resolved a file path (rename, failed-workflow saver,
+            # node-executor publishers) save exactly there via in-place overwrite.
+            # File treats literal absolute paths as non-macros, so the write goes
+            # straight through OSManager's sanitize-and-write branch.
+            destination = ProjectFileDestination(
+                request.file_path,
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
         else:
             # Resolve via the save_workflow situation (workspace-relative by default).
-            file_path = self._build_workflow_save_path(f"{request.file_name}.py").file_path
+            destination = self._build_workflow_save_path(f"{request.file_name}.py").destination
 
-        # Use provided creation date or default to current time
-        creation_date = request.creation_date
+        return self._save_workflow_file_inline(
+            destination=destination,
+            serialized_flow_commands=request.serialized_flow_commands,
+            file_name=request.file_name,
+            creation_date=request.creation_date,
+            display_name=request.display_name,
+            image_path=request.image_path,
+            description=request.description,
+            is_template=request.is_template,
+            branched_from=request.branched_from,
+            workflow_shape=request.workflow_shape,
+            pickle_control_flow_result=request.pickle_control_flow_result,
+        )
+
+    def _save_workflow_file_inline(  # noqa: PLR0913
+        self,
+        *,
+        destination: ProjectFileDestination,
+        serialized_flow_commands: SerializedFlowCommands,
+        file_name: str,
+        creation_date: datetime | None,
+        display_name: str | None,
+        image_path: str | None,
+        description: str | None,
+        is_template: bool | None,
+        branched_from: str | None,
+        workflow_shape: WorkflowShape | None,
+        pickle_control_flow_result: bool,
+    ) -> ResultPayload:
+        """Generate the workflow file content and write it to ``destination``.
+
+        Shared by ``on_save_workflow_request`` and
+        ``on_save_workflow_file_from_serialized_flow_request``. Callers with a
+        pre-resolved Path wrap it as ``ProjectFileDestination(str(path), ...)``
+        before calling this helper.
+        """
         if creation_date is None:
             creation_date = datetime.now(tz=UTC)
 
-        # Generate metadata from the serialized commands
         try:
             workflow_metadata = self._generate_workflow_metadata_from_commands(
-                serialized_flow_commands=request.serialized_flow_commands,
-                file_name=request.file_name,
+                serialized_flow_commands=serialized_flow_commands,
+                file_name=file_name,
                 creation_date=creation_date,
-                display_name=request.display_name,
-                image_path=request.image_path,
-                description=request.description,
-                is_template=request.is_template,
-                branched_from=request.branched_from,
-                workflow_shape=request.workflow_shape,
+                display_name=display_name,
+                image_path=image_path,
+                description=description,
+                is_template=is_template,
+                branched_from=branched_from,
+                workflow_shape=workflow_shape,
             )
         except Exception as err:
-            details = f"Attempted to save workflow file '{request.file_name}' from serialized flow commands. Failed during metadata generation: {err}"
+            details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during metadata generation: {err}"
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=details)
 
-        # Use provided execution flow name or default to file name
-        execution_flow_name = request.execution_flow_name
-        if execution_flow_name is None:
-            execution_flow_name = request.file_name
-
-        # Generate the workflow file content
         try:
             final_code_output = self._generate_workflow_file_content(
-                serialized_flow_commands=request.serialized_flow_commands,
+                serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
-                pickle_control_flow_result=request.pickle_control_flow_result,
+                pickle_control_flow_result=pickle_control_flow_result,
             )
         except Exception as err:
-            details = f"Attempted to save workflow file '{request.file_name}' from serialized flow commands. Failed during content generation: {err}"
+            details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=details)
 
-        # Write the workflow file
-        write_result = self._write_workflow_file(file_path, final_code_output, request.file_name)
+        write_result = self._write_workflow_file(destination, final_code_output, file_name)
         if not write_result.success:
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=write_result.error_details)
 
-        details = f"Successfully saved workflow file at: {file_path}"
+        # Prefer the post-write location from ``_write_workflow_file`` — for
+        # macro-driven saves this reflects the resolved-and-possibly-seeded
+        # filename (e.g. ``..._v001.py``), not the unresolved template.
+        if write_result.written_file is not None:
+            try:
+                # Re-resolve to get the absolute on-disk path the write actually
+                # landed at (``_map_to_macro_file`` may have rewritten the
+                # ``File`` to its portable macro form like ``{workspace_dir}/...``).
+                final_file_path = write_result.written_file.resolve()
+            except FileLoadError:
+                # Re-resolution failed (project unloaded between the write and
+                # this re-resolve, or the macro form references a directory that
+                # disappeared). Fall back to the ``File.location`` string —
+                # for non-macro paths it's the absolute path; for macro paths
+                # it's the unresolved template, which is still a meaningful
+                # human-readable answer for the success message.
+                final_file_path = write_result.written_file.location
+        else:
+            final_file_path = destination.location
+
+        details = f"Successfully saved workflow file at: {final_file_path}"
         return SaveWorkflowFileFromSerializedFlowResultSuccess(
-            file_path=str(file_path),
+            file_path=final_file_path,
             workflow_metadata=workflow_metadata,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
@@ -2482,7 +2619,6 @@ class WorkflowManager:
             description=existing.description,
             image_path=existing.image,
             is_template=existing.is_template,
-            execution_flow_name=file_name,
             workflow_shape=workflow_shape,
         )
         save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
