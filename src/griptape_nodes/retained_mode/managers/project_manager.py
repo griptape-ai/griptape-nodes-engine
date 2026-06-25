@@ -1350,7 +1350,8 @@ class ProjectManager:
         workspace layer, plus whether activation pins it via set_workspace_override.
         Priority, highest first (matching _activate_project's block):
 
-        1. project_workspaces user-config override -> (override dir, apply_override=True)
+        1. project_workspaces user-config override, keyed by project ID or path ->
+           (override dir, apply_override=True)
         2. workspace_directory from env vars -> (env dir, apply_override=False)
         3. workspace_directory from the project-adjacent config -> (project dir, apply_override=False)
         4. the nearest ancestor's resolved workspace, walking the explicit parent-project chain ->
@@ -1421,12 +1422,32 @@ class ProjectManager:
         return WorkspaceDecision(project_file_path.parent, apply_override=True)
 
     def _find_workspace_override(self, project_file_path: Path, project_workspaces: dict[str, str]) -> str | None:
-        """Return the user-configured workspace override for a project file, or None if not mapped."""
+        """Return the user-configured workspace override for a project, or None if not mapped.
+
+        A project_workspaces key may be either an opaque project ID or a project
+        file path. Each key is resolved to a canonical project path and compared
+        against the target's canonical path. See _resolve_workspace_key for the
+        ID-then-path resolution order.
+        """
         resolved_project_path = str(canonicalize_for_identity(project_file_path))
         return next(
-            (v for k, v in project_workspaces.items() if str(canonicalize_for_identity(k)) == resolved_project_path),
+            (v for k, v in project_workspaces.items() if self._resolve_workspace_key(k) == resolved_project_path),
             None,
         )
+
+    def _resolve_workspace_key(self, key: str) -> str:
+        """Canonical project path for a project_workspaces key (a project ID or a path).
+
+        Tries the key as a loaded project's ID first: when a loaded project carries
+        that id (and has a backing file), its file path is the resolved path. When no
+        loaded project matches the id (or it has no backing file), the key is treated
+        as a file path instead. IDs are looked up verbatim, never canonicalized, the
+        same way the registry is keyed.
+        """
+        info = self._successfully_loaded_project_templates.get(key)
+        if info is not None and info.project_file_path is not None:
+            return str(canonicalize_for_identity(info.project_file_path))
+        return str(canonicalize_for_identity(key))
 
     def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:  # noqa: PLR0911
         """Walk the explicit parent-project chain for the nearest ancestor's workspace.

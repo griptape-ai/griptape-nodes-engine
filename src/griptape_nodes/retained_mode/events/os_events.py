@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence
+from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence, SequenceScanOptions
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
@@ -165,6 +165,11 @@ class ListDirectoryRequest(RequestPayload):
         include_modified_time: If True, include modified time in results (default: True). Set to False for faster listing.
         include_mime_type: If True, include MIME type in results (default: True). Set to False for faster listing.
         include_absolute_path: If True, include absolute resolved path in results (default: True). Set to False for faster listing.
+        group_sequences: If True, files that form a numbered sequence are returned as
+            ``Sequence`` objects in the ``sequences`` field instead of individual ``FileSystemEntry``
+            objects in ``entries``. Defaults to False — sequence detection is opt-in.
+        sequence_options: Controls sequence detection behaviour (policy, padding filter, frame bounds).
+            Only used when ``group_sequences=True``. Defaults to ``SequenceScanOptions()`` when None.
 
     Results: ListDirectoryResultSuccess (with entries) | ListDirectoryResultFailure (access denied, not found)
     """
@@ -177,16 +182,29 @@ class ListDirectoryRequest(RequestPayload):
     include_modified_time: bool = True
     include_mime_type: bool = True
     include_absolute_path: bool = True
+    group_sequences: bool = False
+    sequence_options: SequenceScanOptions | None = None
 
 
 @dataclass
 @PayloadRegistry.register
 class ListDirectoryResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Directory listing retrieved successfully."""
+    """Directory listing retrieved successfully.
+
+    Attributes:
+        entries: Files and directories. When ``group_sequences=True`` (opt-in),
+            sequence-member files are removed and appear in ``sequences`` instead;
+            when ``group_sequences=False`` (default) all entries are returned here.
+        sequences: ``Sequence`` objects detected when ``group_sequences=True``.
+            Always an empty list when ``group_sequences=False``.
+        current_path: The directory path used for the listing.
+        is_workspace_path: True when the listed directory is inside the workspace.
+    """
 
     entries: list[FileSystemEntry]
     current_path: str
     is_workspace_path: bool
+    sequences: list[Sequence] = field(default_factory=list)
 
 
 @dataclass
@@ -195,11 +213,130 @@ class ListDirectoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Directory listing failed.
 
     Attributes:
-        failure_reason: Classification of why the listing failed
+        failure_reason: Classification of why the listing failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
         result_details: Human-readable error message (inherited from ResultPayloadFailure)
     """
 
-    failure_reason: FileIOFailureReason
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesRequest(ListDirectoryRequest):
+    """List only file sequences in a directory.
+
+    Returns sequence objects only — non-sequence files and directories are
+    omitted from the result. Equivalent to issuing ``ListDirectoryRequest``
+    with ``group_sequences=True`` but with a dedicated result type and
+    without the flat-entry payload.
+
+    Inherits all filtering arguments from ``ListDirectoryRequest``
+    (``show_hidden``, ``pattern``, ``workspace_only``, etc.).
+
+    Results: ListDirectorySequencesResultSuccess | ListDirectorySequencesResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Directory sequence listing retrieved successfully.
+
+    Attributes:
+        sequences: All ``Sequence`` objects detected in the directory.
+            Empty list when the directory contains no sequences.
+        current_path: The directory path used for the listing.
+        is_workspace_path: True when the listed directory is inside the workspace.
+    """
+
+    sequences: list[Sequence]
+    current_path: str
+    is_workspace_path: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class ListDirectorySequencesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Directory sequence listing failed.
+
+    Attributes:
+        failure_reason: Classification of why the listing failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
+        result_details: Human-readable error message (inherited from ResultPayloadFailure).
+    """
+
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListRequest(RequestPayload):
+    """Detect file sequences within a caller-supplied list of file paths.
+
+    No additional filesystem I/O is performed — pass paths already obtained
+    from a directory listing or any other source. Callers are responsible for
+    supplying only file paths; directory paths in the list will not be
+    filtered out and may produce unexpected results. Files from different
+    parent directories are grouped independently by their shared parent.
+
+    Use when: Sequence grouping is needed for a file list that has already
+    been collected, avoiding a redundant directory scan.
+
+    Args:
+        file_paths: Absolute (or workspace-relative) paths to inspect.
+            Bare filenames without a directory component are allowed but
+            result in ``Sequence.directory`` being an empty string.
+        sequence_options: Policy, padding filter, and frame-range bounds.
+            Defaults to ``SequenceScanOptions()`` when None.
+
+    Results: DeduceSequencesFromFileListResultSuccess | DeduceSequencesFromFileListResultFailure
+    """
+
+    file_paths: list[str] = field(default_factory=list)
+    sequence_options: SequenceScanOptions | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Sequence deduction from file list completed successfully.
+
+    Attributes:
+        sequences: All ``Sequence`` objects detected. Empty list when no
+            sequences were found in the provided file paths.
+    """
+
+    sequences: list[Sequence] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class DeduceSequencesFromFileListResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Sequence deduction from file list failed.
+
+    Attributes:
+        failure_reason: Classification of why the deduction failed. Sequence-semantic
+            failures (bad bounds, ABORT-policy gaps) use ``SequenceScanFailureReason``;
+            OS-layer failures use ``FileIOFailureReason``.
+        missing_item_numbers: Populated only when ``failure_reason`` is
+            ``SequenceScanFailureReason.ABORTED_AT_GAP``. Lists every missing frame
+            number inside the active range, sorted ascending.
+        result_details: Human-readable error message (inherited from ResultPayloadFailure).
+    """
+
+    failure_reason: SequenceScanFailureReason | FileIOFailureReason
+    missing_item_numbers: list[int] = field(default_factory=list)
 
 
 @dataclass

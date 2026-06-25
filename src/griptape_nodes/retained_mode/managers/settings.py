@@ -473,7 +473,7 @@ class Settings(BaseModel):
     project_workspaces: dict[str, str] = Field(
         category=PROJECTS,
         default_factory=dict,
-        description="Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
+        description="Mapping of project identifiers to workspace directory overrides. A key may be either a project ID or a project file path: it is first matched against loaded project IDs, and if none match, treated as a project file path. When a project is loaded, if it matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
     )
     agent: AgentSettings = Field(
         category=AGENT,

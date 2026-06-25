@@ -73,6 +73,10 @@ class DirectoryDefinition(BaseModel):
     path_macro: str | PerPlatformPathMacro = Field(
         description="Path string (may contain macros/env vars), or a per-platform mapping"
     )
+    description: str | None = Field(
+        default=None,
+        description="Human-readable explanation of what this directory is for and how it's used.",
+    )
 
     @staticmethod
     def merge(
@@ -87,6 +91,8 @@ class DirectoryDefinition(BaseModel):
         Field-level merge behavior:
         - path_macro: Use overlay if present, else base. Atomic — when overlay supplies the
           per-platform mapping form, it fully replaces the base value (no per-key deep merge).
+        - description: Use overlay if the key is present (explicit null clears the inherited
+          value), else inherit base.
 
         Args:
             base: Complete base directory
@@ -99,11 +105,18 @@ class DirectoryDefinition(BaseModel):
             New merged DirectoryDefinition
         """
         # Start with base fields
-        merged_data: dict[str, Any] = {"name": base.name, "path_macro": base.path_macro}
+        merged_data: dict[str, Any] = {
+            "name": base.name,
+            "path_macro": base.path_macro,
+            "description": base.description,
+        }
 
         # Apply overlay if present
         if "path_macro" in overlay_data:
             merged_data["path_macro"] = overlay_data["path_macro"]
+
+        if "description" in overlay_data:
+            merged_data["description"] = overlay_data["description"]
 
         try:
             return DirectoryDefinition.model_validate(merged_data)
