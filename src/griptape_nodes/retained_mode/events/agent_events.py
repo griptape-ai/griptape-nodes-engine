@@ -184,6 +184,7 @@ class ConfigureAgentRequest(RequestPayload):
 
     prompt_driver: dict = field(default_factory=dict)
     image_generation_driver: dict = field(default_factory=dict)
+    active_provider: str = ""
 
 
 @dataclass
@@ -649,9 +650,11 @@ class ListAgentProvidersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
             ``base_url``, ``api_key``, ``enabled``, ``description``,
             ``docs_url``, ``download_url``. ``griptape_cloud`` is always
             the first entry.
+        active_provider: ``name`` of the currently active provider.
     """
 
     providers: list[dict] = field(default_factory=list)
+    active_provider: str = ""
 
 
 @dataclass
@@ -703,7 +706,7 @@ class CreateAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFai
 class UpdateAgentProviderRequest(RequestPayload):
     """Update an existing named agent provider configuration.
 
-    Use when: Editing a agent provider's model, base URL, API key, or metadata.
+    Use when: Editing an agent provider's model, base URL, API key, or metadata.
 
     Args:
         name: ``name`` of the provider to update (must already exist).

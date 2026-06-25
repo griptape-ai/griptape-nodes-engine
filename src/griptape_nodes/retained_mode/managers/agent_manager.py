@@ -212,6 +212,7 @@ class AgentManager:
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
         self._providers: list[dict] = []
+        self._active_provider_name: str = _PROTECTED_PROVIDER_NAME
         self._load_providers_from_config()
 
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
@@ -277,11 +278,11 @@ class AgentManager:
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
 
     def _get_provider(self, name: str | None) -> dict:
-        """Return the provider dict for name, falling back to griptape_cloud."""
-        if name:
-            for p in self._providers:
-                if p.get("name") == name:
-                    return p
+        """Return the provider dict for name, falling back to the active provider."""
+        lookup = name or self._active_provider_name
+        for p in self._providers:
+            if p.get("name") == lookup:
+                return p
         for p in self._providers:
             if p.get("name") == _PROTECTED_PROVIDER_NAME:
                 return p
@@ -289,7 +290,7 @@ class AgentManager:
         return {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": default_model}
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
-        _provider_keys = ("agent.providers", "agent.griptape_cloud_model", "agent", "")
+        _provider_keys = ("agent.providers", "agent.active_provider", "agent.griptape_cloud_model", "agent", "")
         if event.key not in ("agent.system_prompt", *_provider_keys):
             return
         new_value = config_manager.get_config_value("agent.system_prompt", default="")
@@ -520,6 +521,15 @@ class AgentManager:
                 if new_image_model != self._image_model_name:
                     self._image_model_name = new_image_model
                     changed = True
+            if request.active_provider:
+                provider_names = {p.get("name") for p in self._providers}
+                if request.active_provider not in provider_names:
+                    return ConfigureAgentResultFailure(
+                        result_details=f"Attempted to set active provider '{request.active_provider}'. Failed because it does not exist."
+                    )
+                if request.active_provider != self._active_provider_name:
+                    self._active_provider_name = request.active_provider
+                    changed = True
             if changed:
                 self._persist_providers()
                 self._runner_cache.clear()
@@ -530,7 +540,7 @@ class AgentManager:
         return ConfigureAgentResultSuccess(result_details="Agent configured successfully.")
 
     def _apply_prompt_driver_config(self, pd: dict) -> bool:
-        """Apply prompt driver config fields to the griptape_cloud provider, return True if any value changed."""
+        """Apply prompt driver config fields to the active provider, return True if any value changed."""
         gc = self._get_provider(None)
         changed = False
         for req_key, dict_key in (
@@ -688,6 +698,7 @@ class AgentManager:
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
             providers=list(self._providers),
+            active_provider=self._active_provider_name,
             result_details="Chat providers retrieved successfully.",
         )
 
@@ -742,6 +753,8 @@ class AgentManager:
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it is the last remaining provider."
             )
         self._providers.pop(idx)
+        if self._active_provider_name == request.name:
+            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
         self._persist_providers()
         self._runner_cache.clear()
         return DeleteAgentProviderResultSuccess(
@@ -749,7 +762,7 @@ class AgentManager:
         )
 
     def _load_providers_from_config(self) -> None:
-        """Load providers list from config, with legacy migration.
+        """Load providers list and active provider from config, with legacy migration.
 
         The griptape_cloud provider is always synthesized — it never needs to appear
         in the config file. Its model override lives in agent.griptape_cloud_model.
@@ -765,6 +778,13 @@ class AgentManager:
             self._providers = [gc_provider, *user_providers]
         else:
             self._providers = [gc_provider, *self._migrate_legacy_user_providers()]
+
+        saved_active = config_manager.get_config_value("agent.active_provider")
+        provider_names = {p.get("name") for p in self._providers}
+        if isinstance(saved_active, str) and saved_active in provider_names:
+            self._active_provider_name = saved_active
+        else:
+            self._active_provider_name = _PROTECTED_PROVIDER_NAME
 
     def _migrate_legacy_user_providers(self) -> list[dict]:
         """Return user-defined providers migrated from the old flat agent.provider config.
@@ -791,7 +811,7 @@ class AgentManager:
         return [migrated]
 
     def _persist_providers(self) -> None:
-        """Write chat provider and image provider state to config.
+        """Write chat provider state to config.
 
         The griptape_cloud entry is never written to agent.providers — it is
         always synthesized on load. Its model override (when changed from default)
@@ -799,6 +819,7 @@ class AgentManager:
         """
         user_providers = [p for p in self._providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
         config_manager.set_config_value("agent.providers", user_providers)
+        config_manager.set_config_value("agent.active_provider", self._active_provider_name)
 
         gc = next((p for p in self._providers if p.get("name") == _PROTECTED_PROVIDER_NAME), None)
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
