@@ -28,12 +28,6 @@ def _main() -> None:
         default=None,
         help="Path to the Griptape Nodes workflow file",
     )
-    parser.add_argument(
-        "--pickle-control-flow-result",
-        action="store_true",
-        default=False,
-        help="Whether to pickle control flow results",
-    )
     args = parser.parse_args()
     flow_input = json.loads(args.json_input)
 
