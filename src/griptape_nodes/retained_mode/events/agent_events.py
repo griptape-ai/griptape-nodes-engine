@@ -622,3 +622,176 @@ class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 @PayloadRegistry.register
 class GetAgentConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Agent config retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersRequest(RequestPayload):
+    """List all configured agent providers and which one is active.
+
+    Use when: Populating the provider management UI, letting users see and
+    switch between named provider configurations.
+
+    Results: ListAgentProvidersResultSuccess | ListAgentProvidersResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider list retrieved successfully.
+
+    Args:
+        providers: Ordered list of provider config dicts. Each has at minimum
+            ``name``, ``type``, and ``model``. Optional keys: ``base_url``,
+            ``api_key``, ``description``, ``docs_url``, ``download_url``.
+        active_provider: ``name`` of the currently active provider.
+    """
+
+    providers: list[dict] = field(default_factory=list)
+    active_provider: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider list retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderRequest(RequestPayload):
+    """Create a new named provider configuration.
+
+    Use when: Adding a new provider (Ollama instance, custom endpoint, etc.)
+    to the list of available providers.
+
+    Args:
+        provider: Provider config dict. Required keys: ``name`` (unique,
+            non-empty), ``type`` (one of the known preset ids). Optional:
+            ``model``, ``base_url``, ``api_key``, ``description``,
+            ``docs_url``, ``download_url``.
+
+    Results: CreateAgentProviderResultSuccess | CreateAgentProviderResultFailure
+    """
+
+    provider: dict = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider created successfully.
+
+    Args:
+        name: ``name`` of the newly created provider.
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider creation failed. Common causes: duplicate name, missing required fields, unknown type."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderRequest(RequestPayload):
+    """Update an existing named provider configuration.
+
+    Use when: Editing a provider's model, base URL, API key, or metadata.
+
+    Args:
+        name: ``name`` of the provider to update (must already exist).
+        provider: Partial or full provider dict. Fields present are merged
+            over the existing config; omitted fields are preserved.
+
+    Results: UpdateAgentProviderResultSuccess | UpdateAgentProviderResultFailure
+    """
+
+    name: str = ""
+    provider: dict = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider updated successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider update failed. Common causes: provider not found, unknown type."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderRequest(RequestPayload):
+    """Delete a named provider configuration.
+
+    The ``griptape_cloud`` provider cannot be deleted.
+
+    Use when: Removing a provider the user no longer needs.
+
+    Args:
+        name: ``name`` of the provider to delete.
+
+    Results: DeleteAgentProviderResultSuccess | DeleteAgentProviderResultFailure
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider deleted successfully.
+
+    Args:
+        name: ``name`` of the deleted provider.
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider deletion failed. Common causes: provider not found, protected provider, last remaining provider."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetActiveProviderRequest(RequestPayload):
+    """Set the active provider by name.
+
+    Use when: Switching which provider the chat sidebar agent uses.
+
+    Args:
+        name: ``name`` of the provider to activate (must already exist).
+
+    Results: SetActiveProviderResultSuccess | SetActiveProviderResultFailure
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetActiveProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Active provider changed successfully.
+
+    Args:
+        name: ``name`` of the now-active provider.
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetActiveProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Active provider change failed. Common causes: provider not found."""

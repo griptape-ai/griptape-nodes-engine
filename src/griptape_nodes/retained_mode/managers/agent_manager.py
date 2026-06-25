@@ -67,9 +67,15 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ConfigureAgentRequest,
     ConfigureAgentResultFailure,
     ConfigureAgentResultSuccess,
+    CreateAgentProviderRequest,
+    CreateAgentProviderResultFailure,
+    CreateAgentProviderResultSuccess,
     CreateThreadRequest,
     CreateThreadResultFailure,
     CreateThreadResultSuccess,
+    DeleteAgentProviderRequest,
+    DeleteAgentProviderResultFailure,
+    DeleteAgentProviderResultSuccess,
     DeleteThreadRequest,
     DeleteThreadResultFailure,
     DeleteThreadResultSuccess,
@@ -80,6 +86,8 @@ from griptape_nodes.retained_mode.events.agent_events import (
     GetConversationMemoryResultSuccess,
     ListAgentModelsRequest,
     ListAgentModelsResultSuccess,
+    ListAgentProvidersRequest,
+    ListAgentProvidersResultSuccess,
     ListProviderModelsRequest,
     ListProviderModelsResultFailure,
     ListProviderModelsResultSuccess,
@@ -93,9 +101,15 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
+    SetActiveProviderRequest,
+    SetActiveProviderResultFailure,
+    SetActiveProviderResultSuccess,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
+    UpdateAgentProviderRequest,
+    UpdateAgentProviderResultFailure,
+    UpdateAgentProviderResultSuccess,
 )
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent, ResultPayload
@@ -120,6 +134,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 API_KEY_ENV_VAR = "GT_CLOUD_API_KEY"
+
+# Valid type values for provider configs (derived from PROVIDER_PRESETS so it
+# stays in sync automatically when new presets are added).
+_VALID_PROVIDER_TYPES: frozenset[str] = frozenset(p["id"] for p in PROVIDER_PRESETS)
+
+# The built-in provider that is always present and may never be deleted.
+_PROTECTED_PROVIDER_NAME = "griptape_cloud"
 
 config_manager = ConfigManager()
 secrets_manager = SecretsManager(config_manager)
@@ -182,14 +203,15 @@ class AgentManager:
     def __init__(self, static_files_manager: StaticFilesManager, event_manager: EventManager | None = None) -> None:
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
-        provider_config = config_manager.get_config_value("agent.provider") or {}
-        if isinstance(provider_config, str):
-            # Flat legacy value — treat the string as the provider id.
-            provider_config = {"id": provider_config}
-        self._provider: str = provider_config.get("id", "griptape_cloud")
-        self._model_name: str = provider_config.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")
-        self._custom_base_url: str = provider_config.get("base_url", "")
-        self._custom_api_key: str = provider_config.get("api_key", "")
+
+        # Named provider list and the currently active entry's name.
+        # Populated by _load_providers_from_config(); never access the flat
+        # _provider/_model_name/_custom_base_url/_custom_api_key fields from
+        # before — use self._active_provider instead.
+        self._providers: list[dict] = []
+        self._active_provider_name: str = ""
+        self._load_providers_from_config()
+
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
         self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
         self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
@@ -199,12 +221,10 @@ class AgentManager:
             self._threads_dir, config_manager, secrets_manager
         )
 
-        # Cache one runner per (provider, model, image-model, base-url, mcp-set); rebuild when any changes.
+        # Cache one runner per (provider-type, model, image-model, base-url, mcp-set).
         self._runner_cache: dict[tuple[str, str, str, str, tuple[str, ...]], PydanticAgentRunner] = {}
 
-        # Cancel handles for in-flight runs, keyed by thread_id. A CancelAgentRequest
-        # signals the event; the run races it and unwinds. Populated for the duration
-        # of each run only.
+        # Cancel handles for in-flight runs, keyed by thread_id.
         self._active_runs: dict[str, _ActiveRun] = {}
 
         if event_manager is not None:
@@ -214,7 +234,6 @@ class AgentManager:
             event_manager.assign_manager_to_request_type(
                 GetConversationMemoryRequest, self.on_handle_get_conversation_memory_request
             )
-
             event_manager.assign_manager_to_request_type(CreateThreadRequest, self.on_handle_create_thread_request)
             event_manager.assign_manager_to_request_type(ListThreadsRequest, self.on_handle_list_threads_request)
             event_manager.assign_manager_to_request_type(DeleteThreadRequest, self.on_handle_delete_thread_request)
@@ -230,7 +249,21 @@ class AgentManager:
             event_manager.assign_manager_to_request_type(
                 ListProviderModelsRequest, self.on_handle_list_provider_models_request
             )
-
+            event_manager.assign_manager_to_request_type(
+                ListAgentProvidersRequest, self.on_handle_list_agent_providers_request
+            )
+            event_manager.assign_manager_to_request_type(
+                CreateAgentProviderRequest, self.on_handle_create_agent_provider_request
+            )
+            event_manager.assign_manager_to_request_type(
+                UpdateAgentProviderRequest, self.on_handle_update_agent_provider_request
+            )
+            event_manager.assign_manager_to_request_type(
+                DeleteAgentProviderRequest, self.on_handle_delete_agent_provider_request
+            )
+            event_manager.assign_manager_to_request_type(
+                SetActiveProviderRequest, self.on_handle_set_active_provider_request
+            )
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
@@ -245,12 +278,27 @@ class AgentManager:
         self._mcp_server_port = sock.getsockname()[1]
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
 
+    @property
+    def _active_provider(self) -> dict:
+        """Return the active provider dict from self._providers."""
+        for p in self._providers:
+            if p.get("name") == self._active_provider_name:
+                return p
+        if self._providers:
+            return self._providers[0]
+        default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
+        return {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": default_model}
+
     def _on_config_changed(self, event: ConfigChanged) -> None:
-        if event.key not in ("agent.system_prompt", "agent", ""):
+        _provider_keys = ("agent.providers", "agent.active_provider", "agent.griptape_cloud_model", "agent", "")
+        if event.key not in ("agent.system_prompt", *_provider_keys):
             return
         new_value = config_manager.get_config_value("agent.system_prompt", default="")
         if new_value != self._system_prompt_extra:
             self._system_prompt_extra = new_value
+            self._runner_cache.clear()
+        if event.key in _provider_keys:
+            self._load_providers_from_config()
             self._runner_cache.clear()
 
     async def on_handle_run_agent_request(self, request: RunAgentRequest) -> ResultPayload:
@@ -470,6 +518,7 @@ class AgentManager:
                     self._image_model_name = new_image_model
                     changed = True
             if changed:
+                self._persist_providers()
                 self._runner_cache.clear()
         except Exception as e:
             details = f"Error configuring agent: {e}"
@@ -478,28 +527,21 @@ class AgentManager:
         return ConfigureAgentResultSuccess(result_details="Agent configured successfully.")
 
     def _apply_prompt_driver_config(self, pd: dict) -> bool:
-        """Apply prompt driver config fields, return True if any value changed."""
+        """Apply prompt driver config fields to the active provider, return True if any value changed."""
+        active = self._active_provider
         changed = False
-        if "provider" in pd:
-            new_value = str(pd["provider"])
-            if new_value != self._provider:
-                self._provider = new_value
-                changed = True
-        if "model" in pd:
-            new_value = str(pd["model"])
-            if new_value != self._model_name:
-                self._model_name = new_value
-                changed = True
-        if "base_url" in pd:
-            new_value = str(pd["base_url"])
-            if new_value != self._custom_base_url:
-                self._custom_base_url = new_value
-                changed = True
-        if "api_key" in pd:
-            new_value = str(pd["api_key"])
-            if new_value != self._custom_api_key:
-                self._custom_api_key = new_value
-                changed = True
+        # "provider" in the legacy request maps to "type" in the provider dict.
+        for req_key, dict_key in (
+            ("provider", "type"),
+            ("model", "model"),
+            ("base_url", "base_url"),
+            ("api_key", "api_key"),
+        ):
+            if req_key in pd:
+                new_value = str(pd[req_key])
+                if active.get(dict_key) != new_value:
+                    active[dict_key] = new_value
+                    changed = True
         return changed
 
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
@@ -512,11 +554,12 @@ class AgentManager:
         )
 
     def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
+        active = self._active_provider
         return GetAgentConfigResultSuccess(
-            provider=self._provider,
-            model_name=self._model_name,
+            provider=str(active.get("type", _PROTECTED_PROVIDER_NAME)),
+            model_name=str(active.get("model", "")),
             image_model_name=self._image_model_name,
-            base_url=self._custom_base_url,
+            base_url=str(active.get("base_url", "")),
             result_details="Agent config retrieved successfully.",
         )
 
@@ -568,11 +611,17 @@ class AgentManager:
             return GetConversationMemoryResultFailure(result_details=details)
 
     def _build_runner(self, additional_mcp_servers: list[str]) -> PydanticAgentRunner:
+        active = self._active_provider
+        provider_type = str(active.get("type", _PROTECTED_PROVIDER_NAME))
+        model_name = str(active.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"))
+        base_url = str(active.get("base_url", ""))
+        api_key = str(active.get("api_key", ""))
+
         cache_key = (
-            self._provider,
-            self._model_name,
+            provider_type,
+            model_name,
             self._image_model_name,
-            self._custom_base_url,
+            base_url,
             tuple(sorted(additional_mcp_servers)),
         )
         if (cached := self._runner_cache.get(cache_key)) is not None:
@@ -594,7 +643,7 @@ class AgentManager:
             if isinstance(rules, str) and rules.strip():
                 server_rules.append(f"Rules for MCP server '{cfg['name']}':\n{rules.strip()}")
 
-        if self._provider == "griptape_cloud":
+        if provider_type == _PROTECTED_PROVIDER_NAME:
             api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
             if not api_key:
                 msg = f"Secret '{API_KEY_ENV_VAR}' not found"
@@ -608,14 +657,13 @@ class AgentManager:
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
             )
         else:
-            api_key = self._custom_api_key
-            model_base_url = self._custom_base_url or None
+            model_base_url = base_url or None
             # Image generation is Griptape Cloud-specific; disable for other providers.
             image_config = None
 
         runner = PydanticAgentRunner(
-            model_name=self._model_name,
-            provider=self._provider,
+            model_name=model_name,
+            provider=provider_type,
             api_key=api_key,
             base_url=model_base_url,
             workspace_root=workspace_root,
@@ -629,6 +677,150 @@ class AgentManager:
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
+        return ListAgentProvidersResultSuccess(
+            providers=list(self._providers),
+            active_provider=self._active_provider_name,
+            result_details="Providers retrieved successfully.",
+        )
+
+    def on_handle_create_agent_provider_request(self, request: CreateAgentProviderRequest) -> ResultPayload:
+        name = str(request.provider.get("name", "")).strip()
+        if not name:
+            return CreateAgentProviderResultFailure(
+                result_details="Attempted to create provider. Failed because 'name' is required."
+            )
+        provider_type = str(request.provider.get("type", ""))
+        if provider_type not in _VALID_PROVIDER_TYPES:
+            return CreateAgentProviderResultFailure(
+                result_details=f"Attempted to create provider '{name}'. Failed because type '{provider_type}' is not a known preset id."
+            )
+        if any(p.get("name") == name for p in self._providers):
+            return CreateAgentProviderResultFailure(
+                result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
+            )
+        self._providers.append(dict(request.provider))
+        self._persist_providers()
+        self._runner_cache.clear()
+        return CreateAgentProviderResultSuccess(name=name, result_details=f"Provider '{name}' created successfully.")
+
+    def on_handle_update_agent_provider_request(self, request: UpdateAgentProviderRequest) -> ResultPayload:
+        existing = next((p for p in self._providers if p.get("name") == request.name), None)
+        if existing is None:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because it does not exist."
+            )
+        if "type" in request.provider and str(request.provider["type"]) not in _VALID_PROVIDER_TYPES:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
+            )
+        existing.update(request.provider)
+        existing["name"] = request.name  # name is the stable key — never allow rename via update
+        self._persist_providers()
+        self._runner_cache.clear()
+        return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
+
+    def on_handle_delete_agent_provider_request(self, request: DeleteAgentProviderRequest) -> ResultPayload:
+        if request.name == _PROTECTED_PROVIDER_NAME:
+            return DeleteAgentProviderResultFailure(
+                result_details=f"Attempted to delete provider '{request.name}'. Failed because it is a protected provider."
+            )
+        idx = next((i for i, p in enumerate(self._providers) if p.get("name") == request.name), None)
+        if idx is None:
+            return DeleteAgentProviderResultFailure(
+                result_details=f"Attempted to delete provider '{request.name}'. Failed because it does not exist."
+            )
+        if len(self._providers) <= 1:
+            return DeleteAgentProviderResultFailure(
+                result_details=f"Attempted to delete provider '{request.name}'. Failed because it is the last remaining provider."
+            )
+        self._providers.pop(idx)
+        if self._active_provider_name == request.name:
+            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
+        self._persist_providers()
+        self._runner_cache.clear()
+        return DeleteAgentProviderResultSuccess(
+            name=request.name, result_details=f"Provider '{request.name}' deleted successfully."
+        )
+
+    def on_handle_set_active_provider_request(self, request: SetActiveProviderRequest) -> ResultPayload:
+        if not any(p.get("name") == request.name for p in self._providers):
+            return SetActiveProviderResultFailure(
+                result_details=f"Attempted to set active provider to '{request.name}'. Failed because it does not exist."
+            )
+        if self._active_provider_name != request.name:
+            self._active_provider_name = request.name
+            self._persist_providers()
+            self._runner_cache.clear()
+        return SetActiveProviderResultSuccess(
+            name=request.name, result_details=f"Active provider set to '{request.name}'."
+        )
+
+    def _load_providers_from_config(self) -> None:
+        """Load providers list and active provider from config, with legacy migration.
+
+        The griptape_cloud provider is always synthesized — it never needs to appear
+        in the config file. Its model override lives in agent.griptape_cloud_model.
+        """
+        default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
+        gc_model = str(config_manager.get_config_value("agent.griptape_cloud_model") or default_model)
+        gc_provider: dict = {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": gc_model}
+
+        raw_providers = config_manager.get_config_value("agent.providers")
+        if isinstance(raw_providers, list):
+            # Strip any griptape_cloud entry — it is always synthesized above.
+            user_providers = [p for p in raw_providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
+            self._providers = [gc_provider, *user_providers]
+        else:
+            self._providers = [gc_provider, *self._migrate_legacy_user_providers()]
+
+        raw_active = config_manager.get_config_value("agent.active_provider")
+        provider_names = {p.get("name") for p in self._providers}
+        if raw_active and raw_active in provider_names:
+            self._active_provider_name = str(raw_active)
+        else:
+            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
+
+    def _migrate_legacy_user_providers(self) -> list[dict]:
+        """Return user-defined providers migrated from the old flat agent.provider config.
+
+        Returns only non-griptape_cloud entries; gc is always synthesized separately.
+        """
+        legacy = config_manager.get_config_value("agent.provider") or {}
+        if isinstance(legacy, str):
+            legacy = {"id": legacy}
+        if not isinstance(legacy, dict) or not legacy:
+            return []
+        type_id = str(legacy.get("id", _PROTECTED_PROVIDER_NAME))
+        if type_id == _PROTECTED_PROVIDER_NAME:
+            return []
+        default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
+        # agent.model was a sibling key some users set intuitively; fall back to it
+        # before the catalog default so the migration preserves their intent.
+        model = str(legacy.get("model") or config_manager.get_config_value("agent.model") or default_model)
+        migrated: dict = {"name": type_id, "type": type_id, "model": model}
+        if "base_url" in legacy:
+            migrated["base_url"] = legacy["base_url"]
+        if "api_key" in legacy:
+            migrated["api_key"] = legacy["api_key"]
+        return [migrated]
+
+    def _persist_providers(self) -> None:
+        """Write provider state to config.
+
+        The griptape_cloud entry is never written to agent.providers — it is always
+        synthesized on load. Its model override (when changed from default) is stored
+        separately under agent.griptape_cloud_model.
+        """
+        user_providers = [p for p in self._providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
+        config_manager.set_config_value("agent.providers", user_providers)
+        config_manager.set_config_value("agent.active_provider", self._active_provider_name)
+
+        gc = next((p for p in self._providers if p.get("name") == _PROTECTED_PROVIDER_NAME), None)
+        default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
+        if gc and gc.get("model") != default_model:
+            config_manager.set_config_value("agent.griptape_cloud_model", gc.get("model"))
 
     def _compose_instructions(self, server_rules: list[str]) -> str:
         """Compose the instructions string from base rules and per-MCP-server rules.
