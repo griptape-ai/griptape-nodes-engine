@@ -2659,6 +2659,83 @@ class TestResolveWorkspaceDirForProjectId:
         assert isinstance(recorded, LoadProjectTemplateResultFailure)
 
 
+class TestOnResolveProjectWorkspaceRequest(TestResolveWorkspaceDirForProjectId):
+    """on_resolve_project_workspace_request wraps resolve_workspace_dir_for_project_id as an event.
+
+    Reuses the disk/config modeling from TestResolveWorkspaceDirForProjectId so the handler is tested
+    against the real resolver, not a stub.
+    """
+
+    @pytest.mark.asyncio
+    async def test_resolves_fallback_workspace_for_undeclared_project(self, tmp_path: Path) -> None:
+        """A project with no declared workspace_dir resolves to the fallback ladder value (success)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectWorkspaceRequest,
+            ResolveProjectWorkspaceResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.on_resolve_project_workspace_request(ResolveProjectWorkspaceRequest(project_id="C"))
+
+        assert isinstance(result, ResolveProjectWorkspaceResultSuccess)
+        assert result.workspace_dir == str(self._resolved("/global/ws"))
+
+    @pytest.mark.asyncio
+    async def test_declared_workspace_dir_flows_through_handler(self, tmp_path: Path) -> None:
+        """A declared workspace_dir (branch 0) is the resolved value the handler returns."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectWorkspaceRequest,
+            ResolveProjectWorkspaceResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        declared = tmp_path / "declared-ws"
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "workspace_dir": str(declared), "config": {}}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.on_resolve_project_workspace_request(ResolveProjectWorkspaceRequest(project_id="C"))
+
+        assert isinstance(result, ResolveProjectWorkspaceResultSuccess)
+        assert result.workspace_dir == str(declared.expanduser().resolve())
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_id_returns_success_with_none(self, tmp_path: Path) -> None:
+        """An id that maps to no readable file is a success carrying workspace_dir=None (no hint)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectWorkspaceRequest,
+            ResolveProjectWorkspaceResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.on_resolve_project_workspace_request(
+            ResolveProjectWorkspaceRequest(project_id="does-not-exist")
+        )
+
+        assert isinstance(result, ResolveProjectWorkspaceResultSuccess)
+        assert result.workspace_dir is None
+
+
 class TestProjectManagerProjectWorkspaces:
     """Test ProjectManager project_workspaces lookup in on_set_current_project_request."""
 

@@ -83,6 +83,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     MacroPath,
     PathResolutionFailureReason,
     ProjectTemplateInfo,
+    ResolveProjectWorkspaceRequest,
+    ResolveProjectWorkspaceResultSuccess,
     SaveProjectTemplateRequest,
     SaveProjectTemplateResultFailure,
     SaveProjectTemplateResultSuccess,
@@ -444,6 +446,9 @@ class ProjectManager:
         # Register event handlers
         event_manager.assign_manager_to_request_type(LoadProjectTemplateRequest, self.on_load_project_template_request)
         event_manager.assign_manager_to_request_type(GetProjectTemplateRequest, self.on_get_project_template_request)
+        event_manager.assign_manager_to_request_type(
+            ResolveProjectWorkspaceRequest, self.on_resolve_project_workspace_request
+        )
         event_manager.assign_manager_to_request_type(
             ListProjectTemplatesRequest, self.on_list_project_templates_request
         )
@@ -886,6 +891,21 @@ class ProjectManager:
             template=project_info.template,
             validation=project_info.validation,
             result_details=f"Successfully retrieved project template for '{request.project_id}'. Status: {project_info.validation.status}",
+        )
+
+    async def on_resolve_project_workspace_request(
+        self, request: ResolveProjectWorkspaceRequest
+    ) -> ResolveProjectWorkspaceResultSuccess:
+        """Resolve the workspace dir a project would use, without loading or activating it.
+
+        A None resolution (the id maps to no readable project file) is a success carrying
+        workspace_dir=None, matching resolve_workspace_dir_for_project_id's "nothing to resolve"
+        contract; the GUI treats null as "no hint to show".
+        """
+        resolved = await self.resolve_workspace_dir_for_project_id(request.project_id)
+        return ResolveProjectWorkspaceResultSuccess(
+            workspace_dir=str(resolved) if resolved is not None else None,
+            result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
         )
 
     def on_list_project_templates_request(
