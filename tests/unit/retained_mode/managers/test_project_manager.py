@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -1034,6 +1034,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ContextManager()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
             mock_gn.ContextManager.return_value = mock_context
@@ -1086,6 +1087,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
             mock_gn.ContextManager.return_value = mock_context
@@ -1154,6 +1156,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
             mock_gn.ContextManager.return_value = mock_context
@@ -1206,6 +1209,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
             mock_gn.ContextManager.return_value = mock_context
@@ -1256,6 +1260,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
             mock_gn.ContextManager.return_value = mock_context
@@ -1318,6 +1323,7 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
 
         # Mock GriptapeNodes - workflow_name will fail because no workflow
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = str(project_base)
             mock_config.workspace_path = project_base
@@ -1435,6 +1441,51 @@ situations:
 
         assert pm._current_project_id == str(workspace_project_path)
         assert str(workspace_project_path) in pm._successfully_loaded_project_templates
+
+    @pytest.mark.asyncio
+    async def test_load_project_denied_by_policy_is_not_cached(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A LoadProject denial blocks the load: the project is not cached as usable."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+        project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        project_path.write_text(self.VALID_PROJECT_YAML)
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            # Gate only the load; resolved facts (id + name) must be present even
+            # though the project is not cached yet.
+            if checkpoint.action == "LoadProject":
+                seen["subject_id"] = checkpoint.subject_id
+                seen["name"] = checkpoint.attributes.get("name")
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to grant this project."),))
+            return None
+
+        event_manager = GriptapeNodes.EventManager()
+        event_manager.add_authorization_hook(deny)
+        try:
+            with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+                mock_file_instance = Mock()
+                mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+                mock_file_cls.return_value = mock_file_instance
+                result = await pm._load_and_cache_project_template(project_path, persist_path=False)
+        finally:
+            event_manager.remove_authorization_hook(deny)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert "Ask your admin to grant this project." in str(result.result_details)
+        # The denied project is never cached as usable.
+        assert str(project_path) not in pm._successfully_loaded_project_templates
+        # The gate resolved the project's name from the in-hand template, not the cache.
+        assert seen["name"] == "Workspace Project"
 
     @pytest.mark.asyncio
     async def test_load_workspace_project_merges_with_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -1779,12 +1830,144 @@ class TestDecideWorkspace:
         mock_config.get_config_value.return_value = project_workspaces
         return ProjectManager(Mock(), mock_config, Mock())
 
+    @staticmethod
+    def _pm_with_config(
+        project_workspaces: dict[str, str],
+        configured_root: str | None,
+        default_root: str | None = None,
+    ) -> ProjectManager:
+        """Build a ProjectManager whose config distinguishes the branch-4 reads.
+
+        The single-return _pm_with_project_workspaces helper can't tell apart the
+        project_workspaces lookup from the configured-root workspace_directory reads (user_config
+        then default_config), which the inheritance branch needs. This keys the mock on
+        (key, config_source) instead. `configured_root` is the user_config layer value;
+        `default_root` is the default_config fallback the branch reads when user_config is None
+        (in production this is always populated by the Settings default).
+        """
+        mock_config = Mock()
+
+        def fake_get(key: str, *, config_source: str = "merged_config", default: Any = None, **_: Any) -> Any:
+            if key == "project_workspaces":
+                return project_workspaces
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            if key == "workspace_directory" and config_source == "default_config":
+                return default_root
+            return default
+
+        mock_config.get_config_value.side_effect = fake_get
+        return ProjectManager(Mock(), mock_config, Mock())
+
+    @staticmethod
+    def _pm_with_chain(
+        specs: list[dict[str, Any]],
+        *,
+        project_workspaces: dict[str, str] | None = None,
+        configured_root: str | None = None,
+        default_root: str | None = None,
+    ) -> ProjectManager:
+        """Build a ProjectManager whose registry models an explicit parent chain.
+
+        Each spec is a dict with keys `id` (registry key / parent link target),
+        `file` (Path to the project YAML, or None for a file-less project like system
+        defaults), `parent_id` (the spec's parent_project_id, or None), and an optional
+        `config` dict standing in for that project's adjacent griptape_nodes_config.json.
+        The mock `read_config_file` returns a spec's `config` keyed on the directory of
+        its file; `get_config_value` resolves project_workspaces and the global
+        workspace_directory (user_config then default_config) so the branch-4 walk and
+        branch-5 fallback both have realistic inputs.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        project_workspaces = project_workspaces or {}
+        mock_config = Mock()
+
+        def fake_get(key: str, *, config_source: str = "merged_config", default: Any = None, **_: Any) -> Any:
+            if key == "project_workspaces":
+                return project_workspaces
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            if key == "workspace_directory" and config_source == "default_config":
+                return default_root
+            return default
+
+        mock_config.get_config_value.side_effect = fake_get
+
+        dir_to_config: dict[Path, dict] = {
+            Path(spec["file"]).parent: spec["config"]
+            for spec in specs
+            if spec.get("file") is not None and "config" in spec
+        }
+
+        def fake_read_config_file(path: Path) -> dict:
+            return dir_to_config.get(Path(path).parent, {})
+
+        mock_config.read_config_file.side_effect = fake_read_config_file
+
+        pm = ProjectManager(Mock(), mock_config, Mock())
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        for spec in specs:
+            file_path = spec.get("file")
+            base_dir = Path(file_path).parent if file_path is not None else Path("/")
+            template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": spec.get("parent_id")})
+            pm._successfully_loaded_project_templates[spec["id"]] = ProjectInfo(
+                project_id=spec["id"],
+                project_file_path=Path(file_path) if file_path is not None else None,
+                project_base_dir=base_dir,
+                template=template,
+                validation=validation,
+                parsed_situation_schemas={},
+                parsed_directory_schemas={},
+            )
+        return pm
+
     def test_project_workspaces_override_wins(self, tmp_path: Path) -> None:
         project_file = tmp_path / "project.yml"
         project_file.touch()
         mapped_workspace = tmp_path / "mapped"
 
         pm = self._pm_with_project_workspaces({str(project_file): str(mapped_workspace)})
+        decision = pm.decide_workspace(
+            project_file,
+            project_config={"workspace_directory": "/ignored/project"},
+            env_config={"workspace_directory": "/ignored/env"},
+        )
+
+        assert decision.workspace_dir == Path(str(mapped_workspace))
+        assert decision.apply_override is True
+
+    def test_project_workspaces_override_by_id_wins(self, tmp_path: Path) -> None:
+        """A project_workspaces key may be the project's opaque ID, not just its path."""
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        mapped_workspace = tmp_path / "mapped"
+
+        pm = self._pm_with_chain(
+            [{"id": "my-guid", "file": project_file, "parent_id": None}],
+            project_workspaces={"my-guid": str(mapped_workspace)},
+        )
+        decision = pm.decide_workspace(
+            project_file,
+            project_config={"workspace_directory": "/ignored/project"},
+            env_config={"workspace_directory": "/ignored/env"},
+        )
+
+        assert decision.workspace_dir == Path(str(mapped_workspace))
+        assert decision.apply_override is True
+
+    def test_project_workspaces_unmatched_id_falls_back_to_path_key(self, tmp_path: Path) -> None:
+        """A key that is not a loaded ID is still honored as a project file path."""
+        project_file = tmp_path / "project.yml"
+        project_file.touch()
+        mapped_workspace = tmp_path / "mapped"
+
+        pm = self._pm_with_chain(
+            [{"id": "my-guid", "file": project_file, "parent_id": None}],
+            project_workspaces={str(project_file): str(mapped_workspace)},
+        )
         decision = pm.decide_workspace(
             project_file,
             project_config={"workspace_directory": "/ignored/project"},
@@ -1826,10 +2009,169 @@ class TestDecideWorkspace:
         project_file = tmp_path / "project.yml"
         project_file.touch()
 
-        pm = self._pm_with_project_workspaces({})
+        pm = self._pm_with_config(project_workspaces={}, configured_root=None)
         decision = pm.decide_workspace(project_file, project_config={}, env_config={})
 
         assert decision.workspace_dir == project_file.parent
+        assert decision.apply_override is True
+
+    def test_three_level_inherits_nearest_ancestor_workspace(self, tmp_path: Path) -> None:
+        """C inherits B's workspace when B (the nearest ancestor) defines one, not A's."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {"workspace_directory": "/ws/b"}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/ws/b")
+        assert decision.apply_override is True
+
+    def test_three_level_skips_to_grandparent_when_parent_has_none(self, tmp_path: Path) -> None:
+        """C inherits A's workspace when B (its parent) defines none but A does."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/ws/a")
+        assert decision.apply_override is True
+
+    def test_chain_exhausted_uses_global_default(self, tmp_path: Path) -> None:
+        """A project derived from the file-less default inherits the global workspace (Jason's case)."""
+        c_file = tmp_path / "test" / "griptape-nodes-project.yml"
+        c_file.parent.mkdir(parents=True)
+        c_file.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "<system-defaults>", "file": None, "parent_id": None},
+                {"id": "C", "file": c_file, "parent_id": "<system-defaults>", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_ancestor_override_mapping_wins(self, tmp_path: Path) -> None:
+        """An ancestor keyed in project_workspaces is inherited over its adjacent config."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "C", "file": c_file, "parent_id": "A", "config": {}},
+            ],
+            project_workspaces={str(a_file): "/mapped/a"},
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/mapped/a")
+        assert decision.apply_override is True
+
+    def test_start_project_sidecar_still_wins(self, tmp_path: Path) -> None:
+        """C's own project-adjacent workspace_directory (branch 3) wins and the walk never runs."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "C", "file": c_file, "parent_id": "A", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(
+            c_file,
+            project_config={"workspace_directory": "/explicit/ws"},
+            env_config={},
+        )
+
+        assert decision.workspace_dir == Path("/explicit/ws")
+        assert decision.apply_override is False
+
+    def test_imported_standalone_uses_global_default(self, tmp_path: Path) -> None:
+        """A parentless project outside the configured root adopts the global workspace, not its own dir."""
+        other_dir = tmp_path / "other"
+        other_dir.mkdir()
+        project_file = other_dir / "griptape-nodes-project.yml"
+        project_file.touch()
+
+        pm = self._pm_with_chain(
+            [{"id": "C", "file": project_file, "parent_id": None, "config": {}}],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(project_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_cyclic_chain_falls_back_to_global_default(self, tmp_path: Path) -> None:
+        """A cyclic parent chain terminates via the visited set and falls back to the global default."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": "B", "config": {}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(a_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path("/global/ws")
+        assert decision.apply_override is True
+
+    def test_global_default_unset_falls_back_to_own_dir(self, tmp_path: Path) -> None:
+        """Chain exhausted AND workspace_directory unset in both layers falls back to the project's own dir."""
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        c_file.parent.mkdir(parents=True)
+        c_file.touch()
+
+        pm = self._pm_with_chain(
+            [{"id": "C", "file": c_file, "parent_id": None, "config": {}}],
+            configured_root=None,
+            default_root=None,
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == c_file.parent
         assert decision.apply_override is True
 
 
@@ -1861,6 +2203,8 @@ class TestProjectManagerProjectWorkspaces:
             if key == LIBRARIES_TO_DOWNLOAD_KEY:
                 return []
             if key == REQUIRES_ENGINE_KEY:
+                return None
+            if key == "workspace_directory":
                 return None
             return default if default is not None else {}
 
@@ -2120,6 +2464,8 @@ class TestProjectManagerProjectWorkspaces:
                 return []
             if key == REQUIRES_ENGINE_KEY:
                 return None
+            if key == "workspace_directory":
+                return None
             return default if default is not None else {}
 
         mock_config = Mock()
@@ -2147,6 +2493,7 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = Mock()
 
@@ -2192,6 +2539,7 @@ class TestProjectManagerProjectWorkspaces:
         pm._initialization_complete = True
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
 
@@ -2219,6 +2567,7 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
             mock_gn.ahandle_request.assert_not_called()
@@ -2251,6 +2600,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_workflow_manager = Mock()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = mock_workflow_manager
 
@@ -2292,6 +2642,7 @@ class TestProjectManagerProjectWorkspaces:
 
         mock_workflow_manager = Mock()
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
             mock_gn.WorkflowManager.return_value = mock_workflow_manager
 
@@ -2336,6 +2687,7 @@ class TestProjectManagerProjectWorkspaces:
         )
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReloadAllLibrariesResultFailure(result_details="reload failed")
             )
@@ -2471,6 +2823,7 @@ class TestRegisterProjectPath:
         project_id = "/path/to/project.yml"
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = [project_id]
             mock_gn.ConfigManager.return_value = mock_config
@@ -2482,6 +2835,7 @@ class TestRegisterProjectPath:
     def test_register_exception_is_swallowed(self, pm: ProjectManager) -> None:
         """A config manager exception does not propagate out of _register_project_path."""
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.side_effect = RuntimeError("config failure")
             mock_gn.ConfigManager.return_value = mock_config
@@ -2518,6 +2872,7 @@ situations:
     async def test_empty_list_does_nothing(self, pm: ProjectManager) -> None:
         """An empty projects_to_register list results in no load attempts."""
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = []
             mock_gn.ConfigManager.return_value = mock_config
@@ -2530,6 +2885,7 @@ situations:
     async def test_none_config_return_does_nothing(self, pm: ProjectManager) -> None:
         """None from config (treated as empty via 'or []') results in no load attempts."""
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = None
             mock_gn.ConfigManager.return_value = mock_config
@@ -2561,6 +2917,7 @@ situations:
         pm._successfully_loaded_project_templates[existing_path] = project_info
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = [existing_path]
             mock_gn.ConfigManager.return_value = mock_config
@@ -2586,6 +2943,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
@@ -2627,6 +2985,7 @@ situations:
             patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
             patch.object(pm, "_register_project_path") as mock_register,
         ):
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
@@ -2720,6 +3079,7 @@ situations:
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
@@ -2900,6 +3260,7 @@ situations:
         absolute_path = (tmp_path / "project.yml").resolve()
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
@@ -2964,6 +3325,7 @@ situations:
         tilde_path = Path("~/project.yml")
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
@@ -3225,6 +3587,7 @@ class TestProjectEnvironmentVariableRecursion:
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_name}_suffix"})
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
             mock_gn.ContextManager.return_value = mock_context
@@ -3244,6 +3607,7 @@ class TestProjectEnvironmentVariableRecursion:
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
             mock_gn.ContextManager.return_value = mock_context
@@ -3263,6 +3627,7 @@ class TestProjectEnvironmentVariableRecursion:
             directories={"inputs": "{workflow_dir}/inputs"},
         )
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
             mock_gn.ContextManager.return_value = mock_context
@@ -3285,6 +3650,7 @@ class TestProjectEnvironmentVariableRecursion:
             patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
             patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_registry,
         ):
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = True
             mock_context.get_current_workflow_name.return_value = "my_workflow"
@@ -3307,6 +3673,7 @@ class TestProjectEnvironmentVariableRecursion:
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_dir?:/}sub"})
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
             mock_gn.ContextManager.return_value = mock_context
@@ -3712,6 +4079,7 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.replace('parent_project_path: "{parent}"\n', "").format(),
         }
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -3737,6 +4105,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -3768,6 +4137,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=grandchild_path))
 
@@ -3796,6 +4166,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -3814,6 +4185,7 @@ directories:
         files = {self_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=self_path.as_posix())}
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=self_path))
 
@@ -3836,6 +4208,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
@@ -3855,6 +4228,7 @@ directories:
         files = {child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=missing_parent.as_posix())}
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -3891,6 +4265,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -3927,6 +4302,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             base_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=base_path))
             child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
@@ -3965,6 +4341,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=base_path))
             child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
@@ -3994,6 +4371,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -4044,6 +4422,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=grandchild_path))
 
@@ -4094,6 +4473,7 @@ file_extension_directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -4123,6 +4503,7 @@ file_extension_directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             a_result = await pm.on_load_project_template_request(
                 LoadProjectTemplateRequest(project_path=sibling_a_path)
@@ -4155,6 +4536,7 @@ file_extension_directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
@@ -4177,6 +4559,7 @@ file_extension_directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
@@ -4201,6 +4584,12 @@ directories:
   outputs:
     path_macro: "outputs2"
 """
+
+    # Description that `outputs` carries via DEFAULT_PROJECT_TEMPLATE -> parent merge.
+    # Tests that hand-build a child's `outputs` directory must include this so the
+    # child matches the parent's merged value field-for-field; otherwise per-item
+    # atomic diff treats the child as divergent on `description`.
+    BASE_PARENT_OUTPUTS_DESCRIPTION = "Files generated by nodes during workflow execution."
 
     @pytest.fixture
     def pm(self, tmp_path: Path) -> ProjectManager:
@@ -4262,6 +4651,7 @@ directories:
 
         files = {parent_path: parent_yaml}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -4309,7 +4699,11 @@ directories:
             "parent_project_path": str(parent_path),
             "situations": {},
             "directories": {
-                "outputs": {"name": "outputs", "path_macro": "outputs2"},
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",
+                    "description": self.BASE_PARENT_OUTPUTS_DESCRIPTION,
+                },
             },
         }
         result = pm.on_save_project_template_request(
@@ -4366,7 +4760,11 @@ directories:
             "parent_project_path": str(parent_path),
             "situations": {},
             "directories": {
-                "outputs": {"name": "outputs", "path_macro": "outputs2"},  # inherited
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",
+                    "description": self.BASE_PARENT_OUTPUTS_DESCRIPTION,
+                },  # inherited
                 "scratch": {"name": "scratch", "path_macro": "scratch_dir"},  # new
             },
         }
@@ -4378,6 +4776,97 @@ directories:
         assert parsed["directories"]["scratch"]["path_macro"] == "scratch_dir"
         # Inherited `outputs` should not be re-emitted.
         assert "outputs" not in parsed["directories"]
+
+    @pytest.mark.asyncio
+    async def test_save_with_parent_emits_custom_directory_description(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A child that customizes only `description` (path inherited) must emit the directory."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            SaveProjectTemplateRequest,
+            SaveProjectTemplateResultSuccess,
+        )
+
+        parent_path = (tmp_path / "parent.yml").resolve()
+        await self._load_parent(pm, parent_path, self.BASE_PARENT_YAML)
+
+        child_path = tmp_path / "child.yml"
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "child",
+            "parent_project_path": str(parent_path),
+            "situations": {},
+            "directories": {
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",  # matches parent
+                    "description": "Renders ready for delivery.",  # diverges from parent
+                },
+            },
+        }
+        result = pm.on_save_project_template_request(
+            SaveProjectTemplateRequest(project_path=child_path, template_data=template_data)
+        )
+        assert isinstance(result, SaveProjectTemplateResultSuccess)
+        parsed = self._parse_yaml(child_path.read_text())
+        # Per-item atomic diff: when a directory differs at all, the full item is emitted.
+        assert parsed["directories"]["outputs"]["description"] == "Renders ready for delivery."
+        assert parsed["directories"]["outputs"]["path_macro"] == "outputs2"
+
+    @pytest.mark.asyncio
+    async def test_save_with_parent_clears_inherited_directory_description(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A child that clears an inherited directory description must round-trip the null."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SaveProjectTemplateRequest,
+            SaveProjectTemplateResultSuccess,
+        )
+
+        # Parent explicitly sets a description so the child can clear it.
+        parent_yaml = """\
+project_template_schema_version: "0.3.2"
+name: With Description
+directories:
+  outputs:
+    path_macro: "outputs2"
+    description: "Parent-level description."
+"""
+        parent_path = (tmp_path / "parent.yml").resolve()
+        await self._load_parent(pm, parent_path, parent_yaml)
+
+        child_path = tmp_path / "child.yml"
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "child",
+            "parent_project_path": str(parent_path),
+            "situations": {},
+            "directories": {
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",  # matches parent
+                    "description": None,  # explicit clear
+                },
+            },
+        }
+        result = pm.on_save_project_template_request(
+            SaveProjectTemplateRequest(project_path=child_path, template_data=template_data)
+        )
+        assert isinstance(result, SaveProjectTemplateResultSuccess)
+        parsed = self._parse_yaml(child_path.read_text())
+        # The description diverges from the parent's, so the directory is emitted with description: null.
+        assert parsed["directories"]["outputs"]["description"] is None
+
+        # Round-trip: reload the child and confirm the inherited description is cleared.
+        files = {parent_path: parent_yaml, child_path: child_path.read_text()}
+        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+            mock_gn.ahandle_request = self._file_router(files)
+            child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
+        assert isinstance(child_load, LoadProjectTemplateResultSuccess)
+        assert child_load.template.directories["outputs"].description is None
 
     @pytest.mark.asyncio
     async def test_save_with_parent_omits_inherited_situation(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -4540,7 +5029,11 @@ directories:
             "parent_project_path": "./parent.yml",
             "situations": {},
             "directories": {
-                "outputs": {"name": "outputs", "path_macro": "outputs2"},  # inherited
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",
+                    "description": self.BASE_PARENT_OUTPUTS_DESCRIPTION,
+                },  # inherited
             },
         }
         result = pm.on_save_project_template_request(
@@ -4576,6 +5069,7 @@ parent_project_path: "{grandparent_path.as_posix()}"
             parent_path: parent_yaml,
         }
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             gp_load = await pm.on_load_project_template_request(
                 LoadProjectTemplateRequest(project_path=grandparent_path)
@@ -4591,7 +5085,11 @@ parent_project_path: "{grandparent_path.as_posix()}"
             "parent_project_path": str(parent_path),
             "situations": {},
             "directories": {
-                "outputs": {"name": "outputs", "path_macro": "outputs2"},  # inherited transitively
+                "outputs": {
+                    "name": "outputs",
+                    "path_macro": "outputs2",
+                    "description": self.BASE_PARENT_OUTPUTS_DESCRIPTION,
+                },  # inherited transitively
             },
         }
         result = pm.on_save_project_template_request(
@@ -4797,6 +5295,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
@@ -4835,6 +5334,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
@@ -4932,6 +5432,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
@@ -5026,6 +5527,7 @@ directories:
         }
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -5058,6 +5560,7 @@ directories:
         files = {child_path: child_yaml}
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -5091,6 +5594,7 @@ directories:
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -5122,6 +5626,7 @@ directories:
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -5483,6 +5988,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
@@ -5508,6 +6014,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "legacy.yml").resolve()
         files = {project_path: self.LEGACY_NO_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
@@ -5528,6 +6035,7 @@ parent_project_id: "ghost-parent-id"
         path_b = (tmp_path / "b.yml").resolve()
         files = {path_a: self.EXPLICIT_ID_YAML, path_b: self.EXPLICIT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             first = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=path_a))
             second = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=path_b))
@@ -5552,6 +6060,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             first = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
             second = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
@@ -5726,6 +6235,7 @@ parent_project_id: "ghost-parent-id"
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
         assert isinstance(load, LoadProjectTemplateResultSuccess)
@@ -5762,6 +6272,7 @@ parent_project_id: "ghost-parent-id"
         child_path = (tmp_path / "child.yml").resolve()
         files = {parent_path: self.PARENT_WITH_ID_YAML, child_path: self.CHILD_BY_PARENT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             parent = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
             child = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
@@ -5787,6 +6298,7 @@ parent_project_id: "ghost-parent-id"
         child_path = (tmp_path / "orphan.yml").resolve()
         files = {child_path: self.CHILD_MISSING_PARENT_ID_YAML}
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -5812,6 +6324,7 @@ parent_project_id: "ghost-parent-id"
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
         with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
+            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
             mock_gn.ahandle_request = self._file_router(files)
             await pm._load_registered_projects()
 
@@ -5822,3 +6335,85 @@ parent_project_id: "ghost-parent-id"
         assert "shared_outputs" in child_info.template.directories
         # The transient boot index is cleared once loading finishes.
         assert pm._boot_id_to_file_path == {}
+
+
+class TestProjectActivationAuthorizationCheckpoint:
+    """The license-policy checkpoint wired into project activation."""
+
+    @pytest.fixture
+    def project_manager(self) -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_denied_activation_is_rejected_and_leaves_current_project(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=(CheckpointFailure(detail="Ask your admin to grant access to acme-prod."),)
+        )
+        # A denying activation must roll nowhere: _activate_project never runs.
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id="acme-prod")
+            )
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "acme-prod" in str(result.result_details)
+        assert "Ask your admin to grant access to acme-prod." in str(result.result_details)
+        assert project_manager._current_project_id == SYSTEM_DEFAULTS_KEY
+        activate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_empty_failure_denial_still_yields_a_reason(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        # A hook that misuses the contract by returning a denial with no failures
+        # (it should return None to allow) must still produce a reason, not an
+        # empty "Failed because: " tail.
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=()
+        )
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id="acme-prod")
+            )
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "Denied by the license policy." in str(result.result_details)
+        activate.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_system_defaults_bypasses_checkpoint(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import _ProjectActivationOutcome
+
+        outcome = _ProjectActivationOutcome(failure=None, workspace_changed=False)
+        with patch.object(project_manager, "_activate_project", new=AsyncMock(return_value=outcome)):
+            result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
+
+        assert isinstance(result, SetCurrentProjectResultSuccess)
+        # The rest state is always allowed; the checkpoint is never consulted.
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.assert_not_called()

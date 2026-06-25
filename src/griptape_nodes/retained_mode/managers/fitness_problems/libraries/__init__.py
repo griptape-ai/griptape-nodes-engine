@@ -27,7 +27,9 @@ from .modified_parameters_set_removed_problem import ModifiedParametersSetRemove
 from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
 from .node_class_not_found_problem import NodeClassNotFoundProblem
 from .node_module_import_problem import NodeModuleImportProblem
+from .node_permission_denied_problem import NodePermissionDeniedProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
+from .permission_denied_problem import PermissionDeniedProblem
 from .pre_dispatch_hook_registration_problem import PreDispatchHookRegistrationProblem
 from .request_handler_registration_problem import RequestHandlerRegistrationProblem
 from .request_handlers_worker_incompatible_problem import RequestHandlersWorkerIncompatibleProblem
@@ -68,7 +70,9 @@ __all__ = [
     "NodeClassNotBaseNodeProblem",
     "NodeClassNotFoundProblem",
     "NodeModuleImportProblem",
+    "NodePermissionDeniedProblem",
     "OldXdgLocationWarningProblem",
+    "PermissionDeniedProblem",
     "PreDispatchHookRegistrationProblem",
     "RequestHandlerRegistrationProblem",
     "RequestHandlersWorkerIncompatibleProblem",

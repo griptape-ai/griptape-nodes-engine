@@ -78,7 +78,20 @@ Zero-pads the value to the specified width. The variable must hold an integer va
 {_index:04}   with _index = 12  → "0012"
 ```
 
-Used with `?` for auto-incrementing filenames: `{_index?:03}` is absent on the first save, then becomes `001`, `002`, and so on as needed.
+Used for auto-incrementing filenames under the `create_new` collision policy. Numeric padding (`:NN`) on a single unresolved variable is the opt-in: the first save lands at index `1` (or omitted, for the optional form), and subsequent saves walk forward against the same template — the padding format is preserved across the whole sequence.
+
+- **Optional form** `{_index?:03}` — absent on the first save, then `_001`, `_002`, … on collision (padded width preserved).
+- **Required form** `{_index:03}` — present from the first save: `_001`, `_002`, `_003`, … with consistent zero-padded width across the whole sequence.
+
+```
+Template: {file_name_base}_v{_index:03}.{file_extension}
+
+  Save #1 → render_v001.png
+  Save #2 → render_v002.png
+  Save #3 → render_v003.png
+```
+
+The variable name does not need to be `_index`; any single unresolved required variable with `:NN` padding will be auto-allocated. Without padding, an unresolved required variable is treated as a missing binding (a configuration error) and the save fails — this prevents `{shot}` from silently being filled with `1, 2, 3, …` when the user forgot to wire it up.
 
 ### String transformations
 
