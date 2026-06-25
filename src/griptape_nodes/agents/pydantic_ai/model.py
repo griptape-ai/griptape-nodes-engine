@@ -17,7 +17,10 @@ import os
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from griptape_nodes.drivers.cloud_models import LM_STUDIO_DEFAULT_BASE_URL, OLLAMA_DEFAULT_BASE_URL
+from griptape_nodes.drivers.cloud_models import (
+    LM_STUDIO_DEFAULT_BASE_URL,
+    OLLAMA_DEFAULT_BASE_URL,
+)
 
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
 """Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
