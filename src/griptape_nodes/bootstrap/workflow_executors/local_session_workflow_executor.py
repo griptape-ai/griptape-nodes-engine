@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSenderMixin):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         session_id: str,
         storage_backend: StorageBackend = StorageBackend.LOCAL,
