@@ -42,15 +42,20 @@ class TestComposeInstructions:
     """Per-MCP-server `rules` are folded into the instructions string, not dropped."""
 
     def test_no_rules_returns_base_instructions(self, agent_manager: AgentManager) -> None:
-        agent_manager._instructions = "BASE"
-        assert agent_manager._compose_instructions([]) == "BASE"
+        result = agent_manager._compose_instructions([], include_image_tool=False)
+        assert "GriptapeNodes" in result
+        assert "generate_image" not in result
+
+    def test_image_tool_included_when_requested(self, agent_manager: AgentManager) -> None:
+        result = agent_manager._compose_instructions([], include_image_tool=True)
+        assert "generate_image" in result
 
     def test_rules_are_appended_to_base_instructions(self, agent_manager: AgentManager) -> None:
-        agent_manager._instructions = "BASE"
         composed = agent_manager._compose_instructions(
-            ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"]
+            ["Rules for MCP server 'a':\nbe terse", "Rules for MCP server 'b':\nbe kind"],
+            include_image_tool=False,
         )
-        assert composed.startswith("BASE")
+        assert "GriptapeNodes" in composed
         assert "be terse" in composed
         assert "be kind" in composed
 

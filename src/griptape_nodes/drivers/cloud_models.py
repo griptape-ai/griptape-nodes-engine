@@ -106,6 +106,7 @@ O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
 
 
 OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
+LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
 
 # Provider presets for the chat sidebar agent.
 # id: internal key used in ConfigureAgentRequest / GetAgentConfigResultSuccess
@@ -130,6 +131,14 @@ PROVIDER_PRESETS: list[dict] = [
         "requires_api_key": False,
         "has_model_list": False,
         "default_model": "llama3.2",
+    },
+    {
+        "id": "lmstudio",
+        "name": "LM Studio (local)",
+        "default_base_url": LM_STUDIO_DEFAULT_BASE_URL,
+        "requires_api_key": False,
+        "has_model_list": False,
+        "default_model": "",
     },
     {
         "id": "custom",

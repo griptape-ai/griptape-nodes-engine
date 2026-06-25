@@ -17,7 +17,7 @@ import os
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
-from griptape_nodes.drivers.cloud_models import OLLAMA_DEFAULT_BASE_URL
+from griptape_nodes.drivers.cloud_models import LM_STUDIO_DEFAULT_BASE_URL, OLLAMA_DEFAULT_BASE_URL
 
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
 """Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
@@ -66,13 +66,16 @@ def build_model(
 
     Args:
         model_name: Model identifier sent to the API.
-        provider: One of ``"griptape_cloud"``, ``"ollama"``, or ``"custom"``.
+        provider: One of ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``,
+            or ``"custom"``.
         api_key: API key for the target endpoint. Required for
             ``"griptape_cloud"`` (falls back to ``GT_CLOUD_API_KEY``) and
-            ``"custom"``. Ignored for ``"ollama"`` (no auth needed).
+            ``"custom"``. Ignored for ``"ollama"`` and ``"lmstudio"``
+            (no auth needed).
         base_url: Base URL of the endpoint. For ``"griptape_cloud"`` the
             ``/api/v1`` suffix is appended automatically. For ``"ollama"``
-            defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. Required for
+            defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. For ``"lmstudio"``
+            defaults to :data:`LM_STUDIO_DEFAULT_BASE_URL`. Required for
             ``"custom"``.
 
     Raises:
@@ -87,6 +90,14 @@ def build_model(
         return OpenAIChatModel(
             model_name,
             provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+        )
+
+    if provider == "lmstudio":
+        resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
+        # LM Studio doesn't require auth but the OpenAI client needs a non-empty key.
+        return OpenAIChatModel(
+            model_name,
+            provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
         )
 
     # "custom" or any future provider: caller must supply both url and key.

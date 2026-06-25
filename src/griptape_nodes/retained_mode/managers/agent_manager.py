@@ -101,9 +101,6 @@ from griptape_nodes.retained_mode.events.agent_events import (
     RunAgentRequestArtifact,
     RunAgentResultFailure,
     RunAgentResultSuccess,
-    SetActiveProviderRequest,
-    SetActiveProviderResultFailure,
-    SetActiveProviderResultSuccess,
     UnarchiveThreadRequest,
     UnarchiveThreadResultFailure,
     UnarchiveThreadResultSuccess,
@@ -146,15 +143,13 @@ config_manager = ConfigManager()
 secrets_manager = SecretsManager(config_manager)
 
 
-DEFAULT_AGENT_INSTRUCTIONS = (
+_AGENT_INSTRUCTIONS_BASE = (
     "You are a coding assistant embedded in Griptape Nodes. You operate by calling tools.\n\n"
     "Tools available to you:\n"
     "  - GriptapeNodes MCP tools (prefixed `GriptapeNodes_`). Use these to interact with the "
     "engine: list libraries and node types, create nodes, set parameter values, wire "
     "connections, save and run workflows.\n"
-    "  - generate_image: turn a text prompt into an image via Griptape Cloud. The chat UI "
-    "displays the generated image inline automatically, so briefly describe what you made and "
-    "do NOT paste the returned URL or markdown image syntax into your reply.\n"
+    "{image_tool_line}"
     "  - Additional MCP tools may be available, each prefixed with its server name.\n\n"
     "Behavior rules (these are non-negotiable):\n"
     "  1. NEVER respond with only a plan or a description of what you intend to do. If a "
@@ -169,6 +164,18 @@ DEFAULT_AGENT_INSTRUCTIONS = (
     "     text response. That final response should be a short summary of what you did, "
     "     including the names of any nodes you created or changed.\n"
 )
+
+_IMAGE_TOOL_INSTRUCTION = (
+    "  - generate_image: turn a text prompt into an image via Griptape Cloud. The chat UI "
+    "displays the generated image inline automatically, so briefly describe what you made and "
+    "do NOT paste the returned URL or markdown image syntax into your reply.\n"
+)
+
+
+def _build_agent_instructions(*, include_image_tool: bool) -> str:
+    image_tool_line = _IMAGE_TOOL_INSTRUCTION if include_image_tool else ""
+    return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
+
 
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
 # wedge the conversation. The numbers are deliberately generous: 60 model
@@ -204,16 +211,10 @@ class AgentManager:
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
-        # Named provider list and the currently active entry's name.
-        # Populated by _load_providers_from_config(); never access the flat
-        # _provider/_model_name/_custom_base_url/_custom_api_key fields from
-        # before — use self._active_provider instead.
         self._providers: list[dict] = []
-        self._active_provider_name: str = ""
         self._load_providers_from_config()
 
         self._image_model_name: str = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
-        self._instructions: str = DEFAULT_AGENT_INSTRUCTIONS
         self._system_prompt_extra: str = config_manager.get_config_value("agent.system_prompt", default="")
 
         self._threads_dir: Path = xdg_data_home() / "griptape_nodes" / "threads"
@@ -261,9 +262,6 @@ class AgentManager:
             event_manager.assign_manager_to_request_type(
                 DeleteAgentProviderRequest, self.on_handle_delete_agent_provider_request
             )
-            event_manager.assign_manager_to_request_type(
-                SetActiveProviderRequest, self.on_handle_set_active_provider_request
-            )
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
                 self.on_app_initialization_complete,
@@ -278,19 +276,20 @@ class AgentManager:
         self._mcp_server_port = sock.getsockname()[1]
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
 
-    @property
-    def _active_provider(self) -> dict:
-        """Return the active provider dict from self._providers."""
+    def _get_provider(self, name: str | None) -> dict:
+        """Return the provider dict for name, falling back to griptape_cloud."""
+        if name:
+            for p in self._providers:
+                if p.get("name") == name:
+                    return p
         for p in self._providers:
-            if p.get("name") == self._active_provider_name:
+            if p.get("name") == _PROTECTED_PROVIDER_NAME:
                 return p
-        if self._providers:
-            return self._providers[0]
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         return {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": default_model}
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
-        _provider_keys = ("agent.providers", "agent.active_provider", "agent.griptape_cloud_model", "agent", "")
+        _provider_keys = ("agent.providers", "agent.griptape_cloud_model", "agent", "")
         if event.key not in ("agent.system_prompt", *_provider_keys):
             return
         new_value = config_manager.get_config_value("agent.system_prompt", default="")
@@ -313,7 +312,11 @@ class AgentManager:
         thread_id = self._validate_thread_for_run(request.thread_id)
         is_first_run = len(self._thread_storage.load_history(thread_id)) == 0
 
-        runner = self._build_runner(request.additional_mcp_servers)
+        runner = self._build_runner(
+            request.additional_mcp_servers,
+            provider_name=request.provider_name,
+            model_name=request.model_name,
+        )
         prompt = await _compose_prompt(request.input, request.url_artifacts)
 
         event_manager = GriptapeNodes.EventManager()
@@ -527,20 +530,18 @@ class AgentManager:
         return ConfigureAgentResultSuccess(result_details="Agent configured successfully.")
 
     def _apply_prompt_driver_config(self, pd: dict) -> bool:
-        """Apply prompt driver config fields to the active provider, return True if any value changed."""
-        active = self._active_provider
+        """Apply prompt driver config fields to the griptape_cloud provider, return True if any value changed."""
+        gc = self._get_provider(None)
         changed = False
-        # "provider" in the legacy request maps to "type" in the provider dict.
         for req_key, dict_key in (
-            ("provider", "type"),
             ("model", "model"),
             ("base_url", "base_url"),
             ("api_key", "api_key"),
         ):
             if req_key in pd:
                 new_value = str(pd[req_key])
-                if active.get(dict_key) != new_value:
-                    active[dict_key] = new_value
+                if gc.get(dict_key) != new_value:
+                    gc[dict_key] = new_value
                     changed = True
         return changed
 
@@ -554,12 +555,12 @@ class AgentManager:
         )
 
     def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
-        active = self._active_provider
+        gc = self._get_provider(None)
         return GetAgentConfigResultSuccess(
-            provider=str(active.get("type", _PROTECTED_PROVIDER_NAME)),
-            model_name=str(active.get("model", "")),
+            provider=str(gc.get("type", _PROTECTED_PROVIDER_NAME)),
+            model_name=str(gc.get("model", "")),
             image_model_name=self._image_model_name,
-            base_url=str(active.get("base_url", "")),
+            base_url=str(gc.get("base_url", "")),
             result_details="Agent config retrieved successfully.",
         )
 
@@ -610,12 +611,17 @@ class AgentManager:
             logger.exception(details)
             return GetConversationMemoryResultFailure(result_details=details)
 
-    def _build_runner(self, additional_mcp_servers: list[str]) -> PydanticAgentRunner:
-        active = self._active_provider
-        provider_type = str(active.get("type", _PROTECTED_PROVIDER_NAME))
-        model_name = str(active.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"))
-        base_url = str(active.get("base_url", ""))
-        api_key = str(active.get("api_key", ""))
+    def _build_runner(
+        self,
+        additional_mcp_servers: list[str],
+        provider_name: str | None = None,
+        model_name: str | None = None,
+    ) -> PydanticAgentRunner:
+        provider = self._get_provider(provider_name)
+        provider_type = str(provider.get("type", _PROTECTED_PROVIDER_NAME))
+        model_name = model_name or str(provider.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"))
+        base_url = str(provider.get("base_url", ""))
+        api_key = str(provider.get("api_key", ""))
 
         cache_key = (
             provider_type,
@@ -668,7 +674,7 @@ class AgentManager:
             base_url=model_base_url,
             workspace_root=workspace_root,
             storage=self._thread_storage,
-            instructions=self._compose_instructions(server_rules),
+            instructions=self._compose_instructions(server_rules, include_image_tool=image_config is not None),
             system_prompt=self._system_prompt_extra or None,
             mcp_servers=mcp_servers,
             image_config=image_config,
@@ -681,15 +687,14 @@ class AgentManager:
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
             providers=list(self._providers),
-            active_provider=self._active_provider_name,
-            result_details="Providers retrieved successfully.",
+            result_details="Chat providers retrieved successfully.",
         )
 
     def on_handle_create_agent_provider_request(self, request: CreateAgentProviderRequest) -> ResultPayload:
         name = str(request.provider.get("name", "")).strip()
         if not name:
             return CreateAgentProviderResultFailure(
-                result_details="Attempted to create provider. Failed because 'name' is required."
+                result_details="Attempted to create chat provider. Failed because 'name' is required."
             )
         provider_type = str(request.provider.get("type", ""))
         if provider_type not in _VALID_PROVIDER_TYPES:
@@ -736,29 +741,14 @@ class AgentManager:
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it is the last remaining provider."
             )
         self._providers.pop(idx)
-        if self._active_provider_name == request.name:
-            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
         self._persist_providers()
         self._runner_cache.clear()
         return DeleteAgentProviderResultSuccess(
             name=request.name, result_details=f"Provider '{request.name}' deleted successfully."
         )
 
-    def on_handle_set_active_provider_request(self, request: SetActiveProviderRequest) -> ResultPayload:
-        if not any(p.get("name") == request.name for p in self._providers):
-            return SetActiveProviderResultFailure(
-                result_details=f"Attempted to set active provider to '{request.name}'. Failed because it does not exist."
-            )
-        if self._active_provider_name != request.name:
-            self._active_provider_name = request.name
-            self._persist_providers()
-            self._runner_cache.clear()
-        return SetActiveProviderResultSuccess(
-            name=request.name, result_details=f"Active provider set to '{request.name}'."
-        )
-
     def _load_providers_from_config(self) -> None:
-        """Load providers list and active provider from config, with legacy migration.
+        """Load providers list from config, with legacy migration.
 
         The griptape_cloud provider is always synthesized — it never needs to appear
         in the config file. Its model override lives in agent.griptape_cloud_model.
@@ -774,13 +764,6 @@ class AgentManager:
             self._providers = [gc_provider, *user_providers]
         else:
             self._providers = [gc_provider, *self._migrate_legacy_user_providers()]
-
-        raw_active = config_manager.get_config_value("agent.active_provider")
-        provider_names = {p.get("name") for p in self._providers}
-        if raw_active and raw_active in provider_names:
-            self._active_provider_name = str(raw_active)
-        else:
-            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
 
     def _migrate_legacy_user_providers(self) -> list[dict]:
         """Return user-defined providers migrated from the old flat agent.provider config.
@@ -807,30 +790,23 @@ class AgentManager:
         return [migrated]
 
     def _persist_providers(self) -> None:
-        """Write provider state to config.
+        """Write chat provider and image provider state to config.
 
-        The griptape_cloud entry is never written to agent.providers — it is always
-        synthesized on load. Its model override (when changed from default) is stored
-        separately under agent.griptape_cloud_model.
+        The griptape_cloud entry is never written to agent.providers — it is
+        always synthesized on load. Its model override (when changed from default)
+        is stored separately under agent.griptape_cloud_model.
         """
         user_providers = [p for p in self._providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
         config_manager.set_config_value("agent.providers", user_providers)
-        config_manager.set_config_value("agent.active_provider", self._active_provider_name)
 
         gc = next((p for p in self._providers if p.get("name") == _PROTECTED_PROVIDER_NAME), None)
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         if gc and gc.get("model") != default_model:
             config_manager.set_config_value("agent.griptape_cloud_model", gc.get("model"))
 
-    def _compose_instructions(self, server_rules: list[str]) -> str:
-        """Compose the instructions string from base rules and per-MCP-server rules.
-
-        Composition order: built-in base instructions → per-MCP-server rules (if
-        any). The base instructions are always first so their non-negotiable
-        behavioral rules cannot be overridden. User system prompt text is passed
-        separately via PydanticAgentRunner.system_prompt.
-        """
-        parts = [self._instructions]
+    def _compose_instructions(self, server_rules: list[str], *, include_image_tool: bool) -> str:
+        """Compose the instructions string from base rules and per-MCP-server rules."""
+        parts = [_build_agent_instructions(include_image_tool=include_image_tool)]
         parts.extend(server_rules)
         return "\n\n".join(parts)
 
