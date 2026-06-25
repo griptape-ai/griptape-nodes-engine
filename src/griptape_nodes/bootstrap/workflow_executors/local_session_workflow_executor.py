@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSenderMixin):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         session_id: str,
         storage_backend: StorageBackend = StorageBackend.LOCAL,
@@ -46,11 +46,13 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         save_on_failure_path: str | None = None,
         *,
         project_file_path: Path | None = None,
+        pickle_control_flow_result: bool = False,
     ):
         super().__init__(
             storage_backend=storage_backend,
             project_file_path=project_file_path,
             save_on_failure_path=save_on_failure_path,
+            pickle_control_flow_result=pickle_control_flow_result,
         )
         self._init_websocket_sender(session_id)
         self._on_start_flow_result = on_start_flow_result
