@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
@@ -77,6 +78,10 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     GetFileInfoResultSuccess,
+)
+from griptape_nodes.retained_mode.events.project_events import (
+    GetSituationRequest,
+    GetSituationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -304,6 +309,7 @@ class WorkflowManager:
         OVERWRITE_EXISTING = "overwrite_existing"  # Save existing workflow to same name
         SAVE_AS = "save_as"  # Save existing workflow with new name
         SAVE_FROM_TEMPLATE = "save_from_template"  # Save from a template
+        CREATE_VERSIONED = "create_versioned"  # Save a new version via create_versioned_workflow situation
 
     @dataclass
     class SaveWorkflowTargetInfo:
@@ -1965,8 +1971,13 @@ class WorkflowManager:
         destination: ProjectFileDestination
         relative_file_path: str
 
-    def _build_workflow_save_path(self, file_name: str, sub_dirs: str | None = None) -> WorkflowSavePath:
-        """Build a workflow save destination via the ``save_workflow`` situation.
+    def _build_workflow_save_path(
+        self,
+        file_name: str,
+        sub_dirs: str | None = None,
+        situation_name: str = "save_workflow",
+    ) -> WorkflowSavePath:
+        """Build a workflow save destination via a named situation.
 
         Returns an unresolved ``ProjectFileDestination`` plus a registry-relative
         display string. The destination's macro is resolved inside
@@ -1976,12 +1987,16 @@ class WorkflowManager:
         ``relative_file_path`` is computed from the user-supplied name and
         sub-directory directly; out-of-workspace handling and macro-form
         portability happen post-write via ``ProjectFileDestination._map_to_macro_file``.
+
+        ``situation_name`` defaults to ``save_workflow`` (overwrite-in-place
+        semantics). Pass ``create_versioned_workflow`` for the versioned-save
+        flow that bumps the padded index every save (issue #4945).
         """
         extra_vars: dict[str, str | int] = {}
         if sub_dirs:
             extra_vars["sub_dirs"] = sub_dirs
 
-        destination = ProjectFileDestination.from_situation(file_name, "save_workflow", **extra_vars)
+        destination = ProjectFileDestination.from_situation(file_name, situation_name, **extra_vars)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
         return WorkflowManager.WorkflowSavePath(
             destination=destination,
@@ -2008,7 +2023,11 @@ class WorkflowManager:
             return str(path)
         return str(relative)
 
-    def _resolve_named_save_path(self, requested_file_name: str) -> NamedSavePath:
+    def _resolve_named_save_path(
+        self,
+        requested_file_name: str,
+        situation_name: str = "save_workflow",
+    ) -> NamedSavePath:
         """Resolve a user-supplied save name (possibly carrying a directory) to a save destination.
 
         A relative name like "episode/my_wf" splits into sub-directory + stem and routes
@@ -2016,13 +2035,20 @@ class WorkflowManager:
         when renaming an externally-registered workflow) is honored verbatim:
         ProjectFileDestination.from_situation bypasses the workspace macro for absolute
         filenames.
+
+        ``situation_name`` selects which situation drives the save (default
+        ``save_workflow``; pass ``create_versioned_workflow`` for versioned saves).
         """
         parts = FilenameParts.from_filename(f"{requested_file_name}.py")
         if parts.directory.is_absolute():
-            destination, relative_file_path = self._build_workflow_save_path(f"{requested_file_name}.py")
+            destination, relative_file_path = self._build_workflow_save_path(
+                f"{requested_file_name}.py", situation_name=situation_name
+            )
         else:
             sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            destination, relative_file_path = self._build_workflow_save_path(f"{parts.stem}.py", sub_dirs=sub_dirs)
+            destination, relative_file_path = self._build_workflow_save_path(
+                f"{parts.stem}.py", sub_dirs=sub_dirs, situation_name=situation_name
+            )
         return WorkflowManager.NamedSavePath(
             file_name=parts.stem, destination=destination, relative_file_path=relative_file_path
         )
@@ -2111,6 +2137,7 @@ class WorkflowManager:
             save_target = self._determine_save_target(
                 requested_file_name=request.file_name,
                 current_workflow_name=current_workflow_name,
+                create_versioned=request.create_versioned,
             )
         except ValueError as e:
             details = f"Attempted to save workflow. Failed when determining save target: {e}"
@@ -2324,14 +2351,24 @@ class WorkflowManager:
                 return candidate_name
             curr_idx += 1
 
-    def _determine_save_target(
-        self, requested_file_name: str | None, current_workflow_name: str | None
+    def _determine_save_target(  # noqa: C901, PLR0912, PLR0915
+        self,
+        requested_file_name: str | None,
+        current_workflow_name: str | None,
+        *,
+        create_versioned: bool = False,
     ) -> SaveWorkflowTargetInfo:
         """Determine the target file path, name, and metadata for saving a workflow.
 
         Args:
             requested_file_name: The name the user wants to save as (can be None)
             current_workflow_name: The workflow currently loaded in context (can be None)
+            create_versioned: When True, route every save through the
+                ``create_versioned_workflow`` situation so each save produces a
+                new versioned file (e.g. ``foo_v001.py``, ``foo_v002.py``, ...).
+                When False (default), the standard scenarios apply
+                (FIRST_SAVE / OVERWRITE_EXISTING / SAVE_AS / SAVE_FROM_TEMPLATE)
+                via the ``save_workflow`` situation.
 
         Returns:
             SaveWorkflowTargetInfo with all information needed to save the workflow
@@ -2353,6 +2390,43 @@ class WorkflowManager:
         current_workflow = None
         if current_workflow_name and WorkflowRegistry.has_workflow_with_name(current_workflow_name):
             current_workflow = WorkflowRegistry.get_workflow_by_name(current_workflow_name)
+
+        # Pick the situation up-front: create_versioned diverts EVERY save through
+        # create_versioned_workflow (with CREATE_NEW + a padded slot) so each save
+        # bumps the version. Without it, the standard save_workflow situation applies.
+        situation_name = "create_versioned_workflow" if create_versioned else "save_workflow"
+        self._warn_if_situation_policy_mismatches_intent(situation_name, create_versioned=create_versioned)
+
+        # CREATE_VERSIONED short-circuits the OVERWRITE_EXISTING branch. Even when
+        # the workflow is already in the registry with a saved file_path, a versioned
+        # save re-resolves the macro so OSManager's seed-and-retry walks past
+        # existing versions and produces the next one. We still need a base filename;
+        # prefer the user's requested name → current workflow's display name →
+        # registry-derived stem from the existing file_path.
+        if create_versioned:
+            base_name = self._derive_versioned_base_name(
+                requested_file_name=requested_file_name,
+                current_workflow=current_workflow,
+                target_workflow=target_workflow,
+            )
+            file_name, destination, relative_file_path = self._resolve_named_save_path(
+                base_name, situation_name=situation_name
+            )
+            creation_date = (
+                current_workflow.metadata.creation_date if current_workflow is not None else datetime.now(tz=UTC)
+            )
+            branched_from = current_workflow.metadata.branched_from if current_workflow is not None else None
+            if (creation_date is None) or (creation_date == WorkflowManager.EPOCH_START):
+                creation_date = datetime.now(tz=UTC)
+            return WorkflowManager.SaveWorkflowTargetInfo(
+                scenario=WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED,
+                file_name=file_name,
+                destination=destination,
+                file_path=None,
+                relative_file_path=relative_file_path,
+                creation_date=creation_date,
+                branched_from=branched_from,
+            )
 
         # Determine scenario and build target info
         # Only treat as SAVE_FROM_TEMPLATE if this is a Griptape-provided template.
@@ -2434,6 +2508,77 @@ class WorkflowManager:
             creation_date=creation_date,
             branched_from=branched_from,
         )
+
+    @staticmethod
+    def _derive_versioned_base_name(
+        *,
+        requested_file_name: str | None,
+        current_workflow: Workflow | None,
+        target_workflow: Workflow | None,
+    ) -> str:
+        """Pick the base filename for a versioned save.
+
+        Priority:
+        1. Explicit ``requested_file_name`` (user typed it).
+        2. The current workflow's display name (``metadata.name``), sanitized.
+        3. The current workflow's existing on-disk stem with any trailing
+           ``_v###`` version suffix stripped — so saving over ``foo_v001.py``
+           produces ``foo_v002.py`` (not ``foo_v001_v001.py``).
+        4. The target workflow's on-disk stem (same suffix strip), if no
+           current workflow is in scope.
+        5. A timestamp fallback when no other source is available.
+        """
+        if requested_file_name:
+            return requested_file_name
+
+        candidate_workflow = current_workflow if current_workflow is not None else target_workflow
+        if candidate_workflow is not None:
+            display_name = (candidate_workflow.metadata.name or "").strip()
+            sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+            if sanitized:
+                return sanitized
+            if candidate_workflow.file_path is not None:
+                stem = derive_registry_key(candidate_workflow.file_path)
+                # Strip a trailing _v### so the next versioned save bumps the
+                # index against the same base name.
+                return re.sub(r"_v\d+$", "", stem)
+
+        return datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
+
+    def _warn_if_situation_policy_mismatches_intent(self, situation_name: str, *, create_versioned: bool) -> None:
+        """Log a warning when a situation's policy doesn't match the caller's intent.
+
+        - ``create_versioned=True`` expects an unresolved padded slot; warn when
+          the chosen situation uses ``overwrite``.
+        - ``create_versioned=False`` expects in-place overwrite; warn when
+          ``save_workflow`` has been customized to ``create_new``.
+
+        These mismatches are configuration smells, not hard errors:
+        CREATE_NEW without a ``{x:NN}`` slot still works (OSManager's collision
+        fallback synthesizes ``_1``, ``_2``, ...), and OVERWRITE with an
+        ``{_index:NN}`` slot renders a literal ``_v000``. We surface the
+        mismatch so the user can correct the situation if it doesn't reflect
+        their intent.
+        """
+        result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        if not isinstance(result, GetSituationResultSuccess):
+            return  # Missing situation surfaces as a load failure elsewhere; nothing useful to warn about here.
+
+        on_collision = result.situation.policy.on_collision
+        if create_versioned and on_collision != SituationFilePolicy.CREATE_NEW:
+            logger.warning(
+                "Versioned save requested but situation '%s' uses '%s' policy; saves may overwrite in place. "
+                "Set the situation's policy to 'create_new' (with a padded `{_index:NN}` slot) for true versioning.",
+                situation_name,
+                on_collision.value,
+            )
+        elif not create_versioned and on_collision == SituationFilePolicy.CREATE_NEW:
+            logger.warning(
+                "Non-versioned save requested but situation '%s' uses 'create_new' policy; saves will produce "
+                "auto-indexed files instead of overwriting in place. Set the situation's policy to 'overwrite' "
+                "for in-place saves, or use create_versioned=True for explicit versioning.",
+                situation_name,
+            )
 
     async def on_save_workflow_file_from_serialized_flow_request(
         self, request: SaveWorkflowFileFromSerializedFlowRequest

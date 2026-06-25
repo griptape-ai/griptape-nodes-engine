@@ -160,6 +160,21 @@ DEFAULT_PROJECT_TEMPLATE = ProjectTemplate(
             ),
             fallback="save_file",
         ),
+        # Versioned workflow save: every save bumps the padded `{_index:03}` slot, so
+        # successive saves produce a sequence (foo_v001.py, foo_v002.py, ...). Selected
+        # via SaveWorkflowRequest.create_versioned=True. The macro and CREATE_NEW policy
+        # are user-customizable like any other situation.
+        # https://github.com/griptape-ai/griptape-nodes-engine/issues/4945
+        "create_versioned_workflow": SituationTemplate(
+            name="create_versioned_workflow",
+            description="Save a new version of a workflow with a padded index suffix",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
+                create_dirs=True,
+            ),
+            fallback="save_file",
+        ),
         "save_workflow_thumbnail": SituationTemplate(
             name="save_workflow_thumbnail",
             description="Save a workflow thumbnail image into the hidden workspace thumbnails directory",
