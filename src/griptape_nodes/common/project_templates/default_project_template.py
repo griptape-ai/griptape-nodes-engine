@@ -3,6 +3,7 @@
 from griptape_nodes.common.project_templates.directory import DirectoryDefinition
 from griptape_nodes.common.project_templates.project import ProjectTemplate
 from griptape_nodes.common.project_templates.situation import (
+    BuiltInSituation,
     SituationFilePolicy,
     SituationPolicy,
     SituationTemplate,
@@ -77,8 +78,8 @@ DEFAULT_PROJECT_TEMPLATE = ProjectTemplate(
         "py": "python",
     },
     situations={
-        "save_file": SituationTemplate(
-            name="save_file",
+        BuiltInSituation.SAVE_FILE: SituationTemplate(
+            name=BuiltInSituation.SAVE_FILE,
             description="Generic file save operation",
             macro="{file_name_base}{_index?:03}.{file_extension}",
             policy=SituationPolicy(
@@ -87,123 +88,123 @@ DEFAULT_PROJECT_TEMPLATE = ProjectTemplate(
             ),
             fallback=None,
         ),
-        "copy_external_file": SituationTemplate(
-            name="copy_external_file",
+        BuiltInSituation.COPY_EXTERNAL_FILE: SituationTemplate(
+            name=BuiltInSituation.COPY_EXTERNAL_FILE,
             description="User copies external file to project",
             macro="{inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}{_index?:03}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "download_url": SituationTemplate(
-            name="download_url",
+        BuiltInSituation.DOWNLOAD_URL: SituationTemplate(
+            name=BuiltInSituation.DOWNLOAD_URL,
             description="Download file from URL",
             macro="{inputs}/{sanitized_url}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "save_node_output": SituationTemplate(
-            name="save_node_output",
+        BuiltInSituation.SAVE_NODE_OUTPUT: SituationTemplate(
+            name=BuiltInSituation.SAVE_NODE_OUTPUT,
             description="Node generates and saves output",
             macro="{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "save_griptape_nodes_preview": SituationTemplate(
-            name="save_griptape_nodes_preview",
+        BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW: SituationTemplate(
+            name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW,
             description="Generate preview/thumbnail with preserved directory hierarchy",
             macro="{griptape-nodes-previews}/{drive_volume_mount?:/}{source_relative_path?:/}{source_file_name}.{preview_format}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "save_static_file": SituationTemplate(
-            name="save_static_file",
+        BuiltInSituation.SAVE_STATIC_FILE: SituationTemplate(
+            name=BuiltInSituation.SAVE_STATIC_FILE,
             description="Save static file to workflow-relative staticfiles directory. Required for projects using StaticFilesManager.save_static_file.",
             macro="{workflow_dir?:/}{static_files_dir}/{file_name_base}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "save_griptape_nodes_metadata": SituationTemplate(
-            name="save_griptape_nodes_metadata",
+        BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA: SituationTemplate(
+            name=BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA,
             description="Save sidecar metadata file with preserved directory hierarchy",
             macro="{griptape-nodes-metadata}/{source_relative_path?:/}{source_file_name}.json",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
         # Workflows save into the workspace root today for backward compatibility.
         # Migrating to a dedicated subdirectory is tracked in
         # https://github.com/griptape-ai/griptape-nodes/issues/2047.
-        "save_workflow": SituationTemplate(
-            name="save_workflow",
+        BuiltInSituation.SAVE_WORKFLOW: SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW,
             description="Save a workflow Python file, preserving any sub-directory hierarchy",
             macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
         # Versioned workflow save: every save bumps the padded `{_index:03}` slot, so
         # successive saves produce a sequence (foo_v001.py, foo_v002.py, ...). Selected
         # via SaveWorkflowRequest.create_versioned=True. The macro and CREATE_NEW policy
         # are user-customizable like any other situation.
         # https://github.com/griptape-ai/griptape-nodes-engine/issues/4945
-        "create_versioned_workflow": SituationTemplate(
-            name="create_versioned_workflow",
+        BuiltInSituation.CREATE_VERSIONED_WORKFLOW: SituationTemplate(
+            name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
             description="Save a new version of a workflow with a padded index suffix",
             macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
-        "save_workflow_thumbnail": SituationTemplate(
-            name="save_workflow_thumbnail",
+        BuiltInSituation.SAVE_WORKFLOW_THUMBNAIL: SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW_THUMBNAIL,
             description="Save a workflow thumbnail image into the hidden workspace thumbnails directory",
             macro="{griptape-nodes-thumbnails}/{file_name_base}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_static_file",
+            fallback=BuiltInSituation.SAVE_STATIC_FILE,
         ),
-        "save_failed_workflow": SituationTemplate(
-            name="save_failed_workflow",
+        BuiltInSituation.SAVE_FAILED_WORKFLOW: SituationTemplate(
+            name=BuiltInSituation.SAVE_FAILED_WORKFLOW,
             description="Save a failed workflow snapshot for post-mortem debugging",
             macro="{workspace_dir}/failures/{file_name_base}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
             ),
-            fallback="save_workflow",
+            fallback=BuiltInSituation.SAVE_WORKFLOW,
         ),
-        "save_temp_file": SituationTemplate(
-            name="save_temp_file",
+        BuiltInSituation.SAVE_TEMP_FILE: SituationTemplate(
+            name=BuiltInSituation.SAVE_TEMP_FILE,
             description="Save a temporary scratch file (e.g. intermediate processing artifacts)",
             macro="{temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
             ),
-            fallback="save_file",
+            fallback=BuiltInSituation.SAVE_FILE,
         ),
     },
 )

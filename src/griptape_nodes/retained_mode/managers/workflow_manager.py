@@ -23,7 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from griptape_nodes.common.project_templates.situation import SituationFilePolicy
+from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
@@ -1975,7 +1975,7 @@ class WorkflowManager:
         self,
         file_name: str,
         sub_dirs: str | None = None,
-        situation_name: str = "save_workflow",
+        situation_name: str = BuiltInSituation.SAVE_WORKFLOW,
     ) -> WorkflowSavePath:
         """Build a workflow save destination via a named situation.
 
@@ -2026,7 +2026,7 @@ class WorkflowManager:
     def _resolve_named_save_path(
         self,
         requested_file_name: str,
-        situation_name: str = "save_workflow",
+        situation_name: str = BuiltInSituation.SAVE_WORKFLOW,
     ) -> NamedSavePath:
         """Resolve a user-supplied save name (possibly carrying a directory) to a save destination.
 
@@ -2394,7 +2394,9 @@ class WorkflowManager:
         # Pick the situation up-front: create_versioned diverts EVERY save through
         # create_versioned_workflow (with CREATE_NEW + a padded slot) so each save
         # bumps the version. Without it, the standard save_workflow situation applies.
-        situation_name = "create_versioned_workflow" if create_versioned else "save_workflow"
+        situation_name = (
+            BuiltInSituation.CREATE_VERSIONED_WORKFLOW if create_versioned else BuiltInSituation.SAVE_WORKFLOW
+        )
         self._warn_if_situation_policy_mismatches_intent(situation_name, create_versioned=create_versioned)
 
         # CREATE_VERSIONED short-circuits the OVERWRITE_EXISTING branch. Even when

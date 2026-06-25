@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 from griptape_nodes.common.macro_parser import MacroVariables
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
     ResultPayloadFailure,
@@ -72,7 +73,7 @@ class CreateStaticFileUploadUrlRequest(RequestPayload):
     """
 
     file_name: str
-    situation_name: str = "copy_external_file"
+    situation_name: str = BuiltInSituation.COPY_EXTERNAL_FILE
 
 
 @dataclass
@@ -123,7 +124,7 @@ class CreateStaticFileDownloadUrlRequest(RequestPayload):
     """
 
     file_name: str
-    situation_name: str = "copy_external_file"
+    situation_name: str = BuiltInSituation.COPY_EXTERNAL_FILE
 
 
 @dataclass
