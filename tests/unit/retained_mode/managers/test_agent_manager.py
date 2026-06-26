@@ -44,6 +44,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListProviderModelsRequest,
     ListProviderModelsResultFailure,
     ListProviderModelsResultSuccess,
+    PromptDriverConfig,
     RunAgentRequestArtifact,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
@@ -728,7 +729,7 @@ class TestConfigureAgentActiveProvider:
 
     def test_model_change_via_configure_updates_active_provider(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_configure_agent_request(
-            ConfigureAgentRequest(prompt_driver={"model": "gpt-5"})
+            ConfigureAgentRequest(prompt_driver=PromptDriverConfig(model="gpt-5"))
         )
 
         assert isinstance(result, ConfigureAgentResultSuccess)

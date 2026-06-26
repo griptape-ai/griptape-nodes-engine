@@ -1,5 +1,7 @@
 from dataclasses import dataclass, field
 
+from pydantic import BaseModel
+
 from griptape_nodes.drivers.cloud_models import ProviderCatalogEntry, ProviderID
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
@@ -10,6 +12,14 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+
+
+class PromptDriverConfig(BaseModel):
+    """Typed prompt-driver fields accepted by ConfigureAgentRequest."""
+
+    model: str | None = None
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
 
 
 @dataclass
@@ -183,7 +193,7 @@ class ConfigureAgentRequest(RequestPayload):
     Results: ConfigureAgentResultSuccess | ConfigureAgentResultFailure (configuration error)
     """
 
-    prompt_driver: dict = field(default_factory=dict)
+    prompt_driver: PromptDriverConfig = field(default_factory=PromptDriverConfig)
     image_generation_driver: dict = field(default_factory=dict)
     active_provider: str = ""
 

@@ -98,6 +98,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListThreadsRequest,
     ListThreadsResultFailure,
     ListThreadsResultSuccess,
+    PromptDriverConfig,
     RenameThreadRequest,
     RenameThreadResultFailure,
     RenameThreadResultSuccess,
@@ -554,22 +555,22 @@ class AgentManager:
             return ConfigureAgentResultFailure(result_details=details)
         return ConfigureAgentResultSuccess(result_details="Agent configured successfully.")
 
-    def _apply_prompt_driver_config(self, pd: dict) -> bool:
+    def _apply_prompt_driver_config(self, pd: PromptDriverConfig) -> bool:
         """Apply prompt driver config fields to the active provider, return True if any value changed."""
         provider = self._get_provider(None)
         changed = False
-        if "model" in pd:
-            new_value = str(pd["model"])
+        if "model" in pd.model_fields_set:
+            new_value = pd.model or ""
             if provider.model != new_value:
                 provider.model = new_value
                 changed = True
-        if "base_url" in pd:
-            new_value = str(pd["base_url"]) or None
+        if "base_url" in pd.model_fields_set:
+            new_value = pd.base_url or None
             if provider.base_url != new_value:
                 provider.base_url = new_value
                 changed = True
-        if "api_key_secret_name" in pd and provider_accepts_customer_key(provider.type):
-            raw = str(pd["api_key_secret_name"])
+        if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(provider.type):
+            raw = pd.api_key_secret_name or ""
             provider.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
             changed = True
         return changed
