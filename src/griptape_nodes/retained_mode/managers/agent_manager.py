@@ -727,29 +727,29 @@ class AgentManager:
         )
 
     def on_handle_create_agent_provider_request(self, request: CreateAgentProviderRequest) -> ResultPayload:
-        name = str(request.provider.get("name", "")).strip()
+        pd = request.provider
+        name = pd.name.strip()
         if not name:
             return CreateAgentProviderResultFailure(
                 result_details="Attempted to create chat provider. Failed because 'name' is required."
             )
-        provider_type = str(request.provider.get("type", ""))
-        if provider_type not in _VALID_PROVIDER_TYPES:
+        if pd.type not in _VALID_PROVIDER_TYPES:
             return CreateAgentProviderResultFailure(
-                result_details=f"Attempted to create provider '{name}'. Failed because type '{provider_type}' is not a known preset id."
+                result_details=f"Attempted to create provider '{name}'. Failed because type '{pd.type}' is not a known preset id."
             )
         if any(p.name == name for p in self._providers):
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
-        raw_secret_name = str(request.provider.get("api_key_secret_name", ""))
+        raw_secret_name = pd.api_key_secret_name or ""
         api_key_secret_name = None
-        if raw_secret_name and provider_accepts_customer_key(provider_type):
+        if raw_secret_name and provider_accepts_customer_key(pd.type):
             api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw_secret_name)
         provider = ProviderConfig(
             name=name,
-            type=provider_type,
-            model=str(request.provider.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")),
-            base_url=str(request.provider.get("base_url", "")) or None,
+            type=pd.type,
+            model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
+            base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
         )
         self._providers.append(provider)
@@ -763,21 +763,20 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because it does not exist."
             )
-        if "type" in request.provider and str(request.provider["type"]) not in _VALID_PROVIDER_TYPES:
+        pd = request.provider
+        if "type" in pd.model_fields_set and pd.type not in _VALID_PROVIDER_TYPES:
             return UpdateAgentProviderResultFailure(
-                result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
+                result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
-        resolved_type = str(request.provider.get("type", existing.type))
-        if "type" in request.provider:
-            existing.type = str(request.provider["type"])
-        if "model" in request.provider:
-            existing.model = str(request.provider["model"])
-        if "base_url" in request.provider:
-            existing.base_url = str(request.provider["base_url"]) or None
-        if "api_key_secret_name" in request.provider and provider_accepts_customer_key(resolved_type):
-            raw = str(request.provider["api_key_secret_name"])
+        if "type" in pd.model_fields_set:
+            existing.type = pd.type or existing.type
+        if "model" in pd.model_fields_set:
+            existing.model = pd.model or existing.model
+        if "base_url" in pd.model_fields_set:
+            existing.base_url = pd.base_url or None
+        if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):
+            raw = pd.api_key_secret_name or ""
             existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
-        # name is the stable key — never allow rename via update
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")

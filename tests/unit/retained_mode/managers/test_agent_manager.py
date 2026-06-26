@@ -32,6 +32,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     CreateAgentProviderRequest,
     CreateAgentProviderResultFailure,
     CreateAgentProviderResultSuccess,
+    CreateProviderPayload,
     DeleteAgentProviderRequest,
     DeleteAgentProviderResultFailure,
     DeleteAgentProviderResultSuccess,
@@ -49,6 +50,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
+    UpdateProviderPayload,
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
@@ -364,7 +366,9 @@ class TestListAgentProviders:
 
 class TestCreateAgentProvider:
     def test_create_valid_provider_appends_and_returns_success(self, providers_manager: AgentManager) -> None:
-        request = CreateAgentProviderRequest(provider={"name": "home-ollama", "type": "ollama", "model": "mistral"})
+        request = CreateAgentProviderRequest(
+            provider=CreateProviderPayload(name="home-ollama", type="ollama", model="mistral")
+        )
 
         result = providers_manager.on_handle_create_agent_provider_request(request)
 
@@ -376,21 +380,21 @@ class TestCreateAgentProvider:
         providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_create_agent_provider_request(
-            CreateAgentProviderRequest(provider={"name": "new", "type": "ollama"})
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="new", type="ollama"))
         )
 
         assert providers_manager._runner_cache == {}
 
     def test_create_fails_when_name_is_missing(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_create_agent_provider_request(
-            CreateAgentProviderRequest(provider={"type": "ollama"})
+            CreateAgentProviderRequest(provider=CreateProviderPayload(type="ollama"))
         )
 
         assert isinstance(result, CreateAgentProviderResultFailure)
 
     def test_create_fails_when_name_is_empty_string(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_create_agent_provider_request(
-            CreateAgentProviderRequest(provider={"name": "   ", "type": "ollama"})
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="   ", type="ollama"))
         )
 
         assert isinstance(result, CreateAgentProviderResultFailure)
@@ -398,7 +402,7 @@ class TestCreateAgentProvider:
     def test_create_fails_when_name_already_exists(self, providers_manager: AgentManager) -> None:
         initial_count = len(providers_manager._providers)
         result = providers_manager.on_handle_create_agent_provider_request(
-            CreateAgentProviderRequest(provider={"name": "my-ollama", "type": "ollama"})
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="my-ollama", type="ollama"))
         )
 
         assert isinstance(result, CreateAgentProviderResultFailure)
@@ -406,7 +410,7 @@ class TestCreateAgentProvider:
 
     def test_create_fails_when_type_is_unknown(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_create_agent_provider_request(
-            CreateAgentProviderRequest(provider={"name": "new", "type": "vllm"})
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="new", type="vllm"))
         )
 
         assert isinstance(result, CreateAgentProviderResultFailure)
@@ -416,7 +420,7 @@ class TestCreateAgentProvider:
         for provider_type in _VALID_PROVIDER_TYPES:
             unique_name = f"test-{provider_type}"
             result = providers_manager.on_handle_create_agent_provider_request(
-                CreateAgentProviderRequest(provider={"name": unique_name, "type": provider_type})
+                CreateAgentProviderRequest(provider=CreateProviderPayload(name=unique_name, type=provider_type))
             )
             # Only check success — some may fail due to duplicate names across iterations,
             # but type validation should never be the cause.
@@ -432,7 +436,7 @@ class TestCreateAgentProvider:
 class TestUpdateAgentProvider:
     def test_update_merges_fields(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="my-ollama", provider={"model": "phi3"})
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="phi3"))
         )
 
         assert isinstance(result, UpdateAgentProviderResultSuccess)
@@ -441,8 +445,9 @@ class TestUpdateAgentProvider:
         assert updated.base_url == "http://localhost:11434/v1"  # untouched
 
     def test_update_does_not_allow_rename(self, providers_manager: AgentManager) -> None:
+        # UpdateProviderPayload has no name field — the type system prevents rename attempts.
         providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="my-ollama", provider={"name": "renamed", "model": "phi3"})
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="phi3"))
         )
 
         names = [p.name for p in providers_manager._providers]
@@ -453,14 +458,14 @@ class TestUpdateAgentProvider:
         providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
 
         providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="my-ollama", provider={"model": "gemma2"})
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="gemma2"))
         )
 
         assert providers_manager._runner_cache == {}
 
     def test_update_fails_when_provider_not_found(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="nonexistent", provider={"model": "phi3"})
+            UpdateAgentProviderRequest(name="nonexistent", provider=UpdateProviderPayload(model="phi3"))
         )
 
         assert isinstance(result, UpdateAgentProviderResultFailure)
@@ -468,7 +473,7 @@ class TestUpdateAgentProvider:
 
     def test_update_fails_when_type_is_invalid(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="my-ollama", provider={"type": "sglang"})
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(type="sglang"))
         )
 
         assert isinstance(result, UpdateAgentProviderResultFailure)
@@ -476,7 +481,7 @@ class TestUpdateAgentProvider:
 
     def test_update_valid_type_change_succeeds(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(
-            UpdateAgentProviderRequest(name="my-ollama", provider={"type": "lmstudio"})
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(type="lmstudio"))
         )
 
         assert isinstance(result, UpdateAgentProviderResultSuccess)

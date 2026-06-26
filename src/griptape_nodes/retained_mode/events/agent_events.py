@@ -22,6 +22,25 @@ class PromptDriverConfig(BaseModel):
     api_key_secret_name: str | None = None
 
 
+class CreateProviderPayload(BaseModel):
+    """Fields for CreateAgentProviderRequest. name and type are required; model defaults to empty."""
+
+    name: str = ""
+    type: str = ""
+    model: str = ""
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
+class UpdateProviderPayload(BaseModel):
+    """Partial fields for UpdateAgentProviderRequest. Only explicitly set fields are applied."""
+
+    type: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
 @dataclass
 class RunAgentRequestArtifact:
     type: str
@@ -701,15 +720,14 @@ class CreateAgentProviderRequest(RequestPayload):
     etc.) to the list of available agent providers.
 
     Args:
-        provider: Provider config dict. Required keys: ``name`` (unique,
+        provider: Provider config. Required fields: ``name`` (unique,
             non-empty), ``type`` (one of the known preset ids). Optional:
-            ``model``, ``base_url``, ``api_key_secret_name``, ``enabled``,
-            ``icon``, ``description``, ``docs_url``, ``download_url``.
+            ``model``, ``base_url``, ``api_key_secret_name``.
 
     Results: CreateAgentProviderResultSuccess | CreateAgentProviderResultFailure
     """
 
-    provider: dict = field(default_factory=dict)
+    provider: CreateProviderPayload = field(default_factory=CreateProviderPayload)
 
 
 @dataclass
@@ -739,14 +757,14 @@ class UpdateAgentProviderRequest(RequestPayload):
 
     Args:
         name: ``name`` of the provider to update (must already exist).
-        provider: Partial or full provider dict. Fields present are merged
-            over the existing config; omitted fields are preserved.
+        provider: Partial provider config. Only explicitly set fields are applied;
+            omitted fields are preserved. Rename is not supported.
 
     Results: UpdateAgentProviderResultSuccess | UpdateAgentProviderResultFailure
     """
 
     name: str = ""
-    provider: dict = field(default_factory=dict)
+    provider: UpdateProviderPayload = field(default_factory=UpdateProviderPayload)
 
 
 @dataclass
