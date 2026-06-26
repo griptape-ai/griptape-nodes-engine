@@ -128,11 +128,13 @@ PROVIDER_CATALOG = ModelCatalogLibraryProperty(
         ),
         "ollama": ModelProvider(
             display_name="Ollama (local)",
+            terms_url="https://ollama.com/terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local Ollama installation.",
         ),
         "lmstudio": ModelProvider(
             display_name="LM Studio (local)",
+            terms_url="https://lmstudio.ai/app-terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local LM Studio installation.",
         ),

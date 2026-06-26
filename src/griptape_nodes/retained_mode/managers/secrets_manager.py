@@ -237,6 +237,19 @@ class SecretsManager:
             logger.error("Secret '%s' not found", secret_name)
         return value
 
+    def delete_secret(self, secret_name: str) -> None:
+        """Remove a secret from the .env file and os.environ.
+
+        No-op if the file or the key does not exist.
+        """
+        secret_name = SecretsManager._apply_secret_name_compliance(secret_name)
+        if not ENV_VAR_PATH.exists():
+            return
+        if get_key(ENV_VAR_PATH, secret_name) is None:
+            return
+        unset_key(ENV_VAR_PATH, secret_name)
+        self._uninstall_managed(secret_name)
+
     def set_secret(self, secret_name: str, secret_value: str) -> None:
         if not ENV_VAR_PATH.exists():
             ENV_VAR_PATH.touch()

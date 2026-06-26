@@ -137,6 +137,12 @@ API_KEY_ENV_VAR = "GT_CLOUD_API_KEY"
 # stays in sync automatically when new presets are added).
 _VALID_PROVIDER_TYPES: frozenset[str] = frozenset(PROVIDER_CATALOG.providers)
 
+
+def _provider_api_key_secret_name(provider_name: str) -> str:
+    """Return the secrets-manager key name for a provider's API key."""
+    return SecretsManager._apply_secret_name_compliance(f"AGENT_PROVIDER_{provider_name}_API_KEY")
+
+
 # The built-in provider that is always present and may never be deleted.
 _PROTECTED_PROVIDER_NAME = "griptape_cloud"
 
@@ -542,18 +548,28 @@ class AgentManager:
 
     def _apply_prompt_driver_config(self, pd: dict) -> bool:
         """Apply prompt driver config fields to the active provider, return True if any value changed."""
-        gc = self._get_provider(None)
+        provider = self._get_provider(None)
         changed = False
         for req_key, dict_key in (
             ("model", "model"),
             ("base_url", "base_url"),
-            ("api_key", "api_key"),
         ):
             if req_key in pd:
                 new_value = str(pd[req_key])
-                if gc.get(dict_key) != new_value:
-                    gc[dict_key] = new_value
+                if provider.get(dict_key) != new_value:
+                    provider[dict_key] = new_value
                     changed = True
+        if "api_key" in pd:
+            new_key = str(pd["api_key"])
+            provider_name = str(provider.get("name", ""))
+            secret_name = _provider_api_key_secret_name(provider_name)
+            if new_key:
+                secrets_manager.set_secret(secret_name, new_key)
+                provider["api_key_ref"] = secret_name
+            else:
+                secrets_manager.delete_secret(secret_name)
+                provider.pop("api_key_ref", None)
+            changed = True
         return changed
 
     def on_handle_list_agent_models_request(self, _: ListAgentModelsRequest) -> ResultPayload:
@@ -632,7 +648,28 @@ class AgentManager:
         provider_type = str(provider.get("type", _PROTECTED_PROVIDER_NAME))
         model_name = model_name or str(provider.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"))
         base_url = str(provider.get("base_url", ""))
-        api_key = str(provider.get("api_key", ""))
+
+        if provider_type == _PROTECTED_PROVIDER_NAME:
+            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
+            if not api_key:
+                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
+                raise ValueError(msg)
+            # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
+            # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
+            # malformed endpoint, so the chat and image paths agree.
+            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
+            model_base_url: str | None = cloud_base_url
+            image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
+                api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
+            )
+        else:
+            api_key_ref = str(provider.get("api_key_ref", ""))
+            api_key = (
+                secrets_manager.get_secret(api_key_ref, should_error_on_not_found=False) or "" if api_key_ref else ""
+            )
+            model_base_url = base_url or None
+            # Image generation is Griptape Cloud-specific; disable for other providers.
+            image_config = None
 
         cache_key = (
             provider_type,
@@ -661,24 +698,6 @@ class AgentManager:
             if isinstance(rules, str) and rules.strip():
                 server_rules.append(f"Rules for MCP server '{cfg['name']}':\n{rules.strip()}")
 
-        if provider_type == _PROTECTED_PROVIDER_NAME:
-            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
-            if not api_key:
-                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
-                raise ValueError(msg)
-            # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
-            # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
-            # malformed endpoint, so the chat and image paths agree.
-            cloud_base_url = os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL
-            model_base_url: str | None = cloud_base_url
-            image_config: ImageGenerationToolsetConfig | None = ImageGenerationToolsetConfig(
-                api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
-            )
-        else:
-            model_base_url = base_url or None
-            # Image generation is Griptape Cloud-specific; disable for other providers.
-            image_config = None
-
         runner = PydanticAgentRunner(
             model_name=model_name,
             provider=provider_type,
@@ -697,8 +716,13 @@ class AgentManager:
         return runner
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
+        redacted = []
+        for p in self._providers:
+            entry = {k: v for k, v in p.items() if k not in ("api_key", "api_key_ref")}
+            entry["has_api_key"] = bool(p.get("api_key_ref"))
+            redacted.append(entry)
         return ListAgentProvidersResultSuccess(
-            providers=list(self._providers),
+            providers=redacted,
             active_provider=self._active_provider_name,
             result_details="Chat providers retrieved successfully.",
         )
@@ -718,7 +742,13 @@ class AgentManager:
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
-        self._providers.append(dict(request.provider))
+        provider = {k: v for k, v in request.provider.items() if k != "api_key"}
+        api_key = str(request.provider.get("api_key", ""))
+        if api_key:
+            secret_name = _provider_api_key_secret_name(name)
+            secrets_manager.set_secret(secret_name, api_key)
+            provider["api_key_ref"] = secret_name
+        self._providers.append(provider)
         self._persist_providers()
         self._runner_cache.clear()
         return CreateAgentProviderResultSuccess(name=name, result_details=f"Provider '{name}' created successfully.")
@@ -733,7 +763,19 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
             )
-        existing.update(request.provider)
+        update = {k: v for k, v in request.provider.items() if k != "api_key"}
+        if "api_key" in request.provider:
+            new_key = str(request.provider["api_key"])
+            secret_name = _provider_api_key_secret_name(request.name)
+            if new_key:
+                secrets_manager.set_secret(secret_name, new_key)
+                update["api_key_ref"] = secret_name
+            else:
+                secrets_manager.delete_secret(secret_name)
+                update["api_key_ref"] = None
+        existing.update(update)
+        if existing.get("api_key_ref") is None:
+            existing.pop("api_key_ref", None)
         existing["name"] = request.name  # name is the stable key — never allow rename via update
         self._persist_providers()
         self._runner_cache.clear()
@@ -753,6 +795,9 @@ class AgentManager:
             return DeleteAgentProviderResultFailure(
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it is the last remaining provider."
             )
+        api_key_ref = str(self._providers[idx].get("api_key_ref", ""))
+        if api_key_ref:
+            secrets_manager.delete_secret(api_key_ref)
         self._providers.pop(idx)
         if self._active_provider_name == request.name:
             self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
@@ -807,8 +852,6 @@ class AgentManager:
         migrated: dict = {"name": type_id, "type": type_id, "model": model}
         if "base_url" in legacy:
             migrated["base_url"] = legacy["base_url"]
-        if "api_key" in legacy:
-            migrated["api_key"] = legacy["api_key"]
         return [migrated]
 
     def _persist_providers(self) -> None:
