@@ -310,6 +310,7 @@ class SaveWorkflowRequest(RequestPayload):
         image_path: Path to save workflow image/thumbnail (None for no image)
         pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
+        create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
 
     Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
     """
@@ -318,6 +319,7 @@ class SaveWorkflowRequest(RequestPayload):
     image_path: str | None = None
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
+    create_versioned: bool = False
 
 
 @dataclass
