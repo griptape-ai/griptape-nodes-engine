@@ -121,7 +121,9 @@ policy:   overwrite, create_dirs: true
 fallback: save_file
 ```
 
-Used when a workflow is saved. The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. Saving a workflow overwrites the existing file rather than versioning it.
+Used when a workflow is saved. The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. By default, saving a workflow overwrites the existing file rather than versioning it.
+
+A project can customize `save_workflow` like any other situation. For example, setting the macro to `{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}` with the `create_new` policy produces a versioned sequence (`my_workflow_v001.py`, `my_workflow_v002.py`, …) — see [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
 
 **Example:**
 
