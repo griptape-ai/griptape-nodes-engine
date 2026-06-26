@@ -5,6 +5,7 @@ from urllib.parse import urljoin
 
 import httpx
 
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.file import FileLoadError
 from griptape_nodes.files.project_file import ProjectFileDestination
@@ -217,7 +218,7 @@ class LocalStorageDriver(BaseStorageDriver):
         Returns:
             Absolute path string for the resolved asset path
         """
-        destination = ProjectFileDestination.from_situation(path.name, "copy_external_file")
+        destination = ProjectFileDestination.from_situation(path.name, BuiltInSituation.COPY_EXTERNAL_FILE)
         try:
             resolved_path = Path(destination.resolve())
         except FileLoadError:

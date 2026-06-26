@@ -997,7 +997,7 @@ class TestWorkflowManager:
         ) as mock_build:
             resolved = workflow_manager._resolve_named_save_path(str(abs_requested))
 
-        mock_build.assert_called_once_with(f"{abs_requested}.py")
+        mock_build.assert_called_once_with(f"{abs_requested}.py", situation_name="save_workflow")
         assert resolved.file_name == "new_name"
         assert resolved.relative_file_path == str(abs_path)
 
@@ -1015,7 +1015,7 @@ class TestWorkflowManager:
         ) as mock_build:
             resolved = workflow_manager._resolve_named_save_path("team/new_name")
 
-        mock_build.assert_called_once_with("new_name.py", sub_dirs="team")
+        mock_build.assert_called_once_with("new_name.py", sub_dirs="team", situation_name="save_workflow")
         assert resolved.file_name == "new_name"
 
     def test_delete_active_workflow_clears_context_stack(self, griptape_nodes: GriptapeNodes) -> None:
@@ -2657,3 +2657,300 @@ class TestWorkflowSaveSituationMacro:
         assert isinstance(result, SaveWorkflowFileFromSerializedFlowResultSuccess)
         assert Path(result.file_path) == temp_dir / "episode" / "my_workflow_v001.py"
         assert (temp_dir / "episode" / "my_workflow_v001.py").exists()
+
+
+class TestCreateVersionedWorkflow:
+    """Regression coverage for #4945: ``create_versioned=True`` produces a fresh version every save.
+
+    Drives ``on_save_workflow_request`` end-to-end (rather than the inner
+    ``_save_workflow_file_inline``) so we exercise the dispatch logic in
+    ``_determine_save_target`` — that's where the OVERWRITE_EXISTING vs.
+    CREATE_VERSIONED choice happens.
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_default_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> "Generator[None, None, None]":
+        """Load the default project template (which ships create_versioned_workflow).
+
+        Same fixture ordering as TestWorkflowSaveSituationMacro: load + activate
+        first, then force workspace_path so SetCurrentProjectRequest's internal
+        re-derivation doesn't clobber the test workspace.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        yield
+
+        WorkflowRegistry._workflows.clear()
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @staticmethod
+    def _determine(
+        griptape_nodes: GriptapeNodes,
+        *,
+        requested_file_name: str | None,
+        current_workflow_name: str | None,
+        create_versioned: bool,
+    ) -> WorkflowManager.SaveWorkflowTargetInfo:
+        return griptape_nodes.WorkflowManager()._determine_save_target(
+            requested_file_name=requested_file_name,
+            current_workflow_name=current_workflow_name,
+            create_versioned=create_versioned,
+        )
+
+    @staticmethod
+    def _register_saved_workflow(temp_dir: Path, *, registry_key: str, file_name: str, display_name: str) -> None:
+        """Materialize a fake saved workflow on disk + in registry.
+
+        Workflow.from_disk verifies the file exists, so we touch a stub file.
+        Real save tests need the file to genuinely be the prior save's content;
+        for dispatch-logic tests, an empty stub suffices.
+        """
+        (temp_dir / file_name).write_text("# stub")
+        metadata = WorkflowMetadata(
+            name=display_name,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        WorkflowRegistry.generate_new_workflow(registry_key=registry_key, metadata=metadata, file_path=file_name)
+
+    def test_create_versioned_short_circuits_overwrite_existing(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Even when the workflow is already saved, create_versioned=True routes through the versioned situation.
+
+        Without this fix, the OVERWRITE_EXISTING branch would win on the second
+        save and write back to the same file_path — the user's reported symptom
+        ("always get v001 / overwrite in place"). With it, we get a
+        CREATE_VERSIONED scenario whose destination carries the unresolved macro.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow_v001",
+                current_workflow_name="my_flow_v001",
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            # The destination carries the create_versioned_workflow macro (unresolved
+            # `{_index:03}`), so OSManager's seed walks past existing v001 and lands
+            # at v002 on write.
+            assert target.destination is not None
+            assert "_index" in target.destination._file.location
+            # The OVERWRITE_EXISTING path-mode is NOT taken.
+            assert target.file_path is None
+
+    def test_create_versioned_strips_existing_version_suffix_from_base(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Saving over `my_flow_v001` produces a destination based on `my_flow`, not `my_flow_v001`.
+
+        Otherwise we'd get `my_flow_v001_v002.py` instead of `my_flow_v002.py`
+        on the second versioned save.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_flow_v001",
+                file_name="my_flow_v001.py",
+                display_name="",  # Empty forces the file-stem fallback in _derive_versioned_base_name.
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="my_flow_v001",
+                create_versioned=True,
+            )
+
+            # The relative_file_path is computed against the macro-stripped stem
+            # ("my_flow.py"), not the suffixed one.
+            assert target.relative_file_path == "my_flow.py"
+
+    def test_create_versioned_false_preserves_overwrite_existing(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """create_versioned=False against a saved workflow keeps the standard OVERWRITE_EXISTING path."""
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow", file_name="my_flow.py", display_name="my_flow"
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow",
+                current_workflow_name="my_flow",
+                create_versioned=False,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.OVERWRITE_EXISTING
+            assert target.destination is None
+            assert target.file_path is not None
+            assert target.file_path.name == "my_flow.py"
+
+    def test_warning_logged_when_save_workflow_customized_to_create_new(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A project that flips `save_workflow` to create_new triggers a warning on non-versioned saves.
+
+        The save still completes (the configuration isn't broken), but the user
+        sees a heads-up that their `save_workflow` situation now auto-indexes
+        and they may have meant to set `create_versioned=True` instead.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        # Replace the in-memory project's save_workflow with a CREATE_NEW variant.
+        flipped = SituationTemplate(
+            name="save_workflow",
+            description="Customized to create_new",
+            macro="{workspace_dir}/{file_name_base}_v{_index:03}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
+            fallback="save_file",
+        )
+        custom = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={"situations": {**DEFAULT_PROJECT_TEMPLATE.situations, "save_workflow": flipped}}
+        )
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True), caplog.at_level("WARNING"):
+            self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow",
+                current_workflow_name=None,
+                create_versioned=False,
+            )
+
+        assert any("uses 'create_new' policy" in record.message for record in caplog.records), (
+            f"Expected warning about save_workflow policy mismatch, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_warning_logged_when_create_versioned_workflow_customized_to_overwrite(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Inverse mismatch: create_versioned=True against a `create_versioned_workflow` flipped to overwrite.
+
+        A project author who keeps `save_workflow` at its default but flips
+        `create_versioned_workflow` to `overwrite` has broken the contract of
+        the per-save flag — `create_versioned=True` saves will overwrite in
+        place. Surface a warning so the misconfiguration doesn't sit silently.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        flipped = SituationTemplate(
+            name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
+            description="Customized to overwrite",
+            macro="{workspace_dir}/{file_name_base}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+            fallback=BuiltInSituation.SAVE_FILE,
+        )
+        custom = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "situations": {
+                    **DEFAULT_PROJECT_TEMPLATE.situations,
+                    BuiltInSituation.CREATE_VERSIONED_WORKFLOW: flipped,
+                }
+            }
+        )
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True), caplog.at_level("WARNING"):
+            self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow",
+                current_workflow_name=None,
+                create_versioned=True,
+            )
+
+        assert any("Versioned save requested" in record.message for record in caplog.records), (
+            f"Expected warning about create_versioned_workflow policy mismatch, got: {[r.message for r in caplog.records]}"
+        )
+
+    def test_create_versioned_workflow_in_default_template(self) -> None:
+        """``BuiltInSituation.CREATE_VERSIONED_WORKFLOW`` must be present in the default template.
+
+        Sanity guard: if the enum value gets out of sync with the default
+        ``DEFAULT_PROJECT_TEMPLATE.situations`` dict, every `create_versioned=True`
+        save against an unmodified project would silently fall through and warn,
+        not save versioned.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
+
+        situation = DEFAULT_PROJECT_TEMPLATE.situations.get(BuiltInSituation.CREATE_VERSIONED_WORKFLOW)
+        assert situation is not None, "create_versioned_workflow missing from DEFAULT_PROJECT_TEMPLATE"
+        assert situation.policy.on_collision == SituationFilePolicy.CREATE_NEW
+        # Padded `{_index:NN}` slot is what makes the seed-and-retry produce v001/v002/...
+        assert "_index" in situation.macro
+
+    def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: GriptapeNodes) -> None:
+        """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name="brand_new_flow",
+                current_workflow_name=None,
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            assert "_index" in target.destination._file.location
+            # Base name comes from the explicit request; relative_file_path reflects
+            # the unresolved (pre-seed) form.
+            assert target.relative_file_path == "brand_new_flow.py"
+            assert target.file_path is None
