@@ -768,10 +768,10 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
-        if "type" in pd.model_fields_set:
-            existing.type = pd.type or existing.type
-        if "model" in pd.model_fields_set:
-            existing.model = pd.model or existing.model
+        if "type" in pd.model_fields_set and pd.type is not None:
+            existing.type = pd.type
+        if "model" in pd.model_fields_set and pd.model is not None:
+            existing.model = pd.model
         if "base_url" in pd.model_fields_set:
             existing.base_url = pd.base_url or None
         if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):

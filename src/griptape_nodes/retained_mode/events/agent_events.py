@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from griptape_nodes.drivers.cloud_models import ProviderCatalogEntry, ProviderID
 from griptape_nodes.retained_mode.events.base_events import (
@@ -39,6 +39,14 @@ class UpdateProviderPayload(BaseModel):
     model: str | None = None
     base_url: str | None = None
     api_key_secret_name: str | None = None
+
+    @field_validator("type", "model")
+    @classmethod
+    def non_empty_if_provided(cls, v: str | None) -> str | None:
+        if not v:
+            msg = "must be a non-empty string if provided"
+            raise ValueError(msg)
+        return v
 
 
 @dataclass
