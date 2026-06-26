@@ -85,33 +85,32 @@ def build_model(
     Raises:
         ValueError: If required credentials or URLs are missing.
     """
-    if provider == ProviderID.GRIPTAPE_CLOUD:
-        return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
-
-    if provider == ProviderID.OLLAMA:
-        resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
-        # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
-        return OpenAIChatModel(
-            model_name,
-            provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
-        )
-
-    if provider == ProviderID.LMSTUDIO:
-        resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
-        # LM Studio doesn't require auth but the OpenAI client needs a non-empty key.
-        return OpenAIChatModel(
-            model_name,
-            provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
-        )
-
-    # "custom" or any future provider: caller must supply both url and key.
-    if not base_url:
-        msg = f"base_url is required for provider '{provider}'."
-        raise ValueError(msg)
-    if not api_key:
-        msg = f"api_key is required for provider '{provider}'."
-        raise ValueError(msg)
-    return OpenAIChatModel(
-        model_name,
-        provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
-    )
+    match provider:
+        case ProviderID.GRIPTAPE_CLOUD:
+            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
+        case ProviderID.OLLAMA:
+            resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
+            # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+            )
+        case ProviderID.LMSTUDIO:
+            resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
+            # LM Studio doesn't require auth but the OpenAI client needs a non-empty key.
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
+            )
+        case _:
+            # "custom" or any future provider: caller must supply both url and key.
+            if not base_url:
+                msg = f"base_url is required for provider '{provider}'."
+                raise ValueError(msg)
+            if not api_key:
+                msg = f"api_key is required for provider '{provider}'."
+                raise ValueError(msg)
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
+            )
