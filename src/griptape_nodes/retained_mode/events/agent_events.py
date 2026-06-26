@@ -611,7 +611,9 @@ class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     """Current agent configuration retrieved successfully.
 
     Args:
-        provider: Active provider id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"custom"``).
+        provider: Active provider type id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"custom"``).
+        active_provider: ``name`` of the currently active provider. Use this (not ``provider``)
+            to round-trip provider identity, since multiple providers can share the same type.
         model_name: Active prompt model id.
         image_model_name: Active image generation model id.
         base_url: Custom base URL in use for non-Griptape-Cloud providers.
@@ -619,6 +621,7 @@ class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     """
 
     provider: str
+    active_provider: str
     model_name: str
     image_model_name: str
     base_url: str

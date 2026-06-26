@@ -578,6 +578,7 @@ class AgentManager:
         gc = self._get_provider(None)
         return GetAgentConfigResultSuccess(
             provider=str(gc.get("type", _PROTECTED_PROVIDER_NAME)),
+            active_provider=str(gc.get("name", self._active_provider_name)),
             model_name=str(gc.get("model", "")),
             image_model_name=self._image_model_name,
             base_url=str(gc.get("base_url", "")),
