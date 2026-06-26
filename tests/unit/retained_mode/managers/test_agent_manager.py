@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListProviderModelsResultFailure,
     ListProviderModelsResultSuccess,
     PromptDriverConfig,
+    ProviderConfig,
     RunAgentRequestArtifact,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
@@ -56,7 +57,6 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _VALID_PROVIDER_TYPES,
     AgentManager,
-    ProviderConfig,
     _ActiveRun,
     _compose_prompt,
 )
@@ -354,7 +354,7 @@ class TestListAgentProviders:
         assert isinstance(result, ListAgentProvidersResultSuccess)
 
         # Mutating the returned list must not affect internal state.
-        result.providers.append({"name": "injected"})
+        result.providers.append(ProviderConfig(name="injected", type="ollama", model="phi3"))
 
         assert len(providers_manager._providers) == initial_count
 

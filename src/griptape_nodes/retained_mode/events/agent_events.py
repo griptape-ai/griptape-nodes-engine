@@ -14,6 +14,16 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 
+class ProviderConfig(BaseModel):
+    """Typed representation of a chat provider entry stored in agent config."""
+
+    name: str
+    type: str
+    model: str
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
 class PromptDriverConfig(BaseModel):
     """Typed prompt-driver fields accepted by ConfigureAgentRequest."""
 
@@ -689,27 +699,12 @@ class ListAgentProvidersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
     """Agent provider list retrieved successfully.
 
     Args:
-        providers: Ordered list of agent provider config dicts. Each has at
-            minimum ``name``, ``type``, and ``model``. Optional keys the engine
-            stores and returns verbatim (no enforcement):
-
-            ``base_url`` — endpoint URL for non-Griptape-Cloud providers.
-            ``api_key_secret_name`` — name of a secret in the SecretsManager
-                whose value is used as the API key at runtime (``custom`` only).
-            ``enabled`` — frontend toggle; when ``false`` the UI may hide or
-                disable the provider in the picker. The engine does not block
-                ``SetActiveProviderRequest`` based on this value.
-            ``icon`` — URL or data-URI of an image to show next to the provider
-                name in the UI. User-supplied for custom providers; the engine
-                does not validate or resize it.
-            ``description``, ``docs_url``, ``download_url`` — free-form metadata
-                the UI may surface in detail/hover views.
-
-            ``griptape_cloud`` is always the first entry and cannot be deleted.
+        providers: Ordered list of provider configs. ``griptape_cloud`` is
+            always the first entry and cannot be deleted.
         active_provider: ``name`` of the currently active provider.
     """
 
-    providers: list[dict] = field(default_factory=list)
+    providers: list[ProviderConfig] = field(default_factory=list)
     active_provider: str = ""
 
 

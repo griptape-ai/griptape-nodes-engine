@@ -31,7 +31,6 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic import BaseModel
 from pydantic_ai.messages import BinaryContent, ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
@@ -99,6 +98,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListThreadsResultFailure,
     ListThreadsResultSuccess,
     PromptDriverConfig,
+    ProviderConfig,
     RenameThreadRequest,
     RenameThreadResultFailure,
     RenameThreadResultSuccess,
@@ -194,16 +194,6 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
-
-
-class ProviderConfig(BaseModel):
-    """Typed representation of a chat provider entry stored in agent config."""
-
-    name: str
-    type: str
-    model: str
-    base_url: str | None = None
-    api_key_secret_name: str | None = None
 
 
 @dataclass
@@ -721,7 +711,7 @@ class AgentManager:
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
-            providers=[p.model_dump(exclude_none=True) for p in self._providers],
+            providers=list(self._providers),
             active_provider=self._active_provider_name,
             result_details="Chat providers retrieved successfully.",
         )
