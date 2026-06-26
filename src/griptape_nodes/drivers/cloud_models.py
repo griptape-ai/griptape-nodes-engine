@@ -14,6 +14,8 @@ every consumer picks up the change.
 
 from enum import StrEnum
 
+from pydantic import BaseModel
+
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
     ModelCatalogSidebarProperty,
@@ -168,31 +170,38 @@ PROVIDER_CATALOG = ModelCatalogSidebarProperty(
 )
 
 
+class ProviderCatalogEntry(BaseModel):
+    """Serialization-ready response shape for a single provider catalog entry."""
+
+    id: str
+    display_name: str
+    terms_url: str | None = None
+    key_support: KeySupport | None = None
+    notes: str | None = None
+    requires_api_key: bool
+    default_base_url: str | None = None
+    has_model_list: bool = False
+    default_model: str = ""
+
+
 def provider_accepts_customer_key(provider_id: str) -> bool:
     """Return True only if this provider expects the user to supply their own API key."""
     provider = PROVIDER_CATALOG.providers.get(provider_id)
     return provider is not None and provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY
 
 
-def provider_catalog_entries() -> list[dict]:
+def provider_catalog_entries() -> list[ProviderCatalogEntry]:
     """Return the full provider list for the ListAgentModelsResultSuccess response.
 
-    Each entry includes catalog fields (id, display_name, terms_url, key_support,
-    notes) and sidebar-specific fields (default_base_url, has_model_list,
-    default_model). requires_api_key is included as a convenience bool so the
-    frontend doesn't have to parse key_support itself.
+    Each entry includes catalog fields and sidebar-specific fields.
+    requires_api_key is a convenience bool so the frontend doesn't have to
+    parse key_support itself.
     """
     return [
-        {
-            "id": provider_id,
-            "display_name": provider.display_name,
-            "terms_url": provider.terms_url,
-            "key_support": str(provider.key_support) if provider.key_support else None,
-            "notes": provider.notes,
-            "requires_api_key": provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
-            "default_base_url": provider.default_base_url,
-            "has_model_list": provider.has_model_list,
-            "default_model": provider.default_model,
-        }
+        ProviderCatalogEntry(
+            id=provider_id,
+            requires_api_key=provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
+            **provider.model_dump(exclude={"models"}),
+        )
         for provider_id, provider in PROVIDER_CATALOG.providers.items()
     ]

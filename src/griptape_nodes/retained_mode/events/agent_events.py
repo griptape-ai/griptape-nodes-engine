@@ -1,6 +1,6 @@
 from dataclasses import dataclass, field
 
-from griptape_nodes.drivers.cloud_models import ProviderID
+from griptape_nodes.drivers.cloud_models import ProviderCatalogEntry, ProviderID
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
     RequestPayload,
@@ -544,7 +544,7 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     prompt_models: list[str] = field(default_factory=list)
     image_models: list[str] = field(default_factory=list)
     deprecated_models: dict[str, str] = field(default_factory=dict)
-    providers: list[dict] = field(default_factory=list)
+    providers: list[ProviderCatalogEntry] = field(default_factory=list)
 
 
 @dataclass

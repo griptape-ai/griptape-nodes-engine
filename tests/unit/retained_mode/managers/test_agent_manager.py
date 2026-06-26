@@ -20,6 +20,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
     PROVIDER_CATALOG,
+    ProviderCatalogEntry,
     provider_catalog_entries,
 )
 from griptape_nodes.retained_mode.events.agent_events import (
@@ -309,20 +310,13 @@ class TestProviderPresets:
     def test_protected_provider_is_in_catalog(self) -> None:
         assert _PROTECTED_PROVIDER_NAME in PROVIDER_CATALOG.providers
 
-    def test_catalog_entries_have_required_keys(self) -> None:
-        required = {
-            "id",
-            "display_name",
-            "terms_url",
-            "key_support",
-            "notes",
-            "requires_api_key",
-            "default_base_url",
-            "has_model_list",
-            "default_model",
-        }
-        for entry in provider_catalog_entries():
-            assert required <= set(entry.keys()), f"Entry {entry.get('id')!r} is missing keys"
+    def test_catalog_entries_are_typed(self) -> None:
+        entries = provider_catalog_entries()
+        assert len(entries) > 0
+        for entry in entries:
+            assert isinstance(entry, ProviderCatalogEntry)
+            assert entry.id
+            assert entry.display_name
 
 
 # ---------------------------------------------------------------------------
