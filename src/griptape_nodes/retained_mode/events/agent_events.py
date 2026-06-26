@@ -649,10 +649,22 @@ class ListAgentProvidersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 
     Args:
         providers: Ordered list of agent provider config dicts. Each has at
-            minimum ``name``, ``type``, and ``model``. Optional keys:
-            ``base_url``, ``api_key``, ``enabled``, ``description``,
-            ``docs_url``, ``download_url``. ``griptape_cloud`` is always
-            the first entry.
+            minimum ``name``, ``type``, and ``model``. Optional keys the engine
+            stores and returns verbatim (no enforcement):
+
+            ``base_url`` — endpoint URL for non-Griptape-Cloud providers.
+            ``api_key_secret_name`` — name of a secret in the SecretsManager
+                whose value is used as the API key at runtime (``custom`` only).
+            ``enabled`` — frontend toggle; when ``false`` the UI may hide or
+                disable the provider in the picker. The engine does not block
+                ``SetActiveProviderRequest`` based on this value.
+            ``icon`` — URL or data-URI of an image to show next to the provider
+                name in the UI. User-supplied for custom providers; the engine
+                does not validate or resize it.
+            ``description``, ``docs_url``, ``download_url`` — free-form metadata
+                the UI may surface in detail/hover views.
+
+            ``griptape_cloud`` is always the first entry and cannot be deleted.
         active_provider: ``name`` of the currently active provider.
     """
 
@@ -677,8 +689,8 @@ class CreateAgentProviderRequest(RequestPayload):
     Args:
         provider: Provider config dict. Required keys: ``name`` (unique,
             non-empty), ``type`` (one of the known preset ids). Optional:
-            ``model``, ``base_url``, ``api_key``, ``description``,
-            ``docs_url``, ``download_url``.
+            ``model``, ``base_url``, ``api_key_secret_name``, ``enabled``,
+            ``icon``, ``description``, ``docs_url``, ``download_url``.
 
     Results: CreateAgentProviderResultSuccess | CreateAgentProviderResultFailure
     """
