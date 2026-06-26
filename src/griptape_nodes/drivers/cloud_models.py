@@ -16,8 +16,8 @@ from enum import StrEnum
 
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
-    ModelCatalogLibraryProperty,
-    ModelProvider,
+    ModelCatalogSidebarProperty,
+    SidebarModelProvider,
 )
 
 
@@ -128,59 +128,44 @@ LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
 # Provider IDs here must match the model_catalog declaration keys used in
 # griptape-nodes-library-standard so that admin enforcement applies uniformly
 # when the enforcement PR lands.
-PROVIDER_CATALOG = ModelCatalogLibraryProperty(
+PROVIDER_CATALOG = ModelCatalogSidebarProperty(
     providers={
-        ProviderID.GRIPTAPE_CLOUD: ModelProvider(
+        ProviderID.GRIPTAPE_CLOUD: SidebarModelProvider(
             display_name="Griptape Cloud",
             terms_url="https://www.griptape.ai/legal/terms",
             notes="Routes upstream models through Griptape's hosted proxy.",
             key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+            default_base_url=None,
+            has_model_list=True,
+            default_model=MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
         ),
-        ProviderID.OLLAMA: ModelProvider(
+        ProviderID.OLLAMA: SidebarModelProvider(
             display_name="Ollama (local)",
             terms_url="https://ollama.com/terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local Ollama installation.",
+            default_base_url=OLLAMA_DEFAULT_BASE_URL,
+            has_model_list=False,
+            default_model="llama3.2",
         ),
-        ProviderID.LMSTUDIO: ModelProvider(
+        ProviderID.LMSTUDIO: SidebarModelProvider(
             display_name="LM Studio (local)",
             terms_url="https://lmstudio.ai/app-terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local LM Studio installation.",
+            default_base_url=LM_STUDIO_DEFAULT_BASE_URL,
+            has_model_list=False,
+            default_model="",
         ),
-        ProviderID.CUSTOM: ModelProvider(
+        ProviderID.CUSTOM: SidebarModelProvider(
             display_name="Custom (OpenAI-compatible)",
             key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+            default_base_url="",
+            has_model_list=False,
+            default_model="",
         ),
     }
 )
-
-# Sidebar-specific fields that have no ModelProvider equivalent.
-# default_base_url: pre-filled URL (None = use engine default for that provider)
-# has_model_list: True = show the curated MODEL_CHOICES dropdown; False = freetext
-# default_model: value to populate when the user first selects this provider
-_SIDEBAR_EXTRA: dict[str, dict] = {
-    ProviderID.GRIPTAPE_CLOUD: {
-        "default_base_url": None,
-        "has_model_list": True,
-        "default_model": MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
-    },
-    ProviderID.OLLAMA: {
-        "default_base_url": OLLAMA_DEFAULT_BASE_URL,
-        "has_model_list": False,
-        "default_model": "llama3.2",
-    },
-    ProviderID.LMSTUDIO: {
-        "default_base_url": LM_STUDIO_DEFAULT_BASE_URL,
-        "has_model_list": False,
-        "default_model": "",
-    },
-    ProviderID.CUSTOM: {
-        "default_base_url": "",
-        "has_model_list": False,
-        "default_model": "",
-    },
-}
 
 
 def provider_accepts_customer_key(provider_id: str) -> bool:
@@ -192,8 +177,8 @@ def provider_accepts_customer_key(provider_id: str) -> bool:
 def provider_catalog_entries() -> list[dict]:
     """Return the full provider list for the ListAgentModelsResultSuccess response.
 
-    Each entry merges catalog fields (id, display_name, terms_url, key_support,
-    notes) with sidebar-specific fields (default_base_url, has_model_list,
+    Each entry includes catalog fields (id, display_name, terms_url, key_support,
+    notes) and sidebar-specific fields (default_base_url, has_model_list,
     default_model). requires_api_key is included as a convenience bool so the
     frontend doesn't have to parse key_support itself.
     """
@@ -205,7 +190,9 @@ def provider_catalog_entries() -> list[dict]:
             "key_support": str(provider.key_support) if provider.key_support else None,
             "notes": provider.notes,
             "requires_api_key": provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
-            **_SIDEBAR_EXTRA[provider_id],
+            "default_base_url": provider.default_base_url,
+            "has_model_list": provider.has_model_list,
+            "default_model": provider.default_model,
         }
         for provider_id, provider in PROVIDER_CATALOG.providers.items()
     ]
