@@ -563,7 +563,7 @@ class ListProviderModelsRequest(RequestPayload):
     picker when the user has selected a non-Griptape-Cloud provider.
 
     Args:
-        provider: Provider id — ``"griptape_cloud"``, ``"ollama"``, or ``"custom"``.
+        provider: Provider id — ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``, or ``"custom"``.
         base_url: Base URL of the endpoint (required for non-Griptape-Cloud providers).
         api_key: API key sent as ``Authorization: Bearer`` (optional; omit for Ollama).
 
@@ -611,7 +611,7 @@ class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     """Current agent configuration retrieved successfully.
 
     Args:
-        provider: Active provider type id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"custom"``).
+        provider: Active provider type id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``, ``"custom"``).
         active_provider: ``name`` of the currently active provider. Use this (not ``provider``)
             to round-trip provider identity, since multiple providers can share the same type.
         model_name: Active prompt model id.
