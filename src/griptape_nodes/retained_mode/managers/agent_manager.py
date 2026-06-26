@@ -51,6 +51,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
     PROVIDER_CATALOG,
+    ProviderID,
     provider_accepts_customer_key,
     provider_catalog_entries,
 )
@@ -140,7 +141,7 @@ _VALID_PROVIDER_TYPES: frozenset[str] = frozenset(PROVIDER_CATALOG.providers)
 
 
 # The built-in provider that is always present and may never be deleted.
-_PROTECTED_PROVIDER_NAME = "griptape_cloud"
+_PROTECTED_PROVIDER_NAME = ProviderID.GRIPTAPE_CLOUD
 
 config_manager = ConfigManager()
 secrets_manager = SecretsManager(config_manager)
@@ -587,7 +588,7 @@ class AgentManager:
 
     async def on_handle_list_provider_models_request(self, request: ListProviderModelsRequest) -> ResultPayload:
         try:
-            if request.provider == "griptape_cloud":
+            if request.provider == ProviderID.GRIPTAPE_CLOUD:
                 return ListProviderModelsResultSuccess(
                     models=list(MODEL_CHOICES),
                     result_details="Griptape Cloud model list retrieved.",

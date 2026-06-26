@@ -52,6 +52,7 @@ from griptape_nodes.agents.pydantic_ai.image_tools import (
     register_image_tools,
 )
 from griptape_nodes.agents.pydantic_ai.model import build_model
+from griptape_nodes.drivers.cloud_models import ProviderID
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterable, Awaitable, Callable, Sequence
@@ -152,7 +153,7 @@ class PydanticAgentRunner:
     storage: BaseThreadStorageDriver
     instructions: str | None = None
     system_prompt: str | None = None
-    provider: str = "griptape_cloud"
+    provider: str = ProviderID.GRIPTAPE_CLOUD
     base_url: str | None = None
     mcp_servers: list[AbstractToolset[Any]] = field(default_factory=list)
     image_config: ImageGenerationToolsetConfig | None = None

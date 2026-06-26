@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 
+from griptape_nodes.drivers.cloud_models import ProviderID
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
     RequestPayload,
@@ -570,7 +571,7 @@ class ListProviderModelsRequest(RequestPayload):
     Results: ListProviderModelsResultSuccess | ListProviderModelsResultFailure
     """
 
-    provider: str = "griptape_cloud"
+    provider: str = ProviderID.GRIPTAPE_CLOUD
     base_url: str = ""
     api_key: str = ""
 

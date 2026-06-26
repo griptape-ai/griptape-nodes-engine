@@ -20,6 +20,7 @@ from pydantic_ai.providers.openai import OpenAIProvider
 from griptape_nodes.drivers.cloud_models import (
     LM_STUDIO_DEFAULT_BASE_URL,
     OLLAMA_DEFAULT_BASE_URL,
+    ProviderID,
 )
 
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
@@ -61,7 +62,7 @@ def build_griptape_cloud_model(
 def build_model(
     model_name: str,
     *,
-    provider: str = "griptape_cloud",
+    provider: str = ProviderID.GRIPTAPE_CLOUD,
     api_key: str | None = None,
     base_url: str | None = None,
 ) -> OpenAIChatModel:
@@ -84,10 +85,10 @@ def build_model(
     Raises:
         ValueError: If required credentials or URLs are missing.
     """
-    if provider == "griptape_cloud":
+    if provider == ProviderID.GRIPTAPE_CLOUD:
         return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
 
-    if provider == "ollama":
+    if provider == ProviderID.OLLAMA:
         resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
         # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
         return OpenAIChatModel(
@@ -95,7 +96,7 @@ def build_model(
             provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
         )
 
-    if provider == "lmstudio":
+    if provider == ProviderID.LMSTUDIO:
         resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
         # LM Studio doesn't require auth but the OpenAI client needs a non-empty key.
         return OpenAIChatModel(

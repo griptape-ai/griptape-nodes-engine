@@ -12,11 +12,21 @@ Griptape Cloud's ServiceModelConfig table. When Cloud's catalog changes
 every consumer picks up the change.
 """
 
+from enum import StrEnum
+
 from griptape_nodes.node_library.library_declarations import (
     KeySupport,
     ModelCatalogLibraryProperty,
     ModelProvider,
 )
+
+
+class ProviderID(StrEnum):
+    GRIPTAPE_CLOUD = "griptape_cloud"
+    OLLAMA = "ollama"
+    LMSTUDIO = "lmstudio"
+    CUSTOM = "custom"
+
 
 # --- Per-family arg presets ---
 
@@ -120,25 +130,25 @@ LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
 # when the enforcement PR lands.
 PROVIDER_CATALOG = ModelCatalogLibraryProperty(
     providers={
-        "griptape_cloud": ModelProvider(
+        ProviderID.GRIPTAPE_CLOUD: ModelProvider(
             display_name="Griptape Cloud",
             terms_url="https://www.griptape.ai/legal/terms",
             notes="Routes upstream models through Griptape's hosted proxy.",
             key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
         ),
-        "ollama": ModelProvider(
+        ProviderID.OLLAMA: ModelProvider(
             display_name="Ollama (local)",
             terms_url="https://ollama.com/terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local Ollama installation.",
         ),
-        "lmstudio": ModelProvider(
+        ProviderID.LMSTUDIO: ModelProvider(
             display_name="LM Studio (local)",
             terms_url="https://lmstudio.ai/app-terms",
             key_support=KeySupport.NO_KEY_REQUIRED,
             notes="Models are dynamically discovered from the local LM Studio installation.",
         ),
-        "custom": ModelProvider(
+        ProviderID.CUSTOM: ModelProvider(
             display_name="Custom (OpenAI-compatible)",
             key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
         ),
@@ -150,22 +160,22 @@ PROVIDER_CATALOG = ModelCatalogLibraryProperty(
 # has_model_list: True = show the curated MODEL_CHOICES dropdown; False = freetext
 # default_model: value to populate when the user first selects this provider
 _SIDEBAR_EXTRA: dict[str, dict] = {
-    "griptape_cloud": {
+    ProviderID.GRIPTAPE_CLOUD: {
         "default_base_url": None,
         "has_model_list": True,
         "default_model": MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
     },
-    "ollama": {
+    ProviderID.OLLAMA: {
         "default_base_url": OLLAMA_DEFAULT_BASE_URL,
         "has_model_list": False,
         "default_model": "llama3.2",
     },
-    "lmstudio": {
+    ProviderID.LMSTUDIO: {
         "default_base_url": LM_STUDIO_DEFAULT_BASE_URL,
         "has_model_list": False,
         "default_model": "",
     },
-    "custom": {
+    ProviderID.CUSTOM: {
         "default_base_url": "",
         "has_model_list": False,
         "default_model": "",
