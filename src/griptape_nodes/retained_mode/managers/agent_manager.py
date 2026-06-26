@@ -139,11 +139,6 @@ API_KEY_ENV_VAR = "GT_CLOUD_API_KEY"
 _VALID_PROVIDER_TYPES: frozenset[str] = frozenset(PROVIDER_CATALOG.providers)
 
 
-def _provider_api_key_secret_name(provider_name: str) -> str:
-    """Return the secrets-manager key name for a provider's API key."""
-    return SecretsManager._apply_secret_name_compliance(f"AGENT_PROVIDER_{provider_name}_API_KEY")
-
-
 # The built-in provider that is always present and may never be deleted.
 _PROTECTED_PROVIDER_NAME = "griptape_cloud"
 
@@ -561,16 +556,12 @@ class AgentManager:
                     provider[dict_key] = new_value
                     changed = True
         provider_type = str(provider.get("type", ""))
-        if "api_key" in pd and provider_accepts_customer_key(provider_type):
-            new_key = str(pd["api_key"])
-            provider_name = str(provider.get("name", ""))
-            secret_name = _provider_api_key_secret_name(provider_name)
-            if new_key:
-                secrets_manager.set_secret(secret_name, new_key)
-                provider["api_key_ref"] = secret_name
+        if "api_key_secret_name" in pd and provider_accepts_customer_key(provider_type):
+            raw = str(pd["api_key_secret_name"])
+            if raw:
+                provider["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw)
             else:
-                secrets_manager.delete_secret(secret_name)
-                provider.pop("api_key_ref", None)
+                provider.pop("api_key_secret_name", None)
             changed = True
         return changed
 
@@ -665,9 +656,9 @@ class AgentManager:
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
             )
         else:
-            api_key_ref = str(provider.get("api_key_ref", ""))
+            secret_name = str(provider.get("api_key_secret_name", ""))
             api_key = (
-                secrets_manager.get_secret(api_key_ref, should_error_on_not_found=False) or "" if api_key_ref else ""
+                secrets_manager.get_secret(secret_name, should_error_on_not_found=False) or "" if secret_name else ""
             )
             model_base_url = base_url or None
             # Image generation is Griptape Cloud-specific; disable for other providers.
@@ -718,13 +709,11 @@ class AgentManager:
         return runner
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
-        redacted = []
-        for p in self._providers:
-            entry = {k: v for k, v in p.items() if k not in ("api_key", "api_key_ref")}
-            entry["has_api_key"] = bool(p.get("api_key_ref"))
-            redacted.append(entry)
+        # Strip any legacy api_key / api_key_ref fields that may exist in old
+        # provider dicts. api_key_secret_name is just a name — safe to return.
+        sanitized = [{k: v for k, v in p.items() if k not in ("api_key", "api_key_ref")} for p in self._providers]
         return ListAgentProvidersResultSuccess(
-            providers=redacted,
+            providers=sanitized,
             active_provider=self._active_provider_name,
             result_details="Chat providers retrieved successfully.",
         )
@@ -744,12 +733,10 @@ class AgentManager:
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
-        provider = {k: v for k, v in request.provider.items() if k != "api_key"}
-        api_key = str(request.provider.get("api_key", ""))
-        if api_key and provider_accepts_customer_key(provider_type):
-            secret_name = _provider_api_key_secret_name(name)
-            secrets_manager.set_secret(secret_name, api_key)
-            provider["api_key_ref"] = secret_name
+        provider = {k: v for k, v in request.provider.items() if k not in ("api_key", "api_key_ref")}
+        raw_secret_name = str(request.provider.get("api_key_secret_name", ""))
+        if raw_secret_name and provider_accepts_customer_key(provider_type):
+            provider["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw_secret_name)
         self._providers.append(provider)
         self._persist_providers()
         self._runner_cache.clear()
@@ -765,20 +752,17 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
             )
-        update = {k: v for k, v in request.provider.items() if k != "api_key"}
+        update = {k: v for k, v in request.provider.items() if k not in ("api_key", "api_key_ref")}
         resolved_type = str(request.provider.get("type", existing.get("type", "")))
-        if "api_key" in request.provider and provider_accepts_customer_key(resolved_type):
-            new_key = str(request.provider["api_key"])
-            secret_name = _provider_api_key_secret_name(request.name)
-            if new_key:
-                secrets_manager.set_secret(secret_name, new_key)
-                update["api_key_ref"] = secret_name
+        if "api_key_secret_name" in request.provider and provider_accepts_customer_key(resolved_type):
+            raw = str(request.provider["api_key_secret_name"])
+            if raw:
+                update["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw)
             else:
-                secrets_manager.delete_secret(secret_name)
-                update["api_key_ref"] = None
+                update["api_key_secret_name"] = None
         existing.update(update)
-        if existing.get("api_key_ref") is None:
-            existing.pop("api_key_ref", None)
+        if existing.get("api_key_secret_name") is None:
+            existing.pop("api_key_secret_name", None)
         existing["name"] = request.name  # name is the stable key — never allow rename via update
         self._persist_providers()
         self._runner_cache.clear()
@@ -798,9 +782,6 @@ class AgentManager:
             return DeleteAgentProviderResultFailure(
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it is the last remaining provider."
             )
-        api_key_ref = str(self._providers[idx].get("api_key_ref", ""))
-        if api_key_ref:
-            secrets_manager.delete_secret(api_key_ref)
         self._providers.pop(idx)
         if self._active_provider_name == request.name:
             self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
