@@ -51,6 +51,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
     PROVIDER_CATALOG,
+    provider_accepts_customer_key,
     provider_catalog_entries,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
@@ -559,7 +560,8 @@ class AgentManager:
                 if provider.get(dict_key) != new_value:
                     provider[dict_key] = new_value
                     changed = True
-        if "api_key" in pd:
+        provider_type = str(provider.get("type", ""))
+        if "api_key" in pd and provider_accepts_customer_key(provider_type):
             new_key = str(pd["api_key"])
             provider_name = str(provider.get("name", ""))
             secret_name = _provider_api_key_secret_name(provider_name)
@@ -744,7 +746,7 @@ class AgentManager:
             )
         provider = {k: v for k, v in request.provider.items() if k != "api_key"}
         api_key = str(request.provider.get("api_key", ""))
-        if api_key:
+        if api_key and provider_accepts_customer_key(provider_type):
             secret_name = _provider_api_key_secret_name(name)
             secrets_manager.set_secret(secret_name, api_key)
             provider["api_key_ref"] = secret_name
@@ -764,7 +766,8 @@ class AgentManager:
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
             )
         update = {k: v for k, v in request.provider.items() if k != "api_key"}
-        if "api_key" in request.provider:
+        resolved_type = str(request.provider.get("type", existing.get("type", "")))
+        if "api_key" in request.provider and provider_accepts_customer_key(resolved_type):
             new_key = str(request.provider["api_key"])
             secret_name = _provider_api_key_secret_name(request.name)
             if new_key:

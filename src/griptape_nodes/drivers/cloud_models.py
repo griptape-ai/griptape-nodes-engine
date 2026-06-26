@@ -173,6 +173,12 @@ _SIDEBAR_EXTRA: dict[str, dict] = {
 }
 
 
+def provider_accepts_customer_key(provider_id: str) -> bool:
+    """Return True only if this provider expects the user to supply their own API key."""
+    provider = PROVIDER_CATALOG.providers.get(provider_id)
+    return provider is not None and provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY
+
+
 def provider_catalog_entries() -> list[dict]:
     """Return the full provider list for the ListAgentModelsResultSuccess response.
 
