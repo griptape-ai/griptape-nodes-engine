@@ -51,7 +51,7 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
     PROVIDER_CATALOG,
-    PROVIDER_PRESETS,
+    provider_catalog_entries,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 from griptape_nodes.retained_mode.events.agent_events import (
@@ -577,7 +577,7 @@ class AgentManager:
             prompt_models=list(MODEL_CHOICES),
             image_models=list(IMAGE_MODEL_CHOICES),
             deprecated_models={**DEPRECATED_MODELS, **IMAGE_DEPRECATED_MODELS},
-            provider_presets=list(PROVIDER_PRESETS),
+            providers=provider_catalog_entries(),
             result_details="Agent model lists retrieved successfully.",
         )
 

@@ -19,7 +19,8 @@ from griptape_nodes.drivers.cloud_models import (
     IMAGE_DEPRECATED_MODELS,
     IMAGE_MODEL_CHOICES,
     MODEL_CHOICES,
-    PROVIDER_PRESETS,
+    PROVIDER_CATALOG,
+    provider_catalog_entries,
 )
 from griptape_nodes.retained_mode.events.agent_events import (
     CancelAgentRequest,
@@ -299,20 +300,28 @@ class TestComposePrompt:
 
 
 class TestProviderPresets:
-    """PROVIDER_PRESETS is the source of truth for _VALID_PROVIDER_TYPES."""
+    """PROVIDER_CATALOG is the source of truth for provider config."""
 
-    def test_valid_provider_types_matches_preset_ids(self) -> None:
-        expected = frozenset(p["id"] for p in PROVIDER_PRESETS)
-        assert expected == _VALID_PROVIDER_TYPES
+    def test_valid_provider_types_matches_catalog_ids(self) -> None:
+        assert frozenset(PROVIDER_CATALOG.providers) == _VALID_PROVIDER_TYPES
 
-    def test_protected_provider_is_in_presets(self) -> None:
-        ids = {p["id"] for p in PROVIDER_PRESETS}
-        assert _PROTECTED_PROVIDER_NAME in ids
+    def test_protected_provider_is_in_catalog(self) -> None:
+        assert _PROTECTED_PROVIDER_NAME in PROVIDER_CATALOG.providers
 
-    def test_presets_have_required_keys(self) -> None:
-        required = {"id", "name", "default_base_url", "requires_api_key", "has_model_list", "default_model"}
-        for preset in PROVIDER_PRESETS:
-            assert required <= set(preset.keys()), f"Preset {preset.get('id')!r} is missing keys"
+    def test_catalog_entries_have_required_keys(self) -> None:
+        required = {
+            "id",
+            "display_name",
+            "terms_url",
+            "key_support",
+            "notes",
+            "requires_api_key",
+            "default_base_url",
+            "has_model_list",
+            "default_model",
+        }
+        for entry in provider_catalog_entries():
+            assert required <= set(entry.keys()), f"Entry {entry.get('id')!r} is missing keys"
 
 
 # ---------------------------------------------------------------------------

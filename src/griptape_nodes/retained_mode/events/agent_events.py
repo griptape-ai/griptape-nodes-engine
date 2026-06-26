@@ -532,15 +532,18 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
         image_models: Ordered list of image-model IDs available on Griptape Cloud.
         deprecated_models: Mapping of deprecated model ID to live replacement
             (covers both the prompt and image namespaces).
-        provider_presets: List of provider preset dicts, each with keys:
-            ``id``, ``name``, ``default_base_url``, ``requires_api_key``,
-            ``has_model_list``, ``default_model``.
+        providers: Ordered list of provider catalog entries. Each entry has:
+            ``id``, ``display_name``, ``terms_url`` (str or None),
+            ``key_support`` (str or None), ``notes`` (str or None),
+            ``requires_api_key`` (bool convenience field),
+            ``default_base_url`` (str or None), ``has_model_list`` (bool),
+            ``default_model`` (str).
     """
 
     prompt_models: list[str] = field(default_factory=list)
     image_models: list[str] = field(default_factory=list)
     deprecated_models: dict[str, str] = field(default_factory=dict)
-    provider_presets: list[dict] = field(default_factory=list)
+    providers: list[dict] = field(default_factory=list)
 
 
 @dataclass

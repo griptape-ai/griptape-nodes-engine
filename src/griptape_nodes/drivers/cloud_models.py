@@ -172,15 +172,24 @@ _SIDEBAR_EXTRA: dict[str, dict] = {
     },
 }
 
-# Derived list for UI consumption and backward compatibility.
-# requires_api_key is derived from key_support; all other sidebar-specific
-# fields come from _SIDEBAR_EXTRA.
-PROVIDER_PRESETS: list[dict] = [
-    {
-        "id": provider_id,
-        "name": provider.display_name,
-        "requires_api_key": provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
-        **_SIDEBAR_EXTRA[provider_id],
-    }
-    for provider_id, provider in PROVIDER_CATALOG.providers.items()
-]
+
+def provider_catalog_entries() -> list[dict]:
+    """Return the full provider list for the ListAgentModelsResultSuccess response.
+
+    Each entry merges catalog fields (id, display_name, terms_url, key_support,
+    notes) with sidebar-specific fields (default_base_url, has_model_list,
+    default_model). requires_api_key is included as a convenience bool so the
+    frontend doesn't have to parse key_support itself.
+    """
+    return [
+        {
+            "id": provider_id,
+            "display_name": provider.display_name,
+            "terms_url": provider.terms_url,
+            "key_support": str(provider.key_support) if provider.key_support else None,
+            "notes": provider.notes,
+            "requires_api_key": provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
+            **_SIDEBAR_EXTRA[provider_id],
+        }
+        for provider_id, provider in PROVIDER_CATALOG.providers.items()
+    ]
