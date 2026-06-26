@@ -85,6 +85,8 @@ def build_model(
     Raises:
         ValueError: If required credentials or URLs are missing.
     """
+    # Pylance may warn "explicit returns mixed with implicit returns" here, but every
+    # branch either raises or returns — case _: is exhaustive. Pyright agrees.
     match provider:
         case ProviderID.GRIPTAPE_CLOUD:
             return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
