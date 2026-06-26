@@ -190,6 +190,24 @@ class ModelCatalogLibraryProperty(BaseModel):
     providers: dict[str, ModelProvider] = Field(default_factory=dict)
 
 
+class SidebarModelProvider(ModelProvider):
+    """Extends ModelProvider with UI fields used by the engine's chat sidebar.
+
+    These fields are engine/sidebar-specific and do not belong in a library's
+    griptape_nodes_library.json declaration.
+    """
+
+    default_base_url: str | None = None
+    has_model_list: bool = False
+    default_model: str = ""
+
+
+class ModelCatalogSidebarProperty(BaseModel):
+    """Engine-side catalog that merges library provider metadata with sidebar UI fields."""
+
+    providers: dict[str, SidebarModelProvider] = Field(default_factory=dict)
+
+
 class LibraryDependencyDeclaration(BaseModel):
     """Declares another Griptape Node Library that this library depends on.
 
