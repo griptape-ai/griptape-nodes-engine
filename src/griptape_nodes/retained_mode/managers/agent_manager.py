@@ -31,6 +31,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
+from pydantic import BaseModel
 from pydantic_ai.messages import BinaryContent, ModelMessagesTypeAdapter
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
@@ -194,6 +195,16 @@ _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
 
 
+class ProviderConfig(BaseModel):
+    """Typed representation of a chat provider entry stored in agent config."""
+
+    name: str
+    type: str
+    model: str
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
 @dataclass
 class _ActiveRun:
     """Handle to an in-flight agent run, used to deliver cancellation.
@@ -215,7 +226,7 @@ class AgentManager:
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
-        self._providers: list[dict] = []
+        self._providers: list[ProviderConfig] = []
         self._active_provider_name: str = _PROTECTED_PROVIDER_NAME
         self._load_providers_from_config()
 
@@ -281,17 +292,17 @@ class AgentManager:
         self._mcp_server_port = sock.getsockname()[1]
         threading.Thread(target=start_mcp_server, args=(sock,), daemon=True, name="mcp-server").start()
 
-    def _get_provider(self, name: str | None) -> dict:
-        """Return the provider dict for name, falling back to the active provider."""
+    def _get_provider(self, name: str | None) -> ProviderConfig:
+        """Return the ProviderConfig for name, falling back to the active provider."""
         lookup = name or self._active_provider_name
         for p in self._providers:
-            if p.get("name") == lookup:
+            if p.name == lookup:
                 return p
         for p in self._providers:
-            if p.get("name") == _PROTECTED_PROVIDER_NAME:
+            if p.name == _PROTECTED_PROVIDER_NAME:
                 return p
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
-        return {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": default_model}
+        return ProviderConfig(name=_PROTECTED_PROVIDER_NAME, type=_PROTECTED_PROVIDER_NAME, model=default_model)
 
     def _on_config_changed(self, event: ConfigChanged) -> None:
         _provider_keys = ("agent.providers", "agent.active_provider", "agent.griptape_cloud_model", "agent", "")
@@ -526,7 +537,7 @@ class AgentManager:
                     self._image_model_name = new_image_model
                     changed = True
             if request.active_provider:
-                provider_names = {p.get("name") for p in self._providers}
+                provider_names = {p.name for p in self._providers}
                 if request.active_provider not in provider_names:
                     return ConfigureAgentResultFailure(
                         result_details=f"Attempted to set active provider '{request.active_provider}'. Failed because it does not exist."
@@ -547,22 +558,19 @@ class AgentManager:
         """Apply prompt driver config fields to the active provider, return True if any value changed."""
         provider = self._get_provider(None)
         changed = False
-        for req_key, dict_key in (
-            ("model", "model"),
-            ("base_url", "base_url"),
-        ):
-            if req_key in pd:
-                new_value = str(pd[req_key])
-                if provider.get(dict_key) != new_value:
-                    provider[dict_key] = new_value
-                    changed = True
-        provider_type = str(provider.get("type", ""))
-        if "api_key_secret_name" in pd and provider_accepts_customer_key(provider_type):
+        if "model" in pd:
+            new_value = str(pd["model"])
+            if provider.model != new_value:
+                provider.model = new_value
+                changed = True
+        if "base_url" in pd:
+            new_value = str(pd["base_url"]) or None
+            if provider.base_url != new_value:
+                provider.base_url = new_value
+                changed = True
+        if "api_key_secret_name" in pd and provider_accepts_customer_key(provider.type):
             raw = str(pd["api_key_secret_name"])
-            if raw:
-                provider["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw)
-            else:
-                provider.pop("api_key_secret_name", None)
+            provider.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
             changed = True
         return changed
 
@@ -578,11 +586,11 @@ class AgentManager:
     def on_handle_get_agent_config_request(self, _: GetAgentConfigRequest) -> ResultPayload:
         gc = self._get_provider(None)
         return GetAgentConfigResultSuccess(
-            provider=str(gc.get("type", _PROTECTED_PROVIDER_NAME)),
-            active_provider=str(gc.get("name", self._active_provider_name)),
-            model_name=str(gc.get("model", "")),
+            provider=gc.type,
+            active_provider=gc.name,
+            model_name=gc.model,
             image_model_name=self._image_model_name,
-            base_url=str(gc.get("base_url", "")),
+            base_url=gc.base_url or "",
             result_details="Agent config retrieved successfully.",
         )
 
@@ -640,9 +648,9 @@ class AgentManager:
         model_name: str | None = None,
     ) -> PydanticAgentRunner:
         provider = self._get_provider(provider_name)
-        provider_type = str(provider.get("type", _PROTECTED_PROVIDER_NAME))
-        model_name = model_name or str(provider.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"))
-        base_url = str(provider.get("base_url", ""))
+        provider_type = provider.type
+        model_name = model_name or provider.model
+        base_url = provider.base_url or ""
 
         if provider_type == _PROTECTED_PROVIDER_NAME:
             api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
@@ -658,7 +666,7 @@ class AgentManager:
                 api_key=api_key, model=self._image_model_name, base_url=cloud_base_url
             )
         else:
-            secret_name = str(provider.get("api_key_secret_name", ""))
+            secret_name = provider.api_key_secret_name or ""
             api_key = (
                 secrets_manager.get_secret(secret_name, should_error_on_not_found=False) or "" if secret_name else ""
             )
@@ -711,11 +719,8 @@ class AgentManager:
         return runner
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
-        # Strip any legacy api_key / api_key_ref fields that may exist in old
-        # provider dicts. api_key_secret_name is just a name — safe to return.
-        sanitized = [{k: v for k, v in p.items() if k not in ("api_key", "api_key_ref")} for p in self._providers]
         return ListAgentProvidersResultSuccess(
-            providers=sanitized,
+            providers=[p.model_dump(exclude_none=True) for p in self._providers],
             active_provider=self._active_provider_name,
             result_details="Chat providers retrieved successfully.",
         )
@@ -731,21 +736,28 @@ class AgentManager:
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider '{name}'. Failed because type '{provider_type}' is not a known preset id."
             )
-        if any(p.get("name") == name for p in self._providers):
+        if any(p.name == name for p in self._providers):
             return CreateAgentProviderResultFailure(
                 result_details=f"Attempted to create provider. Failed because a provider named '{name}' already exists."
             )
-        provider = {k: v for k, v in request.provider.items() if k not in ("api_key", "api_key_ref")}
         raw_secret_name = str(request.provider.get("api_key_secret_name", ""))
+        api_key_secret_name = None
         if raw_secret_name and provider_accepts_customer_key(provider_type):
-            provider["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw_secret_name)
+            api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw_secret_name)
+        provider = ProviderConfig(
+            name=name,
+            type=provider_type,
+            model=str(request.provider.get("model", MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o")),
+            base_url=str(request.provider.get("base_url", "")) or None,
+            api_key_secret_name=api_key_secret_name,
+        )
         self._providers.append(provider)
         self._persist_providers()
         self._runner_cache.clear()
         return CreateAgentProviderResultSuccess(name=name, result_details=f"Provider '{name}' created successfully.")
 
     def on_handle_update_agent_provider_request(self, request: UpdateAgentProviderRequest) -> ResultPayload:
-        existing = next((p for p in self._providers if p.get("name") == request.name), None)
+        existing = next((p for p in self._providers if p.name == request.name), None)
         if existing is None:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because it does not exist."
@@ -754,18 +766,17 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{request.provider['type']}' is not a known preset id."
             )
-        update = {k: v for k, v in request.provider.items() if k not in ("api_key", "api_key_ref")}
-        resolved_type = str(request.provider.get("type", existing.get("type", "")))
+        resolved_type = str(request.provider.get("type", existing.type))
+        if "type" in request.provider:
+            existing.type = str(request.provider["type"])
+        if "model" in request.provider:
+            existing.model = str(request.provider["model"])
+        if "base_url" in request.provider:
+            existing.base_url = str(request.provider["base_url"]) or None
         if "api_key_secret_name" in request.provider and provider_accepts_customer_key(resolved_type):
             raw = str(request.provider["api_key_secret_name"])
-            if raw:
-                update["api_key_secret_name"] = SecretsManager._apply_secret_name_compliance(raw)
-            else:
-                update["api_key_secret_name"] = None
-        existing.update(update)
-        if existing.get("api_key_secret_name") is None:
-            existing.pop("api_key_secret_name", None)
-        existing["name"] = request.name  # name is the stable key — never allow rename via update
+            existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
+        # name is the stable key — never allow rename via update
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
@@ -775,7 +786,7 @@ class AgentManager:
             return DeleteAgentProviderResultFailure(
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it is a protected provider."
             )
-        idx = next((i for i, p in enumerate(self._providers) if p.get("name") == request.name), None)
+        idx = next((i for i, p in enumerate(self._providers) if p.name == request.name), None)
         if idx is None:
             return DeleteAgentProviderResultFailure(
                 result_details=f"Attempted to delete provider '{request.name}'. Failed because it does not exist."
@@ -786,7 +797,7 @@ class AgentManager:
             )
         self._providers.pop(idx)
         if self._active_provider_name == request.name:
-            self._active_provider_name = str(self._providers[0].get("name", _PROTECTED_PROVIDER_NAME))
+            self._active_provider_name = self._providers[0].name
         self._persist_providers()
         self._runner_cache.clear()
         return DeleteAgentProviderResultSuccess(
@@ -801,24 +812,28 @@ class AgentManager:
         """
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
         gc_model = str(config_manager.get_config_value("agent.griptape_cloud_model") or default_model)
-        gc_provider: dict = {"name": _PROTECTED_PROVIDER_NAME, "type": _PROTECTED_PROVIDER_NAME, "model": gc_model}
+        gc_provider = ProviderConfig(name=_PROTECTED_PROVIDER_NAME, type=_PROTECTED_PROVIDER_NAME, model=gc_model)
 
         raw_providers = config_manager.get_config_value("agent.providers")
         if isinstance(raw_providers, list):
             # Strip any griptape_cloud entry — it is always synthesized above.
-            user_providers = [p for p in raw_providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
+            user_providers = [
+                ProviderConfig.model_validate(p)
+                for p in raw_providers
+                if isinstance(p, dict) and p.get("name") != _PROTECTED_PROVIDER_NAME
+            ]
             self._providers = [gc_provider, *user_providers]
         else:
             self._providers = [gc_provider, *self._migrate_legacy_user_providers()]
 
         saved_active = config_manager.get_config_value("agent.active_provider")
-        provider_names = {p.get("name") for p in self._providers}
+        provider_names = {p.name for p in self._providers}
         if isinstance(saved_active, str) and saved_active in provider_names:
             self._active_provider_name = saved_active
         else:
             self._active_provider_name = _PROTECTED_PROVIDER_NAME
 
-    def _migrate_legacy_user_providers(self) -> list[dict]:
+    def _migrate_legacy_user_providers(self) -> list[ProviderConfig]:
         """Return user-defined providers migrated from the old flat agent.provider config.
 
         Returns only non-griptape_cloud entries; gc is always synthesized separately.
@@ -835,10 +850,14 @@ class AgentManager:
         # agent.model was a sibling key some users set intuitively; fall back to it
         # before the catalog default so the migration preserves their intent.
         model = str(legacy.get("model") or config_manager.get_config_value("agent.model") or default_model)
-        migrated: dict = {"name": type_id, "type": type_id, "model": model}
-        if "base_url" in legacy:
-            migrated["base_url"] = legacy["base_url"]
-        return [migrated]
+        return [
+            ProviderConfig(
+                name=type_id,
+                type=type_id,
+                model=model,
+                base_url=str(legacy["base_url"]) if "base_url" in legacy else None,
+            )
+        ]
 
     def _persist_providers(self) -> None:
         """Write chat provider state to config.
@@ -847,14 +866,14 @@ class AgentManager:
         always synthesized on load. Its model override (when changed from default)
         is stored separately under agent.griptape_cloud_model.
         """
-        user_providers = [p for p in self._providers if p.get("name") != _PROTECTED_PROVIDER_NAME]
-        config_manager.set_config_value("agent.providers", user_providers)
+        user_providers = [p for p in self._providers if p.name != _PROTECTED_PROVIDER_NAME]
+        config_manager.set_config_value("agent.providers", [p.model_dump(exclude_none=True) for p in user_providers])
         config_manager.set_config_value("agent.active_provider", self._active_provider_name)
 
-        gc = next((p for p in self._providers if p.get("name") == _PROTECTED_PROVIDER_NAME), None)
+        gc = next((p for p in self._providers if p.name == _PROTECTED_PROVIDER_NAME), None)
         default_model = MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"
-        if gc and gc.get("model") != default_model:
-            config_manager.set_config_value("agent.griptape_cloud_model", gc.get("model"))
+        if gc and gc.model != default_model:
+            config_manager.set_config_value("agent.griptape_cloud_model", gc.model)
 
     def _compose_instructions(self, server_rules: list[str], *, include_image_tool: bool) -> str:
         """Compose the instructions string from base rules and per-MCP-server rules."""

@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _VALID_PROVIDER_TYPES,
     AgentManager,
+    ProviderConfig,
     _ActiveRun,
     _compose_prompt,
 )
@@ -72,8 +73,8 @@ def providers_manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
     """Build an AgentManager with a known two-provider list, no config I/O."""
     manager = AgentManager.__new__(AgentManager)
     manager._providers = [
-        {"name": "griptape_cloud", "type": "griptape_cloud", "model": "gpt-4o"},
-        {"name": "my-ollama", "type": "ollama", "model": "llama3.2", "base_url": "http://localhost:11434/v1"},
+        ProviderConfig(name="griptape_cloud", type="griptape_cloud", model="gpt-4o"),
+        ProviderConfig(name="my-ollama", type="ollama", model="llama3.2", base_url="http://localhost:11434/v1"),
     ]
     manager._active_provider_name = "griptape_cloud"
     manager._runner_cache = {}
@@ -374,7 +375,7 @@ class TestCreateAgentProvider:
 
         assert isinstance(result, CreateAgentProviderResultSuccess)
         assert result.name == "home-ollama"
-        assert any(p["name"] == "home-ollama" for p in providers_manager._providers)
+        assert any(p.name == "home-ollama" for p in providers_manager._providers)
 
     def test_create_clears_runner_cache(self, providers_manager: AgentManager) -> None:
         providers_manager._runner_cache[("griptape_cloud", "gpt-4o", "img", "", "", ())] = object()  # type: ignore[assignment]
@@ -440,16 +441,16 @@ class TestUpdateAgentProvider:
         )
 
         assert isinstance(result, UpdateAgentProviderResultSuccess)
-        updated = next(p for p in providers_manager._providers if p["name"] == "my-ollama")
-        assert updated["model"] == "phi3"
-        assert updated["base_url"] == "http://localhost:11434/v1"  # untouched
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.model == "phi3"
+        assert updated.base_url == "http://localhost:11434/v1"  # untouched
 
     def test_update_does_not_allow_rename(self, providers_manager: AgentManager) -> None:
         providers_manager.on_handle_update_agent_provider_request(
             UpdateAgentProviderRequest(name="my-ollama", provider={"name": "renamed", "model": "phi3"})
         )
 
-        names = [p["name"] for p in providers_manager._providers]
+        names = [p.name for p in providers_manager._providers]
         assert "my-ollama" in names
         assert "renamed" not in names
 
@@ -484,8 +485,8 @@ class TestUpdateAgentProvider:
         )
 
         assert isinstance(result, UpdateAgentProviderResultSuccess)
-        updated = next(p for p in providers_manager._providers if p["name"] == "my-ollama")
-        assert updated["type"] == "lmstudio"
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.type == "lmstudio"
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +500,7 @@ class TestDeleteAgentProvider:
 
         assert isinstance(result, DeleteAgentProviderResultSuccess)
         assert result.name == "my-ollama"
-        assert not any(p["name"] == "my-ollama" for p in providers_manager._providers)
+        assert not any(p.name == "my-ollama" for p in providers_manager._providers)
 
     def test_delete_clears_runner_cache(self, providers_manager: AgentManager) -> None:
         providers_manager._runner_cache[("ollama", "llama3.2", "img", "http://x", "", ())] = object()  # type: ignore[assignment]
@@ -528,7 +529,7 @@ class TestDeleteAgentProvider:
 
     def test_delete_fails_when_last_provider(self, providers_manager: AgentManager) -> None:
         # Remove the griptape_cloud provider so only one remains.
-        providers_manager._providers = [{"name": "solo", "type": "ollama", "model": "phi3"}]
+        providers_manager._providers = [ProviderConfig(name="solo", type="ollama", model="phi3")]
 
         result = providers_manager.on_handle_delete_agent_provider_request(DeleteAgentProviderRequest(name="solo"))
 
@@ -737,5 +738,5 @@ class TestConfigureAgentActiveProvider:
         )
 
         assert isinstance(result, ConfigureAgentResultSuccess)
-        gc = next(p for p in providers_manager._providers if p["name"] == "griptape_cloud")
-        assert gc["model"] == "gpt-5"
+        gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert gc.model == "gpt-5"
