@@ -734,6 +734,10 @@ class WorkflowManager:
     def should_squelch_workflow_altered(self) -> bool:
         return self._squelch_workflow_altered_count > 0
 
+    def on_clear_object_state(self) -> None:
+        """Clear per-workflow state when the engine is reset."""
+        self._variable_substitution_enabled.clear()
+
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""
         context_manager = GriptapeNodes.ContextManager()

@@ -136,6 +136,7 @@ class ObjectManager:
 
         # Clear all local workflow variables
         GriptapeNodes.VariablesManager().on_clear_object_state()
+        GriptapeNodes.WorkflowManager().on_clear_object_state()
         # Clear all event suppression
         GriptapeNodes.EventManager().clear_event_suppression()
 
