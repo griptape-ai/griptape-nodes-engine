@@ -171,6 +171,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowResultSuccess,
     SetVariableSubstitutionEnabledRequest,
     SetVariableSubstitutionEnabledResultFailure,
+    SetVariableSubstitutionEnabledResultNotAlteredSuccess,
     SetVariableSubstitutionEnabledResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
@@ -521,9 +522,12 @@ class WorkflowManager:
             )
         workflow_name = context_manager.get_current_workflow_name()
         self._variable_substitution_enabled[workflow_name] = request.enabled
-        return SetVariableSubstitutionEnabledResultSuccess(
-            result_details=f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
+        details = (
+            f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
         )
+        if request.initial_setup:
+            return SetVariableSubstitutionEnabledResultNotAlteredSuccess(result_details=details)
+        return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # All of the libraries have loaded, and any workflows they came with have been registered.
@@ -4113,6 +4117,7 @@ class WorkflowManager:
                                 args=[],
                                 keywords=[
                                     ast.keyword(arg="enabled", value=ast.Constant(value=False)),
+                                    ast.keyword(arg="initial_setup", value=ast.Constant(value=True)),
                                 ],
                             )
                         ],

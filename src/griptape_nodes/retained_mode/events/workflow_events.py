@@ -1160,15 +1160,24 @@ class SetVariableSubstitutionEnabledRequest(RequestPayload):
     Args:
         enabled: True (default) to substitute {VAR} tokens at execution time;
                  False to leave parameter values unchanged.
+        initial_setup: True when called from build_workflow() during file load.
+                       Prevents marking the workflow as unsaved on reload.
     """
 
     enabled: bool = True
+    initial_setup: bool = False
 
 
 @dataclass
 @PayloadRegistry.register
 class SetVariableSubstitutionEnabledResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Variable substitution flag updated successfully."""
+    """Variable substitution flag updated successfully (interactive change)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariableSubstitutionEnabledResultNotAlteredSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variable substitution flag restored successfully during workflow load."""
 
 
 @dataclass
