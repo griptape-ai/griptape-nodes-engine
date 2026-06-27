@@ -1436,12 +1436,12 @@ class BaseNode(ABC):
         if not parsed.get_variables():
             return text
 
+        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+            return text
+
         try:
             flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
         except KeyError:
-            return text
-
-        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
             return text
 
         variables = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
