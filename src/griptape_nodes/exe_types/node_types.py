@@ -1418,10 +1418,7 @@ class BaseNode(ABC):
         # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        try:
-            connections = GriptapeNodes.FlowManager().get_connections()
-        except Exception:
-            return False
+        connections = GriptapeNodes.FlowManager().get_connections()
         node_connections = connections.incoming_index.get(self.name)
         if node_connections is None:
             return False
