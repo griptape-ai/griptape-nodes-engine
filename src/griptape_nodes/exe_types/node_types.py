@@ -11,6 +11,10 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
+from griptape_nodes.common.macro_parser.resolution import partial_resolve
+from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
@@ -1004,8 +1008,17 @@ class BaseNode(ABC):
             if value is not None:
                 return value
         if param_name in self.parameter_values:
-            return self.parameter_values[param_name]
-        return param.default_value
+            value = self.parameter_values[param_name]
+        else:
+            value = param.default_value
+        if (
+            isinstance(value, str)
+            and "{" in value
+            and _in_aprocess.get()
+            and not self._param_has_incoming_connection(param_name)
+        ):
+            value = self._resolve_variables_in_string(value)
+        return value
 
     def get_parameter_list_value(self, param: str) -> list:
         """Flattens the given param from self.params into a single list.
@@ -1401,6 +1414,52 @@ class BaseNode(ABC):
         # Use reorder_elements to apply the move
         self.reorder_elements(list(new_order))
 
+    def _param_has_incoming_connection(self, param_name: str) -> bool:
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        try:
+            connections = GriptapeNodes.FlowManager().get_connections()
+        except Exception:
+            return False
+        node_connections = connections.incoming_index.get(self.name)
+        if node_connections is None:
+            return False
+        return param_name in node_connections
+
+    def _resolve_variables_in_string(self, text: str) -> str:
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        try:
+            parsed = ParsedMacro(text)
+        except MacroSyntaxError:
+            return text
+
+        if not parsed.get_variables():
+            return text
+
+        try:
+            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
+        except KeyError:
+            return text
+
+        variables = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
+        secrets_manager = GriptapeNodes.SecretsManager()
+
+        try:
+            result = partial_resolve(parsed.template, parsed.segments, variables, secrets_manager)
+        except MacroResolutionError:
+            return text
+
+        parts = []
+        for segment in result.segments:
+            if isinstance(segment, ParsedStaticValue):
+                parts.append(segment.text)
+            elif isinstance(segment, ParsedVariable):
+                parts.append(f"{{{segment.info.name}}}")
+        return "".join(parts)
+
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
 
@@ -1663,7 +1722,20 @@ class TrackedParameterOutputValues(dict[str, Any]):
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
-            event_data["value"] = value
+
+            # When a PROPERTY|OUTPUT parameter contains a variable template (e.g.
+            # "{SHOT}") and substitution ran during execution, the computed output
+            # value would overwrite the template in the UI. Show the raw typed
+            # value instead so users can always see and edit the template they
+            # typed. Only suppress when substitution actually changed the value
+            # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
+            # parameters like loop counters show their computed value normally.
+            display_value = value
+            if not deleted and _in_aprocess.get() and ParameterMode.PROPERTY in parameter.allowed_modes:
+                raw_value = self._node.parameter_values.get(parameter_name, parameter.default_value)
+                if isinstance(raw_value, str) and "{" in raw_value and raw_value != value:
+                    display_value = raw_value
+            event_data["value"] = display_value
 
             # Add modification metadata
             event_data["modification_type"] = "deleted" if deleted else "set"

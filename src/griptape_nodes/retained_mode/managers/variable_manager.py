@@ -479,6 +479,23 @@ class VariablesManager:
 
         return variables
 
+    def get_variables_for_macro_resolution(self, flow_name: str) -> dict[str, str | int]:
+        """Return a name→value dict of variables visible from flow_name, suitable for macro resolution.
+
+        Values that are not str or int are coerced to str. None values are omitted.
+        Uses hierarchical scope so child-flow variables shadow parent-flow variables.
+        """
+        variables = self._get_hierarchical_variables(flow_name)
+        result: dict[str, str | int] = {}
+        for var in variables:
+            if var.value is None:
+                continue
+            if isinstance(var.value, str | int):
+                result[var.name] = var.value
+            else:
+                result[var.name] = str(var.value)
+        return result
+
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
