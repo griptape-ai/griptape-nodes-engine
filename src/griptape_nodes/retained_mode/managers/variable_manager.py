@@ -482,7 +482,7 @@ class VariablesManager:
     def get_variables_for_macro_resolution(self, flow_name: str) -> dict[str, str | int]:
         """Return a name→value dict of variables visible from flow_name, suitable for macro resolution.
 
-        Values that are not str or int are coerced to str. None values are omitted.
+        Only str and int values are included. None values and non-str/int values are omitted.
         Uses hierarchical scope so child-flow variables shadow parent-flow variables.
         """
         variables = self._get_hierarchical_variables(flow_name)
@@ -493,7 +493,12 @@ class VariablesManager:
             if isinstance(var.value, str | int):
                 result[var.name] = var.value
             else:
-                result[var.name] = str(var.value)
+                logger.warning(
+                    "Variable '%s' has type '%s' which is not supported for string substitution. "
+                    "Only str and int variables can be substituted. This variable will be skipped.",
+                    var.name,
+                    type(var.value).__name__,
+                )
         return result
 
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
