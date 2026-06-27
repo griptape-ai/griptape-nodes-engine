@@ -474,6 +474,23 @@ class WorkflowManager:
         """
         return self._referenced_workflow_stack[-1]
 
+    def is_variable_substitution_enabled(self) -> bool:
+        """Return whether inline variable substitution is enabled for the current workflow.
+
+        Defaults to True when no workflow is active or the workflow has not explicitly
+        set the flag, so existing workflows get substitution without any migration.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return True
+        workflow_name = context_manager.get_current_workflow_name()
+        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
+            return True
+        workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
+        return workflow.metadata.variable_substitution_enabled
+
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # All of the libraries have loaded, and any workflows they came with have been registered.
         # Clear any previously registered user/workspace workflows before re-registering, so that

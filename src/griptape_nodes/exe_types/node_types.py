@@ -1444,6 +1444,9 @@ class BaseNode(ABC):
         except KeyError:
             return text
 
+        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+            return text
+
         variables = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
         secrets_manager = GriptapeNodes.SecretsManager()
 

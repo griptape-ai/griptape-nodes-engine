@@ -58,6 +58,7 @@ def _mock_gn(variables: dict, *, connected_params: set[str] | None = None) -> Ab
     mock_connections = MagicMock()
     mock_connections.incoming_index = incoming_index
     mock_gn.FlowManager.return_value.get_connections.return_value = mock_connections
+    mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
 
     return patch(_GN_PATCH, mock_gn)
 
@@ -308,3 +309,39 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         captured = _run_tracked_set(node, "text", "{SHOT}", in_aprocess=True)
 
         assert _display_value_from_event(captured) == "{SHOT}"
+
+
+class TestVariableSubstitutionDisableToggle:
+    """When variable_substitution_enabled is False on the workflow, substitution is skipped."""
+
+    def _mock_gn_disabled(self, variables: dict) -> AbstractContextManager:
+        mock_gn = MagicMock()
+        mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
+        mock_gn.VariablesManager.return_value.get_variables_for_macro_resolution.return_value = variables
+        mock_gn.SecretsManager.return_value = MagicMock()
+        mock_connections = MagicMock()
+        mock_connections.incoming_index = {}
+        mock_gn.FlowManager.return_value.get_connections.return_value = mock_connections
+        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = False
+        return patch(_GN_PATCH, mock_gn)
+
+    def test_no_substitution_when_disabled(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        with self._mock_gn_disabled({"SHOT": "sc001"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == "{SHOT}"
+
+    def test_substitution_still_works_when_enabled(self) -> None:
+        """Sanity-check: the same setup with enabled=True substitutes normally."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        with _mock_gn({"SHOT": "sc001"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == "sc001"

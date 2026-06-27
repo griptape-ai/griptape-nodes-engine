@@ -65,6 +65,7 @@ class WorkflowMetadata(BaseModel):
     last_modified_date: datetime | None = Field(default=None)
     branched_from: str | None = Field(default=None)
     workflow_shape: WorkflowShape | None = Field(default=None)
+    variable_substitution_enabled: bool = Field(default=True)
 
     @field_serializer("node_types_used")
     def serialize_node_types_used(self, node_types_used: set[LibraryNameAndNodeType]) -> list[list[str]]:
