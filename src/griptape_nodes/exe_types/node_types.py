@@ -118,6 +118,15 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
+# Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
+_NO_FLOW: object = object()
+
+# Caches get_variables_for_macro_resolution() result for the duration of one aprocess() call.
+# None = not yet computed; _NO_FLOW = computed but node has no parent flow; dict = resolved vars.
+_aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
+    "_node_types_aprocess_variable_cache", default=None
+)
+
 
 @contextmanager
 def sanctioned_parameter_mutation() -> Iterator[None]:
@@ -144,10 +153,12 @@ def aprocess_scope() -> Iterator[None]:
     pass that also runs under the RUNTIME_EXECUTE strict-mode scope.
     """
     token = _in_aprocess.set(True)
+    cache_token = _aprocess_variable_cache.set(None)
     try:
         yield
     finally:
         _in_aprocess.reset(token)
+        _aprocess_variable_cache.reset(cache_token)
 
 
 class ImportDependency(NamedTuple):
@@ -1424,6 +1435,24 @@ class BaseNode(ABC):
             return False
         return param_name in node_connections
 
+    def _get_cached_variables(self) -> dict[str, str | int] | None:
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        cached = _aprocess_variable_cache.get()
+        if cached is _NO_FLOW:
+            return None
+        if cached is not None:
+            return cached  # type: ignore[return-value]
+        try:
+            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
+        except KeyError:
+            _aprocess_variable_cache.set(_NO_FLOW)
+            return None
+        resolved = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
+        _aprocess_variable_cache.set(resolved)
+        return resolved
+
     def _resolve_variables_in_string(self, text: str) -> str:
         # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -1439,12 +1468,10 @@ class BaseNode(ABC):
         if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
             return text
 
-        try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
-        except KeyError:
+        variables = self._get_cached_variables()
+        if variables is None:
             return text
 
-        variables = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
         secrets_manager = GriptapeNodes.SecretsManager()
 
         try:

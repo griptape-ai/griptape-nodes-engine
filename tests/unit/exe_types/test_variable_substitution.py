@@ -231,7 +231,6 @@ class TestVariableSubstitutionFallbacks:
         assert value == "{SHOT}"
 
 
-
 class TestTrackedOutputValuesDisplayDuringSubstitution:
     """TrackedParameterOutputValues must not overwrite the template in the UI.
 
