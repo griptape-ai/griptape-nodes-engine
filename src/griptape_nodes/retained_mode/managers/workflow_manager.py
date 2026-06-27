@@ -169,6 +169,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
     SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
+    SetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledResultFailure,
+    SetVariableSubstitutionEnabledResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
@@ -347,6 +350,11 @@ class WorkflowManager:
         # unwind. refresh_workflow_registry clears this while it mutates the registry.
         self._workflows_loading_complete = asyncio.Event()
         self._workflows_loading_complete.set()
+        # Maps workflow registry key → whether variable substitution is enabled.
+        # Set via SetVariableSubstitutionEnabledRequest; defaults to True (substitution on).
+        # Stored here rather than in WorkflowMetadata so it is set by executable code inside
+        # build_workflow() and therefore survives both editor loads and direct script execution.
+        self._variable_substitution_enabled: dict[str, bool] = {}
 
         event_manager.assign_manager_to_request_type(
             RunWorkflowFromScratchRequest, self.on_run_workflow_from_scratch_request
@@ -408,6 +416,10 @@ class WorkflowManager:
         event_manager.assign_manager_to_request_type(
             SetWorkflowMetadataRequest,
             self.on_set_workflow_metadata_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            SetVariableSubstitutionEnabledRequest,
+            self.on_set_variable_substitution_enabled_request,
         )
         event_manager.assign_manager_to_request_type(
             GetWorkflowInfoRequest,
@@ -475,10 +487,11 @@ class WorkflowManager:
         return self._referenced_workflow_stack[-1]
 
     def is_variable_substitution_enabled(self) -> bool:
-        """Return whether inline variable substitution is enabled for the current workflow.
+        """Return whether variable substitution is enabled for the current workflow.
 
-        Defaults to True when no workflow is active or the workflow has not explicitly
-        set the flag, so existing workflows get substitution without any migration.
+        Reads from the in-memory dict populated by SetVariableSubstitutionEnabledRequest.
+        Defaults to True so existing workflows that have never set the flag get
+        substitution without any migration.
         """
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -486,10 +499,31 @@ class WorkflowManager:
         if not context_manager.has_current_workflow():
             return True
         workflow_name = context_manager.get_current_workflow_name()
-        if not WorkflowRegistry.has_workflow_with_name(workflow_name):
-            return True
-        workflow = WorkflowRegistry.get_workflow_by_name(workflow_name)
-        return workflow.metadata.variable_substitution_enabled
+        # Return the stored value, or True if this workflow has never set the flag.
+        return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_set_variable_substitution_enabled_request(
+        self, request: SetVariableSubstitutionEnabledRequest
+    ) -> ResultPayload:
+        """Enable or disable variable substitution for the current workflow.
+
+        Stores the flag in memory keyed by the current workflow name. When the
+        workflow is saved, the code generator bakes a SetVariableSubstitutionEnabledRequest
+        call into build_workflow() so the flag is restored on every subsequent load,
+        including direct script execution.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return SetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to set variable substitution enabled. Failed because no workflow is active."
+            )
+        workflow_name = context_manager.get_current_workflow_name()
+        self._variable_substitution_enabled[workflow_name] = request.enabled
+        return SetVariableSubstitutionEnabledResultSuccess(
+            result_details=f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
+        )
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # All of the libraries have loaded, and any workflows they came with have been registered.
@@ -2892,8 +2926,13 @@ class WorkflowManager:
 
         main_body: list[ast.stmt] = []
 
+        # Snapshot the flag now (at save time) so it's baked into build_workflow().
+        variable_substitution_enabled = self.is_variable_substitution_enabled()
+
         prereq_code = self._generate_workflow_run_prerequisite_code(
-            import_recorder=import_recorder, library_names=library_names
+            import_recorder=import_recorder,
+            library_names=library_names,
+            variable_substitution_enabled=variable_substitution_enabled,
         )
         main_body.extend(cast("ast.stmt", node) for node in prereq_code)
 
@@ -3961,6 +4000,8 @@ class WorkflowManager:
         self,
         import_recorder: ImportRecorder,
         library_names: list[str],
+        *,
+        variable_substitution_enabled: bool = True,
     ) -> list[ast.AST]:
         code_blocks: list[ast.AST] = []
 
@@ -4048,6 +4089,40 @@ class WorkflowManager:
         )
         ast.fix_missing_locations(if_stmt)
         code_blocks.append(if_stmt)
+
+        # When variable substitution is disabled, bake a request call into build_workflow()
+        # so the setting is restored on every load — including running the file as a script.
+        # We only emit the call when disabled (False) because True is the default; omitting
+        # the call for enabled workflows keeps the generated code clean.
+        if not variable_substitution_enabled:
+            import_recorder.add_from_import(
+                "griptape_nodes.retained_mode.events.workflow_events",
+                "SetVariableSubstitutionEnabledRequest",
+            )
+            disable_substitution_call = ast.Expr(
+                value=ast.Await(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
+                            attr="ahandle_request",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            ast.Call(
+                                func=ast.Name(id="SetVariableSubstitutionEnabledRequest", ctx=ast.Load()),
+                                args=[],
+                                keywords=[
+                                    ast.keyword(arg="enabled", value=ast.Constant(value=False)),
+                                ],
+                            )
+                        ],
+                        keywords=[],
+                    )
+                )
+            )
+            ast.fix_missing_locations(disable_substitution_call)
+            code_blocks.append(disable_substitution_call)
+
         return code_blocks
 
     def _generate_unique_values_code(
