@@ -1123,6 +1123,7 @@ class WorkflowManager:
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
+        self._variable_substitution_enabled.pop(request.name, None)
         return DeleteWorkflowResultSuccess(
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
@@ -1157,6 +1158,12 @@ class WorkflowManager:
             return RenameWorkflowResultFailure(result_details=details)
 
         new_workflow_name = save_workflow_request.workflow_name
+
+        # Transfer the substitution flag to the new name before the delete call removes the old entry.
+        if new_workflow_name != request.workflow_name:
+            self._variable_substitution_enabled[new_workflow_name] = self._variable_substitution_enabled.pop(
+                request.workflow_name, True
+            )
 
         # If the renamed file landed outside the workspace, keep it registered at its new path
         # (the old path's registration is stripped by the delete below).
