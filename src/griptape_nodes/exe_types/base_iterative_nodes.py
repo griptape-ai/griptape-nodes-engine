@@ -1,3 +1,4 @@
+import asyncio
 import copy
 import logging
 from abc import abstractmethod
@@ -9,6 +10,7 @@ from griptape_nodes.exe_types.core_types import (
     ControlParameterOutput,
     Parameter,
     ParameterGroup,
+    ParameterMessage,
     ParameterMode,
     ParameterTypeBuiltin,
 )
@@ -88,6 +90,7 @@ class IterativeNodeParam(StrEnum):
     TRIGGER_NEXT_ITERATION_SIGNAL = "trigger_next_iteration_signal"
     BREAK_LOOP_SIGNAL = "break_loop_signal"
     LOOP_END_CONDITION_MET_SIGNAL = "loop_end_condition_met_signal"
+    STATUS_MESSAGE = "status_message"
 
     # BaseIterativeEndNode parameters
     FROM_START = "from_start"
@@ -206,6 +209,15 @@ class BaseIterativeStartNode(BaseNode):
         self._progress_bar = ProgressBarComponent(self)
         self._progress_bar.add_property_parameters()
 
+        # Hidden status_message kept for backward-compat (standard library nodes reference it for positioning)
+        self.status_message = ParameterMessage(
+            name=IterativeNodeParam.STATUS_MESSAGE.value,
+            variant="info",
+            value="",
+            ui_options={"hide": True},
+        )
+        self.add_node_element(self.status_message)
+
     def _get_base_node_type_name(self) -> str:
         """Get the base node type name (e.g., 'ForLoop' from 'ForLoopStartNode')."""
         return self.__class__.__name__.replace("StartNode", "")
@@ -285,7 +297,7 @@ class BaseIterativeStartNode(BaseNode):
         # Default implementation for ForEach: return 0-based indices
         return list(range(self._get_total_iterations()))
 
-    def process(self) -> None:
+    async def aprocess(self) -> None:
         if self._flow is None:
             return
 
@@ -299,6 +311,7 @@ class BaseIterativeStartNode(BaseNode):
                 # Next iteration signal from End - advance to next iteration
                 self._advance_to_next_iteration()
                 self._progress_bar.increment()
+                await asyncio.sleep(0)
                 self._check_completion_and_set_output()
             case self.break_loop_signal:
                 # Break signal from End - halt loop immediately

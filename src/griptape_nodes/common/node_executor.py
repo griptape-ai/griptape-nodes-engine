@@ -17,6 +17,7 @@ from griptape_nodes.exe_types import node_types
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
+    IterativeNodeParam,
 )
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_groups import (
@@ -1218,6 +1219,19 @@ class NodeExecutor:
 
                 logger.info("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
 
+                # Update the original start node's progress bar and index display
+                if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
+                    original_start = end_loop_node.start_node
+                    if hasattr(original_start, "_progress_bar"):
+                        original_start._progress_bar.increment()
+                    # Publish the per-iteration index so the UI shows the current value
+                    all_values = original_start.get_all_iteration_values()
+                    if iteration_index < len(all_values):
+                        current_index = all_values[iteration_index]
+                        original_start.parameter_output_values[IterativeNodeParam.INDEX.value] = current_index
+                        original_start.publish_update_to_parameter(IterativeNodeParam.INDEX.value, current_index)
+                    await asyncio.sleep(0)
+
                 # Check if the end node signaled a break (for BaseIterativeEndNode)
                 if self._should_break_loop(node_name_mappings, package_result):
                     logger.info(
@@ -1267,6 +1281,10 @@ class NodeExecutor:
             end_node.name,
             total_iterations,
         )
+
+        # Initialize the progress bar so the UI shows 0% at loop start
+        start_node._progress_bar.initialize(total_iterations)
+        await asyncio.sleep(0)
 
         # Package the loop body (nodes between start and end)
         package_result_and_execution = await self._package_loop_body(start_node, end_node)
