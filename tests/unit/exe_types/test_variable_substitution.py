@@ -1,6 +1,7 @@
 """Tests for inline workflow variable substitution in get_parameter_value()."""
 
 from contextlib import AbstractContextManager
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
@@ -29,7 +30,7 @@ def _make_str_param(name: str, default: str = "", modes: set | None = None) -> P
     )
 
 
-def _make_property_output_param(name: str, default: str) -> Parameter:
+def _make_property_output_param(name: str, default: Any) -> Parameter:
     return Parameter(
         name=name,
         default_value=default,
@@ -75,21 +76,46 @@ def _display_value_from_event(captured: list) -> object:
     return captured[0].wrapped_event.payload.element_details["value"]
 
 
-def _run_tracked_set(node: MockNode, param_name: str, value: object, *, in_aprocess: bool) -> list:
-    """Set a value on TrackedParameterOutputValues and return captured events."""
+def _run_tracked_set(
+    node: MockNode,
+    param_name: str,
+    value: object,
+    *,
+    in_aprocess: bool,
+    variables: dict | None = None,
+) -> tuple[list, TrackedParameterOutputValues]:
+    """Set a value on TrackedParameterOutputValues and return (events, tracker).
+
+    When `variables` is provided, a full GN mock (substitution + event capture) is
+    used. Otherwise only EventManager is mocked (for display-suppression-only tests
+    where the values set contain no {Letter} patterns and thus bypass substitution).
+    """
     tracked = TrackedParameterOutputValues(node)
     captured: list = []
-    mock_gn = MagicMock()
-    mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+
+    if variables is not None:
+        # Build a unified mock that handles both substitution and event capture.
+        mock_gn = MagicMock()
+        mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
+        mock_gn.VariablesManager.return_value.get_variables_for_macro_resolution.return_value = variables
+        mock_gn.SecretsManager.return_value = MagicMock()
+        mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
+        mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
+        mock_gn.EventManager.return_value.put_event.side_effect = captured.append
+        ctx: Any = patch(_GN_PATCH, mock_gn)
+    else:
+        minimal_mock = MagicMock()
+        minimal_mock.EventManager.return_value.put_event.side_effect = captured.append
+        ctx = patch(_GN_PATCH, minimal_mock)
 
     if in_aprocess:
-        with patch(_GN_PATCH, mock_gn), aprocess_scope():
+        with ctx, aprocess_scope():
             tracked[param_name] = value
     else:
-        with patch(_GN_PATCH, mock_gn):
+        with ctx:
             tracked[param_name] = value
 
-    return captured
+    return captured, tracked
 
 
 class TestVariableSubstitutionDuringExecution:
@@ -175,6 +201,49 @@ class TestVariableSubstitutionDuringExecution:
 
         assert value == "hello } world"
 
+    def test_variable_inside_json_string_is_substituted(self) -> None:
+        """Variables embedded inside JSON values should be resolved.
+
+        Previously the outer JSON braces caused a MacroSyntaxError that silently
+        swallowed the substitution.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", '{"status": "{STATUS}"}'))
+        node.parameter_values["text"] = '{"status": "{STATUS}"}'
+
+        with _mock_gn({"STATUS": "active"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == '{"status": "active"}'
+
+    def test_plain_json_without_variables_is_not_mangled(self) -> None:
+        """A JSON string with no variable references must pass through unchanged."""
+        node = MockNode(name="mock_node")
+        raw = '{"key": "value"}'
+        node.add_parameter(_make_str_param("text", raw))
+        node.parameter_values["text"] = raw
+
+        with _mock_gn({"STATUS": "active"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == raw
+
+    def test_dict_value_not_substituted_at_get_level(self) -> None:
+        """Dict parameters are NOT substituted at get_parameter_value time.
+
+        Substitution for dicts happens in TrackedParameterOutputValues so that the
+        node's internal view of its own property is the raw template (unchanged),
+        while downstream nodes receive the resolved value.
+        """
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("data", ""))
+        node.parameter_values["data"] = {"char": "{CHAR}", "count": 1}
+
+        with _mock_gn({"CHAR": "carl"}), aprocess_scope():
+            value = node.get_parameter_value("data")
+
+        assert value == {"char": "{CHAR}", "count": 1}
+
     def test_uses_default_value_when_no_parameter_value_set(self) -> None:
         node = MockNode(name="mock_node")
         node.add_parameter(_make_str_param("text", "{SHOT}"))
@@ -245,7 +314,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         node.add_parameter(_make_property_output_param("text", "{SHOT}"))
         node.parameter_values["text"] = "{SHOT}"
 
-        captured = _run_tracked_set(node, "text", "sc001", in_aprocess=True)
+        captured, _ = _run_tracked_set(node, "text", "sc001", in_aprocess=True)
 
         assert _display_value_from_event(captured) == "{SHOT}"
 
@@ -254,7 +323,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         node.add_parameter(_make_property_output_param("text", "hello"))
         node.parameter_values["text"] = "hello"
 
-        captured = _run_tracked_set(node, "text", "hello", in_aprocess=True)
+        captured, _ = _run_tracked_set(node, "text", "hello", in_aprocess=True)
 
         assert _display_value_from_event(captured) == "hello"
 
@@ -275,7 +344,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         )
         node.parameter_values["index_count"] = 0
 
-        captured = _run_tracked_set(node, "index_count", expected_count, in_aprocess=True)
+        captured, _ = _run_tracked_set(node, "index_count", expected_count, in_aprocess=True)
 
         assert _display_value_from_event(captured) == expected_count
 
@@ -285,7 +354,7 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         node.add_parameter(_make_property_output_param("text", "{SHOT}"))
         node.parameter_values["text"] = "{SHOT}"
 
-        captured = _run_tracked_set(node, "text", "sc001", in_aprocess=False)
+        captured, _ = _run_tracked_set(node, "text", "sc001", in_aprocess=False)
 
         assert _display_value_from_event(captured) == "sc001"
 
@@ -295,9 +364,191 @@ class TestTrackedOutputValuesDisplayDuringSubstitution:
         node.add_parameter(_make_property_output_param("text", "{SHOT}"))
         node.parameter_values["text"] = "{SHOT}"
 
-        captured = _run_tracked_set(node, "text", "{SHOT}", in_aprocess=True)
+        captured, _ = _run_tracked_set(node, "text", "{SHOT}", in_aprocess=True)
 
         assert _display_value_from_event(captured) == "{SHOT}"
+
+    def test_ui_shows_template_dict_not_substituted_dict(self) -> None:
+        """When a PROPERTY|OUTPUT dict parameter contains variable macros, the UI must show the raw template.
+
+        Previously the display suppression only applied to str parameters; dicts were
+        always shown with their substituted output value.
+        """
+        node = MockNode(name="mock_node")
+        raw = {"char": "{CHAR}"}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        captured, _ = _run_tracked_set(node, "data", {"char": "carl"}, in_aprocess=True)
+
+        assert _display_value_from_event(captured) == raw
+
+    def test_ui_shows_computed_value_for_plain_json_output(self) -> None:
+        """A JSON string with no variable macros must not trigger display suppression.
+
+        The old ``'{' in raw_value`` heuristic would incorrectly suppress the
+        display for any string containing a ``{``, including plain JSON.  The
+        new ``_HAS_VARIABLE_MACRO.search`` check only suppresses when the raw
+        value contains ``{Letter`` (a potential variable reference).
+        """
+        node = MockNode(name="mock_node")
+        raw = '{"key": "value"}'
+        node.add_parameter(_make_property_output_param("text", raw))
+        node.parameter_values["text"] = raw
+
+        # Pretend the node computed something different (e.g. a transformed value)
+        captured, _ = _run_tracked_set(node, "text", '{"key": "transformed"}', in_aprocess=True)
+
+        assert _display_value_from_event(captured) == '{"key": "transformed"}'
+
+    def test_dict_output_is_substituted_for_downstream(self) -> None:
+        """Dict output goes through substitution so downstream nodes receive resolved values.
+
+        JSON Input stores its template as a dict; the node reads the raw template
+        but TrackedParameterOutputValues substitutes variables before propagation.
+        """
+        node = MockNode(name="mock_node")
+        raw = {"char": "{CHAR}", "count": 1}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        _, tracked = _run_tracked_set(node, "data", raw, in_aprocess=True, variables={"CHAR": "carl"})
+
+        assert tracked["data"] == {"char": "carl", "count": 1}
+
+    def test_nested_dict_output_is_substituted(self) -> None:
+        """Substitution recurses into nested dict output values."""
+        node = MockNode(name="mock_node")
+        raw = {"outer": {"inner": "{CHAR}"}}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        _, tracked = _run_tracked_set(node, "data", raw, in_aprocess=True, variables={"CHAR": "carl"})
+
+        assert tracked["data"] == {"outer": {"inner": "carl"}}
+
+    def test_list_output_is_substituted(self) -> None:
+        """List output values have their string items substituted."""
+        node = MockNode(name="mock_node")
+        raw = ["{CHAR}", "literal", 42]
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        _, tracked = _run_tracked_set(node, "data", raw, in_aprocess=True, variables={"CHAR": "carl"})
+
+        assert tracked["data"] == ["carl", "literal", 42]
+
+    def test_dict_output_ui_shows_template_not_substituted(self) -> None:
+        """When dict output is substituted, the UI event still shows the raw template."""
+        node = MockNode(name="mock_node")
+        raw = {"char": "{CHAR}"}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        captured, _ = _run_tracked_set(node, "data", raw, in_aprocess=True, variables={"CHAR": "carl"})
+
+        assert _display_value_from_event(captured) == raw
+
+    def test_no_substitution_outside_aprocess_for_dict(self) -> None:
+        """Dict output values are NOT substituted outside aprocess_scope."""
+        node = MockNode(name="mock_node")
+        raw = {"char": "{CHAR}"}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+
+        _, tracked = _run_tracked_set(node, "data", raw, in_aprocess=False, variables={"CHAR": "carl"})
+
+        assert tracked["data"] == {"char": "{CHAR}"}
+
+
+class TestGetDisplayValueForOutput:
+    """get_display_value_for_output returns the UI display value WITHOUT modifying stored output values.
+
+    Setup uses dict.__setitem__ directly to bypass TrackedParameterOutputValues event
+    emission (which requires GriptapeNodes). We're testing the read-only display logic,
+    not the event path.
+    """
+
+    def _seed_output(self, node: MockNode, name: str, value: Any) -> None:
+        """Write directly into the underlying dict to avoid GriptapeNodes event machinery."""
+        dict.__setitem__(node.parameter_output_values, name, value)
+
+    def test_returns_template_for_property_param_with_macro(self) -> None:
+        """Display value is the template; the stored output is the substituted value."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+        self._seed_output(node, "text", "25")
+
+        display = node.get_display_value_for_output("text", "25")
+
+        assert display == "{SHOT}"
+        # Stored output value must NOT be overwritten — downstream nodes still read "25".
+        assert node.parameter_output_values["text"] == "25"
+
+    def test_stored_output_unchanged_after_display_suppression(self) -> None:
+        """Calling get_display_value_for_output is read-only: parameter_output_values is preserved."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+        self._seed_output(node, "text", "sc001")
+
+        node.get_display_value_for_output("text", "sc001")
+
+        assert node.parameter_output_values["text"] == "sc001"
+
+    def test_returns_output_when_no_macro_in_template(self) -> None:
+        """No suppression when the raw parameter value contains no variable macro."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "hello"))
+        node.parameter_values["text"] = "hello"
+
+        display = node.get_display_value_for_output("text", "computed")
+
+        assert display == "computed"
+
+    def test_returns_output_for_input_only_param(self) -> None:
+        """Non-PROPERTY parameters are never suppressed even if template has a macro."""
+        node = MockNode(name="mock_node")
+        param = Parameter(
+            name="text",
+            default_value="{SHOT}",
+            input_types=["str"],
+            output_type="str",
+            type="str",
+            allowed_modes={ParameterMode.INPUT},
+            tooltip="test",
+        )
+        node.add_parameter(param)
+        node.parameter_values["text"] = "{SHOT}"
+
+        display = node.get_display_value_for_output("text", "25")
+
+        assert display == "25"
+
+    def test_returns_output_when_template_matches_output(self) -> None:
+        """If the output already equals the template, no suppression is needed."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_property_output_param("text", "{SHOT}"))
+        node.parameter_values["text"] = "{SHOT}"
+
+        display = node.get_display_value_for_output("text", "{SHOT}")
+
+        assert display == "{SHOT}"
+
+    def test_returns_template_for_dict_property_param_with_macro(self) -> None:
+        """Dict PROPERTY params with macros also return the raw template for display."""
+        node = MockNode(name="mock_node")
+        raw = {"char": "{CHAR}"}
+        node.add_parameter(_make_property_output_param("data", raw))
+        node.parameter_values["data"] = raw
+        substituted = {"char": "carl"}
+        self._seed_output(node, "data", substituted)
+
+        display = node.get_display_value_for_output("data", substituted)
+
+        assert display == raw
+        assert node.parameter_output_values["data"] == substituted
 
 
 class TestVariableSubstitutionDisableToggle:

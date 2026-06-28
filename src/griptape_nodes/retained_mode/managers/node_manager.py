@@ -2107,7 +2107,14 @@ class NodeManager:
         for parameter in element.find_elements_by_type(Parameter):
             # Check if they have an output value, that takes priority
             if parameter.name in node.parameter_output_values:
-                value = node.parameter_output_values[parameter.name]
+                raw_value = node.parameter_output_values[parameter.name]
+                # Apply display suppression: for PROPERTY parameters whose stored
+                # template (e.g. "{SHOT}") contains a variable macro, return the
+                # template rather than the resolved value (e.g. "25").  This path
+                # is hit on browser refresh and workflow reload, so without this
+                # the reconnect would show the substituted value instead of the
+                # user-editable template.
+                value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
                 value = node.get_parameter_value(parameter.name)

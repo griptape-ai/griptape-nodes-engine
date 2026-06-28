@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import warnings
 from abc import ABC
@@ -126,6 +127,51 @@ _NO_FLOW: object = object()
 _aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
     "_node_types_aprocess_variable_cache", default=None
 )
+
+# Fast pre-check: does the string contain any potential variable reference ({Letter...})?
+_HAS_VARIABLE_MACRO: re.Pattern[str] = re.compile(r"\{[A-Za-z_]")
+# Matches a single {CONTENT} token with no nested braces (safe to pass to ParsedMacro).
+_MACRO_TOKEN: re.Pattern[str] = re.compile(r"\{([^{}]*)\}")
+
+
+def _contains_variable_macro(value: Any) -> bool:
+    """Return True if value is, or recursively contains, a str with a variable macro reference."""
+    if isinstance(value, str):
+        return bool(_HAS_VARIABLE_MACRO.search(value))
+    if isinstance(value, dict):
+        return any(_contains_variable_macro(v) for v in value.values())
+    if isinstance(value, list):
+        return any(_contains_variable_macro(item) for item in value)
+    return False
+
+
+def _resolve_macro_token(token: str, variables: dict[str, str | int], secrets_manager: Any) -> str:
+    """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
+
+    Returns the resolved string on success or the original token if the variable
+    is unknown, the token is not a macro reference, or parsing fails.
+    """
+    try:
+        parsed = ParsedMacro(token)
+    except MacroSyntaxError:
+        return token
+    if not parsed.get_variables():
+        return token
+    try:
+        result = partial_resolve(parsed.template, parsed.segments, variables, secrets_manager)
+    except MacroResolutionError:
+        return token
+    # If every segment is still an unresolved variable, keep the original token so that
+    # format specs (e.g. `: "value"` in a JSON key position) are not silently dropped.
+    if all(isinstance(seg, ParsedVariable) for seg in result.segments):
+        return token
+    parts = []
+    for seg in result.segments:
+        if isinstance(seg, ParsedStaticValue):
+            parts.append(seg.text)
+        elif isinstance(seg, ParsedVariable):
+            parts.append(f"{{{seg.info.name}}}")
+    return "".join(parts)
 
 
 @contextmanager
@@ -1024,7 +1070,7 @@ class BaseNode(ABC):
             value = param.default_value
         if (
             isinstance(value, str)
-            and "{" in value
+            and _HAS_VARIABLE_MACRO.search(value)
             and _in_aprocess.get()
             and not self._param_has_incoming_connection(param_name)
         ):
@@ -1453,17 +1499,21 @@ class BaseNode(ABC):
         _aprocess_variable_cache.set(resolved)
         return resolved
 
+    def _resolve_variables_in_value(self, value: Any) -> Any:
+        """Recursively substitute workflow variables in any str/dict/list value."""
+        if isinstance(value, str):
+            if _HAS_VARIABLE_MACRO.search(value):
+                return self._resolve_variables_in_string(value)
+            return value
+        if isinstance(value, dict):
+            return {k: self._resolve_variables_in_value(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._resolve_variables_in_value(item) for item in value]
+        return value
+
     def _resolve_variables_in_string(self, text: str) -> str:
         # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        try:
-            parsed = ParsedMacro(text)
-        except MacroSyntaxError:
-            return text
-
-        if not parsed.get_variables():
-            return text
 
         if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
             return text
@@ -1473,19 +1523,27 @@ class BaseNode(ABC):
             return text
 
         secrets_manager = GriptapeNodes.SecretsManager()
+        return _MACRO_TOKEN.sub(
+            lambda m: _resolve_macro_token(m.group(0), variables, secrets_manager),
+            text,
+        )
 
-        try:
-            result = partial_resolve(parsed.template, parsed.segments, variables, secrets_manager)
-        except MacroResolutionError:
-            return text
+    def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
+        """Return the UI display value for an output parameter.
 
-        parts = []
-        for segment in result.segments:
-            if isinstance(segment, ParsedStaticValue):
-                parts.append(segment.text)
-            elif isinstance(segment, ParsedVariable):
-                parts.append(f"{{{segment.info.name}}}")
-        return "".join(parts)
+        For PROPERTY parameters whose stored template contains a variable macro
+        and the output differs from the template, returns the template so users
+        always see and can edit the {VAR} syntax rather than the resolved value.
+        """
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            return output_value
+        if ParameterMode.PROPERTY not in parameter.allowed_modes:
+            return output_value
+        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
+        if _contains_variable_macro(raw_value) and raw_value != output_value:
+            return raw_value
+        return output_value
 
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
@@ -1696,6 +1754,12 @@ class TrackedParameterOutputValues(dict[str, Any]):
     def __setitem__(self, key: str, value: Any) -> None:
         had_key = key in self
         old_value = self.get(key)
+        # Substitute variables in dict/list output values so downstream nodes
+        # receive resolved values without the node needing to know about variables.
+        # String values are already substituted in get_parameter_value(); this
+        # handles structured types (JSON Input dicts, list outputs, etc.).
+        if _in_aprocess.get():
+            value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -1758,10 +1822,8 @@ class TrackedParameterOutputValues(dict[str, Any]):
             # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
             # parameters like loop counters show their computed value normally.
             display_value = value
-            if not deleted and _in_aprocess.get() and ParameterMode.PROPERTY in parameter.allowed_modes:
-                raw_value = self._node.parameter_values.get(parameter_name, parameter.default_value)
-                if isinstance(raw_value, str) and "{" in raw_value and raw_value != value:
-                    display_value = raw_value
+            if not deleted and _in_aprocess.get():
+                display_value = self._node.get_display_value_for_output(parameter_name, value)
             event_data["value"] = display_value
 
             # Add modification metadata
