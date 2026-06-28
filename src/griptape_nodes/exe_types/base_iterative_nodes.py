@@ -209,7 +209,9 @@ class BaseIterativeStartNode(BaseNode):
         self._progress_bar = ProgressBarComponent(self)
         self._progress_bar.add_property_parameters()
 
-        # Hidden status_message kept for backward-compat (standard library nodes reference it for positioning)
+        # Hidden status_message kept for backward-compat: ForLoopStartNode in griptape-nodes-library-standard
+        # calls get_parameter_by_name("status_message") and move_element_to_position("status_message", ...) to
+        # control parameter ordering. Removing it would break element positioning in published library nodes.
         self.status_message = ParameterMessage(
             name=IterativeNodeParam.STATUS_MESSAGE.value,
             variant="info",
