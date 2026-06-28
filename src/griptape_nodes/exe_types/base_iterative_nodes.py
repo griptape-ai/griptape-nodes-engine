@@ -298,6 +298,9 @@ class BaseIterativeStartNode(BaseNode):
         return list(range(self._get_total_iterations()))
 
     async def aprocess(self) -> None:
+        # Overrides aprocess() directly (rather than process()) because iterations
+        # need await asyncio.sleep(0) to let the event loop publish UI updates mid-loop.
+        # BaseIterativeEndNode uses process() since it has no async work.
         if self._flow is None:
             return
 
