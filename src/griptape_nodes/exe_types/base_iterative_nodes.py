@@ -9,12 +9,12 @@ from griptape_nodes.exe_types.core_types import (
     ControlParameterOutput,
     Parameter,
     ParameterGroup,
-    ParameterMessage,
     ParameterMode,
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.param_components.progress_bar_component import ProgressBarComponent
 
 
 def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
@@ -77,13 +77,6 @@ def _incoming_connection_exists(target_node: str, target_param: str) -> bool:
     return bool(param_connections)
 
 
-class StatusType(StrEnum):
-    """Enum for iterative loop status types."""
-
-    NORMAL = "normal"
-    BREAK = "break"
-
-
 class IterativeNodeParam(StrEnum):
     """Parameter names for iterative start and end nodes."""
 
@@ -95,7 +88,6 @@ class IterativeNodeParam(StrEnum):
     TRIGGER_NEXT_ITERATION_SIGNAL = "trigger_next_iteration_signal"
     BREAK_LOOP_SIGNAL = "break_loop_signal"
     LOOP_END_CONDITION_MET_SIGNAL = "loop_end_condition_met_signal"
-    STATUS_MESSAGE = "status_message"
 
     # BaseIterativeEndNode parameters
     FROM_START = "from_start"
@@ -210,16 +202,9 @@ class BaseIterativeStartNode(BaseNode):
         self.next_control_output: Parameter | None = None
         self._logger = logging.getLogger(f"{__name__}.{self.name}")
 
-        # Status message parameter - moved to bottom
-        self.status_message = ParameterMessage(
-            name=IterativeNodeParam.STATUS_MESSAGE.value,
-            variant="info",
-            value="",
-        )
-        self.add_node_element(self.status_message)
-
-        # Initialize status message
-        self._update_status_message()
+        # Progress bar
+        self._progress_bar = ProgressBarComponent(self)
+        self._progress_bar.add_property_parameters()
 
     def _get_base_node_type_name(self) -> str:
         """Get the base node type name (e.g., 'ForLoop' from 'ForLoopStartNode')."""
@@ -313,10 +298,11 @@ class BaseIterativeStartNode(BaseNode):
             case self.trigger_next_iteration_signal:
                 # Next iteration signal from End - advance to next iteration
                 self._advance_to_next_iteration()
+                self._progress_bar.increment()
                 self._check_completion_and_set_output()
             case self.break_loop_signal:
                 # Break signal from End - halt loop immediately
-                self._complete_loop(StatusType.BREAK)
+                self._complete_loop()
             case _:
                 # Unexpected control entry point - log error for debugging
                 err_str = f"Iterative Start node '{self.name}' received unexpected control parameter: {self._entry_control_parameter}. "
@@ -442,20 +428,6 @@ class BaseIterativeStartNode(BaseNode):
                 return False
         return super().allow_incoming_connection(source_node, source_parameter, target_parameter)
 
-    def _update_status_message(self, status_type: StatusType = StatusType.NORMAL) -> None:
-        """Update the status message parameter based on current loop state."""
-        if self._total_iterations == 0:
-            # Handle the case where loop terminates immediately without iterations
-            status = "Completed 0 (of 0)"
-        elif status_type == StatusType.BREAK:
-            status = f"Stopped at {self._current_iteration_count} (of {self._total_iterations}) - Break"
-        elif self.is_loop_finished():
-            status = f"Completed {self._total_iterations} (of {self._total_iterations})"
-        else:
-            status = f"Processing {self._current_iteration_count} (of {self._total_iterations})"
-
-        self.status_message.value = status
-
     def _initialize_loop(self) -> None:
         """Initialize the loop with fresh parameter values."""
         # Reset all state for fresh loop execution
@@ -469,6 +441,7 @@ class BaseIterativeStartNode(BaseNode):
         # Initialize iteration-specific data and set total iterations
         self._initialize_iteration_data()
         self._total_iterations = self._get_total_iterations()
+        self._progress_bar.initialize(self._total_iterations)
 
     def _check_completion_and_set_output(self) -> None:
         """Check if loop should end or continue and set appropriate control output."""
@@ -493,13 +466,10 @@ class BaseIterativeStartNode(BaseNode):
             # Subclasses can handle their own current_item logic
             pass
 
-        # Update status message and continue with execution
-        self._update_status_message()
         self.next_control_output = self.exec_out
 
-    def _complete_loop(self, status_type: StatusType = StatusType.NORMAL) -> None:
+    def _complete_loop(self) -> None:
         """Complete the loop and set final state."""
-        self._update_status_message(status_type)
         self._current_iteration_count = 0
         self._total_iterations = 0
         self.next_control_output = self.loop_end_condition_met_signal
