@@ -441,6 +441,15 @@ class BaseIterativeStartNode(BaseNode):
                 return False
         return super().allow_incoming_connection(source_node, source_parameter, target_parameter)
 
+    def advance_sequential_progress(self, iteration_index: int) -> None:
+        """Update progress bar and index display after one sequential iteration completes."""
+        self._progress_bar.increment()
+        all_values = self.get_all_iteration_values()
+        if iteration_index < len(all_values):
+            current_index = all_values[iteration_index]
+            self.parameter_output_values[IterativeNodeParam.INDEX.value] = current_index
+            self.publish_update_to_parameter(IterativeNodeParam.INDEX.value, current_index)
+
     def _initialize_loop(self) -> None:
         """Initialize the loop with fresh parameter values."""
         # Reset all state for fresh loop execution
