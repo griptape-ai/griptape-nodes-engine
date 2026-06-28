@@ -95,19 +95,19 @@ The variable name does not need to be `_index`; any single unresolved required v
 
 ### String transformations
 
-| Format spec | Description | Example result |
-|---|---|---|
-| `:lower` | All lowercase | `"my autumn shoot"` |
-| `:upper` | All uppercase | `"MY AUTUMN SHOOT"` |
-| `:title` | Title Case | `"My Autumn Shoot"` |
-| `:snake` | snake_case | `"my_autumn_shoot"` |
-| `:pascal` | PascalCase | `"MyAutumnShoot"` |
-| `:camel` | camelCase | `"myAutumnShoot"` |
-| `:screaming_snake` | SCREAMING_SNAKE_CASE | `"MY_AUTUMN_SHOOT"` |
-| `:slug` | Slug (spaces→hyphens, non-alphanumeric stripped) | `"my-autumn-shoot"` |
-| `:dot` | dot.case | `"my.autumn.shoot"` |
-| `:abbrev` | First letter of each word | `"MAS"` |
-| `:trim` | Strip leading/trailing whitespace | `"My Autumn Shoot"` |
+| Format spec        | Description                                      | Example result      |
+| ------------------ | ------------------------------------------------ | ------------------- |
+| `:lower`           | All lowercase                                    | `"my autumn shoot"` |
+| `:upper`           | All uppercase                                    | `"MY AUTUMN SHOOT"` |
+| `:title`           | Title Case                                       | `"My Autumn Shoot"` |
+| `:snake`           | snake_case                                       | `"my_autumn_shoot"` |
+| `:pascal`          | PascalCase                                       | `"MyAutumnShoot"`   |
+| `:camel`           | camelCase                                        | `"myAutumnShoot"`   |
+| `:screaming_snake` | SCREAMING_SNAKE_CASE                             | `"MY_AUTUMN_SHOOT"` |
+| `:slug`            | Slug (spaces→hyphens, non-alphanumeric stripped) | `"my-autumn-shoot"` |
+| `:dot`             | dot.case                                         | `"my.autumn.shoot"` |
+| `:abbrev`          | First letter of each word                        | `"MAS"`             |
+| `:trim`            | Strip leading/trailing whitespace                | `"My Autumn Shoot"` |
 
 For example, if `workflow_name` is `"My Autumn Shoot"`:
 
