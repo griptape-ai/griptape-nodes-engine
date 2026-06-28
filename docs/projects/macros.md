@@ -95,18 +95,38 @@ The variable name does not need to be `_index`; any single unresolved required v
 
 ### String transformations
 
-```
-{variable_name:lower}    → lowercase
-{variable_name:upper}    → UPPERCASE
-{variable_name:slug}     → slug-form (spaces to hyphens, safe chars only)
-```
+| Format spec | Description | Example result |
+|---|---|---|
+| `:lower` | All lowercase | `"my autumn shoot"` |
+| `:upper` | All uppercase | `"MY AUTUMN SHOOT"` |
+| `:title` | Title Case | `"My Autumn Shoot"` |
+| `:snake` | snake_case | `"my_autumn_shoot"` |
+| `:pascal` | PascalCase | `"MyAutumnShoot"` |
+| `:camel` | camelCase | `"myAutumnShoot"` |
+| `:screaming_snake` | SCREAMING_SNAKE_CASE | `"MY_AUTUMN_SHOOT"` |
+| `:slug` | Slug (spaces→hyphens, non-alphanumeric stripped) | `"my-autumn-shoot"` |
+| `:dot` | dot.case | `"my.autumn.shoot"` |
+| `:abbrev` | First letter of each word | `"MAS"` |
+| `:trim` | Strip leading/trailing whitespace | `"My Autumn Shoot"` |
 
 For example, if `workflow_name` is `"My Autumn Shoot"`:
 
 ```
-{workflow_name:lower}  →  "my autumn shoot"
-{workflow_name:slug}   →  "my-autumn-shoot"
+{workflow_name:lower}           →  "my autumn shoot"
+{workflow_name:upper}           →  "MY AUTUMN SHOOT"
+{workflow_name:title}           →  "My Autumn Shoot"
+{workflow_name:snake}           →  "my_autumn_shoot"
+{workflow_name:pascal}          →  "MyAutumnShoot"
+{workflow_name:camel}           →  "myAutumnShoot"
+{workflow_name:screaming_snake} →  "MY_AUTUMN_SHOOT"
+{workflow_name:slug}            →  "my-autumn-shoot"
+{workflow_name:dot}             →  "my.autumn.shoot"
+{workflow_name:abbrev}          →  "MAS"
 ```
+
+`:snake`, `:pascal`, `:camel`, `:dot`, and `:screaming_snake` also handle camelCase and PascalCase input correctly by splitting on case transitions, so `{varName:snake}` → `"var_name"` works as expected.
+
+`:trim` is most useful as a pre-processing step before another transformation, e.g. `{name:trim:snake}` strips surrounding whitespace and then converts to snake_case.
 
 ### Default value
 
