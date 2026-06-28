@@ -1222,8 +1222,7 @@ class NodeExecutor:
                 # Update the original start node's progress bar and index display
                 if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
                     original_start = end_loop_node.start_node
-                    if hasattr(original_start, "_progress_bar"):
-                        original_start._progress_bar.increment()
+                    original_start._progress_bar.increment()
                     # Publish the per-iteration index so the UI shows the current value
                     all_values = original_start.get_all_iteration_values()
                     if iteration_index < len(all_values):
