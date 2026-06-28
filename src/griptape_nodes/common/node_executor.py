@@ -1281,7 +1281,8 @@ class NodeExecutor:
             total_iterations,
         )
 
-        # Initialize the progress bar so the UI shows 0% at loop start
+        # Initialize here (not just in aprocess/exec_in) because the sequential executor
+        # drives the loop body itself rather than going through the normal start-node signal path.
         start_node._progress_bar.initialize(total_iterations)
         await asyncio.sleep(0)
 
