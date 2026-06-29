@@ -46,17 +46,17 @@ file_extension_directories:
 
 ### Fields reference
 
-| Field                             | Required | Description                                                                                                                         |
-| --------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `project_template_schema_version` | Yes      | Must match the supported version (`"0.5.1"`)                                                                                        |
-| `name`                            | Yes      | Human-readable name for this project                                                                                                |
-| `description`                     | No       | Optional description                                                                                                                |
-| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects). |
-| `workspace_dir`                   | No       | Directory this project uses as its workspace; the highest-priority workspace source. A string (absolute or relative to this YAML) or a per-platform mapping. Not inherited from a parent. See [Workspace directory](#workspace-directory).            |
-| `situations`                      | No       | Dict of situation overrides and additions                                                                                           |
-| `directories`                     | No       | Dict of directory overrides and additions                                                                                           |
-| `environment`                     | No       | Dict of custom key-value variables                                                                                                  |
-| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                        |
+| Field                             | Required | Description                                                                                                                                                                                                                                |
+| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `project_template_schema_version` | Yes      | Must match the supported version (`"0.5.1"`)                                                                                                                                                                                               |
+| `name`                            | Yes      | Human-readable name for this project                                                                                                                                                                                                       |
+| `description`                     | No       | Optional description                                                                                                                                                                                                                       |
+| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects).                                                                                                        |
+| `workspace_dir`                   | No       | Directory this project uses as its workspace; the highest-priority workspace source. A string (absolute or relative to this YAML) or a per-platform mapping. Not inherited from a parent. See [Workspace directory](#workspace-directory). |
+| `situations`                      | No       | Dict of situation overrides and additions                                                                                                                                                                                                  |
+| `directories`                     | No       | Dict of directory overrides and additions                                                                                                                                                                                                  |
+| `environment`                     | No       | Dict of custom key-value variables                                                                                                                                                                                                         |
+| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                                                                                                                               |
 
 ### Situation fields
 
