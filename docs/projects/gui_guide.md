@@ -88,6 +88,16 @@ Use the pencil icon next to the name to edit the **name** and **description** in
 
 The **Inherits from** dropdown sets (or clears) the parent project. The detail view also surfaces the project's editable sections:
 
+### Workspace directory
+
+The **Workspace dir** field sets where this project's work is rooted: the folder that relative paths, outputs, and downloads resolve against. It is the highest-priority way to choose a workspace, overriding per-user and global settings.
+
+Leave it blank and the project uses the workspace the engine works out from your settings; when blank, the field shows that **calculated** path as grey placeholder text, so you can see where the project's work will land without setting anything. Type a path to pin the workspace explicitly. Like Directories, it has a per-platform toggle to give the workspace different paths on Linux, macOS, and Windows.
+
+![The Workspace dir field showing the calculated workspace as grey placeholder text](../assets/img/projects/projects-gui-workspace-dir.png)
+
+For the full reference, see [Workspace directory](projects.md#workspace-directory) and [Workspace](workspace.md).
+
 ### Directories
 
 **Directories** map a short logical name (like `outputs`) to a real folder path. Workflows and nodes refer to the name, and the project decides where it actually points. Use **Add Directory** to create one, and the per-platform toggle on a row to give a directory different paths on Linux, macOS, and Windows.
