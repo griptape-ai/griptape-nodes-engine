@@ -92,7 +92,7 @@ The **Inherits from** dropdown sets (or clears) the parent project. The detail v
 
 The **Workspace dir** field sets where this project's work is rooted: the folder that relative paths, outputs, and downloads resolve against. It is the highest-priority way to choose a workspace, overriding per-user and global settings.
 
-Leave it blank and the project uses the workspace the engine works out from your settings; when blank, the field shows that **calculated** path as grey placeholder text, so you can see where the project's work will land without setting anything. Type a path to pin the workspace explicitly. Like Directories, it has a per-platform toggle to give the workspace different paths on Linux, macOS, and Windows.
+Leave it blank and the project uses the workspace the engine works out from your settings; when blank, the field shows that **calculated** path as grey placeholder text, so you can see where the project's work will land without setting anything. Type a path to pin the workspace explicitly, or use the folder button to browse for one. Like Directories, it has a per-platform toggle to give the workspace different paths on Linux, macOS, and Windows.
 
 ![The Workspace dir field showing the calculated workspace as grey placeholder text](../assets/img/projects/projects-gui-workspace-dir.png)
 
