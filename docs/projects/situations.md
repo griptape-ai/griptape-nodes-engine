@@ -121,7 +121,7 @@ policy:   overwrite, create_dirs: true
 fallback: save_file
 ```
 
-Used when a workflow is saved. The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. Saving a workflow overwrites the existing file rather than versioning it.
+Used when a workflow is saved. The workflow file goes into the workspace root, preserving any sub-directory hierarchy via the optional `{sub_dirs?:/}` prefix. Saving a workflow overwrites the existing file rather than versioning it; to produce a numbered sequence of saves instead, see [`create_versioned_workflow`](#create_versioned_workflow) below.
 
 **Example:**
 
@@ -131,6 +131,29 @@ workspace_dir="/projects/demo", file_name_base="my_workflow", file_extension="py
 
 sub_dirs="archived", file_name_base="my_workflow", file_extension="py"
 → /projects/demo/archived/my_workflow.py
+```
+
+### `create_versioned_workflow`
+
+```
+macro:    {workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}
+policy:   create_new, create_dirs: true
+fallback: save_file
+```
+
+Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next padded index in the sequence — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work. The trailing `_v###` suffix on the previous save is stripped before the next index is computed, so the sequence stays anchored to the base name.
+
+This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
+
+> **Note**: Customizing `save_workflow` to use `create_new` directly (instead of using `create_versioned_workflow` + the flag) emits a warning at save time. The configuration still works — the first save lands at `_v001` — but every subsequent save hits the in-place overwrite branch and writes back to `_v001` rather than advancing to `_v002`. Use `create_versioned_workflow` for true versioning.
+
+**Example:**
+
+```
+workspace_dir="/projects/demo", file_name_base="my_workflow", file_extension="py"
+  First save  → /projects/demo/my_workflow_v001.py
+  Second save → /projects/demo/my_workflow_v002.py
+  Third save  → /projects/demo/my_workflow_v003.py
 ```
 
 ## How nodes use situations

@@ -310,6 +310,7 @@ class SaveWorkflowRequest(RequestPayload):
         image_path: Path to save workflow image/thumbnail (None for no image)
         pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
+        create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
 
     Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
     """
@@ -318,6 +319,7 @@ class SaveWorkflowRequest(RequestPayload):
     image_path: str | None = None
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
+    create_versioned: bool = False
 
 
 @dataclass
@@ -1065,7 +1067,6 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
         image_path: Optional path to workflow image/thumbnail. If None, callers may preserve existing image.
         description: Optional workflow description text. If None, callers may preserve existing description.
         is_template: Optional template status flag. If None, callers may preserve existing template status.
-        execution_flow_name: Optional flow name to use for execution code (defaults to file_name if not provided)
         branched_from: Optional branched from information to preserve workflow lineage
         workflow_shape: Optional workflow shape defining inputs and outputs for external callers
         file_path: Optional specific file path to use (defaults to workspace path if not provided)
@@ -1082,7 +1083,6 @@ class SaveWorkflowFileFromSerializedFlowRequest(RequestPayload):
     image_path: str | None = None
     description: str | None = None
     is_template: bool | None = None
-    execution_flow_name: str | None = None
     branched_from: str | None = None
     workflow_shape: WorkflowShape | None = None
     pickle_control_flow_result: bool = False
