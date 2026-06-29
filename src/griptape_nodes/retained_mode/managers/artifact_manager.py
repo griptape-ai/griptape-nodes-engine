@@ -10,6 +10,7 @@ import semver
 from pydantic import BaseModel, ValidationError
 
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.path_utils import decompose_source_path
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -1481,11 +1482,11 @@ class ArtifactManager:
         decomposed = decompose_source_path(source_path_obj, workspace_dir)
 
         # Get save_griptape_nodes_preview situation template
-        get_situation_request = GetSituationRequest(situation_name="save_griptape_nodes_preview")
+        get_situation_request = GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW)
         get_situation_result = GriptapeNodes.handle_request(get_situation_request)
 
         if not isinstance(get_situation_result, GetSituationResultSuccess):
-            msg = "save_griptape_nodes_preview situation not found in project template"
+            msg = f"{BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW} situation not found in project template"
             raise RuntimeError(msg)  # noqa: TRY004
 
         # Build variables dict for macro resolution
@@ -1515,7 +1516,7 @@ class ArtifactManager:
         full_preview_path = path_result.absolute_path
         preview_file_metadata = SidecarContent(
             situation=SituationMetadata(
-                name="save_griptape_nodes_preview",
+                name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW,
                 macro=situation.macro,
                 policy=SituationPolicy(
                     on_collision=situation.policy.on_collision,

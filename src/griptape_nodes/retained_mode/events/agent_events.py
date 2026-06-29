@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 
+from pydantic import BaseModel, field_validator
+
+from griptape_nodes.drivers.cloud_models import ProviderCatalogEntry, ProviderID
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionPayload,
     RequestPayload,
@@ -9,6 +12,51 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+
+
+class ProviderConfig(BaseModel):
+    """Typed representation of a chat provider entry stored in agent config."""
+
+    name: str
+    type: str
+    model: str
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
+class PromptDriverConfig(BaseModel):
+    """Typed prompt-driver fields accepted by ConfigureAgentRequest."""
+
+    model: str | None = None
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
+class CreateProviderPayload(BaseModel):
+    """Fields for CreateAgentProviderRequest. name and type are required; model defaults to empty."""
+
+    name: str = ""
+    type: str = ""
+    model: str = ""
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+
+class UpdateProviderPayload(BaseModel):
+    """Partial fields for UpdateAgentProviderRequest. Only explicitly set fields are applied."""
+
+    type: str | None = None
+    model: str | None = None
+    base_url: str | None = None
+    api_key_secret_name: str | None = None
+
+    @field_validator("type", "model")
+    @classmethod
+    def non_empty_if_provided(cls, v: str | None) -> str | None:
+        if not v:
+            msg = "must be a non-empty string if provided"
+            raise ValueError(msg)
+        return v
 
 
 @dataclass
@@ -38,6 +86,8 @@ class RunAgentRequest(RequestPayload):
     url_artifacts: list[RunAgentRequestArtifact]
     thread_id: str
     additional_mcp_servers: list[str] = field(default_factory=list)
+    provider_name: str | None = None
+    model_name: str | None = None
 
 
 @dataclass
@@ -180,8 +230,9 @@ class ConfigureAgentRequest(RequestPayload):
     Results: ConfigureAgentResultSuccess | ConfigureAgentResultFailure (configuration error)
     """
 
-    prompt_driver: dict = field(default_factory=dict)
+    prompt_driver: PromptDriverConfig = field(default_factory=PromptDriverConfig)
     image_generation_driver: dict = field(default_factory=dict)
+    active_provider: str = ""
 
 
 @dataclass
@@ -525,18 +576,243 @@ class ListAgentModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess
     """Agent model lists retrieved successfully.
 
     Args:
-        prompt_models: Ordered list of prompt-model IDs.
-        image_models: Ordered list of image-model IDs.
+        prompt_models: Ordered list of prompt-model IDs available on Griptape Cloud.
+        image_models: Ordered list of image-model IDs available on Griptape Cloud.
         deprecated_models: Mapping of deprecated model ID to live replacement
             (covers both the prompt and image namespaces).
+        providers: Ordered list of provider catalog entries. Each entry has:
+            ``id``, ``display_name``, ``terms_url`` (str or None),
+            ``key_support`` (str or None), ``notes`` (str or None),
+            ``requires_api_key`` (bool convenience field),
+            ``default_base_url`` (str or None), ``has_model_list`` (bool),
+            ``default_model`` (str).
     """
 
     prompt_models: list[str] = field(default_factory=list)
     image_models: list[str] = field(default_factory=list)
     deprecated_models: dict[str, str] = field(default_factory=dict)
+    providers: list[ProviderCatalogEntry] = field(default_factory=list)
 
 
 @dataclass
 @PayloadRegistry.register
 class ListAgentModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Agent model list retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsRequest(RequestPayload):
+    """List models available from a specific provider endpoint.
+
+    For ``griptape_cloud`` returns the static curated catalog. For all other
+    providers makes a ``GET {base_url}/models`` call (OpenAI-compatible) and
+    returns whatever models the server reports. Use this to populate a model
+    picker when the user has selected a non-Griptape-Cloud provider.
+
+    Args:
+        provider: Provider id — ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``, or ``"custom"``.
+        base_url: Base URL of the endpoint (required for non-Griptape-Cloud providers).
+        api_key: API key sent as ``Authorization: Bearer`` (optional; omit for Ollama).
+
+    Results: ListProviderModelsResultSuccess | ListProviderModelsResultFailure
+    """
+
+    provider: str = ProviderID.GRIPTAPE_CLOUD
+    base_url: str = ""
+    api_key: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provider model list retrieved successfully.
+
+    Args:
+        models: Ordered list of model IDs reported by the provider.
+    """
+
+    models: list[str] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class ListProviderModelsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provider model list retrieval failed. Common causes: provider unreachable, bad URL."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigRequest(RequestPayload):
+    """Get the current agent configuration.
+
+    Use when: Populating the agent settings panel with the current provider,
+    model, and endpoint values so the UI reflects live engine state.
+
+    Results: GetAgentConfigResultSuccess | GetAgentConfigResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Current agent configuration retrieved successfully.
+
+    Args:
+        provider: Active provider type id (e.g. ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``, ``"custom"``).
+        active_provider: ``name`` of the currently active provider. Use this (not ``provider``)
+            to round-trip provider identity, since multiple providers can share the same type.
+        model_name: Active prompt model id.
+        image_model_name: Active image generation model id.
+        base_url: Custom base URL in use for non-Griptape-Cloud providers.
+            Empty string when the provider manages its own URL.
+    """
+
+    provider: str
+    active_provider: str
+    model_name: str
+    image_model_name: str
+    base_url: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetAgentConfigResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent config retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersRequest(RequestPayload):
+    """List all configured agent providers.
+
+    Use when: Populating the provider management UI, letting users see and
+    enable/disable named agent provider configurations.
+
+    Results: ListAgentProvidersResultSuccess | ListAgentProvidersResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Agent provider list retrieved successfully.
+
+    Args:
+        providers: Ordered list of provider configs. ``griptape_cloud`` is
+            always the first entry and cannot be deleted.
+        active_provider: ``name`` of the currently active provider.
+    """
+
+    providers: list[ProviderConfig] = field(default_factory=list)
+    active_provider: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class ListAgentProvidersResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent provider list retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderRequest(RequestPayload):
+    """Create a new named agent provider configuration.
+
+    Use when: Adding a new agent provider (Ollama instance, custom endpoint,
+    etc.) to the list of available agent providers.
+
+    Args:
+        provider: Provider config. Required fields: ``name`` (unique,
+            non-empty), ``type`` (one of the known preset ids). Optional:
+            ``model``, ``base_url``, ``api_key_secret_name``.
+
+    Results: CreateAgentProviderResultSuccess | CreateAgentProviderResultFailure
+    """
+
+    provider: CreateProviderPayload = field(default_factory=CreateProviderPayload)
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Agent provider created successfully.
+
+    Args:
+        name: ``name`` of the newly created agent provider.
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class CreateAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent provider creation failed. Common causes: duplicate name, missing required fields, unknown type."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderRequest(RequestPayload):
+    """Update an existing named agent provider configuration.
+
+    Use when: Editing an agent provider's model, base URL, API key, or metadata.
+
+    Args:
+        name: ``name`` of the provider to update (must already exist).
+        provider: Partial provider config. Only explicitly set fields are applied;
+            omitted fields are preserved. Rename is not supported.
+
+    Results: UpdateAgentProviderResultSuccess | UpdateAgentProviderResultFailure
+    """
+
+    name: str = ""
+    provider: UpdateProviderPayload = field(default_factory=UpdateProviderPayload)
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Agent provider updated successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UpdateAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent provider update failed. Common causes: provider not found, unknown type."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderRequest(RequestPayload):
+    """Delete a named agent provider configuration.
+
+    The ``griptape_cloud`` provider cannot be deleted.
+
+    Use when: Removing a agent provider the user no longer needs.
+
+    Args:
+        name: ``name`` of the provider to delete.
+
+    Results: DeleteAgentProviderResultSuccess | DeleteAgentProviderResultFailure
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Agent provider deleted successfully.
+
+    Args:
+        name: ``name`` of the deleted agent provider.
+    """
+
+    name: str = ""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeleteAgentProviderResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Agent provider deletion failed. Common causes: provider not found, protected provider, last remaining provider."""

@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -283,10 +284,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
 
         # Empty sentinel — use the save_failed_workflow situation
         situation_result = await GriptapeNodes.ahandle_request(
-            GetSituationRequest(situation_name="save_failed_workflow")
+            GetSituationRequest(situation_name=BuiltInSituation.SAVE_FAILED_WORKFLOW)
         )
         if not isinstance(situation_result, GetSituationResultSuccess):
-            logger.warning("Could not find 'save_failed_workflow' situation; falling back to workspace root.")
+            logger.warning(
+                "Could not find '%s' situation; falling back to workspace root.",
+                BuiltInSituation.SAVE_FAILED_WORKFLOW,
+            )
             return fallback
 
         parsed_macro = ParsedMacro(template=situation_result.situation.macro)
@@ -353,7 +357,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                     file_name=file_name,
                     file_path=target_path,
                     description=description,
-                    execution_flow_name=top_level_flow_result.flow_name,
                 )
             )
             if isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
