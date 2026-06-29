@@ -1220,6 +1220,8 @@ class NodeExecutor:
 
                 if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
                     end_loop_node.start_node.advance_sequential_progress(iteration_index)
+                    # Yield to the event loop so queued publish_update_to_parameter events
+                    # are dispatched to the UI before the next iteration begins.
                     await asyncio.sleep(0)
 
                 # Check if the end node signaled a break (for BaseIterativeEndNode)
