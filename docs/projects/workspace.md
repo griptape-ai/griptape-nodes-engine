@@ -26,14 +26,16 @@ When the workspace directory is the same as the project directory (self-containe
 
 ## Workspace resolution
 
-The workspace directory is determined in this order (later entries win):
+When a project is loaded, its workspace directory is decided by the following sources, **highest priority first** — the first source that supplies a value wins:
 
-1. Built-in default — `GriptapeNodes/` inside the engine's working directory at startup
-1. User config `workspace_directory` key
-1. Project directory auto-default — when a project is loaded and no other source sets the workspace, it defaults to the directory containing the project file
-1. Project-adjacent config `workspace_directory` key
-1. `project_workspaces` entry in user config (see below)
+1. The project's own `workspace_dir` field (see [Project-declared workspace](#project-declared-workspace-workspace_dir) below, and the [`workspace_dir` field](projects.md#workspace-directory) reference)
+1. `project_workspaces` entry in user config (see [Per-project workspace overrides](#per-project-workspace-overrides) below)
 1. Environment variable `GTN_CONFIG_WORKSPACE_DIRECTORY`
+1. Project-adjacent config `workspace_directory` key
+1. The nearest ancestor's resolved workspace, walking the explicit [parent-project chain](projects.md#parent-projects)
+1. The global `workspace_directory` from user config, else the directory containing the project file (auto-default)
+
+When no project file is involved, the workspace comes from the global `workspace_directory` (or the built-in `GriptapeNodes/` default beneath the engine's working directory).
 
 ## Per-project workspace overrides
 
@@ -49,6 +51,29 @@ The `project_workspaces` setting in your user config maps project file paths to 
 ```
 
 Keys are resolved absolute paths to project files. When a project is loaded, if its resolved path matches a key, the corresponding value is used as the workspace directory.
+
+## Project-declared workspace (`workspace_dir`)
+
+A project can name its own workspace directory in the project file via the `workspace_dir` field. This is the **highest-priority** workspace source: it beats the per-user `project_workspaces` mapping, the `GTN_CONFIG_WORKSPACE_DIRECTORY` env var, the project-adjacent config, parent inheritance, and the global default.
+
+Use it when a project should always resolve to a fixed workspace, regardless of each user's machine-level config. Unlike `project_workspaces` (which every user must set in their own config), `workspace_dir` travels inside the project file, so the project carries its workspace with it.
+
+The value may be either a single path or a per-platform mapping:
+
+```yaml
+# A single path: absolute, or relative to this project file's directory.
+workspace_dir: "./workspace"
+
+# Or a per-platform mapping; the active platform's key is used, falling back to `default`.
+workspace_dir:
+  darwin: "/Volumes/fast/ProjectA"
+  windows: "D:/ProjectA"
+  default: "./workspace"
+```
+
+A relative path resolves against the directory containing the project file (the same way `parent_project_path` resolves), so a project that uses `workspace_dir: "./workspace"` stays portable: move or copy the project folder and the workspace follows. The target directory does not need to contain a `griptape_nodes_config.json` — an empty directory is valid.
+
+See the [`workspace_dir` field reference](projects.md#workspace-directory) for the full schema, per-platform fallback rules, and how it behaves with parent projects.
 
 ## Example scenarios
 
@@ -149,6 +174,24 @@ The studio ships `log_level: "WARNING"` in the project-adjacent config. A develo
 
 Griptape Nodes looks for `griptape-nodes-project.yml` in the workspace directory on startup. If found, the project is loaded automatically. This is the same as scenario 2 — workspace and project directory are the same, so the single `griptape_nodes_config.json` serves as both project-adjacent and workspace config.
 
+### Scenario 8: Project pins its own workspace
+
+A project that should always resolve to a fixed workspace declares it directly with `workspace_dir`, so no per-user `project_workspaces` entry is needed. A relative value keeps the project portable across machines.
+
+```yaml
+# griptape-nodes-project.yml
+name: "ProjectA"
+workspace_dir: "./workspace"
+```
+
+```
+/ProjectA/
+  griptape-nodes-project.yml    <- workspace_dir: ./workspace
+  workspace/                    <- resolved workspace (created on demand)
+```
+
+Because `workspace_dir` is the highest-priority source, this wins over any `project_workspaces` mapping or env var. Move the `ProjectA/` folder anywhere and the workspace still resolves to its `workspace/` subdirectory.
+
 ## How paths resolve
 
 All relative paths in the project system resolve against the **workspace directory**. If your workspace is `/Users/you/workspace/` and a situation macro resolves to `outputs/render_001.png`, the final absolute path is `/Users/you/workspace/outputs/render_001.png`.
@@ -165,6 +208,7 @@ See [Projects](projects.md) for details on the project file and merge model.
 
 | Setting                                      | Description                                         |
 | -------------------------------------------- | --------------------------------------------------- |
+| `workspace_dir`                              | Project-declared workspace; highest-priority source |
 | `workspace_directory`                        | The root directory for your work                    |
 | `project_workspaces`                         | Per-project workspace overrides in user config      |
 | `griptape-nodes-project.yml`                 | Optional project template file                      |
