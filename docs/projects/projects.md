@@ -17,7 +17,7 @@ Place this file in your workspace directory. It is optional — if absent, the [
 ## Project file structure
 
 ```yaml
-project_template_schema_version: "0.3.2"
+project_template_schema_version: "0.5.1"
 name: "My Project"
 description: "Optional description"
 
@@ -46,16 +46,17 @@ file_extension_directories:
 
 ### Fields reference
 
-| Field                             | Required | Description                                                                                                                         |
-| --------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `project_template_schema_version` | Yes      | Must match the supported version (`"0.3.2"`)                                                                                        |
-| `name`                            | Yes      | Human-readable name for this project                                                                                                |
-| `description`                     | No       | Optional description                                                                                                                |
-| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects). |
-| `situations`                      | No       | Dict of situation overrides and additions                                                                                           |
-| `directories`                     | No       | Dict of directory overrides and additions                                                                                           |
-| `environment`                     | No       | Dict of custom key-value variables                                                                                                  |
-| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                        |
+| Field                             | Required | Description                                                                                                                                                                                                                                |
+| --------------------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `project_template_schema_version` | Yes      | Must match the supported version (`"0.5.1"`)                                                                                                                                                                                               |
+| `name`                            | Yes      | Human-readable name for this project                                                                                                                                                                                                       |
+| `description`                     | No       | Optional description                                                                                                                                                                                                                       |
+| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects).                                                                                                        |
+| `workspace_dir`                   | No       | Directory this project uses as its workspace; the highest-priority workspace source. A string (absolute or relative to this YAML) or a per-platform mapping. Not inherited from a parent. See [Workspace directory](#workspace-directory). |
+| `situations`                      | No       | Dict of situation overrides and additions                                                                                                                                                                                                  |
+| `directories`                     | No       | Dict of directory overrides and additions                                                                                                                                                                                                  |
+| `environment`                     | No       | Dict of custom key-value variables                                                                                                                                                                                                         |
+| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                                                                                                                               |
 
 ### Situation fields
 
@@ -104,7 +105,7 @@ You never need to repeat inherited values. Your project file only needs to conta
 A project can declare another project as its parent. The parent's fully merged template (after the parent has resolved its *own* parent chain) becomes the base, and this project's overlay is applied on top. This lets you keep a shared base configuration in one place — a team-wide directory layout, a fixed set of environment variables, a custom situation — and let derived projects inherit from it instead of restating every field.
 
 ```yaml
-project_template_schema_version: "0.3.2"
+project_template_schema_version: "0.5.1"
 name: "Marketing Renders"
 parent_project_path: "../team-base/griptape-nodes-project.yml"
 
@@ -149,6 +150,29 @@ A parent that cannot be read or parsed surfaces as a validation error on the chi
 ### Sharing across machines
 
 A workspace zipped on one machine and unpacked on another will keep parent links intact as long as the parent is referenced with a relative path and travels alongside the child inside the workspace. Absolute paths break across machines (different home directories, different drive letters); the relative form is what makes parent chains portable.
+
+## Workspace directory
+
+The optional `workspace_dir` field names the directory this project uses as its [workspace](workspace.md). When set, it is the **highest-priority** workspace source — it overrides the per-user `project_workspaces` mapping, the `GTN_CONFIG_WORKSPACE_DIRECTORY` env var, the project-adjacent config, parent inheritance, and the global default.
+
+The value takes one of two forms:
+
+```yaml
+# A string: absolute, or relative to this project file's directory.
+workspace_dir: "./workspace"
+
+# Or a per-platform mapping with optional linux / darwin / windows / default keys.
+workspace_dir:
+  darwin: "/Volumes/fast/ProjectA"
+  windows: "D:/ProjectA"
+  default: "./workspace"
+```
+
+A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` uses — so a relative value travels with the project across machines and operating systems. The raw value is stored verbatim and only resolved to an absolute path at workspace-resolution time; it is never absolutized on save. The target directory does not need to contain a `griptape_nodes_config.json`; an empty directory is valid.
+
+For the per-platform form, the engine picks the entry matching the current platform. When that platform's key is unset it falls back to `default`. If neither the platform key nor `default` is set, the field yields no value on that platform and workspace resolution falls through to the next source (see [Workspace resolution](workspace.md#workspace-resolution)).
+
+Unlike most fields, `workspace_dir` is **not inherited** from a parent project. It describes this project's own workspace and is taken from this project's overlay alone — a child does not adopt its parent's `workspace_dir`. (Cross-project workspace inheritance is handled separately by the resolution ladder's parent-chain step, not by the merge model.) Setting `workspace_dir: null` or omitting the field both leave the project with no declared workspace.
 
 ## Validation status
 
