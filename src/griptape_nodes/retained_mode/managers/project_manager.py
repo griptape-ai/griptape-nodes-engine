@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
@@ -57,6 +58,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMatchPathAgainstMacroRequest,
     AttemptMatchPathAgainstMacroResultFailure,
     AttemptMatchPathAgainstMacroResultSuccess,
+    ExportProjectRequest,
+    ExportProjectResultFailure,
+    ExportProjectResultSuccess,
     GetAllSituationsForProjectRequest,
     GetAllSituationsForProjectResultFailure,
     GetAllSituationsForProjectResultSuccess,
@@ -75,6 +79,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
+    ImportProjectRequest,
+    ImportProjectResultFailure,
+    ImportProjectResultSuccess,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
     LoadProjectTemplateRequest,
@@ -82,6 +89,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     LoadProjectTemplateResultSuccess,
     MacroPath,
     PathResolutionFailureReason,
+    PreviewImportProjectRequest,
+    PreviewImportProjectResultFailure,
+    PreviewImportProjectResultSuccess,
     ProjectTemplateInfo,
     SaveProjectTemplateRequest,
     SaveProjectTemplateResultFailure,
@@ -107,6 +117,13 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_REGISTER_KEY,
     PROJECTS_TO_REGISTER_KEY,
     REQUIRES_ENGINE_KEY,
+)
+from griptape_nodes.retained_mode.publishing.project_packager import (
+    extract_archive,
+    is_manifest_schema_compatible,
+    package_project_to_zip,
+    read_manifest,
+    rename_project_template,
 )
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
@@ -381,6 +398,19 @@ class _ProvisioningConfigDirs(NamedTuple):
     apply_override: bool
 
 
+class _ManifestValidation(NamedTuple):
+    """Outcome of reading and schema-checking a project package's manifest.
+
+    On success `manifest` is the parsed dict and `failure_reason` is None. On
+    failure `manifest` is None and `failure_reason` holds the user-facing reason
+    fragment (no "Attempted to ..." prefix), so each handler can prepend its own
+    preview/import wording.
+    """
+
+    manifest: dict | None
+    failure_reason: str | None
+
+
 class ProjectManager:
     """Manages project templates, validation, and file path resolution.
 
@@ -471,6 +501,11 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(
             ActivateWorkspaceProjectRequest, self.on_activate_workspace_project_request
         )
+        event_manager.assign_manager_to_request_type(ExportProjectRequest, self.on_export_project_request)
+        event_manager.assign_manager_to_request_type(
+            PreviewImportProjectRequest, self.on_preview_import_project_request
+        )
+        event_manager.assign_manager_to_request_type(ImportProjectRequest, self.on_import_project_request)
 
         # Register app initialization listener
         event_manager.add_listener_to_app_event(
@@ -2259,6 +2294,236 @@ class ProjectManager:
         return ActivateWorkspaceProjectResultSuccess(
             result_details=f"Activated workspace project: {self._current_project_id}",
         )
+
+    def on_export_project_request(
+        self, request: ExportProjectRequest
+    ) -> ExportProjectResultSuccess | ExportProjectResultFailure:
+        """Package a loaded project and its dependencies into a portable .zip.
+
+        Validates that the project is loaded and file-backed and that the
+        destination's parent directory exists, then hands the project base dir and
+        its adjacent griptape_nodes_config.json to package_project_to_zip. Secret
+        VALUES never leave the machine: only required secret KEY names travel.
+
+        Any loaded project may be exported, active or not. The library/asset
+        content is read from the exported project's own files and is correct
+        regardless. The required-secret-KEY list, however, is derived from the
+        engine's merged global config and is most accurate when the exported
+        project is the active one (see _collect_required_secret_keys).
+        """
+        project_info = self._successfully_loaded_project_templates.get(request.project_id)
+        if project_info is None:
+            return ExportProjectResultFailure(
+                result_details=f"Attempted to export project '{request.project_id}'. Failed because it is not loaded.",
+            )
+        if project_info.project_file_path is None:
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}'. "
+                    f"Failed because it has no backing file (e.g. system defaults)."
+                ),
+            )
+
+        # Coerce destination_path at the boundary. Unlike the preview/import
+        # requests, cattrs does NOT coerce this field from its wire string: this
+        # request also carries project_id: ProjectID, and ProjectID is a
+        # TYPE_CHECKING-only forward reference (project_events cannot import
+        # project_manager at runtime without a cycle). get_type_hints() therefore
+        # raises NameError for the whole class and cattrs falls back to a
+        # no-coercion structure, so destination_path arrives as str.
+        destination_path = Path(request.destination_path)
+        if not destination_path.parent.is_dir():
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}' to '{destination_path}'. "
+                    f"Failed because the destination directory '{destination_path.parent}' does not exist."
+                ),
+            )
+
+        project_dir = project_info.project_file_path.parent
+        adjacent_config = self._config_manager.read_config_file(project_dir / "griptape_nodes_config.json")
+        required_secret_keys = self._collect_required_secret_keys()
+
+        try:
+            result = package_project_to_zip(project_info, adjacent_config, destination_path, required_secret_keys)
+        except (RuntimeError, OSError) as err:
+            return ExportProjectResultFailure(
+                result_details=(
+                    f"Attempted to export project '{request.project_id}' to '{destination_path}'. "
+                    f"Failed during packaging because {err}"
+                ),
+            )
+
+        logger.info("Exported project '%s' to '%s'", request.project_id, result.archive_path)
+        return ExportProjectResultSuccess(
+            archive_path=result.archive_path,
+            referenced_libraries=result.referenced_library_names,
+            copied_libraries=result.copied_library_names,
+            required_secret_keys=result.required_secret_keys,
+            warnings=result.warnings,
+            result_details=f"Exported project '{request.project_id}' to '{result.archive_path}'.",
+        )
+
+    def on_preview_import_project_request(
+        self, request: PreviewImportProjectRequest
+    ) -> PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure:
+        """Read a project package's manifest without extracting it (read-only).
+
+        Surfaces the manifest plus the required secret keys that are unset in the
+        current environment, computed via get_secret(should_error_on_not_found=False)
+        so nothing is written.
+        """
+        validation = self._read_and_validate_manifest(request.archive_path)
+        if validation.manifest is None:
+            return PreviewImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to preview project package '{request.archive_path}'. "
+                    f"Failed because {validation.failure_reason}"
+                ),
+            )
+        manifest = validation.manifest
+
+        required_secret_keys = manifest.get("required_secret_keys", [])
+        unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
+        return PreviewImportProjectResultSuccess(
+            manifest=manifest,
+            unset_secret_keys=unset_secret_keys,
+            result_details=f"Read manifest from project package '{request.archive_path}'.",
+        )
+
+    async def on_import_project_request(
+        self, request: ImportProjectRequest
+    ) -> ImportProjectResultSuccess | ImportProjectResultFailure:
+        """Extract a project package to a target directory and register it.
+
+        Mirrors on_load_project_template_request: the package's base-dir tree is
+        extracted 1:1, the optional rename is applied to the extracted YAML, then
+        the project is loaded (which persists its path and re-derives a fresh id).
+        Macro-defined directories re-resolve against the new location automatically.
+        Secrets are never auto-created; required/unset keys are returned for the GUI.
+        """
+        validation = self._read_and_validate_manifest(request.archive_path)
+        if validation.manifest is None:
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}'. "
+                    f"Failed because {validation.failure_reason}"
+                ),
+            )
+        manifest = validation.manifest
+
+        target_yaml = request.target_directory / WORKSPACE_PROJECT_FILE
+        if target_yaml.exists() and not request.overwrite_existing:
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed because a project file already exists at "
+                    f"'{target_yaml}' and overwrite_existing is False."
+                ),
+            )
+
+        try:
+            extract_archive(request.archive_path, request.target_directory)
+            if request.new_project_name is not None:
+                rename_project_template(target_yaml, request.new_project_name)
+        except (zipfile.BadZipFile, OSError) as err:
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Failed during extraction because {err}"
+                ),
+            )
+
+        load_result = await self.on_load_project_template_request(LoadProjectTemplateRequest(project_path=target_yaml))
+        if isinstance(load_result, LoadProjectTemplateResultFailure):
+            return ImportProjectResultFailure(
+                result_details=(
+                    f"Attempted to import project package '{request.archive_path}' into "
+                    f"'{request.target_directory}'. Extracted successfully but the project failed to load: "
+                    f"{load_result.result_details}"
+                ),
+            )
+
+        required_secret_keys = manifest.get("required_secret_keys", [])
+        unset_secret_keys = self._compute_unset_secret_keys(required_secret_keys)
+        warnings = list(manifest.get("warnings", []))
+
+        # Activation can fail without raising (e.g. the imported config's
+        # requires_engine is incompatible). The project is still loaded and
+        # registered, so this is success-with-caveat: surface the activation
+        # failure as a warning rather than masking it behind a clean success.
+        if request.set_as_current:
+            activation_result = await self.on_set_current_project_request(
+                SetCurrentProjectRequest(project_id=load_result.project_id)
+            )
+            if isinstance(activation_result, SetCurrentProjectResultFailure):
+                warnings.append(f"Imported project was not activated: {activation_result.result_details}")
+
+        logger.info("Imported project package '%s' into '%s'", request.archive_path, request.target_directory)
+        return ImportProjectResultSuccess(
+            project_id=load_result.project_id,
+            project_file_path=target_yaml,
+            required_secret_keys=required_secret_keys,
+            unset_secret_keys=unset_secret_keys,
+            warnings=warnings,
+            result_details=f"Imported project package '{request.archive_path}' into '{request.target_directory}'.",
+        )
+
+    def _read_and_validate_manifest(self, archive_path: Path) -> _ManifestValidation:
+        """Read a project package's manifest and check its schema compatibility.
+
+        Returns the parsed manifest on success. On failure returns only the reason
+        fragment (no handler prefix) so the preview and import handlers can supply
+        their own user-facing wording.
+        """
+        try:
+            manifest = read_manifest(archive_path)
+        except (OSError, zipfile.BadZipFile, KeyError, json.JSONDecodeError) as err:
+            return _ManifestValidation(manifest=None, failure_reason=str(err))
+
+        if not is_manifest_schema_compatible(manifest):
+            return _ManifestValidation(
+                manifest=None,
+                failure_reason=(
+                    f"its manifest schema version "
+                    f"'{manifest.get('manifest_schema_version')}' is incompatible with this engine."
+                ),
+            )
+
+        return _ManifestValidation(manifest=manifest, failure_reason=None)
+
+    def _collect_required_secret_keys(self) -> list[str]:
+        """Return the names of secrets the project needs, with NO values.
+
+        Sourced from SecretsManager.secrets_to_register, which is core secrets
+        plus library-declared secrets (a config read returning a name->default
+        dict). The template.environment field resolves builtins/dirs/shell-env,
+        not secrets, so it is not a secret source. GetAllSecretValuesRequest is
+        never used: no secret VALUE ever leaves the machine.
+
+        Scoping caveat: secrets_to_register reflects the engine's MERGED GLOBAL
+        config (the currently-active project plus its LOADED libraries' declared
+        secrets), not the exported project's own adjacent config. Exporting a
+        project that is not the active one can therefore both over-report (keys
+        the active project's libraries need but the exported one does not) and
+        under-report (the exported project's own libraries are not loaded, so
+        their declared secrets never reach the global config). Exporting the
+        active project yields the closest-to-correct list. Scoping the key list
+        to the exported project specifically is deferred.
+        """
+        return sorted(self._secrets_manager.secrets_to_register.keys())
+
+    def _compute_unset_secret_keys(self, required_secret_keys: list[str]) -> list[str]:
+        """Return the subset of required keys with no value in the current environment.
+
+        Uses get_secret(should_error_on_not_found=False) so detection never writes
+        a value or raises. Secrets are never auto-created on import.
+        """
+        return [
+            key
+            for key in required_secret_keys
+            if self._secrets_manager.get_secret(key, should_error_on_not_found=False) is None
+        ]
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Load system default project template when app initializes.
