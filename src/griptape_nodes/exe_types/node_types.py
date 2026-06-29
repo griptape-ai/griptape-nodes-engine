@@ -1501,6 +1501,16 @@ class BaseNode(ABC):
             return None
         if cached is not None:
             return cached  # type: ignore[return-value]
+        # NOTE: The cache has no per-flow key — it stores a single dict for the duration
+        # of the enclosing aprocess_scope(). In practice aprocess_scope() is entered once
+        # per node execution and the cache is reset on exit, so the "one node per scope"
+        # invariant holds. The edge case (another node in a *different* flow having
+        # get_parameter_value() called during this node's aprocess) would return variables
+        # from the wrong flow, but cross-node reads during aprocess are uncommon enough
+        # to leave as a known limitation rather than add per-flow keying overhead.
+        # For worker-executed nodes the cache is pre-seeded by aprocess_scope() from the
+        # orchestrator-resolved variable dict, so this fallback path is only reached for
+        # in-process nodes whose request predates the variables field (e.g. unit tests).
         try:
             flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
         except KeyError:
