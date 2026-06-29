@@ -249,13 +249,12 @@ class LibraryRegistry(metaclass=SingletonMeta):
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
 
     @classmethod
-    def reset_for_testing(cls) -> None:
-        """Clear every registry store. Test-only: localizes the private-store coupling here.
+    def _clear(cls) -> None:
+        """Drop every registered library and its tracking state.
 
-        Tests that register throwaway libraries call this in setup/teardown rather
-        than reaching into the `ClassVar` stores by name, so renaming a store
-        updates this one method instead of silently degrading each test's cleanup
-        to a no-op.
+        Used by tests to reset the singleton between cases. Centralizes the store
+        list here so renaming a `ClassVar` updates this one method rather than
+        silently degrading callers that would otherwise clear stores by name.
         """
         cls._libraries.clear()
         cls._node_aliases.clear()

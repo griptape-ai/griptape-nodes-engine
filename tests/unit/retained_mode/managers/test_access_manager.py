@@ -31,9 +31,9 @@ class TestAccessManager:
     def _clean_registry(self):  # noqa: ANN202
         from griptape_nodes.node_library.library_registry import LibraryRegistry
 
-        LibraryRegistry.reset_for_testing()
+        LibraryRegistry._clear()
         yield
-        LibraryRegistry.reset_for_testing()
+        LibraryRegistry._clear()
 
     def _register(self, node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN202
         from griptape_nodes.node_library.library_registry import (
