@@ -31,12 +31,9 @@ class TestAccessManager:
     def _clean_registry(self):  # noqa: ANN202
         from griptape_nodes.node_library.library_registry import LibraryRegistry
 
-        stores = ("_libraries", "_node_aliases", "_collision_node_names_to_library_names", "_registered_widgets")
-        for store in stores:
-            getattr(LibraryRegistry, store).clear()
+        LibraryRegistry.reset_for_testing()
         yield
-        for store in stores:
-            getattr(LibraryRegistry, store).clear()
+        LibraryRegistry.reset_for_testing()
 
     def _register(self, node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN202
         from griptape_nodes.node_library.library_registry import (
@@ -477,7 +474,7 @@ class TestAccessManager:
         try:
             GriptapeNodes.handle_request(
                 QueryModelAccessForCatalogRequest(
-                    specific_library_name=self._LIBRARY_NAME,
+                    library_name=self._LIBRARY_NAME,
                     candidate_model_ids=["gtc_claude_opus_4_7"],
                 )
             )
@@ -511,7 +508,7 @@ class TestAccessManager:
         try:
             result = GriptapeNodes.handle_request(
                 QueryModelAccessForCatalogRequest(
-                    specific_library_name="library-that-does-not-exist",
+                    library_name="library-that-does-not-exist",
                     candidate_model_ids=["gtc_claude_opus_4_7"],
                 )
             )
@@ -541,7 +538,7 @@ class TestAccessManager:
         try:
             result = GriptapeNodes.handle_request(
                 QueryModelAccessForCatalogRequest(
-                    specific_library_name=self._LIBRARY_NAME,
+                    library_name=self._LIBRARY_NAME,
                     candidate_model_ids=["not_in_catalog"],
                 )
             )

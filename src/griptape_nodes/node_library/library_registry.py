@@ -15,6 +15,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
+    find_model_catalog,
     resolve_node_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
@@ -246,6 +247,20 @@ class LibraryRegistry(metaclass=SingletonMeta):
     _collision_node_names_to_library_names: ClassVar[dict[str, list[str]]] = {}
     # Track registered widgets per library: {library_name: set(widget_names)}
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
+
+    @classmethod
+    def reset_for_testing(cls) -> None:
+        """Clear every registry store. Test-only: localizes the private-store coupling here.
+
+        Tests that register throwaway libraries call this in setup/teardown rather
+        than reaching into the `ClassVar` stores by name, so renaming a store
+        updates this one method instead of silently degrading each test's cleanup
+        to a no-op.
+        """
+        cls._libraries.clear()
+        cls._node_aliases.clear()
+        cls._collision_node_names_to_library_names.clear()
+        cls._registered_widgets.clear()
 
     @classmethod
     def generate_new_library(
@@ -608,10 +623,7 @@ class Library:
         if node_metadata is None:
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
             raise KeyError(msg)
-        catalog = next(
-            (d for d in self._library_data.metadata.declarations if isinstance(d, ModelCatalogLibraryProperty)),
-            None,
-        )
+        catalog = find_model_catalog(self._library_data.metadata.declarations)
         if catalog is None:
             return []
         return resolve_node_models(catalog, node_metadata.declarations)

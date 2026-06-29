@@ -40,13 +40,14 @@ fires from `ModelManager`.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.node_library.library_declarations import (
-    ModelCatalogLibraryProperty,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
     ResolvedModel,
+    find_model_catalog,
     iter_catalog_models,
     resolve_node_models,
 )
@@ -77,6 +78,19 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 
+@dataclass(frozen=True, kw_only=True, slots=True)
+class _NodeResolution:
+    """A node's library context: the node's declarations, the library's, and a catalog index.
+
+    Built only on the success path of `AccessManager._resolve_node_library`; a
+    failed lookup raises instead of producing a half-populated instance.
+    """
+
+    node_declarations: Sequence[NodeDeclaration]
+    library_declarations: Sequence[LibraryDeclaration]
+    resolved_by_id: dict[str, ResolvedModel]
+
+
 class AccessManager:
     """Answers per-candidate authorization queries via the `OFFER_MODEL` checkpoint."""
 
@@ -104,9 +118,10 @@ class AccessManager:
 
     def on_query_model_access_for_node_request(self, request: QueryModelAccessForNodeRequest) -> ResultPayload:
         """Node-attributed. Engine derives candidates from declarations unless caller overrides."""
-        resolution = self._resolve_node_library(request.node_type, request.specific_library_name)
-        if resolution.error is not None:
-            return QueryModelAccessForNodeResultFailure(result_details=resolution.error)
+        try:
+            resolution = self._resolve_node_library(request.node_type, request.specific_library_name)
+        except KeyError as exc:
+            return QueryModelAccessForNodeResultFailure(result_details=str(exc))
 
         if request.candidate_model_ids is None:
             candidates = self._declared_model_ids(
@@ -134,7 +149,7 @@ class AccessManager:
         bare verdicts so a policy can still match on `MODEL_ID`.
         """
         try:
-            library = LibraryRegistry.get_library(request.specific_library_name)
+            library = LibraryRegistry.get_library(request.library_name)
         except KeyError:
             resolved_by_id: dict[str, ResolvedModel] = {}
         else:
@@ -147,47 +162,39 @@ class AccessManager:
         )
         return QueryModelAccessForCatalogResultSuccess(
             verdicts=verdicts,
-            result_details=f"Evaluated {len(verdicts)} candidate model(s) in catalog '{request.specific_library_name}'.",
+            result_details=f"Evaluated {len(verdicts)} candidate model(s) in catalog '{request.library_name}'.",
         )
 
     def _resolve_node_library(self, node_type: str, specific_library_name: str | None) -> _NodeResolution:
         """Look up the node's library and return its declarations plus a model-id index.
 
-        Returns an error string when the lookup fails so the per-node handler can
-        map it onto a `Failure` result; on success ``error`` is ``None`` and the
-        other fields are populated.
+        Raises:
+            KeyError: when the node type's library is not registered, or the node
+                type is not found within that library. The message names the node
+                type so the per-node handler can surface it verbatim on a
+                ``Failure`` result.
         """
         try:
             library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
         except KeyError as exc:
-            return _NodeResolution(
-                error=(
-                    f"Attempted to query model access for node type '{node_type}'. "
-                    f"Failed because the library lookup raised KeyError: {exc}."
-                ),
-                node_declarations=(),
-                library_declarations=(),
-                resolved_by_id={},
+            msg = (
+                f"Attempted to query model access for node type '{node_type}'. "
+                f"Failed because the library lookup raised KeyError: {exc}."
             )
+            raise KeyError(msg) from exc
 
         try:
             node_metadata = library.get_node_metadata(node_type)
         except KeyError as exc:
-            return _NodeResolution(
-                error=(
-                    f"Attempted to query model access for node type '{node_type}'. "
-                    f"Failed because the node type was not found in its library: {exc}."
-                ),
-                node_declarations=(),
-                library_declarations=(),
-                resolved_by_id={},
+            msg = (
+                f"Attempted to query model access for node type '{node_type}'. "
+                f"Failed because the node type was not found in its library: {exc}."
             )
+            raise KeyError(msg) from exc
 
-        node_declarations = node_metadata.declarations
         library_declarations = library.get_metadata().declarations
         return _NodeResolution(
-            error=None,
-            node_declarations=node_declarations,
+            node_declarations=node_metadata.declarations,
             library_declarations=library_declarations,
             resolved_by_id=self._index_catalog(library_declarations),
         )
@@ -195,10 +202,7 @@ class AccessManager:
     @staticmethod
     def _index_catalog(library_declarations: Sequence[LibraryDeclaration]) -> dict[str, ResolvedModel]:
         """Build a `{model_id: ResolvedModel}` index from a library's catalog, empty if none."""
-        catalog = next(
-            (d for d in library_declarations if isinstance(d, ModelCatalogLibraryProperty)),
-            None,
-        )
+        catalog = find_model_catalog(library_declarations)
         if catalog is None:
             return {}
         return {resolved.model_id: resolved for resolved in iter_catalog_models(catalog)}
@@ -224,10 +228,7 @@ class AccessManager:
                         seen.add(model_id)
                         ordered.append(model_id)
 
-        catalog = next(
-            (d for d in library_declarations if isinstance(d, ModelCatalogLibraryProperty)),
-            None,
-        )
+        catalog = find_model_catalog(library_declarations)
         if catalog is None:
             return ordered
 
@@ -287,22 +288,3 @@ class AccessManager:
             )
             verdicts.append(ModelAccessVerdict(model_id=model_id, provider_model_id=provider_model_id, denial=denial))
         return verdicts
-
-
-class _NodeResolution:
-    """Result of looking up a node's library: declarations plus a catalog index, or an error."""
-
-    __slots__ = ("error", "library_declarations", "node_declarations", "resolved_by_id")
-
-    def __init__(
-        self,
-        *,
-        error: str | None,
-        node_declarations: Sequence[NodeDeclaration],
-        library_declarations: Sequence[LibraryDeclaration],
-        resolved_by_id: dict[str, ResolvedModel],
-    ) -> None:
-        self.error = error
-        self.node_declarations = node_declarations
-        self.library_declarations = library_declarations
-        self.resolved_by_id = resolved_by_id

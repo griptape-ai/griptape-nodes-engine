@@ -14,11 +14,14 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import Check
 class ModelAccessVerdict:
     """The per-model authorization verdict for one candidate.
 
-    `model_id` is the catalog key the engine evaluated (e.g. ``gtc_claude_opus_4_7``).
+    `model_id` is the catalog key the engine evaluated (e.g. ``gtc_claude_opus_4_7``);
+    always populated, so it is the field to match a verdict back to a candidate.
     `provider_model_id` is the upstream provider's name for that model (e.g.
-    ``claude-opus-4-7``); populated from the library catalog when the candidate
-    resolves to a known entry, ``None`` otherwise. Nodes match verdicts against
-    their own dropdown choices via this field.
+    ``claude-opus-4-7``), populated from the library catalog when the candidate
+    resolves to a known entry. It is ``None`` both when the candidate did not
+    resolve AND when it resolved to an entry that declares no ``provider_model_id``,
+    so ``None`` cannot be read as "unresolved" -- match on `model_id` for identity
+    and treat `provider_model_id` purely as the upstream display handle.
 
     `denial` is ``None`` when the model is allowed; a ``CheckpointDenial``
     otherwise, carrying the same failure tuple any other denied checkpoint
@@ -62,16 +65,6 @@ class QueryModelAccessResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
     """
 
     verdicts: list[ModelAccessVerdict] = field(default_factory=list)
-
-
-@dataclass
-@PayloadRegistry.register
-class QueryModelAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Bare access query failed.
-
-    The bare form has no lookups that can miss, so this is reserved for
-    unexpected internal errors.
-    """
 
 
 @dataclass
@@ -136,14 +129,14 @@ class QueryModelAccessForCatalogRequest(RequestPayload):
     ``QueryModelAccessRequest`` because the caller is telling the engine WHICH
     library catalog to use for enrichment.
 
-    A ``specific_library_name`` that does not resolve is not an error -- the
+    A ``library_name`` that does not resolve is not an error -- the
     handler returns ``Success`` with bare ``MODEL_ID``-only verdicts. Callers
     are expected to know their library; a missing library means the catalog
     has shifted out from under a stale name and a policy can still match on
     the bare ids.
 
     Args:
-        specific_library_name: Library whose catalog supplies provider / family
+        library_name: Library whose catalog supplies provider / family
             enrichment.
         candidate_model_ids: Catalog keys to evaluate, in input order.
 
@@ -151,7 +144,7 @@ class QueryModelAccessForCatalogRequest(RequestPayload):
         candidate, in input order).
     """
 
-    specific_library_name: str
+    library_name: str
     candidate_model_ids: list[str] = field(default_factory=list)
 
 
@@ -165,13 +158,3 @@ class QueryModelAccessForCatalogResultSuccess(WorkflowNotAlteredMixin, ResultPay
     """
 
     verdicts: list[ModelAccessVerdict] = field(default_factory=list)
-
-
-@dataclass
-@PayloadRegistry.register
-class QueryModelAccessForCatalogResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Catalog-scoped access query failed.
-
-    Reserved for unexpected internal errors; an unknown library name returns
-    ``Success`` with bare verdicts.
-    """
