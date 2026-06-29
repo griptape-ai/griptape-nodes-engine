@@ -192,16 +192,25 @@ def sanctioned_parameter_mutation() -> Iterator[None]:
 
 
 @contextmanager
-def aprocess_scope() -> Iterator[None]:
+def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) -> Iterator[None]:
     """Mark the enclosed block as the actual aprocess() execution.
 
     The framework wraps ``await node.aprocess()`` with this so the
     parameter-mutation-during-aprocess detector fires only for mutations
     that happen inside aprocess itself, not the surrounding hydration
     pass that also runs under the RUNTIME_EXECUTE strict-mode scope.
+
+    Args:
+        precomputed_variables: Optional variable dict from the orchestrator.
+            When provided, the variable cache is pre-seeded so nodes resolve
+            {VAR} tokens without a NodeManager lookup. This is required for
+            worker-executed nodes (which have no registry access) and is a
+            performance shortcut for in-process nodes.
     """
     token = _in_aprocess.set(True)
-    cache_token = _aprocess_variable_cache.set(None)
+    # Pre-seed with orchestrator-resolved variables when provided; otherwise
+    # _get_cached_variables() will populate lazily on first call.
+    cache_token = _aprocess_variable_cache.set(precomputed_variables)
     try:
         yield
     finally:

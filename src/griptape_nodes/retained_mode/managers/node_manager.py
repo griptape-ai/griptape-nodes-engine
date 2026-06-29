@@ -3270,7 +3270,7 @@ class NodeManager:
                     continue
                 node.parameter_values[param.name] = param.default_value
             try:
-                with aprocess_scope():
+                with aprocess_scope(request.variables or None):
                     await node.aprocess()
             except Exception as e:
                 # Pass the live exception through ``exception=`` so the

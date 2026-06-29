@@ -501,6 +501,12 @@ class ExecuteNodeRequest(RequestPayload):
         node_metadata: Full node metadata from the orchestrator. Required when
             the target library spawns a worker (used to construct the transient
             worker-side node). Ignored on the orchestrator path.
+        variables: Workflow variable dict for inline {VAR} substitution, computed
+            by the orchestrator from VariablesManager before the request is sent.
+            An empty dict means substitution is disabled or there are no variables.
+            Workers carry this field because they have no access to VariablesManager
+            or the workflow context; in-process nodes use it to skip the NodeManager
+            lookup that would otherwise resolve the flow.
 
     Results: ExecuteNodeResultSuccess | ExecuteNodeResultFailure
     """
@@ -508,6 +514,7 @@ class ExecuteNodeRequest(RequestPayload):
     node_name: str
     parameter_values: dict[str, Any] = field(default_factory=dict)
     node_metadata: NodeMetadata | None = None
+    variables: dict[str, str | int] = field(default_factory=dict)
 
 
 @dataclass
