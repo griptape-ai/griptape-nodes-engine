@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import threading
 import warnings
 from abc import ABC
@@ -12,9 +11,6 @@ from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
-from griptape_nodes.common.macro_parser.core import ParsedMacro
-from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
-from griptape_nodes.common.macro_parser.segments import ParsedVariable
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
@@ -32,6 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
+from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -118,63 +115,6 @@ _sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_muta
 # the broader RUNTIME_EXECUTE scope would false-positive on every such node.
 _in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
 
-# Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
-_NO_FLOW: object = object()
-
-# Caches get_variables_for_macro_resolution() result for the duration of one aprocess() call.
-# None = not yet computed; _NO_FLOW = computed but node has no parent flow; dict = resolved vars.
-_aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
-    "_node_types_aprocess_variable_cache", default=None
-)
-
-# Fast pre-check: does the string contain any potential variable reference ({Letter...})?
-_HAS_VARIABLE_MACRO: re.Pattern[str] = re.compile(r"\{[A-Za-z_]")
-# Matches a single {CONTENT} token with no nested braces (safe to pass to ParsedMacro).
-_MACRO_TOKEN: re.Pattern[str] = re.compile(r"\{([^{}]*)\}")
-
-
-def _contains_variable_macro(value: Any) -> bool:
-    """Return True if value is, or recursively contains, a str with a variable macro reference."""
-    if isinstance(value, str):
-        return bool(_HAS_VARIABLE_MACRO.search(value))
-    if isinstance(value, dict):
-        return any(_contains_variable_macro(v) for v in value.values())
-    if isinstance(value, list):
-        return any(_contains_variable_macro(item) for item in value)
-    return False
-
-
-def _resolve_macro_token(token: str, variables: dict[str, str | int]) -> str:
-    """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
-
-    Returns the resolved string on success, or the original token if the variable
-    is unknown, the token is not a macro reference, or parsing fails.
-
-    Variable values are substituted literally — NOT routed through env-var resolution.
-    A value like "$HOME" is treated as the string "$HOME", not expanded to the home
-    directory. This prevents both secret exfiltration and silent no-ops on dollar-sign
-    values (e.g. "$50", "$HOME/x").
-    """
-    try:
-        parsed = ParsedMacro(token)
-    except MacroSyntaxError:
-        return token
-    if not parsed.get_variables():
-        return token
-    # _MACRO_TOKEN matches exactly one {VAR} or {VAR:spec} per token, so there is at most
-    # one ParsedVariable segment. Iterate segments directly (not get_variables()) to retain
-    # format_specs, which are stripped by get_variables().
-    parsed_var = next((seg for seg in parsed.segments if isinstance(seg, ParsedVariable)), None)
-    if parsed_var is None or parsed_var.info.name not in variables:
-        return token
-    value: str | int = variables[parsed_var.info.name]
-    try:
-        for format_spec in parsed_var.format_specs:
-            value = format_spec.apply(value)
-    except MacroResolutionError:
-        return token
-    return str(value)
-
 
 @contextmanager
 def sanctioned_parameter_mutation() -> Iterator[None]:
@@ -209,13 +149,13 @@ def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) ->
     """
     token = _in_aprocess.set(True)
     # Pre-seed with orchestrator-resolved variables when provided; otherwise
-    # _get_cached_variables() will populate lazily on first call.
-    cache_token = _aprocess_variable_cache.set(precomputed_variables)
+    # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
+    cache_token = VariableResolver.seed_cache(precomputed_variables)
     try:
         yield
     finally:
         _in_aprocess.reset(token)
-        _aprocess_variable_cache.reset(cache_token)
+        VariableResolver.reset_cache(cache_token)
 
 
 class ImportDependency(NamedTuple):
@@ -1081,7 +1021,7 @@ class BaseNode(ABC):
             value = param.default_value
         if (
             isinstance(value, str)
-            and _HAS_VARIABLE_MACRO.search(value)
+            and VariableResolver.contains_variable_macro(value)
             and _in_aprocess.get()
             and not self._param_has_incoming_connection(param_name)
         ):
@@ -1492,61 +1432,18 @@ class BaseNode(ABC):
             return False
         return param_name in node_connections
 
-    def _get_cached_variables(self) -> dict[str, str | int] | None:
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        cached = _aprocess_variable_cache.get()
-        if cached is _NO_FLOW:
-            return None
-        if cached is not None:
-            return cached  # type: ignore[return-value]
-        # NOTE: The cache has no per-flow key — it stores a single dict for the duration
-        # of the enclosing aprocess_scope(). In practice aprocess_scope() is entered once
-        # per node execution and the cache is reset on exit, so the "one node per scope"
-        # invariant holds. The edge case (another node in a *different* flow having
-        # get_parameter_value() called during this node's aprocess) would return variables
-        # from the wrong flow, but cross-node reads during aprocess are uncommon enough
-        # to leave as a known limitation rather than add per-flow keying overhead.
-        # For worker-executed nodes the cache is pre-seeded by aprocess_scope() from the
-        # orchestrator-resolved variable dict, so this fallback path is only reached for
-        # in-process nodes whose request predates the variables field (e.g. unit tests).
-        try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(self.name)
-        except KeyError:
-            _aprocess_variable_cache.set(_NO_FLOW)
-            return None
-        resolved = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
-        _aprocess_variable_cache.set(resolved)
-        return resolved
-
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
-        if isinstance(value, str):
-            if _HAS_VARIABLE_MACRO.search(value):
-                return self._resolve_variables_in_string(value)
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
             return value
-        if isinstance(value, dict):
-            return {k: self._resolve_variables_in_value(v) for k, v in value.items()}
-        if isinstance(value, list):
-            return [self._resolve_variables_in_value(item) for item in value]
-        return value
+        return VariableResolver.resolve_value(value, variables)
 
     def _resolve_variables_in_string(self, text: str) -> str:
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
-            return text
-
-        variables = self._get_cached_variables()
+        variables = VariableResolver.get_variables_if_enabled(self.name)
         if variables is None:
             return text
-
-        return _MACRO_TOKEN.sub(
-            lambda m: _resolve_macro_token(m.group(0), variables),
-            text,
-        )
+        return VariableResolver.resolve_string(text, variables)
 
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
@@ -1558,10 +1455,7 @@ class BaseNode(ABC):
         Honors the per-workflow substitution toggle: when substitution is disabled
         the template is never shown in place of the real output.
         """
-        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+        if not VariableResolver.is_substitution_enabled():
             return output_value
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
@@ -1569,7 +1463,7 @@ class BaseNode(ABC):
         if ParameterMode.PROPERTY not in parameter.allowed_modes:
             return output_value
         raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
-        if _contains_variable_macro(raw_value) and raw_value != output_value:
+        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
             return raw_value
         return output_value
 
