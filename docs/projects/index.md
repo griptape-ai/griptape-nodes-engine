@@ -42,6 +42,7 @@ workspace
 
 ## Pages in this section
 
+- [Managing Projects (GUI)](gui_guide.md) — create, view, edit, switch, and remove projects from the GUI
 - [Workspace](workspace.md) — the root working context and how relative paths resolve
 - [Projects](projects.md) — the project file format and the merge model
 - [Version Pinning](version_pinning.md) — pin a project to an engine version and to specific library versions
