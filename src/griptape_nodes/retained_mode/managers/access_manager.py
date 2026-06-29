@@ -9,18 +9,18 @@ why?" -- one verdict per candidate, each carrying a `CheckpointDenial` or `None`
 Three request types, named by what attribution the engine adds to each checkpoint:
 
   - `QueryModelAccessRequest` -- bare. Caller supplies ids only. Checkpoint
-    attributes carry only `MODEL_ID`. For non-node callers (sidebar, scripted
-    enumerations) where no engine-side context attributes the query.
+    attributes carry only `ID` (the model id). For non-node callers (sidebar,
+    scripted enumerations) where no engine-side context attributes the query.
 
   - `QueryModelAccessForNodeRequest` -- node-attributed. Caller supplies a node
     type and, optionally, an explicit candidate list. When candidates are
     omitted the engine derives them from the node's `ModelUsageNodeProperty`
     plus `ModelProviderUsageNodeProperty` expansion. Checkpoint attributes
-    carry `NODE_TYPE = node_type`, `MODEL_ID`, plus catalog-resolved `PROVIDER_ID`
-    and `MODEL_FAMILIES` when the id is in the node's library catalog.
+    carry `ID` (the model id), `NODE_TYPE = node_type`, plus catalog-resolved
+    `PROVIDER_ID` and `MODEL_FAMILIES` when the id is in the node's library catalog.
 
   - `QueryModelAccessForCatalogRequest` -- catalog-scoped. Caller supplies a
-    library name and ids. Checkpoint attributes carry `MODEL_ID` plus
+    library name and ids. Checkpoint attributes carry `ID` (the model id) plus
     catalog-resolved `PROVIDER_ID` / `MODEL_FAMILIES`. No `NODE_TYPE` attribute --
     the caller has a library in mind but no node to attribute the query to.
 
@@ -114,7 +114,7 @@ class AccessManager:
             )
 
     def on_query_model_access_request(self, request: QueryModelAccessRequest) -> ResultPayload:
-        """Bare form. Hook sees `MODEL_ID` per candidate; no `ID`, no catalog enrichment."""
+        """Bare form. Hook sees `ID` (the model id) per candidate; no `NODE_TYPE`, no catalog enrichment."""
         verdicts = self._evaluate(
             candidate_model_ids=request.candidate_model_ids,
             node_type=None,
@@ -151,11 +151,11 @@ class AccessManager:
         )
 
     def on_query_model_access_for_catalog_request(self, request: QueryModelAccessForCatalogRequest) -> ResultPayload:
-        """Catalog-scoped. Hook sees `MODEL_ID` plus enrichment when the id resolves.
+        """Catalog-scoped. Hook sees `ID` (the model id) plus enrichment when the id resolves.
 
         A missing library is not fatal -- callers (sidebar, scripts) may name a
         library that's not currently registered; the handler falls through to
-        bare verdicts so a policy can still match on `MODEL_ID`.
+        bare verdicts so a policy can still match on `ID`.
         """
         try:
             library = LibraryRegistry.get_library(request.library_name)
@@ -261,13 +261,13 @@ class AccessManager:
         """Ask the authorization hook chain once per candidate; collect one verdict each.
 
         Attribute composition:
+          - ``ID`` (the model id, mirroring ``subject_id``) always.
           - ``NODE_TYPE = node_type`` only when ``node_type`` is supplied (per-node form).
-          - ``MODEL_ID`` always.
           - ``PROVIDER_ID`` and ``MODEL_FAMILIES`` only when the id resolves in
             ``resolved_by_id`` (the per-node and catalog-scoped forms supply this;
             the bare form does not).
 
-        An unknown id is still asked of the hook with ``MODEL_ID`` only, so a
+        An unknown id is still asked of the hook with ``ID`` only, so a
         policy can still match on the bare key.
 
         Sequential calls reset the hook chain's recursion guard between
@@ -277,7 +277,7 @@ class AccessManager:
         event_manager = GriptapeNodes.EventManager()
         verdicts: list[ModelAccessVerdict] = []
         for model_id in candidate_model_ids:
-            attributes: dict[str, Any] = {CheckpointAttribute.MODEL_ID: model_id}
+            attributes: dict[str, Any] = {CheckpointAttribute.ID: model_id}
             if node_type is not None:
                 attributes[CheckpointAttribute.NODE_TYPE] = node_type
             resolved = resolved_by_id.get(model_id)

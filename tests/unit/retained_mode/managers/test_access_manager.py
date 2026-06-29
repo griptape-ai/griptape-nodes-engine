@@ -166,7 +166,7 @@ class TestAccessManager:
         )
 
         def deny(checkpoint: object) -> CheckpointDenial | None:
-            if checkpoint.attributes.get("model_id") == "gtc_claude_opus_4_7":  # type: ignore[attr-defined]
+            if checkpoint.attributes.get("id") == "gtc_claude_opus_4_7":  # type: ignore[attr-defined]
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Opus is not in your plan."),))
             return None
 
@@ -239,7 +239,7 @@ class TestAccessManager:
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert result.verdicts[0].model_id == "not_in_catalog"
         assert result.verdicts[0].provider_model_id is None
-        assert seen_attributes == [{"node_type": _ProbeNode.__name__, "model_id": "not_in_catalog"}]
+        assert seen_attributes == [{"node_type": _ProbeNode.__name__, "id": "not_in_catalog"}]
 
     def test_for_node_per_candidate_loop_does_not_trip_recursion_guard(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
@@ -252,7 +252,7 @@ class TestAccessManager:
         seen_model_ids: list[str] = []
 
         def record(checkpoint: object) -> None:
-            seen_model_ids.append(checkpoint.attributes["model_id"])  # type: ignore[attr-defined]
+            seen_model_ids.append(checkpoint.attributes["id"])  # type: ignore[attr-defined]
 
         griptape_nodes.EventManager().add_authorization_hook(record)
         try:
@@ -416,7 +416,7 @@ class TestAccessManager:
         assert seen_attributes == [
             {
                 "node_type": _ProbeNode.__name__,
-                "model_id": "gtc_claude_opus_4_7",
+                "id": "gtc_claude_opus_4_7",
                 "provider_id": "anthropic",
                 "model_families": ["Claude 4"],
             }
@@ -457,8 +457,8 @@ class TestAccessManager:
         # `provider_model_id` is None because the bare form does NOT consult any catalog.
         assert all(v.provider_model_id is None for v in result.verdicts)
         assert seen_attributes == [
-            {"model_id": "gtc_claude_opus_4_7"},
-            {"model_id": "anything"},
+            {"id": "gtc_claude_opus_4_7"},
+            {"id": "anything"},
         ]
 
     def test_bare_request_hook_can_deny_on_bare_model_id(self, griptape_nodes: GriptapeNodes) -> None:
@@ -469,7 +469,7 @@ class TestAccessManager:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         def deny(checkpoint: object) -> CheckpointDenial | None:
-            if checkpoint.attributes.get("model_id") == "gtc_claude_opus_4_7":  # type: ignore[attr-defined]
+            if checkpoint.attributes.get("id") == "gtc_claude_opus_4_7":  # type: ignore[attr-defined]
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Opus is not in your plan."),))
             return None
 
@@ -511,7 +511,7 @@ class TestAccessManager:
         # No "node_type" attribute -- catalog-scoped form has no node attribution.
         assert seen_attributes == [
             {
-                "model_id": "gtc_claude_opus_4_7",
+                "id": "gtc_claude_opus_4_7",
                 "provider_id": "anthropic",
                 "model_families": ["Claude 4"],
             }
@@ -546,7 +546,7 @@ class TestAccessManager:
         assert result.verdicts[0].model_id == "gtc_claude_opus_4_7"
         assert result.verdicts[0].provider_model_id is None
         # Hook still got the bare model_id, no enrichment.
-        assert seen_attributes == [{"model_id": "gtc_claude_opus_4_7"}]
+        assert seen_attributes == [{"id": "gtc_claude_opus_4_7"}]
 
     def test_for_catalog_unknown_id_no_enrichment_but_query_still_happens(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
@@ -575,4 +575,4 @@ class TestAccessManager:
         assert isinstance(result, QueryModelAccessForCatalogResultSuccess)
         assert result.verdicts[0].model_id == "not_in_catalog"
         assert result.verdicts[0].provider_model_id is None
-        assert seen_attributes == [{"model_id": "not_in_catalog"}]
+        assert seen_attributes == [{"id": "not_in_catalog"}]

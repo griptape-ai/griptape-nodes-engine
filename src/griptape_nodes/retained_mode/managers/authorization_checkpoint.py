@@ -68,7 +68,6 @@ class CheckpointAttribute(StrEnum):
     PROVIDER_ID = "provider_id"
     EXECUTES_ARBITRARY_CODE = "executes_arbitrary_code"
     NAME = "name"
-    MODEL_ID = "model_id"
     MODEL_IDS = "model_ids"
     PROVIDER_IDS = "provider_ids"
     MODEL_FAMILIES = "model_families"

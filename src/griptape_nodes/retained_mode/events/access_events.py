@@ -40,9 +40,9 @@ class QueryModelAccessRequest(RequestPayload):
 
     Use from non-node callers (sidebar agent, ``ModelManager`` Hugging Face
     enumeration, scripted callers) when there is no engine-side context to
-    attribute the query to. The checkpoint carries only ``MODEL_ID`` per
-    candidate -- no ``ID``, no ``PROVIDER_ID``, no ``MODEL_FAMILIES``. A policy
-    matching on the bare model id still fires.
+    attribute the query to. The checkpoint carries only ``ID`` (the model id) per
+    candidate -- no ``NODE_TYPE``, no ``PROVIDER_ID``, no ``MODEL_FAMILIES``. A
+    policy matching on the bare model id still fires.
 
     Args:
         candidate_model_ids: Catalog keys to evaluate, in input order.
@@ -72,8 +72,8 @@ class QueryModelAccessResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 class QueryModelAccessForNodeRequest(RequestPayload):
     """Node-attributed: 'on behalf of this node, are these ids allowed?'.
 
-    The checkpoint carries ``NODE_TYPE = node_type``, ``MODEL_ID``, and (when the
-    id resolves against the node's library catalog) ``PROVIDER_ID`` and
+    The checkpoint carries ``ID`` (the model id), ``NODE_TYPE = node_type``, and
+    (when the id resolves against the node's library catalog) ``PROVIDER_ID`` and
     ``MODEL_FAMILIES``. When ``candidate_model_ids`` is ``None`` the engine
     derives the list from the node's ``ModelUsageNodeProperty`` plus
     ``ModelProviderUsageNodeProperty`` expansion -- the canonical "populate a
@@ -127,14 +127,14 @@ class QueryModelAccessForNodeResultFailure(WorkflowNotAlteredMixin, ResultPayloa
 class QueryModelAccessForCatalogRequest(RequestPayload):
     """Catalog-scoped: caller has a library in mind but no node.
 
-    The checkpoint carries ``MODEL_ID`` and (when the id resolves against that
-    library's catalog) ``PROVIDER_ID`` and ``MODEL_FAMILIES``. No ``NODE_TYPE``
+    The checkpoint carries ``ID`` (the model id) and (when the id resolves against
+    that library's catalog) ``PROVIDER_ID`` and ``MODEL_FAMILIES``. No ``NODE_TYPE``
     attribute -- the query is not attributed to a node. Distinct from
     ``QueryModelAccessRequest`` because the caller is telling the engine WHICH
     library catalog to use for enrichment.
 
     A ``library_name`` that does not resolve is not an error -- the
-    handler returns ``Success`` with bare ``MODEL_ID``-only verdicts. Callers
+    handler returns ``Success`` with bare ``ID``-only verdicts. Callers
     are expected to know their library; a missing library means the catalog
     has shifted out from under a stale name and a policy can still match on
     the bare ids.
