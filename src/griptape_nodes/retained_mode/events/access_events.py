@@ -72,8 +72,8 @@ class QueryModelAccessResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucces
 class QueryModelAccessForNodeRequest(RequestPayload):
     """Node-attributed: 'on behalf of this node, are these ids allowed?'.
 
-    The checkpoint carries ``ID = node_type``, ``MODEL_ID``, and (when the id
-    resolves against the node's library catalog) ``PROVIDER_ID`` and
+    The checkpoint carries ``NODE_TYPE = node_type``, ``MODEL_ID``, and (when the
+    id resolves against the node's library catalog) ``PROVIDER_ID`` and
     ``MODEL_FAMILIES``. When ``candidate_model_ids`` is ``None`` the engine
     derives the list from the node's ``ModelUsageNodeProperty`` plus
     ``ModelProviderUsageNodeProperty`` expansion -- the canonical "populate a
@@ -102,7 +102,11 @@ class QueryModelAccessForNodeRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class QueryModelAccessForNodeResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """One verdict per candidate, in declaration / input order, de-duplicated.
+    """One verdict per candidate, in declaration order (derived) or input order (explicit).
+
+    De-duplication applies only to engine-derived candidates (when
+    ``candidate_model_ids`` is omitted); an explicit ``candidate_model_ids`` list
+    is evaluated as-is, one verdict per entry including any duplicates.
 
     Args:
         verdicts: Ordered list of per-model verdicts. Empty when the node
@@ -124,7 +128,7 @@ class QueryModelAccessForCatalogRequest(RequestPayload):
     """Catalog-scoped: caller has a library in mind but no node.
 
     The checkpoint carries ``MODEL_ID`` and (when the id resolves against that
-    library's catalog) ``PROVIDER_ID`` and ``MODEL_FAMILIES``. No ``ID``
+    library's catalog) ``PROVIDER_ID`` and ``MODEL_FAMILIES``. No ``NODE_TYPE``
     attribute -- the query is not attributed to a node. Distinct from
     ``QueryModelAccessRequest`` because the caller is telling the engine WHICH
     library catalog to use for enrichment.

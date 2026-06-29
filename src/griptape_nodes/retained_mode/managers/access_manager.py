@@ -16,12 +16,12 @@ Three request types, named by what attribution the engine adds to each checkpoin
     type and, optionally, an explicit candidate list. When candidates are
     omitted the engine derives them from the node's `ModelUsageNodeProperty`
     plus `ModelProviderUsageNodeProperty` expansion. Checkpoint attributes
-    carry `ID = node_type`, `MODEL_ID`, plus catalog-resolved `PROVIDER_ID` and
-    `MODEL_FAMILIES` when the id is in the node's library catalog.
+    carry `NODE_TYPE = node_type`, `MODEL_ID`, plus catalog-resolved `PROVIDER_ID`
+    and `MODEL_FAMILIES` when the id is in the node's library catalog.
 
   - `QueryModelAccessForCatalogRequest` -- catalog-scoped. Caller supplies a
     library name and ids. Checkpoint attributes carry `MODEL_ID` plus
-    catalog-resolved `PROVIDER_ID` / `MODEL_FAMILIES`. No `ID` attribute --
+    catalog-resolved `PROVIDER_ID` / `MODEL_FAMILIES`. No `NODE_TYPE` attribute --
     the caller has a library in mind but no node to attribute the query to.
 
 All three paths share `_evaluate`, which iterates candidates and asks the
@@ -73,21 +73,30 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
-    from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
+    from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty, NodeDeclaration
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 
+class _NodeLookupError(Exception):
+    """A node's library or metadata could not be resolved for a model-access query.
+
+    Carries an already-formatted sentence (free of `KeyError`'s quote/tuple
+    `repr`) that the per-node handler surfaces verbatim on a `Failure` result.
+    """
+
+
 @dataclass(frozen=True, kw_only=True, slots=True)
 class _NodeResolution:
-    """A node's library context: the node's declarations, the library's, and a catalog index.
+    """A node's library context: its declarations, its library's model catalog, and a model-id index.
 
     Built only on the success path of `AccessManager._resolve_node_library`; a
-    failed lookup raises instead of producing a half-populated instance.
+    failed lookup raises `_NodeLookupError` instead of producing a half-populated
+    instance.
     """
 
     node_declarations: Sequence[NodeDeclaration]
-    library_declarations: Sequence[LibraryDeclaration]
+    catalog: ModelCatalogLibraryProperty | None
     resolved_by_id: dict[str, ResolvedModel]
 
 
@@ -120,13 +129,13 @@ class AccessManager:
         """Node-attributed. Engine derives candidates from declarations unless caller overrides."""
         try:
             resolution = self._resolve_node_library(request.node_type, request.specific_library_name)
-        except KeyError as exc:
+        except _NodeLookupError as exc:
             return QueryModelAccessForNodeResultFailure(result_details=str(exc))
 
         if request.candidate_model_ids is None:
             candidates = self._declared_model_ids(
                 node_declarations=resolution.node_declarations,
-                library_declarations=resolution.library_declarations,
+                catalog=resolution.catalog,
             )
         else:
             candidates = list(request.candidate_model_ids)
@@ -153,7 +162,7 @@ class AccessManager:
         except KeyError:
             resolved_by_id: dict[str, ResolvedModel] = {}
         else:
-            resolved_by_id = self._index_catalog(library.get_metadata().declarations)
+            resolved_by_id = self._index_catalog(find_model_catalog(library.get_metadata().declarations))
 
         verdicts = self._evaluate(
             candidate_model_ids=request.candidate_model_ids,
@@ -169,40 +178,41 @@ class AccessManager:
         """Look up the node's library and return its declarations plus a model-id index.
 
         Raises:
-            KeyError: when the node type's library is not registered, or the node
-                type is not found within that library. The message names the node
-                type so the per-node handler can surface it verbatim on a
+            _NodeLookupError: when the node type's library is not registered, or
+                the node type is not found within that library. Its message is a
+                clean sentence the per-node handler surfaces verbatim on a
                 ``Failure`` result.
         """
         try:
             library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
         except KeyError as exc:
+            detail = exc.args[0] if exc.args else str(exc)
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
-                f"Failed because the library lookup raised KeyError: {exc}."
+                f"Failed because the library could not be resolved: {detail}"
             )
-            raise KeyError(msg) from exc
+            raise _NodeLookupError(msg) from exc
 
         try:
             node_metadata = library.get_node_metadata(node_type)
         except KeyError as exc:
+            library_name = exc.args[0] if exc.args else specific_library_name
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
-                f"Failed because the node type was not found in its library: {exc}."
+                f"Failed because it is not registered in library '{library_name}'."
             )
-            raise KeyError(msg) from exc
+            raise _NodeLookupError(msg) from exc
 
-        library_declarations = library.get_metadata().declarations
+        catalog = find_model_catalog(library.get_metadata().declarations)
         return _NodeResolution(
             node_declarations=node_metadata.declarations,
-            library_declarations=library_declarations,
-            resolved_by_id=self._index_catalog(library_declarations),
+            catalog=catalog,
+            resolved_by_id=self._index_catalog(catalog),
         )
 
     @staticmethod
-    def _index_catalog(library_declarations: Sequence[LibraryDeclaration]) -> dict[str, ResolvedModel]:
-        """Build a `{model_id: ResolvedModel}` index from a library's catalog, empty if none."""
-        catalog = find_model_catalog(library_declarations)
+    def _index_catalog(catalog: ModelCatalogLibraryProperty | None) -> dict[str, ResolvedModel]:
+        """Build a `{model_id: ResolvedModel}` index from a catalog, empty when there is none."""
         if catalog is None:
             return {}
         return {resolved.model_id: resolved for resolved in iter_catalog_models(catalog)}
@@ -211,7 +221,7 @@ class AccessManager:
     def _declared_model_ids(
         *,
         node_declarations: Sequence[NodeDeclaration],
-        library_declarations: Sequence[LibraryDeclaration],
+        catalog: ModelCatalogLibraryProperty | None,
     ) -> list[str]:
         """Union of catalog ids from `model_usage` plus `model_provider_usage` expansion.
 
@@ -228,7 +238,6 @@ class AccessManager:
                         seen.add(model_id)
                         ordered.append(model_id)
 
-        catalog = find_model_catalog(library_declarations)
         if catalog is None:
             return ordered
 
@@ -252,7 +261,7 @@ class AccessManager:
         """Ask the authorization hook chain once per candidate; collect one verdict each.
 
         Attribute composition:
-          - ``ID = node_type`` only when ``node_type`` is supplied (per-node form).
+          - ``NODE_TYPE = node_type`` only when ``node_type`` is supplied (per-node form).
           - ``MODEL_ID`` always.
           - ``PROVIDER_ID`` and ``MODEL_FAMILIES`` only when the id resolves in
             ``resolved_by_id`` (the per-node and catalog-scoped forms supply this;
@@ -270,7 +279,7 @@ class AccessManager:
         for model_id in candidate_model_ids:
             attributes: dict[str, Any] = {CheckpointAttribute.MODEL_ID: model_id}
             if node_type is not None:
-                attributes[CheckpointAttribute.ID] = node_type
+                attributes[CheckpointAttribute.NODE_TYPE] = node_type
             resolved = resolved_by_id.get(model_id)
             provider_model_id: str | None = None
             if resolved is not None:

@@ -56,6 +56,11 @@ class CheckpointAttribute(StrEnum):
     fills only the keys it has resolved for a given checkpoint; a hook reads
     whichever it cares about. Members are `str` values, so they serve as dict keys
     that compare equal to their literal spelling on the reading side.
+
+    ``ID`` mirrors the checkpoint's ``subject_id`` (the identifier of the thing
+    being acted on). ``NODE_TYPE`` is supplementary node attribution for
+    checkpoints whose subject is not the node itself -- e.g. ``OFFER_MODEL``,
+    whose subject is the model but which is asked on behalf of a node.
     """
 
     ID = "id"
@@ -67,6 +72,7 @@ class CheckpointAttribute(StrEnum):
     MODEL_IDS = "model_ids"
     PROVIDER_IDS = "provider_ids"
     MODEL_FAMILIES = "model_families"
+    NODE_TYPE = "node_type"
 
 
 @dataclass(frozen=True)

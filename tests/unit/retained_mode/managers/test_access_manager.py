@@ -105,6 +105,33 @@ class TestAccessManager:
 
         result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type="Missing"))
         assert isinstance(result, QueryModelAccessForNodeResultFailure)
+        # Message is clean prose: names the node type, no KeyError quote/tuple repr.
+        details = str(result.result_details)
+        assert "Missing" in details
+        assert not details.startswith('"')
+        assert "('" not in details
+
+    def test_for_node_missing_in_specified_library_returns_clean_failure(
+        self,
+        griptape_nodes: GriptapeNodes,  # noqa: ARG002
+    ) -> None:
+        from griptape_nodes.retained_mode.events.access_events import (
+            QueryModelAccessForNodeRequest,
+            QueryModelAccessForNodeResultFailure,
+        )
+
+        self._register()
+
+        result = GriptapeNodes.handle_request(
+            QueryModelAccessForNodeRequest(node_type="NotRegistered", specific_library_name=self._LIBRARY_NAME)
+        )
+        assert isinstance(result, QueryModelAccessForNodeResultFailure)
+        # The node-not-found path stringifies a KeyError(library, node_type) tuple; the
+        # handler must surface clean prose naming both, not the raw tuple repr.
+        details = str(result.result_details)
+        assert "NotRegistered" in details
+        assert self._LIBRARY_NAME in details
+        assert "('" not in details
 
     def test_for_node_no_hook_all_models_allowed(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
         from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
@@ -212,7 +239,7 @@ class TestAccessManager:
         assert isinstance(result, QueryModelAccessForNodeResultSuccess)
         assert result.verdicts[0].model_id == "not_in_catalog"
         assert result.verdicts[0].provider_model_id is None
-        assert seen_attributes == [{"id": _ProbeNode.__name__, "model_id": "not_in_catalog"}]
+        assert seen_attributes == [{"node_type": _ProbeNode.__name__, "model_id": "not_in_catalog"}]
 
     def test_for_node_per_candidate_loop_does_not_trip_recursion_guard(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.access_events import (
@@ -388,7 +415,7 @@ class TestAccessManager:
 
         assert seen_attributes == [
             {
-                "id": _ProbeNode.__name__,
+                "node_type": _ProbeNode.__name__,
                 "model_id": "gtc_claude_opus_4_7",
                 "provider_id": "anthropic",
                 "model_families": ["Claude 4"],
@@ -481,7 +508,7 @@ class TestAccessManager:
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(record)
 
-        # No "id" attribute -- catalog-scoped form has no node attribution.
+        # No "node_type" attribute -- catalog-scoped form has no node attribution.
         assert seen_attributes == [
             {
                 "model_id": "gtc_claude_opus_4_7",
