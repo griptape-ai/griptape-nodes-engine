@@ -265,13 +265,34 @@ Two workable patterns:
     converter is purely a display nicety (e.g., title-casing a
     string), losing it on the orchestrator is harmless.
 
-## Configuration and secrets propagate automatically
+## Configuration, secrets, and the current project propagate automatically
 
 The orchestrator broadcasts `ReloadConfigRequest` and
 `RefreshSecretsRequest` to every registered worker after a
 successful config or secret mutation. Each worker re-reads the
 shared on-disk files and updates its in-memory view. You do not need
 to wire this up; it happens automatically.
+
+The active **project** propagates the same way. A worker boots like
+the orchestrator: it re-derives the current project from the same
+shared on-disk config, so a freshly spawned worker lands on the
+orchestrator's project for free. After startup, switching projects in
+the orchestrator pushes the new project to every running worker so
+that environment variables, directory macros, and situation/path
+macros resolve against the same project in both processes. Two cases
+are worth knowing:
+
+- A switch that changes library configuration restarts the worker,
+    which then re-derives the project on boot.
+- A "shallow" switch (same workspace and library config, where only
+    the environment, directories, or situations differ) does **not**
+    restart the worker. The orchestrator broadcasts the switch and the
+    worker adopts the new project in place, ahead of any queued node
+    execution, so it never runs against a stale project.
+
+You do not need to wire any of this up. A worker never persists the
+project choice back to the shared config; the orchestrator is the
+single source of truth.
 
 A subtle point: operator-set OS environment variables (e.g., a
 container-injected `OPENAI_API_KEY`) are preserved across **refresh

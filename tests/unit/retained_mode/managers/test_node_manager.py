@@ -508,12 +508,9 @@ class TestNodeInstantiationAuthorizationCheckpoint:
     def _clean_registry(self):  # noqa: ANN202
         from griptape_nodes.node_library.library_registry import LibraryRegistry
 
-        stores = ("_libraries", "_node_aliases", "_collision_node_names_to_library_names", "_registered_widgets")
-        for store in stores:
-            getattr(LibraryRegistry, store).clear()
+        LibraryRegistry._clear()
         yield
-        for store in stores:
-            getattr(LibraryRegistry, store).clear()
+        LibraryRegistry._clear()
 
     def _register(self, node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN202
         from griptape_nodes.node_library.library_registry import (
@@ -580,10 +577,9 @@ class TestNodeInstantiationAuthorizationCheckpoint:
         assert self._attrs(inherit)["lifecycle_stage"] == "BETA"
 
         # Re-register with neither stated -> lifecycle_stage omitted entirely.
-        for store in ("_libraries", "_node_aliases", "_collision_node_names_to_library_names", "_registered_widgets"):
-            from griptape_nodes.node_library.library_registry import LibraryRegistry
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
 
-            getattr(LibraryRegistry, store).clear()
+        LibraryRegistry._clear()
         unstated = self._register()
         assert "lifecycle_stage" not in self._attrs(unstated)
 

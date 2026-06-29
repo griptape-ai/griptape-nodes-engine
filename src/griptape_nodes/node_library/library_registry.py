@@ -15,6 +15,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
+    find_model_catalog,
     resolve_node_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
@@ -130,9 +131,9 @@ class LibraryMetadata(BaseModel):
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
         # Node references and the duplicate-id check assume a single catalog
-        # (see library_validation._find_model_catalog). Two catalogs would let
-        # the second one's models go unseen, so reject the ambiguity here where
-        # all declarations are visible together.
+        # (see library_declarations.find_model_catalog, which returns the first).
+        # Two catalogs would let the second one's models go unseen, so reject the
+        # ambiguity here where all declarations are visible together.
         catalog_count = sum(1 for d in self.declarations if isinstance(d, ModelCatalogLibraryProperty))
         if catalog_count > 1:
             msg = (
@@ -246,6 +247,19 @@ class LibraryRegistry(metaclass=SingletonMeta):
     _collision_node_names_to_library_names: ClassVar[dict[str, list[str]]] = {}
     # Track registered widgets per library: {library_name: set(widget_names)}
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
+
+    @classmethod
+    def _clear(cls) -> None:
+        """Drop every registered library and its tracking state.
+
+        Used by tests to reset the singleton between cases. Centralizes the store
+        list here so renaming a `ClassVar` updates this one method rather than
+        silently degrading callers that would otherwise clear stores by name.
+        """
+        cls._libraries.clear()
+        cls._node_aliases.clear()
+        cls._collision_node_names_to_library_names.clear()
+        cls._registered_widgets.clear()
 
     @classmethod
     def generate_new_library(
@@ -608,10 +622,7 @@ class Library:
         if node_metadata is None:
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
             raise KeyError(msg)
-        catalog = next(
-            (d for d in self._library_data.metadata.declarations if isinstance(d, ModelCatalogLibraryProperty)),
-            None,
-        )
+        catalog = find_model_catalog(self._library_data.metadata.declarations)
         if catalog is None:
             return []
         return resolve_node_models(catalog, node_metadata.declarations)
