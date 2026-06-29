@@ -2113,14 +2113,32 @@ class ProjectManager:
         """Attempt to match a path against a macro schema and extract variables.
 
         Flow:
-        1. Check secrets manager is available (failure = true error)
-        2. Call ParsedMacro.extract_variables() with path and known variables
-        3. If match succeeds, return success with extracted_variables
-        4. If match fails, return success with match_failure (not an error)
+        1. If ``auto_resolve_builtins`` is set, resolve every builtin variable
+           (workspace_dir, workflow_dir, ...) from the current project and merge
+           them under ``known_variables`` (caller wins on collision). Builtins
+           whose runtime state is unavailable (e.g. no current workflow) are
+           silently skipped.
+        2. Call ParsedMacro.extract_variables() with the merged known variables.
+        3. If match succeeds, return success with extracted_variables.
+        4. If match fails, return success with match_failure (not an error).
         """
+        merged_known_variables: MacroVariables = {}
+        if request.auto_resolve_builtins:
+            current_project_result = self.on_get_current_project_request(GetCurrentProjectRequest())
+            if isinstance(current_project_result, GetCurrentProjectResultSuccess):
+                project_info = current_project_result.project_info
+                for var_name in BUILTIN_VARIABLES:
+                    try:
+                        merged_known_variables[var_name] = self._get_builtin_variable_value(var_name, project_info)
+                    except (RuntimeError, NotImplementedError):
+                        # Not available in the current context (e.g. no current workflow);
+                        # match still proceeds — only builtins the macro depends on matter.
+                        continue
+        merged_known_variables.update(request.known_variables)
+
         extracted = request.parsed_macro.extract_variables(
             request.file_path,
-            request.known_variables,
+            merged_known_variables,
             self._secrets_manager,
         )
 
@@ -2131,7 +2149,7 @@ class ProjectManager:
                 match_failure=MacroMatchFailure(
                     failure_reason=MacroMatchFailureReason.STATIC_TEXT_MISMATCH,
                     expected_pattern=request.parsed_macro.template,
-                    known_variables_used=request.known_variables,
+                    known_variables_used=merged_known_variables,
                     error_details=f"Path '{request.file_path}' does not match macro pattern",
                 ),
                 result_details=f"Attempted to match path '{request.file_path}' against macro '{request.parsed_macro.template}'. Pattern did not match",

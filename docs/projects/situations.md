@@ -141,7 +141,9 @@ policy:   create_new, create_dirs: true
 fallback: save_file
 ```
 
-Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next padded index in the sequence — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work. The trailing `_v###` suffix on the previous save is stripped before the next index is computed, so the sequence stays anchored to the base name.
+Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next padded index in the sequence — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work.
+
+The version-bump is **macro-driven**: when a versioned save runs, the engine reverse-matches the previous save's path against this situation's macro and extracts every variable the macro defines, including the bound padded slot. The next save reuses those variables verbatim, and the collision walk advances the padded index past any existing files. Because nothing about the version suffix is hardcoded, customizing the macro (e.g. swapping `_v{_index:03}` for `.{_index:04}`) still works — the new pattern becomes the contract for both forward saves and reverse-matches.
 
 This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
 

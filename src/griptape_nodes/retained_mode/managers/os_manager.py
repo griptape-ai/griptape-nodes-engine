@@ -1106,18 +1106,22 @@ class OSManager:
         None, the caller walks *its* slot (using ProjectManager so unresolved project
         directories like ``{outputs}`` get substituted each iteration).
 
-        When the caller passed a MacroPath whose unresolved variable carries a
-        ``NumericPaddingFormat`` — required ``{x:NN}`` OR optional ``{x?:NN}`` — we
-        walk that slot against the user's ORIGINAL macro. Incrementing it produces
-        consistent zero-padded width across the sequence (``v001 → v002 → v003``).
+        When the caller passed a MacroPath whose macro has a ``NumericPaddingFormat``
+        slot — required ``{x:NN}`` OR optional ``{x?:NN}``, AND regardless of whether
+        the caller pre-bound that slot — we walk that slot against the user's ORIGINAL
+        macro. Incrementing it produces consistent zero-padded width across the
+        sequence (``v001 → v002 → v003``).
 
-        The ``is_required`` distinction matters for the SEED step (we only seed required
-        slots; optional slots happily resolve as omitted on the first attempt). It does
-        NOT matter for the walk: by the time we're in collision-fallback the first
-        attempt has already failed via "file exists," and the user's intent for either
-        shape is "give me a padded index here." Walking either kind closes #4544 and
-        #4092 — optional ``{_index?:03}`` collisions previously rendered as ``_1``
-        (unpadded suffix injection) instead of ``_001`` (padded walk).
+        The bound/unbound distinction matters for *starting* the walk (see the
+        start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
+        *selecting* the slot: by the time we're in collision-fallback the first
+        attempt has already failed via "file exists," and the user's intent for any
+        padded slot is "give me a padded index here." Walking unbound padded slots
+        keeps optional collisions in their padded form (``_001`` instead of ``_1``);
+        walking bound padded slots covers the reverse-match case — a matched file
+        whose variables came back from ``ParsedMacro.extract_variables`` lands here
+        with the index slot bound, and we still want ``v007 → v008`` instead of
+        ``v007_1``.
 
         Otherwise (plain string path, or a MacroPath without ANY padded slot), fall
         back to ``_convert_str_path_to_macro_with_index`` which synthesizes
@@ -1125,10 +1129,8 @@ class OSManager:
         """
         if isinstance(request.file_path, MacroPath):
             for segment in request.file_path.parsed_macro.segments:
-                if (
-                    isinstance(segment, ParsedVariable)
-                    and segment.info.name not in request.file_path.variables
-                    and any(isinstance(spec, NumericPaddingFormat) for spec in segment.format_specs)
+                if isinstance(segment, ParsedVariable) and any(
+                    isinstance(spec, NumericPaddingFormat) for spec in segment.format_specs
                 ):
                     return request.file_path, segment
         return self._convert_str_path_to_macro_with_index(str(file_path)), None
@@ -2397,20 +2399,37 @@ class OSManager:
                     #    via `_resolve_macro_path_to_string` so project directories get
                     #    substituted. Skip the filesystem scan; just walk forward.
                     #
-                    #    Starting index depends on whether the seed already tried index=1:
-                    #    - Required `{x:NN}`: seed in COMMON SETUP assigned 1 → start at 2.
-                    #    - Optional `{x?:NN}`: seed didn't fire (it's gated on required);
-                    #      the first attempt resolved with the slot OMITTED → start at 1
-                    #      so this loop is the FIRST place we try a value.
+                    #    Three starting-index cases depending on whether the slot was
+                    #    bound at request time, and (if unbound) whether the seed gate
+                    #    in COMMON SETUP already tried 1:
+                    #    - Bound to value N (caller reverse-matched an existing file,
+                    #      e.g. `_index=7` from `my_file_v007.py`): start at N+1.
+                    #      The slot's value is the "current version"; we want the next.
+                    #    - Required `{x:NN}` unbound: seed in COMMON SETUP assigned 1 →
+                    #      start at 2.
+                    #    - Optional `{x?:NN}` unbound: seed didn't fire (it's gated on
+                    #      required); the first attempt resolved with the slot OMITTED
+                    #      → start at 1 so this loop is the FIRST place we try a value.
                     # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
                     #    — variables is empty, template is fully static except `{_index}`.
                     #    Run the existing scan to find a starting index (`output.png`
                     #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
                     walking_original = padded_index_var is not None
                     if walking_original:
-                        # padded_index_var is the var the walk targets. is_required tells
-                        # us whether the seed already tried 1 in COMMON SETUP.
-                        start_idx = 2 if padded_index_var.info.is_required else 1
+                        # padded_index_var is the var the walk targets. Three cases:
+                        bound_value = (
+                            request.file_path.variables.get(padded_index_var.info.name)
+                            if isinstance(request.file_path, MacroPath)
+                            else None
+                        )
+                        if isinstance(bound_value, int):
+                            start_idx = bound_value + 1
+                        elif padded_index_var.info.is_required:
+                            # Seed already tried 1 in COMMON SETUP.
+                            start_idx = 2
+                        else:
+                            # Optional + unbound: seed didn't fire; this loop is the first try.
+                            start_idx = 1
                     else:
                         starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
                         start_idx = starting_index if starting_index is not None else 1

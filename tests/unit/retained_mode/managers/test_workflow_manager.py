@@ -2766,20 +2766,24 @@ class TestCreateVersionedWorkflow:
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
-    def test_create_versioned_strips_existing_version_suffix_from_base(
+    def test_create_versioned_match_path_passes_full_matched_dict_through(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
-        """Saving over `my_flow_v001` produces a destination based on `my_flow`, not `my_flow_v001`.
+        """Saving over `my_flow_v001` produces a destination whose MacroPath carries every matched variable.
 
-        Otherwise we'd get `my_flow_v001_v002.py` instead of `my_flow_v002.py`
-        on the second versioned save.
+        The destination's MacroPath has every variable the situation's macro
+        identified in the existing file's name — *including* the bound
+        ``_index``. The macro resolves to ``my_flow_v001.py`` on the first
+        attempt; OSManager's CREATE_NEW collision-walk detects the existing
+        file and steps the padded slot from 1 to 2, landing the next save at
+        ``my_flow_v002.py``.
         """
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             self._register_saved_workflow(
                 temp_dir,
                 registry_key="my_flow_v001",
                 file_name="my_flow_v001.py",
-                display_name="",  # Empty forces the file-stem fallback in _derive_versioned_base_name.
+                display_name="",
             )
 
             target = self._determine(
@@ -2789,9 +2793,14 @@ class TestCreateVersionedWorkflow:
                 create_versioned=True,
             )
 
-            # The relative_file_path is computed against the macro-stripped stem
-            # ("my_flow.py"), not the suffixed one.
-            assert target.relative_file_path == "my_flow.py"
+            # Macro match succeeded: every variable the macro identified is
+            # bound in the destination's MacroPath. OSManager's collision-walk
+            # bumps _index from 1 → 2 on write.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("file_extension") == "py"
+            assert macro_vars.get("_index") == 1
 
     def test_create_versioned_false_preserves_overwrite_existing(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
@@ -2954,3 +2963,174 @@ class TestCreateVersionedWorkflow:
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"
             assert target.file_path is None
+
+    # --- #4956 helper: Step 2 (match) / Step 3 (no-match) / Step 1b (unsaved) -----------
+
+    def test_step2_match_path_with_customized_versioned_macro(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Customizing the versioned situation's macro still round-trips: matched dict goes through verbatim.
+
+        Regression coverage for #4956 — confirms we don't hardcode any variable
+        names in workflow_manager. The macro is the only thing that says which
+        variables exist and what values they have.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        # Customize create_versioned_workflow to a dot-separated 4-digit suffix.
+        custom_versioned = SituationTemplate(
+            name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
+            description="Dot-separated versioning",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}.{_index:04}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
+            fallback=BuiltInSituation.SAVE_FILE,
+        )
+        custom = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "situations": {
+                    **DEFAULT_PROJECT_TEMPLATE.situations,
+                    BuiltInSituation.CREATE_VERSIONED_WORKFLOW: custom_versioned,
+                }
+            }
+        )
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        # SetCurrentProjectRequest re-derives workspace_path; force it back.
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            # Workflow that was previously saved under this customized macro
+            # (so its on-disk name ends in `.0017.py`, not the default `_v017`).
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_flow.0017",
+                file_name="my_flow.0017.py",
+                display_name="my_flow",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="my_flow.0017",
+                create_versioned=True,
+            )
+
+            # Macro reverse-match identified `.0017` as the version component
+            # (per the customized macro). Every variable the macro extracted
+            # rides in the destination's MacroPath, including bound `_index=17`.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("_index") == 17  # noqa: PLR2004 - literal version from setup
+            assert macro_vars.get("file_extension") == "py"
+
+    def test_step3_no_match_path_falls_back_to_file_stem(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A workflow saved under a NON-versioned situation produces a new versioned series on create_versioned.
+
+        The file `random_name.py` doesn't match the versioned situation's macro
+        (no `_v###` suffix). The helper falls through to
+        ``_resolve_named_save_path("random_name", ...)`` which is the same
+        plumbing every non-versioned SAVE_AS uses. The first versioned save
+        produces ``random_name_v001.py`` alongside the original; the original
+        file is left untouched (no in-place overwrite).
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="random_name",
+                file_name="random_name.py",  # No _v### suffix → won't match
+                display_name="random_name",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="random_name",
+                create_versioned=True,
+            )
+
+            # Step 3 path: destination uses random_name as file_name_base;
+            # _index is unbound so the seed-and-retry assigns 1 on write.
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "random_name"
+            assert "_index" not in macro_vars, (
+                "Step 3 (no-match) must leave _index unbound so the seed-and-retry assigns 1 on write."
+            )
+
+    def test_step1b_unsaved_workflow_uses_display_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """create_versioned=True on an unsaved workflow uses display_name as the base.
+
+        The unsaved workflow has no file_path → Step 1b kicks in →
+        display name (metadata.name) is sanitized and fed through
+        ``_resolve_named_save_path``. The first versioned save will land
+        at ``<sanitized_display>_v001.py`` via the seed-and-retry.
+        """
+        unsaved_key = "unsaved:step1b-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="My Pretty Flow")
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name=unsaved_key,
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # Display name sanitized: "My Pretty Flow" → "My_Pretty_Flow".
+            assert macro_vars.get("file_name_base") == "My_Pretty_Flow"
+            # No index assigned yet — the seed handles that on write.
+            assert "_index" not in macro_vars
+
+    def test_create_versioned_invalid_situation_macro_raises_value_error(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """A malformed situation macro surfaces as a clear ValueError, not an opaque crash.
+
+        ``SituationTemplate`` validates macro syntax at template load, so
+        production never reaches this branch. The defensive guard catches
+        any case where a bad macro slips past validation (e.g. tests, future
+        refactors, dynamic situation construction). Pins that the error
+        message identifies which situation is broken.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+            from griptape_nodes.common.macro_parser import MacroSyntaxError
+
+            def raise_bad_macro(_template: str) -> None:
+                msg = "synthetic malformed macro for test"
+                raise MacroSyntaxError(msg)
+
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.managers.workflow_manager.ParsedMacro",
+                    side_effect=raise_bad_macro,
+                ),
+                pytest.raises(ValueError, match="create_versioned_workflow"),
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
