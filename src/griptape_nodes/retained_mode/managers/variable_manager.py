@@ -75,7 +75,7 @@ class VariablesManager:
                 GetVariableDetailsRequest, self.on_get_variable_details_request
             )
 
-    def on_clear_object_state(self) -> None:
+    def clear_object_state(self) -> None:
         """Clear all variables."""
         self._flow_variables.clear()
         self._global_variables.clear()
@@ -490,15 +490,11 @@ class VariablesManager:
         for var in variables:
             if var.value is None:
                 continue
-            if isinstance(var.value, str | int):
+            # bool is a subclass of int, but substituting True/False as "True"/"False" is
+            # almost certainly wrong. Exclude it explicitly so bool variables are silently
+            # skipped rather than treated as integer 1/0.
+            if isinstance(var.value, str | int) and not isinstance(var.value, bool):
                 result[var.name] = var.value
-            else:
-                logger.warning(
-                    "Variable '%s' has type '%s' which is not supported for string substitution. "
-                    "Only str and int variables can be substituted. This variable will be skipped.",
-                    var.name,
-                    type(var.value).__name__,
-                )
         return result
 
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:

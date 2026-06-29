@@ -14,8 +14,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
-from griptape_nodes.common.macro_parser.resolution import partial_resolve
-from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.macro_parser.segments import ParsedVariable
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
@@ -145,11 +144,16 @@ def _contains_variable_macro(value: Any) -> bool:
     return False
 
 
-def _resolve_macro_token(token: str, variables: dict[str, str | int], secrets_manager: Any) -> str:
+def _resolve_macro_token(token: str, variables: dict[str, str | int]) -> str:
     """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
 
-    Returns the resolved string on success or the original token if the variable
+    Returns the resolved string on success, or the original token if the variable
     is unknown, the token is not a macro reference, or parsing fails.
+
+    Variable values are substituted literally — NOT routed through env-var resolution.
+    A value like "$HOME" is treated as the string "$HOME", not expanded to the home
+    directory. This prevents both secret exfiltration and silent no-ops on dollar-sign
+    values (e.g. "$50", "$HOME/x").
     """
     try:
         parsed = ParsedMacro(token)
@@ -157,21 +161,19 @@ def _resolve_macro_token(token: str, variables: dict[str, str | int], secrets_ma
         return token
     if not parsed.get_variables():
         return token
+    # _MACRO_TOKEN matches exactly one {VAR} or {VAR:spec} per token, so there is at most
+    # one ParsedVariable segment. Iterate segments directly (not get_variables()) to retain
+    # format_specs, which are stripped by get_variables().
+    parsed_var = next((seg for seg in parsed.segments if isinstance(seg, ParsedVariable)), None)
+    if parsed_var is None or parsed_var.info.name not in variables:
+        return token
+    value: str | int = variables[parsed_var.info.name]
     try:
-        result = partial_resolve(parsed.template, parsed.segments, variables, secrets_manager)
+        for format_spec in parsed_var.format_specs:
+            value = format_spec.apply(value)
     except MacroResolutionError:
         return token
-    # If every segment is still an unresolved variable, keep the original token so that
-    # format specs (e.g. `: "value"` in a JSON key position) are not silently dropped.
-    if all(isinstance(seg, ParsedVariable) for seg in result.segments):
-        return token
-    parts = []
-    for seg in result.segments:
-        if isinstance(seg, ParsedStaticValue):
-            parts.append(seg.text)
-        elif isinstance(seg, ParsedVariable):
-            parts.append(f"{{{seg.info.name}}}")
-    return "".join(parts)
+    return str(value)
 
 
 @contextmanager
@@ -1522,9 +1524,8 @@ class BaseNode(ABC):
         if variables is None:
             return text
 
-        secrets_manager = GriptapeNodes.SecretsManager()
         return _MACRO_TOKEN.sub(
-            lambda m: _resolve_macro_token(m.group(0), variables, secrets_manager),
+            lambda m: _resolve_macro_token(m.group(0), variables),
             text,
         )
 
@@ -1534,7 +1535,15 @@ class BaseNode(ABC):
         For PROPERTY parameters whose stored template contains a variable macro
         and the output differs from the template, returns the template so users
         always see and can edit the {VAR} syntax rather than the resolved value.
+
+        Honors the per-workflow substitution toggle: when substitution is disabled
+        the template is never shown in place of the real output.
         """
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        if not GriptapeNodes.WorkflowManager().is_variable_substitution_enabled():
+            return output_value
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter is None:
             return output_value

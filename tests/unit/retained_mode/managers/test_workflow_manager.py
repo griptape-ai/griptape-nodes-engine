@@ -1792,7 +1792,7 @@ class TestWorkflowVariablePersistence:
 
         if context_manager.has_current_workflow():
             GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         context_manager.push_workflow(workflow_name="round_trip_workflow")
 
@@ -2043,7 +2043,7 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102
