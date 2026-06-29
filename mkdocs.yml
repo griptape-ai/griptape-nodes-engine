@@ -78,6 +78,8 @@ plugins:
           - how_to/mcp/servers/fetch.md
           - how_to/mcp/servers/filesystem.md
           - how_to/mcp/servers/time.md
+        Enterprise:
+          - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -158,6 +160,7 @@ nav:
       - Scripting: retained_mode.md
       - Project System:
           - Overview: projects/index.md
+          - Managing Projects (GUI): projects/gui_guide.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
           - Version Pinning: projects/version_pinning.md
@@ -197,6 +200,8 @@ nav:
                   - Fetch: how_to/mcp/servers/fetch.md
                   - Filesystem: how_to/mcp/servers/filesystem.md
                   - Time: how_to/mcp/servers/time.md
+  - Enterprise:
+      - Admin Server: enterprise/admin_server.md
   - FAQ: faq.md
   - Nodes Reference:
       - Overview: nodes/overview.md

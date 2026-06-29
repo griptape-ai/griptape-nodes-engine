@@ -56,9 +56,9 @@ from griptape_nodes.node_library.library_declarations import (
     ArbitraryPythonExecutionNodeProperty,
     LifecycleStageLibraryProperty,
     LifecycleStageNodeProperty,
-    ModelCatalogLibraryProperty,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
+    find_model_catalog,
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
@@ -575,14 +575,7 @@ class NodeManager:
         model_ids = list(declared_model_ids)
         provider_ids = list(declared_provider_ids)
         families: list[str] = []
-        catalog = next(
-            (
-                declaration
-                for declaration in library_declarations
-                if isinstance(declaration, ModelCatalogLibraryProperty)
-            ),
-            None,
-        )
+        catalog = find_model_catalog(library_declarations)
         if catalog is not None:
             for resolved in resolve_node_models(catalog, node_declarations):
                 model_ids.append(resolved.model_id)

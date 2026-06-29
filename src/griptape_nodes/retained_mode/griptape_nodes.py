@@ -36,6 +36,7 @@ if TYPE_CHECKING:
         RequestPayload,
         ResultPayload,
     )
+    from griptape_nodes.retained_mode.managers.access_manager import AccessManager
     from griptape_nodes.retained_mode.managers.agent_manager import AgentManager
     from griptape_nodes.retained_mode.managers.arbitrary_code_exec_manager import (
         ArbitraryCodeExecManager,
@@ -89,6 +90,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
     _context_manager: ContextManager
     _library_manager: LibraryManager
     _model_manager: ModelManager
+    _access_manager: AccessManager
     _workflow_manager: WorkflowManager
     _workflow_variables_manager: VariablesManager
     _arbitrary_code_exec_manager: ArbitraryCodeExecManager
@@ -108,6 +110,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
     _worker_manager: WorkerManager
 
     def __init__(self) -> None:  # noqa: PLR0915
+        from griptape_nodes.retained_mode.managers.access_manager import AccessManager
         from griptape_nodes.retained_mode.managers.agent_manager import AgentManager
         from griptape_nodes.retained_mode.managers.arbitrary_code_exec_manager import (
             ArbitraryCodeExecManager,
@@ -162,6 +165,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
             self._worker_manager = WorkerManager(griptape_nodes=self, event_manager=self._event_manager)
             self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager)
             self._model_manager = ModelManager(self._event_manager)
+            self._access_manager = AccessManager(self._event_manager)
             self._workflow_manager = WorkflowManager(self._event_manager)
             self._workflow_variables_manager = VariablesManager(self._event_manager)
             self._arbitrary_code_exec_manager = ArbitraryCodeExecManager(self._event_manager)
@@ -280,6 +284,10 @@ class GriptapeNodes(metaclass=SingletonMeta):
     @classmethod
     def ModelManager(cls) -> ModelManager:
         return GriptapeNodes.get_instance()._model_manager
+
+    @classmethod
+    def AccessManager(cls) -> AccessManager:
+        return GriptapeNodes.get_instance()._access_manager
 
     @classmethod
     def ObjectManager(cls) -> ObjectManager:
