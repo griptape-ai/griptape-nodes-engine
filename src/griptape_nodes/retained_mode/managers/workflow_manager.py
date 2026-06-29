@@ -487,6 +487,19 @@ class WorkflowManager:
         """
         return self._referenced_workflow_stack[-1]
 
+    def _drop_substitution_flag(self, workflow_key: str) -> None:
+        """Remove the substitution flag when a workflow is permanently deleted."""
+        self._variable_substitution_enabled.pop(workflow_key, None)
+
+    def _rekey_substitution_flag(self, old_key: str, new_key: str) -> None:
+        """Transfer the substitution flag when a workflow registry key changes.
+
+        Only moves the entry when a flag was explicitly set; workflows that defaulted
+        to True (no dict entry) stay that way under the new key without polluting the dict.
+        """
+        if old_key in self._variable_substitution_enabled:
+            self._variable_substitution_enabled[new_key] = self._variable_substitution_enabled.pop(old_key)
+
     def is_variable_substitution_enabled(self) -> bool:
         """Return whether variable substitution is enabled for the current workflow.
 
@@ -1127,7 +1140,7 @@ class WorkflowManager:
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
-        self._variable_substitution_enabled.pop(request.name, None)
+        self._drop_substitution_flag(request.name)
         return DeleteWorkflowResultSuccess(
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
@@ -1165,9 +1178,7 @@ class WorkflowManager:
 
         # Transfer the substitution flag to the new name before the delete call removes the old entry.
         if new_workflow_name != request.workflow_name:
-            self._variable_substitution_enabled[new_workflow_name] = self._variable_substitution_enabled.pop(
-                request.workflow_name, True
-            )
+            self._rekey_substitution_flag(request.workflow_name, new_workflow_name)
 
         # If the renamed file landed outside the workspace, keep it registered at its new path
         # (the old path's registration is stripped by the delete below).
@@ -1630,6 +1641,7 @@ class WorkflowManager:
             # Update registry key if directory changed
             if old_registry_key != new_registry_key:
                 WorkflowRegistry.rekey_workflow(old_registry_key, new_registry_key)
+                self._rekey_substitution_flag(old_registry_key, new_registry_key)
                 context_manager = GriptapeNodes.ContextManager()
                 if (
                     context_manager.has_current_workflow()
@@ -2333,8 +2345,10 @@ class WorkflowManager:
             # dropping the unsaved entry and updating the existing saved entry below.
             if registry_key in registered_workflows:
                 WorkflowRegistry.delete_workflow_by_name(unsaved_source_key)
+                self._drop_substitution_flag(unsaved_source_key)
             else:
                 WorkflowRegistry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
+                self._rekey_substitution_flag(unsaved_source_key, registry_key)
                 rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
             for workflow_context_state in GriptapeNodes.ContextManager()._workflow_stack:
@@ -5733,6 +5747,7 @@ class WorkflowManager:
             result_messages = []
             try:
                 WorkflowRegistry.delete_workflow_by_name(request.workflow_name)
+                self._drop_substitution_flag(request.workflow_name)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
                 cleanup_message = f"Deleted branch workflow file and registry entry for '{request.workflow_name}'"
