@@ -1958,6 +1958,14 @@ class ErrorProxyNode(BaseNode):
         self.original_node_type = original_node_type
         self.original_library_name = original_library_name
         self.failure_reason = failure_reason
+
+        # The owning library/node type are normally injected into metadata by
+        # LibraryRegistry.create_node, but a proxy is created precisely because that
+        # path failed, so the keys may be absent. Record the original library and node
+        # type here (without clobbering anything a round-tripped workflow already
+        # carried) so serialization can resolve the library and the proxy round-trips.
+        self.metadata.setdefault("library", original_library_name)
+        self.metadata.setdefault("node_type", original_node_type)
         # Record ALL initial_setup=True requests in order for 1:1 replay
         self._recorded_initialization_requests: list[RequestPayload] = []
 

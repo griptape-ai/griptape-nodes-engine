@@ -3420,8 +3420,19 @@ class NodeManager:
 
         # This is our current dude.
         with GriptapeNodes.ContextManager().node(node=node):
-            # Get the library and version details for all nodes
-            library_used = node.metadata["library"]
+            # Get the library and version details for all nodes.
+            # A node's owning library is normally injected into metadata by
+            # LibraryRegistry.create_node, but proxy/placeholder nodes can be created
+            # without it when that path fails. Fall back to the proxy's recorded
+            # original library, and tolerate a missing key rather than crashing the
+            # entire save.
+            library_used = node.metadata.get("library")
+            if library_used is None and isinstance(node, ErrorProxyNode):
+                library_used = node.original_library_name
+            if library_used is None:
+                # No owning library could be determined. Use an empty name so the
+                # metadata lookup below fails cleanly instead of crashing the save.
+                library_used = ""
             # For SubflowNodeGroup, also check if execution environment uses a special library
             execution_env_library_details = None
             if isinstance(node, SubflowNodeGroup):

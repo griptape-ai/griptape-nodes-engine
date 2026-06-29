@@ -216,6 +216,80 @@ class TestNodeManagerResolutionStateSerialization:
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
 
+class TestSerializeNodeWithoutLibraryMetadata:
+    """Serializing a node whose metadata lacks a 'library' key must not crash the save."""
+
+    def test_error_proxy_node_records_original_library_in_metadata(self) -> None:
+        """A proxy created without library metadata adopts its original library/node type."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+
+        assert node.metadata["library"] == "Missing Library"
+        assert node.metadata["node_type"] == "ExecutePython"
+
+    def test_error_proxy_node_does_not_clobber_existing_metadata(self) -> None:
+        """Library/node type already present in metadata (e.g. from a round trip) is preserved."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={"library": "Original Library", "node_type": "OriginalType"},
+        )
+
+        assert node.metadata["library"] == "Original Library"
+        assert node.metadata["node_type"] == "OriginalType"
+
+    def test_serialize_node_without_library_metadata_does_not_crash(self, griptape_nodes: GriptapeNodes) -> None:
+        """Regression for griptape-ai/griptape-nodes-app#154: a missing 'library' key must not raise."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import (
+            SerializeNodeToCommandsRequest,
+            SerializeNodeToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        griptape_nodes.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow")
+        )
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+        # Simulate a proxy whose metadata never received a 'library' key, which is the
+        # exact condition that previously raised KeyError: 'library' during serialization.
+        node.metadata.pop("library", None)
+        assert "library" not in node.metadata
+
+        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+
+        result = griptape_nodes.NodeManager().on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node.name)
+        )
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        create_command = result.serialized_node_commands.create_node_command
+        assert create_command.node_type == "ExecutePython"
+        assert create_command.specific_library_name == "Missing Library"
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
 class TestNodeManagerAlterParameterDetailsClearDefaultValue:
     """Test AlterParameterDetailsRequest behavior when clear_default_value and default_value are both set."""
 
