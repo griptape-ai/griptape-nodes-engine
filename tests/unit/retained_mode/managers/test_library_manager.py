@@ -1295,10 +1295,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
             LibraryManager as _LibraryManager,
         )
 
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
 
         sandbox_dir = tmp_path / "sandbox"
         sandbox_dir.mkdir()
@@ -1335,10 +1332,7 @@ class TestRegisterSandboxNodeFromSourceRequest:
             try:
                 yield sandbox_dir
             finally:
-                LibraryRegistry._libraries.clear()
-                LibraryRegistry._node_aliases.clear()
-                LibraryRegistry._collision_node_names_to_library_names.clear()
-                LibraryRegistry._registered_widgets.clear()
+                LibraryRegistry._clear()
 
     def test_imports_existing_file_and_registers_node_type(
         self,
@@ -1586,15 +1580,9 @@ class TestDescribeNodeTypeRequest:
     @pytest.fixture(autouse=True)
     def _clean_registry(self) -> Generator[None, None, None]:
         """LibraryRegistry holds class-level state that survives the singleton reset fixture."""
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
         yield
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
 
     def _register_probe_library(self) -> None:
         schema = LibrarySchema(
@@ -1803,15 +1791,9 @@ class TestLibraryNodeMetadataInjection:
 
     @pytest.fixture(autouse=True)
     def _clean_registry(self) -> Generator[None, None, None]:
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
         yield
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
 
     def _register_probe_library(self, node_metadata: NodeMetadata) -> None:
         schema = LibrarySchema(
@@ -3045,15 +3027,9 @@ class TestModelCatalogResolution:
 
     @pytest.fixture(autouse=True)
     def _clean_registry(self) -> Generator[None, None, None]:
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
         yield
-        LibraryRegistry._libraries.clear()
-        LibraryRegistry._node_aliases.clear()
-        LibraryRegistry._collision_node_names_to_library_names.clear()
-        LibraryRegistry._registered_widgets.clear()
+        LibraryRegistry._clear()
 
     @staticmethod
     def _catalog() -> ModelCatalogLibraryProperty:

@@ -1860,22 +1860,6 @@ class ProjectManager:
             current_info = parent_info
         return None
 
-    def _resolve_node_explicit_workspace(
-        self, project_file_path: Path, project_workspaces: dict[str, str]
-    ) -> str | None:
-        """Resolve a single chain node's explicitly-named workspace, or None if it names none.
-
-        Checks the node's project_workspaces override first, then its adjacent
-        griptape_nodes_config.json's workspace_directory. This is the per-node leaf primitive
-        applied at each ancestor by both the live (_inherit_workspace_from_parents) and offline
-        (_inherit_workspace_from_parents_offline) parent walks, so the two stay in lockstep.
-        """
-        override = self._find_workspace_override(project_file_path, project_workspaces)
-        if override is not None:
-            return override
-        node_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
-        return node_config.get("workspace_directory")
-
     def decide_libraries_root(self, project_file_path: Path, template_libraries_dir: str | None) -> Path | None:
         """Decide where a project's libraries install/resolve, or None for the legacy default.
 
@@ -1975,6 +1959,22 @@ class ProjectManager:
                     return node_libraries_dir
             current_info = parent_info
         return None
+
+    def _resolve_node_explicit_workspace(
+        self, project_file_path: Path, project_workspaces: dict[str, str]
+    ) -> str | None:
+        """Resolve a single chain node's explicitly-named workspace, or None if it names none.
+
+        Checks the node's project_workspaces override first, then its adjacent
+        griptape_nodes_config.json's workspace_directory. This is the per-node leaf primitive
+        applied at each ancestor by both the live (_inherit_workspace_from_parents) and offline
+        (_inherit_workspace_from_parents_offline) parent walks, so the two stay in lockstep.
+        """
+        override = self._find_workspace_override(project_file_path, project_workspaces)
+        if override is not None:
+            return override
+        node_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
+        return node_config.get("workspace_directory")
 
     def _snapshot_library_config(self) -> str:
         """Return a stable string of the merged library-affecting config for change detection.
