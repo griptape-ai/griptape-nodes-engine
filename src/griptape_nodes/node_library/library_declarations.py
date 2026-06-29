@@ -265,6 +265,16 @@ def requires_worker_process(declarations: Sequence[LibraryDeclaration]) -> bool:
     return suggested.mode is WorkerMode.WORKER
 
 
+def find_model_catalog(declarations: Sequence[LibraryDeclaration]) -> ModelCatalogLibraryProperty | None:
+    """Return the library's `model_catalog` declaration, or `None` when it declares none.
+
+    The single primitive every catalog consumer builds on: callers that want the
+    resolved models pair this with `iter_catalog_models` / `resolve_node_models`,
+    callers that only need the declaration (e.g. an existence check) use it alone.
+    """
+    return next((d for d in declarations if isinstance(d, ModelCatalogLibraryProperty)), None)
+
+
 class ResolvedModel(NamedTuple):
     """A model paired with its parent provider's identifier and object."""
 
