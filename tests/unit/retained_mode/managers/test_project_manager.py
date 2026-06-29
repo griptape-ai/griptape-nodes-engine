@@ -1916,7 +1916,9 @@ class TestDecideWorkspace:
         for spec in specs:
             file_path = spec.get("file")
             base_dir = Path(file_path).parent if file_path is not None else Path("/")
-            template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": spec.get("parent_id")})
+            template = DEFAULT_PROJECT_TEMPLATE.model_copy(
+                update={"parent_project_id": spec.get("parent_id"), "libraries_dir": spec.get("libraries_dir")}
+            )
             pm._successfully_loaded_project_templates[spec["id"]] = ProjectInfo(
                 project_id=spec["id"],
                 project_file_path=Path(file_path) if file_path is not None else None,
@@ -2281,6 +2283,100 @@ class TestResolveTemplateWorkspaceDir:
         result = self._pm()._resolve_template_workspace_dir(per_platform, tmp_path / "project.yml")
 
         assert result == str(canonicalize_for_identity(abs_ws))
+
+
+class TestDecideLibrariesRoot:
+    """`decide_libraries_root` decides where a project's libraries install/resolve.
+
+    Branch 0 is the project's own libraries_dir; branch 1 inherits the nearest ancestor's
+    libraries_dir resolved against THAT ancestor's dir (so children point at the parent's
+    libraries/ tree); None means fall back to the workspace-relative default. It consults ONLY
+    the template libraries_dir field, never project_workspaces or adjacent config. Reuses the
+    TestDecideWorkspace._pm_with_chain helper, which seeds each spec's template libraries_dir.
+    """
+
+    def test_own_libraries_dir_wins(self, tmp_path: Path) -> None:
+        """A project's own libraries_dir (branch 0) is used verbatim (already resolved)."""
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        c_file.parent.mkdir(parents=True)
+        c_file.touch()
+        own = tmp_path / "own-libs"
+
+        pm = TestDecideWorkspace._pm_with_chain(
+            [{"id": "C", "file": c_file, "parent_id": None, "libraries_dir": "./own-libs"}],
+        )
+        result = pm.decide_libraries_root(c_file, template_libraries_dir=str(own))
+
+        assert result == Path(str(own))
+
+    def test_inherits_parent_libraries_dir_resolved_against_parent(self, tmp_path: Path) -> None:
+        """A child with no libraries_dir adopts the parent's, resolved against the PARENT's dir."""
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = TestDecideWorkspace._pm_with_chain(
+            [
+                {"id": "P", "file": parent_file, "parent_id": None, "libraries_dir": "./libraries"},
+                {"id": "C", "file": child_file, "parent_id": "P"},
+            ],
+        )
+        result = pm.decide_libraries_root(child_file, template_libraries_dir=None)
+
+        # Resolved against the PARENT's dir, not the child's -- this is what makes sharing work.
+        assert result == Path(str(canonicalize_for_identity(parent_file.parent / "libraries")))
+
+    def test_inherits_grandparent_when_parent_has_none(self, tmp_path: Path) -> None:
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = TestDecideWorkspace._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "libraries_dir": "./libraries"},
+                {"id": "B", "file": b_file, "parent_id": "A"},
+                {"id": "C", "file": c_file, "parent_id": "B"},
+            ],
+        )
+        result = pm.decide_libraries_root(c_file, template_libraries_dir=None)
+
+        assert result == Path(str(canonicalize_for_identity(a_file.parent / "libraries")))
+
+    def test_none_when_no_libraries_dir_in_chain(self, tmp_path: Path) -> None:
+        """No libraries_dir anywhere -> None, so the caller falls back to the workspace-relative default."""
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = TestDecideWorkspace._pm_with_chain(
+            [
+                {"id": "P", "file": parent_file, "parent_id": None},
+                {"id": "C", "file": child_file, "parent_id": "P"},
+            ],
+        )
+        assert pm.decide_libraries_root(child_file, template_libraries_dir=None) is None
+
+    def test_cyclic_chain_returns_none(self, tmp_path: Path) -> None:
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = TestDecideWorkspace._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": "B"},
+                {"id": "B", "file": b_file, "parent_id": "A"},
+            ],
+        )
+        assert pm.decide_libraries_root(a_file, template_libraries_dir=None) is None
 
 
 class TestResolveWorkspaceDirForProjectId:

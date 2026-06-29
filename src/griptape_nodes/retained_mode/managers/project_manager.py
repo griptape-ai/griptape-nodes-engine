@@ -39,7 +39,6 @@ from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     resolve_file_path,
     resolve_path_safely,
-    resolve_workspace_path,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
@@ -1545,6 +1544,77 @@ class ProjectManager:
             return None
         return parent_path_candidate
 
+    async def resolve_libraries_root_for_project_id(self, project_id: str) -> Path | None:
+        """Resolve the libraries root a project would use WITHOUT loading it, or None for the default.
+
+        Offline analogue of decide_libraries_root, used by the provisioning preview so the previewed
+        SKIP/INSTALL/OVERWRITE plan matches what activation reconciles. The id is resolved to a file
+        path the same way resolve_workspace_dir_for_project_id does. Branch 0 reads this project's own
+        libraries_dir from its on-disk overlay; branch 1 walks the parent chain offline. Returns None
+        when no libraries_dir is declared anywhere in the chain, so the caller falls back to the
+        workspace-relative libraries directory.
+        """
+        id_index = await self._build_unloaded_id_index()
+        project_file_path = id_index.get(project_id)
+        if project_file_path is None:
+            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
+            if not legacy_path_candidate.is_file():
+                return None
+            project_file_path = legacy_path_candidate
+
+        own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
+        if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
+            _, own_overlay = own_overlay_load
+            template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
+            if template_libraries_dir is not None:
+                return Path(template_libraries_dir)
+
+        inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
+        if inherited is not None:
+            return Path(inherited)
+        return None
+
+    async def _inherit_libraries_dir_from_parents_offline(
+        self, project_file_path: Path, id_index: dict[str, Path]
+    ) -> str | None:
+        """Offline analogue of _inherit_libraries_dir_from_parents: walk the parent chain from disk.
+
+        Reads each node's overlay from disk rather than its loaded template, resolving the per-node
+        libraries_dir against that node's own directory. Mirrors _inherit_workspace_from_parents_offline
+        exactly, differing only in the per-node source (template libraries_dir field). The walk begins
+        at the parent; a visited id-set guards against a cyclic chain.
+        """
+        file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
+
+        start_id = file_path_to_id.get(project_file_path)
+        visited: set[ProjectID] = {start_id} if start_id is not None else set()
+
+        current_path: Path | None = project_file_path
+        while current_path is not None:
+            read_load = await self._read_overlay(current_path, record_status=False)
+            if isinstance(read_load, LoadProjectTemplateResultFailure):
+                return None
+            _, overlay = read_load
+
+            parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
+            if parent_id is None:
+                return None
+            if parent_id in visited:
+                return None
+            visited.add(parent_id)
+
+            parent_path = self._resolve_parent_id_to_path(parent_id, id_index)
+            if parent_path is None:
+                return None
+            parent_overlay_load = await self._read_overlay(parent_path, record_status=False)
+            if not isinstance(parent_overlay_load, LoadProjectTemplateResultFailure):
+                _, parent_overlay = parent_overlay_load
+                node_libraries_dir = self._resolve_template_libraries_dir(parent_overlay.libraries_dir, parent_path)
+                if node_libraries_dir is not None:
+                    return node_libraries_dir
+            current_path = parent_path
+        return None
+
     def decide_workspace(
         self,
         project_file_path: Path,
@@ -1806,6 +1876,106 @@ class ProjectManager:
         node_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         return node_config.get("workspace_directory")
 
+    def decide_libraries_root(self, project_file_path: Path, template_libraries_dir: str | None) -> Path | None:
+        """Decide where a project's libraries install/resolve, or None for the legacy default.
+
+        Priority, highest first:
+
+        0. the project's OWN libraries_dir field (passed in already resolved to an absolute path via
+           _resolve_template_libraries_dir) -> that dir
+        1. the nearest ancestor with a libraries_dir, walking the explicit parent-project chain,
+           resolved against THAT ancestor's project dir -> the ancestor's dir
+        2. None -> no explicit libraries root; the caller (ConfigManager.resolved_libraries_root)
+           falls back to the workspace-relative libraries_directory, preserving legacy behavior.
+
+        Unlike decide_workspace, this consults ONLY the project-template libraries_dir field (no
+        project_workspaces mapping, no adjacent config, no env): library sharing is a portable,
+        version-controlled, template-side concept. Branch 1 resolving the inherited value against the
+        ancestor's own dir is what makes every child point at the same parent libraries/ tree, so a
+        library declared on the parent is downloaded once and reused via SKIP. See
+        _inherit_libraries_dir_from_parents.
+        """
+        if template_libraries_dir is not None:
+            return Path(template_libraries_dir)
+        inherited = self._inherit_libraries_dir_from_parents(project_file_path)
+        if inherited is not None:
+            return Path(inherited)
+        return None
+
+    def _resolve_template_libraries_dir(
+        self, raw: str | PerPlatformProjectPath | None, project_file_path: Path
+    ) -> str | None:
+        """Resolve a template's raw libraries_dir field to an absolute path string, or None.
+
+        Mirrors _resolve_template_workspace_dir: reduces a per-platform mapping to the active
+        platform's value, resolves a relative path against the project YAML's directory, and
+        canonicalizes the result. Returns None when the field is unset or has no value for the active
+        platform. This doubles as the per-node leaf primitive for the parent-chain walks, so an
+        inherited value resolves against the DECLARING node's directory.
+        """
+        selected = select_project_path(raw)
+        if selected is None:
+            return None
+        candidate = Path(selected)
+        if not candidate.is_absolute():
+            candidate = project_file_path.parent / candidate
+        return str(canonicalize_for_identity(candidate))
+
+    def _inherit_libraries_dir_from_parents(self, project_file_path: Path) -> str | None:
+        """Walk the explicit parent-project chain for the nearest ancestor's libraries_dir.
+
+        Returns the resolved absolute libraries_dir the nearest ancestor declares (against that
+        ancestor's own project dir), or None when no ancestor in the chain defines one. The walk is
+        conducted in id-space through the registry (no disk template loads); a visited id-set guards
+        against a cyclic parent chain. The starting project's OWN libraries_dir is handled by branch 0
+        of decide_libraries_root, so the walk begins at the parent. Mirrors
+        _inherit_workspace_from_parents, differing only in the per-node source (template libraries_dir
+        field vs. workspace override/config).
+        """
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
+        resolved_start_path = canonicalize_for_identity(project_file_path)
+        start_id = next(
+            (
+                pid
+                for pid, info in self._successfully_loaded_project_templates.items()
+                if info.project_file_path is not None
+                and canonicalize_for_identity(info.project_file_path) == resolved_start_path
+            ),
+            None,
+        )
+        if start_id is None:
+            return None
+
+        visited: set[ProjectID] = {start_id}
+        current_info = self._successfully_loaded_project_templates.get(start_id)
+        while current_info is not None:
+            parent_id = self._reduce_parent_link_to_id(
+                current_info.template,
+                current_info.project_file_path,
+                file_path_to_id,
+            )
+            if parent_id is None:
+                return None
+            if parent_id in visited:
+                return None
+            visited.add(parent_id)
+            parent_info = self._successfully_loaded_project_templates.get(parent_id)
+            if parent_info is None:
+                return None
+            if parent_info.project_file_path is not None:
+                node_libraries_dir = self._resolve_template_libraries_dir(
+                    parent_info.template.libraries_dir, parent_info.project_file_path
+                )
+                if node_libraries_dir is not None:
+                    return node_libraries_dir
+            current_info = parent_info
+        return None
+
     def _snapshot_library_config(self) -> str:
         """Return a stable string of the merged library-affecting config for change detection.
 
@@ -1818,10 +1988,11 @@ class ProjectManager:
         catches a workspace-only switch: `libraries_directory` is workspace-relative
         by default, so two projects with identical config strings but different
         workspaces resolve to different on-disk `libraries/` trees and must still
-        reload, even though the three values above are unchanged.
+        reload, even though the three values above are unchanged. The resolved dir
+        also reflects a project's own/inherited `libraries_dir` override, so a switch
+        between a sharing child and a non-sharing project trips the reload too.
         """
-        libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
-        resolved_libraries_dir = str(resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path))
+        resolved_libraries_dir = str(self._config_manager.resolved_libraries_root())
         snapshot = {
             LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
             LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
@@ -2010,6 +2181,18 @@ class ProjectManager:
             )
             if decision.apply_override:
                 self._config_manager.set_workspace_override(decision.workspace_dir)
+
+            # Decide the libraries root independently of the workspace (a project may point
+            # workspace_dir away from its own dir yet still share a parent's libraries). None
+            # means no explicit libraries_dir anywhere in the chain, so the override stays
+            # cleared and resolved_libraries_root() falls back to the workspace-relative
+            # default. Set before the post-change snapshot below so a sharing-vs-not switch
+            # is reflected in library_config_changed.
+            template_libraries_dir = self._resolve_template_libraries_dir(
+                project_info.template.libraries_dir, project_file_path
+            )
+            libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
+            self._config_manager.set_libraries_root_override(libraries_root)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
