@@ -131,9 +131,9 @@ class LibraryMetadata(BaseModel):
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
         # Node references and the duplicate-id check assume a single catalog
-        # (see library_validation._find_model_catalog). Two catalogs would let
-        # the second one's models go unseen, so reject the ambiguity here where
-        # all declarations are visible together.
+        # (see library_declarations.find_model_catalog, which returns the first).
+        # Two catalogs would let the second one's models go unseen, so reject the
+        # ambiguity here where all declarations are visible together.
         catalog_count = sum(1 for d in self.declarations if isinstance(d, ModelCatalogLibraryProperty))
         if catalog_count > 1:
             msg = (
