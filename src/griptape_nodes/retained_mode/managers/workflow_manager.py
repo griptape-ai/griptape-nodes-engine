@@ -2208,8 +2208,23 @@ class WorkflowManager:
 
         # Build save request inline (preserve existing display_name/description/image/is_template if present)
         existing = self._get_existing_metadata(registry_key)
-        # Prefer an explicitly provided display_name over the preserved existing value.
-        resolved_display_name = request.display_name if request.display_name is not None else existing.display_name
+        # Display name precedence (high to low):
+        # 1. Caller-supplied request.display_name — explicit intent always wins.
+        # 2. existing.display_name from the registry — preserves the human-readable label
+        #    across re-saves and version bumps (one workflow named "a" with v001, v002, ...).
+        # 3. request.file_name — what the user typed for this save. Used as the seed on a
+        #    fresh Save As so the typed name ("a") becomes the display label, not the
+        #    macro-resolved on-disk name ("a_v001").
+        # 4. Resolved file_name fallback inside _generate_workflow_metadata_from_commands
+        #    (last-resort safety net for code paths that supply nothing).
+        if request.display_name is not None:
+            resolved_display_name = request.display_name
+        elif existing.display_name is not None:
+            resolved_display_name = existing.display_name
+        elif request.file_name:
+            resolved_display_name = Path(request.file_name).stem
+        else:
+            resolved_display_name = None
 
         save_file_result = self._save_workflow_file_inline(
             destination=destination,
@@ -2526,7 +2541,12 @@ class WorkflowManager:
 
         Priority order:
 
-        1. Explicit ``requested_file_name`` (user typed it for this save).
+        1. Explicit ``requested_file_name`` *for a workflow we don't already
+           know about* (true Save-As to a brand-new name). When the requested
+           name maps to an existing registry entry — e.g. the UI re-sends the
+           current workflow's key as ``file_name`` — treat that workflow as
+           the source of truth and fall through to Step 2 so the macro
+           reverse-match advances the version.
         2. Candidate workflow's existing ``file_path`` that matches the
            versioned situation's macro. The matched variables ride through
            the new ``MacroPath``; OSManager's collision-walk steps the
@@ -2540,10 +2560,14 @@ class WorkflowManager:
            ``metadata.name`` and route through ``_resolve_named_save_path``.
         5. Timestamp fallback when no candidate workflow exists.
         """
-        if requested_file_name:
+        # Step 1 only fires for a truly novel requested name. If the name
+        # resolves to a workflow already in the registry (target_workflow is set),
+        # that's the same identity we'd reverse-match from anyway, so drop into
+        # Step 2 instead of starting a fresh "_v001" series under the old name.
+        if requested_file_name and target_workflow is None:
             return self._resolve_named_save_path(requested_file_name, situation_name=situation_name)
 
-        candidate_workflow = current_workflow if current_workflow is not None else target_workflow
+        candidate_workflow = target_workflow if target_workflow is not None else current_workflow
         if candidate_workflow is not None and candidate_workflow.file_path is not None:
             matched = self._try_match_versioned_destination(candidate_workflow.file_path, situation_name=situation_name)
             if matched is not None:
@@ -2617,10 +2641,14 @@ class WorkflowManager:
             )
         )
         if not isinstance(match_result, AttemptMatchPathAgainstMacroResultSuccess):
-            msg = (
-                f"Attempted to build a versioned save destination for '{file_path}'. "
-                "Failed because the match handler returned a failure result."
-            )
+            # The dispatcher caught an exception inside the handler and returned a
+            # generic ResultPayloadFailure. Surface its result_details and exception
+            # so users see the underlying cause instead of an opaque wrapper.
+            inner = getattr(match_result, "result_details", None)
+            exc = getattr(match_result, "exception", None)
+            msg = f"Attempted to build a versioned save destination for '{file_path}'. Match handler failed: {inner}"
+            if exc is not None:
+                msg = f"{msg} (underlying: {type(exc).__name__}: {exc})"
             raise ValueError(msg)  # noqa: TRY004 - handler dispatch failure is a state error
         if match_result.extracted_variables is None:
             # The macro didn't match this file. Not an error — the caller

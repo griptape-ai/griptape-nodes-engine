@@ -2802,6 +2802,48 @@ class TestCreateVersionedWorkflow:
             assert macro_vars.get("file_extension") == "py"
             assert macro_vars.get("_index") == 1
 
+    def test_create_versioned_with_requested_name_matching_existing_workflow_runs_match(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """The UI re-sends the open workflow's key as ``file_name``; we still reverse-match.
+
+        Pins the fix for the manual-test bug where saving ``workflow_115_v002``
+        produced ``workflow_115_v002_v001.py`` instead of bumping to
+        ``workflow_115_v003.py``. The UI passes the loaded workflow's registry
+        key as ``requested_file_name`` even though the user didn't type a new
+        name; if Step 1 treats that as a true Save As, it starts a fresh
+        ``_v001`` series under the old name. The fix: short-circuit Step 1
+        only when the requested name names a workflow we DON'T already know
+        about. When it resolves to an existing registry entry, drop into the
+        reverse-match so the macro advances the version.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_flow_v002",
+                file_name="my_flow_v002.py",
+                display_name="my_flow",
+            )
+
+            # UI sends the loaded workflow's registry key as requested_file_name.
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow_v002",
+                current_workflow_name="my_flow_v002",
+                create_versioned=True,
+            )
+
+            # Reverse-match path taken, NOT a fresh _resolve_named_save_path.
+            # The destination's MacroPath carries _index=2 from the existing file;
+            # OSManager's collision-walk bumps it to 3 on write.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("_index") == 2  # noqa: PLR2004 - literal version from setup
+            # Negative guard: if Step 1 had short-circuited, file_name_base would be
+            # the whole prior stem ("my_flow_v002") and _index would be unbound.
+            assert macro_vars.get("file_name_base") != "my_flow_v002"
+
     def test_create_versioned_false_preserves_overwrite_existing(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:

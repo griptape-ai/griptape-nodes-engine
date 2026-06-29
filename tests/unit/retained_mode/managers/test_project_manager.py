@@ -184,16 +184,19 @@ class TestProjectManagerMacroHandlers:
             GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
             GriptapeNodes.ConfigManager().workspace_path = original_workspace
 
-    def test_match_path_auto_resolve_caller_wins_on_collision(self, tmp_path: Path) -> None:
-        """Caller-supplied ``known_variables`` win when they collide with auto-resolved builtins.
+    def test_match_path_auto_resolve_rejects_conflicting_caller_override(self, tmp_path: Path) -> None:
+        """Caller-supplied builtin overrides that disagree with the project are rejected.
 
-        Pins the merge contract: the caller's intent is authoritative. If a caller
-        explicitly passes ``workspace_dir=X``, the handler uses ``X`` even though
-        it would auto-resolve to something else. The failure record's
-        ``known_variables_used`` reflects what was actually used for the match.
+        Pins the shared "no silent override of builtins" policy: every handler
+        that mixes user-supplied variables with project-derived builtins refuses
+        to let the caller silently shadow the builtin. The match handler hits the
+        same conflict-detection helper as ``GetPathForMacroRequest`` and
+        ``GetStateForMacroRequest``, so the rejection shape is consistent across
+        the public API surface.
         """
         from griptape_nodes.common.macro_parser import ParsedMacro
         from griptape_nodes.retained_mode.events.project_events import (
+            AttemptMatchPathAgainstMacroResultFailure,
             LoadProjectTemplateRequest,
             LoadProjectTemplateResultSuccess,
             SetCurrentProjectRequest,
@@ -211,7 +214,7 @@ class TestProjectManagerMacroHandlers:
 
         try:
             # Caller asserts workspace_dir is "/elsewhere" — different from the real workspace.
-            # The match should align against "/elsewhere", not the real one.
+            # Under the unified policy this is a contract violation, not a silent override.
             parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
             request = AttemptMatchPathAgainstMacroRequest(
                 parsed_macro=parsed_macro,
@@ -222,12 +225,10 @@ class TestProjectManagerMacroHandlers:
 
             result = GriptapeNodes.handle_request(request)
 
-            assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
-            assert result.match_failure is None
-            assert result.extracted_variables is not None
-            # Caller's override survived the merge.
-            assert result.extracted_variables.get("workspace_dir") == "/elsewhere"
-            assert result.extracted_variables.get("file_name_base") == "my_workflow"
+            # Hard failure (not a match-failure result_success): caller violated
+            # the "no override of builtins" contract that all macro handlers share.
+            assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+            assert "workspace_dir" in str(result.result_details)
         finally:
             GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
             GriptapeNodes.ConfigManager().workspace_path = original_workspace
