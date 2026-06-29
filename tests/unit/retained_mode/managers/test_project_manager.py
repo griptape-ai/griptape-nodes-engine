@@ -6417,3 +6417,982 @@ class TestProjectActivationAuthorizationCheckpoint:
         assert isinstance(result, SetCurrentProjectResultSuccess)
         # The rest state is always allowed; the checkpoint is never consulted.
         mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.assert_not_called()
+
+
+# A minimal but realistic standalone project template used to seed an on-disk
+# project base dir for the export/import round-trip tests.
+PACKAGING_PROJECT_YAML = """\
+"project_template_schema_version": "0.4.0"
+"name": "Packaging Test"
+"situations":
+  "save_node_output":
+    "macro": "{outputs}/{file_name_base}.{file_extension}"
+    "policy":
+      "on_collision": "create_new"
+      "create_dirs": true
+"directories":
+  "inputs":
+    "path_macro": "inputs"
+  "outputs":
+    "path_macro": "outputs"
+"""
+
+
+def _write_project_base_dir(base_dir: Path, adjacent_config: dict | None = None) -> Path:
+    """Write a minimal project base dir (template + adjacent config + an asset).
+
+    Returns the path to the project YAML, ready to hand to
+    on_load_project_template_request.
+    """
+    import json
+
+    base_dir.mkdir(parents=True, exist_ok=True)
+    project_yaml = base_dir / "griptape-nodes-project.yml"
+    project_yaml.write_text(PACKAGING_PROJECT_YAML, encoding="utf-8")
+    (base_dir / "griptape_nodes_config.json").write_text(json.dumps(adjacent_config or {}), encoding="utf-8")
+    inputs_dir = base_dir / "inputs"
+    inputs_dir.mkdir()
+    (inputs_dir / "asset.txt").write_text("asset-contents", encoding="utf-8")
+    return project_yaml
+
+
+def _download_config(git_url: str, version: str, name: str) -> dict:
+    """An adjacent-config dict declaring a single libraries_to_download entry."""
+    return {
+        "app_events": {
+            "on_app_initialization_complete": {
+                "libraries_to_download": [{"git_url": git_url, "version": version, "name": name}],
+                "libraries_to_register": [],
+            }
+        }
+    }
+
+
+def _register_config(register_path: str) -> dict:
+    """An adjacent-config dict declaring a single libraries_to_register entry."""
+    return {
+        "app_events": {
+            "on_app_initialization_complete": {
+                "libraries_to_download": [],
+                "libraries_to_register": [register_path],
+            }
+        }
+    }
+
+
+class TestClassifyLibraries:
+    """Test classify_libraries partitions download vs register libs."""
+
+    def test_download_entry_is_referenced(self, tmp_path: Path) -> None:
+        """A libraries_to_download entry is REFERENCE: pin kept, no source copy."""
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
+
+        config = _download_config("https://example.com/lib.git", "v1.2.3", "remote_lib")
+        classification = classify_libraries(config, tmp_path)
+
+        assert len(classification.referenced) == 1
+        referenced = classification.referenced[0]
+        assert referenced.git_url == "https://example.com/lib.git"
+        assert referenced.version == "v1.2.3"
+        assert referenced.name == "remote_lib"
+        assert classification.copied == []
+
+    def test_register_directory_entry_is_copied(self, tmp_path: Path) -> None:
+        """A libraries_to_register dir entry is COPY_LOCAL with its dir recorded."""
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
+
+        lib_dir = tmp_path / "mylib"
+        lib_dir.mkdir()
+        (lib_dir / "griptape_nodes_library.json").write_text('{"name": "mylib"}', encoding="utf-8")
+
+        classification = classify_libraries(_register_config(str(lib_dir)), tmp_path)
+
+        assert classification.referenced == []
+        assert len(classification.copied) == 1
+        local = classification.copied[0]
+        assert local.containing_dir == lib_dir.resolve()
+        # A directory registration copies the dir itself; no file-within-dir.
+        assert local.path_within_containing_dir is None
+
+    def test_register_json_file_entry_records_containing_dir(self, tmp_path: Path) -> None:
+        """A libraries_to_register JSON-file entry copies its parent dir, tracking the file."""
+        from griptape_nodes.retained_mode.publishing.project_packager import classify_libraries
+
+        lib_dir = tmp_path / "mylib"
+        lib_dir.mkdir()
+        library_json = lib_dir / "griptape_nodes_library.json"
+        library_json.write_text('{"name": "mylib"}', encoding="utf-8")
+
+        classification = classify_libraries(_register_config(str(library_json)), tmp_path)
+
+        assert len(classification.copied) == 1
+        local = classification.copied[0]
+        assert local.containing_dir == lib_dir.resolve()
+        assert local.path_within_containing_dir == "griptape_nodes_library.json"
+
+    def test_missing_register_entry_is_skipped_and_reported(self, tmp_path: Path) -> None:
+        """A register entry whose source is missing is not copied but is reported."""
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            classify_libraries,
+            find_missing_local_libraries,
+        )
+
+        config = _register_config(str(tmp_path / "does_not_exist.json"))
+
+        classification = classify_libraries(config, tmp_path)
+        missing = find_missing_local_libraries(config, tmp_path)
+
+        assert classification.copied == []
+        assert missing == [str(tmp_path / "does_not_exist.json")]
+
+
+class TestExportProject:
+    """Test on_export_project_request packages a loaded project to a portable .zip."""
+
+    def test_export_not_loaded_project_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Exporting an unregistered project id returns a Failure."""
+        from griptape_nodes.retained_mode.events.project_events import ExportProjectRequest, ExportProjectResultFailure
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id="not-a-real-project", destination_path=tmp_path / "out.zip")
+        )
+        assert isinstance(result, ExportProjectResultFailure)
+
+    def test_export_system_defaults_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Exporting the file-less system defaults project returns a Failure."""
+        from griptape_nodes.retained_mode.events.project_events import ExportProjectRequest, ExportProjectResultFailure
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = GriptapeNodes.ProjectManager()
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=SYSTEM_DEFAULTS_KEY, destination_path=tmp_path / "out.zip")
+        )
+        assert isinstance(result, ExportProjectResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_export_missing_destination_dir_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Exporting to a destination whose parent dir is missing returns a Failure."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultFailure,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        result = pm.on_export_project_request(
+            ExportProjectRequest(
+                project_id=load_result.project_id,
+                destination_path=tmp_path / "no_such_dir" / "out.zip",
+            )
+        )
+        assert isinstance(result, ExportProjectResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_export_referenced_library_round_trip(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """A download lib is referenced (config only), assets travel, .env never does.
+
+        Also asserts a known secret value never leaks into the archive bytes and
+        that required_secret_keys carries KEY NAMES only.
+        """
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            MANIFEST_FILENAME,
+            PROJECT_TEMPLATE_FILENAME,
+        )
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        project_yaml = _write_project_base_dir(
+            base_dir, _download_config("https://example.com/lib.git", "v1.2.3", "remote_lib")
+        )
+        # A secret-bearing .env must never travel in the package.
+        (base_dir / ".env").write_text("MY_SECRET=super-secret-value", encoding="utf-8")
+
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        assert isinstance(result, ExportProjectResultSuccess)
+        assert destination.exists()
+        assert result.referenced_libraries == ["remote_lib"]
+        assert result.copied_libraries == []
+        # KEY NAMES only: the core secrets are present, but no values travel.
+        assert "GT_CLOUD_API_KEY" in result.required_secret_keys
+        assert "HF_TOKEN" in result.required_secret_keys
+
+        with zipfile.ZipFile(destination) as archive:
+            members = set(archive.namelist())
+            assert PROJECT_TEMPLATE_FILENAME in members
+            assert ADJACENT_CONFIG_FILENAME in members
+            assert MANIFEST_FILENAME in members
+            assert "inputs/asset.txt" in members
+            # .env and the hidden caches must be excluded.
+            assert ".env" not in members
+            assert not any(name.startswith(".griptape-nodes-") for name in members)
+            # Referenced (download) libs ship no source.
+            assert not any(name.startswith("libraries/") for name in members)
+            # No secret VALUE leaks into the archive bytes.
+            archive_bytes = b"".join(archive.read(name) for name in members if not name.endswith("/"))
+            assert b"super-secret-value" not in archive_bytes
+
+    @pytest.mark.asyncio
+    async def test_export_prunes_downloaded_library_sink_inside_base_dir(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A download lib cloned into libraries/ inside the base dir ships no source.
+
+        The engine clones libraries_to_download into the project's
+        libraries_directory (default 'libraries'), which sits inside the base
+        dir. The plain mirror would bundle that referenced source; the export
+        must prune it while keeping unrelated assets.
+        """
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        project_yaml = _write_project_base_dir(base_dir, _download_config("owner/remote_lib", "v1.0.0", "remote_lib"))
+        # Simulate the engine having cloned the referenced lib into the sink.
+        sink = base_dir / "libraries" / "remote_lib"
+        sink.mkdir(parents=True)
+        (sink / "griptape_nodes_library.json").write_text('{"name": "remote_lib"}', encoding="utf-8")
+        (sink / "big_model.bin").write_text("DOWNLOADED-SOURCE-SHOULD-NOT-TRAVEL", encoding="utf-8")
+
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        assert isinstance(result, ExportProjectResultSuccess)
+        assert result.referenced_libraries == ["remote_lib"]
+        assert result.copied_libraries == []
+
+        with zipfile.ZipFile(destination) as archive:
+            members = set(archive.namelist())
+            # The downloaded sink subtree must be absent (referenced libs ship no source).
+            assert not any(name.startswith("libraries/") for name in members)
+            # Unrelated assets still travel.
+            assert "inputs/asset.txt" in members
+            archive_bytes = b"".join(archive.read(name) for name in members if not name.endswith("/"))
+            assert b"DOWNLOADED-SOURCE-SHOULD-NOT-TRAVEL" not in archive_bytes
+
+    @pytest.mark.asyncio
+    async def test_export_nulls_parent_and_id_in_template(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """The bundled YAML has parent links and id nulled, dirs still macro strings."""
+        import zipfile
+
+        from ruamel.yaml import YAML
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import PROJECT_TEMPLATE_FILENAME
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            bundled_yaml = archive.read(PROJECT_TEMPLATE_FILENAME).decode("utf-8")
+        parsed = YAML().load(bundled_yaml)
+        assert parsed.get("parent_project_path") is None
+        assert parsed.get("parent_project_id") is None
+        assert parsed.get("id") is None
+        # Directory paths stay as macro strings so they re-resolve at import.
+        assert parsed["directories"]["outputs"]["path_macro"] == "outputs"
+
+    @pytest.mark.asyncio
+    async def test_export_copies_local_library_and_rewrites_config(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A register-only local lib is true-copied and its config path is package-relative."""
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.publishing.project_packager import ADJACENT_CONFIG_FILENAME
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = GriptapeNodes.ProjectManager()
+        # The local library lives OUTSIDE the project base dir (absolute path), the
+        # confirmed-real shape that must be copied and rewritten to be portable.
+        lib_dir = tmp_path / "external_lib"
+        lib_dir.mkdir()
+        (lib_dir / "griptape_nodes_library.json").write_text('{"name": "external_lib"}', encoding="utf-8")
+        # A secret-bearing .env inside the local library dir must not be true-copied
+        # into the package: the copy path shares the base-dir mirror's exclusion set.
+        (lib_dir / ".env").write_text("LIB_SECRET=copied-lib-secret-value", encoding="utf-8")
+        register_path = str(lib_dir / "griptape_nodes_library.json")
+        project_yaml = _write_project_base_dir(tmp_path / "proj", _register_config(register_path))
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+        assert result.copied_libraries == [register_path]
+
+        with zipfile.ZipFile(destination) as archive:
+            members = set(archive.namelist())
+            assert "libraries/external_lib/griptape_nodes_library.json" in members
+            # The local library's .env (and its secret value) never travels.
+            assert "libraries/external_lib/.env" not in members
+            archive_bytes = b"".join(archive.read(name) for name in members if not name.endswith("/"))
+            assert b"copied-lib-secret-value" not in archive_bytes
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+        rewritten = get_dot_value(bundled_config, LIBRARIES_TO_REGISTER_KEY)
+        assert rewritten == ["libraries/external_lib/griptape_nodes_library.json"]
+
+    @pytest.mark.asyncio
+    async def test_import_copied_local_library_resolves_against_new_base_dir(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A COPY_LOCAL lib is extracted and its rewritten config path resolves at the target.
+
+        Closes the round-trip for the copied-library disposition: export rewrites
+        the register path to a package-relative one, and import must extract that
+        source under the new base dir AND leave the imported adjacent config
+        pointing at the package-relative path so it resolves at the new location.
+        """
+        import json
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = GriptapeNodes.ProjectManager()
+        lib_dir = tmp_path / "external_lib"
+        lib_dir.mkdir()
+        (lib_dir / "griptape_nodes_library.json").write_text('{"name": "external_lib"}', encoding="utf-8")
+        register_path = str(lib_dir / "griptape_nodes_library.json")
+        project_yaml = _write_project_base_dir(tmp_path / "proj", _register_config(register_path))
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "imported"
+        result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target)
+        )
+        assert isinstance(result, ImportProjectResultSuccess)
+
+        # The copied source landed under the new base dir, and the imported config
+        # points at the package-relative path so it resolves at the new location.
+        package_relative = "libraries/external_lib/griptape_nodes_library.json"
+        assert (target / package_relative).exists()
+        imported_config = json.loads((target / "griptape_nodes_config.json").read_text(encoding="utf-8"))
+        assert get_dot_value(imported_config, LIBRARIES_TO_REGISTER_KEY) == [package_relative]
+
+    @pytest.mark.asyncio
+    async def test_export_drops_self_referential_workspace_directory(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A workspace_directory equal to the project's own base dir is dropped on export.
+
+        The source-machine absolute path would otherwise survive the round trip and
+        make the importing engine re-download referenced libraries into the source
+        workspace instead of the imported project's own libraries/ dir. Dropping it
+        lets decide_workspace auto-default the workspace to the import target.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            WORKSPACE_DIRECTORY_KEY,
+        )
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        # workspace_directory points at the project's own base dir (self-contained).
+        project_yaml = _write_project_base_dir(base_dir, {WORKSPACE_DIRECTORY_KEY: str(base_dir)})
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+        assert WORKSPACE_DIRECTORY_KEY not in bundled_config
+
+    @pytest.mark.asyncio
+    async def test_export_preserves_external_workspace_directory(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A workspace_directory pointing outside the project's base dir is preserved.
+
+        Such a value names a genuine external/shared workspace dependency we cannot
+        relocate, so it must survive export verbatim rather than being silently dropped.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            WORKSPACE_DIRECTORY_KEY,
+        )
+
+        pm = GriptapeNodes.ProjectManager()
+        base_dir = tmp_path / "proj"
+        external_workspace = tmp_path / "shared_workspace"
+        external_workspace.mkdir()
+        project_yaml = _write_project_base_dir(base_dir, {WORKSPACE_DIRECTORY_KEY: str(external_workspace)})
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+        assert bundled_config.get(WORKSPACE_DIRECTORY_KEY) == str(external_workspace)
+
+    @pytest.mark.asyncio
+    async def test_export_same_basename_copied_libraries_stay_distinct(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """Two COPY_LOCAL libs whose containing dirs share a basename keep distinct paths.
+
+        The collision-suffix dirname (shared_lib, shared_lib_2) must flow through to
+        BOTH the rewritten config and the manifest's per-lib source_relative_path. A
+        basename-keyed manifest lookup would collapse the two onto one path and
+        mislabel one lib's provenance; this locks the positional pairing in place.
+        """
+        import json
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_REGISTER_KEY
+        from griptape_nodes.retained_mode.publishing.project_packager import (
+            ADJACENT_CONFIG_FILENAME,
+            MANIFEST_FILENAME,
+        )
+        from griptape_nodes.utils.dict_utils import get_dot_value
+
+        pm = GriptapeNodes.ProjectManager()
+        # Two libraries in same-basename containing dirs under different parents.
+        lib_dir_a = tmp_path / "a" / "shared_lib"
+        lib_dir_b = tmp_path / "b" / "shared_lib"
+        lib_dir_a.mkdir(parents=True)
+        lib_dir_b.mkdir(parents=True)
+        (lib_dir_a / "griptape_nodes_library.json").write_text('{"name": "lib_a"}', encoding="utf-8")
+        (lib_dir_b / "griptape_nodes_library.json").write_text('{"name": "lib_b"}', encoding="utf-8")
+        register_path_a = str(lib_dir_a / "griptape_nodes_library.json")
+        register_path_b = str(lib_dir_b / "griptape_nodes_library.json")
+        config = {
+            "app_events": {
+                "on_app_initialization_complete": {
+                    "libraries_to_download": [],
+                    "libraries_to_register": [register_path_a, register_path_b],
+                }
+            }
+        }
+        project_yaml = _write_project_base_dir(tmp_path / "proj", config)
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        result = pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+        assert isinstance(result, ExportProjectResultSuccess)
+
+        with zipfile.ZipFile(destination) as archive:
+            members = set(archive.namelist())
+            bundled_config = json.loads(archive.read(ADJACENT_CONFIG_FILENAME))
+            manifest = json.loads(archive.read(MANIFEST_FILENAME))
+
+        # Both sources are copied under distinct, collision-suffixed dirs.
+        assert "libraries/shared_lib/griptape_nodes_library.json" in members
+        assert "libraries/shared_lib_2/griptape_nodes_library.json" in members
+
+        # The rewritten config preserves order and gives each entry its own path.
+        rewritten = get_dot_value(bundled_config, LIBRARIES_TO_REGISTER_KEY)
+        assert rewritten == [
+            "libraries/shared_lib/griptape_nodes_library.json",
+            "libraries/shared_lib_2/griptape_nodes_library.json",
+        ]
+
+        # The manifest records a distinct source_relative_path per copied lib; a
+        # basename-keyed lookup would have collapsed these to a single path.
+        copied_paths = [
+            lib["source_relative_path"] for lib in manifest["libraries"] if lib["disposition"] == "COPY_LOCAL"
+        ]
+        assert copied_paths == [
+            "libraries/shared_lib/griptape_nodes_library.json",
+            "libraries/shared_lib_2/griptape_nodes_library.json",
+        ]
+
+
+class TestPreviewImportProject:
+    """Test on_preview_import_project_request reads a manifest without extracting."""
+
+    def test_preview_missing_archive_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Previewing a non-existent archive returns a Failure."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        result = pm.on_preview_import_project_request(
+            PreviewImportProjectRequest(archive_path=tmp_path / "missing.zip")
+        )
+        assert isinstance(result, PreviewImportProjectResultFailure)
+
+    def test_preview_non_zip_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Previewing a file that is not a zip returns a Failure."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        not_a_zip = tmp_path / "plain.zip"
+        not_a_zip.write_text("this is not a zip archive", encoding="utf-8")
+
+        pm = GriptapeNodes.ProjectManager()
+        result = pm.on_preview_import_project_request(PreviewImportProjectRequest(archive_path=not_a_zip))
+        assert isinstance(result, PreviewImportProjectResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_non_dict_manifest_fails_cleanly(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """A valid-JSON-but-non-dict manifest returns a clean Failure, not a traceback.
+
+        A tampered package whose manifest.json parses to a list/number/string would
+        otherwise reach is_manifest_schema_compatible(...).get(...) and raise an
+        uncaught AttributeError. read_manifest rejects the non-dict as a
+        JSONDecodeError (already in the handlers' caught set) so both preview and
+        import surface a Failure instead of crashing.
+        """
+        import zipfile
+
+        from griptape_nodes.retained_mode.events.project_events import (
+            ImportProjectRequest,
+            ImportProjectResultFailure,
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.publishing.project_packager import MANIFEST_FILENAME
+
+        bad_manifest_zip = tmp_path / "bad-manifest.zip"
+        with zipfile.ZipFile(bad_manifest_zip, "w") as archive:
+            archive.writestr(MANIFEST_FILENAME, "[]")
+
+        pm = GriptapeNodes.ProjectManager()
+
+        preview_result = pm.on_preview_import_project_request(
+            PreviewImportProjectRequest(archive_path=bad_manifest_zip)
+        )
+        assert isinstance(preview_result, PreviewImportProjectResultFailure)
+
+        import_result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=bad_manifest_zip, target_directory=tmp_path / "imported")
+        )
+        assert isinstance(import_result, ImportProjectResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_preview_valid_archive_returns_manifest_and_unset_secrets(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+    ) -> None:
+        """A valid package previews its manifest plus the unset required secret keys."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        result = pm.on_preview_import_project_request(PreviewImportProjectRequest(archive_path=destination))
+
+        assert isinstance(result, PreviewImportProjectResultSuccess)
+        assert result.manifest["manifest_schema_version"].startswith("1.")
+        # The manifest carries the required secret KEY names; unset_secret_keys is
+        # the subset with no value in this environment (which may or may not have
+        # the core secrets set, so assert the relationship rather than membership).
+        required = result.manifest["required_secret_keys"]
+        assert "GT_CLOUD_API_KEY" in required
+        assert "HF_TOKEN" in required
+        assert set(result.unset_secret_keys) <= set(required)
+
+
+class TestImportProject:
+    """Test on_import_project_request extracts a package and registers the project."""
+
+    @pytest.mark.asyncio
+    async def test_import_registers_new_project_with_assets(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Importing into a fresh dir registers the project and activates it; macros follow the active workspace."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            GetPathForMacroRequest,
+            GetPathForMacroResultSuccess,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "imported"
+        result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target, set_as_current=True)
+        )
+
+        assert isinstance(result, ImportProjectResultSuccess)
+        assert result.project_id in pm._successfully_loaded_project_templates
+        # The asset extracted under the new base dir, and the base dir re-points there.
+        assert (target / "inputs" / "asset.txt").read_text(encoding="utf-8") == "asset-contents"
+        imported_info = pm._successfully_loaded_project_templates[result.project_id]
+        assert imported_info.project_base_dir.resolve() == target.resolve()
+
+        # set_as_current took effect: the imported project is the active one.
+        assert pm._current_project_id == result.project_id
+
+        # {outputs} resolves against the active project's workspace, proving the
+        # macro layer follows the import rather than pointing back at the source
+        # dir. A standalone import with no workspace_directory of its own adopts
+        # the global configured workspace (decide_workspace branch 5), so the
+        # macro anchors there rather than under the export source.
+        active_workspace = pm._config_manager.workspace_path
+        macro_result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/result.txt"), variables={})
+        )
+        assert isinstance(macro_result, GetPathForMacroResultSuccess)
+        assert macro_result.absolute_path.resolve() == (active_workspace / "outputs" / "result.txt").resolve()
+        source_dir = (tmp_path / "proj").resolve()
+        assert source_dir not in macro_result.absolute_path.resolve().parents
+
+    @pytest.mark.asyncio
+    async def test_import_with_new_name_renames_template(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """A new_project_name renames the imported template (duplicate/branch)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "branch"
+        result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target, new_project_name="Branch X")
+        )
+
+        assert isinstance(result, ImportProjectResultSuccess)
+        imported_info = pm._successfully_loaded_project_templates[result.project_id]
+        assert imported_info.template.name == "Branch X"
+
+    @pytest.mark.asyncio
+    async def test_import_two_targets_are_distinct_projects(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Importing the same package to two dirs yields two distinct registrations."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        first = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=tmp_path / "a")
+        )
+        second = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=tmp_path / "b")
+        )
+
+        assert isinstance(first, ImportProjectResultSuccess)
+        assert isinstance(second, ImportProjectResultSuccess)
+        assert first.project_id != second.project_id
+
+    @pytest.mark.asyncio
+    async def test_import_same_dir_without_overwrite_fails(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Re-importing into a dir that already has a project file fails unless overwrite."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultFailure,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "imported"
+        first = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target)
+        )
+        assert isinstance(first, ImportProjectResultSuccess)
+
+        second = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target)
+        )
+        assert isinstance(second, ImportProjectResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_import_unset_secret_reported_no_value_written(
+        self,
+        griptape_nodes: object,  # noqa: ARG002
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A required secret with no value in the target env is reported, never written.
+
+        Uses a synthetic secret key guaranteed absent from the environment so the
+        assertion does not depend on whether the dev machine has the core secrets
+        set. The export reads required keys from secrets_to_register, so injecting
+        the synthetic key there makes it travel in the manifest.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        synthetic_key = "GTN_PACKAGING_TEST_UNSET_SECRET"
+        monkeypatch.delenv(synthetic_key, raising=False)
+
+        pm = GriptapeNodes.ProjectManager()
+        secrets_manager = GriptapeNodes.SecretsManager()
+        monkeypatch.setattr(
+            type(secrets_manager),
+            "secrets_to_register",
+            property(lambda _self: {synthetic_key: ""}),
+        )
+
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        destination = tmp_path / "out.zip"
+        pm.on_export_project_request(
+            ExportProjectRequest(project_id=load_result.project_id, destination_path=destination)
+        )
+
+        target = tmp_path / "imported"
+        result = await pm.on_import_project_request(
+            ImportProjectRequest(archive_path=destination, target_directory=target)
+        )
+
+        assert isinstance(result, ImportProjectResultSuccess)
+        assert result.required_secret_keys == [synthetic_key]
+        assert synthetic_key in result.unset_secret_keys
+        # Detection must not have created/written the secret value.
+        assert secrets_manager.get_secret(synthetic_key, should_error_on_not_found=False) is None
+
+    @pytest.mark.asyncio
+    async def test_round_trip_with_string_paths_from_wire(self, griptape_nodes: object, tmp_path: Path) -> None:  # noqa: ARG002
+        """Path-typed request fields arriving as wire strings round-trip cleanly.
+
+        project_events declares destination_path/archive_path/target_directory as
+        Path. Over the WebSocket they arrive as plain JSON strings. Because
+        project_events imports Path at runtime, cattrs coerces those fields to Path
+        for the preview/import requests (verified below). ExportProjectRequest is
+        the exception: it also carries project_id: ProjectID, a TYPE_CHECKING-only
+        forward reference (project_events cannot import project_manager at runtime
+        without a cycle), so get_type_hints() raises NameError for the whole class
+        and cattrs falls back to a no-coercion structure. destination_path stays a
+        str there, so on_export_project_request coerces it at the boundary. Either
+        way the handler must not crash on a wire string; this exercises the real
+        converter path end to end.
+        """
+        from griptape_nodes.retained_mode.events.event_converter import converter
+        from griptape_nodes.retained_mode.events.project_events import (
+            ExportProjectRequest,
+            ExportProjectResultSuccess,
+            ImportProjectRequest,
+            ImportProjectResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            PreviewImportProjectRequest,
+            PreviewImportProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        pm = GriptapeNodes.ProjectManager()
+        project_yaml = _write_project_base_dir(tmp_path / "proj")
+        load_result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_yaml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        destination = tmp_path / "out.zip"
+        export_request = converter.structure(
+            {"project_id": load_result.project_id, "destination_path": str(destination)},
+            ExportProjectRequest,
+        )
+        # ProjectID forward ref blocks coercion for this class; the field stays str.
+        assert isinstance(export_request.destination_path, str)
+        export_result = pm.on_export_project_request(export_request)
+        assert isinstance(export_result, ExportProjectResultSuccess)
+
+        preview_request = converter.structure({"archive_path": str(destination)}, PreviewImportProjectRequest)
+        assert isinstance(preview_request.archive_path, Path)
+        preview_result = pm.on_preview_import_project_request(preview_request)
+        assert isinstance(preview_result, PreviewImportProjectResultSuccess)
+
+        target = tmp_path / "imported"
+        import_request = converter.structure(
+            {"archive_path": str(destination), "target_directory": str(target)},
+            ImportProjectRequest,
+        )
+        assert isinstance(import_request.archive_path, Path)
+        assert isinstance(import_request.target_directory, Path)
+        import_result = await pm.on_import_project_request(import_request)
+        assert isinstance(import_result, ImportProjectResultSuccess)
+        assert import_result.project_id in pm._successfully_loaded_project_templates
