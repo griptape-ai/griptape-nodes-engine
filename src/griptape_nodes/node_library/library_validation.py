@@ -23,6 +23,7 @@ from griptape_nodes.node_library.library_declarations import (
     ModelCatalogLibraryProperty,
     ModelProviderUsageNodeProperty,
     ModelUsageNodeProperty,
+    find_model_catalog,
     iter_catalog_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
@@ -57,7 +58,7 @@ def validate_library_declarations(library_data: LibrarySchema) -> list[LibraryPr
     problems: list[LibraryProblem] = []
     library_name = library_data.name
 
-    catalog = _find_model_catalog(library_data)
+    catalog = find_model_catalog(library_data.metadata.declarations)
     declared_model_ids: set[str] = set()
     declared_provider_ids: set[str] = set()
     if catalog is not None:
@@ -115,13 +116,6 @@ def detect_retired_node_declarations(library_json: dict[str, Any]) -> list[Libra
                 )
             )
     return problems
-
-
-def _find_model_catalog(library_data: LibrarySchema) -> ModelCatalogLibraryProperty | None:
-    for decl in library_data.metadata.declarations:
-        if isinstance(decl, ModelCatalogLibraryProperty):
-            return decl
-    return None
 
 
 def _check_duplicate_model_ids(

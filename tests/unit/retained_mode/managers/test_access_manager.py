@@ -425,7 +425,7 @@ class TestAccessManager:
     # ---------- Bare request (QueryModelAccessRequest) ----------
 
     def test_bare_request_no_node_no_catalog_attributes(self, griptape_nodes: GriptapeNodes) -> None:
-        """Bare request: hook sees `MODEL_ID` only, even when a library is registered.
+        """Bare request: hook sees `ID` only, even when a library is registered.
 
         The bare form must NOT enrich opportunistically -- it has no library scope
         to draw from, so policies operate on the bare model id regardless of what

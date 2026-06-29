@@ -228,6 +228,13 @@ class AccessManager:
         Order: each ``ModelUsageNodeProperty.model_ids`` entry in declaration order,
         then provider-expanded ids in catalog order, de-duplicated. A node that
         declares no model usage returns an empty list (zero verdicts).
+
+        This deliberately does NOT reuse ``resolve_node_models``: that helper drops
+        ``model_usage`` ids absent from the catalog, but a per-candidate access
+        query must keep them so a policy can explicitly deny an unknown id rather
+        than have it silently vanish from the offered set. Only the provider
+        expansion (which is meaningless without a catalog) goes through the
+        resolver.
         """
         ordered: list[str] = []
         seen: set[str] = set()
