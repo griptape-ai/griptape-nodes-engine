@@ -1911,7 +1911,7 @@ name: Legacy Project
         result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
-        assert "already at or beyond the latest schema major" in str(result.result_details)
+        assert "is not an older major than the latest" in str(result.result_details)
 
     def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
@@ -1939,9 +1939,25 @@ name: Legacy Project
         result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
-        assert "already at or beyond the latest schema major" in str(result.result_details)
+        assert "is not an older major than the latest" in str(result.result_details)
         # The on-disk file is untouched (no downgrade).
         assert "2.0.0" in (tmp_path / "griptape-nodes-project.yml").read_text()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_malformed_version_fails_gracefully(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # The load path tolerates a malformed version, so the upgrade handler must not raise on
+        # one -- it returns a failure result instead of crashing the request dispatch.
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        bad_yaml = 'project_template_schema_version: "not-a-version"\nname: Garbage\n'
+        project_id = await self._load(pm, tmp_path, bad_yaml)
+
+        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
 
 
 class TestLoadSystemDefaults:

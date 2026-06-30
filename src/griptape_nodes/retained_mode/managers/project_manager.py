@@ -10,7 +10,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
-import semver
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -33,6 +32,7 @@ from griptape_nodes.common.project_templates import (
     SituationTemplate,
     default_template_for_version,
     load_partial_project_template,
+    schema_major_or_none,
     select_project_path,
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
@@ -2257,13 +2257,16 @@ class ProjectManager:
         # future major opened on an older engine, which the load path accepts forward-compat)
         # -- the latest major must not be touched: restamping it down to latest would be a
         # silent schema DOWNGRADE re-saved against an older baseline, contradicting the
-        # never-downgrade contract in _version_to_write.
-        if semver.VersionInfo.parse(previous_version).major >= semver.VersionInfo.parse(latest_version).major:
+        # never-downgrade contract in _version_to_write. schema_major_or_none keeps this from
+        # raising on a malformed version (the load path tolerates one, so this must too).
+        previous_major = schema_major_or_none(previous_version)
+        latest_major = schema_major_or_none(latest_version)
+        if previous_major is None or latest_major is None or previous_major >= latest_major:
             return UpgradeProjectSchemaResultFailure(
                 result_details=(
                     f"Attempted to upgrade project '{request.project_id}'. "
-                    f"Failed because it is already at or beyond the latest schema major "
-                    f"(version '{previous_version}', latest '{latest_version}')."
+                    f"Failed because its schema version '{previous_version}' is not an older major "
+                    f"than the latest '{latest_version}' (or is unparsable)."
                 ),
             )
 

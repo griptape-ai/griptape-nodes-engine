@@ -442,7 +442,7 @@ _DEFAULT_TEMPLATE_BY_MAJOR: dict[int, ProjectTemplate] = {
 DEFAULT_PROJECT_TEMPLATE = DEFAULT_PROJECT_TEMPLATE_V1
 
 
-def _major_or_none(version: str) -> int | None:
+def schema_major_or_none(version: str) -> int | None:
     """Parse a schema version's major, or None when the version is not valid semver.
 
     Project version strings are user-controlled (read verbatim from project.yml). Callers on
@@ -464,7 +464,7 @@ def default_template_for_version(version: str) -> ProjectTemplate:
     version falls back to the latest default (forward-compat: a project declaring a not-yet-known
     or unparsable version still loads against the newest baseline rather than failing).
     """
-    major = _major_or_none(version)
+    major = schema_major_or_none(version)
     if major is None:
         return DEFAULT_PROJECT_TEMPLATE
     return _DEFAULT_TEMPLATE_BY_MAJOR.get(major, DEFAULT_PROJECT_TEMPLATE)
@@ -479,7 +479,7 @@ def latest_version_for_major(version: str) -> str | None:
     to the next major. None for a major with no registered default, or a malformed version (no
     in-major target exists, so the caller leaves the version untouched).
     """
-    major = _major_or_none(version)
+    major = schema_major_or_none(version)
     if major is None:
         return None
     template = _DEFAULT_TEMPLATE_BY_MAJOR.get(major)

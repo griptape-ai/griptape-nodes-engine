@@ -5,6 +5,7 @@ from griptape_nodes.common.project_templates.default_project_template import (
     DEFAULT_PROJECT_TEMPLATE_V0,
     DEFAULT_PROJECT_TEMPLATE_V1,
     default_template_for_version,
+    schema_major_or_none,
 )
 from griptape_nodes.common.project_templates.directory import DirectoryDefinition, PerPlatformPathMacro
 from griptape_nodes.common.project_templates.loader import (
@@ -57,5 +58,6 @@ __all__ = [
     "load_partial_project_template",
     "load_project_template_from_yaml",
     "load_yaml_with_line_tracking",
+    "schema_major_or_none",
     "select_project_path",
 ]
