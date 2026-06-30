@@ -1,3 +1,4 @@
+from collections.abc import Generator
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock, patch
@@ -28,6 +29,15 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         return LocalStorageDriver(Path("/workspace"))
 
     @pytest.fixture
+    def mock_workspace_path(self) -> Generator[None, None, None]:
+        """Mock ConfigManager to return /workspace for all tests."""
+        with patch("griptape_nodes.drivers.storage.base_storage_driver.GriptapeNodes") as mock_griptape:
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
+            yield
+
+    @pytest.fixture
     def mock_os_manager(self) -> Mock:
         """Mock OSManager for testing."""
         return Mock()
@@ -53,7 +63,11 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
         )
 
     def test_create_signed_upload_url_delegates_to_os_manager_with_policy(
-        self, local_storage_driver: LocalStorageDriver, mock_os_manager: Mock, mock_write_success_result: Any
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_os_manager: Mock,
+        mock_write_success_result: Any,
+        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test that create_signed_upload_url delegates to OSManager with correct policy."""
         with (
@@ -83,7 +97,11 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             assert call_args.existing_file_policy == ExistingFilePolicy.FAIL
 
     def test_create_signed_upload_url_uses_resolved_path_from_os_manager(
-        self, local_storage_driver: LocalStorageDriver, mock_os_manager: Mock, mock_write_success_result: Any
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_os_manager: Mock,
+        mock_write_success_result: Any,
+        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test that create_signed_upload_url uses resolved filename from OSManager."""
         with (
@@ -107,7 +125,11 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             assert call_kwargs["json"]["file_path"] == str(TEST_RESOLVED_PATH)
 
     def test_create_signed_upload_url_raises_file_exists_error_on_write_failure(
-        self, local_storage_driver: LocalStorageDriver, mock_os_manager: Mock, mock_write_failure_result: Any
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_os_manager: Mock,
+        mock_write_failure_result: Any,
+        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test that create_signed_upload_url raises FileExistsError when WriteFileRequest fails."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.GriptapeNodes") as mock_griptape:
@@ -123,7 +145,11 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             mock_os_manager.on_write_file_request.assert_called_once()
 
     def test_create_signed_upload_url_default_overwrite_policy(
-        self, local_storage_driver: LocalStorageDriver, mock_os_manager: Mock, mock_write_success_result: Any
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_os_manager: Mock,
+        mock_write_success_result: Any,
+        mock_workspace_path: Any,  # noqa: ARG002
     ) -> None:
         """Test that create_signed_upload_url defaults to OVERWRITE policy."""
         with (
@@ -155,7 +181,20 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
         """Create LocalStorageDriver instance for testing."""
         return LocalStorageDriver(Path("/workspace"))
 
-    def test_internal_file_uses_workspace_relative_url(self, local_storage_driver: LocalStorageDriver) -> None:
+    @pytest.fixture
+    def mock_workspace_path(self) -> Generator[None, None, None]:
+        """Mock ConfigManager to return /workspace for all tests."""
+        with patch("griptape_nodes.drivers.storage.base_storage_driver.GriptapeNodes") as mock_griptape:
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
+            yield
+
+    def test_internal_file_uses_workspace_relative_url(
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
         """Internal files should produce a workspace-relative URL."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
             mock_time.time.return_value = 1000
@@ -163,7 +202,11 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
 
         assert url == "http://localhost:8124/workspace/images/photo.png?t=1000"
 
-    def test_external_unix_file_uses_external_url(self, local_storage_driver: LocalStorageDriver) -> None:
+    def test_external_unix_file_uses_external_url(
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
         """External Unix files should produce a /external/ URL with forward slashes."""
         with (
             patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
@@ -176,7 +219,11 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
 
         assert url == "http://localhost:8124/external/external/video.mp4?t=1000"
 
-    def test_external_windows_file_uses_forward_slashes_in_url(self, local_storage_driver: LocalStorageDriver) -> None:
+    def test_external_windows_file_uses_forward_slashes_in_url(
+        self,
+        local_storage_driver: LocalStorageDriver,
+        mock_workspace_path: Any,  # noqa: ARG002
+    ) -> None:
         """External Windows-style files should produce a URL with forward slashes, not backslashes."""
         with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
             mock_time.time.return_value = 1000

@@ -32,10 +32,11 @@ class BaseStorageDriver(ABC):
         """Initialize the storage driver with a workspace directory.
 
         Args:
-            workspace_directory: The base workspace directory path (unused, kept for compatibility).
+            workspace_directory: The base workspace directory path (unused, kept for API compatibility).
+                Drivers now fetch the current workspace dynamically via the workspace_directory property.
         """
-        # Note: workspace_directory parameter is ignored; drivers now fetch the current
-        # workspace fresh from ConfigManager to handle dynamic workspace changes.
+        # workspace_directory parameter is ignored - the property reads from ConfigManager instead.
+        # This ensures drivers always use the current workspace, even if it changes after initialization.
 
     @property
     def workspace_directory(self) -> Path:
