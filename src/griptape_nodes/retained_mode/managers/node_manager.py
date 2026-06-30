@@ -6,6 +6,7 @@ import copy
 import logging
 import pickle
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
@@ -2116,6 +2117,13 @@ class NodeManager:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
                 if value.__class__.__module__ != "builtins":
+                    # Enums (including StrEnum/IntEnum) are not builtins but serialize to
+                    # their underlying value. Without this, the __dict__ fallback below
+                    # would send the raw enum internals (e.g. {"_value_": ..., "_name_": ...})
+                    # to the GUI, which renders them as an object instead of the value.
+                    if isinstance(value, Enum):
+                        param_to_value[element_id] = value.value
+                        continue
                     # Check if it has a to_dict method. Use that, if it's been implemented.
                     if hasattr(value, "to_dict"):
                         # If the object has a __dict__, use that
