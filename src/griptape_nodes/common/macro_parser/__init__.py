@@ -12,12 +12,20 @@ from griptape_nodes.common.macro_parser.exceptions import (
     MacroSyntaxError,
 )
 from griptape_nodes.common.macro_parser.formats import (
+    AbbrevFormat,
+    CamelCaseFormat,
     DateFormat,
+    DotCaseFormat,
     LowerCaseFormat,
     NumericPaddingFormat,
+    PascalCaseFormat,
+    ScreamingSnakeCaseFormat,
     SeparatorFormat,
     SequenceFormat,
     SlugFormat,
+    SnakeCaseFormat,
+    TitleCaseFormat,
+    TrimFormat,
     UpperCaseFormat,
 )
 from griptape_nodes.common.macro_parser.segments import (
@@ -28,7 +36,10 @@ from griptape_nodes.common.macro_parser.segments import (
 )
 
 __all__ = [
+    "AbbrevFormat",
+    "CamelCaseFormat",
     "DateFormat",
+    "DotCaseFormat",
     "LowerCaseFormat",
     "MacroMatchFailure",
     "MacroMatchFailureReason",
@@ -43,9 +54,14 @@ __all__ = [
     "ParsedMacro",
     "ParsedStaticValue",
     "ParsedVariable",
+    "PascalCaseFormat",
+    "ScreamingSnakeCaseFormat",
     "SeparatorFormat",
     "SequenceFormat",
     "SlugFormat",
+    "SnakeCaseFormat",
+    "TitleCaseFormat",
+    "TrimFormat",
     "UpperCaseFormat",
     "VariableInfo",
 ]
