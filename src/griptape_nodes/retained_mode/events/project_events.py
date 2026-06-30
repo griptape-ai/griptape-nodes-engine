@@ -133,6 +133,36 @@ class GetProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 
 @dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceRequest(RequestPayload):
+    """Resolve the workspace directory a project would use, WITHOUT loading/activating it.
+
+    Use when: Showing a project's effective workspace in the detail view when the project does not
+    declare its own workspace_dir, so the user can see where its workspace would land.
+
+    Args:
+        project_id: Opaque id of the project (the registry key). Consumers must not parse it.
+
+    Results: ResolveProjectWorkspaceResultSuccess
+    """
+
+    project_id: ProjectID
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Resolved workspace directory for a project.
+
+    Args:
+        workspace_dir: Absolute path string the project would use, or None when the id resolves to
+            no readable project file (matches the resolver's "nothing to resolve" contract).
+    """
+
+    workspace_dir: str | None = None
+
+
+@dataclass
 class ProjectTemplateInfo:
     """Information about a loaded or failed project template.
 
