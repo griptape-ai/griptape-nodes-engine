@@ -7,7 +7,10 @@ from typing import Any
 import pytest
 
 from griptape_nodes.common.macro_parser import (
+    AbbrevFormat,
+    CamelCaseFormat,
     DateFormat,
+    DotCaseFormat,
     LowerCaseFormat,
     MacroMatchFailure,
     MacroMatchFailureReason,
@@ -21,9 +24,14 @@ from griptape_nodes.common.macro_parser import (
     ParsedMacro,
     ParsedStaticValue,
     ParsedVariable,
+    PascalCaseFormat,
+    ScreamingSnakeCaseFormat,
     SeparatorFormat,
     SequenceFormat,
     SlugFormat,
+    SnakeCaseFormat,
+    TitleCaseFormat,
+    TrimFormat,
     UpperCaseFormat,
     VariableInfo,
 )
@@ -114,6 +122,112 @@ class TestFormatSpecs:
         """Test SlugFormat.reverse() returns as-is (cannot reverse)."""
         fmt = SlugFormat()
         assert fmt.reverse("my-workflow") == "my-workflow"
+
+    def test_title_case_format_apply(self) -> None:
+        """Test TitleCaseFormat.apply() converts to title case."""
+        fmt = TitleCaseFormat()
+        assert fmt.apply("hello world") == "Hello World"
+        assert fmt.apply("HELLO WORLD") == "Hello World"
+        assert fmt.apply("hello") == "Hello"
+        assert fmt.apply(123) == "123"
+
+    def test_title_case_format_reverse(self) -> None:
+        """Test TitleCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = TitleCaseFormat()
+        assert fmt.reverse("Hello World") == "Hello World"
+
+    def test_snake_case_format_apply(self) -> None:
+        """Test SnakeCaseFormat.apply() converts to snake_case."""
+        fmt = SnakeCaseFormat()
+        assert fmt.apply("Hello World") == "hello_world"
+        assert fmt.apply("helloWorld") == "hello_world"
+        assert fmt.apply("HelloWorld") == "hello_world"
+        assert fmt.apply("already_snake") == "already_snake"
+        assert fmt.apply("Hello-World") == "hello_world"
+
+    def test_snake_case_format_reverse(self) -> None:
+        """Test SnakeCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = SnakeCaseFormat()
+        assert fmt.reverse("hello_world") == "hello_world"
+
+    def test_pascal_case_format_apply(self) -> None:
+        """Test PascalCaseFormat.apply() converts to PascalCase."""
+        fmt = PascalCaseFormat()
+        assert fmt.apply("hello world") == "HelloWorld"
+        assert fmt.apply("hello_world") == "HelloWorld"
+        assert fmt.apply("hello-world") == "HelloWorld"
+        assert fmt.apply("hello") == "Hello"
+
+    def test_pascal_case_format_reverse(self) -> None:
+        """Test PascalCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = PascalCaseFormat()
+        assert fmt.reverse("HelloWorld") == "HelloWorld"
+
+    def test_camel_case_format_apply(self) -> None:
+        """Test CamelCaseFormat.apply() converts to camelCase."""
+        fmt = CamelCaseFormat()
+        assert fmt.apply("hello world") == "helloWorld"
+        assert fmt.apply("hello_world") == "helloWorld"
+        assert fmt.apply("hello-world") == "helloWorld"
+        assert fmt.apply("hello") == "hello"
+
+    def test_camel_case_format_reverse(self) -> None:
+        """Test CamelCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = CamelCaseFormat()
+        assert fmt.reverse("helloWorld") == "helloWorld"
+
+    def test_screaming_snake_case_format_apply(self) -> None:
+        """Test ScreamingSnakeCaseFormat.apply() converts to SCREAMING_SNAKE_CASE."""
+        fmt = ScreamingSnakeCaseFormat()
+        assert fmt.apply("hello world") == "HELLO_WORLD"
+        assert fmt.apply("helloWorld") == "HELLO_WORLD"
+        assert fmt.apply("hello-world") == "HELLO_WORLD"
+        assert fmt.apply("already_snake") == "ALREADY_SNAKE"
+
+    def test_screaming_snake_case_format_reverse(self) -> None:
+        """Test ScreamingSnakeCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = ScreamingSnakeCaseFormat()
+        assert fmt.reverse("HELLO_WORLD") == "HELLO_WORLD"
+
+    def test_dot_case_format_apply(self) -> None:
+        """Test DotCaseFormat.apply() converts to dot.case."""
+        fmt = DotCaseFormat()
+        assert fmt.apply("Hello World") == "hello.world"
+        assert fmt.apply("helloWorld") == "hello.world"
+        assert fmt.apply("hello_world") == "hello.world"
+        assert fmt.apply("hello-world") == "hello.world"
+
+    def test_dot_case_format_reverse(self) -> None:
+        """Test DotCaseFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = DotCaseFormat()
+        assert fmt.reverse("hello.world") == "hello.world"
+
+    def test_abbrev_format_apply(self) -> None:
+        """Test AbbrevFormat.apply() takes first letter of each word."""
+        fmt = AbbrevFormat()
+        assert fmt.apply("Hello World") == "HW"
+        assert fmt.apply("hello world") == "hw"
+        assert fmt.apply("one two three") == "ott"
+        assert fmt.apply("hello_world") == "hw"
+        assert fmt.apply("hello-world") == "hw"
+
+    def test_abbrev_format_reverse(self) -> None:
+        """Test AbbrevFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = AbbrevFormat()
+        assert fmt.reverse("HW") == "HW"
+
+    def test_trim_format_apply(self) -> None:
+        """Test TrimFormat.apply() strips leading and trailing whitespace."""
+        fmt = TrimFormat()
+        assert fmt.apply("  hello  ") == "hello"
+        assert fmt.apply("hello") == "hello"
+        assert fmt.apply("\thello\n") == "hello"
+        assert fmt.apply(123) == "123"
+
+    def test_trim_format_reverse(self) -> None:
+        """Test TrimFormat.reverse() returns as-is (cannot reverse)."""
+        fmt = TrimFormat()
+        assert fmt.reverse("hello") == "hello"
 
     def test_date_format_not_implemented(self) -> None:
         """Test DateFormat raises not implemented error."""
