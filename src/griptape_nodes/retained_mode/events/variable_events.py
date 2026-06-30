@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
@@ -368,16 +368,19 @@ class GetVariableDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 @dataclass
 @PayloadRegistry.register
 class GetVariablesRequest(RequestPayload):
-    """Get all variable values visible from the starting flow.
+    """Get variable values visible from the starting flow.
 
-    Returns a name→value mapping for every variable in scope. Suitable for
-    bulk reads without issuing individual GetVariableValueRequest calls.
+    When ``names`` is non-empty, looks up each name individually via
+    ``_find_variable_hierarchical`` and fails (all-or-nothing) if any name is
+    not found. When ``names`` is empty, returns every variable in scope.
 
     Args:
+        names: Specific variable names to retrieve. Empty means "all in scope".
         lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
     """
 
+    names: list[str] = field(default_factory=list)
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
 

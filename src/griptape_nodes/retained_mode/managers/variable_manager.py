@@ -1,5 +1,5 @@
 import logging
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.variable_events import (
@@ -524,7 +524,7 @@ class VariablesManager:
         )
 
     def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
-        """Get all variable values visible from the starting flow."""
+        """Get variable values visible from the starting flow."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
         except ValueError as e:
@@ -532,10 +532,27 @@ class VariablesManager:
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
             )
 
+        if request.names:
+            result: dict[str, Any] = {}
+            missing: list[str] = []
+            for name in request.names:
+                lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope)
+                if lookup.variable is None:
+                    missing.append(name)
+                else:
+                    result[name] = lookup.variable.value
+            if missing:
+                return GetVariablesResultFailure(
+                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
+                )
+            return GetVariablesResultSuccess(
+                variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
+            )
+
         variables = self._get_variables_by_scope(starting_flow, request.lookup_scope)
-        result = {v.name: v.value for v in variables}
+        all_vars = {v.name: v.value for v in variables}
         return GetVariablesResultSuccess(
-            variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
+            variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
     def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
