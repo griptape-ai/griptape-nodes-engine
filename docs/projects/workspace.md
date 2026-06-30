@@ -58,6 +58,8 @@ A project can name its own workspace directory in the project file via the `work
 
 Use it when a project should always resolve to a fixed workspace, regardless of each user's machine-level config. Unlike `project_workspaces` (which every user must set in their own config), `workspace_dir` travels inside the project file, so the project carries its workspace with it.
 
+New **v1** projects are created with `workspace_dir: "./"`, so by default a v1 project is self-contained — its workspace is its own folder. Clearing the field (or omitting it) returns the project to inheriting the workspace from a parent or the global default. See [Schema versions](projects.md#schema-versions).
+
 The value may be either a single path or a per-platform mapping:
 
 ```yaml
