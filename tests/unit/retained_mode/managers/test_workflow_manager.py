@@ -1,5 +1,6 @@
 import ast
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -3176,3 +3177,339 @@ class TestCreateVersionedWorkflow:
                     current_workflow_name="my_flow_v001",
                     create_versioned=True,
                 )
+
+    def test_create_versioned_missing_situation_raises_value_error(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When the active project lacks the versioned situation, the reverse-match raises with the situation name.
+
+        Pins the GetSituationResultSuccess guard at the top of
+        ``_try_match_versioned_destination``. Drives the path where the
+        match attempt happens (a registered workflow with a file_path) so
+        the helper runs end-to-end, then patches ``handle_request`` to
+        simulate the situation being absent.
+        """
+        from griptape_nodes.retained_mode.events.base_events import RequestPayload
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetSituationRequest,
+            GetSituationResultFailure,
+        )
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+
+            real_handle = GriptapeNodes.handle_request
+
+            def fake_handle(req: RequestPayload) -> object:
+                if isinstance(req, GetSituationRequest):
+                    return GetSituationResultFailure(result_details="not found")
+                return real_handle(req)
+
+            with (
+                patch.object(GriptapeNodes, "handle_request", side_effect=fake_handle),
+                pytest.raises(ValueError, match="not found in the active project template"),
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
+
+    def test_create_versioned_match_dispatch_failure_surfaces_underlying_cause(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When the match handler crashes, the error message includes the underlying exception.
+
+        Pins the better-error-message branch in ``_try_match_versioned_destination``:
+        if ``GriptapeNodes.handle_request`` catches an exception in the match
+        handler and returns a generic ResultPayloadFailure, the wrapper raises
+        ``ValueError`` with both the result_details and the underlying
+        exception type and message so future debugging starts with the real
+        cause, not an opaque dispatch wrapper.
+        """
+        from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayloadFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            AttemptMatchPathAgainstMacroRequest,
+        )
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+
+            real_handle = GriptapeNodes.handle_request
+            synthetic_exc = RuntimeError("synthetic match-handler crash for test")
+
+            def fake_handle(req: RequestPayload) -> object:
+                if isinstance(req, AttemptMatchPathAgainstMacroRequest):
+                    return ResultPayloadFailure(
+                        exception=synthetic_exc,
+                        result_details="dispatch caught an exception",
+                    )
+                return real_handle(req)
+
+            with (
+                patch.object(GriptapeNodes, "handle_request", side_effect=fake_handle),
+                pytest.raises(ValueError, match="synthetic match-handler crash") as exc_info,
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
+
+            # The message includes both the underlying exception's class name and
+            # its text — future debuggers shouldn't have to chase the original cause.
+            assert "RuntimeError" in str(exc_info.value)
+            assert "dispatch caught an exception" in str(exc_info.value)
+
+    def test_create_versioned_timestamp_fallback_when_no_candidate_workflow(
+        self,
+        griptape_nodes: GriptapeNodes,
+    ) -> None:
+        """Step 5: no current AND no target workflow → timestamp-derived filename.
+
+        Pins the last-resort branch of ``_resolve_versioned_save_target``:
+        when there's nothing in scope to derive a base name from, the
+        helper falls back to a ``%d.%m_%H.%M`` timestamp routed through
+        the standard ``_resolve_named_save_path`` plumbing.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            # Empty registry + no current workflow + no target → Step 5.
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name=None,
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # The base name is a timestamp matching DD.MM_HH.MM; the index is
+            # unbound so the seed-and-retry assigns 001 on write.
+            base = macro_vars.get("file_name_base")
+            assert isinstance(base, str)
+            assert re.fullmatch(r"\d{2}\.\d{2}_\d{2}\.\d{2}", base), (
+                f"Expected timestamp pattern DD.MM_HH.MM but got {base!r}"
+            )
+            assert "_index" not in macro_vars
+
+
+class TestSaveWorkflowDisplayNameFallback:
+    """Pin the display-name fallback chain in ``on_save_workflow_request``.
+
+    Four branches with strict precedence (high → low):
+    1. ``request.display_name`` — explicit caller intent always wins.
+    2. ``existing.display_name`` — preserves human-readable label across re-saves.
+    3. ``Path(request.file_name).stem`` — what the user typed on a fresh Save As.
+    4. ``None`` → metadata generator's last-resort fallback uses resolved file_name.
+
+    Drives ``on_save_workflow_request`` end-to-end with mocks; intercepts
+    ``_save_workflow_file_inline`` to capture the ``display_name`` argument
+    that the chain produced.
+    """
+
+    @staticmethod
+    def _capture_display_name(
+        griptape_nodes: GriptapeNodes,
+        *,
+        request_file_name: str | None,
+        request_display_name: str | None,
+        current_workflow_name: str | None,
+    ) -> str | None:
+        """Drive on_save_workflow_request and return the display_name handed to _save_workflow_file_inline."""
+        from datetime import UTC, datetime
+
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+        from griptape_nodes.retained_mode.events.flow_events import (
+            GetTopLevelFlowRequest,
+            GetTopLevelFlowResultSuccess,
+            SerializedFlowCommands,
+            SerializeFlowToCommandsRequest,
+            SerializeFlowToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowFileFromSerializedFlowResultSuccess,
+            SaveWorkflowRequest,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager = griptape_nodes.ContextManager()
+
+        empty_commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=MagicMock(),
+            node_types_used=set(),
+        )
+        saved_metadata = WorkflowMetadata(
+            name="placeholder",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        captured: dict[str, str | None] = {}
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, GetTopLevelFlowRequest):
+                return GetTopLevelFlowResultSuccess(flow_name="ControlFlow_1", result_details="ok")
+            if isinstance(req, SerializeFlowToCommandsRequest):
+                return SerializeFlowToCommandsResultSuccess(
+                    serialized_flow_commands=empty_commands, result_details="ok"
+                )
+            msg = f"Unexpected request type in test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        def capture_inline(**kwargs: object) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
+            # display_name is what we're testing — record it then return success.
+            captured["display_name"] = kwargs.get("display_name")  # type: ignore[assignment]
+            workspace = griptape_nodes.ConfigManager().workspace_path
+            file_name = kwargs.get("file_name", "stub")
+            return SaveWorkflowFileFromSerializedFlowResultSuccess(
+                file_path=str(workspace / f"{file_name}.py"),
+                workflow_metadata=saved_metadata,
+                result_details="ok",
+            )
+
+        pushed_context = False
+        if current_workflow_name is not None:
+            context_manager.push_workflow(workflow_name=current_workflow_name)
+            pushed_context = True
+
+        try:
+            with (
+                patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+                patch.object(workflow_manager, "_save_workflow_file_inline", side_effect=capture_inline),
+                patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
+            ):
+                asyncio.run(
+                    workflow_manager.on_save_workflow_request(
+                        SaveWorkflowRequest(file_name=request_file_name, display_name=request_display_name)
+                    )
+                )
+        finally:
+            if pushed_context and context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
+        return captured.get("display_name")
+
+    def test_explicit_request_display_name_wins(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 1: ``request.display_name`` is explicit caller intent and always wins.
+
+        Even when the registry has an existing display_name AND request.file_name
+        is set, the explicit request.display_name still takes precedence.
+        """
+        unsaved_key = "unsaved:branch1-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="In-Memory Label")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="some_file_name",
+                request_display_name="Caller-Specified Label",
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured == "Caller-Specified Label"
+
+    def test_existing_registry_display_name_used_when_request_omits(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 2: when request.display_name is None, the registry's existing display_name wins over the file_name.
+
+        Pins the "preserve human-readable label across re-saves" rule — a
+        second save of an already-registered workflow keeps its existing
+        display name rather than resetting it from the typed/resolved
+        file_name.
+        """
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+
+        registry_key = "preserved_display_name_test"
+        workspace = griptape_nodes.ConfigManager().workspace_path
+        stub_path = workspace / f"{registry_key}.py"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            stub_path.write_text("# stub")
+            try:
+                metadata = WorkflowMetadata(
+                    name="Preserved Display Name",
+                    schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                    engine_version_created_with="test",
+                    node_libraries_referenced=[],
+                    creation_date=datetime.now(UTC),
+                )
+                WorkflowRegistry.generate_new_workflow(
+                    registry_key=registry_key, metadata=metadata, file_path=f"{registry_key}.py"
+                )
+
+                captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                    griptape_nodes,
+                    request_file_name=registry_key,
+                    request_display_name=None,
+                    current_workflow_name=registry_key,
+                )
+
+                # Registry value wins over the typed file_name fallback.
+                assert captured == "Preserved Display Name"
+            finally:
+                stub_path.unlink(missing_ok=True)
+
+    def test_no_request_display_name_no_existing_metadata_uses_file_name_stem(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """Branch 3: fresh Save As with no registry entry — typed file_name's stem becomes the display name.
+
+        This is the case that the manual-test bug surfaced: typing "a" should
+        produce metadata.name="a" even though the macro resolves the on-disk
+        name to "a_v001". The fallback uses Path(file_name).stem so a typed
+        "episode/my_wf" yields the leaf "my_wf", not the full subdir path.
+        """
+        unsaved_key = "unsaved:branch3-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="ignored - we use request.file_name")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="episode/my_wf",
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            # Path(...).stem strips the directory and extension — "my_wf", not "episode/my_wf".
+            assert captured == "my_wf"
+
+    def test_all_sources_empty_falls_through_to_none(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 4: with no source for a display name, the chain returns None.
+
+        ``_generate_workflow_metadata_from_commands`` has its own last-resort
+        fallback (uses the resolved file_name when display_name is None);
+        verifying the chain emits None here confirms the four branches are
+        cleanly separated and the safety net engages downstream rather than
+        being short-circuited by an over-eager upstream default.
+        """
+        unsaved_key = "unsaved:branch4-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            # Unsaved workflow whose metadata.name will be used to derive raw_name
+            # (so _determine_save_target succeeds), but the fallback chain itself
+            # sees no display_name source and emits None.
+            _register_unsaved_workflow(key=unsaved_key, name="Used Only For Filename Derivation")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name=None,
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            # No request.display_name, no existing.display_name (the workflow
+            # isn't in the registry under the resolved key yet), no
+            # request.file_name → fall-through to None.
+            assert captured is None
