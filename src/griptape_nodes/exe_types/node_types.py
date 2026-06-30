@@ -1042,7 +1042,7 @@ class BaseNode(ABC):
             for item in items:
                 if isinstance(item, Iterable) and not isinstance(item, (str, bytes, dict)):
                     yield from _flatten(item)
-                elif item:
+                elif item is not None:
                     yield item
 
         raw = self.get_parameter_value(param) or []  # ← Fallback for None
@@ -1167,7 +1167,7 @@ class BaseNode(ABC):
     def validate_empty_parameter(self, param: str, additional_msg: str = "") -> Exception | None:
         param_value = self.parameter_values.get(param, None)
         node_name = self.name
-        if not param_value or param_value.isspace():
+        if param_value is None or not isinstance(param_value, str) or param_value.isspace():
             msg = str(f"Parameter \"{param}\" was left blank for node '{node_name}'. {additional_msg}").strip()
             return ValueError(msg)
         return None
