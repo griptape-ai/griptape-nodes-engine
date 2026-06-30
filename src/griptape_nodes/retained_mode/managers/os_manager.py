@@ -174,6 +174,23 @@ class FileWriteAttemptResult(NamedTuple):
     error_message: str | None
 
 
+class ExtensionAlignment(NamedTuple):
+    """Result of aligning a destination path's suffix to the sniffed byte format.
+
+    Attributes:
+        aligned_path: The path the write should target. Equal to the requested path
+            when the suffix already matches, when bytes were unrecognizable, or for
+            non-bytes content. Otherwise the requested path with its suffix replaced
+            by the sniffed extension.
+        sniffed_ext: The sniffed extension (e.g. ``"jpg"``) when a swap occurred,
+            None otherwise. Downstream code carries this forward so the indexed
+            walk and the sidecar update agree on the final extension.
+    """
+
+    aligned_path: Path
+    sniffed_ext: str | None
+
+
 @dataclass
 class CopyTreeValidationResult:
     """Result from validating copy tree paths."""
@@ -2276,44 +2293,11 @@ class OSManager:
         # globs the wrong family, returns an already-used index, writes, and the
         # rename clobbers the prior save. (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
         # Strict mode fails here before touching the disk.
-        sniffed_ext: str | None = None
-        if isinstance(request.content, bytes):
-            sniffed = GriptapeNodes.ArtifactManager().sniff_extension(request.content)
-            destination_suffix = file_path.suffix.lstrip(".").lower()
-            if sniffed is None and destination_suffix:
-                logger.warning(
-                    "Attempted to identify the format of bytes destined for '%s'. "
-                    "Could not recognize the bytes as a known file format, so the file will be written "
-                    "with its requested '.%s' extension unchanged.",
-                    file_path,
-                    destination_suffix,
-                )
-            elif (
-                sniffed is not None
-                and destination_suffix
-                and canonical_extension(destination_suffix) != canonical_extension(sniffed)
-            ):
-                if not request.coerce_extension_to_match_bytes:
-                    msg = (
-                        f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
-                        f"Failed because the requested extension '.{destination_suffix}' does not match the "
-                        f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
-                        f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
-                    )
-                    return WriteFileResultFailure(
-                        failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
-                        result_details=msg,
-                    )
-                sniffed_ext = sniffed
-                coerced_file_path = file_path.with_suffix(f".{sniffed}")
-                logger.warning(
-                    "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
-                    "adjusted to '%s' to match the byte content.",
-                    file_path,
-                    sniffed,
-                    coerced_file_path,
-                )
-                file_path = coerced_file_path
+        alignment = self._apply_extension_coercion(request, file_path)
+        if isinstance(alignment, WriteFileResultFailure):
+            return alignment
+        sniffed_ext = alignment.sniffed_ext
+        file_path = alignment.aligned_path
 
         # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
@@ -2604,6 +2588,72 @@ class OSManager:
             bytes_written=final_bytes_written,
             result_details=result_details,
         )
+
+    def _apply_extension_coercion(
+        self,
+        request: WriteFileRequest,
+        file_path: Path,
+    ) -> ExtensionAlignment | WriteFileResultFailure:
+        """Reconcile the destination suffix with the sniffed byte format.
+
+        Runs once at the top of ``on_write_file_request`` so the planner and the
+        on-disk filename agree on the extension before any scan or write begins.
+        The two relevant signals are the sniffed canonical extension and the
+        path's current suffix:
+
+        - No bytes / unrecognized bytes / empty suffix → no swap; pass the path
+          through unchanged. An unrecognized-bytes case logs a warning so callers
+          can spot it in logs.
+        - Sniffed matches the path's canonical suffix → no swap.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=True`` (default)
+          → swap to the sniffed suffix and return the new path.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` → return
+          a ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the caller
+          can early-exit before touching the disk.
+        """
+        content = request.content
+        if not isinstance(content, bytes):
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        destination_suffix = file_path.suffix.lstrip(".").lower()
+        if not destination_suffix:
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        sniffed = GriptapeNodes.ArtifactManager().sniff_extension(content)
+        if sniffed is None:
+            logger.warning(
+                "Attempted to identify the format of bytes destined for '%s'. "
+                "Could not recognize the bytes as a known file format, so the file will be written "
+                "with its requested '.%s' extension unchanged.",
+                file_path,
+                destination_suffix,
+            )
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        if canonical_extension(destination_suffix) == canonical_extension(sniffed):
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        if not request.coerce_extension_to_match_bytes:
+            msg = (
+                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
+                f"Failed because the requested extension '.{destination_suffix}' does not match the "
+                f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
+                f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
+            )
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
+                result_details=msg,
+            )
+
+        aligned_path = file_path.with_suffix(f".{sniffed}")
+        logger.warning(
+            "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
+            "adjusted to '%s' to match the byte content.",
+            file_path,
+            sniffed,
+            aligned_path,
+        )
+        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed)
 
     def _ensure_parent_directory_ready(
         self,
