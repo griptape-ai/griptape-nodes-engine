@@ -1898,7 +1898,7 @@ name: Legacy Project
         result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
-        assert "already at the latest schema major" in str(result.result_details)
+        assert "already at or beyond the latest schema major" in str(result.result_details)
 
     def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
@@ -1910,6 +1910,25 @@ name: Legacy Project
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
         assert "not loaded" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_upgrade_future_major_is_refused_not_downgraded(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # The load path forward-compat-accepts an unknown future major; the upgrade handler must
+        # NOT restamp it DOWN to the (older) latest, which would be a silent schema downgrade.
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        future_yaml = 'project_template_schema_version: "2.0.0"\nname: FromTheFuture\n'
+        project_id = await self._load(pm, tmp_path, future_yaml)
+
+        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "already at or beyond the latest schema major" in str(result.result_details)
+        # The on-disk file is untouched (no downgrade).
+        assert "2.0.0" in (tmp_path / "griptape-nodes-project.yml").read_text()
 
 
 class TestLoadSystemDefaults:

@@ -2253,11 +2253,16 @@ class ProjectManager:
 
         previous_version = project_info.template.project_template_schema_version
         latest_version = ProjectTemplate.LATEST_SCHEMA_VERSION
-        if semver.VersionInfo.parse(previous_version).major == semver.VersionInfo.parse(latest_version).major:
+        # Only upgrade STRICTLY older majors. A project already at -- or somehow ahead of (a
+        # future major opened on an older engine, which the load path accepts forward-compat)
+        # -- the latest major must not be touched: restamping it down to latest would be a
+        # silent schema DOWNGRADE re-saved against an older baseline, contradicting the
+        # never-downgrade contract in _version_to_write.
+        if semver.VersionInfo.parse(previous_version).major >= semver.VersionInfo.parse(latest_version).major:
             return UpgradeProjectSchemaResultFailure(
                 result_details=(
                     f"Attempted to upgrade project '{request.project_id}'. "
-                    f"Failed because it is already at the latest schema major "
+                    f"Failed because it is already at or beyond the latest schema major "
                     f"(version '{previous_version}', latest '{latest_version}')."
                 ),
             )
