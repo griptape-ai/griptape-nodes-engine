@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from typing import TYPE_CHECKING, ClassVar
 
+import semver
 from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml import YAML
 
@@ -133,7 +134,7 @@ class ProjectTemplate(BaseModel):
         base_dump = base.model_dump(mode="json")
 
         output: dict = {
-            "project_template_schema_version": self_dump["project_template_schema_version"],
+            "project_template_schema_version": self._version_to_write(self_dump["project_template_schema_version"]),
             "name": self_dump["name"],
         }
 
@@ -201,6 +202,22 @@ class ProjectTemplate(BaseModel):
         removed = {key: None for key in base_env if key not in self_env}
         return {**changed, **removed}
 
+    @classmethod
+    def _version_to_write(cls, loaded_version: str) -> str:
+        """Decide the schema version to stamp on save, per the version-fork policy.
+
+        Within the same major as LATEST, a save silently upgrades to LATEST (minor/patch
+        bumps are additive, so the label can advance freely). Across a major boundary the
+        loaded version is preserved verbatim: a v0 project never becomes v1 implicitly,
+        because that would adopt a new defaults baseline and could relocate the project.
+        Crossing a major is an explicit, opt-in upgrade handled elsewhere.
+        """
+        loaded_major = semver.VersionInfo.parse(loaded_version).major
+        latest_major = semver.VersionInfo.parse(cls.LATEST_SCHEMA_VERSION).major
+        if loaded_major != latest_major:
+            return loaded_version
+        return cls.LATEST_SCHEMA_VERSION
+
     def to_yaml(self) -> str:
         """Export the complete, fully-resolved project template as YAML.
 
@@ -209,7 +226,9 @@ class ProjectTemplate(BaseModel):
         (e.g., Griptape Cloud bundles) that receive the project on its own
         and have no DEFAULT_PROJECT_TEMPLATE to layer an overlay on top of.
         """
-        return self._dump_yaml(self.model_dump(mode="json", exclude_none=True))
+        data = self.model_dump(mode="json", exclude_none=True)
+        data["project_template_schema_version"] = self._version_to_write(data["project_template_schema_version"])
+        return self._dump_yaml(data)
 
     @staticmethod
     def _dump_yaml(data: dict) -> str:
