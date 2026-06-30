@@ -35,7 +35,6 @@ from griptape_nodes.exe_types.node_types import (
     NodeResolutionState,
     StartNode,
 )
-from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.files.path_utils import derive_registry_key
 from griptape_nodes.machines.dag_builder import DagBuilder
 from griptape_nodes.node_library.library_registry import Library, LibraryRegistry
@@ -95,10 +94,6 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultFailure,
     SetParameterValueResultSuccess,
 )
-from griptape_nodes.retained_mode.events.variable_events import (
-    GetVariablesRequest,
-    GetVariablesResultSuccess,
-)
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
     DeleteWorkflowResultFailure,
@@ -117,7 +112,6 @@ from griptape_nodes.retained_mode.managers.event_manager import (
     EventSuppressionContext,
     EventTranslationContext,
 )
-from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -267,8 +261,6 @@ class NodeExecutor:
                 await self.handle_loop_execution(node)
                 return
 
-            variables = self._resolve_variables_for_node(node)
-
             # Single entry point for both local and worker execution. The
             # ExecuteNodeRequest handler routes to a worker subprocess when the
             # node's library requires it, otherwise runs aprocess in-process.
@@ -277,7 +269,6 @@ class NodeExecutor:
                     node_name=node.name,
                     parameter_values=dict(node.parameter_values),
                     node_metadata=cast("NodeMetadata", dict(node.metadata)),
-                    variables=variables,
                 )
             )
             if not isinstance(result, ExecuteNodeResultSuccess):
@@ -298,29 +289,6 @@ class NodeExecutor:
                 node.parameter_output_values[name] = value
         finally:
             current_executing_node_name.reset(token)
-
-    @staticmethod
-    def _resolve_variables_for_node(node: BaseNode) -> dict[str, str | int]:
-        """Return the workflow variable dict for this node, for passing into ExecuteNodeRequest.
-
-        Workers have no registry access and cannot resolve variables themselves; the
-        orchestrator computes the dict here so it can be carried in the request and
-        pre-seed the aprocess_scope cache on whichever side actually runs the node.
-        Returns an empty dict when substitution is disabled or the node has no flow.
-        """
-        workflow_manager = GriptapeNodes.WorkflowManager()
-        if not workflow_manager.is_variable_substitution_enabled():
-            return {}
-        try:
-            flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node.name)
-        except KeyError:
-            return {}
-        result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
-        )
-        if not isinstance(result, GetVariablesResultSuccess):
-            return {}
-        return VariableResolver._filter_for_substitution(result.variables)
 
     @staticmethod
     def _format_node_failure_message(node_name: str, result: Any, exc: BaseException | None) -> str:
