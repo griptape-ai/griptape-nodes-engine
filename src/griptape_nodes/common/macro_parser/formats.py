@@ -151,6 +151,130 @@ class SlugFormat(FormatSpec):
 
 
 @dataclass
+class TitleCaseFormat(FormatSpec):
+    """Title case transformation :title."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to title case: 'hello world' → 'Hello World'."""
+        return str(value).title()
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse title case - return as-is."""
+        return value
+
+
+@dataclass
+class SnakeCaseFormat(FormatSpec):
+    """Snake case transformation :snake."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to snake_case: 'Hello World' → 'hello_world'."""
+        s = str(value)
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+        s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
+        s = re.sub(r"[\s\-]+", "_", s)
+        return s.lower()
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse snake_case - return as-is."""
+        return value
+
+
+@dataclass
+class PascalCaseFormat(FormatSpec):
+    """PascalCase transformation :pascal."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to PascalCase: 'hello world' → 'HelloWorld'."""
+        s = str(value)
+        words = re.split(r"[\s_\-]+", s)
+        return "".join(word.capitalize() for word in words if word)
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse PascalCase - return as-is."""
+        return value
+
+
+@dataclass
+class CamelCaseFormat(FormatSpec):
+    """camelCase transformation :camel."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to camelCase: 'hello world' → 'helloWorld'."""
+        s = str(value)
+        words = re.split(r"[\s_\-]+", s)
+        if not words:
+            return s
+        return words[0].lower() + "".join(word.capitalize() for word in words[1:] if word)
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse camelCase - return as-is."""
+        return value
+
+
+@dataclass
+class TrimFormat(FormatSpec):
+    """Trim whitespace transformation :trim."""
+
+    def apply(self, value: str | int) -> str:
+        """Strip leading and trailing whitespace."""
+        return str(value).strip()
+
+    def reverse(self, value: str) -> str:
+        """Cannot reverse trim - return as-is."""
+        return value
+
+
+@dataclass
+class AbbrevFormat(FormatSpec):
+    """Abbreviation transformation :abbrev."""
+
+    def apply(self, value: str | int) -> str:
+        """Take first letter of each word: 'Hello World' → 'HW'."""
+        s = str(value)
+        words = re.split(r"[\s_\-]+", s)
+        return "".join(word[0] for word in words if word)
+
+    def reverse(self, value: str) -> str:
+        """Cannot reverse abbreviation - return as-is."""
+        return value
+
+
+@dataclass
+class DotCaseFormat(FormatSpec):
+    """Dot case transformation :dot."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to dot.case: 'Hello World' → 'hello.world'."""
+        s = str(value)
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1.\2", s)
+        s = re.sub(r"([a-z\d])([A-Z])", r"\1.\2", s)
+        s = re.sub(r"[\s_\-]+", ".", s)
+        return s.lower()
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse dot.case - return as-is."""
+        return value
+
+
+@dataclass
+class ScreamingSnakeCaseFormat(FormatSpec):
+    """SCREAMING_SNAKE_CASE transformation :screaming_snake."""
+
+    def apply(self, value: str | int) -> str:
+        """Convert value to SCREAMING_SNAKE_CASE: 'hello world' → 'HELLO_WORLD'."""
+        s = str(value)
+        s = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", s)
+        s = re.sub(r"([a-z\d])([A-Z])", r"\1_\2", s)
+        s = re.sub(r"[\s\-]+", "_", s)
+        return s.upper()
+
+    def reverse(self, value: str) -> str:
+        """Cannot reliably reverse SCREAMING_SNAKE_CASE - return as-is."""
+        return value
+
+
+@dataclass
 class DateFormat(FormatSpec):
     """Date formatting like :%Y-%m-%d."""
 
@@ -176,4 +300,12 @@ FORMAT_REGISTRY: dict[str, FormatSpec] = {
     "lower": LowerCaseFormat(),
     "upper": UpperCaseFormat(),
     "slug": SlugFormat(),
+    "title": TitleCaseFormat(),
+    "snake": SnakeCaseFormat(),
+    "pascal": PascalCaseFormat(),
+    "camel": CamelCaseFormat(),
+    "trim": TrimFormat(),
+    "abbrev": AbbrevFormat(),
+    "dot": DotCaseFormat(),
+    "screaming_snake": ScreamingSnakeCaseFormat(),
 }
