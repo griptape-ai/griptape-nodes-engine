@@ -16,6 +16,7 @@ from griptape_nodes.common.macro_parser.formats import (
     LowerCaseFormat,
     NumericPaddingFormat,
     SeparatorFormat,
+    SequenceFormat,
     SlugFormat,
     UpperCaseFormat,
 )
@@ -43,6 +44,7 @@ __all__ = [
     "ParsedStaticValue",
     "ParsedVariable",
     "SeparatorFormat",
+    "SequenceFormat",
     "SlugFormat",
     "UpperCaseFormat",
     "VariableInfo",

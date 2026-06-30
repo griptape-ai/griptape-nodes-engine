@@ -143,6 +143,8 @@ fallback: save_file
 
 Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next padded index in the sequence — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work. The trailing `_v###` suffix on the previous save is stripped before the next index is computed, so the sequence stays anchored to the base name.
 
+> **Tip:** Custom projects can switch the auto-index slot to the more explicit `_v###` syntax (see [Sequence slot (`###`)](macros.md#sequence-slot--)). It behaves identically to `{_index:03}` for the default 3-digit case and overflows naturally past `999` instead of staying zero-padded.
+
 This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
 
 > **Note**: Customizing `save_workflow` to use `create_new` directly (instead of using `create_versioned_workflow` + the flag) emits a warning at save time. The configuration still works — the first save lands at `_v001` — but every subsequent save hits the in-place overwrite branch and writes back to `_v001` rather than advancing to `_v002`. Use `create_versioned_workflow` for true versioning.

@@ -109,6 +109,70 @@ class NumericPaddingFormat(FormatSpec):
 
 
 @dataclass
+class SequenceFormat(FormatSpec):
+    """Sequence-slot marker emitted by `###`-style syntax (or wider runs like `####`).
+
+    The presence of this format spec on a `ParsedVariable` means two things:
+
+    1. **The slot is system-allocated.** The CREATE_NEW write path is allowed
+       to auto-fill it with a sequence number; the `ScanSequencesRequest`
+       handler recognizes it as the variable to enumerate over. Macro authors
+       who instead write `{shot:03}` (numeric padding only, no `#` shorthand)
+       are signalling user intent to bind that variable themselves; the
+       legacy `NumericPaddingFormat`-on-lone-unresolved heuristic still
+       treats those as system-allocated for backward compatibility, but new
+       macros should use `###` to be unambiguous.
+    2. **Minimum render width is ``min_width``.** Values smaller than
+       ``10 ** min_width`` render zero-padded to ``min_width`` digits; values
+       at or above the threshold render at their natural width (``_v999``
+       → ``_v1000``, no truncation). Matches the universal `###` convention
+       (ffmpeg ``%03d``, Houdini ``$F4``, Nuke ``####``, Python ``f"{n:03}"``).
+
+    This is intentionally a separate class from `NumericPaddingFormat` even
+    though the rendering math overlaps — see issue #4902 and the design plan
+    for the reasoning.
+    """
+
+    min_width: int  # e.g., 3 for ###
+
+    def apply(self, value: str | int) -> str:
+        """Render an integer with the slot's minimum width.
+
+        Always int-normalizes the input before zero-padding, so two spellings
+        of the same number produce the same output:
+
+        - ``apply(5)`` with min_width=3 → ``"005"``
+        - ``apply("5")`` with min_width=3 → ``"005"``
+        - ``apply("0005")`` with min_width=3 → ``"005"`` (NOT ``"0005"``)
+        - ``apply(1000)`` with min_width=3 → ``"1000"`` (overflow renders natural width)
+
+        This matches ``NumericPaddingFormat.apply``'s behavior and the
+        documented "minimum width" semantics: input represents a quantity,
+        not a glyph string.
+        """
+        if not isinstance(value, int):
+            if not str(value).isdigit():
+                msg = f"Sequence format with min_width={self.min_width} cannot be applied to non-numeric value: {value}"
+                raise MacroResolutionError(
+                    msg,
+                    failure_reason=MacroResolutionFailureReason.NUMERIC_PADDING_ON_NON_NUMERIC,
+                )
+            value = int(value)
+        return f"{value:0{self.min_width}d}"
+
+    def reverse(self, value: str) -> int:
+        """Reverse a rendered sequence value back to an integer: "005" → 5."""
+        try:
+            return int(value)
+        except ValueError as e:
+            msg = f"Cannot parse '{value}' as integer"
+            raise MacroResolutionError(
+                msg,
+                failure_reason=MacroResolutionFailureReason.INVALID_INTEGER_PARSE,
+            ) from e
+
+
+@dataclass
 class LowerCaseFormat(FormatSpec):
     """Lowercase transformation :lower."""
 

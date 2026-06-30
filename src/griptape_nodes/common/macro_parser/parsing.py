@@ -11,6 +11,7 @@ from griptape_nodes.common.macro_parser.formats import (
     FormatSpec,
     NumericPaddingFormat,
     SeparatorFormat,
+    SequenceFormat,
 )
 from griptape_nodes.common.macro_parser.segments import (
     ParsedSegment,
@@ -19,9 +20,29 @@ from griptape_nodes.common.macro_parser.segments import (
     VariableInfo,
 )
 
+# Canonical name for the variable emitted by `###`-style sequence slots.
+# Matches the legacy `{_index:NN}` convention so downstream code (OSManager
+# seed/walk, reverse-match against existing files) doesn't need a separate
+# code path for the new syntax.
+SEQUENCE_VARIABLE_NAME = "_index"
+
 
 def parse_segments(template: str) -> list[ParsedSegment]:
     """Parse template into alternating static/variable segments.
+
+    Recognizes two kinds of variable syntax:
+
+    1. ``{name}`` / ``{name:format}`` / ``{name?:format}`` — explicit
+       variable references parsed by ``parse_variable``.
+    2. ``###`` (or ``#``, ``####``, ``#####``...) — sequence-slot shorthand.
+       A run of ``N`` hash characters in static text desugars to a
+       ``ParsedVariable`` with name ``SEQUENCE_VARIABLE_NAME`` and a single
+       ``SequenceFormat(min_width=N)`` spec. See issue #4902.
+
+    A macro may contain at most one sequence-slot shorthand. If two `#`
+    runs are present the parser raises ``MacroSyntaxError`` — the writer
+    likely meant to bind one as a user-supplied integer; OSManager won't
+    know which to auto-allocate.
 
     Args:
         template: Template string to parse
@@ -34,6 +55,9 @@ def parse_segments(template: str) -> list[ParsedSegment]:
     """
     segments: list[ParsedSegment] = []
     current_pos = 0
+    # Mutable single-element counter passed to _split_static_text_with_sequence_slots
+    # so the "one sequence slot per macro" rule is enforced across all invocations.
+    sequence_slot_count: list[int] = [0]
 
     while current_pos < len(template):
         # Find next opening brace
@@ -41,33 +65,14 @@ def parse_segments(template: str) -> list[ParsedSegment]:
 
         if brace_start == -1:
             # No more variables, rest is static text
-            static_text = template[current_pos:]
-            if static_text:
-                # Check for unmatched closing braces in remaining text
-                if "}" in static_text:
-                    closing_pos = current_pos + static_text.index("}")
-                    msg = f"Unmatched closing brace at position {closing_pos}"
-                    raise MacroSyntaxError(
-                        msg,
-                        failure_reason=MacroParseFailureReason.UNMATCHED_CLOSING_BRACE,
-                        error_position=closing_pos,
-                    )
-                segments.append(ParsedStaticValue(text=static_text))
+            _split_static_text_with_sequence_slots(template[current_pos:], current_pos, segments, sequence_slot_count)
             break
 
-        # Add static text before the brace (if any)
+        # Add static text before the brace (if any), splitting around `#` runs.
         if brace_start > current_pos:
-            static_text = template[current_pos:brace_start]
-            # Check for unmatched closing braces in static text
-            if "}" in static_text:
-                closing_pos = current_pos + static_text.index("}")
-                msg = f"Unmatched closing brace at position {closing_pos}"
-                raise MacroSyntaxError(
-                    msg,
-                    failure_reason=MacroParseFailureReason.UNMATCHED_CLOSING_BRACE,
-                    error_position=closing_pos,
-                )
-            segments.append(ParsedStaticValue(text=static_text))
+            _split_static_text_with_sequence_slots(
+                template[current_pos:brace_start], current_pos, segments, sequence_slot_count
+            )
 
         # Find matching closing brace
         brace_end = template.find("}", brace_start)
@@ -210,3 +215,73 @@ def parse_format_spec(format_text: str) -> FormatSpec:
 
     # Otherwise, treat as separator (unquoted text that doesn't match any format)
     return SeparatorFormat(separator=format_text)
+
+
+def _split_static_text_with_sequence_slots(
+    static_text: str,
+    base_pos: int,
+    segments: list[ParsedSegment],
+    sequence_slot_count: list[int],
+) -> None:
+    """Append ``static_text`` to ``segments``, splitting around any sequence-slot `#` runs.
+
+    Each contiguous run of one or more `#` characters becomes a synthesized
+    ``ParsedVariable`` (sequence slot); text on either side stays as
+    ``ParsedStaticValue``. ``base_pos`` is the offset of ``static_text[0]``
+    in the original template, used for error reporting.
+
+    ``sequence_slot_count`` is a single-element list used as a mutable
+    counter — passed by reference so this helper can enforce the
+    "at most one sequence-slot per macro" rule across multiple invocations
+    from ``parse_segments``.
+
+    Raises:
+        MacroSyntaxError: For unmatched ``}`` in static text, or when this
+        invocation would push the sequence-slot count above 1.
+    """
+    if not static_text:
+        return
+    # Reject unmatched `}` in static text — same rule as the brace-finding pass.
+    if "}" in static_text:
+        closing_pos = base_pos + static_text.index("}")
+        msg = f"Unmatched closing brace at position {closing_pos}"
+        raise MacroSyntaxError(
+            msg,
+            failure_reason=MacroParseFailureReason.UNMATCHED_CLOSING_BRACE,
+            error_position=closing_pos,
+        )
+    # Walk the text, emitting static spans between `#` runs and a
+    # synthesized ParsedVariable for each run.
+    idx = 0
+    while idx < len(static_text):
+        hash_match = re.search(r"#+", static_text[idx:])
+        if hash_match is None:
+            trailing = static_text[idx:]
+            if trailing:
+                segments.append(ParsedStaticValue(text=trailing))
+            return
+        run_start = idx + hash_match.start()
+        run_end = idx + hash_match.end()
+        if run_start > idx:
+            segments.append(ParsedStaticValue(text=static_text[idx:run_start]))
+        sequence_slot_count[0] += 1
+        if sequence_slot_count[0] > 1:
+            msg = (
+                f"More than one sequence-slot shorthand (`#`-run) in macro template; "
+                f"only one is allowed (position {base_pos + run_start})"
+            )
+            raise MacroSyntaxError(
+                msg,
+                failure_reason=MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS,
+                error_position=base_pos + run_start,
+            )
+        # Synthesize the sequence-slot variable. Name + required flag mirror
+        # the legacy `{_index:NN}` convention so downstream code stays unified.
+        segments.append(
+            ParsedVariable(
+                info=VariableInfo(name=SEQUENCE_VARIABLE_NAME, is_required=True),
+                format_specs=[SequenceFormat(min_width=run_end - run_start)],
+                default_value=None,
+            )
+        )
+        idx = run_end
