@@ -17,6 +17,7 @@ here.
 
 from __future__ import annotations
 
+import contextlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -24,6 +25,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
@@ -35,7 +37,10 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.object_events import (
+    ClearAllObjectStateRequest,
+    ClearAllObjectStateResultSuccess,
+)
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -92,16 +97,22 @@ def _clean_engine_state() -> Iterator[None]:
 
     This test mutates global GriptapeNodes state (the object registry and the workflow context
     stack) directly instead of in a subprocess, so it clears object state before running and
-    tears down the workflow context plus object state afterwards. Without this teardown the
-    pushed workflow context and registered objects would leak into sibling tests sharing the
-    same pytest-xdist worker.
+    tears down object state plus the registered fixture library afterwards. Without this
+    teardown the registered objects/library would leak into sibling tests sharing the same
+    pytest-xdist worker.
     """
     GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     yield
-    context_manager = GriptapeNodes.ContextManager()
-    while context_manager.has_current_workflow():
-        context_manager.pop_workflow()
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    # ClearAllObjectStateRequest drains the workflow context stack and deletes its flows/nodes in
+    # one step; popping the workflow first would leave has_current_workflow() False and skip that
+    # deletion, so the clear must run against the still-active context.
+    clear_result = GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    assert isinstance(clear_result, ClearAllObjectStateResultSuccess), clear_result
+    # ClearAllObjectStateRequest does not touch the LibraryRegistry, so drop the fixture library
+    # explicitly to avoid a dangling entry pointing at a deleted tmp_path directory. The library
+    # is absent if the test failed before registering it.
+    with contextlib.suppress(KeyError):
+        LibraryRegistry.unregister_library(LIBRARY_NAME)
 
 
 @pytest.mark.skipif(

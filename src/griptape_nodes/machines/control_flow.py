@@ -325,9 +325,11 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
         PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 adds data
-        sink (terminal/leaf) nodes: a sink reachable from a graph's forward control path is
-        registered as a control-gated candidate (so branches stay gated), while a sink that is
-        only data-connected gets its own graph so its dependencies resolve unconditionally.
+        sink (terminal/leaf) nodes. A sink that is only data-connected gets its own graph so its
+        dependencies resolve unconditionally; a sink reachable from a graph's forward control
+        path is instead registered as a control-gated candidate so branches stay gated. The
+        current classifier only routes control-disconnected nodes into data_sink_nodes, so the
+        gated branch is a defensive fallback and the data-connected case is what runs in practice.
         """
         start_nodes = [start_node]
 
