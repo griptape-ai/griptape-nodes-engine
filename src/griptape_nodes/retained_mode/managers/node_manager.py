@@ -17,7 +17,7 @@ from griptape_nodes.common.strict_mode import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
 
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
@@ -305,6 +305,14 @@ class NodeManager:
 
     def __init__(self, event_manager: EventManager) -> None:
         self._name_to_parent_flow_name = {}
+
+        # Stack of active node-name remap recorders. While a recorder is on the stack
+        # (see record_node_name_remaps), every node created records its requested ->
+        # assigned name into the top recorder. Referenced-subflow imports use this to
+        # learn which nodes were auto-renamed on a name collision (e.g. a second imported
+        # subflow whose 'Start Flow' became 'Start Flow_1') so they can still route
+        # inputs/outputs by the original name from the workflow shape.
+        self._node_name_remap_recorders: list[dict[str, str]] = []
 
         # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
         # for ExecuteNodeRequests currently routed to a worker. Populated in
@@ -667,6 +675,27 @@ class NodeManager:
                 denials[node.class_name] = denial
         return denials
 
+    @contextlib.contextmanager
+    def record_node_name_remaps(self) -> Iterator[dict[str, str]]:
+        """Record requested -> assigned node names for nodes created within this scope.
+
+        Node names are globally unique, so a requested name that collides with an existing
+        object is auto-renamed (``generate_name_for_object`` appends ``_1``, ``_2``, ...).
+        Callers that need to correlate the names they asked for with the names that were
+        actually assigned (notably referenced-subflow imports, where the same workflow can
+        be imported alongside another that shares ``Start Flow`` / ``End Flow`` node names)
+        wrap the work in this context manager and read the yielded mapping afterwards.
+
+        Only the innermost recorder receives each node, so nested imports keep their
+        mappings separate.
+        """
+        recorder: dict[str, str] = {}
+        self._node_name_remap_recorders.append(recorder)
+        try:
+            yield recorder
+        finally:
+            self._node_name_remap_recorders.pop()
+
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
@@ -785,6 +814,12 @@ class NodeManager:
         # Record keeping.
         obj_mgr.add_object_by_name(node.name, node)
         self._name_to_parent_flow_name[node.name] = parent_flow_name
+
+        # If a scoped operation is recording node-name remaps (e.g. a referenced-subflow
+        # import), capture the requested -> assigned mapping so it can translate names that
+        # collided and were auto-renamed.
+        if self._node_name_remap_recorders and request.node_name is not None:
+            self._node_name_remap_recorders[-1][request.node_name] = node.name
 
         # We don't want to start in a resolving state, bump it back to unresolved.
         state = request.resolution

@@ -890,3 +890,101 @@ class TestNodeInstantiationAuthorizationCheckpoint:
                 )
             ],
         )
+
+
+class TestNodeNameRemapRecorder:
+    """record_node_name_remaps captures requested -> assigned node names, including auto-renames.
+
+    Globally unique node names mean a requested name that collides with an existing object is
+    auto-renamed (e.g. 'Start Flow' -> 'Start Flow_1'). Referenced-subflow imports rely on this
+    recorder to learn that mapping so they can still route inputs/outputs by the original name.
+    """
+
+    _LIBRARY_NAME = "node-remap-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_probe(self) -> None:
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t", description="d", library_version="1.0.0", engine_version="1.0.0", tags=[]
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(_GateProbe, NodeMetadata(category="t", description="d", display_name="Probe"))
+
+    def test_records_requested_to_assigned_name_on_collision(self, griptape_nodes: GriptapeNodes) -> None:
+        """A name collision inside the recorder scope is captured as requested -> renamed."""
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        self._register_probe()
+        griptape_nodes.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="remap_workflow", flow_name="remap_flow")
+        )
+
+        first = griptape_nodes.handle_request(
+            CreateNodeRequest(
+                node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME, node_name="Start Flow"
+            )
+        )
+        assert isinstance(first, CreateNodeResultSuccess)
+        assert first.node_name == "Start Flow"
+
+        node_manager = griptape_nodes.NodeManager()
+        with node_manager.record_node_name_remaps() as remap:
+            second = griptape_nodes.handle_request(
+                CreateNodeRequest(
+                    node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME, node_name="Start Flow"
+                )
+            )
+
+        assert isinstance(second, CreateNodeResultSuccess)
+        assert second.node_name == "Start Flow_1"
+        assert remap == {"Start Flow": "Start Flow_1"}
+        # The recorder is popped on context exit.
+        assert node_manager._node_name_remap_recorders == []
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    def test_no_recording_outside_scope(self, griptape_nodes: GriptapeNodes) -> None:
+        """Nodes created outside any recorder scope are not captured (stack stays empty)."""
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        self._register_probe()
+        griptape_nodes.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="remap_workflow_2", flow_name="remap_flow_2")
+        )
+
+        node_manager = griptape_nodes.NodeManager()
+        result = griptape_nodes.handle_request(
+            CreateNodeRequest(
+                node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME, node_name="Lonely Node"
+            )
+        )
+        assert isinstance(result, CreateNodeResultSuccess)
+        assert node_manager._node_name_remap_recorders == []
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))

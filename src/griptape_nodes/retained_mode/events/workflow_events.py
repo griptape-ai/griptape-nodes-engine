@@ -1,5 +1,5 @@
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Literal
@@ -20,6 +20,11 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 if TYPE_CHECKING:
     # Circular import: flow_events <-> workflow_events
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+
+# Key under which a referenced sub-flow's requested -> assigned node-name map is stored on
+# the created flow's metadata. Lets consumers that did not trigger the import (e.g. a node
+# restored during deserialization) translate workflow-shape node names to the live names.
+REFERENCED_SUBFLOW_NODE_NAME_MAP_METADATA_KEY = "referenced_subflow_node_name_map"
 
 
 @dataclass
@@ -346,9 +351,18 @@ class ImportWorkflowAsReferencedSubFlowResultSuccess(WorkflowAlteredMixin, Resul
 
     Args:
         created_flow_name: Name of the created sub-flow
+        node_name_map: Mapping of each node's requested name to the name actually assigned
+            inside the imported sub-flow. Node names are globally unique, so a node whose
+            name collided with an existing object was auto-renamed (e.g. ``Start Flow`` ->
+            ``Start Flow_1``). Consumers that address nodes by the names recorded in the
+            workflow shape must translate through this map. The same mapping is stamped onto
+            the created flow's metadata under
+            ``REFERENCED_SUBFLOW_NODE_NAME_MAP_METADATA_KEY`` so consumers that did not
+            trigger the import (e.g. a node restored during deserialization) can still read it.
     """
 
     created_flow_name: str
+    node_name_map: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

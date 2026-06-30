@@ -84,6 +84,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetSituationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
+    REFERENCED_SUBFLOW_NODE_NAME_MAP_METADATA_KEY,
     BranchWorkflowRequest,
     BranchWorkflowResultFailure,
     BranchWorkflowResultSuccess,
@@ -5320,7 +5321,11 @@ class WorkflowManager:
         # Execute the workflow within the target flow context.
         # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
         # serializes as an import command. When False, the flow serializes as inline content.
-        with GriptapeNodes.ContextManager().flow(flow_name):
+        # Record node-name remaps during the run so the consumer can tell which nodes were
+        # auto-renamed on a collision (e.g. importing two workflows that both define a
+        # 'Start Flow') and still route inputs/outputs by the workflow-shape node names.
+        node_manager = GriptapeNodes.NodeManager()
+        with node_manager.record_node_name_remaps() as node_name_map, GriptapeNodes.ContextManager().flow(flow_name):
             if request.track_as_referenced:
                 with self.ReferencedWorkflowContext(self, request.workflow_name):
                     workflow_result = await self.run_workflow(workflow_file_path)
@@ -5366,11 +5371,19 @@ class WorkflowManager:
                 "Applied imported flow metadata to '%s': %s", created_flow_name, request.imported_flow_metadata
             )
 
+        # Persist the requested -> assigned node-name map on the created flow so consumers
+        # that did not trigger this import (e.g. a Subflow Workflow Node restored during
+        # deserialization) can translate workflow-shape node names to the live node names.
+        if node_name_map:
+            created_flow = obj_manager.attempt_get_object_by_name_as_type(created_flow_name, ControlFlow)
+            if created_flow is not None:
+                created_flow.metadata[REFERENCED_SUBFLOW_NODE_NAME_MAP_METADATA_KEY] = dict(node_name_map)
+
         details = (
             f"Successfully imported workflow '{request.workflow_name}' as referenced sub flow '{created_flow_name}'"
         )
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
-            created_flow_name=created_flow_name, result_details=details
+            created_flow_name=created_flow_name, node_name_map=dict(node_name_map), result_details=details
         )
 
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
