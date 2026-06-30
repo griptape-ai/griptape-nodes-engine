@@ -11,7 +11,7 @@ from griptape_nodes.common.macro_parser.segments import ParsedVariable
 # Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
 _NO_FLOW: object = object()
 
-# Caches get_variables_for_macro_resolution() result for the duration of one aprocess() call.
+# Caches the resolved variable dict for the duration of one aprocess() call.
 # None = not yet computed; _NO_FLOW = computed but node has no parent flow; dict = resolved vars.
 # Reset and optionally pre-seeded by aprocess_scope() via VariableResolver.seed_cache().
 _aprocess_variable_cache: ContextVar[dict | object | None] = ContextVar(
