@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+import semver
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
@@ -105,6 +106,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     UnregisterProjectTemplateRequest,
     UnregisterProjectTemplateResultFailure,
     UnregisterProjectTemplateResultSuccess,
+    UpgradeProjectSchemaRequest,
+    UpgradeProjectSchemaResultFailure,
+    UpgradeProjectSchemaResultSuccess,
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
@@ -488,6 +492,9 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(SetCurrentProjectRequest, self.on_set_current_project_request)
         event_manager.assign_manager_to_request_type(GetCurrentProjectRequest, self.on_get_current_project_request)
         event_manager.assign_manager_to_request_type(SaveProjectTemplateRequest, self.on_save_project_template_request)
+        event_manager.assign_manager_to_request_type(
+            UpgradeProjectSchemaRequest, self.on_upgrade_project_schema_request
+        )
         event_manager.assign_manager_to_request_type(
             AttemptMatchPathAgainstMacroRequest, self.on_match_path_against_macro_request
         )
@@ -2213,6 +2220,75 @@ class ProjectManager:
 
         return SaveProjectTemplateResultSuccess(
             result_details=f"Successfully saved project template to '{request.project_path}'",
+        )
+
+    def on_upgrade_project_schema_request(
+        self, request: UpgradeProjectSchemaRequest
+    ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
+        """Electively upgrade a loaded project to the latest schema major and re-save.
+
+        A within-major advance happens automatically on save; this performs the explicit,
+        opt-in crossing of a major boundary. It restamps the project's schema version to the
+        latest and delegates to the normal save path, so the re-diff happens against the
+        new-major default baseline and the file adopts the new-major defaults. BREAKING: it
+        does not migrate values to preserve prior behavior.
+
+        Failure cases (evaluated first): the project is not loaded, has no backing file, or is
+        already at the latest major. Only then is the upgrade performed.
+        """
+        project_info = self._successfully_loaded_project_templates.get(request.project_id)
+        if project_info is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. Failed because it is not loaded."
+                ),
+            )
+        if project_info.project_file_path is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because it has no backing file (e.g. system defaults)."
+                ),
+            )
+
+        previous_version = project_info.template.project_template_schema_version
+        latest_version = ProjectTemplate.LATEST_SCHEMA_VERSION
+        if semver.VersionInfo.parse(previous_version).major == semver.VersionInfo.parse(latest_version).major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because it is already at the latest schema major "
+                    f"(version '{previous_version}', latest '{latest_version}')."
+                ),
+            )
+
+        # Restamp to the latest version and re-save through the normal path, which re-diffs
+        # against the new-major default baseline (default_template_for_version) and writes.
+        template_data = project_info.template.model_dump(mode="json")
+        template_data["project_template_schema_version"] = latest_version
+        save_result = self.on_save_project_template_request(
+            SaveProjectTemplateRequest(
+                project_path=project_info.project_file_path,
+                template_data=template_data,
+            )
+        )
+        if isinstance(save_result, SaveProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the re-save failed: {save_result.result_details}"
+                ),
+            )
+
+        return UpgradeProjectSchemaResultSuccess(
+            project_id=request.project_id,
+            previous_schema_version=previous_version,
+            new_schema_version=latest_version,
+            result_details=(
+                f"Upgraded project '{request.project_id}' from schema '{previous_version}' "
+                f"to '{latest_version}'. The project now uses the new-major defaults; its "
+                f"effective workspace/library/file layout may have changed."
+            ),
         )
 
     def on_validate_project_template_request(

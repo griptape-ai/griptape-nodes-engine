@@ -1825,6 +1825,93 @@ name: Modern Project
         assert "{file_extension_directory" in template.situations["save_node_output"].macro
 
 
+class TestUpgradeProjectSchema:
+    """Elective v0 -> v1 schema upgrade: restamp to latest major and re-save."""
+
+    V0_PROJECT_YAML = """\
+project_template_schema_version: "0.5.1"
+name: Legacy Project
+"""
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = {}
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    async def _load(self, pm: ProjectManager, tmp_path: Path, yaml_text: str) -> str:
+        """Load a project from disk and return its registry id."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        project_path = tmp_path / "griptape-nodes-project.yml"
+        project_path.write_text(yaml_text)
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=yaml_text)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        return next(
+            pid
+            for pid, info in pm._successfully_loaded_project_templates.items()
+            if info.project_file_path == canonicalize_for_identity(project_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_upgrade_v0_to_latest_writes_new_major(self, pm: ProjectManager, tmp_path: Path) -> None:
+        from griptape_nodes.common.project_templates import ProjectTemplate
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultSuccess,
+        )
+
+        project_id = await self._load(pm, tmp_path, self.V0_PROJECT_YAML)
+
+        written: dict[str, str] = {}
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.write_text = lambda content: written.update(yaml=content)
+            mock_file_cls.return_value = mock_file_instance
+            result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultSuccess)
+        assert result.previous_schema_version == "0.5.1"
+        assert result.new_schema_version == ProjectTemplate.LATEST_SCHEMA_VERSION
+        # The re-saved file carries the new major version.
+        assert f'"project_template_schema_version": "{ProjectTemplate.LATEST_SCHEMA_VERSION}"' in written["yaml"]
+
+    @pytest.mark.asyncio
+    async def test_upgrade_already_latest_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
+        from griptape_nodes.common.project_templates import ProjectTemplate
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        latest_yaml = f'project_template_schema_version: "{ProjectTemplate.LATEST_SCHEMA_VERSION}"\nname: Modern\n'
+        project_id = await self._load(pm, tmp_path, latest_yaml)
+
+        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "already at the latest schema major" in str(result.result_details)
+
+    def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id="not-loaded"))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "not loaded" in str(result.result_details)
+
+
 class TestLoadSystemDefaults:
     """Test _load_system_defaults uses resolved workspace path for project_base_dir."""
 
