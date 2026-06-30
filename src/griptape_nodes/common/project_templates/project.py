@@ -206,17 +206,24 @@ class ProjectTemplate(BaseModel):
     def _version_to_write(cls, loaded_version: str) -> str:
         """Decide the schema version to stamp on save, per the version-fork policy.
 
-        Within the same major as LATEST, a save silently upgrades to LATEST (minor/patch
-        bumps are additive, so the label can advance freely). Across a major boundary the
-        loaded version is preserved verbatim: a v0 project never becomes v1 implicitly,
-        because that would adopt a new defaults baseline and could relocate the project.
-        Crossing a major is an explicit, opt-in upgrade handled elsewhere.
+        A save advances the version to the latest within the SAME major (minor/patch bumps
+        are additive, so the label can roll forward freely), but never crosses a major: a v0
+        project rolls up to the latest 0.x, never to 1.x, because the next major carries a
+        different defaults baseline that could relocate the project. Crossing a major is an
+        explicit, opt-in upgrade handled elsewhere. The bump is one-directional: a version
+        already at or beyond the latest-for-its-major is left untouched (never downgraded).
         """
-        loaded_major = semver.VersionInfo.parse(loaded_version).major
-        latest_major = semver.VersionInfo.parse(cls.LATEST_SCHEMA_VERSION).major
-        if loaded_major != latest_major:
+        # Lazy import: default_project_template imports ProjectTemplate, so importing it at
+        # module scope here is a circular dependency. The per-major latest lives there because
+        # it is the version each per-major default template declares.
+        from griptape_nodes.common.project_templates.default_project_template import latest_version_for_major
+
+        latest_in_major = latest_version_for_major(loaded_version)
+        if latest_in_major is None:
             return loaded_version
-        return cls.LATEST_SCHEMA_VERSION
+        if semver.VersionInfo.parse(latest_in_major) > semver.VersionInfo.parse(loaded_version):
+            return latest_in_major
+        return loaded_version
 
     def to_yaml(self) -> str:
         """Export the complete, fully-resolved project template as YAML.

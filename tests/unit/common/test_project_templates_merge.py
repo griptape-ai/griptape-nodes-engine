@@ -1,7 +1,5 @@
 """Tests for project template layering and merge functionality."""
 
-import pytest
-
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
     DEFAULT_PROJECT_TEMPLATE_V0,
@@ -1272,42 +1270,47 @@ workspace_dir: 42
 
 
 class TestSchemaVersionSavePolicy:
-    """Version stamped on save: auto-upgrade within a major, preserve across a major.
+    """Version stamped on save: roll forward to the latest WITHIN a major, never cross one.
 
-    Within the same major as LATEST, a save advances the version to LATEST (minor/patch
-    bumps are additive). Across a major boundary the loaded version is preserved verbatim,
-    so a v0 project never silently becomes v1 (which would adopt a new defaults baseline).
-    LATEST is pinned via monkeypatch so the policy is tested independently of its current
-    value.
+    A save advances the version to the latest known version in its own major (additive
+    minor/patch bumps), but never crosses to the next major (which carries a different
+    defaults baseline). The bump is one-directional. Tested against the real registered
+    majors: v0 latest is DEFAULT_PROJECT_TEMPLATE_V0's version, v1 latest is V1's.
     """
+
+    V0_LATEST = DEFAULT_PROJECT_TEMPLATE_V0.project_template_schema_version
+    V1_LATEST = DEFAULT_PROJECT_TEMPLATE_V1.project_template_schema_version
 
     def _template(self, version: str) -> ProjectTemplate:
         return DEFAULT_PROJECT_TEMPLATE.model_copy(update={"project_template_schema_version": version})
 
-    def test_within_major_upgrades_to_latest_on_overlay(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
-        overlay_yaml = self._template("1.1.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
-        assert '"project_template_schema_version": "1.4.0"' in overlay_yaml
+    def test_old_v0_rolls_forward_to_latest_v0_on_overlay(self) -> None:
+        overlay_yaml = self._template("0.3.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in overlay_yaml
 
-    def test_across_major_preserves_loaded_on_overlay(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
-        overlay_yaml = self._template("0.5.2").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
-        assert '"project_template_schema_version": "0.5.2"' in overlay_yaml
+    def test_v0_never_crosses_to_v1_on_overlay(self) -> None:
+        # A v0 project rolls up only within major 0; it must not become 1.x.
+        overlay_yaml = self._template("0.3.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V1_LATEST}"' not in overlay_yaml
 
-    def test_already_latest_is_unchanged_on_overlay(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
-        overlay_yaml = self._template("1.4.0").to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
-        assert '"project_template_schema_version": "1.4.0"' in overlay_yaml
+    def test_latest_v0_is_unchanged_on_overlay(self) -> None:
+        overlay_yaml = self._template(self.V0_LATEST).to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE_V0)
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in overlay_yaml
 
-    def test_within_major_upgrades_to_latest_on_full_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
-        yaml_str = self._template("1.0.0").to_yaml()
-        assert '"project_template_schema_version": "1.4.0"' in yaml_str
+    def test_old_v0_rolls_forward_on_full_yaml(self) -> None:
+        yaml_str = self._template("0.1.0").to_yaml()
+        assert f'"project_template_schema_version": "{self.V0_LATEST}"' in yaml_str
 
-    def test_across_major_preserves_loaded_on_full_yaml(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
-        yaml_str = self._template("0.5.2").to_yaml()
-        assert '"project_template_schema_version": "0.5.2"' in yaml_str
+    def test_latest_v1_is_unchanged_on_full_yaml(self) -> None:
+        yaml_str = self._template(self.V1_LATEST).to_yaml()
+        assert f'"project_template_schema_version": "{self.V1_LATEST}"' in yaml_str
+
+    def test_never_downgrades_a_newer_in_major_version(self) -> None:
+        # A version already beyond the registered latest-for-its-major is left untouched.
+        assert ProjectTemplate._version_to_write("0.99.0") == "0.99.0"
+
+    def test_unknown_major_is_preserved(self) -> None:
+        assert ProjectTemplate._version_to_write("9.9.9") == "9.9.9"
 
 
 class TestDefaultTemplateByMajor:

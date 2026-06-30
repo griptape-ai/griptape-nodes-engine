@@ -452,3 +452,18 @@ def default_template_for_version(version: str) -> ProjectTemplate:
     """
     major = semver.VersionInfo.parse(version).major
     return _DEFAULT_TEMPLATE_BY_MAJOR.get(major, DEFAULT_PROJECT_TEMPLATE)
+
+
+def latest_version_for_major(version: str) -> str | None:
+    """Return the latest known schema version within a version's major, or None if unknown.
+
+    Each per-major default template carries the latest version for its major (e.g. the v0
+    default is pinned at the newest 0.x). The save policy targets this so a v0 project rolls
+    forward to the latest 0.x on save (an additive within-major upgrade) without ever crossing
+    to the next major. None for a major with no registered default (no in-major target exists).
+    """
+    major = semver.VersionInfo.parse(version).major
+    template = _DEFAULT_TEMPLATE_BY_MAJOR.get(major)
+    if template is None:
+        return None
+    return template.project_template_schema_version
