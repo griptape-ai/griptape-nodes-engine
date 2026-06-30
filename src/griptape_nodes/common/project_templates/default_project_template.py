@@ -442,15 +442,31 @@ _DEFAULT_TEMPLATE_BY_MAJOR: dict[int, ProjectTemplate] = {
 DEFAULT_PROJECT_TEMPLATE = DEFAULT_PROJECT_TEMPLATE_V1
 
 
+def _major_or_none(version: str) -> int | None:
+    """Parse a schema version's major, or None when the version is not valid semver.
+
+    Project version strings are user-controlled (read verbatim from project.yml). Callers on
+    the load path must not raise on a malformed value -- before the per-major fork existed, a
+    bad version was never parsed and the project still loaded against the single default. None
+    lets callers fall back to the latest default rather than crashing the load.
+    """
+    try:
+        return semver.VersionInfo.parse(version).major
+    except ValueError:
+        return None
+
+
 def default_template_for_version(version: str) -> ProjectTemplate:
     """Return the default (merge-base) ProjectTemplate matching a schema version's major.
 
     A project merges onto the default for its own major so a breaking defaults change can
-    land under a new major without moving existing projects. An unknown major falls back to
-    the latest default (forward-compat: a project declaring a not-yet-known major still loads
-    against the newest baseline rather than failing).
+    land under a new major without moving existing projects. An unknown major OR a malformed
+    version falls back to the latest default (forward-compat: a project declaring a not-yet-known
+    or unparsable version still loads against the newest baseline rather than failing).
     """
-    major = semver.VersionInfo.parse(version).major
+    major = _major_or_none(version)
+    if major is None:
+        return DEFAULT_PROJECT_TEMPLATE
     return _DEFAULT_TEMPLATE_BY_MAJOR.get(major, DEFAULT_PROJECT_TEMPLATE)
 
 
@@ -460,9 +476,12 @@ def latest_version_for_major(version: str) -> str | None:
     Each per-major default template carries the latest version for its major (e.g. the v0
     default is pinned at the newest 0.x). The save policy targets this so a v0 project rolls
     forward to the latest 0.x on save (an additive within-major upgrade) without ever crossing
-    to the next major. None for a major with no registered default (no in-major target exists).
+    to the next major. None for a major with no registered default, or a malformed version (no
+    in-major target exists, so the caller leaves the version untouched).
     """
-    major = semver.VersionInfo.parse(version).major
+    major = _major_or_none(version)
+    if major is None:
+        return None
     template = _DEFAULT_TEMPLATE_BY_MAJOR.get(major)
     if template is None:
         return None

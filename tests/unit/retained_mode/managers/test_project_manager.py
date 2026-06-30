@@ -1824,6 +1824,19 @@ name: Modern Project
         assert template.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
         assert "{file_extension_directory" in template.situations["save_node_output"].macro
 
+    @pytest.mark.asyncio
+    async def test_malformed_version_loads_against_latest_without_crashing(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        # Version strings are user-controlled. The per-major merge-base selection must not raise
+        # on a non-semver value (it would crash the load / boot); it falls back to the latest
+        # default instead.
+        template = await self._load_yaml(
+            pm, tmp_path, 'project_template_schema_version: "not-a-version"\nname: Garbage\n'
+        )
+        # Fell back to the latest (v1) baseline rather than raising.
+        assert template.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+
 
 class TestUpgradeProjectSchema:
     """Elective v0 -> v1 schema upgrade: restamp to latest major and re-save."""

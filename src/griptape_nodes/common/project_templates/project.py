@@ -221,7 +221,14 @@ class ProjectTemplate(BaseModel):
         latest_in_major = latest_version_for_major(loaded_version)
         if latest_in_major is None:
             return loaded_version
-        if semver.VersionInfo.parse(latest_in_major) > semver.VersionInfo.parse(loaded_version):
+        # latest_in_major came from a registered template (always valid semver); guard the
+        # comparison so a loaded version that is not full semver is left untouched rather than
+        # raising on the save path (the version is user-controlled).
+        try:
+            loaded_is_behind = semver.VersionInfo.parse(latest_in_major) > semver.VersionInfo.parse(loaded_version)
+        except ValueError:
+            return loaded_version
+        if loaded_is_behind:
             return latest_in_major
         return loaded_version
 
