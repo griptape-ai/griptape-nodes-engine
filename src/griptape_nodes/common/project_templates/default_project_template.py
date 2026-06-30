@@ -17,7 +17,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifa
 
 # Default project template matching the values from project_template.yml
 DEFAULT_PROJECT_TEMPLATE = ProjectTemplate(
-    project_template_schema_version="0.5.0",
+    project_template_schema_version="0.5.1",
     name="Default Project",
     description="System default configuration",
     directories={
