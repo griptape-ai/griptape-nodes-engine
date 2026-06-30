@@ -702,7 +702,7 @@ class TestExtensionCoercion:
         assert Path(result.final_file_path) == coerced_path
         assert coerced_path.exists()
         assert not requested_path.exists()
-        assert any("Coerced file extension" in r.message for r in caplog.records)
+        assert any("destination has been adjusted" in r.message for r in caplog.records)
 
     def test_strict_mode_returns_extension_mismatch_failure(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
@@ -748,7 +748,7 @@ class TestExtensionCoercion:
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
-        assert any("Could not identify byte content" in r.message for r in caplog.records)
+        assert any("Could not recognize the bytes as a known file format" in r.message for r in caplog.records)
 
     def test_coerce_updates_sidecar_file_extension_variable(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
@@ -790,6 +790,106 @@ class TestExtensionCoercion:
 
         assert isinstance(result, WriteFileResultSuccess)
         assert Path(result.final_file_path) == requested_path
+
+
+class TestExtensionCoercionDoesNotClobberPriorSave:
+    """Regression for issue #4924.
+
+    Before the fix, CREATE_NEW saves whose bytes coerced to a different suffix than the
+    template's would silently overwrite a prior save: the index scan globbed the template's
+    suffix, missed the previously-coerced file, returned the same index, and the post-write
+    rename clobbered it. After the fix the planner sniffs once up front and every candidate
+    path (try-first, scan glob, indexed-walk) ends at the sniffed suffix, so each save
+    lands on a distinct index.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        yield
+
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
+
+    def test_padded_index_macro_does_not_clobber_previously_coerced_save(self, outputs_dir: Path) -> None:
+        """The exact scenario from issue #4924.
+
+        Macro declares ``.png`` but the bytes sniff as JPEG. Two CREATE_NEW saves with the
+        same JPEG bytes should produce ``render_v001.jpg`` AND ``render_v002.jpg``, with
+        the first save intact. Before the fix the second save overwrote the first.
+        """
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+
+        first_payload = _jpeg_bytes()
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(first_payload)
+
+        second_payload = _jpeg_bytes()
+        FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(second_payload)
+
+        v001 = outputs_dir / "render_v001.jpg"
+        v002 = outputs_dir / "render_v002.jpg"
+
+        assert v001.exists(), "First coerced save must still exist after the second save"
+        assert v002.exists(), "Second save must land at v002, not clobber v001"
+        # The template's .png suffix must never appear on disk for these saves.
+        assert not (outputs_dir / "render_v001.png").exists()
+        assert not (outputs_dir / "render_v002.png").exists()
+
+    def test_plain_path_create_new_with_mismatched_bytes_does_not_clobber(
+        self, griptape_nodes: GriptapeNodes, outputs_dir: Path
+    ) -> None:
+        """Plain string path variant: two JPEG saves to ``output.png`` produce two .jpg files."""
+        os_manager = griptape_nodes.OSManager()
+        requested_path = outputs_dir / "output.png"
+
+        first_result = os_manager.on_write_file_request(
+            WriteFileRequest(
+                file_path=str(requested_path),
+                content=_jpeg_bytes(),
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+        second_result = os_manager.on_write_file_request(
+            WriteFileRequest(
+                file_path=str(requested_path),
+                content=_jpeg_bytes(),
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+
+        assert isinstance(first_result, WriteFileResultSuccess)
+        assert isinstance(second_result, WriteFileResultSuccess)
+        first_path = Path(first_result.final_file_path)
+        second_path = Path(second_result.final_file_path)
+        assert first_path != second_path, "Second save must not reuse the first save's path"
+        assert first_path.exists()
+        assert second_path.exists()
+        assert first_path.suffix == ".jpg"
+        assert second_path.suffix == ".jpg"
 
 
 class TestCreateNewMacroIndexSeed:
