@@ -740,17 +740,24 @@ class NodeManager:
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
                 try:
-                    # Use fitness problem details if available for a more actionable error message
-                    library_metadata_result = GriptapeNodes.handle_request(
-                        GetLibraryMetadataRequest(library=request.specific_library_name or "")
-                    )
-                    if (
-                        isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
-                        and library_metadata_result.problems is not None
-                    ):
-                        failure_reason = library_metadata_result.problems
-                    else:
+                    # A policy denial is a recoverable restriction rather than a broken
+                    # node, so the proxy carries the denial reason and renders as a warning
+                    # instead of surfacing library-load diagnostics as a hard error.
+                    denied_by_policy = isinstance(err, _NodeInstantiationDeniedError)
+                    if denied_by_policy:
                         failure_reason = str(err)
+                    else:
+                        # Use fitness problem details if available for a more actionable error message
+                        library_metadata_result = GriptapeNodes.handle_request(
+                            GetLibraryMetadataRequest(library=request.specific_library_name or "")
+                        )
+                        if (
+                            isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
+                            and library_metadata_result.problems is not None
+                        ):
+                            failure_reason = library_metadata_result.problems
+                        else:
+                            failure_reason = str(err)
 
                     # Create ErrorProxyNode directly since it needs special initialization
                     node = ErrorProxyNode(
@@ -759,6 +766,7 @@ class NodeManager:
                         original_library_name=request.specific_library_name or "Unknown",
                         failure_reason=failure_reason,
                         metadata=request.metadata,
+                        denied_by_policy=denied_by_policy,
                     )
 
                     logger.warning(
