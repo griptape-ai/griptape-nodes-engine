@@ -4,11 +4,14 @@ import pytest
 
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
+    DEFAULT_PROJECT_TEMPLATE_V0,
+    DEFAULT_PROJECT_TEMPLATE_V1,
     ProjectOverrideAction,
     ProjectOverrideCategory,
     ProjectTemplate,
     ProjectValidationInfo,
     ProjectValidationStatus,
+    default_template_for_version,
     load_partial_project_template,
     load_project_template_from_yaml,
 )
@@ -1266,6 +1269,8 @@ workspace_dir: 42
 
         assert validation.status != ProjectValidationStatus.GOOD
         assert any("workspace_dir" in problem.field_path for problem in validation.problems)
+
+
 class TestSchemaVersionSavePolicy:
     """Version stamped on save: auto-upgrade within a major, preserve across a major.
 
@@ -1303,3 +1308,65 @@ class TestSchemaVersionSavePolicy:
         monkeypatch.setattr(ProjectTemplate, "LATEST_SCHEMA_VERSION", "1.4.0")
         yaml_str = self._template("0.5.2").to_yaml()
         assert '"project_template_schema_version": "0.5.2"' in yaml_str
+
+
+class TestDefaultTemplateByMajor:
+    """default_template_for_version selects the merge-base default by schema MAJOR.
+
+    A v0 project merges onto the frozen v0 baseline (workspace-root-relative dirs); a v1
+    project merges onto the v1 baseline (workflow-relative dirs, file_extension_directory
+    routing, 3d/splat categories). This is what lets the breaking default change land under
+    a new major without moving existing v0 projects.
+    """
+
+    def test_v0_version_selects_v0_default(self) -> None:
+        assert default_template_for_version("0.5.1") is DEFAULT_PROJECT_TEMPLATE_V0
+
+    def test_v1_version_selects_v1_default(self) -> None:
+        assert default_template_for_version("1.0.0") is DEFAULT_PROJECT_TEMPLATE_V1
+
+    def test_latest_alias_is_v1(self) -> None:
+        assert DEFAULT_PROJECT_TEMPLATE is DEFAULT_PROJECT_TEMPLATE_V1
+
+    def test_unknown_future_major_falls_back_to_latest(self) -> None:
+        # A project declaring a not-yet-known major still loads against the newest baseline.
+        assert default_template_for_version("9.9.9") is DEFAULT_PROJECT_TEMPLATE
+
+    def test_v0_default_is_workspace_root_relative(self) -> None:
+        # The frozen v0 layout: dirs are NOT workflow-relative and routing is absent.
+        assert DEFAULT_PROJECT_TEMPLATE_V0.directories["inputs"].path_macro == "inputs"
+
+    def test_v1_default_is_workflow_relative(self) -> None:
+        assert DEFAULT_PROJECT_TEMPLATE_V1.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+
+    def test_v0_project_merges_onto_v0_layout(self) -> None:
+        # A v0 overlay with no directory override inherits the v0 (workspace-root) layout,
+        # NOT the v1 workflow-relative one.
+        yaml_text = """
+project_template_schema_version: "0.5.1"
+name: "Legacy Project"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(
+            base=default_template_for_version(overlay.project_template_schema_version),
+            overlay=overlay,
+            validation_info=validation,
+        )
+        assert merged.directories["inputs"].path_macro == "inputs"
+
+    def test_v1_project_merges_onto_v1_layout(self) -> None:
+        yaml_text = """
+project_template_schema_version: "1.0.0"
+name: "Modern Project"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(
+            base=default_template_for_version(overlay.project_template_schema_version),
+            overlay=overlay,
+            validation_info=validation,
+        )
+        assert merged.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"

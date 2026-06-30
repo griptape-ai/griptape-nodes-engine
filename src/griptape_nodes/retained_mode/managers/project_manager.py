@@ -30,6 +30,7 @@ from griptape_nodes.common.project_templates import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
     SituationTemplate,
+    default_template_for_version,
     load_partial_project_template,
     select_project_path,
 )
@@ -820,14 +821,14 @@ class ProjectManager:
                     "treating as no parent on this OS",
                     overlay.parent_project_path,
                 )
-                return DEFAULT_PROJECT_TEMPLATE
+                return default_template_for_version(overlay.project_template_schema_version)
             parent_label = selected_parent
             parent_path_raw = Path(selected_parent)
             if not parent_path_raw.is_absolute():
                 parent_path_raw = project_file_path.parent / parent_path_raw
             parent_file_path = canonicalize_for_identity(parent_path_raw)
         else:
-            return DEFAULT_PROJECT_TEMPLATE
+            return default_template_for_version(overlay.project_template_schema_version)
 
         if parent_file_path in visited:
             cycle = " -> ".join(str(p) for p in [*sorted(visited, key=str), parent_file_path])
@@ -2147,7 +2148,7 @@ class ProjectManager:
         # mappings are reduced to the active platform's value first; a mapping
         # with no matching key and no `default` falls back to system defaults
         # (no parent on this OS).
-        base_template: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE
+        base_template: ProjectTemplate = default_template_for_version(template.project_template_schema_version)
         if template.parent_project_id is not None:
             parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
             if parent_info is None:
@@ -3297,7 +3298,9 @@ class ProjectManager:
             )
             return f"its id '{project_id}' is already used by a different project at '{existing.project_file_path}'"
 
-        template = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
+        template = ProjectTemplate.merge(
+            default_template_for_version(overlay.project_template_schema_version), overlay, validation
+        )
 
         if not validation.is_usable():
             problem_details = "; ".join(
