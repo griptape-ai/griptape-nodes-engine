@@ -1322,6 +1322,14 @@ class TestDefaultTemplateByMajor:
     a new major without moving existing v0 projects.
     """
 
+    def test_latest_version_matches_latest_default_template(self) -> None:
+        # LATEST_SCHEMA_VERSION (what saves/upgrades stamp) and the latest-major default
+        # template's own version (what latest_version_for_major derives roll-forward and the
+        # load warning from) are two sources of truth that MUST agree. If they drift, a saved
+        # project gets stamped a version the loader then flags as "behind latest" -- a spurious
+        # FLAWED warning on a project that is actually current.
+        assert ProjectTemplate.LATEST_SCHEMA_VERSION == DEFAULT_PROJECT_TEMPLATE.project_template_schema_version
+
     def test_v0_version_selects_v0_default(self) -> None:
         assert default_template_for_version("0.5.1") is DEFAULT_PROJECT_TEMPLATE_V0
 

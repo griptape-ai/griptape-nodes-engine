@@ -155,7 +155,7 @@ A workspace zipped on one machine and unpacked on another will keep parent links
 
 The optional `workspace_dir` field names the directory this project uses as its [workspace](workspace.md). When set, it is the **highest-priority** workspace source — it overrides the per-user `project_workspaces` mapping, the `GTN_CONFIG_WORKSPACE_DIRECTORY` env var, the project-adjacent config, parent inheritance, and the global default.
 
-New **v1** projects are created with `workspace_dir: "./"`, which makes them self-contained: the workspace resolves to the project's own folder. It is still an ordinary, optional field — clear it (or set it to `null`) to fall back to inheriting the workspace from a parent or the global default. **v0** projects are not given a default `workspace_dir`.
+When you create a **v1** project, the creation UI writes `workspace_dir: "./"` into it, which makes it self-contained: the workspace resolves to the project's own folder. It is still an ordinary, optional field — clear it (or set it to `null`) to fall back to inheriting the workspace from a parent or the global default. **v0** projects are not given a default `workspace_dir`. (The engine's default template itself leaves `workspace_dir` unset for every major; the `./` is supplied at creation, not inherited from the default.)
 
 The value takes one of two forms:
 
@@ -198,7 +198,7 @@ The system defaults define these situations and directories out of the box. See 
 `project_template_schema_version` is read as a [semantic version](https://semver.org); its **major** component selects which defaults baseline the project merges onto. This lets the defaults change in a breaking way under a new major while existing projects keep the behavior they were written against:
 
 - **v0 (`0.x`)** — the legacy baseline. File destinations are workspace-root-relative and files are not routed into per-type subfolders by default.
-- **v1 (`1.x`)** — the current baseline. File destinations are workflow-relative, output files route through [file-extension directories](file_extension_directories.md), and a new project is **self-contained by default** (its [`workspace_dir`](#workspace-directory) is set to `./` at creation, so it resolves its workspace to its own folder). New projects are created at `1.0.0`.
+- **v1 (`1.x`)** — the current baseline. File destinations are workflow-relative, output files route through [file-extension directories](file_extension_directories.md), and a new project is **self-contained by default** — the creation UI writes [`workspace_dir`](#workspace-directory): `./` into a new v1 project so it resolves its workspace to its own folder (the field is an ordinary, removable override, not baked into the default template). New projects are created at `1.0.0`.
 
 A project always merges onto the baseline for **its own** major, so opening an older-major project never silently shifts its layout.
 
