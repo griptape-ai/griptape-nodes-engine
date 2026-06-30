@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -37,6 +38,9 @@ from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, C
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "subflow_dataflow_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
@@ -82,14 +86,32 @@ def _connect(source_node: str, source_param: str, target_node: str, target_param
     assert isinstance(result, CreateConnectionResultSuccess), result
 
 
+@pytest.fixture
+def _clean_engine_state() -> Iterator[None]:
+    """Keep the shared engine singleton clean despite running in-process.
+
+    This test mutates global GriptapeNodes state (the object registry and the workflow context
+    stack) directly instead of in a subprocess, so it clears object state before running and
+    tears down the workflow context plus object state afterwards. Without this teardown the
+    pushed workflow context and registered objects would leak into sibling tests sharing the
+    same pytest-xdist worker.
+    """
+    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    yield
+    context_manager = GriptapeNodes.ContextManager()
+    while context_manager.has_current_workflow():
+        context_manager.pop_workflow()
+    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
 @pytest.mark.skipif(
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"Subflow Dataflow Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
 )
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("_clean_engine_state")
 async def test_isolated_subflow_runs_data_only_graph(tmp_path: Path) -> None:
     """A data-only referenced subflow must resolve its downstream/leaf nodes and return outputs."""
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
     library_json = _materialize_library(tmp_path / "library")
     register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result

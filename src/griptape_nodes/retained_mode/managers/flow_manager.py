@@ -4518,10 +4518,8 @@ class FlowManager:
         for current_flow in all_flows.values():
             if self.is_referenced_workflow(current_flow):
                 continue
-            for node in current_flow.nodes.values():
-                if node.parent_group is not None and isinstance(node.parent_group, SubflowNodeGroup):
-                    continue
-                scope_nodes.append(node)
+            scope_nodes.extend(current_flow.nodes.values())
+        scope_nodes = self.exclude_subflow_group_children(scope_nodes)
 
         # if no nodes across all flows, no execution possible
         if not scope_nodes:
@@ -4538,6 +4536,16 @@ class FlowManager:
             self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.DATA_NODE))
 
         return self._global_flow_queue
+
+    @staticmethod
+    def exclude_subflow_group_children(nodes: list[BaseNode]) -> list[BaseNode]:
+        """Drop nodes owned by a SubflowNodeGroup; they run inside their group's own subflow.
+
+        This is a scope/ownership decision kept out of classify_nodes_for_dag so the classifier
+        stays scope-agnostic and is shared by both the top-level run and isolated subflow
+        execution. Both callers must apply it so the two paths cannot drift.
+        """
+        return [node for node in nodes if not isinstance(node.parent_group, SubflowNodeGroup)]
 
     def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
         """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
@@ -4640,9 +4648,7 @@ class FlowManager:
             if not has_external_outgoing:
                 valid_data_nodes.append(node)
 
-        return DagNodeCategories(
-            start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes
-        )
+        return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes)
 
     def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
         global_connections = self.get_connections()

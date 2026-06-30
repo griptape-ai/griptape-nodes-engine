@@ -260,9 +260,10 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         Top-level runs and isolated subflows share one classifier and one seeding routine; they
         differ only in scope. A top-level run draws its categorized nodes from the global queue
         (already scoped by get_start_node_queue to exclude referenced subflows and group
-        children). An isolated subflow classifies its own nodes directly, since the global queue
-        deliberately omits referenced subflows. Either way the same seeding logic runs, so a
-        data-only subflow resolves its leaf nodes instead of stopping at the start node.
+        children). An isolated subflow classifies its own nodes directly, applying the same
+        SubflowNodeGroup-child exclusion, since the global queue deliberately omits referenced
+        subflows. Either way the same seeding logic runs, so a data-only subflow resolves its
+        leaf nodes instead of stopping at the start node.
         """
         # Use the DagBuilder from the resolution machine context (may be isolated or global)
         dag_builder = self._context.resolution_machine.context.dag_builder
@@ -279,7 +280,10 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
 
         if is_isolated:
             subflow = flow_manager.get_flow_by_name(self._context.flow_name)
-            categories = flow_manager.classify_nodes_for_dag(list(subflow.nodes.values()))
+            # Same scope decision as get_start_node_queue: SubflowNodeGroup children run inside
+            # their own group's subflow, so they must not be seeded directly into this DAG.
+            scope_nodes = flow_manager.exclude_subflow_group_children(list(subflow.nodes.values()))
+            categories = flow_manager.classify_nodes_for_dag(scope_nodes)
             logger.debug("Seeding isolated subflow '%s' DAG from its own nodes", self._context.flow_name)
         else:
             categories = self._drain_global_flow_queue(flow_manager)
@@ -293,6 +297,8 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         The queue is populated (and scoped) by get_start_node_queue before a top-level run. Draining
         it here preserves the existing contract that the queue is emptied during DAG construction.
         """
+        # Local import: flow_manager imports control_flow (CompleteState, ControlFlowMachine) at
+        # module scope, so importing DagExecutionType at the top would be a circular import.
         from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType
 
         start_nodes: list[BaseNode] = []
@@ -306,12 +312,10 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             elif item.dag_execution_type == DagExecutionType.DATA_NODE:
                 data_sink_nodes.append(item.node)
             flow_manager.global_flow_queue.queue.remove(item)
-        return DagNodeCategories(
-            start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=data_sink_nodes
-        )
+        return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=data_sink_nodes)
 
+    @staticmethod
     def _seed_dag_from_categories(
-        self,
         start_node: BaseNode,
         categories: DagNodeCategories,
         dag_builder: DagBuilder,
