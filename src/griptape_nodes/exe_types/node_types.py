@@ -1117,6 +1117,17 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
+        if VariableResolver.is_substitution_enabled():
+            for param in self.parameters:
+                value = self.parameter_values.get(param.name, param.default_value)
+                if VariableResolver.contains_variable_macro(value):
+                    self.make_node_unresolved(
+                        current_states_to_trigger_change_event={
+                            NodeResolutionState.RESOLVED,
+                            NodeResolutionState.RESOLVING,
+                        }
+                    )
+                    break
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:

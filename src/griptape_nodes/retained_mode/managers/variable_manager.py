@@ -283,6 +283,7 @@ class VariablesManager:
             )
 
         result.variable.value = request.value
+        self._unresolve_nodes_referencing_variables([request.name])
         return SetVariableValueResultSuccess(result_details=f"Successfully set value for variable '{request.name}'.")
 
     def on_get_variable_type_request(self, request: GetVariableTypeRequest) -> ResultPayload:
@@ -564,6 +565,7 @@ class VariablesManager:
         for name, value in request.variables.items():
             found[name].value = value
 
+        self._unresolve_nodes_referencing_variables(list(request.variables.keys()))
         return SetVariablesResultSuccess(result_details=f"Successfully set {len(request.variables)} variable(s).")
 
     def on_get_variable_details_request(self, request: GetVariableDetailsRequest) -> ResultPayload:
@@ -587,6 +589,35 @@ class VariablesManager:
         return GetVariableDetailsResultSuccess(
             details=details, result_details=f"Successfully retrieved details for variable '{request.name}'."
         )
+
+    def _unresolve_nodes_referencing_variables(self, variable_names: list[str]) -> None:
+        # Lazy imports to avoid circular dependency between retained_mode and exe_types.
+        from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+        from griptape_nodes.exe_types.variable_resolver import VariableResolver
+
+        flow_manager = GriptapeNodes.FlowManager()
+        if flow_manager.check_for_existing_running_flow():
+            # Mid-run: downstream UNRESOLVED nodes pick up new values naturally via GetVariablesRequest.
+            return
+
+        connections = flow_manager.get_connections()
+
+        for obj in list(GriptapeNodes.ObjectManager()._name_to_objects.values()):
+            if not isinstance(obj, BaseNode):
+                continue
+            if obj.state not in (NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING):
+                continue
+            for param in obj.parameters:
+                value = obj.parameter_values.get(param.name, param.default_value)
+                if any(VariableResolver.references_variable(value, name) for name in variable_names):
+                    obj.make_node_unresolved(
+                        current_states_to_trigger_change_event={
+                            NodeResolutionState.RESOLVED,
+                            NodeResolutionState.RESOLVING,
+                        }
+                    )
+                    connections.unresolve_future_nodes(obj)
+                    break
 
     def _find_variable_by_name(self, name: str) -> FlowVariable | None:
         """Find a variable by name in current flow context (legacy compatibility)."""

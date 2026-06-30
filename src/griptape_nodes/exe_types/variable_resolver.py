@@ -165,6 +165,27 @@ class VariableResolver:
         return resolved
 
     @staticmethod
+    def references_variable(value: Any, variable_name: str) -> bool:
+        """Return True if value contains a macro reference to the given variable name.
+
+        Handles format specs, optional markers, and default values:
+        {VAR}, {VAR:lower}, {VAR?}, {VAR|default} all count as referencing VAR.
+        Recurses into dicts and lists.
+        """
+        if isinstance(value, str):
+            for match in VariableResolver._MACRO_TOKEN.finditer(value):
+                content = match.group(1)
+                name = content.split("|")[0].split(":")[0].rstrip("?").strip()
+                if name == variable_name:
+                    return True
+            return False
+        if isinstance(value, dict):
+            return any(VariableResolver.references_variable(v, variable_name) for v in value.values())
+        if isinstance(value, list):
+            return any(VariableResolver.references_variable(item, variable_name) for item in value)
+        return False
+
+    @staticmethod
     def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
         """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
         return {
