@@ -875,16 +875,26 @@ class TestEnhancedExceptions:
 
 
 class TestParseSequenceSlotShorthand:
-    """Test cases for `###`-style sequence-slot syntax (issue #4902).
+    """Test cases for `{###}` / `{##?}`-style sequence-slot syntax (issue #4902).
 
     The shorthand desugars to a synthesized ``ParsedVariable`` carrying a
     ``SequenceFormat`` marker. Downstream code (OSManager seed/walk,
     ScanSequencesRequest enumeration) recognizes the marker to identify
     sequence slots.
+
+    The sigil lives **inside** the variable braces (`{###}`) rather than as
+    bare static text. Reasons:
+    - Markdown templates use ``#`` for headers; embedding our sigil inside
+      ``{}`` avoids forcing macro authors to escape every `#` in
+      doc-rendering contexts.
+    - The existing grammar already says "anything in `{}` is a variable
+      slot"; this just extends what variable shapes are recognized.
+    - The optional form `{##?}` falls out of the trailing-`?` rule
+      naturally — no separate grammar.
     """
 
-    def test_triple_hash_emits_sequence_variable_with_min_width_3(self) -> None:
-        """`###` parses to a single ParsedVariable with SequenceFormat(min_width=3).
+    def test_braced_triple_hash_emits_sequence_variable_with_min_width_3(self) -> None:
+        """`{###}` parses to a single ParsedVariable with SequenceFormat(min_width=3).
 
         Locks the canonical shape: name is the well-known ``_index`` (so
         downstream reverse-match against existing files via
@@ -894,7 +904,7 @@ class TestParseSequenceSlotShorthand:
         OSManager queries the format-spec type to tell user-bound
         ``{shot:03}`` apart from a sequence slot.
         """
-        segments = parse_segments("my_workflow_v###.py")
+        segments = parse_segments("my_workflow_v{###}.py")
 
         assert len(segments) == 3
         assert isinstance(segments[0], ParsedStaticValue)
@@ -906,19 +916,39 @@ class TestParseSequenceSlotShorthand:
         spec = segments[1].format_specs[0]
         assert isinstance(spec, SequenceFormat)
         assert spec.min_width == 3
-        # No NumericPaddingFormat involvement on the `###` path — see #4902
+        # No NumericPaddingFormat involvement on the `{###}` path — see #4902
         # for why these are kept as distinct format types.
         assert not any(isinstance(s, NumericPaddingFormat) for s in segments[1].format_specs)
         assert isinstance(segments[2], ParsedStaticValue)
         assert segments[2].text == ".py"
+
+    def test_braced_double_hash_question_mark_emits_optional_sequence_slot(self) -> None:
+        """`{##?}` parses as an optional sequence slot with min_width=2.
+
+        The trailing `?` re-uses the existing optional-variable convention.
+        Optional sequence slots are what most file-save situations want
+        (`save_file`, `save_node_output`, etc. where the first save lands
+        without an index and only collisions trigger indexing).
+        """
+        segments = parse_segments("foo{##?}.png")
+
+        var_segments = [s for s in segments if isinstance(s, ParsedVariable)]
+        assert len(var_segments) == 1
+        var = var_segments[0]
+        assert var.info.name == SEQUENCE_VARIABLE_NAME
+        assert var.info.is_required is False
+        assert len(var.format_specs) == 1
+        spec = var.format_specs[0]
+        assert isinstance(spec, SequenceFormat)
+        assert spec.min_width == 2
 
     @pytest.mark.parametrize(
         ("hash_run", "expected_min_width"),
         [("#", 1), ("##", 2), ("####", 4), ("#####", 5)],
     )
     def test_hash_run_lengths_map_to_min_width(self, hash_run: str, expected_min_width: int) -> None:
-        """Any run length of `#` characters becomes that exact min_width."""
-        segments = parse_segments(f"v{hash_run}.py")
+        """Any run length of `#` characters inside braces becomes that exact min_width."""
+        segments = parse_segments(f"v{{{hash_run}}}.py")
 
         sequence_vars = [s for s in segments if isinstance(s, ParsedVariable)]
         assert len(sequence_vars) == 1
@@ -926,14 +956,30 @@ class TestParseSequenceSlotShorthand:
         assert isinstance(spec, SequenceFormat)
         assert spec.min_width == expected_min_width
 
-    def test_hash_run_adjacent_to_brace_variable_parses_cleanly(self) -> None:
-        """`prefix_###{ext}` splits into static text, sequence slot, then variable.
+    @pytest.mark.parametrize(
+        ("hash_run", "expected_min_width"),
+        [("#", 1), ("##", 2), ("####", 4), ("#####", 5)],
+    )
+    def test_optional_hash_run_lengths_map_to_min_width(self, hash_run: str, expected_min_width: int) -> None:
+        """Any run length followed by `?` produces the same min_width with is_required=False."""
+        segments = parse_segments(f"v{{{hash_run}?}}.py")
 
-        Confirms the tokenizer emits the sequence-slot segment when it hits
-        the boundary between a `#` run and the `{` that follows — no static
-        text gets eaten or duplicated.
+        sequence_vars = [s for s in segments if isinstance(s, ParsedVariable)]
+        assert len(sequence_vars) == 1
+        var = sequence_vars[0]
+        assert var.info.is_required is False
+        spec = var.format_specs[0]
+        assert isinstance(spec, SequenceFormat)
+        assert spec.min_width == expected_min_width
+
+    def test_braced_hash_run_adjacent_to_brace_variable_parses_cleanly(self) -> None:
+        """`prefix_{###}{ext}` splits into static, sequence slot, then variable.
+
+        Confirms the tokenizer handles back-to-back ``{}`` blocks where the
+        first is a sequence-slot shorthand and the second is a regular
+        variable. No static text gets eaten or duplicated between them.
         """
-        segments = parse_segments("prefix_###{ext}")
+        segments = parse_segments("prefix_{###}{ext}")
 
         assert len(segments) == 3
         assert isinstance(segments[0], ParsedStaticValue)
@@ -943,28 +989,39 @@ class TestParseSequenceSlotShorthand:
         assert isinstance(segments[2], ParsedVariable)
         assert segments[2].info.name == "ext"
 
-    def test_two_hash_runs_in_one_macro_raises_multiple_sequence_slots(self) -> None:
-        """Two `#` runs in the same template raise MULTIPLE_SEQUENCE_SLOTS.
+    def test_two_sequence_slots_in_one_macro_raises_multiple_sequence_slots(self) -> None:
+        """Two `{###}` blocks in the same template raise MULTIPLE_SEQUENCE_SLOTS.
 
         OSManager would have no way to pick which slot to auto-fill, so the
         parser rejects this upfront with a specific failure reason. The
-        error message reports the position of the offending second run.
+        check happens after the per-block parse completes (post-pass walk
+        over the segment list).
         """
         with pytest.raises(MacroSyntaxError) as exc_info:
-            parse_segments("v###_take_##.png")
+            parse_segments("v{###}_take_{##}.png")
 
         err = exc_info.value
         assert err.failure_reason == MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS
-        # Second run starts after "v###_take_" → position 10.
-        assert err.error_position == 10
+
+    def test_two_sequence_slots_required_and_optional_also_raises(self) -> None:
+        """Mixing required and optional sequence slots in one macro still raises.
+
+        Defense against the `{###}_{##?}` case — both are sequence slots
+        even though only one is optional. OSManager still can't pick.
+        """
+        with pytest.raises(MacroSyntaxError) as exc_info:
+            parse_segments("{###}_{##?}.png")
+
+        err = exc_info.value
+        assert err.failure_reason == MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS
 
     def test_explicit_index_padding_still_parses_as_numeric_padding(self) -> None:
         """`{_index:03}` remains the user-bound rendering form — no SequenceFormat involved.
 
         The explicit-padding path stays a string-formatting concern. Only
-        `###` shorthand creates a sequence slot; `{_index:03}` continues to
-        parse as a plain padded variable. OSManager still treats it as a
-        sequence slot via the legacy ``NumericPaddingFormat`` heuristic
+        `{###}` shorthand creates a sequence slot; `{_index:03}` continues
+        to parse as a plain padded variable. OSManager still treats it as
+        a sequence slot via the legacy ``NumericPaddingFormat`` heuristic
         (the OR-branch documented on ``_has_sequence_slot_marker``), but
         that's an OSManager concern — the parser's output stays cleanly
         separated.
@@ -978,9 +1035,23 @@ class TestParseSequenceSlotShorthand:
         assert any(isinstance(s, NumericPaddingFormat) for s in var.format_specs)
         assert not any(isinstance(s, SequenceFormat) for s in var.format_specs)
 
-    def test_hash_only_template_parses(self) -> None:
-        """A template that is *only* `###` (no static prefix/suffix) parses to one variable."""
-        segments = parse_segments("###")
+    def test_bare_hash_run_in_static_text_is_literal(self) -> None:
+        """Bare `###` outside `{}` is literal static text, NOT a sequence slot.
+
+        Pins the moved-to-braces decision: macro authors using `#` chars in
+        their markdown or static text don't accidentally trigger sequence
+        semantics. To get a sequence slot you must wrap the `#`s in `{}`.
+        """
+        segments = parse_segments("foo###.png")
+
+        # Pure static text — no synthesized variable.
+        assert len(segments) == 1
+        assert isinstance(segments[0], ParsedStaticValue)
+        assert segments[0].text == "foo###.png"
+
+    def test_braced_hash_only_template_parses(self) -> None:
+        """A template that is *only* `{###}` (no static prefix/suffix) parses to one variable."""
+        segments = parse_segments("{###}")
 
         assert len(segments) == 1
         assert isinstance(segments[0], ParsedVariable)
@@ -988,34 +1059,11 @@ class TestParseSequenceSlotShorthand:
         assert isinstance(spec, SequenceFormat)
         assert spec.min_width == 3
 
-    def test_template_starting_with_brace_handles_empty_leading_static(self) -> None:
-        """`{var}###` parses cleanly even though no static text precedes the first `{`.
-
-        Exercises the no-leading-static branch in ``parse_segments``: when
-        the template starts with `{`, the static-text helper isn't invoked
-        for the empty span before the brace. The synthesized sequence slot
-        still gets emitted from the trailing static-text pass.
-        """
-        segments = parse_segments("{prefix}###")
-
-        # Two segments: the `{prefix}` variable, then the synthesized sequence slot.
-        # No leading ParsedStaticValue with empty text.
-        assert len(segments) == 2
-        assert isinstance(segments[0], ParsedVariable)
-        assert segments[0].info.name == "prefix"
-        assert isinstance(segments[1], ParsedVariable)
-        assert segments[1].info.name == SEQUENCE_VARIABLE_NAME
-        spec = segments[1].format_specs[0]
-        assert isinstance(spec, SequenceFormat)
-        assert spec.min_width == 3
-
     def test_template_ending_with_brace_emits_no_trailing_empty_static(self) -> None:
         """`{var}` (template ending with the closing brace) emits only the variable, no trailing static.
 
         Confirms ``parse_segments`` doesn't append an empty ``ParsedStaticValue``
-        when the template ends exactly at a closing brace. The while-loop
-        condition exits cleanly without calling the static-text helper with
-        an empty trailing span.
+        when the template ends exactly at a closing brace.
         """
         segments = parse_segments("{prefix}")
 
@@ -1024,24 +1072,8 @@ class TestParseSequenceSlotShorthand:
         assert isinstance(segments[0], ParsedVariable)
         assert segments[0].info.name == "prefix"
 
-    def test_split_static_text_helper_handles_empty_input(self) -> None:
-        """``_split_static_text_with_sequence_slots("", ...)`` is a no-op.
-
-        Defense-in-depth check: the helper guards against empty input even
-        though ``parse_segments``'s while-loop bounds prevent the public
-        entry point from ever invoking it that way. Tested directly so the
-        guard isn't dead code.
-        """
-        from griptape_nodes.common.macro_parser.parsing import _split_static_text_with_sequence_slots
-
-        segments: list[Any] = []
-        counter = [0]
-        _split_static_text_with_sequence_slots("", 0, segments, counter)
-        assert segments == []
-        assert counter == [0]
-
     def test_full_resolve_with_sequence_slot_uses_min_width(self) -> None:
-        """End-to-end: ParsedMacro.resolve() with a `###` slot zero-pads correctly.
+        """End-to-end: ParsedMacro.resolve() with a `{###}` slot zero-pads correctly.
 
         Confirms the integration between the parser's synthesized variable
         and the resolver. Caller binds the synthesized ``_index`` name to
@@ -1050,7 +1082,7 @@ class TestParseSequenceSlotShorthand:
         """
         from unittest.mock import MagicMock
 
-        macro = ParsedMacro("v###.py")
+        macro = ParsedMacro("v{###}.py")
         secrets_manager = MagicMock()
 
         assert macro.resolve({SEQUENCE_VARIABLE_NAME: 1}, secrets_manager) == "v001.py"

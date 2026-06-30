@@ -93,18 +93,21 @@ Template: {file_name_base}_v{_index:03}.{file_extension}
 
 The variable name does not need to be `_index`; any single unresolved required variable with `:NN` padding will be auto-allocated. Without padding, an unresolved required variable is treated as a missing binding (a configuration error) and the save fails — this prevents `{shot}` from silently being filled with `1, 2, 3, …` when the user forgot to wire it up.
 
-### Sequence slot (`###`)
+### Sequence slot (`{###}`)
 
 ```
-###       → 1-digit minimum (1, 2, ..., 9, 10, 11, ...)
-###       → 3-digit minimum (001, 002, ..., 999, 1000, ...)
-####      → 4-digit minimum (0001, 0002, ..., 9999, 10000, ...)
+{#}       → 1-digit minimum (1, 2, ..., 9, 10, 11, ...)
+{###}     → 3-digit minimum (001, 002, ..., 999, 1000, ...)
+{####}    → 4-digit minimum (0001, 0002, ..., 9999, 10000, ...)
+{##?}     → 2-digit minimum, optional (omitted on first save; 01, 02, … on collision)
 ```
 
-A run of `#` characters in static text is the explicit syntax for a sequence slot. Each `#` contributes one digit to the **minimum** render width. Values below `10 ^ width` are zero-padded to that width; values at or above it render at their natural width (no truncation). This matches the universal `###` convention from ffmpeg (`%03d`), Houdini (`$F4`), Nuke (`####`), and Python's `:03` format spec.
+A run of `#` characters **inside `{}` braces** is the explicit syntax for a sequence slot. Each `#` contributes one digit to the **minimum** render width. Values below `10 ^ width` are zero-padded to that width; values at or above it render at their natural width (no truncation). This matches the universal `###` convention from ffmpeg (`%03d`), Houdini (`$F4`), Nuke (`####`), and Python's `:03` format spec.
+
+A trailing `?` inside the braces (e.g. `{##?}`) marks the slot **optional** — the same rule as for any other variable. Optional slots are omitted on the first save and only fill in on collision.
 
 ```
-Template: {file_name_base}_v###.{file_extension}
+Template: {file_name_base}_v{###}.{file_extension}
 
   Save #1    → render_v001.png
   Save #2    → render_v002.png
@@ -113,11 +116,21 @@ Template: {file_name_base}_v###.{file_extension}
   Save #1000 → render_v1000.png   (overflow: 4 digits, not truncated)
 ```
 
-Use `###` whenever you want a system-allocated sequence index. It says "this slot is what `create_new` should advance on collision" without leaning on the numeric-padding heuristic described above, so a macro author who genuinely needs a user-bound `{shot:03}` variable can write that without ambiguity.
+```
+Template (optional): {file_name_base}{##?}.{file_extension}
 
-**One sequence slot per macro.** A template with two `#` runs (e.g. `v###_take_##.png`) is rejected at parse time — the system has no way to know which slot to auto-allocate. Compose the second number as an explicit `{var}` if you need it.
+  Save #1 → render.png            (slot omitted)
+  Save #2 → render01.png          (slot fills in on collision)
+  Save #3 → render02.png
+```
 
-**Relationship to `{_index:NN}`.** Internally `###` desugars to a variable named `_index` carrying a sequence-format marker. The legacy `{_index:03}` / `{_index?:03}` syntax continues to work and is still treated as a sequence slot for backward compatibility, but `###` is the recommended form going forward. Future versions may retire the `{_index:NN}` shorthand once project templates have migrated; see [issue #4902](https://github.com/griptape-ai/griptape-nodes-engine/issues/4902).
+Use `{###}` whenever you want a system-allocated sequence index. It says "this slot is what `create_new` should advance on collision" without leaning on the numeric-padding heuristic described above, so a macro author who genuinely needs a user-bound `{shot:03}` variable can write that without ambiguity.
+
+**Why the `{}` wrapping.** Macro templates often appear in places where bare `#` chars have other meanings — Markdown headers, comments, shell scripts. Wrapping the sigil inside `{}` keeps the sequence-slot syntax inside the same delimiters that already mark "this is a macro variable," so authors don't need escaping rules for stray `#` chars in static text.
+
+**One sequence slot per macro.** A template with two `{###}` blocks (e.g. `{###}_take_{##}.png`) is rejected at parse time — the system has no way to know which slot to auto-allocate. Compose the second number as an explicit `{var}` if you need it.
+
+**Relationship to `{_index:NN}`.** Internally `{###}` desugars to a variable named `_index` carrying a sequence-format marker. The legacy `{_index:03}` / `{_index?:03}` syntax continues to work and is still treated as a sequence slot for backward compatibility, but `{###}` is the recommended form going forward. Future versions may retire the `{_index:NN}` shorthand once project templates have migrated; see [issue #4902](https://github.com/griptape-ai/griptape-nodes-engine/issues/4902).
 
 ### String transformations
 

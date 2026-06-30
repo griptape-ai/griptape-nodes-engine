@@ -887,18 +887,18 @@ class TestCreateNewMacroIndexSeed:
         assert (outputs_dir / "render_v002.png").read_bytes() == b"new"
 
     def test_hash_shorthand_macro_auto_allocates_like_padded_legacy(self, outputs_dir: Path) -> None:
-        """A `###` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{_index:03}` form.
+        """A `{###}` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{_index:03}` form.
 
         Drives the production write path through the new explicit syntax. The
         parser emits a ``SequenceFormat`` slot which ``_has_sequence_slot_marker``
         recognizes through the seed gate and the collision-walk gate — so the
-        ``###`` macro produces the same v001/v002/v003 sequence as the legacy
+        ``{###}`` macro produces the same v001/v002/v003 sequence as the legacy
         ``{_index:03}`` form would. (The glob-builder's ``SequenceFormat`` →
         `*` branch is a separate code path exercised by
-        ``test_sequence_macro_scan_sees_files_past_min_width`` in
+        ``test_sequence_format_glob_uses_permissive_wildcard`` in
         ``test_os_manager.py``.)
         """
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v###.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         for _ in range(3):
             self._save(macro_path, b"x")

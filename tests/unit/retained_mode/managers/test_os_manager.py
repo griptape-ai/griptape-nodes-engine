@@ -1993,7 +1993,7 @@ class TestGetNextUnusedFilenameRequest:
         secrets_manager = GriptapeNodes.SecretsManager()
 
         # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
-        sequence_macro = ParsedMacro("/anywhere/render_v###.png")
+        sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
         sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
         sequence_glob = os_manager._build_glob_pattern_from_partially_resolved(sequence_partial.segments, "_index")
         assert sequence_glob == "/anywhere/render_v*.png"
