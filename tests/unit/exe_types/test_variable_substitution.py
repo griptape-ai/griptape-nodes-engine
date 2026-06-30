@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
+from griptape_nodes.retained_mode.events.variable_events import GetVariablesRequest, GetVariablesResultSuccess
 
 from .mocks import MockNode
 
@@ -58,8 +59,11 @@ def _mock_gn(
 
     mock_gn = MagicMock()
     mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-    mock_gn.VariablesManager.return_value.get_variables_for_macro_resolution.return_value = variables
-    mock_gn.SecretsManager.return_value = MagicMock()
+    mock_gn.handle_request.side_effect = lambda req: (
+        GetVariablesResultSuccess(variables=variables, result_details="ok")
+        if isinstance(req, GetVariablesRequest)
+        else MagicMock()
+    )
 
     incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
     mock_connections = MagicMock()
@@ -97,8 +101,11 @@ def _run_tracked_set(
         # Build a unified mock that handles both substitution and event capture.
         mock_gn = MagicMock()
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
-        mock_gn.VariablesManager.return_value.get_variables_for_macro_resolution.return_value = variables
-        mock_gn.SecretsManager.return_value = MagicMock()
+        mock_gn.handle_request.side_effect = lambda req: (
+            GetVariablesResultSuccess(variables=variables, result_details="ok")
+            if isinstance(req, GetVariablesRequest)
+            else MagicMock()
+        )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
         mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
         mock_gn.EventManager.return_value.put_event.side_effect = captured.append
