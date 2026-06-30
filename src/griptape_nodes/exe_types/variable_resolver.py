@@ -143,11 +143,32 @@ class VariableResolver:
         if cached is not None:
             return cached  # type: ignore[return-value]
 
+        from griptape_nodes.retained_mode.events.variable_events import (
+            GetVariablesRequest,
+            GetVariablesResultSuccess,
+        )
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
         try:
             flow_name = GriptapeNodes.NodeManager().get_node_parent_flow_by_name(node_name)
         except KeyError:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
-        resolved = GriptapeNodes.VariablesManager().get_variables_for_macro_resolution(flow_name)
+        result = GriptapeNodes.handle_request(
+            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+        )
+        if not isinstance(result, GetVariablesResultSuccess):
+            _aprocess_variable_cache.set(_NO_FLOW)
+            return None
+        resolved = VariableResolver._filter_for_substitution(result.variables)
         _aprocess_variable_cache.set(resolved)
         return resolved
+
+    @staticmethod
+    def _filter_for_substitution(variables: dict[str, Any]) -> dict[str, str | int]:
+        """Filter a name→value dict to only str/int values (excluding bool) for macro substitution."""
+        return {
+            name: value
+            for name, value in variables.items()
+            if isinstance(value, (str, int)) and not isinstance(value, bool)
+        }

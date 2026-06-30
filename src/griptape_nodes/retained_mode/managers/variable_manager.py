@@ -15,6 +15,9 @@ from griptape_nodes.retained_mode.events.variable_events import (
     GetVariableRequest,
     GetVariableResultFailure,
     GetVariableResultSuccess,
+    GetVariablesRequest,
+    GetVariablesResultFailure,
+    GetVariablesResultSuccess,
     GetVariableTypeRequest,
     GetVariableTypeResultFailure,
     GetVariableTypeResultSuccess,
@@ -30,6 +33,9 @@ from griptape_nodes.retained_mode.events.variable_events import (
     RenameVariableRequest,
     RenameVariableResultFailure,
     RenameVariableResultSuccess,
+    SetVariablesRequest,
+    SetVariablesResultFailure,
+    SetVariablesResultSuccess,
     SetVariableTypeRequest,
     SetVariableTypeResultFailure,
     SetVariableTypeResultSuccess,
@@ -74,6 +80,8 @@ class VariablesManager:
             event_manager.assign_manager_to_request_type(
                 GetVariableDetailsRequest, self.on_get_variable_details_request
             )
+            event_manager.assign_manager_to_request_type(GetVariablesRequest, self.on_get_variables_request)
+            event_manager.assign_manager_to_request_type(SetVariablesRequest, self.on_set_variables_request)
 
     def clear_object_state(self) -> None:
         """Clear all variables."""
@@ -513,6 +521,50 @@ class VariablesManager:
         return ListVariablesResultSuccess(
             variables=variables, result_details=f"Successfully listed {len(variables)} variables."
         )
+
+    def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
+        """Get all variable values visible from the starting flow."""
+        try:
+            starting_flow = self._get_starting_flow(request.starting_flow)
+        except ValueError as e:
+            return GetVariablesResultFailure(
+                result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
+            )
+
+        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope)
+        result = {v.name: v.value for v in variables}
+        return GetVariablesResultSuccess(
+            variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
+        )
+
+    def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
+        """Set multiple variable values atomically (all-or-nothing)."""
+        try:
+            starting_flow = self._get_starting_flow(request.starting_flow)
+        except ValueError as e:
+            return SetVariablesResultFailure(
+                result_details=f"Attempted to set variables. Failed to determine starting flow: {e}"
+            )
+
+        # Validate all variables exist before writing any (all-or-nothing semantics).
+        found: dict[str, FlowVariable] = {}
+        missing: list[str] = []
+        for name in request.variables:
+            lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope)
+            if lookup.variable is None:
+                missing.append(name)
+            else:
+                found[name] = lookup.variable
+
+        if missing:
+            return SetVariablesResultFailure(
+                result_details=f"Attempted to set variables. Failed because variables not found: {missing!r}"
+            )
+
+        for name, value in request.variables.items():
+            found[name].value = value
+
+        return SetVariablesResultSuccess(result_details=f"Successfully set {len(request.variables)} variable(s).")
 
     def on_get_variable_details_request(self, request: GetVariableDetailsRequest) -> ResultPayload:
         """Get variable details (metadata only, no heavy values)."""

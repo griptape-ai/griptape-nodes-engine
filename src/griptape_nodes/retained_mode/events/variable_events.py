@@ -362,3 +362,67 @@ class GetVariableDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class GetVariableDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Variable details retrieval failed."""
+
+
+# Bulk Get/Set Variable Events
+@dataclass
+@PayloadRegistry.register
+class GetVariablesRequest(RequestPayload):
+    """Get all variable values visible from the starting flow.
+
+    Returns a name→value mapping for every variable in scope. Suitable for
+    bulk reads without issuing individual GetVariableValueRequest calls.
+
+    Args:
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variables retrieved successfully."""
+
+    variables: dict[str, Any]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Variables retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesRequest(RequestPayload):
+    """Set multiple variable values atomically (all-or-nothing).
+
+    All variable names are validated to exist in scope before any value is
+    written. If any variable is not found the entire batch is rejected and
+    no variables are modified.
+
+    Args:
+        variables: Mapping of variable name → new value
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    variables: dict[str, Any]
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Variables set successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
+    """Variables batch set failed."""
