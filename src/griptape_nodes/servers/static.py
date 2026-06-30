@@ -252,6 +252,34 @@ async def _serve_external_file(file_path: str) -> FileResponse:
     return FileResponse(absolute_path)
 
 
+class WorkspaceStaticFiles(StaticFiles):
+    """A StaticFiles mount whose served directory tracks the active workspace.
+
+    Starlette's StaticFiles freezes its directory list at construction. The engine's
+    workspace can change at runtime (project switches, workspace_dir overrides), so this
+    subclass recomputes the served directory from ConfigManager on every lookup, mirroring
+    how the storage drivers read workspace_directory live rather than caching it.
+    """
+
+    def __init__(self, *, subdirectory: str | None = None) -> None:
+        self._subdirectory = subdirectory
+        # check_dir=False: the live workspace directory may not exist yet at construction
+        # time, and it can change after the server starts.
+        super().__init__(directory=self._current_directory(), check_dir=False)
+
+    def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
+        # Refresh the served directory so it follows the active workspace before delegating
+        # to Starlette's path-traversal-safe lookup.
+        self.all_directories = [self._current_directory()]
+        return super().lookup_path(path)
+
+    def _current_directory(self) -> Path:
+        workspace_directory = GriptapeNodes.ConfigManager().workspace_path
+        if self._subdirectory is None:
+            return workspace_directory
+        return workspace_directory / self._subdirectory
+
+
 def start_static_server(sock: socket.socket) -> None:
     """Run uvicorn server synchronously using a pre-bound socket.
 
@@ -302,13 +330,14 @@ def start_static_server(sock: socket.socket) -> None:
         allow_private_network=True,  # Required for Starlette 0.51+ to allow localhost access from public origins
     )
 
-    # Mount static files
+    # Mount static files. The served directories resolve the workspace live on each request
+    # (see WorkspaceStaticFiles) so they follow runtime workspace changes such as project switches.
     workspace_directory = GriptapeNodes.ConfigManager().workspace_path
-    static_files_directory = Path(GriptapeNodes.ConfigManager().get_config_value("static_files_directory"))
+    static_files_directory = GriptapeNodes.ConfigManager().get_config_value("static_files_directory")
 
     app.mount(
         STATIC_SERVER_URL,
-        StaticFiles(directory=workspace_directory),
+        WorkspaceStaticFiles(),
         name="workspace",
     )
     static_files_path = workspace_directory / static_files_directory
@@ -316,7 +345,7 @@ def start_static_server(sock: socket.socket) -> None:
     # For legacy urls
     app.mount(
         "/static",
-        StaticFiles(directory=workspace_directory / static_files_directory),
+        WorkspaceStaticFiles(subdirectory=static_files_directory),
         name="static",
     )
 
