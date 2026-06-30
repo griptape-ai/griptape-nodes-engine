@@ -5,18 +5,22 @@ A macro is a template string that generates a file path by substituting named va
 Before diving into the full syntax, here are two examples that show what macros look like in practice:
 
 ```
-Template:  {outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
+Template:  {outputs}/{node_name?:_}{file_name_base}{###?}.{file_extension}
 
-With all variables:
-  outputs="outputs", node_name="ImageGen", file_name_base="render", _index=2, file_extension="png"
-  → outputs/ImageGen_render002.png
+First save (no collision):
+  outputs="outputs", node_name="ImageGen", file_name_base="render", file_extension="png"
+  → outputs/ImageGen_render.png
+
+Second save (collides with first, sequence slot fills in):
+  same variables as above
+  → outputs/ImageGen_render001.png
 
 With optional variables omitted:
   outputs="outputs", file_name_base="render", file_extension="png"
   → outputs/render.png
 ```
 
-`{outputs}` is a directory name that the project system supplies automatically. `{node_name?:_}` is optional — when present, its value is followed by `_`; when absent, the block disappears entirely. `{_index?:03}` is optional and zero-padded to three digits when present.
+`{outputs}` is a directory name that the project system supplies automatically. `{node_name?:_}` is optional — when present, its value is followed by `_`; when absent, the block disappears entirely. `{###?}` is an optional [sequence slot](#sequence-slot-) — omitted on the first save, then `001`, `002`, … on collision.
 
 ## Variable syntax reference
 
@@ -74,24 +78,13 @@ Path separators work the same way — `{sub_dirs?:/}` adds a subdirectory prefix
 Zero-pads the value to the specified width. The variable must hold an integer value.
 
 ```
-{_index:03}   with _index = 5   → "005"
-{_index:04}   with _index = 12  → "0012"
+{shot:03}   with shot = 5   → "005"
+{shot:04}   with shot = 12  → "0012"
 ```
 
-Used for auto-incrementing filenames under the `create_new` collision policy. Numeric padding (`:NN`) on a single unresolved variable is the opt-in: the first save lands at index `1` (or omitted, for the optional form), and subsequent saves walk forward against the same template — the padding format is preserved across the whole sequence.
+Numeric padding is a **string-formatting** concern: it controls how an integer value renders. It does NOT mark the slot as system-allocated. If you want a slot that the engine fills with the next sequence number under `create_new` policy, see [Sequence slot (`{###}`)](#sequence-slot-) below.
 
-- **Optional form** `{_index?:03}` — absent on the first save, then `_001`, `_002`, … on collision (padded width preserved).
-- **Required form** `{_index:03}` — present from the first save: `_001`, `_002`, `_003`, … with consistent zero-padded width across the whole sequence.
-
-```
-Template: {file_name_base}_v{_index:03}.{file_extension}
-
-  Save #1 → render_v001.png
-  Save #2 → render_v002.png
-  Save #3 → render_v003.png
-```
-
-The variable name does not need to be `_index`; any single unresolved required variable with `:NN` padding will be auto-allocated. Without padding, an unresolved required variable is treated as a missing binding (a configuration error) and the save fails — this prevents `{shot}` from silently being filled with `1, 2, 3, …` when the user forgot to wire it up.
+> **Compatibility note:** Earlier engine versions treated `{_index:NN}` (or any single unresolved padded variable like `{shot:03}`) as an implicit opt-in to auto-allocation. That heuristic was retired in favor of the explicit `{###}` syntax. A custom project template that still uses `{_index:NN}` to opt into auto-indexing will now surface `MISSING_REQUIRED_VARIABLES` on save — rewrite the slot as `{###}` (or `{###?}` for the optional form). See [issue #4991](https://github.com/griptape-ai/griptape-nodes-engine/issues/4991).
 
 ### Sequence slot (`{###}`)
 
@@ -130,7 +123,7 @@ Use `{###}` whenever you want a system-allocated sequence index. It says "this s
 
 **One sequence slot per macro.** A template with two `{###}` blocks (e.g. `{###}_take_{##}.png`) is rejected at parse time — the system has no way to know which slot to auto-allocate. Compose the second number as an explicit `{var}` if you need it.
 
-**Relationship to `{_index:NN}`.** Internally `{###}` desugars to a variable named `_index` carrying a sequence-format marker. The legacy `{_index:03}` / `{_index?:03}` syntax continues to work and is still treated as a sequence slot for backward compatibility, but `{###}` is the recommended form going forward. Future versions may retire the `{_index:NN}` shorthand once project templates have migrated; see [issue #4902](https://github.com/griptape-ai/griptape-nodes-engine/issues/4902).
+**Relationship to `{_index:NN}`.** Internally `{###}` desugars to a variable named `_index` carrying a sequence-format marker. The legacy `{_index:03}` / `{_index?:03}` syntax still parses, but it's now treated as a regular user-bound padded variable — the auto-allocation behavior is reserved for the explicit `{###}` form. If you have a custom project template that uses `{_index:NN}` for sequence slots, rewrite it as `{###}` (or `{###?}` for the optional form). See [issue #4991](https://github.com/griptape-ai/griptape-nodes-engine/issues/4991) for the migration context.
 
 ### String transformations
 
@@ -183,11 +176,12 @@ When a macro is resolved, directory names and builtin variables are supplied aut
 For example, resolving the `save_node_output` situation macro:
 
 ```
-Template:   {outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
+Template:   {outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{###?}.{file_extension}
 
 Automatic:  outputs → resolved from the "outputs" directory definition → "outputs"
-Provided:   node_name="StyleTransfer", file_name_base="portrait", _index=3, file_extension="png"
-Result:     outputs/StyleTransfer_portrait003.png
+Provided:   node_name="StyleTransfer", file_name_base="portrait", file_extension="png"
+Result (first save):       outputs/StyleTransfer_portrait.png
+Result (second, on collision): outputs/StyleTransfer_portrait001.png
 ```
 
 Directory names (like `outputs`) are automatically resolved to their configured paths. See [Directories](directories.md).
@@ -201,7 +195,7 @@ The macro system can also work in reverse: given an actual path and a macro temp
 For example:
 
 ```
-Template:  {outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
+Template:  {outputs}/{node_name?:_}{file_name_base}{###?}.{file_extension}
 Path:      outputs/StyleTransfer_portrait003.png
 Extracted: outputs="outputs", node_name="StyleTransfer", file_name_base="portrait", _index=3, file_extension="png"
 ```

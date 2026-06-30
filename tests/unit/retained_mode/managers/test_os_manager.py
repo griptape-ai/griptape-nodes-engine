@@ -1979,30 +1979,23 @@ class TestGetNextUnusedFilenameRequest:
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
     def test_sequence_format_glob_uses_permissive_wildcard(self, griptape_nodes: GriptapeNodes) -> None:
-        """The glob builder emits ``*`` for ``SequenceFormat`` slots, not fixed-width ``?`` chars.
+        """The glob builder emits ``*`` for ``SequenceFormat`` slots.
 
-        Pins the new branch added for #4902: ``SequenceFormat`` means
-        *minimum* width N, so the scan must use a permissive wildcard that
-        also matches values whose digit count overflows N. Contrast with
-        the legacy ``NumericPaddingFormat`` glob (fixed-width via N copies
-        of ``?``), which is unchanged.
+        Pins #4902's contract: ``SequenceFormat`` means *minimum* width N,
+        so the scan must use a permissive wildcard that also matches values
+        whose digit count overflows N. Without this, an existing `_v1000.png`
+        wouldn't show up in the scan when min_width=3, and the gap-fill
+        would misreport the next available index.
         """
         from griptape_nodes.common.macro_parser.resolution import partial_resolve
 
         os_manager = griptape_nodes.OSManager()
         secrets_manager = GriptapeNodes.SecretsManager()
 
-        # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
         sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
         sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
         sequence_glob = os_manager._build_glob_pattern_from_partially_resolved(sequence_partial.segments, "_index")
         assert sequence_glob == "/anywhere/render_v*.png"
-
-        # `NumericPaddingFormat` (legacy): fixed-width `???` (one `?` per digit).
-        legacy_macro = ParsedMacro("/anywhere/render_v{_index:03}.png")
-        legacy_partial = partial_resolve(legacy_macro.template, legacy_macro.segments, {}, secrets_manager)
-        legacy_glob = os_manager._build_glob_pattern_from_partially_resolved(legacy_partial.segments, "_index")
-        assert legacy_glob == "/anywhere/render_v???.png"
 
 
 class TestGetNextVersionIndexRequest:

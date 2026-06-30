@@ -2513,7 +2513,7 @@ class TestWorkflowSaveSituationMacro:
     """Regression coverage for #4941: the save_workflow situation macro is honored.
 
     When a project customizes the ``save_workflow`` situation to use
-    ``create_new`` with a padded `{_index:03}` slot, the workflow save path
+    ``create_new`` with a padded `{###}` slot, the workflow save path
     must thread the unresolved ``ProjectFileDestination`` through to OSManager
     so the seed-and-retry contract for missing required ``{x:NN}`` slots fires.
     Pre-resolving the macro upstream (the bug fixed here) strips that context
@@ -2528,7 +2528,7 @@ class TestWorkflowSaveSituationMacro:
     def setup_versioned_save_workflow_project(
         self, temp_dir: Path, griptape_nodes: GriptapeNodes
     ) -> "Generator[None, None, None]":
-        """Load a project that overrides save_workflow to CREATE_NEW with a `{_index:03}` slot.
+        """Load a project that overrides save_workflow to CREATE_NEW with a `{###}` slot.
 
         Mirrors the fixture in TestCreateNewMacroIndexSeed: the project is loaded
         and activated BEFORE workspace_path is forced, so SetCurrentProjectRequest
@@ -2550,8 +2550,8 @@ class TestWorkflowSaveSituationMacro:
 
         versioned_save_workflow = SituationTemplate(
             name="save_workflow",
-            description="Versioned workflow save: {_index:03} required, CREATE_NEW policy.",
-            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
+            description="Versioned workflow save: {###} required, CREATE_NEW policy.",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}",
             policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
             fallback="save_file",
         )
@@ -2616,7 +2616,7 @@ class TestWorkflowSaveSituationMacro:
         return result.file_path
 
     def test_first_save_writes_v001(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """Bug #4941: the first save with `{_index:03}` must produce v001 (not fail with MISSING_REQUIRED)."""
+        """Bug #4941: the first save with `{###}` must produce v001 (not fail with MISSING_REQUIRED)."""
         saved_path = self._save(griptape_nodes, "my_workflow")
 
         assert Path(saved_path) == temp_dir / "my_workflow_v001.py"
@@ -2759,10 +2759,10 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             # The destination carries the create_versioned_workflow macro (unresolved
-            # `{_index:03}`), so OSManager's seed walks past existing v001 and lands
-            # at v002 on write.
+            # `{###}` sequence slot), so OSManager's seed walks past existing v001
+            # and lands at v002 on write.
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            assert "{###}" in target.destination._file.location
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
@@ -2839,7 +2839,7 @@ class TestCreateVersionedWorkflow:
         flipped = SituationTemplate(
             name="save_workflow",
             description="Customized to create_new",
-            macro="{workspace_dir}/{file_name_base}_v{_index:03}.{file_extension}",
+            macro="{workspace_dir}/{file_name_base}_v{###}.{file_extension}",
             policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
             fallback="save_file",
         )
@@ -2934,8 +2934,8 @@ class TestCreateVersionedWorkflow:
         situation = DEFAULT_PROJECT_TEMPLATE.situations.get(BuiltInSituation.CREATE_VERSIONED_WORKFLOW)
         assert situation is not None, "create_versioned_workflow missing from DEFAULT_PROJECT_TEMPLATE"
         assert situation.policy.on_collision == SituationFilePolicy.CREATE_NEW
-        # Padded `{_index:NN}` slot is what makes the seed-and-retry produce v001/v002/...
-        assert "_index" in situation.macro
+        # `{###}` sequence-slot shorthand is what makes the seed-and-retry produce v001/v002/...
+        assert "{###}" in situation.macro
 
     def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: GriptapeNodes) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
@@ -2949,7 +2949,7 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            assert "{###}" in target.destination._file.location
             # Base name comes from the explicit request; relative_file_path reflects
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"

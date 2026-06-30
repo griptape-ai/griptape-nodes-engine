@@ -27,7 +27,7 @@ from griptape_nodes.common.macro_parser import (
     ParsedMacro,
 )
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailureReason
-from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
+from griptape_nodes.common.macro_parser.formats import SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
 from griptape_nodes.common.sequences import (
@@ -890,29 +890,14 @@ class OSManager:
                 pattern_parts.append(segment.text)
             elif isinstance(segment, ParsedVariable):
                 if segment.info.name == index_var_name:
-                    # Pick the glob width based on the slot's format spec:
-                    #  - NumericPaddingFormat (legacy `{x:NN}`): exact width via
-                    #    fixed-count `?` wildcards. Matches the original semantics
-                    #    where `:03` means "exactly 3 digits."
-                    #  - SequenceFormat (new `###` shorthand): minimum width, so
-                    #    overflow values like `_v1000` against `###` are valid
-                    #    matches. Use the permissive `*` glob; the downstream
-                    #    integer extraction filters non-numeric matches.
-                    #  - Neither (no padding info): also `*`.
-                    matched_spec = False
-                    for format_spec in segment.format_specs:
-                        if isinstance(format_spec, NumericPaddingFormat):
-                            pattern_parts.append("?" * format_spec.width)
-                            matched_spec = True
-                            break
-                        if isinstance(format_spec, SequenceFormat):
-                            pattern_parts.append("*")
-                            matched_spec = True
-                            break
-
-                    if not matched_spec:
-                        # No padding-style format - match any number of digits
-                        pattern_parts.append("*")
+                    # Sequence slots (`{###}` shorthand) carry a `SequenceFormat`
+                    # spec with a *minimum* render width — overflow values like
+                    # `_v1000` against `{###}` are valid matches. Use the
+                    # permissive `*` glob; downstream integer extraction filters
+                    # non-numeric matches. Slots without a SequenceFormat fall
+                    # through to the same permissive `*` (defensive — the seed
+                    # step shouldn't have picked this slot in the first place).
+                    pattern_parts.append("*")
                 else:
                     # This shouldn't happen - all non-index variables should be resolved
                     msg = f"Unexpected unresolved variable '{segment.info.name}' when building glob pattern"
@@ -1062,25 +1047,25 @@ class OSManager:
 
     @staticmethod
     def _has_sequence_slot_marker(variable: ParsedVariable) -> bool:
-        """Return True when this variable should be treated as a sequence-allocated slot.
+        """Return True when this variable carries the explicit sequence-slot marker.
 
-        Two paths qualify, ORed together:
+        The marker is a ``SequenceFormat`` spec — emitted by the ``{###}`` /
+        ``{##?}`` shorthand in the macro template. It unambiguously says
+        "this slot is system-allocated; OSManager fills it with a sequence
+        number under CREATE_NEW."
 
-        1. **Explicit ``SequenceFormat`` marker** — emitted by ``###`` shorthand in
-           the macro template (issue #4902). Unambiguously says "this slot is
-           system-allocated; OSManager fills it with a sequence number."
-        2. **Legacy ``NumericPaddingFormat`` heuristic** — a ``{x:NN}`` slot that
-           the macro author intended to bind, but which CREATE_NEW has historically
-           treated as auto-indexable when it's the lone unresolved required variable.
-           Kept for backward compatibility with shipping project templates and the
-           documented behavior in [macros.md], [situations.md], and the default
-           situation macros. The OR is the load-bearing piece of #4902's
-           "introduce explicit syntax without breaking existing macros" strategy.
-
-        A follow-up cleanup will retire the heuristic path once project templates
-        and docs migrate to ``###``; until then both routes are equivalent.
+        Prior to issue #4991 this helper also recognized
+        ``NumericPaddingFormat`` on a lone unresolved variable as a legacy
+        heuristic, kept for backward compatibility with shipping project
+        templates. That branch was retired once the built-in macros
+        migrated to ``{###}`` / ``{##?}``. Numeric padding (``{x:NN}``)
+        now means exactly what the docs say it means — string formatting,
+        nothing more. If a custom project template still uses
+        ``{_index:NN}`` to opt into auto-indexing, the save will surface
+        ``MISSING_REQUIRED_VARIABLES`` pointing at the slot; the
+        migration is to rewrite it as ``{###}``.
         """
-        return any(isinstance(spec, (SequenceFormat, NumericPaddingFormat)) for spec in variable.format_specs)
+        return any(isinstance(spec, SequenceFormat) for spec in variable.format_specs)
 
     @staticmethod
     def _find_padded_unresolved_required(
@@ -1088,12 +1073,11 @@ class OSManager:
     ) -> ParsedVariable | None:
         """Find the single missing required variable that opts into auto-index seeding.
 
-        A macro author opts in by writing either ``###`` shorthand (parsed as a
-        sequence slot — see :class:`SequenceFormat`) or a single unresolved required
-        variable with a ``NumericPaddingFormat`` (``{x:NN}`` — legacy heuristic).
-        Either marker is the safety contract: without it, an unresolved ``{shot}``
-        could just as plausibly be a variable the user forgot to bind, and silently
-        filling it with ``1`` would write data under a name the user never intended.
+        A macro author opts in by writing ``{###}`` shorthand (parsed as a sequence
+        slot — see :class:`SequenceFormat`). That marker is the safety contract:
+        without it, an unresolved ``{shot}`` could just as plausibly be a variable
+        the user forgot to bind, and silently filling it with ``1`` would write data
+        under a name the user never intended.
 
         Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
         first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
@@ -1124,9 +1108,9 @@ class OSManager:
             return None
         candidate = matching[0]
 
-        # Gate 3: the slot must carry a sequence-allocation marker — either the
-        # explicit ``SequenceFormat`` (from ``###`` shorthand) or the legacy
-        # ``NumericPaddingFormat`` heuristic. Without it the macro author didn't opt in.
+        # Gate 3: the slot must carry a `SequenceFormat` marker (from `{###}` shorthand).
+        # Numeric-padding-only slots like `{x:NN}` are user-bound string formatting now,
+        # not sequence-allocated. Without the marker the macro author didn't opt in.
         if not OSManager._has_sequence_slot_marker(candidate):
             return None
 

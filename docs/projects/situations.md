@@ -10,11 +10,11 @@ When a node needs to save a file, it names the situation it's in (for example, `
 
 ## Collision policies
 
-| Policy       | Behavior                                                                                                                                                                                                                                                                                                                            |
-| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `create_new` | Increment a counter in the filename until a non-colliding name is found. The macro can include `{_index?:NN}` (optional — absent on the first save, indexed on collision) or `{_index:NN}` (required — indexed from the first save). If neither is present, the system appends `_1`, `_2`, … to the resolved filename on collision. |
-| `overwrite`  | Replace the existing file without asking.                                                                                                                                                                                                                                                                                           |
-| `fail`       | Stop and report an error if the file already exists.                                                                                                                                                                                                                                                                                |
+| Policy       | Behavior                                                                                                                                                                                                                                                                                                                                                                 |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `create_new` | Increment a counter in the filename until a non-colliding name is found. The macro can include a [sequence slot](macros.md#sequence-slot-) like `{###?}` (optional — absent on the first save, indexed on collision) or `{###}` (required — indexed from the first save). If neither is present, the system appends `_1`, `_2`, … to the resolved filename on collision. |
+| `overwrite`  | Replace the existing file without asking.                                                                                                                                                                                                                                                                                                                                |
+| `fail`       | Stop and report an error if the file already exists.                                                                                                                                                                                                                                                                                                                     |
 
 The `create_dirs` field controls whether intermediate parent directories are created automatically (`true`, like `mkdir -p`) or whether a missing parent directory causes an error (`false`).
 
@@ -27,16 +27,16 @@ A situation can name a fallback situation. If the primary situation cannot resol
 ### `save_file`
 
 ```
-macro:  {file_name_base}{_index?:03}.{file_extension}
+macro:  {file_name_base}{###?}.{file_extension}
 policy: create_new, create_dirs: true
 ```
 
-Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{_index?:03}` variable is zero-padded and optional — omitted on the first save, then `001`, `002`, … on collision (padded width preserved across the sequence).
+Generic file save at the project root (or wherever the caller's path context puts it). This is the fallback for most other situations. The `{###?}` slot is an optional [sequence position](macros.md#sequence-slot-) — omitted on the first save, then `001`, `002`, … on collision (3-digit minimum width preserved across the sequence).
 
 ### `copy_external_file`
 
 ```
-macro:    {inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}{_index?:03}.{file_extension}
+macro:    {inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}{###?}.{file_extension}
 policy:   create_new, create_dirs: true
 fallback: save_file
 ```
@@ -66,7 +66,7 @@ Used when a node downloads a file from a URL. The URL is sanitized into a safe f
 ### `save_node_output`
 
 ```
-macro:    {outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
+macro:    {outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{###?}.{file_extension}
 policy:   create_new, create_dirs: true
 fallback: save_file
 ```
@@ -76,8 +76,10 @@ Used when a node generates and saves output. Files go into the `outputs` directo
 **Example:**
 
 ```
-outputs="outputs", node_name="ImageGen", file_name_base="render", _index=1, file_extension="png"
-→ outputs/ImageGen_render001.png
+outputs="outputs", node_name="ImageGen", file_name_base="render", file_extension="png"
+  First save  → outputs/ImageGen_render.png            (sequence slot omitted)
+  Second save → outputs/ImageGen_render001.png         (slot fills in on collision)
+  Third save  → outputs/ImageGen_render002.png
 
 sub_dirs="lighting/pass_a", node_name="ImageGen", file_name_base="render", file_extension="exr"
 → outputs/lighting/pass_a/ImageGen_render.exr
@@ -106,7 +108,7 @@ Used by the static files manager to save static assets. Files go into the `stati
 ### `save_temp_file`
 
 ```
-macro:    {temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
+macro:    {temp}/{node_name?:_}{file_name_base}{###?}.{file_extension}
 policy:   overwrite, create_dirs: true
 fallback: save_file
 ```
@@ -136,16 +138,14 @@ sub_dirs="archived", file_name_base="my_workflow", file_extension="py"
 ### `create_versioned_workflow`
 
 ```
-macro:    {workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}
+macro:    {workspace_dir}/{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}
 policy:   create_new, create_dirs: true
 fallback: save_file
 ```
 
-Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next padded index in the sequence — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work. The trailing `_v###` suffix on the previous save is stripped before the next index is computed, so the sequence stays anchored to the base name.
+Used when a workflow is saved with the versioned-save intent. Every save produces a new file with the next sequence number — `my_workflow_v001.py`, `my_workflow_v002.py`, … — so users can keep snapshots without overwriting earlier work. The `{###}` token is the [sequence-slot shorthand](macros.md#sequence-slot-): each `#` contributes one digit to the minimum render width, with natural overflow past `999` to `1000`, `1001`, etc.
 
-> **Tip:** Custom projects can switch the auto-index slot to the more explicit `_v{###}` syntax (see [Sequence slot (`{###}`)](macros.md#sequence-slot-)). It behaves identically to `{_index:03}` for the default 3-digit case and overflows naturally past `999` instead of staying zero-padded.
-
-This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
+This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Sequence slot](macros.md#sequence-slot-) for the auto-index contract.
 
 > **Note**: Customizing `save_workflow` to use `create_new` directly (instead of using `create_versioned_workflow` + the flag) emits a warning at save time. The configuration still works — the first save lands at `_v001` — but every subsequent save hits the in-place overwrite branch and writes back to `_v001` rather than advancing to `_v002`. Use `create_versioned_workflow` for true versioning.
 

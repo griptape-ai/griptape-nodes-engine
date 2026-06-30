@@ -21,7 +21,7 @@ from unittest.mock import patch
 import pytest
 from PIL import Image
 
-from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.macro_parser import MacroParseFailureReason, MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination, FileLoadError, FileWriteError
@@ -857,7 +857,7 @@ class TestCreateNewMacroIndexSeed:
 
     def test_first_save_with_padded_required_index_writes_v001(self, outputs_dir: Path) -> None:
         """Bug #4875: the first save must produce v001, not fail with MISSING_REQUIRED."""
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         self._save(macro_path, b"first")
 
@@ -865,7 +865,7 @@ class TestCreateNewMacroIndexSeed:
 
     def test_subsequent_saves_increment_with_padding_preserved(self, outputs_dir: Path) -> None:
         """Three saves in a row must produce v001, v002, v003 — not v001, v001_1, v001_2."""
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         for _ in range(3):
             self._save(macro_path, b"x")
@@ -879,7 +879,7 @@ class TestCreateNewMacroIndexSeed:
         (outputs_dir / "render_v001.png").write_bytes(b"existing")
         (outputs_dir / "render_v003.png").write_bytes(b"existing")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         self._save(macro_path, b"new")
 
@@ -887,13 +887,13 @@ class TestCreateNewMacroIndexSeed:
         assert (outputs_dir / "render_v002.png").read_bytes() == b"new"
 
     def test_hash_shorthand_macro_auto_allocates_like_padded_legacy(self, outputs_dir: Path) -> None:
-        """A `{###}` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{_index:03}` form.
+        """A `{###}` sequence-slot macro auto-allocates v001/v002/v003 just like the legacy `{###}` form.
 
         Drives the production write path through the new explicit syntax. The
         parser emits a ``SequenceFormat`` slot which ``_has_sequence_slot_marker``
         recognizes through the seed gate and the collision-walk gate — so the
         ``{###}`` macro produces the same v001/v002/v003 sequence as the legacy
-        ``{_index:03}`` form would. (The glob-builder's ``SequenceFormat`` →
+        ``{###}`` form would. (The glob-builder's ``SequenceFormat`` →
         `*` branch is a separate code path exercised by
         ``test_sequence_format_glob_uses_permissive_wildcard`` in
         ``test_os_manager.py``.)
@@ -953,7 +953,7 @@ class TestCreateNewMacroIndexSeed:
         (outputs_dir / "render[final]_v001.png").write_bytes(b"existing")
 
         macro_path = MacroPath(
-            ParsedMacro("{outputs}/{file_name_base}_v{_index:03}.png"),
+            ParsedMacro("{outputs}/{file_name_base}_v{###}.png"),
             {"file_name_base": "render[final]"},
         )
 
@@ -984,7 +984,7 @@ class TestCreateNewMacroIndexSeed:
 
         # Macro author binds the NFC form (the form their text editor / API likely produced).
         macro_path = MacroPath(
-            ParsedMacro("{outputs}/{file_name_base}_v{_index:03}.png"),
+            ParsedMacro("{outputs}/{file_name_base}_v{###}.png"),
             {"file_name_base": unicodedata.normalize("NFC", "café")},
         )
 
@@ -1002,13 +1002,13 @@ class TestCreateNewMacroIndexSeed:
     def test_non_create_new_policies_do_not_seed_padded_index(
         self, outputs_dir: Path, policy: ExistingFilePolicy
     ) -> None:
-        """OVERWRITE and FAIL must NOT auto-seed `{_index:03}` — that's CREATE_NEW's contract.
+        """OVERWRITE and FAIL must NOT auto-seed `{###}` — that's CREATE_NEW's contract.
 
         ``GetPathForMacroRequest`` only fires the auto-seed when ``existing_file_policy``
         is ``CREATE_NEW``. Other policies surface MISSING_REQUIRED_VARIABLES so callers
         see a real configuration error rather than silently allocating an indexed path.
         """
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         # Write surfaces the macro-resolution failure as a FileWriteError (the failure
         # happens inside OSManager during WriteFileRequest, not in file.py's resolver).
@@ -1020,7 +1020,7 @@ class TestCreateNewMacroIndexSeed:
         assert not any(outputs_dir.iterdir())
 
     def test_read_path_does_not_seed_padded_index(self, outputs_dir: Path) -> None:
-        """`File.read()` against a padded `{_index:03}` macro must fail loudly, not auto-allocate.
+        """`File.read()` against a padded `{###}` macro must fail loudly, not auto-allocate.
 
         The seed-on-retry only fires when ``_resolve_file_path`` is called with
         ``existing_file_policy=CREATE_NEW``. Read paths leave the policy as ``None`` so an
@@ -1031,38 +1031,33 @@ class TestCreateNewMacroIndexSeed:
         # Pre-populate so even if the seed mistakenly fires, there's something to "find".
         (outputs_dir / "render_v001.png").write_bytes(b"existing")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         with pytest.raises(FileLoadError) as excinfo:
             File(macro_path).read()
 
         assert excinfo.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
 
-    def test_same_index_variable_used_in_directory_and_filename(self, outputs_dir: Path) -> None:
-        """Same `{_index:03}` referenced twice (as dir AND filename component) — both seeded equally.
+    def test_two_sequence_slots_in_same_macro_rejected_at_parse_time(self) -> None:
+        """Two `{###}` blocks in one macro are rejected up front by the parser.
 
-        ``_find_padded_unresolved_required`` picks the first ParsedVariable matching the
-        missing name; ``GetPathForMacroRequest.resolve`` then renders BOTH occurrences with
-        the same value. Pre-create a v001 sibling so the scan must gap-fill / extend.
+        Pre-#4991 the legacy `{_index:03}` form let the same variable
+        appear in two slots — both bound to the same value (e.g. `v003/render_v003.png`).
+        Under the new sequence-slot semantics, `{###}` is a sigil rather than a
+        named variable, so two occurrences are two independent slots that OSManager
+        can't disambiguate. The parser catches this at parse time.
 
-        Currently xfail — see issue link in the marker. Promote to expected-pass when
-        #4915 lands.
+        If a future use-case needs the same index in two spots, the explicit
+        ``{_index:NN}`` form is the escape hatch (user-bound, set the value
+        manually). See #4915 for the broader directory-component-index design.
         """
-        # Pre-existing v001 directory + v001 file inside.
-        (outputs_dir / "v001").mkdir()
-        (outputs_dir / "v001" / "render_v001.png").write_bytes(b"existing")
-
-        macro_path = MacroPath(ParsedMacro("{outputs}/v{_index:03}/render_v{_index:03}.png"), {})
-
-        self._save(macro_path, b"new")
-
-        # Same index value applied to both directory and filename → v002/render_v002.png.
-        assert (outputs_dir / "v002" / "render_v002.png").exists()
-        assert (outputs_dir / "v002" / "render_v002.png").read_bytes() == b"new"
+        with pytest.raises(MacroSyntaxError) as exc_info:
+            ParsedMacro("{outputs}/v{###}/render_v{###}.png")
+        assert exc_info.value.failure_reason == MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS
 
 
 class TestOptionalPaddedIndexCollision:
-    """Regression tests for #4544 / #4092: `{_index?:03}` padding preserved on collision.
+    """Regression tests for #4544 / #4092: `{###?}` padding preserved on collision.
 
     Optional padded slots (`{x?:NN}`) were rendering as `_1`, `_2`, … on collision
     because the convert-on-collision branch synthesized `{stem}_{_index}` from the
@@ -1107,15 +1102,15 @@ class TestOptionalPaddedIndexCollision:
     # --- Required `{x:03}` shape ----------------------------------------------------
 
     def test_required_padded_first_save_writes_001(self, outputs_dir: Path) -> None:
-        """Required `{_index:03}` first save: seed assigns 1, lands at v001."""
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        """Required `{###}` first save: seed assigns 1, lands at v001."""
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
         self._save(macro_path, b"first")
         assert (outputs_dir / "render_v001.png").exists()
 
     def test_required_padded_collision_walks_to_002(self, outputs_dir: Path) -> None:
-        """Required `{_index:03}` second save: walks to v002 with padding preserved."""
+        """Required `{###}` second save: walks to v002 with padding preserved."""
         (outputs_dir / "render_v001.png").write_bytes(b"existing")
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
         self._save(macro_path, b"second")
         assert (outputs_dir / "render_v002.png").exists()
         # Negative: the buggy convert-on-collision shape produced this name.
@@ -1124,13 +1119,13 @@ class TestOptionalPaddedIndexCollision:
     # --- Optional `{x?:03}` shape (the #4544 / #4092 regression tests) --------------
 
     def test_optional_padded_first_save_writes_unindexed(self, outputs_dir: Path) -> None:
-        """Optional `{_index?:03}` first save: index slot is OMITTED (no padding rendered).
+        """Optional `{###?}` first save: index slot is OMITTED (no padding rendered).
 
         This is the optional-`?` contract: the slot disappears entirely when no value
         is supplied. The auto-index seed only fires for REQUIRED missing vars, so the
         first save resolves with `_index` simply not present in the output.
         """
-        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{###?}.png"), {})
         self._save(macro_path, b"first")
         # No padded suffix on the first save — the optional slot vanishes.
         assert (outputs_dir / "file.png").exists()
@@ -1141,17 +1136,17 @@ class TestOptionalPaddedIndexCollision:
         assert index_files == [], f"Unexpected index files: {index_files}"
 
     def test_optional_padded_collision_walks_to_001_padded(self, outputs_dir: Path) -> None:
-        """Optional `{_index?:03}` SECOND save: walks to padded `_001`, NOT unpadded `_1`.
+        """Optional `{###?}` SECOND save: walks to padded `_001`, NOT unpadded `_1`.
 
         This is the bug #4544 / #4092 regression test. Pre-fix behavior:
         `_convert_str_path_to_macro_with_index("file.png")` synthesized
         `file_{_index}.png` (no format spec) → produced `file_1.png`. The fix walks
-        the user's ORIGINAL macro's `{_index?:03}` slot, preserving the `:03` format.
+        the user's ORIGINAL macro's `{###?}` slot, preserving the `:03` format.
         """
         # Pre-create the un-indexed base so the next save MUST walk to a padded index.
         (outputs_dir / "file.png").write_bytes(b"existing un-indexed")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{###?}.png"), {})
         self._save(macro_path, b"second")
 
         # Correct outcome with the fix: padded index from the original macro.
@@ -1162,11 +1157,11 @@ class TestOptionalPaddedIndexCollision:
         assert not (outputs_dir / "file_001.png").exists()  # different separator shape
 
     def test_optional_padded_third_save_walks_to_002(self, outputs_dir: Path) -> None:
-        """Optional `{_index?:03}` THIRD save: continues padded — 002, not _1 or _2."""
+        """Optional `{###?}` THIRD save: continues padded — 002, not _1 or _2."""
         (outputs_dir / "file.png").write_bytes(b"existing un-indexed")
         (outputs_dir / "file001.png").write_bytes(b"existing v001")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/file{_index?:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{###?}.png"), {})
         self._save(macro_path, b"third")
 
         assert (outputs_dir / "file002.png").exists()
@@ -1255,7 +1250,7 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         # Pre-create v003 to simulate a racer's win (or a prior save in this series).
         (outputs_dir / "render_v003.png").write_bytes(b"existing race winner")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         # The seed assigns 1 → resolves to v001 → write succeeds (no v001 yet).
         # To exercise the collision-walk we need to land on a slot that already exists.
@@ -1290,7 +1285,7 @@ class TestCreateNewMacroIndexSeedDefensiveFallthrough:
         for i in range(1, MAX_INDEXED_CANDIDATES + 2):
             (outputs_dir / f"render_v{i:03}.png").write_bytes(b"taken")
 
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         with pytest.raises(FileWriteError) as excinfo:
             FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(
@@ -1366,7 +1361,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
 
         # Match the deep template — repeat the segment 12 times under {outputs}.
         sub = "/".join([deep_segment] * 12)
-        macro_path = MacroPath(ParsedMacro(f"{{outputs}}/{sub}/render_v{{_index:03}}.png"), {})
+        macro_path = MacroPath(ParsedMacro(f"{{outputs}}/{sub}/render_v{{###}}.png"), {})
 
         FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(b"new")
 
@@ -1387,7 +1382,7 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
         (outputs_dir / "render_v002.png").write_bytes(b"existing")
 
         # POSIX-style template; production macros always use `/`.
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(b"new")
 
