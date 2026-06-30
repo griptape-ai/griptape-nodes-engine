@@ -61,6 +61,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post,
         ):
             # Setup mocks
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
             mock_griptape.OSManager.return_value = mock_os_manager
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -91,6 +94,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post,
         ):
             # Setup mocks
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
             mock_griptape.OSManager.return_value = mock_os_manager
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -131,6 +137,9 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
             patch("griptape_nodes.drivers.storage.local_storage_driver.httpx.post") as mock_post,
         ):
             # Setup mocks
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
             mock_griptape.OSManager.return_value = mock_os_manager
             mock_os_manager.on_write_file_request.return_value = mock_write_success_result
             mock_post_response = Mock()
@@ -157,7 +166,13 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
 
     def test_internal_file_uses_workspace_relative_url(self, local_storage_driver: LocalStorageDriver) -> None:
         """Internal files should produce a workspace-relative URL."""
-        with patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time:
+        with (
+            patch("griptape_nodes.drivers.storage.local_storage_driver.time") as mock_time,
+            patch("griptape_nodes.drivers.storage.local_storage_driver.GriptapeNodes") as mock_griptape,
+        ):
+            mock_config_manager = Mock()
+            mock_config_manager.workspace_path = Path("/workspace")
+            mock_griptape.ConfigManager.return_value = mock_config_manager
             mock_time.time.return_value = 1000
             url = local_storage_driver.create_signed_download_url(Path("/workspace/images/photo.png"))
 
