@@ -2032,43 +2032,71 @@ class EndNode(BaseNode):
 
 
 class ErrorProxyNode(BaseNode):
-    """A proxy node that substitutes for nodes that failed to create due to missing dependencies or errors.
+    """A proxy node that substitutes for nodes that failed to create due to missing dependencies, policy denials, or errors.
 
     This node maintains the original node type information and allows workflows to continue loading
     even when some node types are unavailable. It generates parameters dynamically as connections
     and values are assigned to maintain workflow structure.
+
+    A node denied by an authorization policy is a recoverable restriction rather than a broken node,
+    so `denied_by_policy` substitutes a warning treatment for the hard-error one and explains the
+    cause as a permission gate instead of a load failure. The engine stays policy-agnostic: the
+    specific reason text arrives in `failure_reason` from whatever hook denied the node.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         name: str,
         original_node_type: str,
         original_library_name: str,
         failure_reason: str,
         metadata: dict[Any, Any] | None = None,
+        *,
+        denied_by_policy: bool = False,
     ) -> None:
         super().__init__(name, metadata)
 
         self.original_node_type = original_node_type
         self.original_library_name = original_library_name
         self.failure_reason = failure_reason
+        self.denied_by_policy = denied_by_policy
+
+        # The owning library/node type are normally injected into metadata by
+        # LibraryRegistry.create_node, but a proxy is created precisely because that
+        # path failed, so the keys may be absent. Record the original library and node
+        # type here (without clobbering anything a round-tripped workflow already
+        # carried) so serialization can resolve the library and the proxy round-trips.
+        self.metadata.setdefault("library", original_library_name)
+        self.metadata.setdefault("node_type", original_node_type)
         # Record ALL initial_setup=True requests in order for 1:1 replay
         self._recorded_initialization_requests: list[RequestPayload] = []
 
         # Track if user has made connection modifications after initial setup
         self._has_connection_modifications: bool = False
 
-        # Add error message parameter explaining the failure
+        # A policy denial is a recoverable "not yet permitted" state, not a broken
+        # node, so it surfaces as a warning rather than an error. Markdown lets the
+        # message emphasize that distinction; the editor renders both the variant and the markdown.
         self._error_message = ParameterMessage(
             name="error_proxy_message",
-            variant="error",
+            variant="warning" if denied_by_policy else "error",
             value="",  # Will be set by _update_error_message
+            markdown=denied_by_policy,
         )
         self.add_node_element(self._error_message)
         self._update_error_message()
 
     def _get_base_error_message(self) -> str:
         """Generate the base error message for this ErrorProxyNode."""
+        if self.denied_by_policy:
+            return (
+                f"**Permission denied**\n\n"
+                f"You don't have permission to use the **{self.original_node_type}** node from the "
+                f"**{self.original_library_name}** library, so this placeholder is holding its spot.\n\n"
+                f"{self.failure_reason}\n\n"
+                f"Your original node will be restored automatically once permission is granted. "
+                f"Contact your administrator if you need this capability enabled."
+            )
         return (
             f"This placeholder stands in for the '{self.original_node_type}' node "
             f"from the '{self.original_library_name}' library, which could not be loaded.\n\n"
