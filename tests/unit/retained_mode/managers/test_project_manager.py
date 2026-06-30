@@ -165,8 +165,15 @@ class TestProjectManagerMacroHandlers:
         GriptapeNodes.ConfigManager().workspace_path = workspace
 
         try:
+            # Macro templates use forward-slash separators (the cross-platform
+            # convention). On Windows the OS-native absolute path comes back
+            # with backslashes; normalize to POSIX so the static-text
+            # comparison between `{workspace_dir}` and the next segment lines
+            # up regardless of OS. The match handler POSIX-normalizes its
+            # auto-resolved directory builtins, so both sides agree on
+            # separator without the caller having to inject workspace_dir.
             parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
-            absolute_path = str(workspace / "my_workflow.py")
+            absolute_path = (workspace / "my_workflow.py").as_posix()
 
             request = AttemptMatchPathAgainstMacroRequest(
                 parsed_macro=parsed_macro,

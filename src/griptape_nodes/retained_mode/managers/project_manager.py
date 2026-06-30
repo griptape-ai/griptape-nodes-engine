@@ -2478,6 +2478,23 @@ class ProjectManager:
                             f"{', '.join(sorted(resolution.conflicts))}"
                         ),
                     )
+                # POSIX-normalize auto-resolved directory builtins so reverse-match
+                # works cross-platform. Macro templates use forward-slash separators
+                # (the authoring convention); on Windows the builtins come back with
+                # backslashes and the literal-text comparison between segments would
+                # then fail. Only touch auto-resolved values — a caller who supplied
+                # their own known_variables gets them used verbatim. Non-directory
+                # builtins (workflow_name, project_name, ...) aren't paths, so they
+                # pass through untouched.
+                for builtin_name in BUILTIN_VARIABLES:
+                    if builtin_name in request.known_variables:
+                        continue
+                    builtin_info = _BUILTIN_VARIABLE_INFO.get(builtin_name)
+                    if builtin_info is None or not builtin_info.is_directory:
+                        continue
+                    value = merged_known_variables.get(builtin_name)
+                    if isinstance(value, str):
+                        merged_known_variables[builtin_name] = Path(value).as_posix()
 
         extracted = request.parsed_macro.extract_variables(
             request.file_path,

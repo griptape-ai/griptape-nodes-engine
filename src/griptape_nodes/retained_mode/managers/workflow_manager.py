@@ -2627,11 +2627,16 @@ class WorkflowManager:
         # end-to-end. Use WorkflowRegistry.get_complete_file_path — the same
         # absolutize helper non-versioned saves use — so the anchor value
         # the macro sees here matches the rest of the save plumbing.
-        absolute_path = WorkflowRegistry.get_complete_file_path(file_path)
+        #
+        # Macro templates use forward-slash separators (the cross-platform
+        # convention). On Windows the absolute path comes back with
+        # backslashes; normalize to POSIX so the static-text comparison
+        # between `{workspace_dir}` and the next segment lines up. The
+        # match handler's auto-resolve path POSIX-normalizes the directory
+        # builtins it injects, so both sides agree on separator regardless
+        # of OS.
+        absolute_path = Path(WorkflowRegistry.get_complete_file_path(file_path)).as_posix()
 
-        # Ask the match handler to resolve builtins (workspace_dir, workflow_dir, ...)
-        # itself; the macro's directory anchors need them to line up with the
-        # absolute path.
         match_result = GriptapeNodes.handle_request(
             AttemptMatchPathAgainstMacroRequest(
                 parsed_macro=parsed_macro,
