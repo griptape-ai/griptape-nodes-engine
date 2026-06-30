@@ -36,7 +36,7 @@ from griptape_nodes.exe_types.node_types import (
     VariableReference,
 )
 from griptape_nodes.machines.control_flow import CompleteState, ControlFlowMachine
-from griptape_nodes.machines.dag_builder import DagBuilder
+from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import LibraryNameAndNodeType
 from griptape_nodes.retained_mode.events.base_events import (
@@ -4505,39 +4505,62 @@ class FlowManager:
                         return connection.get_source_node()
         return None
 
-    def get_start_node_queue(self) -> Queue | None:  # noqa: C901, PLR0912, PLR0915
-        # For cross-flow execution, we need to consider ALL nodes across ALL flows
-        # Clear and use the global execution queue
+    def get_start_node_queue(self) -> Queue | None:
+        # For cross-flow execution, we consider ALL nodes across ALL (non-referenced) flows.
+        # Referenced subflows are executed explicitly via StartLocalSubflowRequest and must not
+        # participate in the top-level queue; SubflowNodeGroup children run inside their group's
+        # subflow. Both are ownership/scope decisions and live here, NOT in the classifier, so
+        # the classifier stays scope-agnostic and is shared with isolated subflow execution.
         self._global_flow_queue.queue.clear()
 
-        # Get all flows and collect all nodes across all flows.
-        # Exclude nodes from referenced subflows - they are executed explicitly via
-        # StartLocalSubflowRequest and should not participate in the top-level queue.
         all_flows = GriptapeNodes.ObjectManager().get_filtered_subset(type=ControlFlow)
-        all_nodes = []
+        scope_nodes: list[BaseNode] = []
         for current_flow in all_flows.values():
-            if not self.is_referenced_workflow(current_flow):
-                all_nodes.extend(current_flow.nodes.values())
+            if self.is_referenced_workflow(current_flow):
+                continue
+            for node in current_flow.nodes.values():
+                if node.parent_group is not None and isinstance(node.parent_group, SubflowNodeGroup):
+                    continue
+                scope_nodes.append(node)
 
         # if no nodes across all flows, no execution possible
-        if not all_nodes:
+        if not scope_nodes:
             return None
 
-        data_nodes = []
-        valid_data_nodes = []
-        start_nodes = []
-        control_nodes = []
-        cn_mgr = self.get_connections()
-        for node in all_nodes:
-            # Skip nodes that are children of a SubflowNodeGroup - they should not be start nodes
-            if node.parent_group is not None and isinstance(node.parent_group, SubflowNodeGroup):
-                continue
+        categories = self.classify_nodes_for_dag(scope_nodes)
 
-            # if it's a start node, start here! Return the first one!
+        # populate the global flow queue with node type information
+        for node in categories.start_nodes:
+            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.START_NODE))
+        for node in categories.control_nodes:
+            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.CONTROL_NODE))
+        for node in categories.data_sink_nodes:
+            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.DATA_NODE))
+
+        return self._global_flow_queue
+
+    def classify_nodes_for_dag(self, nodes: list[BaseNode]) -> DagNodeCategories:  # noqa: C901, PLR0912, PLR0915
+        """Bucket a scope of nodes into start / control-entry / data-sink roles for DAG seeding.
+
+        This is scope-agnostic: callers decide which nodes are in scope (a whole flow's worth of
+        nodes for a top-level run, or a single subflow's nodes for an isolated subflow run). The
+        same categorization then drives DAG seeding for both, so the two paths cannot drift.
+
+        - StartNode instances are start nodes.
+        - A node with active control parameters is a control-entry node unless it has an external
+          incoming control connection (in which case the forward control walk reaches it).
+        - A node with no active control parameters is a data node; data nodes with no external
+          outgoing connection are terminal/leaf sinks and get seeded so their dependencies resolve.
+        """
+        data_nodes: list[BaseNode] = []
+        start_nodes: list[BaseNode] = []
+        control_nodes: list[BaseNode] = []
+        cn_mgr = self.get_connections()
+        for node in nodes:
+            # if it's a start node, start here!
             if isinstance(node, StartNode):
                 start_nodes.append(node)
                 continue
-            # no start nodes. let's find the first control node.
             # if it's a control node, there could be a flow.
             control_param = False
             for parameter in node.parameters:
@@ -4555,7 +4578,6 @@ class FlowManager:
             if not control_param:
                 # saving this for later
                 data_nodes.append(node)
-                # If this node doesn't have a control connection..
                 continue
             # check if it has an incoming connection. If it does, it's not a start node
             has_control_connection = False
@@ -4598,11 +4620,9 @@ class FlowManager:
             else:
                 control_nodes.append(node)
 
-        # If we've gotten to this point, there are no control parameters
-        # Let's return a data node that has no OUTGOING data connections!
+        # A data node with no OUTGOING (non-internal) data connection is a terminal/leaf sink.
+        valid_data_nodes: list[BaseNode] = []
         for node in data_nodes:
-            cn_mgr = self.get_connections()
-            # Check if the node has any non-internal outgoing connections
             has_external_outgoing = False
             if node.name in cn_mgr.outgoing_index:
                 for param_name in cn_mgr.outgoing_index[node.name]:
@@ -4619,15 +4639,10 @@ class FlowManager:
             # Only add nodes that have no non-internal outgoing connections
             if not has_external_outgoing:
                 valid_data_nodes.append(node)
-        # ok now - populate the global flow queue with node type information
-        for node in start_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.START_NODE))
-        for node in control_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.CONTROL_NODE))
-        for node in valid_data_nodes:
-            self._global_flow_queue.put(QueueItem(node=node, dag_execution_type=DagExecutionType.DATA_NODE))
 
-        return self._global_flow_queue
+        return DagNodeCategories(
+            start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=valid_data_nodes
+        )
 
     def get_connected_input_from_node(self, flow: ControlFlow, node: BaseNode) -> list[tuple[BaseNode, Parameter]]:  # noqa: ARG002
         global_connections = self.get_connections()
