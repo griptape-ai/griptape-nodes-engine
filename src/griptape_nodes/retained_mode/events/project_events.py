@@ -907,12 +907,14 @@ class UpgradeProjectSchemaRequest(RequestPayload):
     A within-major version advance happens automatically on save; crossing a MAJOR
     (e.g. 0.x -> 1.0.0) does not, because the new major carries a different defaults
     baseline that can change where the project resolves its workspace, libraries, and
-    file destinations. This request performs that crossing explicitly: it restamps the
-    project's `project_template_schema_version` to the latest and re-saves, so the
-    project adopts the new-major defaults.
+    file destinations. This request performs that crossing explicitly: it re-reads the
+    project's explicit overrides (its own overlay, not the materialized old-major
+    defaults), restamps to the latest version, and re-merges onto the new-major base, so
+    the project ADOPTS the new-major defaults for everything it did not explicitly override.
 
-    BREAKING: this is opt-in and may change the project's effective layout. It does NOT
-    migrate existing values to preserve prior behavior.
+    BREAKING: this is opt-in and may change the project's effective layout. Only the
+    project's explicit overrides are preserved; previously-default values are dropped so
+    they pick up the new-major defaults (it does not pin old behavior).
 
     Use when: the user explicitly chooses to upgrade an outdated project.
 

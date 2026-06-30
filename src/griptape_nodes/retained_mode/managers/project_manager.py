@@ -2222,19 +2222,25 @@ class ProjectManager:
             result_details=f"Successfully saved project template to '{request.project_path}'",
         )
 
-    def on_upgrade_project_schema_request(
+    async def on_upgrade_project_schema_request(  # noqa: PLR0911
         self, request: UpgradeProjectSchemaRequest
     ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
         """Electively upgrade a loaded project to the latest schema major and re-save.
 
         A within-major advance happens automatically on save; this performs the explicit,
-        opt-in crossing of a major boundary. It restamps the project's schema version to the
-        latest and delegates to the normal save path, so the re-diff happens against the
-        new-major default baseline and the file adopts the new-major defaults. BREAKING: it
-        does not migrate values to preserve prior behavior.
+        opt-in crossing of a major boundary so the project ADOPTS the new major's defaults.
 
-        Failure cases (evaluated first): the project is not loaded, has no backing file, or is
-        already at the latest major. Only then is the upgrade performed.
+        It re-reads the project's own on-disk OVERLAY (its explicit customizations only -- NOT
+        the merged template, whose inherited fields were materialized to the old-major values at
+        load), restamps that overlay to the latest version, and re-merges it onto the new-major
+        base. Re-saving that merged template diffs it back against the same new-major base, so a
+        field the user never overrode is omitted and falls through to the NEW default, while
+        genuine user overrides survive. BREAKING: a project's effective workspace/library/file
+        layout can change, which is exactly the point of crossing a major.
+
+        Failure cases (evaluated first): not loaded, no backing file, already at/ahead of the
+        latest major (or an unparsable version), the overlay can't be re-read, or the re-save
+        fails. Only then is the upgrade performed.
         """
         project_info = self._successfully_loaded_project_templates.get(request.project_id)
         if project_info is None:
@@ -2270,14 +2276,39 @@ class ProjectManager:
                 ),
             )
 
-        # Restamp to the latest version and re-save through the normal path, which re-diffs
-        # against the new-major default baseline (default_template_for_version) and writes.
-        template_data = project_info.template.model_dump(mode="json")
-        template_data["project_template_schema_version"] = latest_version
+        # Re-read the project's OWN overlay (explicit fields only) so inherited values are NOT
+        # carried over as old-major pins. Restamp it to the latest version, then re-merge onto
+        # the base for that version + the project's parent chain (the same base the save path
+        # re-diffs against), so un-overridden fields adopt the new-major defaults.
+        project_file_path = project_info.project_file_path
+        overlay_load = await self._read_overlay(project_file_path, record_status=False)
+        if isinstance(overlay_load, LoadProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its project file could not be re-read: {overlay_load.result_details}"
+                ),
+            )
+        _, overlay = overlay_load
+        upgraded_overlay = overlay._replace(project_template_schema_version=latest_version)
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        base_template = await self._resolve_parent_chain(
+            upgraded_overlay, project_file_path, validation, visited={canonicalize_for_identity(project_file_path)}
+        )
+        if base_template is None or not validation.is_usable():
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the upgraded template could not be resolved against the latest base."
+                ),
+            )
+        upgraded_template = ProjectTemplate.merge(base_template, upgraded_overlay, validation)
+
         save_result = self.on_save_project_template_request(
             SaveProjectTemplateRequest(
-                project_path=project_info.project_file_path,
-                template_data=template_data,
+                project_path=project_file_path,
+                template_data=upgraded_template.model_dump(mode="json"),
             )
         )
         if isinstance(save_result, SaveProjectTemplateResultFailure):
@@ -2294,7 +2325,7 @@ class ProjectManager:
             new_schema_version=latest_version,
             result_details=(
                 f"Upgraded project '{request.project_id}' from schema '{previous_version}' "
-                f"to '{latest_version}'. The project now uses the new-major defaults; its "
+                f"to '{latest_version}'. The project now adopts the new-major defaults; its "
                 f"effective workspace/library/file layout may have changed."
             ),
         )

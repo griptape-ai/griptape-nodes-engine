@@ -1882,6 +1882,8 @@ name: Legacy Project
             UpgradeProjectSchemaResultSuccess,
         )
 
+        # A minimal v0 project: only name + version, no explicit directory/situation overrides.
+        # On upgrade it must ADOPT the v1 layout, not pin the materialized v0 defaults.
         project_id = await self._load(pm, tmp_path, self.V0_PROJECT_YAML)
 
         written: dict[str, str] = {}
@@ -1889,13 +1891,17 @@ name: Legacy Project
             mock_file_instance = Mock()
             mock_file_instance.write_text = lambda content: written.update(yaml=content)
             mock_file_cls.return_value = mock_file_instance
-            result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+            result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultSuccess)
         assert result.previous_schema_version == "0.5.1"
         assert result.new_schema_version == ProjectTemplate.LATEST_SCHEMA_VERSION
         # The re-saved file carries the new major version.
         assert f'"project_template_schema_version": "{ProjectTemplate.LATEST_SCHEMA_VERSION}"' in written["yaml"]
+        # ADOPTION, not relabel: the project had no explicit directory override, so the upgraded
+        # overlay must NOT pin the old v0 "inputs" macro -- it falls through to the v1 default.
+        assert '"inputs"' not in written["yaml"]
+        assert "directories" not in written["yaml"]
 
     @pytest.mark.asyncio
     async def test_upgrade_already_latest_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -1908,18 +1914,19 @@ name: Legacy Project
         latest_yaml = f'project_template_schema_version: "{ProjectTemplate.LATEST_SCHEMA_VERSION}"\nname: Modern\n'
         project_id = await self._load(pm, tmp_path, latest_yaml)
 
-        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
         assert "is not an older major than the latest" in str(result.result_details)
 
-    def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
+    @pytest.mark.asyncio
+    async def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
             UpgradeProjectSchemaRequest,
             UpgradeProjectSchemaResultFailure,
         )
 
-        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id="not-loaded"))
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id="not-loaded"))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
         assert "not loaded" in str(result.result_details)
@@ -1936,7 +1943,7 @@ name: Legacy Project
         future_yaml = 'project_template_schema_version: "2.0.0"\nname: FromTheFuture\n'
         project_id = await self._load(pm, tmp_path, future_yaml)
 
-        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
         assert "is not an older major than the latest" in str(result.result_details)
@@ -1955,7 +1962,7 @@ name: Legacy Project
         bad_yaml = 'project_template_schema_version: "not-a-version"\nname: Garbage\n'
         project_id = await self._load(pm, tmp_path, bad_yaml)
 
-        result = pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
 
         assert isinstance(result, UpgradeProjectSchemaResultFailure)
 
