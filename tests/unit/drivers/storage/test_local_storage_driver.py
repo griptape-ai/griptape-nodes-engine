@@ -31,7 +31,7 @@ class TestLocalStorageDriverCreateSignedUploadUrl:
     @pytest.fixture
     def mock_workspace_path(self) -> Generator[None, None, None]:
         """Mock ConfigManager to return /workspace for all tests."""
-        with patch("griptape_nodes.drivers.storage.base_storage_driver.GriptapeNodes") as mock_griptape:
+        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape:
             mock_config_manager = Mock()
             mock_config_manager.workspace_path = Path("/workspace")
             mock_griptape.ConfigManager.return_value = mock_config_manager
@@ -184,7 +184,7 @@ class TestLocalStorageDriverCreateSignedDownloadUrl:
     @pytest.fixture
     def mock_workspace_path(self) -> Generator[None, None, None]:
         """Mock ConfigManager to return /workspace for all tests."""
-        with patch("griptape_nodes.drivers.storage.base_storage_driver.GriptapeNodes") as mock_griptape:
+        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes") as mock_griptape:
             mock_config_manager = Mock()
             mock_config_manager.workspace_path = Path("/workspace")
             mock_griptape.ConfigManager.return_value = mock_config_manager
