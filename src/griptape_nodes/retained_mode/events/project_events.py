@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+
+# Runtime import (not TYPE_CHECKING): the Path-typed request fields below rely on
+# cattrs coercing wire-form strings to Path. cattrs resolves field types via
+# get_type_hints, which needs Path importable at runtime; under TYPE_CHECKING it
+# raises NameError and cattrs silently skips coercion, handing handlers raw strings.
+from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.common.macro_parser import MacroMatchFailure, MacroVariables, ParsedMacro, VariableInfo
@@ -17,8 +23,6 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
 
@@ -126,6 +130,36 @@ class GetProjectTemplateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class GetProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Project template retrieval failed (not loaded yet)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceRequest(RequestPayload):
+    """Resolve the workspace directory a project would use, WITHOUT loading/activating it.
+
+    Use when: Showing a project's effective workspace in the detail view when the project does not
+    declare its own workspace_dir, so the user can see where its workspace would land.
+
+    Args:
+        project_id: Opaque id of the project (the registry key). Consumers must not parse it.
+
+    Results: ResolveProjectWorkspaceResultSuccess
+    """
+
+    project_id: ProjectID
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Resolved workspace directory for a project.
+
+    Args:
+        workspace_dir: Absolute path string the project would use, or None when the id resolves to
+            no readable project file (matches the resolver's "nothing to resolve" contract).
+    """
+
+    workspace_dir: str | None = None
 
 
 @dataclass
@@ -704,4 +738,169 @@ class ActivateWorkspaceProjectResultFailure(WorkflowNotAlteredMixin, ResultPaylo
 
     Boot is soft: the app logs this and continues so the engine still starts and
     the user can switch to a working project.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectRequest(RequestPayload):
+    """Package a loaded project and its dependencies into a portable .zip.
+
+    Use when: User wants to archive or branch an entire project. The package
+    carries the project template, its adjacent config, workflow files, and on-disk
+    assets, plus a true copy of any register-only local libraries. Git-sourced
+    libraries (libraries_to_download) travel by reference and are re-downloaded on
+    import. Required secret KEY NAMES travel in the manifest; secret VALUES never
+    leave the machine and .env is never copied.
+
+    Args:
+        project_id: Opaque id of the loaded project to export (the registry key).
+            Consumers must not parse or construct it.
+        destination_path: Full path to the .zip file to create.
+
+    Results: ExportProjectResultSuccess | ExportProjectResultFailure
+    """
+
+    project_id: ProjectID
+    destination_path: Path
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project exported successfully.
+
+    Args:
+        archive_path: Path to the written .zip.
+        referenced_libraries: Names (or git urls) of libraries shipped by reference.
+        copied_libraries: Registered paths of local libraries true-copied into the zip.
+        required_secret_keys: Names of secrets the project needs (NO values).
+        warnings: Non-fatal issues encountered, e.g. a registered local library
+            whose source was missing on disk and could not be packaged.
+    """
+
+    archive_path: Path
+    referenced_libraries: list[str]
+    copied_libraries: list[str]
+    required_secret_keys: list[str]
+    warnings: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project export failed.
+
+    Common causes:
+    - project_id not loaded
+    - project has no backing file (e.g. system defaults)
+    - destination parent directory missing or unwritable
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectRequest(RequestPayload):
+    """Read a project package's manifest without extracting it.
+
+    Use when: The GUI wants to show what a .zip contains (libraries, required
+    secret keys) and which required secrets are unset in the target environment,
+    before committing to an import. Read-only: no files are written.
+
+    Args:
+        archive_path: Path to the project package .zip to inspect.
+
+    Results: PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure
+    """
+
+    archive_path: Path
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Package manifest read successfully.
+
+    Args:
+        manifest: The parsed manifest.json (provenance + flat library/secret summary).
+        unset_secret_keys: Required secret keys with no value in the target
+            environment (computed without writing anything).
+    """
+
+    manifest: dict[str, Any]
+    unset_secret_keys: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Package preview failed.
+
+    Common causes:
+    - archive missing or not a zip
+    - manifest.json absent
+    - incompatible major manifest_schema_version
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectRequest(RequestPayload):
+    """Extract a project package to a target directory and register it.
+
+    Use when: User archives or branches a project. The mirrored base-dir tree is
+    extracted 1:1 at the target, so {inputs}/{outputs}/etc. macro paths re-resolve
+    against the new location automatically. Git-sourced libraries re-provision on
+    activation; copied local libraries register from their package-relative path.
+    Secrets are never auto-created: required/unset keys are returned for the GUI
+    to prompt.
+
+    Args:
+        archive_path: Path to the project package .zip.
+        target_directory: Directory to extract the project into.
+        new_project_name: When set, renames the imported project (duplicate/branch).
+        set_as_current: When True, activates the imported project after import.
+        overwrite_existing: When True, allows extracting over an existing project
+            file in target_directory; otherwise that collision fails.
+
+    Results: ImportProjectResultSuccess | ImportProjectResultFailure
+    """
+
+    archive_path: Path
+    target_directory: Path
+    new_project_name: str | None = None
+    set_as_current: bool = False
+    overwrite_existing: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project imported and registered successfully.
+
+    Args:
+        project_id: Opaque id of the newly registered project (the registry key).
+        project_file_path: Path to the extracted project template file.
+        required_secret_keys: Names of secrets the project needs (NO values).
+        unset_secret_keys: Required secret keys with no value in the current
+            environment, for the GUI to prompt.
+        warnings: Non-fatal issues recorded in the package manifest.
+    """
+
+    project_id: ProjectID
+    project_file_path: Path
+    required_secret_keys: list[str]
+    unset_secret_keys: list[str]
+    warnings: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project import failed.
+
+    Common causes:
+    - archive missing / not a zip / manifest absent / incompatible schema
+    - target project file already exists and overwrite_existing is False
+    - extraction or re-registration failed
     """

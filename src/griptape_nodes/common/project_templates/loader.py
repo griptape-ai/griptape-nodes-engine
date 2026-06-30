@@ -32,6 +32,7 @@ FIELD_FILE_EXTENSION_DIRECTORIES = "file_extension_directories"
 FIELD_DESCRIPTION = "description"
 FIELD_PARENT_PROJECT_PATH = "parent_project_path"
 FIELD_PARENT_PROJECT_ID = "parent_project_id"
+FIELD_WORKSPACE_DIR = "workspace_dir"
 
 # Special constants
 ROOT_FIELD_PATH = "<root>"
@@ -88,6 +89,7 @@ class ProjectOverlayData(NamedTuple):
     line_info: YAMLLineInfo
     id: str | None = None
     parent_project_id: str | None = None
+    workspace_dir: str | PerPlatformProjectPath | None = None
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
@@ -95,6 +97,7 @@ class ProjectOverlayData(NamedTuple):
     clears_description: bool = False
     clears_parent_project_path: bool = False
     clears_parent_project_id: bool = False
+    clears_workspace_dir: bool = False
 
 
 def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
@@ -434,6 +437,37 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         )
         parent_project_id = None
 
+    # Optional field: workspace_dir. Same absent-vs-null semantics as
+    # parent_project_path (absent = inherit base, explicit null = tombstone).
+    # Accepts a plain string (single path, absolute or relative to this YAML's
+    # directory) or a per-platform mapping (PerPlatformProjectPath).
+    clears_workspace_dir = FIELD_WORKSPACE_DIR in data and data.get(FIELD_WORKSPACE_DIR) is None
+    raw_workspace_dir = data.get(FIELD_WORKSPACE_DIR)
+    workspace_dir: str | PerPlatformProjectPath | None = None
+    if raw_workspace_dir is not None:
+        if isinstance(raw_workspace_dir, str):
+            workspace_dir = raw_workspace_dir
+        elif isinstance(raw_workspace_dir, dict):
+            try:
+                workspace_dir = PerPlatformProjectPath.model_validate(raw_workspace_dir)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_WORKSPACE_DIR}.{error_field_path}" if error_field_path else FIELD_WORKSPACE_DIR
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path) or line_info.get_line(FIELD_WORKSPACE_DIR),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_WORKSPACE_DIR,
+                message=f"Must be string or per-platform mapping, got {type(raw_workspace_dir).__name__}",
+                line_number=line_info.get_line(FIELD_WORKSPACE_DIR),
+            )
+
     return ProjectOverlayData(
         name=name,
         project_template_schema_version=schema_version,
@@ -446,6 +480,7 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         line_info=line_info,
         id=project_id,
         parent_project_id=parent_project_id,
+        workspace_dir=workspace_dir,
         removed_situations=frozenset(removed_situations),
         removed_directories=frozenset(removed_directories),
         removed_environment=frozenset(removed_environment),
@@ -453,6 +488,7 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         clears_description=clears_description,
         clears_parent_project_path=clears_parent_project_path,
         clears_parent_project_id=clears_parent_project_id,
+        clears_workspace_dir=clears_workspace_dir,
     )
 
 

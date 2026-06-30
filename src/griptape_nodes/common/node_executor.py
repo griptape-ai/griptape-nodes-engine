@@ -1218,6 +1218,12 @@ class NodeExecutor:
 
                 logger.info("Completed sequential iteration %d/%d", iteration_index + 1, total_iterations)
 
+                if isinstance(end_loop_node, BaseIterativeEndNode) and end_loop_node.start_node is not None:
+                    end_loop_node.start_node.advance_sequential_progress(iteration_index)
+                    # Yield to the event loop so queued publish_update_to_parameter events
+                    # are dispatched to the UI before the next iteration begins.
+                    await asyncio.sleep(0)
+
                 # Check if the end node signaled a break (for BaseIterativeEndNode)
                 if self._should_break_loop(node_name_mappings, package_result):
                     logger.info(
@@ -1267,6 +1273,11 @@ class NodeExecutor:
             end_node.name,
             total_iterations,
         )
+
+        # Initialize here (not just in aprocess/exec_in) because the sequential executor
+        # drives the loop body itself rather than going through the normal start-node signal path.
+        start_node._progress_bar.initialize(total_iterations)
+        await asyncio.sleep(0)
 
         # Package the loop body (nodes between start and end)
         package_result_and_execution = await self._package_loop_body(start_node, end_node)

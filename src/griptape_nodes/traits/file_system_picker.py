@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 class FileSystemPicker(Trait):
     allow_files: bool = False
     allow_directories: bool = True
+    allow_sequences: bool = False
     multiple: bool = False
     file_types: list[str] = field(default_factory=list)
     file_extensions: list[str] = field(default_factory=list)
@@ -27,6 +28,7 @@ class FileSystemPicker(Trait):
         *,
         allow_files: bool = False,
         allow_directories: bool = True,
+        allow_sequences: bool = False,
         multiple: bool = False,
         file_types: list[str] | None = None,
         file_extensions: list[str] | None = None,
@@ -42,6 +44,7 @@ class FileSystemPicker(Trait):
         super().__init__()
         self.allow_files = allow_files
         self.allow_directories = allow_directories
+        self.allow_sequences = allow_sequences
         self.multiple = multiple
         self.file_types = file_types or []
         self.file_extensions = file_extensions or []
@@ -63,6 +66,7 @@ class FileSystemPicker(Trait):
         options: dict[str, Any] = {
             "allowFiles": self.allow_files,
             "allowDirectories": self.allow_directories,
+            "allowSequences": self.allow_sequences,
             "multiple": self.multiple,
             "workspaceOnly": self.workspace_only,
             "allowCreate": self.allow_create,
@@ -98,18 +102,18 @@ class FileSystemPicker(Trait):
 
         def validate(param: Parameter, value: Any) -> None:  # noqa: ARG001
             # Validate that at least one selection type is enabled
-            if not self.allow_files and not self.allow_directories:
-                msg = "At least one of allow_files or allow_directories must be True"
+            if not self.allow_files and not self.allow_directories and not self.allow_sequences:
+                msg = "At least one of allow_files, allow_directories, or allow_sequences must be True"
                 raise ValueError(msg)
 
             # Validate that creation is only allowed when appropriate selection types are enabled
-            if self.allow_create and not self.allow_files and not self.allow_directories:
-                msg = "allow_create requires at least one of allow_files or allow_directories to be True"
+            if self.allow_create and not self.allow_files and not self.allow_directories and not self.allow_sequences:
+                msg = "allow_create requires at least one of allow_files, allow_directories, or allow_sequences to be True"
                 raise ValueError(msg)
 
             # Validate that rename is only allowed when appropriate selection types are enabled
-            if self.allow_rename and not self.allow_files and not self.allow_directories:
-                msg = "allow_rename requires at least one of allow_files or allow_directories to be True"
+            if self.allow_rename and not self.allow_files and not self.allow_directories and not self.allow_sequences:
+                msg = "allow_rename requires at least one of allow_files, allow_directories, or allow_sequences to be True"
                 raise ValueError(msg)
 
             # Validate file size limits
