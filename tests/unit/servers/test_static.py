@@ -1,9 +1,10 @@
+from contextlib import AbstractContextManager
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.servers.static import _serve_external_file
+from griptape_nodes.servers.static import WorkspaceStaticFiles, _serve_external_file
 
 
 class TestServeExternalFile:
@@ -49,3 +50,63 @@ class TestServeExternalFile:
             # Path() should have been called with the raw path, not with "/" prepended
             mock_path_cls.assert_called_once_with(already_absolute_path)
             mock_response.assert_called_once_with(mock_candidate)
+
+
+class TestWorkspaceStaticFiles:
+    """Test that WorkspaceStaticFiles resolves the served directory live, per request."""
+
+    def _patch_workspace(self, workspace: Path) -> AbstractContextManager[MagicMock]:
+        """Patch ConfigManager().workspace_path to return the given directory."""
+        config_manager = MagicMock()
+        config_manager.workspace_path = workspace
+        griptape_nodes = MagicMock()
+        griptape_nodes.ConfigManager.return_value = config_manager
+        return patch("griptape_nodes.servers.static.GriptapeNodes", griptape_nodes)
+
+    def test_lookup_follows_workspace_change(self, tmp_path: Path) -> None:
+        """A file written under the new workspace resolves after the workspace changes at runtime."""
+        boot_workspace = tmp_path / "boot"
+        new_workspace = tmp_path / "project"
+        new_workspace.mkdir()
+        (new_workspace / "outputs").mkdir()
+        served = new_workspace / "outputs" / "image.png"
+        served.write_bytes(b"fake png")
+
+        # Construct against the boot workspace, then switch the active workspace.
+        with self._patch_workspace(boot_workspace):
+            static = WorkspaceStaticFiles()
+
+        with self._patch_workspace(new_workspace):
+            full_path, stat_result = static.lookup_path("outputs/image.png")
+
+        assert Path(full_path) == served
+        assert stat_result is not None
+
+    def test_subdirectory_is_appended_to_live_workspace(self, tmp_path: Path) -> None:
+        """The legacy /static mount serves from <workspace>/<subdirectory>, resolved live."""
+        workspace = tmp_path / "ws"
+        static_dir = workspace / "staticfiles"
+        static_dir.mkdir(parents=True)
+        served = static_dir / "asset.bin"
+        served.write_bytes(b"data")
+
+        with self._patch_workspace(workspace):
+            static = WorkspaceStaticFiles(subdirectory="staticfiles")
+            full_path, stat_result = static.lookup_path("asset.bin")
+
+        assert Path(full_path) == served
+        assert stat_result is not None
+
+    def test_path_traversal_is_rejected(self, tmp_path: Path) -> None:
+        """A path escaping the workspace must not resolve, even with the live directory."""
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+        secret = tmp_path / "secret.txt"
+        secret.write_bytes(b"top secret")
+
+        with self._patch_workspace(workspace):
+            static = WorkspaceStaticFiles()
+            full_path, stat_result = static.lookup_path("../secret.txt")
+
+        assert full_path == ""
+        assert stat_result is None

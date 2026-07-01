@@ -178,3 +178,51 @@ class TestTrackedParameterOutputValuesSetItem:
             tracked["out"] = None
 
         mock_emit.assert_not_called()
+
+
+class TestErrorProxyNode:
+    """The placeholder substituted for a node that could not be created."""
+
+    @staticmethod
+    def _message(node):  # noqa: ANN001, ANN205
+        from griptape_nodes.exe_types.core_types import ParameterMessage
+
+        message = node.get_message_by_name_or_element_id("error_proxy_message")
+        assert isinstance(message, ParameterMessage)
+        return message
+
+    def test_load_failure_reads_as_error(self) -> None:
+        """A missing dependency / load failure keeps the hard-error treatment."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="proxy",
+            original_node_type="FancyNode",
+            original_library_name="fancy-lib",
+            failure_reason="No module named 'fancy'",
+        )
+
+        message = self._message(node)
+        assert node.denied_by_policy is False
+        assert message.variant == "error"
+        assert message.markdown is False
+        assert "could not be loaded" in message.value
+
+    def test_policy_denial_reads_as_warning(self) -> None:
+        """A policy denial is recoverable, so it reads as a warning that surfaces the hook's reason."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="proxy",
+            original_node_type="FancyNode",
+            original_library_name="fancy-lib",
+            failure_reason="Ask your admin to enable Labs nodes.",
+            denied_by_policy=True,
+        )
+
+        message = self._message(node)
+        assert node.denied_by_policy is True
+        assert message.variant == "warning"
+        assert message.markdown is True
+        assert "**Permission denied**" in message.value
+        assert "Ask your admin to enable Labs nodes." in message.value
