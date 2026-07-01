@@ -125,6 +125,21 @@ Use `{###}` whenever you want a system-allocated sequence index. It says "this s
 
 **Relationship to `{_index:NN}`.** Internally `{###}` desugars to a variable named `_index` carrying a sequence-format marker. The legacy `{_index:03}` / `{_index?:03}` syntax still parses, but it's now treated as a regular user-bound padded variable — the auto-allocation behavior is reserved for the explicit `{###}` form. If you have a custom project template that uses `{_index:NN}` for sequence slots, rewrite it as `{###}` (or `{###?}` for the optional form). See [issue #4991](https://github.com/griptape-ai/griptape-nodes-engine/issues/4991) for the migration context.
 
+### Unresolved sequence slots
+
+A required `{###}` slot has no value until the write path allocates one. Any code that resolves a macro *before* that allocation happens — a node previewing where its output will land, a UI classifying user input as absolute-vs-relative — has to tell the resolver what to do about the empty slot. `GetPathForMacroRequest` exposes the choice as `unresolved_sequence_slot_behavior`, whose values live in the `UnresolvedSequenceSlotBehavior` enum:
+
+| Behavior                  | Renders as                               | When to use                                                                                                                                                                                                                                                                    |
+| ------------------------- | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `FAIL` *(default)*        | `MISSING_REQUIRED_VARIABLES` failure     | The **write path** — the failure is the signal `on_write_file_request` uses to seed the first index and retry on collision. Nothing else should override the default.                                                                                                          |
+| `RENDER_SEQUENCE_PATTERN` | `###` (or `####`, matching source width) | **Presentation only.** Renders the slot as its bare hash glyphs (the universal ffmpeg / Houdini / Nuke convention) so the resulting path reads as its on-disk shape. Never open, write, or hand this string to any I/O primitive — the pattern is not a valid filesystem path. |
+| `START_AT_ZERO`           | `000`                                    | Previewing 0-indexed sequences before the first save.                                                                                                                                                                                                                          |
+| `START_AT_ONE`            | `001`                                    | Previewing "what would my first save land at" — matches the write-path seed, so the preview lines up with the real save when the destination is empty.                                                                                                                         |
+
+Optional slots (`{###?}`) are unaffected — they're already omitted when unbound, so the flag only takes effect on required slots.
+
+**Rule of thumb.** If your code is about to open a file, do not pass a flag; let the write path do its thing. If your code is about to show a string to a user, use `RENDER_SEQUENCE_PATTERN`. `START_AT_ZERO` / `START_AT_ONE` are narrow tools for previewing an actual first save.
+
 ### String transformations
 
 | Format spec        | Description                                      | Example result      |
