@@ -1,14 +1,18 @@
 import contextlib
 import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
     BatchSetNodeMetadataResultFailure,
     BatchSetNodeMetadataResultSuccess,
+    UnresolveNodeRequest,
+    UnresolveNodeResultFailure,
+    UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -214,6 +218,157 @@ class TestNodeManagerResolutionStateSerialization:
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert any("Attempted to serialize set value for parameter 'test_param'" in msg for msg in warning_messages)
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
+
+
+class TestSerializeNodeWithoutLibraryMetadata:
+    """Serializing a node whose metadata lacks a 'library' key must not crash the save."""
+
+    def test_error_proxy_node_records_original_library_in_metadata(self) -> None:
+        """A proxy created without library metadata adopts its original library/node type."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+
+        assert node.metadata["library"] == "Missing Library"
+        assert node.metadata["node_type"] == "ExecutePython"
+
+    def test_error_proxy_node_does_not_clobber_existing_metadata(self) -> None:
+        """Library/node type already present in metadata (e.g. from a round trip) is preserved."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={"library": "Original Library", "node_type": "OriginalType"},
+        )
+
+        assert node.metadata["library"] == "Original Library"
+        assert node.metadata["node_type"] == "OriginalType"
+
+    def test_serialize_node_without_library_metadata_does_not_crash(self, griptape_nodes: GriptapeNodes) -> None:
+        """Regression for griptape-ai/griptape-nodes-app#154: a missing 'library' key must not raise."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import (
+            SerializeNodeToCommandsRequest,
+            SerializeNodeToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        griptape_nodes.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow")
+        )
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+        # Simulate a proxy whose metadata never received a 'library' key, which is the
+        # exact condition that previously raised KeyError: 'library' during serialization.
+        node.metadata.pop("library", None)
+        assert "library" not in node.metadata
+
+        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+
+        result = griptape_nodes.NodeManager().on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node.name)
+        )
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        create_command = result.serialized_node_commands.create_node_command
+        assert create_command.node_type == "ExecutePython"
+        assert create_command.specific_library_name == "Missing Library"
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestUnresolveNodeRequest:
+    """Tests for the on_unresolve_node_request handler."""
+
+    def test_node_not_found_returns_failure(self) -> None:
+        result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "nonexistent_node" in str(result.result_details)
+
+    def test_resolving_node_returns_failure_without_side_effects(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVING
+        mock_node.parameter_output_values = MagicMock()
+        with patch.object(
+            GriptapeNodes.ObjectManager(),
+            "attempt_get_object_by_name_as_type",
+            return_value=mock_node,
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "test_node" in str(result.result_details)
+        mock_node.make_node_unresolved.assert_not_called()
+        mock_node.parameter_output_values.clear.assert_not_called()
+
+    def test_resolved_node_unresolves_and_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.make_node_unresolved.assert_called_once_with(
+            current_states_to_trigger_change_event={NodeResolutionState.RESOLVED}
+        )
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
+
+    def test_unresolved_node_still_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.UNRESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
 
 
 class TestNodeManagerAlterParameterDetailsClearDefaultValue:

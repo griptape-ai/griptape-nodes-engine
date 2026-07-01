@@ -1104,3 +1104,35 @@ class MoveNodeToNewFlowResultFailure(ResultPayloadFailure):
     Common causes: node not found, source flow not found, target flow not found,
     node not in source flow, node is a NodeGroup with subflow conflicts.
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class UnresolveNodeRequest(RequestPayload):
+    """Mark a node UNRESOLVED without resetting its parameter values.
+
+    Use when: Forcing a node to re-execute without resetting its parameter values.
+    Downstream nodes are also marked UNRESOLVED. Useful for developer tooling.
+
+    If the node is currently RESOLVING the request fails immediately. Retry
+    after the node has finished resolving to unresolve it.
+
+    Args:
+        node_name: Name of the node to unresolve.
+
+    Results: UnresolveNodeResultSuccess | UnresolveNodeResultFailure
+    """
+
+    node_name: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UnresolveNodeResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Node marked UNRESOLVED. Downstream nodes also invalidated."""
+
+
+@dataclass
+@PayloadRegistry.register
+class UnresolveNodeResultFailure(ResultPayloadFailure):
+    """Unresolve failed. Common causes: node not found, node is currently RESOLVING."""
