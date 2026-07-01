@@ -95,56 +95,16 @@ class TestDownloadLibrariesFromGitUrlsPath:
     """Test _download_libraries_from_git_urls resolves absolute and relative paths."""
 
     @pytest.mark.asyncio
-    async def test_relative_path(self, griptape_nodes: GriptapeNodes) -> None:
-        """A relative libraries_directory is resolved against the workspace."""
+    async def test_uses_resolved_libraries_root(self, griptape_nodes: GriptapeNodes) -> None:
+        """The download root comes from ConfigManager.resolved_libraries_root (own/inherited or default)."""
         library_manager = griptape_nodes.LibraryManager()
         config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = "libraries"
-        config_mgr.workspace_path = Path("/workspace")
-
-        with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-                return_value=Path("/workspace/libraries"),
-            ) as mock_resolve,
-        ):
-            result = await library_manager._download_libraries_from_git_urls([])
-
-        mock_resolve.assert_called_once_with(Path("libraries"), Path("/workspace"))
-        assert result == {}
-
-    @pytest.mark.asyncio
-    async def test_absolute_path(self, griptape_nodes: GriptapeNodes) -> None:
-        """An absolute libraries_directory is used as-is."""
-        library_manager = griptape_nodes.LibraryManager()
-        config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = "/opt/libraries"
-        config_mgr.workspace_path = Path("/workspace")
-
-        with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-                return_value=Path("/opt/libraries"),
-            ) as mock_resolve,
-        ):
-            result = await library_manager._download_libraries_from_git_urls([])
-
-        mock_resolve.assert_called_once_with(Path("/opt/libraries"), Path("/workspace"))
-        assert result == {}
-
-    @pytest.mark.asyncio
-    async def test_not_configured_returns_empty(self, griptape_nodes: GriptapeNodes) -> None:
-        """When libraries_directory is empty, returns empty dict without resolving."""
-        library_manager = griptape_nodes.LibraryManager()
-        config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = ""
-        config_mgr.workspace_path = Path("/workspace")
+        config_mgr.resolved_libraries_root.return_value = Path("/workspace/libraries")
 
         with patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr):
             result = await library_manager._download_libraries_from_git_urls([])
 
+        config_mgr.resolved_libraries_root.assert_called_once_with()
         assert result == {}
 
 
@@ -152,12 +112,11 @@ class TestDownloadLibraryRequestPath:
     """Test download_library_request resolves absolute and relative paths."""
 
     @pytest.mark.asyncio
-    async def test_relative_path(self, griptape_nodes: GriptapeNodes) -> None:
-        """A relative libraries_directory is resolved against the workspace."""
+    async def test_uses_resolved_libraries_root(self, griptape_nodes: GriptapeNodes) -> None:
+        """The download root comes from ConfigManager.resolved_libraries_root."""
         library_manager = griptape_nodes.LibraryManager()
         config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = "libraries"
-        config_mgr.workspace_path = Path("/workspace")
+        config_mgr.resolved_libraries_root.return_value = Path("/workspace/libraries")
 
         request = MagicMock()
         request.git_url = "https://github.com/user/repo.git"
@@ -168,10 +127,6 @@ class TestDownloadLibraryRequestPath:
         with (
             patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-                return_value=Path("/workspace/libraries"),
-            ) as mock_resolve,
-            patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
             ),
@@ -181,40 +136,7 @@ class TestDownloadLibraryRequestPath:
         ):
             result = await library_manager.download_library_request(request)
 
-        mock_resolve.assert_called_once_with(Path("libraries"), Path("/workspace"))
-        assert isinstance(result, DownloadLibraryResultFailure)
-
-    @pytest.mark.asyncio
-    async def test_absolute_path(self, griptape_nodes: GriptapeNodes) -> None:
-        """An absolute libraries_directory is used as-is."""
-        library_manager = griptape_nodes.LibraryManager()
-        config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = "/opt/libraries"
-        config_mgr.workspace_path = Path("/workspace")
-
-        request = MagicMock()
-        request.git_url = "https://github.com/user/repo.git"
-        request.branch_tag_commit = None
-        request.target_directory_name = None
-        request.download_directory = None
-
-        with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-                return_value=Path("/opt/libraries"),
-            ) as mock_resolve,
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
-                return_value="https://github.com/user/repo.git",
-            ),
-            patch("anyio.Path.mkdir"),
-            patch("anyio.Path.exists", return_value=False),
-            patch.object(asyncio, "to_thread", side_effect=GitCloneError("stop test here")),
-        ):
-            result = await library_manager.download_library_request(request)
-
-        mock_resolve.assert_called_once_with(Path("/opt/libraries"), Path("/workspace"))
+        config_mgr.resolved_libraries_root.assert_called_once_with()
         assert isinstance(result, DownloadLibraryResultFailure)
 
     @pytest.mark.asyncio
@@ -233,9 +155,6 @@ class TestDownloadLibraryRequestPath:
         with (
             patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
             patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-            ) as mock_resolve,
-            patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
             ),
@@ -245,32 +164,7 @@ class TestDownloadLibraryRequestPath:
         ):
             await library_manager.download_library_request(request)
 
-        mock_resolve.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_not_configured_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
-        """When libraries_directory is empty and no download_directory, returns failure."""
-        library_manager = griptape_nodes.LibraryManager()
-        config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = ""
-        config_mgr.workspace_path = Path("/workspace")
-
-        request = MagicMock()
-        request.git_url = "https://github.com/user/repo.git"
-        request.branch_tag_commit = None
-        request.target_directory_name = None
-        request.download_directory = None
-
-        with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
-                return_value="https://github.com/user/repo.git",
-            ),
-        ):
-            result = await library_manager.download_library_request(request)
-
-        assert isinstance(result, DownloadLibraryResultFailure)
+        config_mgr.resolved_libraries_root.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_existing_target_dir_sets_existing_path(self, griptape_nodes: GriptapeNodes) -> None:
@@ -283,8 +177,7 @@ class TestDownloadLibraryRequestPath:
         """
         library_manager = griptape_nodes.LibraryManager()
         config_mgr = MagicMock()
-        config_mgr.get_config_value.return_value = "/opt/libraries"
-        config_mgr.workspace_path = Path("/workspace")
+        config_mgr.resolved_libraries_root.return_value = Path("/opt/libraries")
 
         request = MagicMock()
         request.git_url = "https://github.com/user/repo.git"
@@ -296,10 +189,6 @@ class TestDownloadLibraryRequestPath:
 
         with (
             patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
-                return_value=Path("/opt/libraries"),
-            ),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",

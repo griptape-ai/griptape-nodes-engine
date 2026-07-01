@@ -332,7 +332,7 @@ class Settings(BaseModel):
     libraries_directory: str = Field(
         category=FILE_SYSTEM,
         default="libraries",
-        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is.",
+        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,
