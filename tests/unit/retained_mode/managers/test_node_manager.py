@@ -1,14 +1,18 @@
 import contextlib
 import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
     BatchSetNodeMetadataResultFailure,
     BatchSetNodeMetadataResultSuccess,
+    UnresolveNodeRequest,
+    UnresolveNodeResultFailure,
+    UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -288,6 +292,83 @@ class TestSerializeNodeWithoutLibraryMetadata:
         assert create_command.specific_library_name == "Missing Library"
 
         griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestUnresolveNodeRequest:
+    """Tests for the on_unresolve_node_request handler."""
+
+    def test_node_not_found_returns_failure(self) -> None:
+        result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "nonexistent_node" in str(result.result_details)
+
+    def test_resolving_node_returns_failure_without_side_effects(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVING
+        mock_node.parameter_output_values = MagicMock()
+        with patch.object(
+            GriptapeNodes.ObjectManager(),
+            "attempt_get_object_by_name_as_type",
+            return_value=mock_node,
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "test_node" in str(result.result_details)
+        mock_node.make_node_unresolved.assert_not_called()
+        mock_node.parameter_output_values.clear.assert_not_called()
+
+    def test_resolved_node_unresolves_and_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.make_node_unresolved.assert_called_once_with(
+            current_states_to_trigger_change_event={NodeResolutionState.RESOLVED}
+        )
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
+
+    def test_unresolved_node_still_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.UNRESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
 
 
 class TestNodeManagerAlterParameterDetailsClearDefaultValue:

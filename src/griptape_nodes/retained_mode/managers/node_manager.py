@@ -170,6 +170,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetNodeMetadataRequest,
     SetNodeMetadataResultFailure,
     SetNodeMetadataResultSuccess,
+    UnresolveNodeRequest,
+    UnresolveNodeResultFailure,
+    UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectRequest,
@@ -397,6 +400,7 @@ class NodeManager:
             CanResetNodeToDefaultsRequest, self.on_can_reset_node_to_defaults_request
         )
         event_manager.assign_manager_to_request_type(ResetNodeToDefaultsRequest, self.on_reset_node_to_defaults_request)
+        event_manager.assign_manager_to_request_type(UnresolveNodeRequest, self.on_unresolve_node_request)
         event_manager.assign_manager_to_request_type(
             BatchSetNodeLockStateRequest, self.on_batch_set_lock_node_state_request
         )
@@ -5420,3 +5424,18 @@ class NodeManager:
         return ReorderParameterListItemResultSuccess(
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."
         )
+
+    def on_unresolve_node_request(self, request: UnresolveNodeRequest) -> ResultPayload:
+        """Mark a single node UNRESOLVED and propagate to downstream nodes."""
+        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            return UnresolveNodeResultFailure(
+                result_details=f"Attempted to unresolve Node '{request.node_name}'. Node not found."
+            )
+        if node.state == NodeResolutionState.RESOLVING:
+            return UnresolveNodeResultFailure(
+                result_details=f"Attempted to unresolve Node '{request.node_name}'. Node is currently RESOLVING."
+            )
+        node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
+        GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+        return UnresolveNodeResultSuccess(result_details=f"Node '{request.node_name}' marked as unresolved.")
