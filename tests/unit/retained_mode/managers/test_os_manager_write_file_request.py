@@ -842,7 +842,7 @@ class TestExtensionCoercionDoesNotClobberPriorSave:
         same JPEG bytes should produce ``render_v001.jpg`` AND ``render_v002.jpg``, with
         the first save intact. Before the fix the second save overwrote the first.
         """
-        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {})
+        macro_path = MacroPath(ParsedMacro("{outputs}/render_v{###}.png"), {})
 
         first_payload = _jpeg_bytes()
         FileDestination(macro_path, existing_file_policy=ExistingFilePolicy.CREATE_NEW).write_bytes(first_payload)
