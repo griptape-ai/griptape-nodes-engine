@@ -2954,3 +2954,72 @@ class TestCreateVersionedWorkflow:
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"
             assert target.file_path is None
+
+
+class TestScrubForAstConstant:
+    """Regression coverage for griptape-nodes-engine#5013.
+
+    A Button trait object placed inside a parameter's ``ui_options`` dict (instead of
+    attached via ``traits=``) survives serialization and, when emitted by codegen via
+    ``ast.Constant``, is rendered as its ``repr()`` (``<function ... at 0x...>``), which
+    is invalid Python and prevents the saved workflow from reopening.
+    """
+
+    def test_primitive_values_are_safe(self) -> None:
+        for value in ["s", b"b", True, 1, 1.5, None]:
+            assert WorkflowManager._is_ast_constant_safe(value) is True
+
+    def test_nested_container_of_primitives_is_safe(self) -> None:
+        value = {"a": [1, 2, {"b": ("x", None)}], "c": {1, 2}}
+        assert WorkflowManager._is_ast_constant_safe(value) is True
+
+    def test_callable_leaf_is_unsafe(self) -> None:
+        assert WorkflowManager._is_ast_constant_safe(lambda: None) is False
+
+    def test_scrub_leaves_safe_value_untouched(self) -> None:
+        value = {"display_name": "X", "hide": True, "nums": [1, 2]}
+        result = WorkflowManager._scrub_for_ast_constant(value)
+        assert result.dropped is False
+        assert result.value == value
+
+    def test_scrub_drops_button_in_ui_options_traits(self) -> None:
+        from griptape_nodes.traits.button import Button
+
+        button = Button(size="icon", icon="audio-lines", tooltip="Search", button_link="https://example.com")
+        ui_options = {
+            "display_name": "Custom Voice ID",
+            "hide": True,
+            "placeholder_text": "e.g., 21m00Tcm4TlvDq8ikWAM",
+            "traits": [button],
+        }
+
+        result = WorkflowManager._scrub_for_ast_constant(ui_options)
+
+        assert result.dropped is True
+        # Safe keys are preserved; the unsafe Button is removed, leaving an empty traits list.
+        assert result.value == {
+            "display_name": "Custom Voice ID",
+            "hide": True,
+            "placeholder_text": "e.g., 21m00Tcm4TlvDq8ikWAM",
+            "traits": [],
+        }
+
+    def test_keyword_from_field_value_emits_valid_python(self) -> None:
+        from griptape_nodes.traits.button import Button
+
+        button = Button(icon="key", tooltip="Open", button_link="https://example.com")
+        ui_options = {"display_name": "X", "traits": [button]}
+
+        keyword = WorkflowManager._keyword_from_field_value("ui_options", ui_options, object())
+        call_node = ast.Call(
+            func=ast.Name(id="Req", ctx=ast.Load()),
+            args=[],
+            keywords=[keyword],
+        )
+        source = ast.unparse(ast.fix_missing_locations(call_node))
+
+        # The rendered source must be free of the invalid function repr and must parse.
+        assert "0x" not in source
+        assert "<function" not in source
+        assert "Button(" not in source
+        ast.parse(source)

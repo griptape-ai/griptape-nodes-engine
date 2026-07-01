@@ -4033,6 +4033,98 @@ class WorkflowManager:
         code_blocks.append(if_stmt)
         return code_blocks
 
+    class _ScrubResult(NamedTuple):
+        """Result of scrubbing a value for inline AST emission."""
+
+        value: Any
+        dropped: bool
+
+    @staticmethod
+    def _is_ast_constant_safe(value: Any) -> bool:
+        """True if value is composed only of literals ``ast.unparse`` can round-trip.
+
+        Anything else (e.g. a Button trait object mistakenly placed in ``ui_options``)
+        would be rendered by ``ast.Constant`` via its ``repr()``, which is not valid
+        Python and breaks reopening the saved workflow.
+        """
+        primitives = (str, bytes, bool, int, float, complex, type(None))
+        if isinstance(value, primitives):
+            return True
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return all(WorkflowManager._is_ast_constant_safe(item) for item in value)
+        if isinstance(value, dict):
+            return all(
+                WorkflowManager._is_ast_constant_safe(key) and WorkflowManager._is_ast_constant_safe(item)
+                for key, item in value.items()
+            )
+        return False
+
+    @staticmethod
+    def _scrub_for_ast_constant(value: Any) -> WorkflowManager._ScrubResult:
+        """Return a copy of value with any non-literal leaves removed.
+
+        Recurses through dict/list/tuple/set, dropping keys (for dicts) or elements
+        (for sequences) whose values cannot be emitted as an ``ast.Constant``. The
+        boolean flags whether anything was dropped so callers can warn.
+
+        A bare unsafe scalar with no surrounding container is replaced with ``None``.
+        """
+        containers = (dict, list, tuple, set, frozenset)
+
+        if WorkflowManager._is_ast_constant_safe(value):
+            return WorkflowManager._ScrubResult(value=value, dropped=False)
+
+        if isinstance(value, dict):
+            scrubbed_dict = {}
+            dropped = False
+            for key, item in value.items():
+                # An unsafe key or an unsafe non-container value means we drop the entry entirely.
+                if not WorkflowManager._is_ast_constant_safe(key) or (
+                    not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item)
+                ):
+                    dropped = True
+                    continue
+                item_result = WorkflowManager._scrub_for_ast_constant(item)
+                scrubbed_dict[key] = item_result.value
+                dropped = dropped or item_result.dropped
+            return WorkflowManager._ScrubResult(value=scrubbed_dict, dropped=dropped)
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            scrubbed_items = []
+            dropped = False
+            for item in value:
+                # An unsafe non-container element is dropped; containers are recursed into.
+                if not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item):
+                    dropped = True
+                    continue
+                item_result = WorkflowManager._scrub_for_ast_constant(item)
+                scrubbed_items.append(item_result.value)
+                dropped = dropped or item_result.dropped
+            return WorkflowManager._ScrubResult(value=type(value)(scrubbed_items), dropped=dropped)
+
+        # A bare unsafe scalar (e.g. a callable or trait object) with no container to
+        # prune: signal that it was dropped and return None as a safe placeholder.
+        return WorkflowManager._ScrubResult(value=None, dropped=True)
+
+    @staticmethod
+    def _keyword_from_field_value(arg_name: str, field_value: Any, command: Any) -> ast.keyword:
+        """Build an ``ast.keyword`` for a command field, scrubbing unsafe content.
+
+        Non-serializable content (e.g. a Button trait object mistakenly placed in
+        ``ui_options`` instead of attached via ``traits=``) is dropped so the saved
+        workflow stays valid Python and can be reopened.
+        """
+        scrub_result = WorkflowManager._scrub_for_ast_constant(field_value)
+        if scrub_result.dropped:
+            logger.warning(
+                "Omitting non-serializable content from field '%s' of %s while saving the workflow. "
+                "This usually means a UI object (e.g. a Button) was placed in ui_options instead of "
+                "being attached as a trait.",
+                arg_name,
+                type(command).__name__,
+            )
+        return ast.keyword(arg=arg_name, value=ast.Constant(value=scrub_result.value, lineno=1, col_offset=0))
+
     def _generate_unique_values_code(
         self,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
@@ -4174,7 +4266,7 @@ class WorkflowManager:
                         )
                     else:
                         create_flow_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_flow_command)
                         )
 
         # Create a comment explaining the behavior
@@ -4267,7 +4359,7 @@ class WorkflowManager:
                 field_value = getattr(import_workflow_command, field.name)
                 if field_value != field.default:
                     import_workflow_request_args.append(
-                        ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                        self._keyword_from_field_value(field.name, field_value, import_workflow_command)
                     )
 
         # Construct the AST for importing the workflow
@@ -4495,7 +4587,7 @@ class WorkflowManager:
                             )
                     else:
                         create_node_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_node_request)
                         )
 
         # After processing all fields, handle subflow_name from metadata
@@ -4602,9 +4694,7 @@ class WorkflowManager:
                         field_value = getattr(element_command, field.name)
                         if field_value != field.default:
                             element_command_args.append(
-                                ast.keyword(
-                                    arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0)
-                                )
+                                self._keyword_from_field_value(field.name, field_value, element_command)
                             )
 
                 # Create the await ahandle_request call
