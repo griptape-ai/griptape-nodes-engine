@@ -6,7 +6,29 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
+from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, DagNodeCategories, NodeState
+
+
+class TestDagNodeCategories:
+    """Test cases for the DagNodeCategories seeding contract.
+
+    The classifier (FlowManager.classify_nodes_for_dag) and the queue drainer
+    (ControlFlowMachine._drain_global_flow_queue) both produce this tuple, and the DAG-seeding
+    routine consumes it positionally, so the field order/names are part of the shared contract.
+    """
+
+    def test_fields_are_accessible_by_name_and_position(self) -> None:
+        start = MagicMock(spec=BaseNode)
+        control = MagicMock(spec=BaseNode)
+        sink = MagicMock(spec=BaseNode)
+
+        categories = DagNodeCategories(start_nodes=[start], control_nodes=[control], data_sink_nodes=[sink])
+
+        assert categories.start_nodes == [start]
+        assert categories.control_nodes == [control]
+        assert categories.data_sink_nodes == [sink]
+        # Positional order backs the tuple-unpacking consumers.
+        assert tuple(categories) == ([start], [control], [sink])
 
 
 class TestDagBuilder:
