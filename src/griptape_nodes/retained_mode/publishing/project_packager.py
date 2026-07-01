@@ -386,16 +386,24 @@ class ProjectExporter:
             shutil.rmtree(staged_sink, ignore_errors=True)
 
     def _resolve_libraries_sink(self) -> Path:
-        """Resolve where this project clones libraries_to_download, mirroring the engine.
+        """Resolve where this project clones libraries_to_download.
 
-        Precedence matches the engine's resolved libraries root: the project's own
-        template `libraries_dir` field wins (relative to the base dir), otherwise the
-        `libraries_directory` config value resolved against the workspace dir. The
+        Consults two of the engine's three `decide_libraries_root` branches: the
+        project's own template `libraries_dir` field (relative to the base dir), else
+        the `libraries_directory` config value resolved against the workspace dir. The
         workspace dir is the project's own template `workspace_dir` field, else the
         adjacent config's workspace_directory, else the base dir. Template fields are
         consulted because the engine honors them over the adjacent config; reading only
         the config here would miss a relocated sink and bundle the referenced sources.
         Per-platform mappings are reduced to the active platform's value.
+
+        The engine's middle branch (a nearest-ancestor `libraries_dir` inherited from a
+        parent project) is intentionally NOT consulted here. Export is self-contained:
+        `_write_self_contained_template` strips the parent link, so the exported project
+        has no ancestor to inherit from, and an inherited sink would resolve against the
+        parent's dir (outside this project's base dir) where pruning does not apply
+        anyway. Only sinks that fall inside the base dir need pruning, and those come
+        from branches 0 and 2.
         """
         template = self._project_info.template
 
