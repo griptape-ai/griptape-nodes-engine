@@ -28,13 +28,26 @@ class BaseStorageDriver(ABC):
     converting absolute paths to workspace-relative before calling driver methods.
     """
 
-    def __init__(self, workspace_directory: Path) -> None:
+    def __init__(self, workspace_directory: Path) -> None:  # noqa: B027
         """Initialize the storage driver with a workspace directory.
 
         Args:
-            workspace_directory: The base workspace directory path.
+            workspace_directory: The base workspace directory path (unused, kept for API compatibility).
+                Drivers now fetch the current workspace dynamically via the workspace_directory property.
         """
-        self.workspace_directory = workspace_directory
+        # workspace_directory parameter is ignored - the property reads from ConfigManager instead.
+        # This ensures drivers always use the current workspace, even if it changes after initialization.
+
+    @property
+    def workspace_directory(self) -> Path:
+        """Get the current workspace directory from ConfigManager.
+
+        Returns the workspace path fresh on each access to handle dynamic workspace
+        changes (e.g., project switches, workspace_dir overrides).
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        return GriptapeNodes.ConfigManager().workspace_path
 
     @abstractmethod
     def create_signed_upload_url(
