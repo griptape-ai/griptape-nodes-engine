@@ -4069,42 +4069,63 @@ class WorkflowManager:
 
         A bare unsafe scalar with no surrounding container is replaced with ``None``.
         """
-        containers = (dict, list, tuple, set, frozenset)
-
         if WorkflowManager._is_ast_constant_safe(value):
             return WorkflowManager._ScrubResult(value=value, dropped=False)
 
         if isinstance(value, dict):
-            scrubbed_dict = {}
-            dropped = False
-            for key, item in value.items():
-                # An unsafe key or an unsafe non-container value means we drop the entry entirely.
-                if not WorkflowManager._is_ast_constant_safe(key) or (
-                    not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item)
-                ):
-                    dropped = True
-                    continue
-                item_result = WorkflowManager._scrub_for_ast_constant(item)
-                scrubbed_dict[key] = item_result.value
-                dropped = dropped or item_result.dropped
-            return WorkflowManager._ScrubResult(value=scrubbed_dict, dropped=dropped)
+            return WorkflowManager._scrub_dict(value)
 
         if isinstance(value, (list, tuple, set, frozenset)):
-            scrubbed_items = []
-            dropped = False
-            for item in value:
-                # An unsafe non-container element is dropped; containers are recursed into.
-                if not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item):
-                    dropped = True
-                    continue
-                item_result = WorkflowManager._scrub_for_ast_constant(item)
-                scrubbed_items.append(item_result.value)
-                dropped = dropped or item_result.dropped
-            return WorkflowManager._ScrubResult(value=type(value)(scrubbed_items), dropped=dropped)
+            return WorkflowManager._scrub_sequence(value)
 
         # A bare unsafe scalar (e.g. a callable or trait object) with no container to
         # prune: signal that it was dropped and return None as a safe placeholder.
         return WorkflowManager._ScrubResult(value=None, dropped=True)
+
+    @staticmethod
+    def _scrub_dict(value: dict) -> WorkflowManager._ScrubResult:
+        """Scrub a dict, dropping entries whose key or (non-container) value is unsafe."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_dict = {}
+        dropped = False
+        for key, item in value.items():
+            # An unsafe key or an unsafe non-container value means we drop the entry entirely.
+            if not WorkflowManager._is_ast_constant_safe(key) or (
+                not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item)
+            ):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_dict[key] = item_result.value
+            dropped = dropped or item_result.dropped
+        return WorkflowManager._ScrubResult(value=scrubbed_dict, dropped=dropped)
+
+    @staticmethod
+    def _scrub_sequence(value: list | tuple | set | frozenset) -> WorkflowManager._ScrubResult:
+        """Scrub a sequence, dropping unsafe non-container elements and recursing into containers."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_items = []
+        dropped = False
+        for item in value:
+            # An unsafe non-container element is dropped; containers are recursed into.
+            if not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_items.append(item_result.value)
+            dropped = dropped or item_result.dropped
+        # Rebuild using the nearest builtin constructor rather than type(value)(...),
+        # so a tuple subclass like a namedtuple (whose __new__ takes positional fields,
+        # not an iterable) becomes a plain tuple instead of raising TypeError.
+        if isinstance(value, list):
+            rebuilt: Any = scrubbed_items
+        elif isinstance(value, tuple):
+            rebuilt = tuple(scrubbed_items)
+        elif isinstance(value, frozenset):
+            rebuilt = frozenset(scrubbed_items)
+        else:
+            rebuilt = set(scrubbed_items)
+        return WorkflowManager._ScrubResult(value=rebuilt, dropped=dropped)
 
     @staticmethod
     def _keyword_from_field_value(arg_name: str, field_value: Any, command: Any) -> ast.keyword:
