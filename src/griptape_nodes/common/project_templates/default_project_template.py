@@ -29,9 +29,11 @@ from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifa
 
 # v0 default (schema 0.x): the legacy baseline. File destinations are workspace-root
 # relative and file_extension_directory routing is not applied. Frozen: existing
-# projects keep these defaults so their on-disk layout never shifts under them.
+# projects keep these defaults so their on-disk layout never shifts under them. The
+# latest v0 version is 0.5.2 (additive schema bump from main), which a saved v0 project
+# rolls forward to; V1 below carries the new-major baseline.
 DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
-    project_template_schema_version="0.5.1",
+    project_template_schema_version="0.5.2",
     name="Default Project",
     description="System default configuration",
     directories={

@@ -1995,8 +1995,7 @@ class TestInstalledLibraryVersion:
     @staticmethod
     def _config_manager_for(libraries_dir: Path) -> MagicMock:
         config_manager = MagicMock()
-        config_manager.get_config_value.return_value = str(libraries_dir)
-        config_manager.workspace_path = str(libraries_dir.parent)
+        config_manager.resolved_libraries_root.return_value = libraries_dir
         return config_manager
 
     @pytest.mark.asyncio
@@ -2018,12 +2017,10 @@ class TestInstalledLibraryVersion:
             assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = self._config_manager_for(tmp_path / "empty-libraries")
             assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
@@ -2066,12 +2063,12 @@ class TestInstalledLibraryManifestPath:
             assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
+                tmp_path / "empty-libraries"
+            )
             assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
 
@@ -2121,13 +2118,13 @@ class TestInstalledDownloadVersion:
             assert await library_manager._installed_download_version(download) == "0.9.0"
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
+                tmp_path / "empty-libraries"
+            )
             assert await library_manager._installed_download_version(download) is None
 
     @pytest.mark.asyncio
@@ -2331,9 +2328,16 @@ class TestPreviewProjectProvisioning:
         }
 
     @staticmethod
-    def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object) -> None:
-        """Wire the mocked ProjectManager/ConfigManager the new handler calls."""
+    def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object, libraries_root: object = None) -> None:
+        """Wire the mocked ProjectManager/ConfigManager the new handler calls.
+
+        `libraries_root` is what resolve_libraries_root_for_project_id returns: None (the default)
+        makes the preview fall back to the merged config's workspace-relative libraries dir.
+        """
         mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = dirs
+        mock_gn.ProjectManager.return_value.resolve_libraries_root_for_project_id = AsyncMock(
+            return_value=libraries_root
+        )
         mock_gn.ConfigManager.return_value.compute_project_provisioning_config.return_value = merged
 
     @staticmethod
@@ -2498,6 +2502,45 @@ class TestPreviewProjectProvisioning:
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
+            result = await library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert [a.kind for a in result.actions] == [LibraryProvisioningActionKind.OVERWRITE]
+        assert result.actions[0].destructive is True
+        assert result.actions[0].installed_version == "1.0.0"
+
+    @pytest.mark.asyncio
+    async def test_probes_offline_resolved_libraries_root_over_workspace_default(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A non-None libraries_root from the offline resolver overrides the workspace-relative default.
+
+        Exercises the branch that consumes resolve_libraries_root_for_project_id: when the target
+        project's own/inherited libraries_dir relocates the sink (e.g. a child sharing its parent's
+        libraries tree), the probe must read THAT dir, not merged workspace/libraries_directory. Here
+        the unsatisfying version lives only in the resolved root; if the preview probed the merged
+        workspace default instead, the plan would wrongly be a non-destructive INSTALL.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            LibraryProvisioningActionKind,
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        resolved_root = tmp_path / "shared-libs"
+        TestInstalledLibraryVersion._write_manifest(resolved_root / "git-lib", "git-lib", "1.0.0")
+        # The merged workspace-relative default points at an empty dir; probing it would miss the
+        # stale version and under-report the plan as INSTALL.
+        merged = self._merged_config(
+            [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}],
+            workspace_directory=str(tmp_path / "ws"),
+            libraries_directory="libraries",
+        )
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged, libraries_root=resolved_root)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )

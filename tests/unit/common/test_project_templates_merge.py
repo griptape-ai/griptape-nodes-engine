@@ -1381,3 +1381,107 @@ name: "Modern Project"
             validation_info=validation,
         )
         assert merged.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+
+
+class TestLibrariesDir:
+    """Round-trip, tombstone, and merge behavior for the per-project `libraries_dir` field.
+
+    `libraries_dir` declares where a project's libraries install/resolve, decoupled from
+    workspace_dir. Like workspace_dir it has OWN-node merge semantics (never inherited from
+    base; cross-project inheritance is the resolution ladder's job) and the stored value is
+    the raw string/per-platform mapping (never absolutized) so a relative path stays portable.
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_string_libraries_dir_survives_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/abs/libraries"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.libraries_dir == "/abs/libraries"
+
+    def test_relative_libraries_dir_stored_verbatim(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        assert "libraries_dir" in overlay_yaml
+
+        merged = self._roundtrip(modified)
+        assert merged.libraries_dir == "./libraries"
+
+    def test_per_platform_libraries_dir_survives_round_trip(self) -> None:
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        per_platform = PerPlatformProjectPath(
+            linux="/lib/linux", darwin="/lib/darwin", windows="C:\\lib", default="/lib"
+        )
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": per_platform})
+
+        merged = self._roundtrip(modified)
+
+        assert isinstance(merged.libraries_dir, PerPlatformProjectPath)
+        assert merged.libraries_dir.linux == "/lib/linux"
+        assert merged.libraries_dir.default == "/lib"
+
+    def test_unset_libraries_dir_not_emitted(self) -> None:
+        assert "libraries_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_explicit_null_tombstones_inherited_libraries_dir(self) -> None:
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/inherited/lib"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+libraries_dir: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_libraries_dir is True
+        assert overlay_data.libraries_dir is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.libraries_dir is None
+
+    def test_child_does_not_inherit_base_libraries_dir(self) -> None:
+        # OWN-node semantics: a child whose overlay omits libraries_dir does NOT adopt the
+        # base's value (cross-project inheritance is the resolution ladder's job, not merge's).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/base/lib"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.libraries_dir is None
+        assert overlay_data.clears_libraries_dir is False
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.libraries_dir is None
+
+    def test_invalid_libraries_dir_type_records_error(self) -> None:
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Bad"
+libraries_dir: 42
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        load_partial_project_template(yaml_text, validation)
+
+        assert validation.status != ProjectValidationStatus.GOOD
+        assert any("libraries_dir" in problem.field_path for problem in validation.problems)

@@ -97,6 +97,22 @@ class ProjectTemplate(BaseModel):
             "time, so a relative value keeps the project portable across machines."
         ),
     )
+    libraries_dir: str | PerPlatformProjectPath | None = Field(
+        default=None,
+        description=(
+            "Optional directory where this project's downloaded/registered libraries install and resolve, "
+            "decoupled from workspace_dir. When set, libraries_to_download are provisioned here instead of "
+            "under the workspace-relative libraries_directory, so a child project can share its parent's "
+            "library install location and avoid re-downloading. It inherits down the parent-project chain: a "
+            "child with no libraries_dir of its own adopts the nearest ancestor that declares one, resolved "
+            "against that ancestor's project directory. The value may be: (1) a string — absolute, or relative "
+            "to the directory of this project's YAML (e.g. `./libraries`); or (2) a per-platform mapping with "
+            "optional `linux`, `darwin`, `windows`, and `default` string fields. The raw string is stored "
+            "verbatim and only resolved to an absolute path at resolution time, so a relative value keeps the "
+            "project portable across machines. When unset everywhere in the chain, libraries resolve the legacy "
+            "way: the workspace-relative libraries_directory config value."
+        ),
+    )
     situations: dict[str, SituationTemplate] = Field(description="Situation templates (situation_name -> template)")
     directories: dict[str, DirectoryDefinition] = Field(
         description="Directory definitions (logical_name -> definition)",
@@ -166,6 +182,11 @@ class ProjectTemplate(BaseModel):
         # round-trips verbatim. An explicit null tombstones an inherited value.
         if self_dump.get("workspace_dir") != base_dump.get("workspace_dir"):
             output["workspace_dir"] = self_dump.get("workspace_dir")
+
+        # libraries_dir: same semantics as workspace_dir. Raw string/mapping stored
+        # verbatim; emitted only when it diverges from base; explicit null tombstones.
+        if self_dump.get("libraries_dir") != base_dump.get("libraries_dir"):
+            output["libraries_dir"] = self_dump.get("libraries_dir")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
         if situations_overlay:
@@ -515,6 +536,12 @@ class ProjectTemplate(BaseModel):
         # both yield None.
         merged_workspace_dir = None if overlay.clears_workspace_dir else overlay.workspace_dir
 
+        # libraries_dir is never merge-inherited, for the same reason as workspace_dir:
+        # cross-project library-root inheritance is handled by the resolution ladder's
+        # parent-chain branch (decide_libraries_root), not by merge. Taken from the
+        # overlay alone; an explicit null or omitted field both yield None.
+        merged_libraries_dir = None if overlay.clears_libraries_dir else overlay.libraries_dir
+
         return ProjectTemplate(
             project_template_schema_version=overlay.project_template_schema_version,
             name=overlay.name,
@@ -522,6 +549,7 @@ class ProjectTemplate(BaseModel):
             parent_project_path=merged_parent_project_path,
             parent_project_id=merged_parent_project_id,
             workspace_dir=merged_workspace_dir,
+            libraries_dir=merged_libraries_dir,
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,
