@@ -99,6 +99,16 @@ Leave it blank and the project uses the workspace the engine works out from your
 
 For the full reference, see [Workspace directory](projects.md#workspace-directory) and [Workspace](workspace.md).
 
+### Libraries directory
+
+The **Libraries dir** field sets where this project installs and resolves its libraries, separate from the workspace. Use it so related projects can share one library install location instead of each re-downloading its own copy.
+
+Leave it blank and the project inherits its parent's libraries directory, falling back to a `libraries` folder inside the workspace when nothing is declared up the chain. A new top-level project is pre-filled with `./libraries` so its child projects inherit that shared location by default; child projects are created blank. Type a path to pin a specific location, or use the folder button to browse for one. Like the workspace field, it has a per-platform toggle for different paths on Linux, macOS, and Windows.
+
+![The Libraries dir field in the project detail view](../assets/img/projects/projects-gui-libraries-dir.png)
+
+For the full reference, see [Libraries directory](projects.md#libraries-directory).
+
 ### Directories
 
 **Directories** map a short logical name (like `outputs`) to a real folder path. Workflows and nodes refer to the name, and the project decides where it actually points. Use **Add Directory** to create one, and the per-platform toggle on a row to give a directory different paths on Linux, macOS, and Windows.

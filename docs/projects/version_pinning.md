@@ -93,6 +93,17 @@ You do not need to also add the library to `libraries_to_register`: after a
 successful download the engine appends the resolved manifest path to the
 register list automatically, so the download-then-load chain works on its own.
 
+### Where the downloads land
+
+`libraries_to_download` says **what** to install and at which version;
+[`libraries_dir`](projects.md#libraries-directory) (a field in the project YAML)
+says **where** those libraries install and resolve. The two compose: each pinned
+download is provisioned into the project's resolved libraries directory. When a
+project declares no `libraries_dir` (and inherits none from a parent), downloads
+land in the workspace-relative `libraries` directory, preserving today's behavior.
+A shared `libraries_dir` across a project tree means a pinned library downloaded
+once by the parent is reused by every child rather than re-downloaded.
+
 ## What happens on activation
 
 When a user activates a pinned project, the engine compares each

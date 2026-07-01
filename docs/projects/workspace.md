@@ -198,6 +198,8 @@ Because `workspace_dir` is the highest-priority source, this wins over any `proj
 
 All relative paths in the project system resolve against the **workspace directory**. If your workspace is `/Users/you/workspace/` and a situation macro resolves to `outputs/render_001.png`, the final absolute path is `/Users/you/workspace/outputs/render_001.png`.
 
+Libraries are the exception: they install and resolve under the workspace-relative `libraries` directory by default, but a project can relocate them (and share them across a project tree) with the [`libraries_dir`](projects.md#libraries-directory) field, independent of the workspace.
+
 The **project base directory** (the folder containing `griptape-nodes-project.yml`) is exposed as the `{project_dir}` builtin variable but is not used as the resolution base for relative paths. It is used as a fallback when the path manager maps an absolute path back to a macro form and the path falls inside the project folder but outside any named directory.
 
 ## Workspace and the project file
