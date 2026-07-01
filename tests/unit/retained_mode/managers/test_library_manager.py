@@ -3230,6 +3230,57 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         assert stored.problems
 
 
+class TestCollectLibraryLoadStatuses:
+    """_collect_library_load_statuses turns LibraryInfo into serializable status data."""
+
+    def test_maps_fields_and_disabled_state(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        library_manager = griptape_nodes.LibraryManager()
+
+        good = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/libs/good.json",
+            is_sandbox=False,
+            library_name="Good Library",
+            library_version="1.2.3",
+        )
+        disabled = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISABLED,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path="/libs/off.json",
+            is_sandbox=False,
+            library_name="Disabled Library",
+            library_version=None,
+        )
+        library_manager._library_file_path_to_info = {
+            "/libs/good.json": good,
+            "/libs/off.json": disabled,
+        }
+
+        statuses = library_manager._collect_library_load_statuses()
+
+        # Unpacking enforces exactly two statuses were produced.
+        good_status, disabled_status = statuses
+
+        assert good_status.library_name == "Good Library"
+        assert good_status.library_version == "1.2.3"
+        assert good_status.library_path == "/libs/good.json"
+        assert good_status.fitness == "GOOD"
+        assert good_status.disabled is False
+        assert good_status.problems is None
+
+        assert disabled_status.disabled is True
+        assert disabled_status.library_version is None
+
+    def test_empty_when_no_libraries(self, griptape_nodes: GriptapeNodes) -> None:
+        library_manager = griptape_nodes.LibraryManager()
+        library_manager._library_file_path_to_info = {}
+
+        assert library_manager._collect_library_load_statuses() == []
+
+
 class TestLibraryFitnessAuthorizationCheckpoint:
     """The license-policy checkpoint wired into library fitness evaluation."""
 
