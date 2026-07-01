@@ -171,6 +171,20 @@ class SequenceFormat(FormatSpec):
                 failure_reason=MacroResolutionFailureReason.INVALID_INTEGER_PARSE,
             ) from e
 
+    def render_pattern(self) -> str:
+        """Return the bare hash-pattern glyphs (``###``) for this spec, sized to ``min_width``.
+
+        Consumed by ``GetPathForMacroRequest``'s ``RENDER_SEQUENCE_PATTERN``
+        behavior when the caller wants to preview a macro whose sequence slot
+        isn't bound yet. Matches the ffmpeg / Houdini / Nuke convention where
+        ``###`` reads universally as "an integer goes here" — the returned
+        string is meant for display (destination fields, path previews), not
+        for filesystem I/O. It contains no braces or ``?`` marker, so the
+        surrounding text renders as the eventual on-disk shape rather than as
+        residual macro syntax.
+        """
+        return "#" * self.min_width
+
 
 @dataclass
 class LowerCaseFormat(FormatSpec):

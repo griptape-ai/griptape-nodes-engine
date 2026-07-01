@@ -302,6 +302,12 @@ class TestFormatSpecs:
         with pytest.raises(MacroResolutionError, match="Cannot parse"):
             fmt.reverse("abc")
 
+    def test_sequence_format_render_pattern_emits_bare_hashes(self) -> None:
+        """render_pattern emits the bare ``###`` glyphs at ``min_width`` — no braces, no ``?``."""
+        assert SequenceFormat(min_width=1).render_pattern() == "#"
+        assert SequenceFormat(min_width=3).render_pattern() == "###"
+        assert SequenceFormat(min_width=5).render_pattern() == "#####"
+
 
 class TestParsedMacro:
     """Test cases for ParsedMacro class."""

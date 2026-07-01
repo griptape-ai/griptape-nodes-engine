@@ -457,6 +457,209 @@ class TestProjectManagerBuiltinVariables:
         assert "cannot override builtin variables" in str(result.result_details)
 
 
+class TestUnresolvedSequenceSlotBehavior:
+    """Test the ``unresolved_sequence_slot_behavior`` flag on ``GetPathForMacroRequest``.
+
+    Each behavior is tested against a required ``{###}`` slot with no bound
+    value. The default (``FAIL``) is the write-path contract; the other three
+    behaviors are opt-ins for previewers.
+    """
+
+    @pytest.fixture
+    def project_manager_with_template(self) -> ProjectManager:
+        """Same fixture as ``TestProjectManagerBuiltinVariables`` — a PM with system defaults loaded."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_secrets = Mock()
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
+
+        project_path = Path("/test/project.yml")
+        project_id = str(project_path)
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_path,
+            project_base_dir=project_path.parent,
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+
+        pm._successfully_loaded_project_templates[project_id] = project_info
+        pm._current_project_id = project_id
+
+        return pm
+
+    def test_fail_returns_missing_required_for_required_sequence_slot(
+        self, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Default FAIL behavior surfaces MISSING_REQUIRED_VARIABLES so the write-path seed step can fire."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.FAIL,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert result.failure_reason == PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES
+        assert result.missing_variables == {"_index"}
+
+    def test_render_sequence_pattern_renders_bare_hashes(self, project_manager_with_template: ProjectManager) -> None:
+        """RENDER_SEQUENCE_PATTERN emits ``###`` (no braces) into the resolved path."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v###.png"
+
+    def test_render_sequence_pattern_matches_source_width(self, project_manager_with_template: ProjectManager) -> None:
+        """A ``{#####}`` slot renders as ``#####`` — width flows through, still bare hashes."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("frame_{#####}.exr")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "frame_#####.exr"
+
+    def test_start_at_zero_seeds_index_zero(self, project_manager_with_template: ProjectManager) -> None:
+        """START_AT_ZERO seeds ``_index = 0`` — a ``{###}`` slot renders as ``000``."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.START_AT_ZERO,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v000.png"
+
+    def test_start_at_one_seeds_index_one(self, project_manager_with_template: ProjectManager) -> None:
+        """START_AT_ONE matches the write-path seed — a ``{###}`` slot renders as ``001``."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.START_AT_ONE,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v001.png"
+
+    def test_optional_sequence_slot_is_omitted_regardless_of_behavior(
+        self, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Optional ``{###?}`` slots are always omitted when unbound — the flag doesn't matter.
+
+        FAIL is the interesting case: optional slots must NOT trigger MISSING_REQUIRED_VARIABLES.
+        The three non-FAIL behaviors must not substitute into an optional slot either — the
+        contract is "only required slots are affected."
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###?}.png")
+
+        for behavior in UnresolvedSequenceSlotBehavior:
+            request = GetPathForMacroRequest(
+                parsed_macro=parsed_macro,
+                variables={},
+                unresolved_sequence_slot_behavior=behavior,
+            )
+            result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+            assert isinstance(result, GetPathForMacroResultSuccess), (
+                f"Behavior {behavior} unexpectedly failed on optional slot"
+            )
+            # Optional slot is omitted → the ``_v`` separator survives but no digits/hashes are emitted.
+            assert str(result.resolved_path) == "render_v.png", (
+                f"Behavior {behavior} altered an optional slot; got {result.resolved_path!r}"
+            )
+
+    def test_bound_sequence_variable_ignores_behavior_flag(self, project_manager_with_template: ProjectManager) -> None:
+        """When the caller binds ``_index`` explicitly, the flag is a no-op."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={"_index": 42},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v042.png"
+
+    def test_no_sequence_slot_ignores_behavior_flag(self, project_manager_with_template: ProjectManager) -> None:
+        """Macros with no sequence slot are unaffected by the flag."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("plain/{file_name}.txt")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={"file_name": "hello"},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "plain/hello.txt"
+
+
 class TestProjectManagerGetStateForMacro:
     """Test ProjectManager GetStateForMacro request handler."""
 
