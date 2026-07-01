@@ -4,8 +4,8 @@ These tests cover small, near-pure helpers that decide loop control flow:
 
 * ``get_node_parameter_mappings`` - select the start or end mapping out of a
   PackageNodesAsSerializedFlowResultSuccess.
-* ``_should_break_loop`` - decide whether a packaged loop body's End node is
-  signaling a break.
+* ``_get_iteration_control_action`` - determine BREAK/SKIP/ADD for both the
+  legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path.
 * ``_check_control_source_fired`` - decide whether a (source_node, source_param)
   pair has fired its control output.
 * ``_find_source_for_control_param`` - return the first source for a given
@@ -17,8 +17,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from griptape_nodes.common.node_executor import NodeExecutor
+from griptape_nodes.common.node_executor import IterationControlAction, NodeExecutor
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
+from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
+from griptape_nodes.retained_mode.events.node_events import ListConnectionsForNodeResultSuccess
 
 _GRIPTAPE_NODES_PATH = "griptape_nodes.common.node_executor.GriptapeNodes"
 
@@ -71,86 +73,114 @@ class TestGetNodeParameterMappings:
             _make_executor().get_node_parameter_mappings(package, "middle")
 
 
-class TestShouldBreakLoop:
-    """_should_break_loop returns True iff the deserialized End node signals a break."""
+class TestGetIterationControlAction:
+    """_get_iteration_control_action returns BREAK/SKIP/ADD for both legacy and group end nodes."""
 
     @staticmethod
-    def _make_end_node(
-        *,
-        is_iterative_end: bool = True,
-        next_control_output: Any = None,
-        break_signal: Any = None,
-    ) -> Any:
-        if not is_iterative_end:
-            node = MagicMock()
-            return node
-        node = MagicMock(spec=BaseIterativeEndNode)
-        node.get_next_control_output.return_value = next_control_output
-        node.break_loop_signal_output = break_signal
-        return node
+    def _make_connections_result(connections: list[Any]) -> MagicMock:
+        result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        result.incoming_connections = connections
+        return result
 
-    def test_returns_false_when_end_name_missing_from_mappings(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        with patch(_GRIPTAPE_NODES_PATH):
-            result = _make_executor()._should_break_loop({}, package)
-        assert result is False
+    @staticmethod
+    def _make_connection(*, target_param: str, source_node: str, source_param: str) -> MagicMock:
+        conn = MagicMock()
+        conn.target_parameter_name = target_param
+        conn.source_node_name = source_node
+        conn.source_parameter_name = source_param
+        return conn
 
-    def test_returns_false_when_deserialized_end_node_not_found(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        mappings = {"EndPkg": "EndPkg_inst1"}
+    def _run(
+        self,
+        end_node: Any,
+        connections: list[Any],
+        check_fired_returns: dict[str, bool],
+    ) -> IterationControlAction:
+        """Run _get_iteration_control_action with mocked connections and fired results."""
+        connections_result = self._make_connections_result(connections)
 
+        # _find_sources_for_control_param returns the direct source for each connection
+        # _check_control_source_fired is keyed on the source_node_name returned
+        def fake_find_sources(incoming: list, param_name: str) -> list[tuple[str, str]]:
+            return [
+                (c.source_node_name, c.source_parameter_name) for c in incoming if c.target_parameter_name == param_name
+            ]
+
+        def fake_check_fired(source: tuple[str, str] | None, _mappings: dict) -> bool:
+            if source is None:
+                return False
+            return check_fired_returns.get(source[0], False)
+
+        executor = _make_executor()
         with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = None
-            result = _make_executor()._should_break_loop(mappings, package)
+            mock_gn.handle_request.return_value = connections_result
+            with (
+                patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
+                patch.object(NodeExecutor, "_check_control_source_fired", side_effect=fake_check_fired),
+            ):
+                return executor._get_iteration_control_action(end_node, {})
 
-        assert result is False
+    def test_returns_add_when_no_connections(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        result = self._run(end_node, [], {})
+        assert result == IterationControlAction.ADD
 
-    def test_returns_false_when_deserialized_node_is_not_iterative_end(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        mappings = {"EndPkg": "EndPkg_inst1"}
-        non_iterative_node = MagicMock()  # Not a BaseIterativeEndNode
+    def test_returns_add_when_no_source_fired(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="BodyNode", source_param="exec_out"),
+        ]
+        result = self._run(end_node, connections, {"BodyNode": False})
+        assert result == IterationControlAction.ADD
 
+    def test_legacy_end_node_returns_break_when_break_source_fired(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="CondNode", source_param="exec_out"),
+        ]
+        result = self._run(end_node, connections, {"CondNode": True})
+        assert result == IterationControlAction.BREAK
+
+    def test_legacy_end_node_returns_skip_when_skip_source_fired(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="skip_iteration", source_node="CondNode", source_param="exec_out"),
+        ]
+        result = self._run(end_node, connections, {"CondNode": True})
+        assert result == IterationControlAction.SKIP
+
+    def test_break_takes_priority_over_skip(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="BreakNode", source_param="exec_out"),
+            self._make_connection(target_param="skip_iteration", source_node="SkipNode", source_param="exec_out"),
+        ]
+        result = self._run(end_node, connections, {"BreakNode": True, "SkipNode": True})
+        assert result == IterationControlAction.BREAK
+
+    def test_group_end_node_returns_break_when_break_source_fired(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeNodeGroup)
+        end_node.name = "ForEachGroup"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="BodyNode", source_param="exec_out"),
+        ]
+        result = self._run(end_node, connections, {"BodyNode": True})
+        assert result == IterationControlAction.BREAK
+
+    def test_returns_add_when_list_connections_fails(self) -> None:
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        executor = _make_executor()
+        # Return a non-success result from handle_request
         with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = non_iterative_node
-            result = _make_executor()._should_break_loop(mappings, package)
-
-        assert result is False
-
-    def test_returns_false_when_no_next_control_output(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        mappings = {"EndPkg": "EndPkg_inst1"}
-        end_node = self._make_end_node(next_control_output=None)
-
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = end_node
-            result = _make_executor()._should_break_loop(mappings, package)
-
-        assert result is False
-
-    def test_returns_false_when_next_control_output_is_not_break_signal(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        mappings = {"EndPkg": "EndPkg_inst1"}
-        not_break = object()
-        break_signal = object()
-        end_node = self._make_end_node(next_control_output=not_break, break_signal=break_signal)
-
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = end_node
-            result = _make_executor()._should_break_loop(mappings, package)
-
-        assert result is False
-
-    def test_returns_true_when_next_control_output_matches_break_signal(self) -> None:
-        package = _make_package_result(end_node_name="EndPkg")
-        mappings = {"EndPkg": "EndPkg_inst1"}
-        break_signal = object()
-        end_node = self._make_end_node(next_control_output=break_signal, break_signal=break_signal)
-
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = end_node
-            result = _make_executor()._should_break_loop(mappings, package)
-
-        assert result is True
+            mock_gn.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
+            result = executor._get_iteration_control_action(end_node, {})
+        assert result == IterationControlAction.ADD
 
 
 class TestCheckControlSourceFired:

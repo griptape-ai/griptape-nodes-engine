@@ -915,63 +915,21 @@ class NodeExecutor:
 
         end_node._output_results_list()
 
-    def _should_break_loop(
+    def _get_iteration_control_action(
         self,
-        node_name_mappings: dict[str, str],
-        package_result: PackageNodesAsSerializedFlowResultSuccess,
-    ) -> bool:
-        """Check if the loop should break based on the end node's control output.
-
-        Args:
-            node_name_mappings: Mapping from original to deserialized node names
-            package_result: The package result containing parameter mappings
-
-        Returns:
-            True if the end node signaled a break, False otherwise
-        """
-        node_manager = GriptapeNodes.NodeManager()
-
-        # Get the End node mapping
-        end_node_mapping = self.get_node_parameter_mappings(package_result, "end")
-        end_node_name = end_node_mapping.node_name
-
-        # Get the deserialized end node name
-        packaged_end_node_name = node_name_mappings.get(end_node_name)
-        if packaged_end_node_name is None:
-            logger.warning("Could not find deserialized End node name for %s", end_node_name)
-            return False
-
-        # Get the deserialized end node instance
-        deserialized_end_node = node_manager.get_node_by_name(packaged_end_node_name)
-        if deserialized_end_node is None:
-            logger.warning("Could not find deserialized End node instance for %s", packaged_end_node_name)
-            return False
-
-        # Check if this is a BaseIterativeEndNode
-        if not isinstance(deserialized_end_node, BaseIterativeEndNode):
-            return False
-
-        # Check if end node would emit break_loop_signal_output
-        next_control_output = deserialized_end_node.get_next_control_output()
-        if next_control_output is None:
-            return False
-
-        # Check if it's the break signal
-        return next_control_output == deserialized_end_node.break_loop_signal_output
-
-    def _get_iteration_control_action_for_group(
-        self,
-        end_loop_node: BaseIterativeNodeGroup,
+        end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
         node_name_mappings: dict[str, str],
     ) -> IterationControlAction:
-        """Determine which control action was taken during iteration for an iterative group.
+        """Determine which control action was taken during an iteration.
 
-        Checks if any internal nodes have executed their control outputs that connect to the
-        group's control parameters (loop_complete, skip_iteration, break_loop). This is done by
-        checking the source node's parameter_output_values for CONTROL_INPUT_PARAMETER.
+        Checks if any nodes whose control outputs connect to the loop end node's
+        skip_iteration, break_loop, or loop_complete inputs have fired. Works for both
+        the legacy BaseIterativeEndNode path and the BaseIterativeNodeGroup path —
+        both expose identically-named control inputs and the detection is purely
+        connection/name based.
 
         Args:
-            end_loop_node: The BaseIterativeNodeGroup being executed
+            end_loop_node: The loop end node (BaseIterativeEndNode or BaseIterativeNodeGroup)
             node_name_mappings: Mapping from original to deserialized node names
 
         Returns:
@@ -1202,9 +1160,9 @@ class NodeExecutor:
                 else:
                     successful_iterations.append(iteration_index)
 
-                # For BaseIterativeNodeGroup, check control action to handle skip/break
-                if isinstance(end_loop_node, BaseIterativeNodeGroup):
-                    control_action = self._get_iteration_control_action_for_group(end_loop_node, node_name_mappings)
+                # Check control action to handle skip/break for both group and legacy end nodes
+                if isinstance(end_loop_node, (BaseIterativeNodeGroup, BaseIterativeEndNode)):
+                    control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
 
                     if control_action == IterationControlAction.SKIP:
                         logger.info(
@@ -1251,16 +1209,6 @@ class NodeExecutor:
                     # Yield to the event loop so queued publish_update_to_parameter events
                     # are dispatched to the UI before the next iteration begins.
                     await asyncio.sleep(0)
-
-                # Check if the end node signaled a break (for BaseIterativeEndNode)
-                if self._should_break_loop(node_name_mappings, package_result):
-                    logger.info(
-                        "Loop break detected at iteration %d/%d - stopping execution early",
-                        iteration_index + 1,
-                        total_iterations,
-                    )
-                    break_occurred = True
-                    break
 
             # Extract last iteration values from the last successful iteration
             last_successful_iteration = successful_iterations[-1] if successful_iterations else 0
@@ -1333,13 +1281,14 @@ class NodeExecutor:
                         parameter_values_per_iteration[iteration_index][param_name] = param_value
 
         # Execute iterations sequentially based on execution environment
+        break_occurred = False
         if execution_type == LOCAL_EXECUTION:
             (
                 iteration_results,
                 successful_iterations,
                 last_iteration_values,
                 _skipped_count,
-                _break_occurred,
+                break_occurred,
             ) = await self._execute_loop_iterations_sequentially(
                 package_result=package_result,
                 total_iterations=total_iterations,
@@ -1370,10 +1319,16 @@ class NodeExecutor:
                 end_loop_node=end_node,
                 execution_type=execution_type,
             )
-        # Check if execution stopped early due to break (not failure)
-        if len(successful_iterations) < total_iterations:
+        # A break legitimately stops the loop early — not a failure.
+        if break_occurred:
+            logger.info(
+                "Loop '%s' broke early at %d of %d iterations (break signal)",
+                end_node.name,
+                len(successful_iterations),
+                total_iterations,
+            )
+        elif len(successful_iterations) < total_iterations:
             # Only raise an error if there were actual failures (not just early termination)
-            # If iterations stopped due to break, the last successful iteration count matches
             expected_count = len(successful_iterations)
             actual_count = len(iteration_results)
             if expected_count != actual_count:
@@ -1381,7 +1336,7 @@ class NodeExecutor:
                 msg = f"Loop execution failed: {failed_count} of {expected_count} iterations failed"
                 raise RuntimeError(msg)
             logger.info(
-                "Loop execution stopped early at %d of %d iterations (break signal)",
+                "Loop execution stopped early at %d of %d iterations",
                 len(successful_iterations),
                 total_iterations,
             )
