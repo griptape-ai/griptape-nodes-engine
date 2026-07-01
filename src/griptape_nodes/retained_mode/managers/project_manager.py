@@ -1478,54 +1478,24 @@ class ProjectManager:
     ) -> str | None:
         """Offline analogue of _inherit_workspace_from_parents: walk the parent chain from disk.
 
-        Resolves parent links by reading each node's overlay from disk rather than its loaded
-        template, so resolving an ancestor's workspace never forces that ancestor to be
-        loaded/enabled. Each hop reduces the node's parent link to an
-        id via the shared _reduce_parent_link_to_id (which reads only the parent_project_id /
-        parent_project_path fields, present on ProjectOverlayData as well as ProjectTemplate), then
-        maps that id back to a file path: through `id_index` for a parent_project_id (or a legacy
-        path already in the index), or by following the reduced canonical path directly from disk for
-        an unregistered legacy parent_project_path. A parent_project_id with no index entry and no
-        readable file fails closed (returns None). The per-node workspace test is the shared
-        _resolve_node_explicit_workspace primitive. The walk begins at the parent: the starting
-        project's own explicit sources are handled by _decide_workspace_pre_inheritance. A visited
-        id-set guards against a cyclic parent chain.
+        Resolves an ancestor's workspace without forcing that ancestor to be loaded/enabled. The
+        chain traversal, cycle guard, and single per-node overlay read live in the shared
+        _nearest_ancestor_value_offline; only the per-node probe (an ancestor's explicit workspace,
+        read from config) is supplied here. The walk begins at the parent: the starting project's own
+        explicit sources are handled by _decide_workspace_pre_inheritance.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
             config_source="user_config",
             default={},
         )
-        file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
 
-        # Seed the cycle guard with the start project's id (when it has one in the index) so a chain
-        # that loops back to the start is detected on the hop into it, mirroring the live walk. A
-        # legacy start reachable only by path has no index id; it is left unseeded.
-        start_id = file_path_to_id.get(project_file_path)
-        visited: set[ProjectID] = {start_id} if start_id is not None else set()
+        def probe(node_path: Path, _overlay: ProjectOverlayData) -> str | None:
+            # Workspace is read from config, not the overlay; the overlay was read by the walker to
+            # follow the parent link and doubles as the ancestor's readability check.
+            return self._resolve_node_explicit_workspace(node_path, project_workspaces)
 
-        current_path: Path | None = project_file_path
-        while current_path is not None:
-            read_load = await self._read_overlay(current_path, record_status=False)
-            if isinstance(read_load, LoadProjectTemplateResultFailure):
-                return None
-            _, overlay = read_load
-
-            parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
-            if parent_id is None:
-                return None
-            if parent_id in visited:
-                return None
-            visited.add(parent_id)
-
-            parent_path = self._resolve_parent_id_to_path(parent_id, id_index)
-            if parent_path is None:
-                return None
-            node_workspace = self._resolve_node_explicit_workspace(parent_path, project_workspaces)
-            if node_workspace is not None:
-                return node_workspace
-            current_path = parent_path
-        return None
+        return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
 
     def _resolve_parent_id_to_path(self, parent_id: ProjectID, id_index: dict[str, Path]) -> Path | None:
         """Map a reduced parent id to a project file path for the offline walk, or None if unresolvable.
@@ -1579,22 +1549,60 @@ class ProjectManager:
     ) -> str | None:
         """Offline analogue of _inherit_libraries_dir_from_parents: walk the parent chain from disk.
 
-        Reads each node's overlay from disk rather than its loaded template, resolving the per-node
-        libraries_dir against that node's own directory. Mirrors _inherit_workspace_from_parents_offline
-        exactly, differing only in the per-node source (template libraries_dir field). The walk begins
-        at the parent; a visited id-set guards against a cyclic chain.
+        Resolves an ancestor's libraries_dir without forcing that ancestor to be loaded/enabled. The
+        chain traversal, cycle guard, and single per-node overlay read live in the shared
+        _nearest_ancestor_value_offline; only the per-node probe (an ancestor's template libraries_dir,
+        read from the overlay the walker already loaded) is supplied here. The walk begins at the
+        parent: the starting project's own libraries_dir is handled by branch 0 of the caller.
+        """
+
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+            return self._resolve_template_libraries_dir(overlay.libraries_dir, node_path)
+
+        return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
+
+    async def _nearest_ancestor_value_offline(
+        self,
+        project_file_path: Path,
+        id_index: dict[str, Path],
+        probe: Callable[[Path, ProjectOverlayData], str | None],
+    ) -> str | None:
+        """Walk the explicit parent chain from disk and return the first probe hit, or None.
+
+        Shared skeleton for the offline workspace and libraries inheritance walks, used when a target
+        project may not be loaded (e.g. the provisioning preview). Reads each node's overlay from disk
+        exactly ONCE, at the top of the loop, and uses it both to reduce the parent link (via the
+        shared _reduce_parent_link_to_id) and to probe that node. Each reduced id maps back to a file
+        path through `id_index` for a parent_project_id (or a legacy path already indexed), else the
+        reduced canonical path is followed directly from disk for an unregistered legacy
+        parent_project_path; an id with no index entry and no readable file fails closed (None).
+
+        The start project is NOT probed: its own value is handled by the caller's branch 0 / the
+        earlier decide_workspace branches, so the walk begins at the parent. A node whose overlay
+        cannot be read returns None (fail-closed) -- an unreadable project YAML is not a valid chain
+        link. A visited id-set guards against a cyclic parent chain.
         """
         file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
 
+        # Seed the cycle guard with the start project's id (when it has one in the index) so a chain
+        # that loops back to the start is detected on the hop into it, mirroring the live walk. A
+        # legacy start reachable only by path has no index id; it is left unseeded.
         start_id = file_path_to_id.get(project_file_path)
         visited: set[ProjectID] = {start_id} if start_id is not None else set()
 
         current_path: Path | None = project_file_path
+        is_start = True
         while current_path is not None:
             read_load = await self._read_overlay(current_path, record_status=False)
             if isinstance(read_load, LoadProjectTemplateResultFailure):
                 return None
             _, overlay = read_load
+
+            if not is_start:
+                node_value = probe(current_path, overlay)
+                if node_value is not None:
+                    return node_value
+            is_start = False
 
             parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
             if parent_id is None:
@@ -1603,16 +1611,7 @@ class ProjectManager:
                 return None
             visited.add(parent_id)
 
-            parent_path = self._resolve_parent_id_to_path(parent_id, id_index)
-            if parent_path is None:
-                return None
-            parent_overlay_load = await self._read_overlay(parent_path, record_status=False)
-            if not isinstance(parent_overlay_load, LoadProjectTemplateResultFailure):
-                _, parent_overlay = parent_overlay_load
-                node_libraries_dir = self._resolve_template_libraries_dir(parent_overlay.libraries_dir, parent_path)
-                if node_libraries_dir is not None:
-                    return node_libraries_dir
-            current_path = parent_path
+            current_path = self._resolve_parent_id_to_path(parent_id, id_index)
         return None
 
     def decide_workspace(
@@ -1805,60 +1804,24 @@ class ProjectManager:
 
         Returns the workspace_directory the nearest ancestor would resolve to (its
         project_workspaces override, else its adjacent griptape_nodes_config.json),
-        or None when no ancestor in the chain defines one. The walk is conducted in
-        id-space through the registry (no disk template loads); each ancestor's
-        adjacent config is read read-only. A visited id-set guards against a cyclic
-        parent chain. The starting project's OWN explicit sources are handled by the
-        earlier branches of decide_workspace, so the walk begins at the parent.
+        or None when no ancestor in the chain defines one. The starting project's OWN
+        explicit sources are handled by the earlier branches of decide_workspace, so the
+        walk begins at the parent. The chain traversal and cycle guard live in the shared
+        _nearest_ancestor_value_live; only the per-node probe (an ancestor's explicit
+        workspace) is supplied here.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
             config_source="user_config",
             default={},
         )
-        file_path_to_id: dict[Path, ProjectID] = {
-            info.project_file_path: pid
-            for pid, info in self._successfully_loaded_project_templates.items()
-            if info.project_file_path is not None
-        }
 
-        resolved_start_path = canonicalize_for_identity(project_file_path)
-        start_id = next(
-            (
-                pid
-                for pid, info in self._successfully_loaded_project_templates.items()
-                if info.project_file_path is not None
-                and canonicalize_for_identity(info.project_file_path) == resolved_start_path
-            ),
-            None,
-        )
-        if start_id is None:
-            return None
+        def probe(info: ProjectInfo) -> str | None:
+            if info.project_file_path is None:
+                return None
+            return self._resolve_node_explicit_workspace(info.project_file_path, project_workspaces)
 
-        visited: set[ProjectID] = {start_id}
-        current_info = self._successfully_loaded_project_templates.get(start_id)
-        while current_info is not None:
-            parent_id = self._reduce_parent_link_to_id(
-                current_info.template,
-                current_info.project_file_path,
-                file_path_to_id,
-            )
-            if parent_id is None:
-                return None
-            if parent_id in visited:
-                return None
-            visited.add(parent_id)
-            parent_info = self._successfully_loaded_project_templates.get(parent_id)
-            if parent_info is None:
-                return None
-            if parent_info.project_file_path is not None:
-                node_workspace = self._resolve_node_explicit_workspace(
-                    parent_info.project_file_path, project_workspaces
-                )
-                if node_workspace is not None:
-                    return node_workspace
-            current_info = parent_info
-        return None
+        return self._nearest_ancestor_value_live(project_file_path, probe)
 
     def decide_libraries_root(self, project_file_path: Path, template_libraries_dir: str | None) -> Path | None:
         """Decide where a project's libraries install/resolve, or None for the legacy default.
@@ -1909,12 +1872,31 @@ class ProjectManager:
         """Walk the explicit parent-project chain for the nearest ancestor's libraries_dir.
 
         Returns the resolved absolute libraries_dir the nearest ancestor declares (against that
-        ancestor's own project dir), or None when no ancestor in the chain defines one. The walk is
-        conducted in id-space through the registry (no disk template loads); a visited id-set guards
-        against a cyclic parent chain. The starting project's OWN libraries_dir is handled by branch 0
-        of decide_libraries_root, so the walk begins at the parent. Mirrors
-        _inherit_workspace_from_parents, differing only in the per-node source (template libraries_dir
-        field vs. workspace override/config).
+        ancestor's own project dir), or None when no ancestor in the chain defines one. The starting
+        project's OWN libraries_dir is handled by branch 0 of decide_libraries_root, so the walk
+        begins at the parent. The chain traversal and cycle guard live in the shared
+        _nearest_ancestor_value_live; only the per-node probe (an ancestor's template libraries_dir)
+        is supplied here.
+        """
+
+        def probe(info: ProjectInfo) -> str | None:
+            if info.project_file_path is None:
+                return None
+            return self._resolve_template_libraries_dir(info.template.libraries_dir, info.project_file_path)
+
+        return self._nearest_ancestor_value_live(project_file_path, probe)
+
+    def _nearest_ancestor_value_live(
+        self, project_file_path: Path, probe: Callable[[ProjectInfo], str | None]
+    ) -> str | None:
+        """Walk the explicit parent chain (loaded registry) and return the first probe hit, or None.
+
+        Shared skeleton for the live workspace and libraries inheritance walks. Traverses in id-space
+        through _successfully_loaded_project_templates (no disk loads): find the start project's id,
+        then hop parent to parent via _reduce_parent_link_to_id, guarding against a cyclic chain with
+        a visited id-set. The walk begins at the parent (the starting project's own value is handled
+        by the caller's branch 0 / earlier decide_workspace branches). `probe` is applied to each
+        ancestor ProjectInfo; the first non-None result wins.
         """
         file_path_to_id: dict[Path, ProjectID] = {
             info.project_file_path: pid
@@ -1951,12 +1933,9 @@ class ProjectManager:
             parent_info = self._successfully_loaded_project_templates.get(parent_id)
             if parent_info is None:
                 return None
-            if parent_info.project_file_path is not None:
-                node_libraries_dir = self._resolve_template_libraries_dir(
-                    parent_info.template.libraries_dir, parent_info.project_file_path
-                )
-                if node_libraries_dir is not None:
-                    return node_libraries_dir
+            node_value = probe(parent_info)
+            if node_value is not None:
+                return node_value
             current_info = parent_info
         return None
 
