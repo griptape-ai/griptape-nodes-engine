@@ -3428,11 +3428,21 @@ class LibraryManager:
 
         # Probe the installed versions against the TARGET project's libraries dir, not the
         # live one, so the plan matches what activation would reconcile in that workspace.
+        # A project's own/inherited libraries_dir (resolved offline so an unloaded target is
+        # honored) takes precedence; otherwise fall back to the workspace-relative default.
         # Both keys come from Settings defaults, so they are always present in `merged`.
-        libraries_path = resolve_workspace_path(
-            Path(get_dot_value(merged, "libraries_directory")),
-            Path(get_dot_value(merged, "workspace_directory")),
-        )
+        libraries_root = None
+        if request.project_id != SYSTEM_DEFAULTS_KEY:
+            libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
+                request.project_id
+            )
+        if libraries_root is not None:
+            libraries_path = libraries_root
+        else:
+            libraries_path = resolve_workspace_path(
+                Path(get_dot_value(merged, "libraries_directory")),
+                Path(get_dot_value(merged, "workspace_directory")),
+            )
 
         actions = await asyncio.gather(
             *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
@@ -3638,11 +3648,7 @@ class LibraryManager:
         about is exactly the file overwrite targets.
         """
         if libraries_path is None:
-            config_mgr = GriptapeNodes.ConfigManager()
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                return None
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
 
         for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
@@ -3688,11 +3694,7 @@ class LibraryManager:
             return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
 
         if libraries_path is None:
-            config_mgr = GriptapeNodes.ConfigManager()
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                return None
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
 
         repo_name = extract_repo_name_from_url(download.git_url)
         repo_directory = libraries_path / repo_name
@@ -3811,13 +3813,7 @@ class LibraryManager:
             }
         """
         config_mgr = GriptapeNodes.ConfigManager()
-        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-
-        if not libraries_dir_setting:
-            logger.warning("Cannot download libraries: libraries_directory not configured")
-            return {}
-
-        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+        libraries_path = config_mgr.resolved_libraries_root()
 
         async def download_one(git_url_with_ref: str) -> tuple[str, dict[str, Any]]:
             """Download a single library if not already present."""
@@ -5810,12 +5806,9 @@ class LibraryManager:
             # Use custom download directory if provided
             libraries_path = Path(download_directory)
         else:
-            # Use default from config
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                details = "Cannot download library: libraries_directory setting is not configured."
-                return DownloadLibraryResultFailure(result_details=details)
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            # Resolve the libraries root (a project's own/inherited libraries_dir override, else the
+            # workspace-relative libraries_directory).
+            libraries_path = config_mgr.resolved_libraries_root()
 
         # Ensure parent directory exists
         await anyio.Path(libraries_path).mkdir(parents=True, exist_ok=True)
