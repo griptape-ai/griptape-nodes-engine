@@ -243,6 +243,17 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
             LIBRARIES_TO_REGISTER_KEY,
             libraries_config.libraries_to_register,
         )
+        # If a workspace config exists at the configured workspace directory, mirror
+        # the library settings there. The workspace config layer has higher precedence
+        # than the user config and would otherwise silently override the values above.
+        config_manager.set_workspace_config_value(
+            LIBRARIES_TO_DOWNLOAD_KEY,
+            libraries_config.libraries_to_download,
+        )
+        config_manager.set_workspace_config_value(
+            LIBRARIES_TO_REGISTER_KEY,
+            libraries_config.libraries_to_register,
+        )
         download_git_urls = [
             download.git_url for download in normalize_library_downloads(libraries_config.libraries_to_download)
         ]

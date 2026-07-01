@@ -587,6 +587,41 @@ class ConfigManager:
 
         return write_succeeded
 
+    def set_workspace_config_value(self, key: str, value: Any) -> bool:
+        """Write a value to the workspace config file.
+
+        A no-op when the resolved workspace config file does not yet exist on
+        disk — in those cases the user config layer is sufficient.
+        Returns True on success, False otherwise.
+        """
+        # Prefer the explicitly loaded workspace config path (set by load_workspace_config
+        # during engine startup). Fall back to the current workspace_path so that callers
+        # such as `gtn init` (which never calls load_workspace_config) can still reach the
+        # workspace config when the user passes --workspace-directory.
+        workspace_config_path = self._workspace_config_path
+        if workspace_config_path is None:
+            workspace_config_path = self.workspace_path / "griptape_nodes_config.json"
+
+        if not workspace_config_path.exists():
+            return False
+
+        delta = set_dot_value({}, key, value)
+        try:
+            current = json.loads(workspace_config_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as e:
+            logger.warning("set_workspace_config_value: failed to read workspace config: %s", e)
+            return False
+
+        merged = merge_dicts(current, delta)
+        try:
+            workspace_config_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+        except OSError as e:
+            logger.warning("set_workspace_config_value: failed to write workspace config: %s", e)
+            return False
+
+        self.load_configs()
+        return True
+
     def on_handle_get_config_category_request(self, request: GetConfigCategoryRequest) -> ResultPayload:
         if request.category is None or request.category == "":
             # Return the whole shebang. Start with the defaults and then layer on the user config.
