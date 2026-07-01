@@ -2512,6 +2512,45 @@ class TestPreviewProjectProvisioning:
         assert result.actions[0].installed_version == "1.0.0"
 
     @pytest.mark.asyncio
+    async def test_probes_offline_resolved_libraries_root_over_workspace_default(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A non-None libraries_root from the offline resolver overrides the workspace-relative default.
+
+        Exercises the branch that consumes resolve_libraries_root_for_project_id: when the target
+        project's own/inherited libraries_dir relocates the sink (e.g. a child sharing its parent's
+        libraries tree), the probe must read THAT dir, not merged workspace/libraries_directory. Here
+        the unsatisfying version lives only in the resolved root; if the preview probed the merged
+        workspace default instead, the plan would wrongly be a non-destructive INSTALL.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            LibraryProvisioningActionKind,
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        resolved_root = tmp_path / "shared-libs"
+        TestInstalledLibraryVersion._write_manifest(resolved_root / "git-lib", "git-lib", "1.0.0")
+        # The merged workspace-relative default points at an empty dir; probing it would miss the
+        # stale version and under-report the plan as INSTALL.
+        merged = self._merged_config(
+            [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}],
+            workspace_directory=str(tmp_path / "ws"),
+            libraries_directory="libraries",
+        )
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged, libraries_root=resolved_root)
+            result = await library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert [a.kind for a in result.actions] == [LibraryProvisioningActionKind.OVERWRITE]
+        assert result.actions[0].destructive is True
+        assert result.actions[0].installed_version == "1.0.0"
+
+    @pytest.mark.asyncio
     async def test_unsatisfiable_engine_version_populates_failure(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:

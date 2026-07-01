@@ -2400,6 +2400,7 @@ class TestResolveWorkspaceDirForProjectId:
         parent_id: str | None = None,
         parent_path: str | None = None,
         workspace_dir: "str | PerPlatformProjectPath | None" = None,
+        libraries_dir: "str | PerPlatformProjectPath | None" = None,
     ) -> "ProjectOverlayData":
         """Build a minimal ProjectOverlayData carrying only the id / parent-link / workspace fields the walk reads."""
         from griptape_nodes.common.project_templates.loader import ProjectOverlayData, YAMLLineInfo
@@ -2417,6 +2418,7 @@ class TestResolveWorkspaceDirForProjectId:
             id=project_id,
             parent_project_id=parent_id,
             workspace_dir=workspace_dir,
+            libraries_dir=libraries_dir,
         )
 
     @classmethod
@@ -2486,6 +2488,7 @@ class TestResolveWorkspaceDirForProjectId:
                 parent_id=spec.get("parent_id"),
                 parent_path=spec.get("parent_path"),
                 workspace_dir=spec.get("workspace_dir"),
+                libraries_dir=spec.get("libraries_dir"),
             )
             for spec in specs
         }
@@ -2512,7 +2515,13 @@ class TestResolveWorkspaceDirForProjectId:
         for loaded_id in loaded:
             spec = spec_by_id[loaded_id]
             file_path = canonicalize_for_identity(Path(spec["file"]))
-            template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": spec.get("parent_id")})
+            template = DEFAULT_PROJECT_TEMPLATE.model_copy(
+                update={
+                    "parent_project_id": spec.get("parent_id"),
+                    "workspace_dir": spec.get("workspace_dir"),
+                    "libraries_dir": spec.get("libraries_dir"),
+                }
+            )
             pm._successfully_loaded_project_templates[loaded_id] = ProjectInfo(
                 project_id=loaded_id,
                 project_file_path=file_path,
@@ -2753,6 +2762,158 @@ class TestResolveWorkspaceDirForProjectId:
 
         assert isinstance(probe, LoadProjectTemplateResultFailure)
         assert isinstance(recorded, LoadProjectTemplateResultFailure)
+
+
+class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
+    """`resolve_libraries_root_for_project_id` resolves an UNLOADED project's libraries root.
+
+    Offline analogue of decide_libraries_root, used by the provisioning preview. Unlike the workspace
+    resolver it consults ONLY the project-template libraries_dir field (branch 0) and the nearest
+    ancestor's libraries_dir walked from disk (branch 1); there is no project_workspaces / env /
+    adjacent-config input. Returns None when no libraries_dir is declared anywhere in the chain, so the
+    caller falls back to the workspace-relative libraries directory. Reuses the disk/config modeling
+    from TestResolveWorkspaceDirForProjectId (the specs now also carry an optional `libraries_dir`),
+    driving the real _build_unloaded_id_index and _inherit_libraries_dir_from_parents_offline.
+    """
+
+    @staticmethod
+    def _canonical(path: Path) -> Path:
+        """Canonicalize the way _resolve_template_libraries_dir returns its result."""
+        return canonicalize_for_identity(path)
+
+    @pytest.mark.asyncio
+    async def test_unloaded_no_libraries_dir_returns_none(self, tmp_path: Path) -> None:
+        """A parentless project with no libraries_dir returns None (caller uses the workspace default)."""
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unloaded_own_libraries_dir_wins(self, tmp_path: Path) -> None:
+        """A project's own libraries_dir field (branch 0) is returned, canonicalized."""
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        own_libs = tmp_path / "my-libs"
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": str(own_libs)}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(own_libs)
+
+    @pytest.mark.asyncio
+    async def test_unloaded_relative_libraries_dir_resolves_against_yaml(self, tmp_path: Path) -> None:
+        """A relative libraries_dir resolves against the project YAML's directory, not the cwd."""
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "./libraries"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(project_file.parent / "libraries")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_child_inherits_id_parent_libraries_dir(self, tmp_path: Path) -> None:
+        """A child with no own libraries_dir inherits the parent's (branch 1), resolved against the PARENT dir.
+
+        This is the library-sharing case: the child declares a workspace_dir of its own but points at
+        the parent's libraries/ tree, so a library declared on the parent is reused rather than
+        re-downloaded per child.
+        """
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "libraries_dir": "./shared-libs"},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}, "workspace_dir": "./ws"},
+            ],
+            registered=[str(parent_file), str(child_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(parent_file.parent / "shared-libs")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_own_libraries_dir_beats_inherited(self, tmp_path: Path) -> None:
+        """A child's own libraries_dir (branch 0) wins over an inherited one (branch 1)."""
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "libraries_dir": "./parent-libs"},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}, "libraries_dir": "./child-libs"},
+            ],
+            registered=[str(parent_file), str(child_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(child_file.parent / "child-libs")
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_id_returns_none(self, tmp_path: Path) -> None:
+        """An id present nowhere, and not a file path, returns None."""
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "./libs"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("does-not-exist")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_matches_decide_libraries_root_for_loaded_project(self, tmp_path: Path) -> None:
+        """Parity: for a LOADED child the offline resolver equals decide_libraries_root's value."""
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "libraries_dir": "./shared-libs"},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(parent_file), str(child_file)],
+            loaded=["A", "C"],
+        )
+
+        child_canonical = canonicalize_for_identity(child_file)
+        # The child declares no own libraries_dir, so branch 0 passes None and the live walk (branch 1)
+        # resolves the parent's value; the offline resolver must reach the same path.
+        live_decision = pm.decide_libraries_root(child_canonical, template_libraries_dir=None)
+        offline_result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert live_decision is not None
+        assert offline_result == live_decision
+        assert offline_result == self._canonical(parent_file.parent / "shared-libs")
 
 
 class TestOnResolveProjectWorkspaceRequest(TestResolveWorkspaceDirForProjectId):
