@@ -542,7 +542,9 @@ class OSManager:
             # Re-raise the exception for non-workspace mode
             raise
 
-    def _resolve_macro_path_to_string(self, macro_path: MacroPath) -> str | MacroResolutionFailure:
+    def _resolve_macro_path_to_string(
+        self, macro_path: MacroPath, *, failure_log_level: int = logging.ERROR
+    ) -> str | MacroResolutionFailure:
         """Resolve MacroPath to absolute string via ProjectManager.
 
         Pure resolver: routes through ``GetPathForMacroRequest`` so project
@@ -553,6 +555,14 @@ class OSManager:
 
         Args:
             macro_path: MacroPath containing parsed macro and variables
+            failure_log_level: Log level for the failure result's
+                ``result_details``. Defaults to ``logging.ERROR`` — the
+                natural level for a failed resolve. Callers that treat a
+                resolution failure as an expected signal (e.g. the
+                ``on_write_file_request`` seed-and-retry path, whose first
+                attempt is intentionally probing for a missing sequence slot)
+                should pass ``logging.DEBUG`` so the noise doesn't surface as
+                a user-facing ERROR when the fallback succeeds.
 
         Returns:
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
@@ -562,6 +572,7 @@ class OSManager:
             GetPathForMacroRequest(
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
+                failure_log_level=failure_log_level,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):
@@ -2239,7 +2250,17 @@ class OSManager:
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
             path_display = f"{macro_path.parsed_macro}"
-            resolution_result = self._resolve_macro_path_to_string(macro_path)
+            # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
+            # the failure is the signal the seed-and-retry logic below uses to pick which
+            # slot to auto-allocate. Demote the log level so the probing miss doesn't
+            # surface as a user-facing ERROR when the retry succeeds. For any other
+            # policy the failure IS terminal, so it keeps the default ERROR level.
+            first_attempt_log_level = (
+                logging.DEBUG if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW else logging.ERROR
+            )
+            resolution_result = self._resolve_macro_path_to_string(
+                macro_path, failure_log_level=first_attempt_log_level
+            )
 
             # Seed-and-retry: ONLY for CREATE_NEW + a single padded missing-required
             # slot. Anything else (other policies, multiple missing, no padding) falls
@@ -2256,6 +2277,8 @@ class OSManager:
                 if candidate is not None:
                     seeded_vars = {**macro_path.variables, candidate.info.name: 1}
                     seeded_macro = MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
+                    # Second-attempt resolve: if seeding didn't fix it, that's genuinely
+                    # broken — keep the ERROR default so the user sees what went wrong.
                     resolution_result = self._resolve_macro_path_to_string(seeded_macro)
 
             if isinstance(resolution_result, MacroResolutionFailure):
