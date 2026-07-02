@@ -2058,6 +2058,32 @@ class TestGetNextVersionIndexRequest:
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
+    def test_sequence_slot_scan_skips_non_numeric_siblings(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Regression: scanning a `{###}` macro with a non-numeric sibling must not crash.
+
+        `SequenceFormat` slots use a permissive `*` glob, so `render_vfinal.png`
+        matches the shell glob against `render_v{###}.png`. Before the fix,
+        reverse-matching that name routed through `SequenceFormat.reverse("final")`,
+        raising `MacroResolutionError` all the way out to the request handler.
+        The scan now catches that error and treats non-parseable matches as
+        non-matches, so the numeric siblings still drive the next-index result.
+        """
+        (temp_dir / "render_v001.png").touch()
+        (temp_dir / "render_v002.png").touch()
+        (temp_dir / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
+
+        os_manager = griptape_nodes.OSManager()
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render_v{###}.png"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 3  # noqa: PLR2004
+
 
 class TestMakeDirectoryRequest:
     """Test MakeDirectoryRequest handler."""

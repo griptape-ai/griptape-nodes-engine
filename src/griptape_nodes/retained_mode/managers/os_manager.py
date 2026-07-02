@@ -920,11 +920,16 @@ class OSManager:
                 if segment.info.name == index_var_name:
                     # Sequence slots (`{###}` shorthand) carry a `SequenceFormat`
                     # spec with a *minimum* render width — overflow values like
-                    # `_v1000` against `{###}` are valid matches. Use the
-                    # permissive `*` glob; downstream integer extraction filters
-                    # non-numeric matches. Slots without a SequenceFormat fall
-                    # through to the same permissive `*` (defensive — the seed
-                    # step shouldn't have picked this slot in the first place).
+                    # `_v1000` against `{###}` are valid matches, so this globs
+                    # with a permissive `*`. The `*` may match non-numeric
+                    # siblings (e.g. `foo_vfinal.py`); those are skipped
+                    # downstream when `_extract_index_from_filename` catches
+                    # the MacroResolutionError raised by
+                    # `SequenceFormat.reverse("final")`. Slots without a
+                    # SequenceFormat fall through to the same permissive `*`
+                    # (defensive — the seed step shouldn't have picked this
+                    # slot in the first place, and the same skip behavior
+                    # covers whatever landed here).
                     pattern_parts.append("*")
                 else:
                     # This shouldn't happen - all non-index variables should be resolved
@@ -961,8 +966,17 @@ class OSManager:
         """
         secrets_manager = GriptapeNodes.SecretsManager()
 
-        # Use macro's extract_variables to reverse-match
-        extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        # Use macro's extract_variables to reverse-match. Non-numeric siblings caught
+        # by the permissive `*` glob (e.g. `workflow_vfinal.py` scanning against
+        # `workflow_v{###}.py`) reach `SequenceFormat.reverse()` and raise
+        # MacroResolutionError from int("final"). Treat that as "this file doesn't
+        # match" — same contract as extract_variables returning None. Anything else
+        # matched the glob but isn't a valid sequence entry, so it should be skipped,
+        # not crash the scan.
+        try:
+            extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        except MacroResolutionError:
+            return None
 
         if extracted is None:
             # Filename doesn't match template
