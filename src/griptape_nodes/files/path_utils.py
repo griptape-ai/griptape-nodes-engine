@@ -433,45 +433,46 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     return Path(prefixed)
 
 
-def canonicalize_for_reverse_match(path: str | Path) -> str:
-    r"""Produce a POSIX-form string for reverse-matching against a macro template.
+def canonicalize_to_posix(path: str | Path) -> str:
+    r"""Produce a POSIX-form (forward-slash) string from a maybe-Windows-shaped path.
 
-    Macro templates are author-written and use ``/`` as the path separator by
-    convention (see ``docs/projects/macros.md``). Filesystem paths reaching
-    the reverse-matcher — from ``Path.glob()`` output, ``str(WindowsPath)``,
-    or user-bound variables holding a directory path — may use ``\``. The
-    parser's reverse-match
-    (``common.macro_parser.matching.extract_unknown_variables``) aligns
-    static text byte-for-byte, so a single separator mismatch causes the
-    whole match to fail.
-
-    This helper routes the path through ``PureWindowsPath.as_posix()``,
-    which correctly understands every Windows path form and preserves them
-    under conversion:
+    Routes the input through ``PureWindowsPath.as_posix()``, which understands
+    every Windows path form and preserves them under conversion:
 
     - Drive-letter: ``C:\path`` → ``C:/path``
     - UNC: ``\\server\share\file`` → ``//server/share/file``
     - Long-path prefix: ``\\?\C:\path`` → ``//?/C:/path``
     - Long-UNC: ``\\?\UNC\server\share`` → ``//?/UNC/server/share/``
       (``PureWindowsPath`` appends a trailing separator when the input is
-      a bare share root; not a problem in practice because reverse-match
-      inputs always have a file component past the root)
+      a bare share root; harmless in practice because callers pass
+      filenames or subpaths past the root)
     - Mixed separators: ``C:\a/b\c`` → ``C:/a/b/c``
+    - POSIX input is a no-op: ``/some/path`` → ``/some/path``
 
     Works on any host OS — ``PureWindowsPath`` parses Windows-shaped strings
     without needing an actual Windows filesystem, so cross-platform tests
     can exercise the Windows edge cases from macOS or Linux runners.
 
-    NOT suitable for I/O — the returned string uses ``/`` on Windows, which
-    most Windows APIs accept but not all. For handing a path to the OS, use
-    ``canonicalize_for_io``.
+    **When to reach for this.** Anywhere a filesystem-derived path needs to
+    be compared, joined, or matched against text that uses ``/`` by
+    convention. Concrete cases in the tree:
+
+    - Reverse-matching a filesystem path against a macro template (see
+      ``_extract_index_from_filename`` in ``os_manager.py``) — templates use
+      ``/`` but ``Path.glob()`` output uses ``\`` on Windows.
+    - Constructing URL-shaped strings from filesystem paths.
+    - Deriving registry / cache keys from paths so the same file gets one
+      key regardless of the host's native separator.
+
+    **NOT suitable for I/O.** The returned string uses ``/`` on Windows,
+    which most Windows APIs accept but not all. For handing a path to the
+    OS, use ``canonicalize_for_io``.
 
     Args:
         path: Raw path string (possibly Windows-shaped) or Path object.
 
     Returns:
-        Forward-slash-separated string suitable for byte-for-byte comparison
-        against a macro template's static text.
+        Forward-slash-separated string.
     """
     # `Path.as_posix()` on Windows would give the right answer, but on POSIX
     # hosts a `Path("C:\foo")` becomes `PurePosixPath` and treats the whole

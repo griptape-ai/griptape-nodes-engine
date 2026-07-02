@@ -53,7 +53,7 @@ from griptape_nodes.files.file import File, FileLoadError, canonical_extension
 from griptape_nodes.files.file_driver import FileDriverNotFoundError, FileDriverRegistry
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
-    canonicalize_for_reverse_match,
+    canonicalize_to_posix,
     normalize_path_for_platform,
     path_needs_expansion,
     resolve_path_safely,
@@ -988,13 +988,12 @@ class OSManager:
         # mismatch causes the reverse-matcher to fail static-text alignment
         # and return no matches, which manifested as the sequence-slot scan
         # finding zero existing files on Windows CI.
-        # `canonicalize_for_reverse_match` correctly handles UNC, long-path
+        # `canonicalize_to_posix` correctly handles UNC, long-path
         # prefix (`\\?\`), long-UNC prefix, drive-letter, and mixed-separator
         # cases — see its docstring for the full contract.
-        normalized_filename = canonicalize_for_reverse_match(filename)
+        normalized_filename = canonicalize_to_posix(filename)
         normalized_variables: MacroVariables = {
-            key: canonicalize_for_reverse_match(value) if isinstance(value, str) else value
-            for key, value in variables.items()
+            key: canonicalize_to_posix(value) if isinstance(value, str) else value for key, value in variables.items()
         }
 
         # Use macro's extract_variables to reverse-match. Non-numeric siblings caught

@@ -11,7 +11,7 @@ from griptape_nodes.files.path_utils import (
     FilenameParts,
     canonicalize_for_identity,
     canonicalize_for_io,
-    canonicalize_for_reverse_match,
+    canonicalize_to_posix,
     decompose_source_path,
     expand_path,
     normalize_path_for_platform,
@@ -790,8 +790,8 @@ class TestCanonicalizeForIo:
         assert not str(result).startswith("\\\\?\\")
 
 
-class TestCanonicalizeForReverseMatch:
-    """Tests for ``canonicalize_for_reverse_match``.
+class TestCanonicalizeToPosix:
+    """Tests for ``canonicalize_to_posix``.
 
     These tests run on every host — ``PureWindowsPath`` parses
     Windows-shaped strings without needing an actual Windows filesystem,
@@ -800,11 +800,11 @@ class TestCanonicalizeForReverseMatch:
 
     def test_posix_path_is_no_op(self) -> None:
         """A path already in POSIX form is returned unchanged."""
-        assert canonicalize_for_reverse_match("/posix/path/file.txt") == "/posix/path/file.txt"
+        assert canonicalize_to_posix("/posix/path/file.txt") == "/posix/path/file.txt"
 
     def test_drive_letter_windows_path_normalized(self) -> None:
         r"""Drive-letter paths convert `\` to `/`, preserving the drive."""
-        assert canonicalize_for_reverse_match("C:\\Users\\name") == "C:/Users/name"
+        assert canonicalize_to_posix("C:\\Users\\name") == "C:/Users/name"
 
     def test_unc_path_preserved(self) -> None:
         r"""UNC paths (`\\server\share\file`) preserve their network semantics.
@@ -812,11 +812,11 @@ class TestCanonicalizeForReverseMatch:
         `\\server\share` becomes `//server/share` — the leading double
         forward-slash marks a UNC path in POSIX form.
         """
-        assert canonicalize_for_reverse_match("\\\\server\\share\\file.txt") == "//server/share/file.txt"
+        assert canonicalize_to_posix("\\\\server\\share\\file.txt") == "//server/share/file.txt"
 
     def test_long_path_prefix_preserved(self) -> None:
         r"""Windows long-path prefix (`\\?\C:\...`) survives conversion."""
-        assert canonicalize_for_reverse_match("\\\\?\\C:\\path\\file.txt") == "//?/C:/path/file.txt"
+        assert canonicalize_to_posix("\\\\?\\C:\\path\\file.txt") == "//?/C:/path/file.txt"
 
     def test_long_unc_prefix_preserved(self) -> None:
         r"""Combined long-path + UNC prefix (`\\?\UNC\...`) survives conversion.
@@ -825,12 +825,12 @@ class TestCanonicalizeForReverseMatch:
         share root with no file component; documented and asserted so the
         behavior is stable if someone accidentally passes a bare root.
         """
-        assert canonicalize_for_reverse_match("\\\\?\\UNC\\server\\share") == "//?/UNC/server/share/"
+        assert canonicalize_to_posix("\\\\?\\UNC\\server\\share") == "//?/UNC/server/share/"
 
     def test_mixed_separators_normalized(self) -> None:
         r"""Paths mixing `\` and `/` collapse to POSIX form."""
-        assert canonicalize_for_reverse_match("C:\\a/b\\c") == "C:/a/b/c"
+        assert canonicalize_to_posix("C:\\a/b\\c") == "C:/a/b/c"
 
     def test_path_input(self) -> None:
         """Path objects are accepted; the helper strings them first."""
-        assert canonicalize_for_reverse_match(Path("/x/y/z")) == "/x/y/z"
+        assert canonicalize_to_posix(Path("/x/y/z")) == "/x/y/z"
