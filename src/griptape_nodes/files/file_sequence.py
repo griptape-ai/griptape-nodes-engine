@@ -343,7 +343,7 @@ def build_versioned_sequence_destination(
         raise FileSequenceError(msg)
 
     index = index_result.index if index_result.index is not None else 1
-    locked_vars = {**macro_path.variables, "_index": index}
+    locked_vars = {**macro_path.variables, macro_parser.SEQUENCE_VARIABLE_NAME: index}
     locked_macro = project_events.MacroPath(macro_path.parsed_macro, locked_vars)
     return FileSequenceDestination(
         locked_macro,

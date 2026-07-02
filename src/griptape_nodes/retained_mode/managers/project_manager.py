@@ -13,13 +13,18 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
+    SEQUENCE_VARIABLE_NAME,
     MacroMatchFailure,
     MacroMatchFailureReason,
     MacroResolutionError,
     MacroResolutionFailureReason,
     MacroVariables,
     ParsedMacro,
+    ParsedStaticValue,
+    ParsedVariable,
+    SequenceFormat,
 )
+from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
     DirectoryDefinition,
@@ -103,6 +108,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     UnregisterProjectTemplateRequest,
     UnregisterProjectTemplateResultFailure,
     UnregisterProjectTemplateResultSuccess,
+    UnresolvedSequenceSlotBehavior,
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
@@ -132,6 +138,7 @@ from griptape_nodes.utils.version_utils import engine_version, engine_version_fa
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -410,6 +417,31 @@ class _ManifestValidation(NamedTuple):
 
     manifest: dict | None
     failure_reason: str | None
+
+
+def _find_unresolved_sequence_segment(
+    segments: list[ParsedSegment], resolution_bag: MacroVariables
+) -> ParsedVariable | None:
+    """Return the REQUIRED sequence-slot ``ParsedVariable`` if the macro has one that isn't bound.
+
+    A "sequence slot" is any variable carrying a ``SequenceFormat`` in its
+    format specs — emitted by ``{###}`` / ``{###?}`` shorthand. Parsing already
+    enforces at most one sequence slot per macro. Optional slots (``{###?}``)
+    are intentionally skipped: the standard resolver already omits them when
+    unbound, so ``UnresolvedSequenceSlotBehavior`` only fires on required
+    slots. Returns ``None`` when the macro has no required sequence slot or
+    the slot's value is already bound.
+    """
+    for segment in segments:
+        if not isinstance(segment, ParsedVariable):
+            continue
+        if not segment.info.is_required:
+            continue
+        if segment.info.name in resolution_bag:
+            continue
+        if any(isinstance(spec, SequenceFormat) for spec in segment.format_specs):
+            return segment
+    return None
 
 
 class ProjectManager:
@@ -1232,8 +1264,51 @@ class ProjectManager:
             if shell_value is not None:
                 resolution_bag[var_name] = shell_value
 
+        # Apply the caller's unresolved-sequence-slot behavior BEFORE the
+        # required-vars check, since START_AT_ZERO / START_AT_ONE / RENDER_SEQUENCE_PATTERN
+        # all satisfy an otherwise-missing required `{###}` slot. The write path
+        # (default FAIL) is untouched — a missing sequence slot falls through
+        # to MISSING_REQUIRED_VARIABLES so `on_write_file_request`'s seed step
+        # can auto-allocate the first index.
+        sequence_segment = _find_unresolved_sequence_segment(request.parsed_macro.segments, resolution_bag)
+        rewritten_segments: list[ParsedSegment] | None = None
+        if sequence_segment is not None:
+            match request.unresolved_sequence_slot_behavior:
+                case UnresolvedSequenceSlotBehavior.FAIL:
+                    # Default write-path contract — fall through to MISSING_REQUIRED_VARIABLES
+                    # below so on_write_file_request's seed step can auto-allocate the first index.
+                    pass
+                case UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN:
+                    # Substitute a static pattern segment so SequenceFormat.apply
+                    # never runs on the sentinel. Presentation-only output.
+                    sequence_format = next(
+                        (spec for spec in sequence_segment.format_specs if isinstance(spec, SequenceFormat)),
+                        None,
+                    )
+                    if sequence_format is not None:
+                        pattern = sequence_format.render_pattern()
+                        rewritten_segments = [
+                            ParsedStaticValue(text=pattern) if seg is sequence_segment else seg
+                            for seg in request.parsed_macro.segments
+                        ]
+                case UnresolvedSequenceSlotBehavior.START_AT_ZERO:
+                    resolution_bag[SEQUENCE_VARIABLE_NAME] = 0
+                case UnresolvedSequenceSlotBehavior.START_AT_ONE:
+                    resolution_bag[SEQUENCE_VARIABLE_NAME] = 1
+                case _:
+                    msg = (
+                        f"Attempted to resolve macro path. Failed because unresolved_sequence_slot_behavior "
+                        f"{request.unresolved_sequence_slot_behavior!r} is not a recognized "
+                        f"UnresolvedSequenceSlotBehavior value; add a case for it above when introducing a new one."
+                    )
+                    raise ValueError(msg)
+
         required_vars = {v.name for v in variable_infos if v.is_required}
         provided_vars = set(resolution_bag.keys())
+        if rewritten_segments is not None:
+            # Segment-level substitution satisfies the sequence slot without
+            # touching the resolution bag, so exempt it from the missing check.
+            provided_vars = provided_vars | {SEQUENCE_VARIABLE_NAME}
         missing = required_vars - provided_vars
 
         if missing:
@@ -1244,7 +1319,21 @@ class ProjectManager:
             )
 
         try:
-            resolved_string = request.parsed_macro.resolve(resolution_bag, self._secrets_manager)
+            # RENDER_SEQUENCE_PATTERN rewrote the sequence-slot segment to a static ``###`` string.
+            # We can't route that through ParsedMacro.resolve because the resolver would still run
+            # SequenceFormat.apply on the slot's variable — apply() only accepts digits and would raise
+            # on ``###``. Instead, feed the rewritten segment list directly to partial_resolve, which
+            # walks segments without re-applying format specs to already-substituted static values.
+            if rewritten_segments is not None:
+                partial = partial_resolve(
+                    request.parsed_macro.template,
+                    rewritten_segments,
+                    resolution_bag,
+                    self._secrets_manager,
+                )
+                resolved_string = partial.to_string()
+            else:
+                resolved_string = request.parsed_macro.resolve(resolution_bag, self._secrets_manager)
         except MacroResolutionError as e:
             if e.failure_reason == MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES:
                 path_failure_reason = PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES

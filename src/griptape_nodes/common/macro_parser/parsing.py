@@ -11,6 +11,7 @@ from griptape_nodes.common.macro_parser.formats import (
     FormatSpec,
     NumericPaddingFormat,
     SeparatorFormat,
+    SequenceFormat,
 )
 from griptape_nodes.common.macro_parser.segments import (
     ParsedSegment,
@@ -19,9 +20,43 @@ from griptape_nodes.common.macro_parser.segments import (
     VariableInfo,
 )
 
+# Canonical name for the variable emitted by `{###}`-style sequence slots.
+# Matches the legacy `{_index:NN}` convention so downstream code (OSManager
+# seed/walk, reverse-match against existing files) doesn't need a separate
+# code path for the new syntax.
+SEQUENCE_VARIABLE_NAME = "_index"
+
+# Pattern for the sequence-slot shorthand `{###}` / `{##?}` (the content
+# between the braces, after the leading-brace and trailing-brace are stripped
+# by ``parse_segments``). One or more `#` characters, optionally followed by
+# `?` for an optional slot. Anything else inside the braces — extra format
+# specs, default values, mixed content — is NOT a sequence slot; it parses
+# as a regular variable named with the `#` chars (which would then surface
+# as a `MISSING_REQUIRED_VARIABLES` error downstream, making the user's
+# typo visible). Wrapping the sigil in `{}` matches the rest of the macro
+# grammar and avoids escaping conflicts with markdown's `#` header syntax.
+_SEQUENCE_SHORTHAND_RE = re.compile(r"^(#+)(\?)?$")
+
 
 def parse_segments(template: str) -> list[ParsedSegment]:
     """Parse template into alternating static/variable segments.
+
+    Recognizes two kinds of variable syntax:
+
+    1. ``{name}`` / ``{name:format}`` / ``{name?:format}`` — explicit
+       variable references parsed by ``parse_variable``.
+    2. ``{###}`` / ``{##?}`` (or other widths: ``{#}``, ``{####}``,
+       ``{#####?}``, ...) — sequence-slot shorthand. The content between
+       the braces is a run of ``N`` hash characters, optionally followed
+       by ``?`` to mark the slot optional. Desugars to a ``ParsedVariable``
+       with name ``SEQUENCE_VARIABLE_NAME``, ``is_required`` from the
+       trailing ``?``, and a single ``SequenceFormat(min_width=N)`` spec.
+       See issue #4902.
+
+    A macro may contain at most one sequence-slot. If two are present
+    the parser raises ``MacroSyntaxError`` — the writer likely meant to
+    bind one as a user-supplied integer; OSManager won't know which to
+    auto-allocate.
 
     Args:
         template: Template string to parse
@@ -43,7 +78,6 @@ def parse_segments(template: str) -> list[ParsedSegment]:
             # No more variables, rest is static text
             static_text = template[current_pos:]
             if static_text:
-                # Check for unmatched closing braces in remaining text
                 if "}" in static_text:
                     closing_pos = current_pos + static_text.index("}")
                     msg = f"Unmatched closing brace at position {closing_pos}"
@@ -58,7 +92,6 @@ def parse_segments(template: str) -> list[ParsedSegment]:
         # Add static text before the brace (if any)
         if brace_start > current_pos:
             static_text = template[current_pos:brace_start]
-            # Check for unmatched closing braces in static text
             if "}" in static_text:
                 closing_pos = current_pos + static_text.index("}")
                 msg = f"Unmatched closing brace at position {closing_pos}"
@@ -105,7 +138,46 @@ def parse_segments(template: str) -> list[ParsedSegment]:
         # Move past the closing brace
         current_pos = brace_end + 1
 
+    # Post-parse validation: at most one sequence-slot shorthand per macro.
+    # Two would leave OSManager with no way to pick the auto-allocated slot.
+    # Counted here (rather than during parsing) because `{###}` goes through
+    # `parse_variable`, which has no global view of the template.
+    _reject_multiple_sequence_slots(template, segments)
+
     return segments
+
+
+def _reject_multiple_sequence_slots(template: str, segments: list[ParsedSegment]) -> None:
+    """Raise ``MULTIPLE_SEQUENCE_SLOTS`` when more than one sequence-slot shorthand exists.
+
+    Identifies a sequence slot by the presence of a ``SequenceFormat`` in
+    the variable's ``format_specs``. The shorthand currently emits a
+    single ``SequenceFormat`` and nothing else, so this is a stable
+    discriminator.
+
+    ``error_position`` is best-effort: locates the second occurrence of
+    ``{`` in ``template`` that follows the first sequence-slot's position.
+    Used only for human-friendly error reporting; the failure mode is
+    unambiguous regardless of position accuracy.
+    """
+    sequence_slot_count = sum(
+        1
+        for seg in segments
+        if isinstance(seg, ParsedVariable) and any(isinstance(spec, SequenceFormat) for spec in seg.format_specs)
+    )
+    if sequence_slot_count <= 1:
+        return
+    # Find the second `{` in the template for the error_position. This
+    # heuristic gets the right spot in the common case (two `{###}` blocks);
+    # in pathological templates it just points somewhere reasonable.
+    first_brace = template.find("{")
+    second_brace = template.find("{", first_brace + 1) if first_brace != -1 else -1
+    msg = "More than one sequence-slot shorthand (`{###}` / `{##?}`) in macro template; only one is allowed"
+    raise MacroSyntaxError(
+        msg,
+        failure_reason=MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS,
+        error_position=second_brace if second_brace != -1 else first_brace,
+    )
 
 
 def parse_variable(variable_content: str) -> ParsedVariable:
@@ -120,6 +192,23 @@ def parse_variable(variable_content: str) -> ParsedVariable:
     Raises:
         MacroSyntaxError: If variable syntax is invalid
     """
+    # Sequence-slot shorthand `{###}` / `{##?}`. Content is purely `#` chars
+    # (one or more), optionally followed by `?` for an optional slot.
+    # Synthesizes a variable with the canonical sequence name and a single
+    # SequenceFormat carrying min_width. Anything else inside the braces —
+    # extra format specs, default values, mixed content — falls through to
+    # regular variable parsing below (which would just treat the `#` chars
+    # as part of a variable name, surfacing as MISSING_REQUIRED_VARIABLES
+    # at resolve time).
+    sequence_match = _SEQUENCE_SHORTHAND_RE.match(variable_content)
+    if sequence_match is not None:
+        hash_run, optional_marker = sequence_match.groups()
+        return ParsedVariable(
+            info=VariableInfo(name=SEQUENCE_VARIABLE_NAME, is_required=optional_marker is None),
+            format_specs=[SequenceFormat(min_width=len(hash_run))],
+            default_value=None,
+        )
+
     # Parse variable content: name[?][:format[:format...]][|default]
 
     # Check for default value (|)
