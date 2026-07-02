@@ -457,6 +457,211 @@ class TestProjectManagerBuiltinVariables:
         assert "cannot override builtin variables" in str(result.result_details)
 
 
+class TestUnresolvedSequenceSlotBehavior:
+    """Test the ``unresolved_sequence_slot_behavior`` flag on ``GetPathForMacroRequest``.
+
+    Each behavior is tested against a required ``{###}`` slot with no bound
+    value. The default (``FAIL``) is the write-path contract; the other three
+    behaviors are opt-ins for previewers.
+    """
+
+    @pytest.fixture
+    def project_manager_with_template(self) -> ProjectManager:
+        """Same fixture as ``TestProjectManagerBuiltinVariables`` — a PM with system defaults loaded."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_secrets = Mock()
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
+
+        project_path = Path("/test/project.yml")
+        project_id = str(project_path)
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_path,
+            project_base_dir=project_path.parent,
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+
+        pm._successfully_loaded_project_templates[project_id] = project_info
+        pm._current_project_id = project_id
+
+        return pm
+
+    def test_fail_returns_missing_required_for_required_sequence_slot(
+        self, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Default FAIL behavior surfaces MISSING_REQUIRED_VARIABLES so the write-path seed step can fire."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.FAIL,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert result.failure_reason == PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES
+        assert result.missing_variables == {"_index"}
+
+    def test_render_sequence_pattern_renders_bare_hashes(self, project_manager_with_template: ProjectManager) -> None:
+        """RENDER_SEQUENCE_PATTERN emits ``###`` (no braces) into the resolved path."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v###.png"
+
+    def test_render_sequence_pattern_matches_source_width(self, project_manager_with_template: ProjectManager) -> None:
+        """A ``{#####}`` slot renders as ``#####`` — width flows through, still bare hashes."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("frame_{#####}.exr")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "frame_#####.exr"
+
+    def test_start_at_zero_seeds_index_zero(self, project_manager_with_template: ProjectManager) -> None:
+        """START_AT_ZERO seeds ``_index = 0`` — a ``{###}`` slot renders as ``000``."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.START_AT_ZERO,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v000.png"
+
+    def test_start_at_one_seeds_index_one(self, project_manager_with_template: ProjectManager) -> None:
+        """START_AT_ONE matches the write-path seed — a ``{###}`` slot renders as ``001``."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.START_AT_ONE,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v001.png"
+
+    def test_optional_sequence_slot_is_omitted_regardless_of_behavior(
+        self, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Optional ``{###?}`` slots are always omitted when unbound — the flag doesn't matter.
+
+        FAIL is the interesting case: optional slots must NOT trigger MISSING_REQUIRED_VARIABLES.
+        The three non-FAIL behaviors must not substitute into an optional slot either — the
+        contract is "only required slots are affected."
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###?}.png")
+
+        for behavior in UnresolvedSequenceSlotBehavior:
+            request = GetPathForMacroRequest(
+                parsed_macro=parsed_macro,
+                variables={},
+                unresolved_sequence_slot_behavior=behavior,
+            )
+            result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+            assert isinstance(result, GetPathForMacroResultSuccess), (
+                f"Behavior {behavior} unexpectedly failed on optional slot"
+            )
+            # Optional slot is omitted → the ``_v`` separator survives but no digits/hashes are emitted.
+            assert str(result.resolved_path) == "render_v.png", (
+                f"Behavior {behavior} altered an optional slot; got {result.resolved_path!r}"
+            )
+
+    def test_bound_sequence_variable_ignores_behavior_flag(self, project_manager_with_template: ProjectManager) -> None:
+        """When the caller binds ``_index`` explicitly, the flag is a no-op."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("render_v{###}.png")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={"_index": 42},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert str(result.resolved_path) == "render_v042.png"
+
+    def test_no_sequence_slot_ignores_behavior_flag(self, project_manager_with_template: ProjectManager) -> None:
+        """Macros with no sequence slot are unaffected by the flag."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import UnresolvedSequenceSlotBehavior
+
+        parsed_macro = ParsedMacro("plain/{file_name}.txt")
+
+        request = GetPathForMacroRequest(
+            parsed_macro=parsed_macro,
+            variables={"file_name": "hello"},
+            unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+        )
+
+        result = project_manager_with_template.on_get_path_for_macro_request(request)
+
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        # `resolved_path` is a `pathlib.Path`; compare with a `Path` so the
+        # assertion is platform-agnostic (Windows uses `\`, POSIX uses `/`).
+        assert result.resolved_path == Path("plain/hello.txt")
+
+
 class TestProjectManagerGetStateForMacro:
     """Test ProjectManager GetStateForMacro request handler."""
 
@@ -2731,6 +2936,114 @@ class TestResolveWorkspaceDirForProjectId:
         assert offline_result == self._resolved("/ws/a")
 
     @pytest.mark.asyncio
+    async def test_unloaded_skips_to_grandparent_workspace(self, tmp_path: Path) -> None:
+        """Offline multi-hop: C inherits A's workspace when B (its parent) declares none but A does."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": a_file, "config": {"workspace_directory": "/ws/a"}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(a_file), str(b_file), str(c_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/ws/a")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_cyclic_chain_falls_back_to_global_default(self, tmp_path: Path) -> None:
+        """Offline: a cyclic parent chain terminates via the visited set and uses the global default."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": a_file, "parent_id": "B", "config": {}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(a_file), str(b_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("A")
+
+        assert result == self._resolved("/global/ws")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_unreadable_ancestor_fails_closed_to_global_default(self, tmp_path: Path) -> None:
+        """Offline: an unreadable ancestor YAML mid-chain stops the walk (fail-closed), using the default.
+
+        C -> B (readable, no workspace) -> A (file exists but overlay unreadable). The walk reads B,
+        finds no workspace, follows the legacy link to A, and A's overlay read fails -> the walk
+        returns None and the resolver falls back to the global default. An unreadable project YAML is
+        not a valid chain link; this pins the accepted fail-closed behavior of the shared walker.
+        """
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        # A is present on disk (so the legacy link resolves) but absent from specs, so its overlay
+        # read returns a failure -- modeling an unreadable/corrupt project YAML.
+        pm = self._build_pm(
+            [
+                {"id": "B", "file": b_file, "parent_path": str(a_file), "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(b_file), str(c_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/global/ws")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_unreadable_ancestor_with_config_workspace_fails_closed(self, tmp_path: Path) -> None:
+        """Offline: an unreadable ancestor is skipped even when it declares a workspace via config.
+
+        C -> B (readable, no workspace) -> A (file exists but overlay unreadable, yet A carries a
+        project_workspaces override). The shared walker requires A's overlay to be readable to probe
+        it, so A is dropped and the resolver falls back to the global default. This differs from the
+        pre-dedupe offline workspace walk, which probed A's config workspace (an override read never
+        touches the overlay) before requiring A's own overlay to load, and so would have inherited
+        A's override. Fail-closed here matches the live walk and the offline libraries walk, which
+        already treat an unloadable ancestor as a broken chain link. Pins the accepted behavior.
+        """
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        # A is present on disk (so the legacy link resolves) and carries a project_workspaces override,
+        # but is absent from specs so its overlay read fails -- modeling an unreadable/corrupt YAML.
+        pm = self._build_pm(
+            [
+                {"id": "B", "file": b_file, "parent_path": str(a_file), "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(b_file), str(c_file)],
+            project_workspaces={str(a_file): "/ws/a"},
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/global/ws")
+
+    @pytest.mark.asyncio
     async def test_read_overlay_record_status_false_does_not_record_failures(self, tmp_path: Path) -> None:
         """A read-only probe (record_status=False) must not inject phantom failed-load entries.
 
@@ -2914,6 +3227,135 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
         assert live_decision is not None
         assert offline_result == live_decision
         assert offline_result == self._canonical(parent_file.parent / "shared-libs")
+
+    @pytest.mark.asyncio
+    async def test_offline_walk_reads_each_node_overlay_once(self, tmp_path: Path) -> None:
+        """The shared offline walker reads each chain node's overlay exactly once.
+
+        Regression guard for the fixed double-read: the previous libraries walk read each parent
+        overlay twice per hop (once to probe libraries_dir, once next iteration for its parent link).
+        The shared single-read walker must read each node once. This measures the walker in isolation
+        (id-index built first, before the counter is installed) so it does not conflate the walk with
+        _build_unloaded_id_index's disk scan or the caller's branch-0 own-overlay read. Uses a 3-level
+        chain where the top ancestor supplies the libraries_dir, so the walk visits every node.
+        """
+        grand_file = tmp_path / "g" / "griptape-nodes-project.yml"
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (grand_file, parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "G", "file": grand_file, "config": {}, "libraries_dir": "./shared-libs"},
+                {"id": "A", "file": parent_file, "parent_id": "G", "config": {}},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(grand_file), str(parent_file), str(child_file)],
+        )
+
+        # Build the id-index up front so its disk scan is not counted; the counter measures only the
+        # walker's own reads.
+        id_index = await pm._build_unloaded_id_index()
+        child_canonical = canonicalize_for_identity(child_file)
+
+        read_counts: dict[Path, int] = {}
+        inner_read_overlay = pm._read_overlay
+
+        async def counting_read_overlay(
+            project_file_path: Path,
+            *,
+            record_status: bool = True,
+        ) -> "tuple[ProjectValidationInfo, ProjectOverlayData] | LoadProjectTemplateResultFailure":
+            key = canonicalize_for_identity(project_file_path)
+            read_counts[key] = read_counts.get(key, 0) + 1
+            return await inner_read_overlay(project_file_path, record_status=record_status)
+
+        pm._read_overlay = counting_read_overlay  # type: ignore[method-assign]
+
+        def probe(node_path: Path, overlay: "ProjectOverlayData") -> str | None:
+            return pm._resolve_template_libraries_dir(overlay.libraries_dir, node_path)
+
+        result = await pm._nearest_ancestor_value_offline(child_canonical, id_index, probe)
+
+        assert result == str(self._canonical(grand_file.parent / "shared-libs"))
+        # The walk visits C (start), A, G -- each overlay read exactly once, none twice.
+        assert read_counts, "expected the walk to read at least one overlay"
+        assert max(read_counts.values()) == 1, f"a node overlay was read more than once: {read_counts}"
+
+    @pytest.mark.asyncio
+    async def test_unloaded_cyclic_chain_returns_none_libraries(self, tmp_path: Path) -> None:
+        """Offline libraries: a cyclic parent chain terminates via the visited set and returns None."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        # Neither declares a libraries_dir, and they point at each other: the walk must not loop.
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": a_file, "parent_id": "B", "config": {}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(a_file), str(b_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("A")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unloaded_unreadable_ancestor_returns_none_libraries(self, tmp_path: Path) -> None:
+        """Offline libraries: an unreadable ancestor YAML mid-chain stops the walk (fail-closed -> None).
+
+        C -> B (readable, no libraries_dir) -> A (file exists but overlay unreadable). Since no
+        readable node in the chain declares a libraries_dir, the resolver returns None and the caller
+        falls back to the workspace-relative libraries default.
+        """
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        # A exists on disk (legacy link resolves) but is absent from specs -> its overlay read fails.
+        pm = self._build_pm(
+            [
+                {"id": "B", "file": b_file, "parent_path": str(a_file), "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(b_file), str(c_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_unloaded_readable_ancestor_before_unreadable_still_found_libraries(self, tmp_path: Path) -> None:
+        """Offline libraries: a nearer readable ancestor's libraries_dir wins before an unreadable one is reached.
+
+        C -> B (readable, declares libraries_dir) -> A (unreadable). The walk finds B's value and
+        never needs to read A, so fail-closed does not mask a legitimately inherited value.
+        """
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "B", "file": b_file, "parent_path": str(a_file), "config": {}, "libraries_dir": "./b-libs"},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(b_file), str(c_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(b_file.parent / "b-libs")
 
 
 class TestOnResolveProjectWorkspaceRequest(TestResolveWorkspaceDirForProjectId):

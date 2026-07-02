@@ -178,8 +178,8 @@ class DirectoryDestination:
         # Guarantee the template has a {_index} slot. Without one,
         # GetNextVersionIndexRequest fails. This covers macro strings like
         # "{outputs}/renders" that carry other variables but omit {_index}.
-        if not any(var.name == "_index" for var in macro_path.parsed_macro.get_variables()):
-            new_template = macro_path.parsed_macro.template + "_{_index}"
+        if not any(var.name == macro_parser.SEQUENCE_VARIABLE_NAME for var in macro_path.parsed_macro.get_variables()):
+            new_template = macro_path.parsed_macro.template + "_{" + macro_parser.SEQUENCE_VARIABLE_NAME + "}"
             macro_path = project_events.MacroPath(macro_parser.ParsedMacro(new_template), macro_path.variables)
 
         # Get the next available version index for this macro path.
@@ -192,7 +192,7 @@ class DirectoryDestination:
             raise DirectoryError(msg)
 
         index = index_result.index if index_result.index is not None else 1
-        variables = macro_path.variables | {"_index": index}
+        variables = macro_path.variables | {macro_parser.SEQUENCE_VARIABLE_NAME: index}
         resolve_result = griptape_nodes_mod.GriptapeNodes.handle_request(
             project_events.GetPathForMacroRequest(parsed_macro=macro_path.parsed_macro, variables=variables)
         )
