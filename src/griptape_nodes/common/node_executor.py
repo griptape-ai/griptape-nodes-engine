@@ -1047,7 +1047,7 @@ class NodeExecutor:
         total_iterations: int,
         parameter_values_per_iteration: dict[int, dict[str, Any]],
         end_loop_node: BaseIterativeEndNode | BaseIterativeNodeGroup,
-    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool]:
+    ) -> tuple[dict[int, Any], list[int], dict[str, Any], int, bool, list[int]]:
         """Execute loop iterations sequentially by running one flow instance N times.
 
         Args:
@@ -1063,6 +1063,7 @@ class NodeExecutor:
             - last_iteration_values: Dict mapping parameter names -> values from last iteration
             - skipped_count: Number of iterations that were skipped via skip control signal
             - break_occurred: True if the loop exited early due to a break signal
+            - failed_iterations: List of iteration indices that raised a subflow error
         """
         # Deserialize flow once
         context_manager = GriptapeNodes.ContextManager()
@@ -1091,6 +1092,7 @@ class NodeExecutor:
 
         iteration_results: dict[int, Any] = {}
         successful_iterations: list[int] = []
+        failed_iterations: list[int] = []
         skipped_count = 0
         break_occurred = False
 
@@ -1148,7 +1150,6 @@ class NodeExecutor:
                     start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
 
                 if not isinstance(start_subflow_result, StartLocalSubflowResultSuccess):
-                    msg = f"Sequential loop iteration {iteration_index} failed: {start_subflow_result.result_details}"
                     logger.warning(
                         "Sequential iteration %d failed for loop ending at '%s'. Will attempt to extract partial results. Error: %s",
                         iteration_index,
@@ -1157,41 +1158,41 @@ class NodeExecutor:
                     )
                     # Don't immediately store None - try to extract results first in case there are partial results
                     # (e.g., nested loop that had some failures but still produced output)
+                    failed_iterations.append(iteration_index)
                 else:
                     successful_iterations.append(iteration_index)
 
                 # Check control action to handle skip/break for both group and legacy end nodes
-                if isinstance(end_loop_node, (BaseIterativeNodeGroup, BaseIterativeEndNode)):
-                    control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
+                control_action = self._get_iteration_control_action(end_loop_node, node_name_mappings)
 
-                    if control_action == IterationControlAction.SKIP:
-                        logger.info(
-                            "Skip detected at iteration %d/%d - skipping result collection",
-                            iteration_index + 1,
-                            total_iterations,
-                        )
-                        skipped_count += 1
-                        continue
+                if control_action == IterationControlAction.SKIP:
+                    logger.info(
+                        "Skip detected at iteration %d/%d - skipping result collection",
+                        iteration_index + 1,
+                        total_iterations,
+                    )
+                    skipped_count += 1
+                    continue
 
-                    if control_action == IterationControlAction.BREAK:
-                        logger.info(
-                            "Break detected at iteration %d/%d - collecting result then stopping",
-                            iteration_index + 1,
-                            total_iterations,
-                        )
-                        # Extract result from this iteration before breaking
-                        # (the work was done, so we should collect the result)
-                        deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
-                        single_iteration_results = self.get_parameter_values_from_iterations(
-                            end_loop_node=end_loop_node,
-                            deserialized_flows=deserialized_flows,
-                            package_flow_result_success=package_result,
-                        )
-                        iteration_results.update(single_iteration_results)
-                        break_occurred = True
-                        break
+                if control_action == IterationControlAction.BREAK:
+                    logger.info(
+                        "Break detected at iteration %d/%d - collecting result then stopping",
+                        iteration_index + 1,
+                        total_iterations,
+                    )
+                    # Extract result from this iteration before breaking
+                    # (the work was done, so we should collect the result)
+                    deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
+                    single_iteration_results = self.get_parameter_values_from_iterations(
+                        end_loop_node=end_loop_node,
+                        deserialized_flows=deserialized_flows,
+                        package_flow_result_success=package_result,
+                    )
+                    iteration_results.update(single_iteration_results)
+                    break_occurred = True
+                    break
 
-                    # control_action == ADD: fall through to extract result
+                # control_action == ADD: fall through to extract result
 
                 # Extract result from this iteration
                 deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
@@ -1219,7 +1220,14 @@ class NodeExecutor:
                 total_iterations=len(successful_iterations),
             )
 
-            return iteration_results, successful_iterations, last_iteration_values, skipped_count, break_occurred
+            return (
+                iteration_results,
+                successful_iterations,
+                last_iteration_values,
+                skipped_count,
+                break_occurred,
+                failed_iterations,
+            )
 
         finally:
             # Cleanup - delete the flow
@@ -1282,6 +1290,7 @@ class NodeExecutor:
 
         # Execute iterations sequentially based on execution environment
         break_occurred = False
+        failed_iterations: list[int] = []
         if execution_type == LOCAL_EXECUTION:
             (
                 iteration_results,
@@ -1289,6 +1298,7 @@ class NodeExecutor:
                 last_iteration_values,
                 _skipped_count,
                 break_occurred,
+                failed_iterations,
             ) = await self._execute_loop_iterations_sequentially(
                 package_result=package_result,
                 total_iterations=total_iterations,
@@ -1327,14 +1337,10 @@ class NodeExecutor:
                 len(successful_iterations),
                 total_iterations,
             )
+        elif failed_iterations:
+            msg = f"Loop execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+            raise RuntimeError(msg)
         elif len(successful_iterations) < total_iterations:
-            # Only raise an error if there were actual failures (not just early termination)
-            expected_count = len(successful_iterations)
-            actual_count = len(iteration_results)
-            if expected_count != actual_count:
-                failed_count = expected_count - actual_count
-                msg = f"Loop execution failed: {failed_count} of {expected_count} iterations failed"
-                raise RuntimeError(msg)
             logger.info(
                 "Loop execution stopped early at %d of %d iterations",
                 len(successful_iterations),
@@ -2269,16 +2275,17 @@ class NodeExecutor:
         parameter_values_per_iteration = self._get_merged_parameter_values_for_iterative_group(node, package_result)
 
         # Execute iterations sequentially based on execution environment
-        skipped_count = 0
         break_occurred = False
+        failed_iterations: list[int] = []
         match execution_type:
             case node_types.LOCAL_EXECUTION:
                 (
                     iteration_results,
                     successful_iterations,
                     last_iteration_values,
-                    skipped_count,
+                    _skipped_count,
                     break_occurred,
+                    failed_iterations,
                 ) = await self._execute_loop_iterations_sequentially(
                     package_result=package_result,
                     total_iterations=total_iterations,
@@ -2311,24 +2318,21 @@ class NodeExecutor:
                 )
 
         # Check if execution stopped early
-        if len(successful_iterations) < total_iterations:
-            if break_occurred:
-                # Early exit due to break signal - this is expected behavior
-                logger.info(
-                    "Iterative group execution stopped early at %d of %d iterations (break signal)",
-                    len(successful_iterations),
-                    total_iterations,
-                )
-            else:
-                # Early exit not due to break - check for failures
-                # successful_iterations includes skipped iterations, but iteration_results does not
-                # So we need to account for skipped iterations when checking for failures
-                expected_result_count = len(successful_iterations) - skipped_count
-                actual_result_count = len(iteration_results)
-                if expected_result_count != actual_result_count:
-                    failed_count = expected_result_count - actual_result_count
-                    msg = f"Iterative group execution failed: {failed_count} of {len(successful_iterations)} iterations failed"
-                    raise RuntimeError(msg)
+        if break_occurred:
+            logger.info(
+                "Iterative group execution stopped early at %d of %d iterations (break signal)",
+                len(successful_iterations),
+                total_iterations,
+            )
+        elif failed_iterations:
+            msg = f"Iterative group execution failed: {len(failed_iterations)} of {total_iterations} iterations failed"
+            raise RuntimeError(msg)
+        elif len(successful_iterations) < total_iterations:
+            logger.info(
+                "Iterative group execution stopped early at %d of %d iterations",
+                len(successful_iterations),
+                total_iterations,
+            )
 
         # Build results list in iteration order
         node._results_list = []
@@ -2968,7 +2972,7 @@ class NodeExecutor:
                 ):
                     context_manager.pop_flow()
         logger.info("Successfully deserialized %d flow instances for parallel execution", total_iterations)
-        # Step 3: Run all flows concurrently
+        # Step 2: Define the per-iteration coroutine
         packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
 
         async def run_single_iteration(flow_name: str, iteration_index: int, start_node_name: str) -> tuple[int, bool]:
@@ -2985,7 +2989,7 @@ class NodeExecutor:
                 return iteration_index, success
 
         try:
-            # Step 2: Set input values on start nodes for each iteration
+            # Step 3: Set input values on start nodes for each iteration
             for iteration_index, _, node_name_mappings in deserialized_flows:
                 parameter_values = parameter_values_per_iteration[iteration_index]
 
@@ -3027,7 +3031,7 @@ class NodeExecutor:
                         )
 
             logger.info("Successfully set input values for %d iterations", total_iterations)
-            # Run all iterations concurrently
+            # Step 4: Run all iterations concurrently
             iteration_tasks = [
                 run_single_iteration(
                     flow_name,
@@ -3038,7 +3042,7 @@ class NodeExecutor:
             ]
             iteration_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
 
-            # Step 4: Collect successful and failed iterations
+            # Step 5: Collect successful and failed iterations
             successful_iterations = []
             failed_iteration_indices = []
             failed_iteration_errors = {}  # Map iteration_index -> error
@@ -3065,7 +3069,7 @@ class NodeExecutor:
                     failed_iteration_errors,
                 )
 
-            # Step 4: Extract parameter values from iterations BEFORE cleanup
+            # Step 6: Extract parameter values from iterations BEFORE cleanup
             iteration_results = self.get_parameter_values_from_iterations(
                 end_loop_node=end_loop_node,
                 deserialized_flows=deserialized_flows,
@@ -3078,7 +3082,7 @@ class NodeExecutor:
                 if failed_idx not in iteration_results:
                     iteration_results[failed_idx] = None
 
-            # Step 5: Extract last iteration values BEFORE cleanup (flows deleted in finally block)
+            # Step 7: Extract last iteration values BEFORE cleanup (flows deleted in finally block)
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
                 deserialized_flows=deserialized_flows,
                 package_result=package_result,
@@ -3088,7 +3092,7 @@ class NodeExecutor:
             return iteration_results, successful_iterations, last_iteration_values
 
         finally:
-            # Step 5: Cleanup - delete all iteration flows
+            # Step 8: Cleanup - delete all iteration flows
             # Suppress events during deletion to prevent sending them to websockets
             with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
                 for iteration_index, flow_name, _ in deserialized_flows:

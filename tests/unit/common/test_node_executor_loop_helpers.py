@@ -283,3 +283,117 @@ class TestFindSourceForControlParam:
             result = executor._find_source_for_control_param([], "break_loop")
 
         assert result is None
+
+
+class TestGetIterationControlActionEndToEnd:
+    """Real name-matching tests for _get_iteration_control_action.
+
+    _find_source_for_control_param and _check_control_source_fired are NOT mocked,
+    so a regression in parameter-name matching will fail these tests.
+    """
+
+    @staticmethod
+    def _make_connection(*, target_param: str, source_node: str, source_param: str) -> MagicMock:
+        conn = MagicMock()
+        conn.target_parameter_name = target_param
+        conn.source_node_name = source_node
+        conn.source_parameter_name = source_param
+        return conn
+
+    @staticmethod
+    def _make_connections_result(connections: list[Any]) -> MagicMock:
+        result = MagicMock(spec=ListConnectionsForNodeResultSuccess)
+        result.incoming_connections = connections
+        return result
+
+    def _run_real(
+        self,
+        end_node: Any,
+        connections: list[Any],
+        node_name_mappings: dict[str, str],
+        deserialized_nodes: dict[str, Any],
+    ) -> IterationControlAction:
+        """Run _get_iteration_control_action with only GriptapeNodes patched.
+
+        _find_source_for_control_param and _check_control_source_fired execute
+        against real logic so that parameter-name matching is exercised.
+        """
+        connections_result = self._make_connections_result(connections)
+        executor = _make_executor()
+
+        def fake_get_node(name: str) -> Any:
+            return deserialized_nodes.get(name)
+
+        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
+            mock_gn.handle_request.return_value = connections_result
+            mock_gn.NodeManager.return_value.get_node_by_name.side_effect = fake_get_node
+            return executor._get_iteration_control_action(end_node, node_name_mappings)
+
+    def _make_deserialized_node_firing(self, param_name: str) -> MagicMock:
+        """Return a mock deserialized node whose get_next_control_output fires the named param."""
+        fired_param = MagicMock()
+        fired_param.name = param_name
+        node = MagicMock()
+        node.get_next_control_output.return_value = fired_param
+        node.get_parameter_by_name.side_effect = lambda n: fired_param if n == param_name else None
+        return node
+
+    def _make_deserialized_node_not_firing(self) -> MagicMock:
+        """Return a mock deserialized node whose get_next_control_output returns None."""
+        node = MagicMock()
+        node.get_next_control_output.return_value = None
+        return node
+
+    def test_legacy_break_detected_via_real_name_matching(self) -> None:
+        """BREAK is detected through real connection/name resolution for a legacy end node."""
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="CondNode_orig", source_param="exec_out"),
+        ]
+        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
+        deserialized_nodes = {
+            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
+        }
+        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        assert result == IterationControlAction.BREAK
+
+    def test_legacy_skip_detected_via_real_name_matching(self) -> None:
+        """SKIP is detected through real connection/name resolution for a legacy end node."""
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="skip_iteration", source_node="CondNode_orig", source_param="exec_out"),
+        ]
+        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
+        deserialized_nodes = {
+            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
+        }
+        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        assert result == IterationControlAction.SKIP
+
+    def test_wrong_parameter_name_does_not_trigger_break(self) -> None:
+        """A connection targeting the wrong param name does NOT trigger BREAK."""
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            # Misspelled control param — should NOT match break_loop
+            self._make_connection(target_param="break_loooop", source_node="CondNode_orig", source_param="exec_out"),
+        ]
+        node_name_mappings = {"CondNode_orig": "CondNode_inst1"}
+        deserialized_nodes = {
+            "CondNode_inst1": self._make_deserialized_node_firing("exec_out"),
+        }
+        result = self._run_real(end_node, connections, node_name_mappings, deserialized_nodes)
+        assert result == IterationControlAction.ADD
+
+    def test_node_not_in_mappings_does_not_trigger_break(self) -> None:
+        """If the source node is missing from node_name_mappings, no BREAK fires."""
+        end_node = MagicMock(spec=BaseIterativeEndNode)
+        end_node.name = "EndLoop"
+        connections = [
+            self._make_connection(target_param="break_loop", source_node="CondNode_orig", source_param="exec_out"),
+        ]
+        # CondNode_orig is NOT in node_name_mappings
+        result = self._run_real(end_node, connections, {}, {})
+        assert result == IterationControlAction.ADD

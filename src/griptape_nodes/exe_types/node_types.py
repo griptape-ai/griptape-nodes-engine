@@ -1167,7 +1167,7 @@ class BaseNode(ABC):
     def validate_empty_parameter(self, param: str, additional_msg: str = "") -> Exception | None:
         param_value = self.parameter_values.get(param, None)
         node_name = self.name
-        if param_value is None or not isinstance(param_value, str) or param_value.isspace():
+        if not isinstance(param_value, str) or not param_value.strip():
             msg = str(f"Parameter \"{param}\" was left blank for node '{node_name}'. {additional_msg}").strip()
             return ValueError(msg)
         return None
