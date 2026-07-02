@@ -2510,9 +2510,15 @@ class ProjectManager:
         genuine user overrides survive. BREAKING: a project's effective workspace/library/file
         layout can change, which is exactly the point of crossing a major.
 
+        Only a parentless project can adopt the new defaults this way: its merge base is the
+        latest-major default template. A child's merge base is its parent's resolved template, which
+        each ancestor resolves against ITS OWN major, so a child cannot adopt new-major defaults while
+        its parent is still on the old major. Such a child is refused (upgrade the parent first) rather
+        than re-stamped to a version label its inherited layout does not match.
+
         Failure cases (evaluated first): not loaded, no backing file, already at/ahead of the
-        latest major (or an unparsable version), the overlay can't be re-read, or the re-save
-        fails. Only then is the upgrade performed.
+        latest major (or an unparsable version), the overlay can't be re-read, the parent chain is
+        still on an older major, or the re-save fails. Only then is the upgrade performed.
         """
         project_info = self._successfully_loaded_project_templates.get(request.project_id)
         if project_info is None:
@@ -2575,6 +2581,26 @@ class ProjectManager:
                     f"Failed because the upgraded template could not be resolved against the latest base."
                 ),
             )
+
+        # Refuse to upgrade a child whose parent chain is still on an older major. The merge base is
+        # the parent's fully-resolved template, and each ancestor resolves against ITS OWN declared
+        # major (see _resolve_parent_chain), so a child re-stamped to the latest major but merged onto
+        # a v0-derived base would keep the old-major defaults for every field it never overrode --
+        # reporting a successful major upgrade while its effective layout does not change. Only a
+        # parentless project (whose base is the latest-major default template) can actually adopt the
+        # new defaults here. A parented child must upgrade the top of its chain first. schema_major_or_none
+        # tolerates a malformed base version the same way the guards above tolerate the project's own.
+        base_major = schema_major_or_none(base_template.project_template_schema_version)
+        if base_major is None or base_major < latest_major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its parent project is still on an older schema major "
+                    f"('{base_template.project_template_schema_version}'); a child inherits its parent's "
+                    f"defaults, so upgrade the parent (the top of the chain) to '{latest_version}' first."
+                ),
+            )
+
         upgraded_template = ProjectTemplate.merge(base_template, upgraded_overlay, validation)
 
         save_result = self.on_save_project_template_request(
