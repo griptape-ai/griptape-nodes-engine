@@ -625,8 +625,13 @@ class ConfigManager:
         """Write a value to the workspace config file.
 
         A no-op when the resolved workspace config file does not yet exist on
-        disk — in those cases the user config layer is sufficient.
+        disk; in those cases the user config layer is sufficient.
         Returns True on success, False otherwise.
+
+        No ConfigChanged event is broadcast. This method is a file-only mirror
+        intended for callers such as ``gtn init`` where no workers are listening;
+        callers that need event-driven side-effects should use ``set_config_value``
+        instead.
         """
         # Prefer the explicitly loaded workspace config path (set by load_workspace_config
         # during engine startup). Fall back to the current workspace_path so that callers
