@@ -32,6 +32,15 @@
       }
     },
     {
+      "class_name": "TimedEchoNode",
+      "file_path": "subflow_echo_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Async echo node that records start/end times for parallelism tests",
+        "display_name": "Timed Echo"
+      }
+    },
+    {
       "class_name": "SubflowGroupNode",
       "file_path": "subflow_echo_node.py",
       "metadata": {
