@@ -3783,6 +3783,95 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.set_workspace_override.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_activation_sets_libraries_root_override_from_inherited_parent(self, tmp_path: Path) -> None:
+        """Activating a child pins the libraries root to the parent's dir (the sharing seam).
+
+        End-to-end wiring test for _activate_project's libraries block: activation must call
+        decide_libraries_root (which walks the parent chain) and push the result into
+        set_libraries_root_override, so resolved_libraries_root() then returns the shared tree. The
+        child declares no libraries_dir of its own; the parent declares "./libraries", so the child
+        inherits the PARENT's dir. Guards against the override being dropped, ordered wrongly relative
+        to clear_project_layers, or fed the wrong value -- none of which the isolated
+        decide_libraries_root tests would catch.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        parent_file = tmp_path / "parent" / "project.yml"
+        parent_file.parent.mkdir()
+        parent_file.touch()
+        child_file = tmp_path / "parent" / "child" / "project.yml"
+        child_file.parent.mkdir()
+        child_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
+        # griptape_nodes_config.json, so it must return a real dict (not a Mock) for the child's
+        # branch-4 workspace inheritance. The child inherits the parent's workspace here (neither
+        # declares workspace_dir), which is orthogonal to the libraries_dir seam under test.
+        mock_config.read_config_file.return_value = {}
+
+        # Parent declares libraries_dir "./libraries"; child inherits (declares none).
+        parent_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "P", "libraries_dir": "./libraries"})
+        child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "C", "parent_project_id": "P"})
+        pm = self._make_project_manager_with_project(child_file, mock_config)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        # Re-key the child's registry entry to its opaque id (parent link resolves by id), and add parent.
+        del pm._successfully_loaded_project_templates[str(child_file)]
+        for pid, f, tmpl in [("P", parent_file, parent_template), ("C", child_file, child_template)]:
+            pm._successfully_loaded_project_templates[pid] = ProjectInfo(
+                project_id=pid,
+                project_file_path=f,
+                project_base_dir=f.parent,
+                template=tmpl,
+                validation=validation,
+                parsed_situation_schemas=pm._parse_situation_macros(tmpl.situations, validation),
+                parsed_directory_schemas=pm._parse_directory_macros(tmpl.directories, validation),
+            )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        # The override is set to the PARENT's libraries dir, resolved against the parent -- not the
+        # child's own dir, and not None (which would fall back to the workspace-relative default).
+        mock_config.set_libraries_root_override.assert_called_once_with(
+            Path(str(canonicalize_for_identity(parent_file.parent / "libraries")))
+        )
+
+    @pytest.mark.asyncio
+    async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
+        """Activating a project with no libraries_dir anywhere pins the override to None (fallback).
+
+        The other half of the seam: when decide_libraries_root returns None (no own or inherited
+        libraries_dir), activation must still call set_libraries_root_override(None) so a stale
+        override from a previously-active sharing project is dropped and resolved_libraries_root()
+        falls back to the workspace-relative default.
+        """
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_file = tmp_path / "solo" / "project.yml"
+        project_file.parent.mkdir()
+        project_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+
+        # _make_project_manager_with_project registers a bare DEFAULT_PROJECT_TEMPLATE (no libraries_dir).
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
+
+        mock_config.set_libraries_root_override.assert_called_once_with(None)
+
+    @pytest.mark.asyncio
     async def test_switch_to_system_defaults_drops_prior_project_library_pins(self, tmp_path: Path) -> None:
         """Switching from a pinned project to system defaults unloads the project's library pins.
 
