@@ -43,6 +43,7 @@ from griptape_nodes.common.sequences.scan import (
     scan_sequences,
     scan_sequences_from_filenames,
 )
+from griptape_nodes.files import os_utils
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
@@ -1312,18 +1313,17 @@ class OSManager:
     def platform() -> str:
         return sys.platform
 
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4418
     @staticmethod
     def is_windows() -> bool:
-        return sys.platform.startswith("win")
+        return os_utils.is_windows()
 
     @staticmethod
     def is_mac() -> bool:
-        return sys.platform.startswith("darwin")
+        return os_utils.is_mac()
 
     @staticmethod
     def is_linux() -> bool:
-        return sys.platform.startswith("linux")
+        return os_utils.is_linux()
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.

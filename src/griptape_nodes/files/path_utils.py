@@ -14,10 +14,11 @@ and are used by OSManager, FileDrivers, and workspace managers.
 
 import os
 import re
-import sys
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 from urllib.parse import unquote, urlparse
+
+from griptape_nodes.files.os_utils import is_windows
 
 # Path decomposition patterns
 _WINDOWS_DRIVE_MATCH_PATTERN = r"^([A-Z]):"
@@ -33,21 +34,31 @@ _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
 
-# Windows MAX_PATH limit - paths at or above this length need the \\?\ prefix.
+# Windows MAX_PATH limit. Paths at or above this length require the \\?\ prefix,
+# but we apply the prefix unconditionally on Windows (see below) rather than
+# gating on this value.
 WINDOWS_MAX_PATH = 260
 
 
 def _apply_windows_long_path_prefix(path_str: str) -> str:
-    r"""Prepend the Windows long-path prefix (``\\?\``) when required.
+    r"""Prepend the Windows long-path prefix (``\\?\``) on Windows.
 
-    No-op on non-Windows platforms, on paths shorter than ``WINDOWS_MAX_PATH``,
-    or on paths that already carry the prefix. UNC paths (``\\server\share``)
-    get the ``\\?\UNC\`` variant.
+    No-op on non-Windows platforms and on paths that already carry the prefix.
+    UNC paths (``\\server\share``) get the ``\\?\UNC\`` variant.
+
+    The prefix is applied **unconditionally** on Windows, not only when the
+    string already exceeds ``WINDOWS_MAX_PATH``. The old length gate meant a
+    short root path (e.g. a destination under ``%TEMP%``) was handed to the
+    filesystem unprefixed, and per-file leaf paths built from it later — during
+    a recursive copy that descends into a deep source tree — grew past MAX_PATH
+    without ever inheriting the prefix, raising ``WinError 206``. Applying the
+    prefix at the root lets ``pathlib``/``os.path`` joins carry it through to
+    every leaf. The ``\\?\`` prefix is safe to apply to a sub-MAX_PATH path on
+    modern Windows.
     """
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4418
-    if not sys.platform.startswith("win"):
+    if not is_windows():
         return path_str
-    if len(path_str) < WINDOWS_MAX_PATH or path_str.startswith("\\\\?\\"):
+    if path_str.startswith("\\\\?\\"):
         return path_str
     if path_str.startswith("\\\\"):
         return f"\\\\?\\UNC\\{path_str[2:]}"
