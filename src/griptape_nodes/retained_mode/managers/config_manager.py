@@ -648,9 +648,12 @@ class ConfigManager:
         current = self._load_config_from_file(workspace_config_path, "workspace")
 
         merged = merge_dicts(current, delta)
+        tmp_path = workspace_config_path.with_suffix(".tmp")
         try:
-            workspace_config_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+            tmp_path.write_text(json.dumps(merged, indent=2), encoding="utf-8")
+            tmp_path.replace(workspace_config_path)
         except OSError as e:
+            tmp_path.unlink(missing_ok=True)
             logger.warning("set_workspace_config_value: failed to write workspace config: %s", e)
             return False
 
