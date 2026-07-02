@@ -1488,9 +1488,11 @@ class ProjectManager:
 
         Resolves an ancestor's workspace without forcing that ancestor to be loaded/enabled. The
         chain traversal, cycle guard, and single per-node overlay read live in the shared
-        _nearest_ancestor_value_offline; only the per-node probe (an ancestor's explicit workspace,
-        read from config) is supplied here. The walk begins at the parent: the starting project's own
-        explicit sources are handled by _decide_workspace_pre_inheritance.
+        _nearest_ancestor_value_offline; only the per-node probe is supplied here. Each ancestor is
+        probed the same way (and in the same precedence) as the live walk: its workspace_dir template
+        field first (from the overlay, resolved against the ancestor's dir), then its
+        project_workspaces override, then its adjacent config. The walk begins at the parent: the
+        starting project's own explicit sources are handled by _decide_workspace_pre_inheritance.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
@@ -1498,9 +1500,14 @@ class ProjectManager:
             default={},
         )
 
-        def probe(node_path: Path, _overlay: ProjectOverlayData) -> str | None:
-            # Workspace is read from config, not the overlay; the overlay was read by the walker to
-            # follow the parent link and doubles as the ancestor's readability check.
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+            # The ancestor's workspace_dir template field (branch 0) wins, mirroring how the ancestor
+            # would resolve its own workspace as the active project; the overlay was already read by
+            # the walker to follow the parent link, so the field is free to read here. Falls through
+            # to the ancestor's project_workspaces override / adjacent config when the field is unset.
+            template_workspace = self._resolve_template_workspace_dir(overlay.workspace_dir, node_path)
+            if template_workspace is not None:
+                return template_workspace
             return self._resolve_node_explicit_workspace(node_path, project_workspaces)
 
         return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
@@ -1810,13 +1817,16 @@ class ProjectManager:
     def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:
         """Walk the explicit parent-project chain for the nearest ancestor's workspace.
 
-        Returns the workspace_directory the nearest ancestor would resolve to (its
-        project_workspaces override, else its adjacent griptape_nodes_config.json),
-        or None when no ancestor in the chain defines one. The starting project's OWN
-        explicit sources are handled by the earlier branches of decide_workspace, so the
-        walk begins at the parent. The chain traversal and cycle guard live in the shared
-        _nearest_ancestor_value_live; only the per-node probe (an ancestor's explicit
-        workspace) is supplied here.
+        Returns the workspace the nearest ancestor would resolve to, or None when no ancestor in the
+        chain defines one. Each ancestor is probed the SAME way it resolves its own workspace when it
+        is the active project: its workspace_dir template field first (resolved against that
+        ancestor's dir, so a relative "./" means the ancestor's own folder -- not the child's), then
+        its project_workspaces override, then its adjacent griptape_nodes_config.json. Consulting the
+        template field here is what lets a parent that declares only workspace_dir be inherited (it is
+        the common self-contained case). The starting project's OWN explicit sources are handled by
+        the earlier branches of decide_workspace, so the walk begins at the parent. The chain
+        traversal and cycle guard live in the shared _nearest_ancestor_value_live; only the per-node
+        probe is supplied here.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
@@ -1827,6 +1837,11 @@ class ProjectManager:
         def probe(info: ProjectInfo) -> str | None:
             if info.project_file_path is None:
                 return None
+            template_workspace = self._resolve_template_workspace_dir(
+                info.template.workspace_dir, info.project_file_path
+            )
+            if template_workspace is not None:
+                return template_workspace
             return self._resolve_node_explicit_workspace(info.project_file_path, project_workspaces)
 
         return self._nearest_ancestor_value_live(project_file_path, probe)

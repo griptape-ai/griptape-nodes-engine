@@ -188,7 +188,7 @@ class ProjectTemplate(BaseModel):
         # mapping or adjacent griptape_nodes_config.json (see _inherit_workspace_from_parents /
         # _resolve_node_explicit_workspace), NOT from the ancestor's own workspace_dir template field;
         # a parent that declares only workspace_dir contributes nothing there, so the child falls all
-        # the way to the global workspace and (mis)scans the whole workspace tree for its workflows.
+        # the way to the global workspace and wrongly scans the whole workspace tree for its workflows.
         # Emit whenever a value is set (like `id` above); a None value is omitted. For libraries_dir,
         # an omitted value does resolve up the chain to the nearest ancestor's libraries_dir
         # (decide_libraries_root branch 1). The stored value is the raw string or per-platform mapping
