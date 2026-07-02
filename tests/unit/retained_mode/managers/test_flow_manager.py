@@ -11,6 +11,10 @@ import pytest
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
+from griptape_nodes.exe_types.connections import Connections
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
+from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.events.flow_events import (
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
@@ -18,6 +22,54 @@ from griptape_nodes.retained_mode.events.flow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+def _data_parameter(name: str = "value") -> Parameter:
+    """A plain data Parameter usable as input, property, and output."""
+    return Parameter(
+        name=name,
+        type="str",
+        default_value="",
+        tooltip="",
+        allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY, ParameterMode.OUTPUT},
+    )
+
+
+def _param(node: BaseNode, name: str) -> Parameter:
+    """Fetch a parameter by name, asserting it exists (keeps the type checker happy)."""
+    parameter = node.get_parameter_by_name(name)
+    assert parameter is not None, f"{node.name} is missing parameter {name!r}"
+    return parameter
+
+
+class _ClassifyStartNode(StartNode):
+    """StartNode carrying a passthrough ``value`` for classifier tests."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(_data_parameter())
+
+    def process(self) -> None: ...
+
+
+class _ClassifyDataNode(DataNode):
+    """DataNode carrying a passthrough ``value`` (its control params stay unconnected)."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(_data_parameter())
+
+    def process(self) -> None: ...
+
+
+class _ClassifyControlNode(ControlNode):
+    """ControlNode with exec_in/exec_out plus a passthrough ``value``."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name, metadata)
+        self.add_parameter(_data_parameter())
+
+    def process(self) -> None: ...
 
 
 @pytest.fixture
@@ -609,3 +661,140 @@ class TestAutoLayoutFlowRequest:
         assert result.positioned_nodes == []
 
         self._cleanup(griptape_nodes)
+
+
+class TestExcludeSubflowGroupChildren:
+    """Tests for FlowManager.exclude_subflow_group_children.
+
+    This scope/ownership filter drops nodes owned by a SubflowNodeGroup so they are not seeded
+    directly into a DAG (they run inside their group's own subflow). Both the top-level queue
+    and the isolated-subflow path apply it, so it must behave identically for either caller.
+    """
+
+    def test_drops_only_subflow_group_children(self, griptape_nodes: GriptapeNodes) -> None:
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
+        from griptape_nodes.exe_types.node_types import BaseNode
+
+        flow_manager = griptape_nodes.FlowManager()
+
+        child = MagicMock(spec=BaseNode)
+        child.name = "child"
+        child.parent_group = MagicMock(spec=SubflowNodeGroup)
+
+        free = MagicMock(spec=BaseNode)
+        free.name = "free"
+        free.parent_group = None
+
+        # A parent_group that is not a SubflowNodeGroup must not be excluded.
+        other_group_child = MagicMock(spec=BaseNode)
+        other_group_child.name = "other_group_child"
+        other_group_child.parent_group = MagicMock(spec=BaseNode)
+
+        kept = flow_manager.exclude_subflow_group_children([child, free, other_group_child])
+
+        assert [node.name for node in kept] == ["free", "other_group_child"]
+
+    def test_empty_input_returns_empty(self, griptape_nodes: GriptapeNodes) -> None:
+        flow_manager = griptape_nodes.FlowManager()
+
+        assert flow_manager.exclude_subflow_group_children([]) == []
+
+
+class TestClassifyNodesForDag:
+    """Tests for FlowManager.classify_nodes_for_dag.
+
+    The classifier is scope-agnostic: it buckets an arbitrary list of nodes into start /
+    control-entry / data-sink roles based purely on the connection graph. It backs both the
+    top-level queue and isolated subflow seeding, so these tests lock in each branch. Real node
+    subclasses and a real Connections object are used so the Parameter/Connection semantics match
+    production; only get_connections is patched to hand the classifier the crafted graph.
+    """
+
+    @staticmethod
+    def _classify(griptape_nodes: GriptapeNodes, nodes: list, connections: Connections) -> DagNodeCategories:
+        from unittest.mock import patch
+
+        flow_manager = griptape_nodes.FlowManager()
+        with patch.object(flow_manager, "get_connections", return_value=connections):
+            return flow_manager.classify_nodes_for_dag(nodes)
+
+    def test_start_node_is_a_start_node(self, griptape_nodes: GriptapeNodes) -> None:
+        start = _ClassifyStartNode("Start")
+        data = _ClassifyDataNode("Data")
+        connections = Connections()
+        connections.add_connection(start, _param(start, "value"), data, _param(data, "value"))
+
+        categories = self._classify(griptape_nodes, [start, data], connections)
+
+        assert [node.name for node in categories.start_nodes] == ["Start"]
+        # Data has an incoming data connection and no outgoing one, so it is a terminal sink.
+        assert [node.name for node in categories.data_sink_nodes] == ["Data"]
+        assert categories.control_nodes == []
+
+    def test_data_node_with_external_outgoing_is_not_a_sink(self, griptape_nodes: GriptapeNodes) -> None:
+        upstream = _ClassifyDataNode("Upstream")
+        downstream = _ClassifyDataNode("Downstream")
+        connections = Connections()
+        connections.add_connection(upstream, _param(upstream, "value"), downstream, _param(downstream, "value"))
+
+        categories = self._classify(griptape_nodes, [upstream, downstream], connections)
+
+        # Only the leaf (Downstream) is a sink; Upstream feeds a downstream node so it is skipped.
+        assert [node.name for node in categories.data_sink_nodes] == ["Downstream"]
+        assert categories.start_nodes == []
+        assert categories.control_nodes == []
+
+    def test_control_chain_first_node_is_control_entry(self, griptape_nodes: GriptapeNodes) -> None:
+        first = _ClassifyControlNode("First")
+        second = _ClassifyControlNode("Second")
+        connections = Connections()
+        connections.add_connection(first, _param(first, "exec_out"), second, _param(second, "exec_in"))
+
+        categories = self._classify(griptape_nodes, [first, second], connections)
+
+        # First drives the control flow; Second has an external incoming control edge so the
+        # forward control walk reaches it and it is not seeded as an entry node.
+        assert [node.name for node in categories.control_nodes] == ["First"]
+        assert categories.start_nodes == []
+        assert categories.data_sink_nodes == []
+
+    def test_control_node_without_control_connections_is_treated_as_data_sink(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        lone = _ClassifyControlNode("Lone")
+        connections = Connections()
+
+        categories = self._classify(griptape_nodes, [lone], connections)
+
+        # Control params exist but are unused, so the node is a plain data node with no outgoing
+        # connection, i.e. a terminal sink.
+        assert [node.name for node in categories.data_sink_nodes] == ["Lone"]
+        assert categories.control_nodes == []
+        assert categories.start_nodes == []
+
+    def test_internal_node_group_outgoing_does_not_disqualify_sink(self, griptape_nodes: GriptapeNodes) -> None:
+        source = _ClassifyDataNode("Source")
+        target = _ClassifyDataNode("Target")
+        connections = Connections()
+        connections.add_connection(
+            source,
+            _param(source, "value"),
+            target,
+            _param(target, "value"),
+            is_node_group_internal=True,
+        )
+
+        categories = self._classify(griptape_nodes, [source, target], connections)
+
+        # Internal NodeGroup connections do not count as external outgoing, so both nodes remain
+        # terminal sinks.
+        assert sorted(node.name for node in categories.data_sink_nodes) == ["Source", "Target"]
+
+    def test_empty_scope_returns_empty_categories(self, griptape_nodes: GriptapeNodes) -> None:
+        categories = self._classify(griptape_nodes, [], Connections())
+
+        assert categories.start_nodes == []
+        assert categories.control_nodes == []
+        assert categories.data_sink_nodes == []

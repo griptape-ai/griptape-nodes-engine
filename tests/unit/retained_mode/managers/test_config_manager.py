@@ -141,6 +141,48 @@ class TestConfigManager:
                 assert manager.workspace_path == override_workspace.resolve()
                 assert manager.get_config_value("workspace_directory") == str(override_workspace)
 
+    def test_resolved_libraries_root_default_is_workspace_relative(self) -> None:
+        """With no override, the root is libraries_directory resolved against workspace_path."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            workspace = Path(temp_dir) / "ws"
+            workspace.mkdir()
+            manager = ConfigManager()
+            manager.workspace_path = workspace
+
+            # default libraries_directory is "libraries" (relative -> under the workspace)
+            assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
+
+    def test_resolved_libraries_root_uses_override_verbatim(self) -> None:
+        """When an override is set, it is returned as-is, independent of workspace_path."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            workspace = Path(temp_dir) / "ws"
+            workspace.mkdir()
+            shared = Path(temp_dir) / "shared-libs"
+            shared.mkdir()
+            manager = ConfigManager()
+            manager.workspace_path = workspace
+
+            manager.set_libraries_root_override(shared)
+            assert manager.resolved_libraries_root() == shared.resolve()
+
+            # Clearing restores the workspace-relative default.
+            manager.set_libraries_root_override(None)
+            assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
+
+    def test_clear_project_layers_clears_libraries_root_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            workspace = Path(temp_dir) / "ws"
+            workspace.mkdir()
+            shared = Path(temp_dir) / "shared-libs"
+            shared.mkdir()
+            manager = ConfigManager()
+            manager.workspace_path = workspace
+            manager.set_libraries_root_override(shared)
+
+            manager.clear_project_layers()
+
+            assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
+
     def test_coerce_to_type_bool_from_string(self) -> None:
         """Test that _coerce_to_type correctly converts string values to bool."""
         manager = ConfigManager()
