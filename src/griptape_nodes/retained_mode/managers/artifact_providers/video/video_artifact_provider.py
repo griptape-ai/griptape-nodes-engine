@@ -144,6 +144,14 @@ class VideoArtifactProvider(BaseArtifactProvider):
         cannot identify what we are writing, we cannot make a permission
         decision. The write proceeds and any downstream policy that keys on
         codec must accept that some writes are unclassified.
+
+        NOTE: today this writes bytes to the OS temp dir before probing, which
+        doubles disk usage for the duration of the vet. For multi-GB videos on
+        machines where OS temp is small this can exhaust the temp partition.
+        A follow-up will stage bytes as a sibling of the destination path
+        (same filesystem) and atomically rename on approve; that requires
+        ``RenameFileRequest.overwrite`` and a small reservation dance for
+        CREATE_NEW policies.
         """
         codec = self._extract_codec_from_bytes(data, detected_format)
         if codec is None:
@@ -204,12 +212,23 @@ class VideoArtifactProvider(BaseArtifactProvider):
     def _evaluate_codec_checkpoint(
         action: CheckpointAction, codec: str, container_format: str
     ) -> CheckpointDenial | None:
-        """Build the checkpoint and ask the event manager's hook chain for a verdict."""
+        """Build the checkpoint and ask the event manager's hook chain for a verdict.
+
+        Populates both ``subject_id`` and ``attributes[ID]`` with the codec so hooks
+        that key on ``attributes["id"]`` (the convention across model-access queries)
+        see the same fact here. Without the ``ID`` attribute the enforcement path
+        would fall open silently for any hook written to the model-access shape,
+        while the query path in ``AccessManager.on_query_codec_access_request`` --
+        which DOES set ``ID`` -- would still deny.
+        """
         checkpoint = AuthorizationCheckpoint(
             action=action,
             subject_type=CheckpointSubjectType.VIDEO_CODEC,
             subject_id=codec,
-            attributes={CheckpointAttribute.CONTAINER_FORMAT: container_format},
+            attributes={
+                CheckpointAttribute.ID: codec,
+                CheckpointAttribute.CONTAINER_FORMAT: container_format,
+            },
         )
         return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(checkpoint)
 

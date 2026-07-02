@@ -889,6 +889,61 @@ class TestOSWritePermissionVet:
         assert called == []
         assert requested_path.exists()
 
+    def test_deny_returns_codec_not_permitted_and_no_file_for_extensionless_destination(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: extension-less destinations must not bypass the codec vet.
+
+        Before the fix, ``_apply_extension_coercion`` returned early when the
+        destination had no suffix and the vet inside it never fired, letting
+        gated bytes reach disk simply by omitting the extension. The vet now
+        lives in ``on_write_file_request`` and runs BEFORE coercion, so an
+        extensionless destination is protected.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes, "PNG must resolve to the registered image provider"
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(provider, "check_write_permission", lambda data, detected_format: expected_denial)  # noqa: ARG005
+
+        os_manager = griptape_nodes.OSManager()
+        # Destination has NO extension. Sniff on bytes classifies as PNG,
+        # provider denies, OSManager must refuse the write. Before finding 1
+        # this would return Success and leave the file on disk.
+        requested_path = temp_dir / "movie"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "This codec is not licensed." in str(result.result_details)
+        assert not requested_path.exists()
+
+    def test_append_writes_are_not_vetted(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Appends skip the codec vet: the tail alone has no container header to classify."""
+        called: list[bool] = []
+
+        def spy(data: bytes, detected_format: str) -> None:  # noqa: ARG001
+            called.append(True)
+
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        # Seed the file so append has something to append to.
+        requested_path.write_bytes(_png_bytes())
+
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes(), append=True)
+        os_manager.on_write_file_request(request)
+
+        assert called == []
+
 
 class TestExtensionCoercionDoesNotClobberPriorSave:
     """Regression for issue #4924.

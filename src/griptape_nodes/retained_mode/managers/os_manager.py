@@ -2373,17 +2373,44 @@ class OSManager:
                 result_details=msg,
             )
 
-        # Sniff bytes ONCE and align the destination suffix to the sniffed format
-        # before any scan, write, or candidate generation runs. Without this, the
-        # scan globs the template's suffix while the post-write rename moves the
-        # file to the sniffed suffix; the next CREATE_NEW save with the same bytes
-        # globs the wrong family, returns an already-used index, writes, and the
-        # rename clobbers the prior save. (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
+        # Sniff bytes ONCE up front. The sniffed format drives two independent
+        # decisions -- the codec-permission vet (which must run even for
+        # extension-less destinations) and the extension-coercion planner
+        # (only relevant when there IS a destination extension to reconcile).
+        # ``sniff_extension`` returns None for non-bytes content, so a non-None
+        # sniffed_ext also implies ``request.content`` is bytes; downstream code
+        # relies on that.
+        sniffed_ext = (
+            GriptapeNodes.ArtifactManager().sniff_extension(request.content)
+            if isinstance(request.content, bytes)
+            else None
+        )
+
+        # Codec-permission vet. Runs BEFORE extension coercion so an
+        # extension-less destination (e.g. "movie") does not silently bypass
+        # the gate -- sniff on bytes is independent of the destination suffix.
+        # Appends skip the vet: the tail alone has no container header to
+        # classify.
+        if sniffed_ext is not None and not request.append:
+            denial = GriptapeNodes.ArtifactManager().check_write_permission(request.content, sniffed_ext)  # type: ignore[arg-type]
+            if denial is not None:
+                msg = f"Cannot save '{file_path.name}': {denial.reason()}"
+                return WriteFileResultFailure(
+                    failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                    result_details=msg,
+                )
+
+        # Align the destination suffix to the sniffed format before any scan,
+        # write, or candidate generation runs. Without this, the scan globs
+        # the template's suffix while the post-write rename moves the file to
+        # the sniffed suffix; the next CREATE_NEW save with the same bytes
+        # globs the wrong family, returns an already-used index, writes, and
+        # the rename clobbers the prior save.
+        # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
         # Strict mode fails here before touching the disk.
-        alignment = self._apply_extension_coercion(request, file_path)
+        alignment = self._apply_extension_coercion(request, file_path, sniffed_ext)
         if isinstance(alignment, WriteFileResultFailure):
             return alignment
-        sniffed_ext = alignment.sniffed_ext
         file_path = alignment.aligned_path
 
         # Normalize path
@@ -2676,27 +2703,30 @@ class OSManager:
             result_details=result_details,
         )
 
-    def _apply_extension_coercion(  # noqa: PLR0911
+    def _apply_extension_coercion(
         self,
         request: WriteFileRequest,
         file_path: Path,
+        sniffed_ext: str | None,
     ) -> ExtensionAlignment | WriteFileResultFailure:
-        """Reconcile the destination suffix with the sniffed byte format.
+        """Reconcile the destination suffix with the pre-sniffed byte format.
 
-        Runs once at the top of ``on_write_file_request`` so the planner and the
-        on-disk filename agree on the extension before any scan or write begins.
-        The two relevant signals are the sniffed canonical extension and the
-        path's current suffix:
+        ``on_write_file_request`` sniffs once up front and hands the result in,
+        so this method never sniffs on its own; its single responsibility is
+        deciding whether to rewrite the destination suffix.
 
-        - No bytes / unrecognized bytes / empty suffix → no swap; pass the path
-          through unchanged. An unrecognized-bytes case logs a warning so callers
-          can spot it in logs.
+        The three relevant signals are the pre-sniffed extension, the path's
+        current suffix, and ``coerce_extension_to_match_bytes``:
+
+        - No sniff / no bytes / empty destination suffix → no swap; pass the
+          path through unchanged. Unrecognized bytes with a non-empty suffix
+          log a warning so callers can spot it in logs.
         - Sniffed matches the path's canonical suffix → no swap.
         - Sniffed differs and ``coerce_extension_to_match_bytes=True`` (default)
           → swap to the sniffed suffix and return the new path.
-        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` → return
-          a ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the caller
-          can early-exit before touching the disk.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` →
+          return ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the
+          caller can early-exit before touching the disk.
         """
         content = request.content
         if not isinstance(content, bytes):
@@ -2706,8 +2736,7 @@ class OSManager:
         if not destination_suffix:
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        sniffed = GriptapeNodes.ArtifactManager().sniff_extension(content)
-        if sniffed is None:
+        if sniffed_ext is None:
             logger.warning(
                 "Attempted to identify the format of bytes destined for '%s'. "
                 "Could not recognize the bytes as a known file format, so the file will be written "
@@ -2717,38 +2746,30 @@ class OSManager:
             )
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        denial = GriptapeNodes.ArtifactManager().check_write_permission(content, sniffed)
-        if denial is not None:
-            msg = f"Cannot save '{file_path.name}': {denial.reason()}"
-            return WriteFileResultFailure(
-                failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
-                result_details=msg,
-            )
-
-        if canonical_extension(destination_suffix) == canonical_extension(sniffed):
+        if canonical_extension(destination_suffix) == canonical_extension(sniffed_ext):
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
         if not request.coerce_extension_to_match_bytes:
             msg = (
-                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
+                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed_ext}'. "
                 f"Failed because the requested extension '.{destination_suffix}' does not match the "
                 f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
-                f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
+                f"to '.{sniffed_ext}' or supply bytes that match '.{destination_suffix}'."
             )
             return WriteFileResultFailure(
                 failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
                 result_details=msg,
             )
 
-        aligned_path = file_path.with_suffix(f".{sniffed}")
+        aligned_path = file_path.with_suffix(f".{sniffed_ext}")
         logger.warning(
             "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
             "adjusted to '%s' to match the byte content.",
             file_path,
-            sniffed,
+            sniffed_ext,
             aligned_path,
         )
-        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed)
+        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed_ext)
 
     def _ensure_parent_directory_ready(
         self,

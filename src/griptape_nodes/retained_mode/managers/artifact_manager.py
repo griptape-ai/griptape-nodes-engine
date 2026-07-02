@@ -284,12 +284,9 @@ class ArtifactManager:
             ``None`` when the write is permitted (including when no provider
             handles this format).
         """
-        provider_classes = self._registry.get_provider_classes_by_format(detected_format)
-        if not provider_classes:
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
             return None
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
-        # Handle ambiguity when multiple providers support the same extension.
-        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
         return provider.check_write_permission(data, detected_format)
 
     def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
@@ -314,13 +311,27 @@ class ArtifactManager:
         extension = Path(source_path).suffix.lstrip(".").lower()
         if not extension:
             return None
-        provider_classes = self._registry.get_provider_classes_by_format(extension)
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        return provider.check_read_permission(source_path)
+
+    def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
+        """Resolve the registered provider that handles ``fmt`` (empty → None).
+
+        Centralizes the "which class wins when multiple providers claim the
+        same format" decision so ``check_write_permission``,
+        ``check_read_permission``, and (eventually) ``prepare_content_for_write``
+        don't drift on it. Currently just "first registered class wins" per the
+        provider registry order; ambiguity handling is tracked at
+        https://github.com/griptape-ai/griptape-nodes/issues/4027.
+        """
+        if not fmt:
+            return None
+        provider_classes = self._registry.get_provider_classes_by_format(fmt)
         if not provider_classes:
             return None
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
-        # Handle ambiguity when multiple providers support the same extension.
-        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
-        return provider.check_read_permission(source_path)
+        return self._registry.get_or_create_provider_instance(provider_classes[0])
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
