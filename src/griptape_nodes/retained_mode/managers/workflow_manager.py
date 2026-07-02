@@ -3491,6 +3491,12 @@ class WorkflowManager:
                         # Create CLI argument name: --{param_name}
                         arg_name = f"--{param_name}".lower()
 
+                        # Derive an explicit, identifier-safe dest. Without this, argparse
+                        # derives the dest from the flag name, which can contain characters
+                        # (e.g. parentheses from a node name) that are not valid in a Python
+                        # identifier, making the emitted `args.<dest>` access invalid Python.
+                        arg_dest = self._safe_arg_dest(param_name)
+
                         # Get help text from parameter info
                         help_text = param_info.get("tooltip", f"Parameter {param_name} for node {node_name}")
 
@@ -3504,6 +3510,7 @@ class WorkflowManager:
                                     ),
                                     args=[ast.Constant(arg_name)],
                                     keywords=[
+                                        ast.keyword(arg="dest", value=ast.Constant(arg_dest)),
                                         ast.keyword(arg="default", value=ast.Constant(None)),
                                         ast.keyword(arg="help", value=ast.Constant(help_text)),
                                     ],
@@ -3601,7 +3608,7 @@ class WorkflowManager:
                     test=ast.Compare(
                         left=ast.Attribute(
                             value=ast.Name(id="args", ctx=ast.Load()),
-                            attr=param_name.lower(),
+                            attr=self._safe_arg_dest(param_name),
                             ctx=ast.Load(),
                         ),
                         ops=[ast.IsNot()],
@@ -3622,7 +3629,7 @@ class WorkflowManager:
                             ],
                             value=ast.Attribute(
                                 value=ast.Name(id="args", ctx=ast.Load()),
-                                attr=param_name.lower(),
+                                attr=self._safe_arg_dest(param_name),
                                 ctx=ast.Load(),
                             ),
                         )
@@ -4126,6 +4133,24 @@ class WorkflowManager:
         else:
             rebuilt = set(scrubbed_items)
         return WorkflowManager._ScrubResult(value=rebuilt, dropped=dropped)
+
+    @staticmethod
+    def _safe_arg_dest(param_name: str) -> str:
+        """Derive a Python-identifier-safe argparse ``dest`` from a parameter name.
+
+        Workflow-input parameter names can contain characters that are invalid in a
+        Python identifier (e.g. ``(``, ``)``, ``.``, ``-``) — this happens when a node
+        name contains them (e.g. ``Generate Media (Diffusion Pipeline)``). argparse
+        would otherwise store the parsed value under an attribute that cannot be read
+        back as ``args.<name>``, and the ``ast.Attribute`` access emitted into the
+        generated workflow is not valid Python, so the file fails to import with
+        ``SyntaxError``. Non-word characters are collapsed to underscores, and a
+        leading digit is prefixed so the result is always a valid identifier.
+        """
+        dest = re.sub(r"\W+", "_", param_name.lower())
+        if dest and dest[0].isdigit():
+            dest = f"_{dest}"
+        return dest
 
     @staticmethod
     def _keyword_from_field_value(arg_name: str, field_value: Any, command: Any) -> ast.keyword:
