@@ -182,16 +182,16 @@ class ProjectTemplate(BaseModel):
         # so they must NOT be diffed against the base like the merge-inherited fields below. Diffing
         # would drop a child value that happens to equal the parent's (e.g. a child workspace_dir "./"
         # matching the parent's "./"). Because these fields don't merge-inherit, that dropped value is
-        # NOT re-supplied from the base at merge time -- the child ends up with no own workspace_dir and
-        # must fall through the resolution ladder instead of keeping its intended "./". That matters
-        # because the ladder inherits an ancestor's workspace from the ancestor's project_workspaces
-        # mapping or adjacent griptape_nodes_config.json (see _inherit_workspace_from_parents /
-        # _resolve_node_explicit_workspace), NOT from the ancestor's own workspace_dir template field;
-        # a parent that declares only workspace_dir contributes nothing there, so the child falls all
-        # the way to the global workspace and wrongly scans the whole workspace tree for its workflows.
-        # Emit whenever a value is set (like `id` above); a None value is omitted. For libraries_dir,
-        # an omitted value does resolve up the chain to the nearest ancestor's libraries_dir
-        # (decide_libraries_root branch 1). The stored value is the raw string or per-platform mapping
+        # NOT re-supplied from the base at merge time -- the child ends up with no own value and must
+        # fall through the resolution ladder instead of keeping its intended "./". The ladder DOES
+        # inherit an ancestor's value up the parent chain, but relative to the ANCESTOR's directory
+        # (decide_workspace branch 4 / decide_libraries_root branch 1), so silently substituting that
+        # for a child's own "./" would resolve to the ancestor's folder rather than the child's -- a
+        # different location. Emitting the child's own value keeps it self-scoped as intended.
+        # Emit whenever a value is set (like `id` above); a None value is omitted. For an OMITTED
+        # value, the ladder resolves up the chain to the nearest ancestor that declares one
+        # (decide_libraries_root branch 1 / decide_workspace branch 4). The stored value is the raw
+        # string or per-platform mapping
         # (never absolutized), so a relative path round-trips verbatim.
         if self_dump.get("workspace_dir") is not None:
             output["workspace_dir"] = self_dump.get("workspace_dir")
