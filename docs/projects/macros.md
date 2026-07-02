@@ -65,6 +65,55 @@ Path separators work the same way — `{sub_dirs?:/}` adds a subdirectory prefix
   → outputs/render.exr
 ```
 
+### Leading separator
+
+```
+{variable_name:^prefix}
+```
+
+Mirror of the [separator format](#separator-format), but the text is **prepended** to the variable's value rather than appended. Marked by a `^` at the start of the format-spec text; anything after the `^` is the literal prefix payload. Renders iff the variable emits — an unbound optional variable takes its leading separator with it into oblivion.
+
+```
+{file_name_base}{version?:^_v}.{file_extension}
+
+  file_name_base="render", version=3, file_extension="png"  →  render_v3.png
+  file_name_base="render", version not provided             →  render.png
+```
+
+The load-bearing pattern: pair with a [sequence slot](#sequence-slot-) to get a version suffix that comes and goes with the sequence:
+
+```
+render{###?:^_v}.png
+
+  first save (slot omitted)  →  render.png
+  second save (slot fires)   →  render_v001.png
+  third save                 →  render_v002.png
+```
+
+Works outside filenames too — the trailing separator is not just for path prefixes and neither is the leading one:
+
+```
+Hello, {name?}!{intro?:^ Nice to meet you.}
+
+  name="Alice", intro="y"  →  Hello, Alice! Nice to meet you.y
+  name="Alice", intro absent →  Hello, Alice!
+  name absent, intro absent  →  Hello, !
+```
+
+**Composition rules**
+
+- A variable can carry at most **one** leading separator.
+- The leading separator is applied **after** every other format spec on the same variable, regardless of where you write it in the template. `{shot:03:^_v}` and `{shot:^_v:03}` both render `shot=5` as `_v005` — the parser normalizes the leading spec to the tail of the list so ordering never mangles the prefix.
+
+**Related grammar errors**
+
+| Error                         | Cause                                      |
+| ----------------------------- | ------------------------------------------ |
+| `EMPTY_LEADING_SEPARATOR`     | `:^` with no payload after the caret       |
+| `MULTIPLE_LEADING_SEPARATORS` | Two `:^`-marked specs on the same variable |
+
+**Limitation.** A `^` at the start of a format spec is now reserved as the leading-separator discriminator, so a literal `^_v` prefix isn't spellable today. If a real use case surfaces, a future escape mechanism (e.g. `\^` or a `'^'`-quoted form) will fill it in.
+
 ### Numeric padding
 
 ```

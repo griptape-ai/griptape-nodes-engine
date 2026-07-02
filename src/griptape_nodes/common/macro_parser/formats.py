@@ -76,6 +76,46 @@ class SeparatorFormat(FormatSpec):
 
 
 @dataclass
+class LeadingSeparatorFormat(FormatSpec):
+    """Prefix that renders iff the variable emits — mirror of ``SeparatorFormat``.
+
+    Emitted by ``{var?:^prefix}`` shorthand. The ``^`` at the start of the
+    format-spec text is the discriminator; the remaining characters are the
+    literal prefix payload. Applied by prepending to the (already
+    format-spec-transformed) rendered value.
+
+    Must be the LAST format spec on a variable, and there may be only one per
+    variable. Both invariants are validated at parse time
+    (``LEADING_SEPARATOR_NOT_LAST`` / ``MULTIPLE_LEADING_SEPARATORS``) so any
+    inner transforms (``:upper``, ``:03``, etc.) run first and the prefix
+    text is never mangled by them.
+
+    Omit case is handled by the resolver's normal optional-variable path: an
+    unbound optional variable skips its whole segment (including this spec),
+    so an unbound ``{shot?:^_v}`` emits nothing, not ``_v``.
+    """
+
+    prefix: str  # e.g., "_v"; the ``^`` discriminator is stripped at parse time
+
+    def apply(self, value: str | int) -> str:
+        """Prepend ``prefix`` to the rendered value."""
+        return self.prefix + str(value)
+
+    def reverse(self, value: str) -> str:
+        """Strip ``prefix`` from the front of the value if present.
+
+        Idempotent when the prefix is absent, matching
+        ``SeparatorFormat.reverse``'s "no-op if the trailing separator is
+        missing" behavior. Consistent with the optional-variable contract:
+        if the segment was omitted at resolve time, its ``reverse`` never
+        runs; if the segment fired, the prefix will be present.
+        """
+        if value.startswith(self.prefix):
+            return value[len(self.prefix) :]
+        return value
+
+
+@dataclass
 class NumericPaddingFormat(FormatSpec):
     """Numeric padding format like :03, :04."""
 
