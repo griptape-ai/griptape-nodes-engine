@@ -191,6 +191,13 @@ class ExecuteDagState(State):
             if data_type is None:
                 data_type = ParameterTypeBuiltin.NONE.value
 
+            # Use the template (e.g. "{SHOT}") instead of the substituted value
+            # (e.g. "25") for PROPERTY parameters that contain a variable macro.
+            # This ParameterValueUpdateEvent is the authoritative "node done"
+            # broadcast and fires outside aprocess_scope, so without this
+            # suppression it would overwrite the display that
+            # _emit_parameter_change_event already set correctly during execution.
+            display_value = current_node.get_display_value_for_output(parameter_name, value)
             await GriptapeNodes.EventManager().aput_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(
@@ -198,7 +205,7 @@ class ExecuteDagState(State):
                             node_name=current_node.name,
                             parameter_name=parameter_name,
                             data_type=data_type,
-                            value=safe_unstructure(value),
+                            value=safe_unstructure(display_value),
                         )
                     ),
                 )
@@ -210,12 +217,20 @@ class ExecuteDagState(State):
         else:
             library_name = None
 
+        # Apply the same display suppression here: NodeResolvedEvent carries the
+        # full parameter_output_values dict and the frontend uses it to update
+        # displayed values, so raw substituted values (e.g. "25") would
+        # overwrite the template (e.g. "{SHOT}") the user sees on the node.
+        display_output_values = {
+            param_name: safe_unstructure(current_node.get_display_value_for_output(param_name, val))
+            for param_name, val in current_node.parameter_output_values.items()
+        }
         await GriptapeNodes.EventManager().aput_event(
             ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(
                     payload=NodeResolvedEvent(
                         node_name=current_node.name,
-                        parameter_output_values=safe_unstructure(current_node.parameter_output_values),
+                        parameter_output_values=display_output_values,
                         node_type=current_node.__class__.__name__,
                         specific_library_name=library_name,
                     )

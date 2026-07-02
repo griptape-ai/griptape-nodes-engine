@@ -2,7 +2,7 @@ import ast
 import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, NamedTuple, cast
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import anyio
@@ -52,7 +52,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder, WorkflowManager
 
 
 def _register_unsaved_workflow(key: str, name: str) -> None:
@@ -137,6 +137,62 @@ class TestWorkflowManager:
         assert "is_user_defined" in result
         assert isinstance(result["is_user_defined"], bool)
         assert result["is_user_defined"] is True
+
+    @pytest.mark.parametrize(
+        ("param_name", "expected_dest"),
+        [
+            ("prompt", "prompt"),
+            ("My Prompt", "my_prompt"),
+            ("Generate_Media_(Diffusion_Pipeline)_prompt", "generate_media__diffusion_pipeline__prompt"),
+            ("seed.value", "seed_value"),
+            ("max-tokens", "max_tokens"),
+            ("3_seed", "_3_seed"),
+        ],
+    )
+    def test_safe_arg_dest_produces_valid_identifier(self, param_name: str, expected_dest: str) -> None:
+        """_safe_arg_dest collapses non-identifier characters so the dest is a valid Python identifier."""
+        dest = WorkflowManager._safe_arg_dest(param_name)
+
+        assert dest == expected_dest
+        assert dest.isidentifier()
+
+    def test_generate_workflow_execution_is_valid_python_for_special_char_param(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """A param name with non-identifier characters must still emit compilable Python.
+
+        Regression for griptape-nodes-engine#5033: a node named e.g. `Generate Media
+        (Diffusion Pipeline)` yields proxy parameter names containing `(`/`)`, which used
+        to be emitted verbatim as `args.<name>` attribute accesses and produced a
+        `SyntaxError` at import time. The generated argparse `dest` must be a valid
+        identifier and be used in both the `add_argument` call and the readback.
+        """
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        param_name = "Subflow_Node_Group_packaged_node_Generate_Media_(Diffusion_Pipeline)_prompt"
+        metadata = WorkflowMetadata(
+            name="special_char_workflow",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="0.0.0",
+            node_libraries_referenced=[],
+            workflow_shape=WorkflowShape(
+                inputs={"Start_1": {param_name: {"tooltip": "a prompt", "type": "str"}}},
+                outputs={},
+            ),
+        )
+
+        statements = workflow_manager._generate_workflow_execution(ImportRecorder(), metadata)
+        assert statements is not None
+
+        module = ast.fix_missing_locations(ast.Module(body=cast("list[ast.stmt]", statements), type_ignores=[]))
+        # The bug manifested as a SyntaxError raised from compile(); assert it no longer does.
+        compile(module, filename="<generated_workflow>", mode="exec")
+
+        # The raw param name (with parens) must survive as the flow_input dict key so the
+        # workflow shape is unchanged, while the argparse dest is the sanitized identifier.
+        source = ast.unparse(module)
+        assert param_name in source
+        assert WorkflowManager._safe_arg_dest(param_name) in source
 
     def test_on_import_workflow_request_success(self, griptape_nodes: GriptapeNodes) -> None:
         """Test successful workflow import."""
@@ -1792,7 +1848,7 @@ class TestWorkflowVariablePersistence:
 
         if context_manager.has_current_workflow():
             GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         context_manager.push_workflow(workflow_name="round_trip_workflow")
 
@@ -2043,7 +2099,7 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102

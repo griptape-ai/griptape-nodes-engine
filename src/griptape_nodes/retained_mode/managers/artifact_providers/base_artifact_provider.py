@@ -16,6 +16,7 @@ if TYPE_CHECKING:
         BaseArtifactPreviewGenerator,
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 
 class BaseArtifactMetadata(BaseModel):
@@ -243,6 +244,53 @@ class BaseArtifactProvider(ABC):
             Processed bytes (or original bytes if no processing needed)
         """
         return data
+
+    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:  # noqa: ARG002
+        """Ask whether writing ``data`` is permitted before it hits disk.
+
+        Override in subclasses that gate writes on media-specific properties
+        (e.g., legally-encumbered video codecs). The default implementation
+        returns ``None`` (allow), so providers without a policy pay no cost.
+
+        Called by ``OSManager`` after the incoming bytes have been recognized
+        as a format this provider claims, and before the disk write occurs.
+        The implementation may inspect ``data`` (e.g. run ffprobe on a spooled
+        temp file) to extract facts a policy hook cares about, then evaluate
+        an ``AuthorizationCheckpoint`` via ``EventManager``.
+
+        Args:
+            data: The full buffered write payload.
+            detected_format: The lowercase canonical extension the provider
+                returned from ``detect_format`` for these bytes (e.g. ``"mp4"``).
+
+        Returns:
+            A ``CheckpointDenial`` to refuse the write (OSManager converts it
+            to a ``WriteFileResultFailure``), or ``None`` to allow.
+        """
+        return None
+
+    def check_read_permission(self, source_path: str) -> CheckpointDenial | None:  # noqa: ARG002
+        """Ask whether reading the file at ``source_path`` is permitted.
+
+        Override in subclasses that gate reads on media-specific properties.
+        The default returns ``None`` (allow); providers without a policy pay
+        no cost.
+
+        Called by library code (via
+        ``CheckArtifactReadPermissionRequest``) before it hands a file to a
+        subprocess or loads it into memory. Implementations typically inspect
+        the file (e.g. run ffprobe) to extract facts a policy hook cares
+        about, then evaluate an ``AuthorizationCheckpoint`` via
+        ``EventManager``.
+
+        Args:
+            source_path: Absolute path to the source file. The provider is
+                trusted to open it read-only.
+
+        Returns:
+            A ``CheckpointDenial`` to refuse the read, or ``None`` to allow.
+        """
+        return None
 
     @classmethod
     def detect_format(cls, data: bytes) -> str | None:  # noqa: ARG003

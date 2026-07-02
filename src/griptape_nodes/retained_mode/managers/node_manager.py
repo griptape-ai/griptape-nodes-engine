@@ -2113,7 +2113,14 @@ class NodeManager:
         for parameter in element.find_elements_by_type(Parameter):
             # Check if they have an output value, that takes priority
             if parameter.name in node.parameter_output_values:
-                value = node.parameter_output_values[parameter.name]
+                raw_value = node.parameter_output_values[parameter.name]
+                # Apply display suppression: for PROPERTY parameters whose stored
+                # template (e.g. "{SHOT}") contains a variable macro, return the
+                # template rather than the resolved value (e.g. "25").  This path
+                # is hit on browser refresh and workflow reload, so without this
+                # the reconnect would show the substituted value instead of the
+                # user-editable template.
+                value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
                 value = node.get_parameter_value(parameter.name)
@@ -3276,7 +3283,7 @@ class NodeManager:
                     continue
                 node.parameter_values[param.name] = param.default_value
             try:
-                with aprocess_scope():
+                with aprocess_scope(request.variables):
                     await node.aprocess()
             except Exception as e:
                 # Pass the live exception through ``exception=`` so the
@@ -4396,8 +4403,10 @@ class NodeManager:
 
         Returns the command to record on success. Returns None when there is nothing to record:
         either no value was present, the author opted out via serializable=False, or serialization
-        genuinely failed. In the genuine-failure case, also emits a warning and marks the node
-        UNRESOLVED — opt-outs are silent.
+        genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
+        genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
+        missing value; downstream consumers would otherwise see None (issue #4994). Only the
+        genuine-failure branch also emits a warning — opt-outs are silent.
 
         value_kind is "set" or "output" and is used only in the warning text.
         """
@@ -4416,14 +4425,17 @@ class NodeManager:
         )
         if command is not None:
             return command
+
+        # Non-serialisable parameter means node must be re-resolved when loaded.
+        if isinstance(create_node_request, CreateNodeRequest):
+            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+
         # Author opted out via serializable=False — silently skip; not a failure.
         if not parameter.serializable:
             return None
         # Genuine serialization failure — warn and mark unresolved.
         details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
         logger.warning(details)
-        if isinstance(create_node_request, CreateNodeRequest):
-            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
         return None
 
     @staticmethod

@@ -1,0 +1,36 @@
+{
+  "name": "NonSerializable Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library for the serializable=False resolution-state regression test (issue #4994)",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "ProducerNode",
+      "file_path": "nonserializable_nodes.py",
+      "metadata": {"category": "test", "description": "producer with non-serializable output", "display_name": "Producer"}
+    },
+    {
+      "class_name": "ConsumerNode",
+      "file_path": "nonserializable_nodes.py",
+      "metadata": {"category": "test", "description": "consumer that reads from producer", "display_name": "Consumer"}
+    }
+  ]
+}

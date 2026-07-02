@@ -49,6 +49,43 @@ class PathResolutionFailureReason(StrEnum):
     RESERVED_NAME_COLLISION = "RESERVED_NAME_COLLISION"
 
 
+class UnresolvedSequenceSlotBehavior(StrEnum):
+    """How ``GetPathForMacroRequest`` handles a REQUIRED, unresolved sequence slot.
+
+    A "sequence slot" is a variable whose ``format_specs`` contains a
+    ``SequenceFormat`` — emitted by ``{###}`` / ``{###?}`` shorthand in the
+    macro template. Optional slots (``{###?}``) that aren't bound are always
+    omitted by the resolver, so this enum only takes effect on a required
+    ``{###}`` slot with no value in the ``variables`` dict.
+
+    Values:
+        FAIL — default. Return ``GetPathForMacroResultFailure`` with
+            ``MISSING_REQUIRED_VARIABLES``. This is what the write path (via
+            ``on_write_file_request``) wants: the failure is the signal the
+            seed-and-retry logic uses to auto-allocate the first index.
+        RENDER_SEQUENCE_PATTERN — render the slot as its bare hash glyphs
+            (``###``, ``####``, ...) into the resolved path — the ffmpeg /
+            Houdini / Nuke convention that reads universally as "digits go
+            here." **Presentation only.** The output previews the eventual
+            on-disk shape of the path (a saved file becomes e.g.
+            ``render_v001.png``); it is NOT a valid filesystem path itself
+            and must not be opened, written, or handed to any I/O primitive.
+            Use when showing users a preview of the macro shape (e.g. UI
+            destination fields, path-classification previews).
+        START_AT_ZERO — seed the slot with ``0`` and render it (``000``
+            at min_width=3). Useful for 0-indexed preview flows.
+        START_AT_ONE — seed the slot with ``1`` and render it (``001`` at
+            min_width=3). Matches the write-path seed's starting value,
+            so this is the right choice when previewing "what would my
+            first save land at" (assuming the destination is empty).
+    """
+
+    FAIL = "FAIL"
+    RENDER_SEQUENCE_PATTERN = "RENDER_SEQUENCE_PATTERN"
+    START_AT_ZERO = "START_AT_ZERO"
+    START_AT_ONE = "START_AT_ONE"
+
+
 @dataclass
 @PayloadRegistry.register
 class LoadProjectTemplateRequest(RequestPayload):
@@ -284,12 +321,18 @@ class GetPathForMacroRequest(RequestPayload):
     Args:
         parsed_macro: The parsed macro to resolve
         variables: Variable values for macro substitution (e.g., {"file_name": "output", "file_ext": "png"})
+        unresolved_sequence_slot_behavior: How to handle a required sequence
+            slot (``{###}``) with no value bound. Defaults to ``FAIL`` — the
+            write-path contract. Preview / display callers should pass
+            ``RENDER_SEQUENCE_PATTERN`` so the slot renders as its source
+            pattern instead of failing. See ``UnresolvedSequenceSlotBehavior``.
 
     Results: GetPathForMacroResultSuccess | GetPathForMacroResultFailure
     """
 
     parsed_macro: ParsedMacro
     variables: MacroVariables
+    unresolved_sequence_slot_behavior: UnresolvedSequenceSlotBehavior = UnresolvedSequenceSlotBehavior.FAIL
 
 
 @dataclass

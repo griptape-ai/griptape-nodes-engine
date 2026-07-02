@@ -1145,3 +1145,42 @@ class SaveSubflowToWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
 @PayloadRegistry.register
 class SaveSubflowToWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Subflow save to workflow file failed. Common causes: serialization error, file system error, invalid flow name."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariableSubstitutionEnabledRequest(RequestPayload):
+    """Enable or disable inline variable substitution for the current workflow.
+
+    The setting is stored in memory and, when the workflow is saved, is baked into
+    the generated build_workflow() function as a SetVariableSubstitutionEnabledRequest
+    call. This means the flag survives a full reload — including running the workflow
+    .py file directly as a script — without any registry lookup.
+
+    Args:
+        enabled: True (default) to substitute {VAR} tokens at execution time;
+                 False to leave parameter values unchanged.
+        initial_setup: True when called from build_workflow() during file load.
+                       Prevents marking the workflow as unsaved on reload.
+    """
+
+    enabled: bool = True
+    initial_setup: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariableSubstitutionEnabledResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Variable substitution flag updated successfully (interactive change)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariableSubstitutionEnabledResultNotAlteredSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variable substitution flag restored successfully during workflow load."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariableSubstitutionEnabledResultFailure(ResultPayloadFailure):
+    """Variable substitution flag update failed. Common cause: no active workflow context."""
