@@ -316,6 +316,25 @@ class TestApplyWindowsLongPathPrefix:
         leaf = PureWindowsPath(root) / "rel" / "deep" / "file.txt"
         assert str(leaf).startswith("\\\\?\\")
 
+    def test_relative_path_is_not_prefixed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A non-absolute path is returned unchanged rather than wrapped.
+
+        The precondition is that the input is fully-qualified; ``\\?\`` disables
+        Win32 normalization, so prefixing ``sub\file`` would yield the invalid
+        ``\\?\sub\file``. The guard leaves such inputs alone.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert _apply_windows_long_path_prefix(r"sub\file.txt") == r"sub\file.txt"
+
+    def test_forward_slash_path_is_not_prefixed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A forward-slash path is returned unchanged rather than wrapped.
+
+        ``\\?\`` requires backslash separators; prefixing ``C:/x`` would produce
+        the invalid ``\\?\C:/x``. The guard leaves it alone.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert _apply_windows_long_path_prefix("C:/x/file.txt") == "C:/x/file.txt"
+
 
 class TestResolveFilePath:
     """Tests for resolve_file_path function."""
@@ -833,6 +852,24 @@ class TestCanonicalizeForIo:
         result = canonicalize_for_io(link)
         # The io helper should NOT resolve the symlink.
         assert result == link
+
+    def test_wires_prefix_through_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""canonicalize_for_io applies the \\?\ prefix when running on Windows.
+
+        Host-independent: patches ``is_windows`` to True and stubs
+        ``resolve_path_safely`` to yield a fully-qualified Windows path, so the
+        wiring of the unconditional prefix *through canonicalize_for_io* is
+        verified even on a non-Windows CI host (the Windows-only test below
+        skips there). Complements ``TestApplyWindowsLongPathPrefix``, which only
+        covers the helper in isolation.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.path_utils.resolve_path_safely",
+            lambda _path: Path(r"C:\Users\x\Temp\bundle\file.txt"),
+        )
+        result = canonicalize_for_io("ignored")
+        assert str(result) == r"\\?\C:\Users\x\Temp\bundle\file.txt"
 
     @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows long-path prefix")
     def test_adds_long_path_prefix_on_windows(self, tmp_path: Path) -> None:

@@ -1396,7 +1396,13 @@ class OSManager:
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
-                os.startfile(normalize_path_for_platform(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
+                #
+                # NOTE: do NOT pass normalize_path_for_platform(path) here. os.startfile is
+                # backed by ShellExecute, which does not understand the \\?\ extended-length
+                # prefix that normalize_path_for_platform now applies unconditionally on
+                # Windows -- a prefixed path makes ShellExecute fail to open the file. The
+                # path is already validated to exist above, so hand it over unprefixed.
+                os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
                 logger.info("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location

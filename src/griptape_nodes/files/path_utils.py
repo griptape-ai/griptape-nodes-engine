@@ -34,9 +34,10 @@ _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
 
-# Windows MAX_PATH limit. Paths at or above this length require the \\?\ prefix,
-# but we apply the prefix unconditionally on Windows (see below) rather than
-# gating on this value.
+# Windows MAX_PATH limit. Retained for documentation/reference only: the historical
+# 260-char threshold at which the \\?\ prefix becomes strictly necessary. We no longer
+# gate on it -- _apply_windows_long_path_prefix applies the prefix unconditionally on
+# Windows (see below) -- but the constant documents where the limit comes from.
 WINDOWS_MAX_PATH = 260
 
 
@@ -55,10 +56,24 @@ def _apply_windows_long_path_prefix(path_str: str) -> str:
     prefix at the root lets ``pathlib``/``os.path`` joins carry it through to
     every leaf. The ``\\?\`` prefix is safe to apply to a sub-MAX_PATH path on
     modern Windows.
+
+    Precondition: ``path_str`` must be a fully-qualified, backslash-separated
+    Windows path (absolute drive path like ``C:\\dir`` or UNC ``\\\\server\\share``).
+    The ``\\?\`` prefix disables Win32 path normalization, so a relative path
+    (``sub\\file``) or a forward-slash path (``C:/dir``) would become an invalid
+    ``\\?\`` string. Both current callers (``normalize_path_for_platform``,
+    ``canonicalize_for_io``) absolutize and normalize before calling, so this
+    holds; the guard below returns such inputs unchanged rather than producing a
+    broken prefix, so a future caller can't silently create one.
     """
     if not is_windows():
         return path_str
     if path_str.startswith("\\\\?\\"):
+        return path_str
+    # A relative or forward-slash path is not fully-qualified; prefixing it would
+    # yield an invalid \\?\ string (the prefix disables normalization). Leave it
+    # unchanged rather than corrupt it -- see the precondition above.
+    if not PureWindowsPath(path_str).is_absolute() or "/" in path_str:
         return path_str
     if path_str.startswith("\\\\"):
         return f"\\\\?\\UNC\\{path_str[2:]}"
