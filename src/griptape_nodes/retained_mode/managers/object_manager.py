@@ -135,7 +135,8 @@ class ObjectManager:
             return ClearAllObjectStateResultFailure(result_details=details)
 
         # Clear all local workflow variables
-        GriptapeNodes.VariablesManager().on_clear_object_state()
+        GriptapeNodes.VariablesManager().clear_object_state()
+        GriptapeNodes.WorkflowManager().clear_object_state()
         # Clear all event suppression
         GriptapeNodes.EventManager().clear_event_suppression()
 

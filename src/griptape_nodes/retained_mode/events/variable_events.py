@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
@@ -362,3 +362,70 @@ class GetVariableDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class GetVariableDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Variable details retrieval failed."""
+
+
+# Bulk Get/Set Variable Events
+@dataclass
+@PayloadRegistry.register
+class GetVariablesRequest(RequestPayload):
+    """Get variable values visible from the starting flow.
+
+    When ``names`` is non-empty, looks up each name individually via
+    ``_find_variable_hierarchical`` and fails (all-or-nothing) if any name is
+    not found. When ``names`` is empty, returns every variable in scope.
+
+    Args:
+        names: Specific variable names to retrieve. Empty means "all in scope".
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    names: list[str] = field(default_factory=list)
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variables retrieved successfully."""
+
+    variables: dict[str, Any]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Variables retrieval failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesRequest(RequestPayload):
+    """Set multiple variable values atomically (all-or-nothing).
+
+    All variable names are validated to exist in scope before any value is
+    written. If any variable is not found the entire batch is rejected and
+    no variables are modified.
+
+    Args:
+        variables: Mapping of variable name → new value
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    variables: dict[str, Any]
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
+    """Variables set successfully."""
+
+
+@dataclass
+@PayloadRegistry.register
+class SetVariablesResultFailure(WorkflowAlteredMixin, ResultPayloadFailure):
+    """Variables batch set failed."""

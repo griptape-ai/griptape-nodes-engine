@@ -28,6 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
+from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -131,19 +132,30 @@ def sanctioned_parameter_mutation() -> Iterator[None]:
 
 
 @contextmanager
-def aprocess_scope() -> Iterator[None]:
+def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) -> Iterator[None]:
     """Mark the enclosed block as the actual aprocess() execution.
 
     The framework wraps ``await node.aprocess()`` with this so the
     parameter-mutation-during-aprocess detector fires only for mutations
     that happen inside aprocess itself, not the surrounding hydration
     pass that also runs under the RUNTIME_EXECUTE strict-mode scope.
+
+    Args:
+        precomputed_variables: Optional variable dict from the orchestrator.
+            When provided, the variable cache is pre-seeded so nodes resolve
+            {VAR} tokens without a NodeManager lookup. This is required for
+            worker-executed nodes (which have no registry access) and is a
+            performance shortcut for in-process nodes.
     """
     token = _in_aprocess.set(True)
+    # Pre-seed with orchestrator-resolved variables when provided; otherwise
+    # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
+    cache_token = VariableResolver.seed_cache(precomputed_variables)
     try:
         yield
     finally:
         _in_aprocess.reset(token)
+        VariableResolver.reset_cache(cache_token)
 
 
 class ImportDependency(NamedTuple):
@@ -1004,8 +1016,17 @@ class BaseNode(ABC):
             if value is not None:
                 return value
         if param_name in self.parameter_values:
-            return self.parameter_values[param_name]
-        return param.default_value
+            value = self.parameter_values[param_name]
+        else:
+            value = param.default_value
+        if (
+            isinstance(value, str)
+            and VariableResolver.contains_variable_macro(value)
+            and _in_aprocess.get()
+            and not self._param_has_incoming_connection(param_name)
+        ):
+            value = self._resolve_variables_in_string(value)
+        return value
 
     def get_parameter_list_value(self, param: str) -> list:
         """Flattens the given param from self.params into a single list.
@@ -1096,6 +1117,17 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
+        if VariableResolver.is_substitution_enabled():
+            for param in self.parameters:
+                value = self.parameter_values.get(param.name, param.default_value)
+                if VariableResolver.contains_variable_macro(value):
+                    self.make_node_unresolved(
+                        current_states_to_trigger_change_event={
+                            NodeResolutionState.RESOLVED,
+                            NodeResolutionState.RESOLVING,
+                        }
+                    )
+                    break
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:
@@ -1401,6 +1433,51 @@ class BaseNode(ABC):
         # Use reorder_elements to apply the move
         self.reorder_elements(list(new_order))
 
+    def _param_has_incoming_connection(self, param_name: str) -> bool:
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        connections = GriptapeNodes.FlowManager().get_connections()
+        node_connections = connections.incoming_index.get(self.name)
+        if node_connections is None:
+            return False
+        return param_name in node_connections
+
+    def _resolve_variables_in_value(self, value: Any) -> Any:
+        """Recursively substitute workflow variables in any str/dict/list value."""
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
+            return value
+        return VariableResolver.resolve_value(value, variables)
+
+    def _resolve_variables_in_string(self, text: str) -> str:
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
+            return text
+        return VariableResolver.resolve_string(text, variables)
+
+    def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
+        """Return the UI display value for an output parameter.
+
+        For PROPERTY parameters whose stored template contains a variable macro
+        and the output differs from the template, returns the template so users
+        always see and can edit the {VAR} syntax rather than the resolved value.
+
+        Honors the per-workflow substitution toggle: when substitution is disabled
+        the template is never shown in place of the real output.
+        """
+        if not VariableResolver.is_substitution_enabled():
+            return output_value
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            return output_value
+        if ParameterMode.PROPERTY not in parameter.allowed_modes:
+            return output_value
+        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
+        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
+            return raw_value
+        return output_value
+
     def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
         """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
 
@@ -1610,6 +1687,12 @@ class TrackedParameterOutputValues(dict[str, Any]):
     def __setitem__(self, key: str, value: Any) -> None:
         had_key = key in self
         old_value = self.get(key)
+        # Substitute variables in dict/list output values so downstream nodes
+        # receive resolved values without the node needing to know about variables.
+        # String values are already substituted in get_parameter_value(); this
+        # handles structured types (JSON Input dicts, list outputs, etc.).
+        if _in_aprocess.get():
+            value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -1663,7 +1746,18 @@ class TrackedParameterOutputValues(dict[str, Any]):
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
-            event_data["value"] = value
+
+            # When a PROPERTY|OUTPUT parameter contains a variable template (e.g.
+            # "{SHOT}") and substitution ran during execution, the computed output
+            # value would overwrite the template in the UI. Show the raw typed
+            # value instead so users can always see and edit the template they
+            # typed. Only suppress when substitution actually changed the value
+            # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
+            # parameters like loop counters show their computed value normally.
+            display_value = value
+            if not deleted and _in_aprocess.get():
+                display_value = self._node.get_display_value_for_output(parameter_name, value)
+            event_data["value"] = display_value
 
             # Add modification metadata
             event_data["modification_type"] = "deleted" if deleted else "set"
