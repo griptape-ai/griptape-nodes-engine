@@ -657,7 +657,9 @@ class TestUnresolvedSequenceSlotBehavior:
         result = project_manager_with_template.on_get_path_for_macro_request(request)
 
         assert isinstance(result, GetPathForMacroResultSuccess)
-        assert str(result.resolved_path) == "plain/hello.txt"
+        # `resolved_path` is a `pathlib.Path`; compare with a `Path` so the
+        # assertion is platform-agnostic (Windows uses `\`, POSIX uses `/`).
+        assert result.resolved_path == Path("plain/hello.txt")
 
 
 class TestProjectManagerGetStateForMacro:

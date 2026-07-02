@@ -15,7 +15,7 @@ and are used by OSManager, FileDrivers, and workspace managers.
 import os
 import re
 import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 
@@ -431,6 +431,55 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     if prefixed == normalized_str:
         return normalized
     return Path(prefixed)
+
+
+def canonicalize_for_reverse_match(path: str | Path) -> str:
+    r"""Produce a POSIX-form string for reverse-matching against a macro template.
+
+    Macro templates are author-written and use ``/`` as the path separator by
+    convention (see ``docs/projects/macros.md``). Filesystem paths reaching
+    the reverse-matcher — from ``Path.glob()`` output, ``str(WindowsPath)``,
+    or user-bound variables holding a directory path — may use ``\``. The
+    parser's reverse-match
+    (``common.macro_parser.matching.extract_unknown_variables``) aligns
+    static text byte-for-byte, so a single separator mismatch causes the
+    whole match to fail.
+
+    This helper routes the path through ``PureWindowsPath.as_posix()``,
+    which correctly understands every Windows path form and preserves them
+    under conversion:
+
+    - Drive-letter: ``C:\path`` → ``C:/path``
+    - UNC: ``\\server\share\file`` → ``//server/share/file``
+    - Long-path prefix: ``\\?\C:\path`` → ``//?/C:/path``
+    - Long-UNC: ``\\?\UNC\server\share`` → ``//?/UNC/server/share/``
+      (``PureWindowsPath`` appends a trailing separator when the input is
+      a bare share root; not a problem in practice because reverse-match
+      inputs always have a file component past the root)
+    - Mixed separators: ``C:\a/b\c`` → ``C:/a/b/c``
+
+    Works on any host OS — ``PureWindowsPath`` parses Windows-shaped strings
+    without needing an actual Windows filesystem, so cross-platform tests
+    can exercise the Windows edge cases from macOS or Linux runners.
+
+    NOT suitable for I/O — the returned string uses ``/`` on Windows, which
+    most Windows APIs accept but not all. For handing a path to the OS, use
+    ``canonicalize_for_io``.
+
+    Args:
+        path: Raw path string (possibly Windows-shaped) or Path object.
+
+    Returns:
+        Forward-slash-separated string suitable for byte-for-byte comparison
+        against a macro template's static text.
+    """
+    # `Path.as_posix()` on Windows would give the right answer, but on POSIX
+    # hosts a `Path("C:\foo")` becomes `PurePosixPath` and treats the whole
+    # string as a filename. Routing through `PureWindowsPath(str(...))`
+    # forces Windows-aware parsing on every host.
+    if isinstance(path, Path):
+        path = str(path)
+    return PureWindowsPath(path).as_posix()
 
 
 def resolve_file_path(path_str: str, base_dir: Path) -> Path:
