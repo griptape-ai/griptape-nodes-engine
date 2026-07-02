@@ -924,9 +924,12 @@ class OSManager:
                     #    where `:03` means "exactly 3 digits."
                     #  - SequenceFormat (new `###` shorthand): minimum width, so
                     #    overflow values like `_v1000` against `###` are valid
-                    #    matches. Use the permissive `*` glob; the downstream
-                    #    integer extraction filters non-numeric matches.
-                    #  - Neither (no padding info): also `*`.
+                    #    matches. Use the permissive `*` glob. The `*` may match
+                    #    non-numeric siblings (e.g. `foo_vfinal.py`); those are
+                    #    skipped downstream when `_extract_index_from_filename`
+                    #    catches the MacroResolutionError raised by
+                    #    `SequenceFormat.reverse("final")`.
+                    #  - Neither (no padding info): also `*`; same skip behavior.
                     matched_spec = False
                     for format_spec in segment.format_specs:
                         if isinstance(format_spec, NumericPaddingFormat):
@@ -976,8 +979,17 @@ class OSManager:
         """
         secrets_manager = GriptapeNodes.SecretsManager()
 
-        # Use macro's extract_variables to reverse-match
-        extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        # Use macro's extract_variables to reverse-match. Non-numeric siblings caught
+        # by the permissive `*` glob (e.g. `workflow_vfinal.py` scanning against
+        # `workflow_v{###}.py`) reach `SequenceFormat.reverse()` and raise
+        # MacroResolutionError from int("final"). Treat that as "this file doesn't
+        # match" — same contract as extract_variables returning None. Anything else
+        # matched the glob but isn't a valid sequence entry, so it should be skipped,
+        # not crash the scan.
+        try:
+            extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        except MacroResolutionError:
+            return None
 
         if extracted is None:
             # Filename doesn't match template
