@@ -334,7 +334,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_NODE_OUTPUT: SituationTemplate(
             name=BuiltInSituation.SAVE_NODE_OUTPUT,
             description="Node generates and saves output",
-            macro="{outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
+            macro="{outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
