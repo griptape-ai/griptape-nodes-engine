@@ -1218,6 +1218,22 @@ class TestWorkspaceDir:
         # The default has workspace_dir=None; an unset field must not be written.
         assert "workspace_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
 
+    def test_workspace_dir_emitted_even_when_equal_to_base(self) -> None:
+        # Regression: workspace_dir is OWN-node (not merge-inherited), so it must be emitted
+        # whenever set, even when it equals the base's value. A child self-contained project
+        # (workspace_dir "./") whose parent also declares "./" must still write its own "./";
+        # if it were diffed away as "same as base", the child would resolve to NO declared
+        # workspace and fall through to the global workspace -- causing it to scan the whole
+        # workspace tree for workflows instead of just its own folder.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./"})
+        child = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./", "name": "Child"})
+
+        overlay_yaml = child.to_overlay_yaml(base)
+        assert "workspace_dir" in overlay_yaml
+
+        merged = self._roundtrip(child, base=base)
+        assert merged.workspace_dir == "./"
+
     def test_explicit_null_tombstones_inherited_workspace_dir(self) -> None:
         # An explicit `workspace_dir: null` overlay clears an inherited value.
         base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/inherited/ws"})
@@ -1438,6 +1454,20 @@ class TestLibrariesDir:
 
     def test_unset_libraries_dir_not_emitted(self) -> None:
         assert "libraries_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_libraries_dir_emitted_even_when_equal_to_base(self) -> None:
+        # Regression, mirror of the workspace_dir case: libraries_dir is OWN-node (not
+        # merge-inherited), so it must be emitted whenever set, even when it equals the base's
+        # value -- otherwise a child whose libraries_dir matches the parent's would be diffed away
+        # and resolve incorrectly.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries"})
+        child = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries", "name": "Child"})
+
+        overlay_yaml = child.to_overlay_yaml(base)
+        assert "libraries_dir" in overlay_yaml
+
+        merged = self._roundtrip(child, base=base)
+        assert merged.libraries_dir == "./libraries"
 
     def test_explicit_null_tombstones_inherited_libraries_dir(self) -> None:
         base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/inherited/lib"})

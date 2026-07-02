@@ -177,15 +177,26 @@ class ProjectTemplate(BaseModel):
         elif self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
             output["parent_project_path"] = self_dump.get("parent_project_path")
 
-        # workspace_dir: emit only when it diverges from base. The stored value is the
-        # raw string or per-platform mapping (never absolutized), so a relative path
-        # round-trips verbatim. An explicit null tombstones an inherited value.
-        if self_dump.get("workspace_dir") != base_dump.get("workspace_dir"):
+        # workspace_dir / libraries_dir are OWN-NODE fields: merge() takes them from the overlay
+        # alone and never inherits them from the base (see merged_workspace_dir/merged_libraries_dir),
+        # so they must NOT be diffed against the base like the merge-inherited fields below. Diffing
+        # would drop a child value that happens to equal the parent's (e.g. a child workspace_dir "./"
+        # matching the parent's "./"). Because these fields don't merge-inherit, that dropped value is
+        # NOT re-supplied from the base at merge time -- the child ends up with no own workspace_dir and
+        # must fall through the resolution ladder instead of keeping its intended "./". That matters
+        # because the ladder inherits an ancestor's workspace from the ancestor's project_workspaces
+        # mapping or adjacent griptape_nodes_config.json (see _inherit_workspace_from_parents /
+        # _resolve_node_explicit_workspace), NOT from the ancestor's own workspace_dir template field;
+        # a parent that declares only workspace_dir contributes nothing there, so the child falls all
+        # the way to the global workspace and (mis)scans the whole workspace tree for its workflows.
+        # Emit whenever a value is set (like `id` above); a None value is omitted. For libraries_dir,
+        # an omitted value does resolve up the chain to the nearest ancestor's libraries_dir
+        # (decide_libraries_root branch 1). The stored value is the raw string or per-platform mapping
+        # (never absolutized), so a relative path round-trips verbatim.
+        if self_dump.get("workspace_dir") is not None:
             output["workspace_dir"] = self_dump.get("workspace_dir")
 
-        # libraries_dir: same semantics as workspace_dir. Raw string/mapping stored
-        # verbatim; emitted only when it diverges from base; explicit null tombstones.
-        if self_dump.get("libraries_dir") != base_dump.get("libraries_dir"):
+        if self_dump.get("libraries_dir") is not None:
             output["libraries_dir"] = self_dump.get("libraries_dir")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
