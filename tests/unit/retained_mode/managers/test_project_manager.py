@@ -3010,6 +3010,40 @@ class TestResolveWorkspaceDirForProjectId:
         assert result == self._resolved("/global/ws")
 
     @pytest.mark.asyncio
+    async def test_unloaded_unreadable_ancestor_with_config_workspace_fails_closed(self, tmp_path: Path) -> None:
+        """Offline: an unreadable ancestor is skipped even when it declares a workspace via config.
+
+        C -> B (readable, no workspace) -> A (file exists but overlay unreadable, yet A carries a
+        project_workspaces override). The shared walker requires A's overlay to be readable to probe
+        it, so A is dropped and the resolver falls back to the global default. This differs from the
+        pre-dedupe offline workspace walk, which probed A's config workspace (an override read never
+        touches the overlay) before requiring A's own overlay to load, and so would have inherited
+        A's override. Fail-closed here matches the live walk and the offline libraries walk, which
+        already treat an unloadable ancestor as a broken chain link. Pins the accepted behavior.
+        """
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        # A is present on disk (so the legacy link resolves) and carries a project_workspaces override,
+        # but is absent from specs so its overlay read fails -- modeling an unreadable/corrupt YAML.
+        pm = self._build_pm(
+            [
+                {"id": "B", "file": b_file, "parent_path": str(a_file), "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            registered=[str(b_file), str(c_file)],
+            project_workspaces={str(a_file): "/ws/a"},
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/global/ws")
+
+    @pytest.mark.asyncio
     async def test_read_overlay_record_status_false_does_not_record_failures(self, tmp_path: Path) -> None:
         """A read-only probe (record_status=False) must not inject phantom failed-load entries.
 

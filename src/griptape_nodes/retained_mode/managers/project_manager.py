@@ -1572,6 +1572,12 @@ class ProjectManager:
         _nearest_ancestor_value_offline; only the per-node probe (an ancestor's explicit workspace,
         read from config) is supplied here. The walk begins at the parent: the starting project's own
         explicit sources are handled by _decide_workspace_pre_inheritance.
+
+        Because the shared walker requires each node's overlay to be readable to stay on the chain, an
+        ancestor whose project YAML is unreadable is skipped even if it declares a workspace via a
+        project_workspaces override or adjacent config. This fails closed (the walk returns None and
+        the resolver falls back to the global default), matching the live walk and the offline
+        libraries walk, which already treat an unreadable/unloadable ancestor as a broken chain link.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
