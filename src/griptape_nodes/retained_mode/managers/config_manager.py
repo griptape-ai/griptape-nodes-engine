@@ -645,11 +645,7 @@ class ConfigManager:
             return False
 
         delta = set_dot_value({}, key, value)
-        try:
-            current = json.loads(workspace_config_path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError) as e:
-            logger.warning("set_workspace_config_value: failed to read workspace config: %s", e)
-            return False
+        current = self._load_config_from_file(workspace_config_path, "workspace")
 
         merged = merge_dicts(current, delta)
         try:
