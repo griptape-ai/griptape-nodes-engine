@@ -417,7 +417,8 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     Same sanitization, expansion, absolutization, and normalization as
     ``canonicalize_for_identity``, but does NOT follow symlinks (safe for
     paths that do not yet exist) and applies the Windows long-path
-    (``\\?\``) prefix when the result exceeds MAX_PATH.
+    (``\\?\``) prefix unconditionally on Windows (see
+    ``_apply_windows_long_path_prefix``).
 
     Use this at the boundary that actually hands the path to the OS (driver
     or request handler). Do NOT call it before constructing a

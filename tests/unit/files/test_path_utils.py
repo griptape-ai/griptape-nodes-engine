@@ -810,12 +810,17 @@ class TestCanonicalizeForIo:
     def test_anchors_relative_to_base(self, tmp_path: Path) -> None:
         """Relative paths are anchored to the provided base."""
         result = canonicalize_for_io("sub/file.txt", base=tmp_path)
-        assert Path(os.path.normpath(tmp_path / "sub" / "file.txt")) == result
+        # On Windows canonicalize_for_io unconditionally applies the \\?\ long-path
+        # prefix, so anchor the expectation through the same helper.
+        expected = Path(_apply_windows_long_path_prefix(os.path.normpath(tmp_path / "sub" / "file.txt")))
+        assert expected == result
 
     def test_nonexistent_path_does_not_raise(self, tmp_path: Path) -> None:
         """Non-existent paths canonicalize without error."""
         result = canonicalize_for_io(tmp_path / "new_file.txt")
-        assert result == tmp_path / "new_file.txt"
+        # On Windows the returned path carries the unconditional \\?\ prefix.
+        expected = Path(_apply_windows_long_path_prefix(os.path.normpath(tmp_path / "new_file.txt")))
+        assert result == expected
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
     def test_does_not_follow_symlinks(self, tmp_path: Path) -> None:
