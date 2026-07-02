@@ -135,8 +135,15 @@ class TestNodeManagerResolutionStateSerialization:
         # Resolution should be reset to UNRESOLVED due to serialization failure
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
-    def test_serializable_false_param_does_not_warn_or_unresolve(self, caplog: pytest.LogCaptureFixture) -> None:
-        """A parameter explicitly opting out via serializable=False must not trigger the warning or UNRESOLVED transition."""
+    def test_serializable_false_param_does_not_warn_but_becomes_unresolved(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A parameter opting out via serializable=False must not warn but MUST mark the node UNRESOLVED.
+
+        The value is intentionally not persisted, so the node must be re-run on load to
+        recompute it. Keeping the node RESOLVED would cause downstream consumers to see
+        None instead of the recomputed value (issue #4994).
+        """
         from unittest.mock import MagicMock
 
         from griptape_nodes.exe_types.core_types import Parameter
@@ -158,8 +165,6 @@ class TestNodeManagerResolutionStateSerialization:
             node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
         )
 
-        # Tracker reports NOT_IN_TRACKER so _handle_value_hashing enters the opt-out branch
-        # (parameter.serializable is False) and returns None.
         mock_tracker = MagicMock()
         mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
 
@@ -176,7 +181,7 @@ class TestNodeManagerResolutionStateSerialization:
 
         warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
         assert not any("Attempted to serialize" in msg for msg in warning_messages)
-        assert create_node_request.resolution == NodeResolutionState.RESOLVED.value
+        assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
 
     def test_serializable_true_param_with_pickle_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
         """Genuine serialization failures (serializable=True) must still emit the warning."""

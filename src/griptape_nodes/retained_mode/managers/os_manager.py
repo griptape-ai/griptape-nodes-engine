@@ -53,6 +53,7 @@ from griptape_nodes.files.file import File, FileLoadError, canonical_extension
 from griptape_nodes.files.file_driver import FileDriverNotFoundError, FileDriverRegistry
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
+    canonicalize_to_posix,
     normalize_path_for_platform,
     path_needs_expansion,
     resolve_path_safely,
@@ -966,6 +967,22 @@ class OSManager:
         """
         secrets_manager = GriptapeNodes.SecretsManager()
 
+        # Normalize path separators to POSIX form before reverse-matching. The
+        # macro template uses `/` by convention, but the filename comes from
+        # `Path.glob()` on the host filesystem (backslashes on Windows), and
+        # directory-shaped `variables` values (e.g. `{outputs}` bound to
+        # `str(temp_dir)`) may likewise carry `\`. A single-char separator
+        # mismatch causes the reverse-matcher to fail static-text alignment
+        # and return no matches, which manifested as the sequence-slot scan
+        # finding zero existing files on Windows CI.
+        # `canonicalize_to_posix` correctly handles UNC, long-path
+        # prefix (`\\?\`), long-UNC prefix, drive-letter, and mixed-separator
+        # cases — see its docstring for the full contract.
+        normalized_filename = canonicalize_to_posix(filename)
+        normalized_variables: MacroVariables = {
+            key: canonicalize_to_posix(value) if isinstance(value, str) else value for key, value in variables.items()
+        }
+
         # Use macro's extract_variables to reverse-match. Non-numeric siblings caught
         # by the permissive `*` glob (e.g. `workflow_vfinal.py` scanning against
         # `workflow_v{###}.py`) reach `SequenceFormat.reverse()` and raise
@@ -974,7 +991,7 @@ class OSManager:
         # matched the glob but isn't a valid sequence entry, so it should be skipped,
         # not crash the scan.
         try:
-            extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+            extracted = parsed_macro.extract_variables(normalized_filename, normalized_variables, secrets_manager)
         except MacroResolutionError:
             return None
 

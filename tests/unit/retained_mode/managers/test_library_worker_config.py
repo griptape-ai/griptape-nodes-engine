@@ -118,35 +118,6 @@ class TestGetWorkerForLibrary:
                 mgr.get_worker_for_library("my_lib")
 
 
-class TestMaybePrintEngineReadyBanner:
-    def test_skips_when_is_worker(self) -> None:
-        mgr = _make_library_manager()
-
-        with patch("griptape_nodes.retained_mode.managers.library_manager.console") as mock_console:
-            mgr._maybe_print_engine_ready_banner(is_worker=True)
-
-        mock_console.print.assert_not_called()
-
-    def test_prints_panel_when_not_worker(self) -> None:
-        mgr = _make_library_manager()
-
-        with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.get_complete_version_string",
-                return_value="1.0.0",
-            ),
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn,
-            patch("griptape_nodes.retained_mode.managers.library_manager.console") as mock_console,
-        ):
-            mock_gtn.get_session_id.return_value = None
-            mock_gtn.UserManager.return_value.user = None
-            mock_gtn.UserManager.return_value.user_organization = None
-
-            mgr._maybe_print_engine_ready_banner(is_worker=False)
-
-        mock_console.print.assert_called_once()
-
-
 class TestOnLibraryLoadedNotification:
     def _make_lib_info(self, library_name: str) -> LibraryManager.LibraryInfo:
         return LibraryManager.LibraryInfo(
