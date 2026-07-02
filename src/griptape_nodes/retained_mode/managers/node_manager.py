@@ -6,6 +6,7 @@ import copy
 import logging
 import pickle
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
@@ -2120,6 +2121,13 @@ class NodeManager:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
                 if value.__class__.__module__ != "builtins":
+                    # Enums (including StrEnum/IntEnum) are not builtins but serialize to
+                    # their underlying value. Without this, the __dict__ fallback below
+                    # would send the raw enum internals (e.g. {"_value_": ..., "_name_": ...})
+                    # to the GUI, which renders them as an object instead of the value.
+                    if isinstance(value, Enum):
+                        param_to_value[element_id] = value.value
+                        continue
                     # Check if it has a to_dict method. Use that, if it's been implemented.
                     if hasattr(value, "to_dict"):
                         # If the object has a __dict__, use that
@@ -4388,8 +4396,10 @@ class NodeManager:
 
         Returns the command to record on success. Returns None when there is nothing to record:
         either no value was present, the author opted out via serializable=False, or serialization
-        genuinely failed. In the genuine-failure case, also emits a warning and marks the node
-        UNRESOLVED — opt-outs are silent.
+        genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
+        genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
+        missing value; downstream consumers would otherwise see None (issue #4994). Only the
+        genuine-failure branch also emits a warning — opt-outs are silent.
 
         value_kind is "set" or "output" and is used only in the warning text.
         """
@@ -4408,14 +4418,17 @@ class NodeManager:
         )
         if command is not None:
             return command
+
+        # Non-serialisable parameter means node must be re-resolved when loaded.
+        if isinstance(create_node_request, CreateNodeRequest):
+            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+
         # Author opted out via serializable=False — silently skip; not a failure.
         if not parameter.serializable:
             return None
         # Genuine serialization failure — warn and mark unresolved.
         details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
         logger.warning(details)
-        if isinstance(create_node_request, CreateNodeRequest):
-            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
         return None
 
     @staticmethod
