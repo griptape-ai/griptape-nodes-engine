@@ -84,11 +84,16 @@ class LeadingSeparatorFormat(FormatSpec):
     literal prefix payload. Applied by prepending to the (already
     format-spec-transformed) rendered value.
 
-    Must be the LAST format spec on a variable, and there may be only one per
-    variable. Both invariants are validated at parse time
-    (``LEADING_SEPARATOR_NOT_LAST`` / ``MULTIPLE_LEADING_SEPARATORS``) so any
-    inner transforms (``:upper``, ``:03``, etc.) run first and the prefix
-    text is never mangled by them.
+    Applied last regardless of where the author wrote it in the format-spec
+    chain — ``_normalize_leading_separator_position`` in the parser moves the
+    spec to the tail of ``format_specs`` if it isn't already there. That means
+    inner transforms (``:upper``, ``:03``, etc.) always run first and the
+    prefix text is never mangled by them, no matter what order the author
+    chose in the template.
+
+    Only one ``LeadingSeparatorFormat`` per variable is allowed — two
+    prefixes on the same variable is genuinely ambiguous. Parse time rejects
+    with ``MULTIPLE_LEADING_SEPARATORS``.
 
     Omit case is handled by the resolver's normal optional-variable path: an
     unbound optional variable skips its whole segment (including this spec),

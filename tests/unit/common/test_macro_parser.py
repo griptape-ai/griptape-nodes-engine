@@ -1296,18 +1296,31 @@ class TestLeadingSeparatorSyntax:
         assert variable.format_specs[1] == LeadingSeparatorFormat(prefix="V")
 
     def test_parse_empty_leading_separator_raises(self) -> None:
-        """`{shot:^}` (just the caret, no payload) raises EMPTY_LEADING_SEPARATOR."""
+        """`{shot:^}` (just the caret, no payload) raises EMPTY_LEADING_SEPARATOR.
+
+        `error_position` is `None` — `parse_format_spec` receives a spec
+        string without template-relative offset context, so hardcoding `0`
+        would misreport the location. Regression guard against reintroducing
+        a bogus offset.
+        """
         with pytest.raises(MacroSyntaxError) as exc_info:
             parse_variable("shot:^")
 
         assert exc_info.value.failure_reason == MacroParseFailureReason.EMPTY_LEADING_SEPARATOR
+        assert exc_info.value.error_position is None
 
     def test_parse_multiple_leading_separators_raises(self) -> None:
-        """`{shot:^a:^b}` (two `^` specs) raises MULTIPLE_LEADING_SEPARATORS."""
+        """`{shot:^a:^b}` (two `^` specs) raises MULTIPLE_LEADING_SEPARATORS.
+
+        `error_position` is `None` — the normalizer runs after all format
+        specs are collected, so the template-relative offset of the second
+        `:^` isn't known at this depth. Better honest-unknown than a bogus `0`.
+        """
         with pytest.raises(MacroSyntaxError) as exc_info:
             parse_variable("shot:^a:^b")
 
         assert exc_info.value.failure_reason == MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS
+        assert exc_info.value.error_position is None
 
     def test_parse_leading_separator_normalized_to_end(self) -> None:
         """`{shot:^_v:upper}` — leading separator written mid-list — parses with the leading spec at the tail.
@@ -1339,6 +1352,68 @@ class TestLeadingSeparatorSyntax:
         end = ParsedMacro("{shot:upper:^_v}").resolve({"shot": "a"}, secrets_manager)
 
         assert mid == end == "_vA"
+
+    def test_parse_sequence_shorthand_with_trailing_optional_marker(self) -> None:
+        """`{###:upper?}` — trailing `?` on the last format spec — marks the sequence variable optional.
+
+        Before the fix, the sequence-shorthand branch skipped the trailing-`?`
+        handling that the regular-variable branch performed, so `{###:upper?}`
+        would produce a required variable with `SeparatorFormat("upper?")`
+        instead of an optional variable with `UpperCaseFormat`. This asserts
+        the two grammars agree on trailing-`?` semantics.
+        """
+        variable = parse_variable("###:upper?")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is False
+        assert len(variable.format_specs) == 2
+        assert isinstance(variable.format_specs[0], SequenceFormat)
+        assert variable.format_specs[0].min_width == 3
+        assert isinstance(variable.format_specs[1], UpperCaseFormat)
+
+    def test_parse_sequence_shorthand_trailing_and_pre_colon_optional_are_equivalent(self) -> None:
+        """`{###?:upper}` and `{###:upper?}` parse to the same ``ParsedVariable``.
+
+        Locks the grammatical symmetry between sequence-shorthand and
+        regular-variable trailing-`?` handling — Collin's finding on #5026.
+        """
+        pre_colon = parse_variable("###?:upper")
+        post_colon = parse_variable("###:upper?")
+
+        assert pre_colon.info == post_colon.info
+        assert pre_colon.format_specs == post_colon.format_specs
+        assert pre_colon.default_value == post_colon.default_value
+
+    def test_parse_sequence_shorthand_quoted_trailing_question_mark_is_literal(self) -> None:
+        """`{###:'foo?'}` — quoted `?` on sequence shorthand — stays required, `?` is literal.
+
+        Now that the sequence-shorthand branch calls the shared trailing-`?`
+        helper, it needs to respect the same quoted-preserves-literal rule
+        the regular-variable branch does. Guards against a future edit
+        that drops the quoted-check from the helper.
+        """
+        variable = parse_variable("###:'foo?'")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is True  # Quoted `?` doesn't trigger optionality
+        assert len(variable.format_specs) == 2
+        assert isinstance(variable.format_specs[0], SequenceFormat)
+        assert isinstance(variable.format_specs[1], SeparatorFormat)
+        assert variable.format_specs[1].separator == "foo?"
+
+    def test_parse_sequence_shorthand_leading_separator_with_trailing_optional(self) -> None:
+        """`{###:^_v?}` composes leading separator + trailing-`?` optional marker.
+
+        The `?` at the end of `^_v?` must strip cleanly (marking the variable
+        optional) and the surviving `^_v` must parse as
+        `LeadingSeparatorFormat("_v")`. Locks the composition of the two
+        grammar features on the sequence-shorthand branch.
+        """
+        variable = parse_variable("###:^_v?")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is False
+        assert variable.format_specs == [SequenceFormat(min_width=3), LeadingSeparatorFormat(prefix="_v")]
 
     def test_parse_regular_variable_has_no_leading_separator(self) -> None:
         """Regression check: no `^` spec present means `format_specs` has no `LeadingSeparatorFormat`."""

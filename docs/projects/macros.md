@@ -36,6 +36,8 @@ The variable must be provided. If it is missing when the macro is resolved, reso
 
 The `?` marks the variable as optional. If the variable is not provided, the `{}` block — and any format spec — is omitted entirely from the output. The rest of the macro continues normally.
 
+**Trailing form.** The `?` can also appear at the end of the last format spec — `{shot:upper?}` is equivalent to `{shot?:upper}`. Both spellings mark the variable optional. Applies to plain variables and sequence shorthand alike: `{###:upper?}` is the same as `{###?:upper}`. Quote the separator (`{shot:'lower?'}`) to keep the `?` as a literal character.
+
 ### Separator format
 
 ```
