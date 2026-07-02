@@ -4542,8 +4542,11 @@ class FlowManager:
         """Drop nodes owned by a SubflowNodeGroup; they run inside their group's own subflow.
 
         This is a scope/ownership decision kept out of classify_nodes_for_dag so the classifier
-        stays scope-agnostic and is shared by both the top-level run and isolated subflow
-        execution. Both callers must apply it so the two paths cannot drift.
+        stays scope-agnostic. Only the top-level run (get_start_node_queue) applies it, to keep a
+        group's members from being seeded into the cross-flow DAG (they run when the group's proxy
+        node executes its subflow). The isolated-subflow path must NOT apply it: inside a group's
+        own subflow every member carries that group as its parent_group, so excluding them would
+        strand the members and seed only the start node.
         """
         return [node for node in nodes if not isinstance(node.parent_group, SubflowNodeGroup)]
 
