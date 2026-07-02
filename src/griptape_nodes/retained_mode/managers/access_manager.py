@@ -53,7 +53,11 @@ from griptape_nodes.node_library.library_declarations import (
 )
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
+    CodecAccessVerdict,
     ModelAccessVerdict,
+    QueryCodecAccessRequest,
+    QueryCodecAccessResultFailure,
+    QueryCodecAccessResultSuccess,
     QueryModelAccessForCatalogRequest,
     QueryModelAccessForCatalogResultSuccess,
     QueryModelAccessForNodeRequest,
@@ -112,6 +116,7 @@ class AccessManager:
             event_manager.assign_manager_to_request_type(
                 QueryModelAccessForCatalogRequest, self.on_query_model_access_for_catalog_request
             )
+            event_manager.assign_manager_to_request_type(QueryCodecAccessRequest, self.on_query_codec_access_request)
 
     def on_query_model_access_request(self, request: QueryModelAccessRequest) -> ResultPayload:
         """Bare form. Hook sees `ID` (the model id) per candidate; no `NODE_TYPE`, no catalog enrichment."""
@@ -148,6 +153,44 @@ class AccessManager:
         return QueryModelAccessForNodeResultSuccess(
             verdicts=verdicts,
             result_details=f"Evaluated {len(verdicts)} model(s) for '{request.node_type}'.",
+        )
+
+    def on_query_codec_access_request(self, request: QueryCodecAccessRequest) -> ResultPayload:
+        """Per-codec offer query. Hook sees `ID` (the codec) plus optional `CONTAINER_FORMAT`.
+
+        Mirrors ``QueryModelAccessRequest`` for codec dropdowns: filter what the
+        UI offers against the same policy that gates the actual read or write.
+        """
+        match request.direction:
+            case "read":
+                action = CheckpointAction.READ_VIDEO_CODEC
+            case "write":
+                action = CheckpointAction.WRITE_VIDEO_CODEC
+            case _:
+                msg = (
+                    f"Attempted to query codec access. Failed because direction "
+                    f"'{request.direction}' is not one of 'read' or 'write'."
+                )
+                return QueryCodecAccessResultFailure(result_details=msg)
+
+        event_manager = GriptapeNodes.EventManager()
+        verdicts: list[CodecAccessVerdict] = []
+        for codec in request.candidate_codecs:
+            attributes: dict[str, Any] = {CheckpointAttribute.ID: codec}
+            if request.container_format is not None:
+                attributes[CheckpointAttribute.CONTAINER_FORMAT] = request.container_format
+            denial = event_manager.evaluate_authorization_checkpoint(
+                AuthorizationCheckpoint(
+                    action=action,
+                    subject_type=CheckpointSubjectType.VIDEO_CODEC,
+                    subject_id=codec,
+                    attributes=attributes,
+                )
+            )
+            verdicts.append(CodecAccessVerdict(codec=codec, container_format=request.container_format, denial=denial))
+        return QueryCodecAccessResultSuccess(
+            verdicts=verdicts,
+            result_details=f"Evaluated {len(verdicts)} candidate codec(s) for '{request.direction}'.",
         )
 
     def on_query_model_access_for_catalog_request(self, request: QueryModelAccessForCatalogRequest) -> ResultPayload:

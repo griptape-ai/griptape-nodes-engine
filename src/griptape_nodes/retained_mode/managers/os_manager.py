@@ -2676,7 +2676,7 @@ class OSManager:
             result_details=result_details,
         )
 
-    def _apply_extension_coercion(
+    def _apply_extension_coercion(  # noqa: PLR0911
         self,
         request: WriteFileRequest,
         file_path: Path,
@@ -2716,6 +2716,14 @@ class OSManager:
                 destination_suffix,
             )
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        denial = GriptapeNodes.ArtifactManager().check_write_permission(content, sniffed)
+        if denial is not None:
+            msg = f"Cannot save '{file_path.name}': {denial.reason()}"
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                result_details=msg,
+            )
 
         if canonical_extension(destination_suffix) == canonical_extension(sniffed):
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)

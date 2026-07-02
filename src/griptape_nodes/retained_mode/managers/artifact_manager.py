@@ -14,6 +14,9 @@ from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.path_utils import decompose_source_path
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    CheckArtifactReadPermissionRequest,
+    CheckArtifactReadPermissionResultFailure,
+    CheckArtifactReadPermissionResultSuccess,
     GeneratePreviewFromDefaultsRequest,
     GeneratePreviewFromDefaultsResultFailure,
     GeneratePreviewFromDefaultsResultSuccess,
@@ -101,6 +104,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_mo
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.utils.async_utils import to_thread
 
@@ -207,6 +211,9 @@ class ArtifactManager:
             event_manager.assign_manager_to_request_type(
                 GetArtifactSchemasRequest, self.on_handle_get_artifact_schemas_request
             )
+            event_manager.assign_manager_to_request_type(
+                CheckArtifactReadPermissionRequest, self.on_check_artifact_read_permission_request
+            )
 
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
@@ -259,6 +266,61 @@ class ArtifactManager:
         # (e.g., .mp4 could be handled by both video and audio providers).
         provider = self._registry.get_or_create_provider_instance(provider_classes[0])
         return provider.prepare_content_for_write(data, file_name)
+
+    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:
+        """Route a pending write through the format's provider for permission checking.
+
+        Looks up the provider that claims ``detected_format`` and asks its
+        ``check_write_permission`` hook whether the write is allowed. Providers
+        without a policy fall through to the default ``None`` (allow).
+
+        Args:
+            data: The full buffered write payload.
+            detected_format: The canonical lowercase extension returned by
+                ``sniff_extension`` for ``data`` (e.g. ``"mp4"``).
+
+        Returns:
+            A ``CheckpointDenial`` if the provider refuses the write, or
+            ``None`` when the write is permitted (including when no provider
+            handles this format).
+        """
+        provider_classes = self._registry.get_provider_classes_by_format(detected_format)
+        if not provider_classes:
+            return None
+        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
+        # Handle ambiguity when multiple providers support the same extension.
+        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
+        return provider.check_write_permission(data, detected_format)
+
+    def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
+        """Route a pending read through the format's provider for permission checking.
+
+        Resolves the provider from the file's extension and asks its
+        ``check_read_permission`` hook whether the read is allowed. Providers
+        without a policy fall through to the default ``None`` (allow), as does
+        an unrecognized extension.
+
+        Callers should reach this via ``CheckArtifactReadPermissionRequest``
+        rather than calling here directly, so library code stays request-driven.
+
+        Args:
+            source_path: Absolute path to the source file.
+
+        Returns:
+            A ``CheckpointDenial`` if the provider refuses the read, or
+            ``None`` when the read is permitted (including when no provider
+            handles this extension).
+        """
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return None
+        provider_classes = self._registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            return None
+        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
+        # Handle ambiguity when multiple providers support the same extension.
+        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
+        return provider.check_read_permission(source_path)
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
@@ -806,6 +868,25 @@ class ArtifactManager:
             result_details=f"Preview retrieved for '{source_path}'",
             paths_to_preview=paths_to_preview,
             artifact_metadata=metadata.artifact_metadata,
+        )
+
+    def on_check_artifact_read_permission_request(
+        self, request: CheckArtifactReadPermissionRequest
+    ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
+        """Handle a read-permission check request by dispatching to the provider."""
+        if not request.source_path:
+            return CheckArtifactReadPermissionResultFailure(
+                result_details="Attempted to check read permission. Failed because no source path was provided."
+            )
+        denial = self.check_read_permission(request.source_path)
+        if denial is None:
+            return CheckArtifactReadPermissionResultSuccess(
+                denial=None,
+                result_details=f"Read allowed for '{request.source_path}'.",
+            )
+        return CheckArtifactReadPermissionResultSuccess(
+            denial=denial,
+            result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
         )
 
     def on_handle_list_artifact_providers_request(
