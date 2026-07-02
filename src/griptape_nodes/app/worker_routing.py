@@ -81,6 +81,10 @@ from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueRequest,
     SetSecretValueRequest,
 )
+from griptape_nodes.retained_mode.events.variable_events import (
+    GetVariablesRequest,
+    SetVariablesRequest,
+)
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.utils.async_utils import call_function
 
@@ -128,6 +132,9 @@ FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # secrets_events
         SetSecretValueRequest,
         DeleteSecretValueRequest,
+        # variable_events
+        GetVariablesRequest,
+        SetVariablesRequest,
     }
 )
 
