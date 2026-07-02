@@ -657,6 +657,10 @@ class ConfigManager:
             logger.warning("set_workspace_config_value: failed to write workspace config: %s", e)
             return False
 
+        # Re-merge so the live merged_config reflects the updated workspace file.
+        # Only meaningful when _workspace_config_path is set (engine runtime path);
+        # during gtn init _workspace_config_path is None so the workspace layer is
+        # not re-read, but the call is harmless and mirrors set_config_value's pattern.
         self.load_configs()
         return True
 
