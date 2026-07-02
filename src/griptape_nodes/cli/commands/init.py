@@ -246,11 +246,14 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
         # If a workspace config exists at the configured workspace directory, mirror
         # the library settings there. The workspace config layer has higher precedence
         # than the user config and would otherwise silently override the values above.
-        config_manager.set_workspace_config_value(
+        # Snapshot existence now so a False return can be read as "write failed" vs "no file".
+        workspace_config_path = config_manager.workspace_path / "griptape_nodes_config.json"
+        workspace_config_existed = workspace_config_path.exists()
+        download_mirrored = config_manager.set_workspace_config_value(
             LIBRARIES_TO_DOWNLOAD_KEY,
             libraries_config.libraries_to_download,
         )
-        config_manager.set_workspace_config_value(
+        register_mirrored = config_manager.set_workspace_config_value(
             LIBRARIES_TO_REGISTER_KEY,
             libraries_config.libraries_to_register,
         )
@@ -261,6 +264,11 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
         console.print(
             f"[bold green]Libraries to register: {', '.join(libraries_config.libraries_to_register)}[/bold green]"
         )
+        if workspace_config_existed and not (download_mirrored and register_mirrored):
+            console.print(
+                f"[bold yellow]Warning: library settings were saved to your user config but could not be "
+                f"mirrored to {workspace_config_path}. Your workspace config may override them on next launch.[/bold yellow]"
+            )
 
     return register_advanced_library
 
