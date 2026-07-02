@@ -792,6 +792,104 @@ class TestExtensionCoercion:
         assert Path(result.final_file_path) == requested_path
 
 
+class TestOSWritePermissionVet:
+    """Provider write-permission vet runs on every recognized-bytes write.
+
+    After sniff picks a format, OSManager asks the format's provider whether
+    the write is permitted. A denial produces WriteFileResultFailure(
+    CODEC_NOT_PERMITTED) BEFORE any bytes reach disk. Format sniffing itself
+    is unchanged -- only the vet is new. Unregistered / unrecognized bytes
+    bypass the vet entirely (there's no provider to ask).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Register the image provider so PNG/JPEG bytes are recognized; the
+        # vet under test is provider.check_write_permission on the returned
+        # provider instance.
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        griptape_nodes.ArtifactManager().on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
+        )
+
+        yield
+
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_deny_returns_codec_not_permitted_and_no_file(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A provider that denies must abort the write before any bytes hit disk."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
+
+        # Force the ImageArtifactProvider instance's check_write_permission to
+        # deny. We patch on the instance retrieved through the same lookup path
+        # the manager uses so we intercept the exact object it will call.
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes, "PNG must resolve to the registered image provider"
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(provider, "check_write_permission", lambda data, detected_format: expected_denial)  # noqa: ARG005
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        # The user-facing message must include the denial's own reason string
+        # (owned by the policy) so an artist sees plain English, not "sniffed".
+        assert "This codec is not licensed." in str(result.result_details)
+        assert "sniffed" not in str(result.result_details).lower()
+        assert not requested_path.exists()
+
+    def test_allow_writes_normally(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """The default BaseArtifactProvider.check_write_permission returns None -> allow."""
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert Path(result.final_file_path) == requested_path
+        assert requested_path.exists()
+
+    def test_unrecognized_bytes_skip_vet_entirely(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If sniff returns None (no provider claims the bytes), the vet is never invoked."""
+        called: list[bool] = []
+
+        def spy(data: bytes, detected_format: str) -> None:  # noqa: ARG001
+            called.append(True)
+
+        # Attach the spy to any provider instance we might reach; if the vet
+        # were ever invoked for unrecognized bytes we'd catch it here. Simpler:
+        # spy on ArtifactManager.check_write_permission at the dispatch layer.
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "blob.dat"
+
+        request = WriteFileRequest(file_path=str(requested_path), content=b"\x00\x01 not a known format")
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert called == []
+        assert requested_path.exists()
+
+
 class TestExtensionCoercionDoesNotClobberPriorSave:
     """Regression for issue #4924.
 
