@@ -667,8 +667,9 @@ class TestExcludeSubflowGroupChildren:
     """Tests for FlowManager.exclude_subflow_group_children.
 
     This scope/ownership filter drops nodes owned by a SubflowNodeGroup so they are not seeded
-    directly into a DAG (they run inside their group's own subflow). Both the top-level queue
-    and the isolated-subflow path apply it, so it must behave identically for either caller.
+    directly into a DAG (they run inside their group's own subflow). The top-level queue applies
+    it to keep group members out of the cross-flow run; the isolated-subflow path deliberately
+    does NOT, because within a group's own subflow those members are exactly what must resolve.
     """
 
     def test_drops_only_subflow_group_children(self, griptape_nodes: GriptapeNodes) -> None:

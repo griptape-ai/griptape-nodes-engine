@@ -1593,9 +1593,12 @@ class LibraryManager:
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
         if not file_path.is_file():
+            # Display file_identity, not file_path: on Windows the latter now carries the
+            # \\?\ long-path prefix (canonicalize_for_io applies it unconditionally), which
+            # is confusing in a user-facing message. file_identity is the un-prefixed form.
             details = (
                 f"Attempted to register a sandbox node with file_path={request.file_path!r}. "
-                f"Failed because no file exists at the resolved path '{file_path}'. Write "
+                f"Failed because no file exists at the resolved path '{file_identity}'. Write "
                 "the source file into the sandbox directory before calling this request."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
@@ -1606,7 +1609,8 @@ class LibraryManager:
         try:
             module = self._load_module_from_file(file_path, LibraryManager.SANDBOX_LIBRARY_NAME)
         except ImportError as err:
-            details = f"Attempted to register a sandbox node from '{file_path}'. Failed at import time: {err}"
+            # Display file_identity (un-prefixed); file_path may carry the \\?\ prefix on Windows.
+            details = f"Attempted to register a sandbox node from '{file_identity}'. Failed at import time: {err}"
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
         # The Sandbox Library must already be registered. It is created as part of normal
