@@ -16,6 +16,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 from unittest.mock import MagicMock, patch
 
+import pytest
+
+from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
@@ -160,3 +163,52 @@ class TestSeedDagFromCategories:
         # Already-present sinks short-circuit before any connectivity check.
         flow_manager.is_node_connected.assert_not_called()
         assert dag_builder.start_node_candidates == {}
+
+
+class TestProcessNodesForDagIsolatedScope:
+    """Tests for ControlFlowMachine._process_nodes_for_dag isolated-subflow scope selection.
+
+    A SubflowNodeGroup's own subflow runs on the isolated path, and its direct nodes are the
+    group's members, which all carry the owning group as their parent_group. The isolated scope
+    must therefore be the subflow's nodes as-is: running them through the top-level
+    exclude_subflow_group_children filter would drop every member and seed only the start node,
+    so only one node would resolve.
+    """
+
+    @pytest.mark.asyncio
+    async def test_isolated_scope_keeps_group_children(self, griptape_nodes: GriptapeNodes) -> None:
+        machine = ControlFlowMachine("grp_subflow", is_isolated=True)
+        # Swap the fresh DagBuilder for a stub: add_node_with_dependencies becomes a no-op, and the
+        # is_isolated check (dag_builder is not the global one) still holds for a MagicMock.
+        machine.context.resolution_machine.context.dag_builder = MagicMock()
+
+        group = MagicMock(spec=SubflowNodeGroup)
+        child_a = _mock_node("child_a")
+        child_a.parent_group = group
+        child_b = _mock_node("child_b")
+        child_b.parent_group = group
+        subflow = MagicMock()
+        subflow.nodes = {"child_a": child_a, "child_b": child_b}
+
+        flow_manager = griptape_nodes.FlowManager()
+        captured: dict[str, list[BaseNode]] = {}
+
+        def fake_classify(nodes: list[BaseNode]) -> DagNodeCategories:
+            captured["scope"] = list(nodes)
+            return DagNodeCategories(start_nodes=[], control_nodes=[], data_sink_nodes=list(nodes))
+
+        with (
+            patch.object(flow_manager, "get_flow_by_name", return_value=subflow),
+            patch.object(flow_manager, "classify_nodes_for_dag", side_effect=fake_classify),
+            patch.object(ControlFlowMachine, "_seed_dag_from_categories", return_value=[child_a]) as seed,
+        ):
+            entry_nodes = await machine._process_nodes_for_dag(child_a)
+
+        # Both group members reach the classifier; the group-child filter is not applied here.
+        assert {node.name for node in captured["scope"]} == {"child_a", "child_b"}
+        # Applying the top-level filter to this scope would drop everything, which is exactly the
+        # behavior the isolated path must avoid.
+        assert flow_manager.exclude_subflow_group_children(captured["scope"]) == []
+        # The categories built from the full scope are what get seeded.
+        assert entry_nodes == [child_a]
+        seed.assert_called_once()
