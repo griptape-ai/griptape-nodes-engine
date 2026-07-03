@@ -277,6 +277,8 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         "txt": "text",
         "md": "text",
         "json": "text",
+        "html": "text",
+        "htm": "text",
         "yaml": "text",
         "yml": "text",
         "csv": "text",
