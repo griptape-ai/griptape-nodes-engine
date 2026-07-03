@@ -1,0 +1,79 @@
+name: Version Ahead Check
+
+# Blocks merges into main while its version is not ahead of the latest published
+# release. Enforces the policy that after a release nothing merges until main is
+# bumped to the next version (the auto-generated "chore: bump" PR).
+#
+# Required check setup: mark this job required in branch protection and enable
+# "require branches to be up to date before merging" so blocked PRs re-run and
+# clear automatically once the bump lands on main.
+#
+# Break-glass: set the repository variable ALLOW_VERSION_DRIFT=true to
+# temporarily let PRs through (e.g. if the auto-bump workflow is broken and an
+# urgent fix must merge). Unset it once main is bumped.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: ["main"]
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  version-ahead:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Compare version against latest release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ALLOW_DRIFT: ${{ vars.ALLOW_VERSION_DRIFT }}
+        run: |
+          CURRENT=$(uv version --short)
+
+          # releases/latest excludes prereleases, so this is the latest stable tag.
+          # Fail open on API errors so a GitHub hiccup can't freeze all merges.
+          RELEASED_TAG=$(gh api "repos/${{ github.repository }}/releases/latest" --jq .tag_name 2>/dev/null || true)
+          if [ -z "$RELEASED_TAG" ]; then
+            echo "No published release found (or releases API unavailable); skipping check."
+            exit 0
+          fi
+          RELEASED="${RELEASED_TAG#v}"
+
+          echo "main version: $CURRENT | latest release: $RELEASED"
+
+          HIGHEST=$(printf '%s\n%s\n' "$CURRENT" "$RELEASED" | sort -V | tail -n1)
+          if [ "$HIGHEST" != "$RELEASED" ]; then
+            echo "OK: version $CURRENT is ahead of the last release $RELEASED."
+            echo "### ✅ Version ahead of last release ($CURRENT > $RELEASED)" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          MSG="main version ($CURRENT) is not ahead of the last release ($RELEASED). Merge the auto-generated 'chore: bump' PR to advance main before merging other changes."
+          echo "### ⛔ Version not bumped past last release" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "$MSG" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$ALLOW_DRIFT" = "true" ]; then
+            echo "::warning::${MSG} (allowed via ALLOW_VERSION_DRIFT)"
+            echo "" >> "$GITHUB_STEP_SUMMARY"
+            echo "_Allowed via \`ALLOW_VERSION_DRIFT\`._" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "::error::${MSG}"
+          exit 1

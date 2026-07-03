@@ -260,10 +260,14 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         Top-level runs and isolated subflows share one classifier and one seeding routine; they
         differ only in scope. A top-level run draws its categorized nodes from the global queue
         (already scoped by get_start_node_queue to exclude referenced subflows and group
-        children). An isolated subflow classifies its own nodes directly, applying the same
-        SubflowNodeGroup-child exclusion, since the global queue deliberately omits referenced
-        subflows. Either way the same seeding logic runs, so a data-only subflow resolves its
-        leaf nodes instead of stopping at the start node.
+        children). An isolated subflow classifies its own direct nodes and, unlike the top-level
+        run, does NOT drop group children: a node carries a parent_group only when it belongs to
+        the group that owns this very subflow (members are moved into their group's subflow), so
+        those children are exactly the nodes this run must resolve. A nested group appears as its
+        proxy node, which resolves here and executes its own subflow in turn, so nothing is
+        double-executed. Either way the same seeding logic runs, so a data-only subflow (or a
+        group of independent nodes) resolves all its leaf nodes in parallel instead of stopping
+        at the start node.
         """
         # Use the DagBuilder from the resolution machine context (may be isolated or global)
         dag_builder = self._context.resolution_machine.context.dag_builder
@@ -280,9 +284,13 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
 
         if is_isolated:
             subflow = flow_manager.get_flow_by_name(self._context.flow_name)
-            # Same scope decision as get_start_node_queue: SubflowNodeGroup children run inside
-            # their own group's subflow, so they must not be seeded directly into this DAG.
-            scope_nodes = flow_manager.exclude_subflow_group_children(list(subflow.nodes.values()))
+            # Scope is this subflow's own direct nodes. Do NOT apply exclude_subflow_group_children
+            # here (unlike get_start_node_queue): a node carries a parent_group only when it belongs
+            # to the group that owns this exact subflow, so its "group children" are precisely the
+            # nodes this run must resolve. A nested group is represented by its proxy node, whose
+            # own members live in the nested group's subflow, so excluding here would strand this
+            # group's independent nodes and let only the start node run.
+            scope_nodes = list(subflow.nodes.values())
             categories = flow_manager.classify_nodes_for_dag(scope_nodes)
             logger.debug("Seeding isolated subflow '%s' DAG from its own nodes", self._context.flow_name)
         else:

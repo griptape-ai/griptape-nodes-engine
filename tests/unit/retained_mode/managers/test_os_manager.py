@@ -1247,12 +1247,19 @@ class TestWindowsLongPathHandling:
         return Path(*path_parts)
 
     def test_normalize_path_short_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:  # noqa: ARG002
-        """Test that short paths are not modified."""
+        r"""Short paths get the \\?\ prefix on Windows, none elsewhere.
+
+        The prefix is applied unconditionally on Windows (not gated on length):
+        prefixing a short root is what lets a recursive copy carry the prefix
+        down to deep leaf paths that individually exceed MAX_PATH.
+        """
         short_path = temp_dir / "short.txt"
         result = normalize_path_for_platform(short_path)
 
-        # Should return string without \\?\ prefix
-        assert not result.startswith("\\\\?\\")
+        if platform.system() == "Windows":
+            assert result.startswith("\\\\?\\")
+        else:
+            assert not result.startswith("\\\\?\\")
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
     def test_normalize_path_long_path_windows(self, griptape_nodes: GriptapeNodes, long_path: Path) -> None:  # noqa: ARG002

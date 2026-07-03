@@ -1,5 +1,4 @@
 import asyncio
-import copy
 import logging
 from abc import abstractmethod
 from enum import StrEnum
@@ -715,10 +714,12 @@ class BaseIterativeEndNode(BaseNode):
     def _output_results_list(self) -> None:
         """Output the current results list to the results parameter.
 
-        Uses deep copy to ensure nested objects (like dictionaries) are properly copied
-        and won't have unintended side effects if modified later.
+        Shallow copy: items are never mutated after append, and the list is replaced
+        wholesale via ``= []`` rather than cleared in-place, so shared item references
+        are safe. deepcopy broke websocket payload deduplication by creating new object
+        identities for every item on every broadcast.
         """
-        self.parameter_output_values[IterativeNodeParam.RESULTS.value] = copy.deepcopy(self._results_list)
+        self.parameter_output_values[IterativeNodeParam.RESULTS.value] = list(self._results_list)
 
     def _validate_end_node(self) -> list[Exception] | None:
         """Common validation logic for both workflow and node run validation."""
