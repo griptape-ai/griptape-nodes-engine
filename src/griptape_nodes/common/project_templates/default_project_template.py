@@ -343,6 +343,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
+        # Come back to this
         BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW: SituationTemplate(
             name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW,
             description="Generate preview/thumbnail with preserved directory hierarchy",
@@ -373,9 +374,6 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
-        # Workflows save into the workspace root today for backward compatibility.
-        # Migrating to a dedicated subdirectory is tracked in
-        # https://github.com/griptape-ai/griptape-nodes/issues/2047.
         BuiltInSituation.SAVE_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.SAVE_WORKFLOW,
             description="Save a workflow Python file, preserving any sub-directory hierarchy",
