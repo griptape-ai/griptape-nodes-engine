@@ -441,7 +441,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_WORKFLOW_BACKUP: SituationTemplate(
             name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
             description="Save a backup of a workflow file, preserving any sub-directory hierarchy",
-            macro="{backups}/{sub_dirs?:/}{file_name_base}_backup_v{_index:1}.{file_extension}",
+            macro="{backups}/{sub_dirs?:/}{file_name_base}_backup_v{###}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
