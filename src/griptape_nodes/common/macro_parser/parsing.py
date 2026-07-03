@@ -9,6 +9,7 @@ from griptape_nodes.common.macro_parser.formats import (
     FORMAT_REGISTRY,
     DateFormat,
     FormatSpec,
+    LeadingSeparatorFormat,
     NumericPaddingFormat,
     SeparatorFormat,
     SequenceFormat,
@@ -180,6 +181,42 @@ def _reject_multiple_sequence_slots(template: str, segments: list[ParsedSegment]
     )
 
 
+def _apply_trailing_optional_marker(format_specs: list[FormatSpec], format_parts: list[str]) -> bool:
+    """Strip an unquoted trailing ``?`` from the last format spec, mutating ``format_specs`` in place.
+
+    The last format spec's source text (``format_parts[-1]``) may carry a
+    trailing ``?`` that marks the whole variable optional — e.g. ``{shot:upper?}``
+    is the same shape as ``{shot?:upper}``. Quoted separators (``{shot:'lower?'}``)
+    preserve the ``?`` as literal and don't trigger optionality.
+
+    Called from both branches of ``parse_variable`` (regular-variable and
+    sequence-shorthand) so the two grammars stay symmetric on trailing-``?``
+    handling — previously the sequence branch skipped this step entirely and
+    ``{###:upper?}`` diverged from ``{name:upper?}``.
+
+    Returns:
+        True if the trailing ``?`` was found and stripped (caller should mark
+        the variable optional); False otherwise (leave optional flag as-is).
+    """
+    if not format_parts:
+        return False
+    last_format_part = format_parts[-1]
+
+    # Quoted formats preserve `?` as literal — don't treat as optional marker.
+    is_quoted = last_format_part.startswith("'") and last_format_part.endswith("'")
+    if is_quoted or not last_format_part.endswith("?"):
+        return False
+
+    stripped_format = last_format_part[:-1]
+    if stripped_format:
+        # Re-parse the last spec without the trailing `?`.
+        format_specs[-1] = parse_format_spec(stripped_format)
+    else:
+        # Format was just `?` — remove the empty spec entirely.
+        format_specs.pop()
+    return True
+
+
 def parse_variable(variable_content: str) -> ParsedVariable:
     """Parse a variable from its content (text between braces).
 
@@ -192,66 +229,55 @@ def parse_variable(variable_content: str) -> ParsedVariable:
     Raises:
         MacroSyntaxError: If variable syntax is invalid
     """
-    # Sequence-slot shorthand `{###}` / `{##?}`. Content is purely `#` chars
-    # (one or more), optionally followed by `?` for an optional slot.
-    # Synthesizes a variable with the canonical sequence name and a single
-    # SequenceFormat carrying min_width. Anything else inside the braces —
-    # extra format specs, default values, mixed content — falls through to
-    # regular variable parsing below (which would just treat the `#` chars
-    # as part of a variable name, surfacing as MISSING_REQUIRED_VARIABLES
-    # at resolve time).
-    sequence_match = _SEQUENCE_SHORTHAND_RE.match(variable_content)
-    if sequence_match is not None:
-        hash_run, optional_marker = sequence_match.groups()
-        return ParsedVariable(
-            info=VariableInfo(name=SEQUENCE_VARIABLE_NAME, is_required=optional_marker is None),
-            format_specs=[SequenceFormat(min_width=len(hash_run))],
-            default_value=None,
-        )
-
-    # Parse variable content: name[?][:format[:format...]][|default]
-
-    # Check for default value (|)
+    # Split off default value (|) before anything else — the default text
+    # is opaque to the rest of the parser and can contain colons.
     default_value = None
     if "|" in variable_content:
         parts = variable_content.split("|", 1)
         variable_content = parts[0]
         default_value = parts[1]
 
-    # Check for format specifiers (:)
-    format_specs: list[FormatSpec] = []
-    is_required = True
+    # Split off format specs (:) before matching the sequence-slot shorthand
+    # so shorthand can carry additional format specs (e.g. `{###?:^_v}`).
+    # Prior to #5023 the shorthand regex matched the WHOLE variable content;
+    # any trailing format spec would have silently broken shorthand
+    # recognition and turned `###?` into a bare variable name.
+    variable_part = variable_content
+    format_parts: list[str] = []
     if ":" in variable_content:
-        parts = variable_content.split(":")
-        variable_part = parts[0]
-        format_parts = parts[1:]
+        pieces = variable_content.split(":")
+        variable_part = pieces[0]
+        format_parts = pieces[1:]
 
-        # Parse format specifiers
-        for format_part in format_parts:
-            format_spec = parse_format_spec(format_part)
-            format_specs.append(format_spec)
+    # Sequence-slot shorthand `{###}` / `{##?}`. The name piece (pre-colon)
+    # is purely `#` chars (one or more), optionally followed by `?` for an
+    # optional slot. Synthesizes a variable with the canonical sequence
+    # name and a `SequenceFormat` carrying min_width; additional format
+    # specs after `:` (if any) are parsed as usual and appended.
+    sequence_match = _SEQUENCE_SHORTHAND_RE.match(variable_part)
+    if sequence_match is not None:
+        hash_run, optional_marker = sequence_match.groups()
+        format_specs: list[FormatSpec] = [SequenceFormat(min_width=len(hash_run))]
+        format_specs.extend(parse_format_spec(format_part) for format_part in format_parts)
+        # A trailing `?` on the last format spec ALSO makes the variable
+        # optional — `{###:upper?}` should behave like `{###?:upper}`.
+        # OR the two paths so either spelling produces the same result.
+        pre_colon_optional = optional_marker is not None
+        post_colon_optional = _apply_trailing_optional_marker(format_specs, format_parts)
+        _normalize_leading_separator_position(format_specs)
+        return ParsedVariable(
+            info=VariableInfo(name=SEQUENCE_VARIABLE_NAME, is_required=not (pre_colon_optional or post_colon_optional)),
+            format_specs=format_specs,
+            default_value=default_value,
+        )
 
-        # Check if last format spec ends with unquoted ?
-        if format_parts:
-            last_format_part = format_parts[-1]
-
-            # Check if it's quoted (quoted formats preserve ? as literal)
-            is_quoted = last_format_part.startswith("'") and last_format_part.endswith("'")
-
-            if not is_quoted and last_format_part.endswith("?"):
-                # Strip the ? and re-parse the format
-                stripped_format = last_format_part[:-1]
-                if stripped_format:
-                    # Re-parse without the ?
-                    format_specs[-1] = parse_format_spec(stripped_format)
-                else:
-                    # Format was just "?", remove it entirely
-                    format_specs.pop()
-
-                # Mark variable as optional
-                is_required = False
-    else:
-        variable_part = variable_content
+    # Regular variable: name[?][:format[:format...]][|default]
+    format_specs = []
+    is_required = True
+    if format_parts:
+        format_specs.extend(parse_format_spec(format_part) for format_part in format_parts)
+        if _apply_trailing_optional_marker(format_specs, format_parts):
+            is_required = False
 
     # Check for optional marker (?) after variable name
     if variable_part.endswith("?"):
@@ -260,8 +286,44 @@ def parse_variable(variable_content: str) -> ParsedVariable:
     else:
         name = variable_part
 
+    _normalize_leading_separator_position(format_specs)
     info = VariableInfo(name=name, is_required=is_required)
     return ParsedVariable(info=info, format_specs=format_specs, default_value=default_value)
+
+
+def _normalize_leading_separator_position(format_specs: list[FormatSpec]) -> None:
+    """Move any ``LeadingSeparatorFormat`` to the end of ``format_specs`` in-place.
+
+    A leading separator is semantically a **prefix to the rendered value** —
+    it should apply *after* every other format spec on the same variable,
+    regardless of where the author wrote it in the template. Rather than
+    forcing the author to remember which end of the spec list the prefix
+    belongs on, the parser normalizes here: `{shot:^_v:upper}` and
+    `{shot:upper:^_v}` parse to the same ordered list of specs, and
+    therefore render identically.
+
+    Rejects only the genuinely ambiguous case: more than one
+    ``LeadingSeparatorFormat`` on the same variable
+    (``MULTIPLE_LEADING_SEPARATORS``) — no sensible answer to "does the
+    second prefix prepend before or after the first?"
+    """
+    leading_indices = [i for i, spec in enumerate(format_specs) if isinstance(spec, LeadingSeparatorFormat)]
+    if not leading_indices:
+        return
+    if len(leading_indices) > 1:
+        msg = "More than one leading separator (`:^prefix`) in a single variable; only one is allowed"
+        # `error_position` is left `None`: at this depth in the parser we
+        # don't have the template-relative offset of the offending spec,
+        # and reporting a bogus `0` would point at the wrong character.
+        raise MacroSyntaxError(
+            msg,
+            failure_reason=MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS,
+        )
+    idx = leading_indices[0]
+    if idx == len(format_specs) - 1:
+        # Already at the end — no work to do.
+        return
+    format_specs.append(format_specs.pop(idx))
 
 
 def parse_format_spec(format_text: str) -> FormatSpec:
@@ -280,6 +342,25 @@ def parse_format_spec(format_text: str) -> FormatSpec:
     if format_text.startswith("'") and format_text.endswith("'"):
         # Quoted text is always a separator, even if it matches other keywords
         return SeparatorFormat(separator=format_text[1:-1])
+
+    # Leading-separator marker: `:^prefix` prepends `prefix` to the variable's
+    # rendered value. Mirror of the unquoted trailing separator (`:_`, `:foo`)
+    # that today falls through to the SeparatorFormat branch below. Emitted
+    # by issue #5023. Applies last regardless of where the author wrote it —
+    # ``_normalize_leading_separator_position`` moves it to the tail of
+    # ``format_specs`` after this function returns.
+    if format_text.startswith("^"):
+        prefix = format_text[1:]
+        if not prefix:
+            msg = "Empty leading separator (`:^`) — supply the prefix text after the caret"
+            # `error_position` is left `None`: `parse_format_spec` receives
+            # a spec string without template-relative offset context, so
+            # reporting a bogus `0` would point at the wrong character.
+            raise MacroSyntaxError(
+                msg,
+                failure_reason=MacroParseFailureReason.EMPTY_LEADING_SEPARATOR,
+            )
+        return LeadingSeparatorFormat(prefix=prefix)
 
     # Check for date format (starts with %)
     if format_text.startswith("%"):

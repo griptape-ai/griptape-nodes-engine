@@ -3,12 +3,13 @@
 import os
 import platform
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from griptape_nodes.files.path_utils import (
     FilenameParts,
+    _apply_windows_long_path_prefix,
     canonicalize_for_identity,
     canonicalize_for_io,
     canonicalize_to_posix,
@@ -261,6 +262,78 @@ class TestNormalizePathForPlatform:
         # Check for actual newline and carriage return characters, not the string sequences
         assert "\n" not in result
         assert "\r" not in result
+
+
+class TestApplyWindowsLongPathPrefix:
+    r"""Tests for _apply_windows_long_path_prefix.
+
+    These patch ``path_utils.is_windows`` so the Windows / non-Windows branches
+    can both be exercised regardless of the host OS the suite runs on.
+    """
+
+    def test_no_prefix_off_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """On non-Windows, the path is returned unchanged even when very long."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+        long_path = "/" + "a" * 400
+        assert _apply_windows_long_path_prefix(long_path) == long_path
+
+    def test_prefixes_short_path_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A short (<MAX_PATH) Windows path still gets the \\?\ prefix.
+
+        This is the regression guard for the deep-copy MAX_PATH bug: the old
+        length gate left short roots unprefixed, so leaf paths that grew past
+        260 during a recursive copy never inherited the prefix.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        short_path = r"C:\Users\x\Temp\bundle"
+        assert _apply_windows_long_path_prefix(short_path) == r"\\?\C:\Users\x\Temp\bundle"
+
+    def test_prefixes_long_path_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A path already exceeding MAX_PATH still gets the \\?\ prefix."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        long_path = r"C:\Users\x" + "\\" + "a" * 300
+        assert _apply_windows_long_path_prefix(long_path) == r"\\?\C:\Users\x" + "\\" + "a" * 300
+
+    def test_unc_path_gets_unc_variant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""UNC paths (\\server\share) get the \\?\UNC\ variant."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert _apply_windows_long_path_prefix(r"\\server\share\file") == r"\\?\UNC\server\share\file"
+
+    def test_already_prefixed_is_idempotent(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A path that already carries the \\?\ prefix is returned unchanged."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        already = r"\\?\C:\Users\x\file"
+        assert _apply_windows_long_path_prefix(already) == already
+
+    def test_prefix_survives_pathlib_join(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""The prefix applied at the root is preserved through pathlib joins.
+
+        This is what lets a prefixed destination root carry the prefix down to
+        every per-file leaf path built during a recursive copy.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        root = _apply_windows_long_path_prefix(r"C:\Users\x\Temp\bundle")
+        leaf = PureWindowsPath(root) / "rel" / "deep" / "file.txt"
+        assert str(leaf).startswith("\\\\?\\")
+
+    def test_relative_path_is_not_prefixed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A non-absolute path is returned unchanged rather than wrapped.
+
+        The precondition is that the input is fully-qualified; ``\\?\`` disables
+        Win32 normalization, so prefixing ``sub\file`` would yield the invalid
+        ``\\?\sub\file``. The guard leaves such inputs alone.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert _apply_windows_long_path_prefix(r"sub\file.txt") == r"sub\file.txt"
+
+    def test_forward_slash_path_is_not_prefixed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""A forward-slash path is returned unchanged rather than wrapped.
+
+        ``\\?\`` requires backslash separators; prefixing ``C:/x`` would produce
+        the invalid ``\\?\C:/x``. The guard leaves it alone.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        assert _apply_windows_long_path_prefix("C:/x/file.txt") == "C:/x/file.txt"
 
 
 class TestResolveFilePath:
@@ -756,12 +829,17 @@ class TestCanonicalizeForIo:
     def test_anchors_relative_to_base(self, tmp_path: Path) -> None:
         """Relative paths are anchored to the provided base."""
         result = canonicalize_for_io("sub/file.txt", base=tmp_path)
-        assert Path(os.path.normpath(tmp_path / "sub" / "file.txt")) == result
+        # On Windows canonicalize_for_io unconditionally applies the \\?\ long-path
+        # prefix, so anchor the expectation through the same helper.
+        expected = Path(_apply_windows_long_path_prefix(os.path.normpath(tmp_path / "sub" / "file.txt")))
+        assert expected == result
 
     def test_nonexistent_path_does_not_raise(self, tmp_path: Path) -> None:
         """Non-existent paths canonicalize without error."""
         result = canonicalize_for_io(tmp_path / "new_file.txt")
-        assert result == tmp_path / "new_file.txt"
+        # On Windows the returned path carries the unconditional \\?\ prefix.
+        expected = Path(_apply_windows_long_path_prefix(os.path.normpath(tmp_path / "new_file.txt")))
+        assert result == expected
 
     @pytest.mark.skipif(sys.platform.startswith("win"), reason="POSIX symlinks")
     def test_does_not_follow_symlinks(self, tmp_path: Path) -> None:
@@ -774,6 +852,24 @@ class TestCanonicalizeForIo:
         result = canonicalize_for_io(link)
         # The io helper should NOT resolve the symlink.
         assert result == link
+
+    def test_wires_prefix_through_on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        r"""canonicalize_for_io applies the \\?\ prefix when running on Windows.
+
+        Host-independent: patches ``is_windows`` to True and stubs
+        ``resolve_path_safely`` to yield a fully-qualified Windows path, so the
+        wiring of the unconditional prefix *through canonicalize_for_io* is
+        verified even on a non-Windows CI host (the Windows-only test below
+        skips there). Complements ``TestApplyWindowsLongPathPrefix``, which only
+        covers the helper in isolation.
+        """
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        monkeypatch.setattr(
+            "griptape_nodes.files.path_utils.resolve_path_safely",
+            lambda _path: Path(r"C:\Users\x\Temp\bundle\file.txt"),
+        )
+        result = canonicalize_for_io("ignored")
+        assert str(result) == r"\\?\C:\Users\x\Temp\bundle\file.txt"
 
     @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows long-path prefix")
     def test_adds_long_path_prefix_on_windows(self, tmp_path: Path) -> None:

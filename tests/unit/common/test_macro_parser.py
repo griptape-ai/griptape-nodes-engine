@@ -11,6 +11,7 @@ from griptape_nodes.common.macro_parser import (
     CamelCaseFormat,
     DateFormat,
     DotCaseFormat,
+    LeadingSeparatorFormat,
     LowerCaseFormat,
     MacroMatchFailure,
     MacroMatchFailureReason,
@@ -52,6 +53,18 @@ class TestFormatSpecs:
         fmt = SeparatorFormat(separator="_")
         assert fmt.reverse("workflow_") == "workflow"
         assert fmt.reverse("workflow") == "workflow"  # No separator to remove
+
+    def test_leading_separator_format_apply(self) -> None:
+        """LeadingSeparatorFormat.apply() prepends the prefix."""
+        fmt = LeadingSeparatorFormat(prefix="_v")
+        assert fmt.apply("001") == "_v001"
+        assert fmt.apply(5) == "_v5"
+
+    def test_leading_separator_format_reverse(self) -> None:
+        """LeadingSeparatorFormat.reverse() strips the prefix; idempotent when absent."""
+        fmt = LeadingSeparatorFormat(prefix="_v")
+        assert fmt.reverse("_v001") == "001"
+        assert fmt.reverse("001") == "001"  # No prefix to remove — mirrors SeparatorFormat.reverse
 
     def test_numeric_padding_format_apply_int(self) -> None:
         """Test NumericPaddingFormat.apply() with integer."""
@@ -911,7 +924,9 @@ class TestMacroFailureTypes:
         assert MacroParseFailureReason.EMPTY_VARIABLE == "EMPTY_VARIABLE"
         assert MacroParseFailureReason.UNEXPECTED_SEGMENT_TYPE == "UNEXPECTED_SEGMENT_TYPE"
         assert MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS == "MULTIPLE_SEQUENCE_SLOTS"
-        assert len(MacroParseFailureReason) == 6
+        assert MacroParseFailureReason.EMPTY_LEADING_SEPARATOR == "EMPTY_LEADING_SEPARATOR"
+        assert MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS == "MULTIPLE_LEADING_SEPARATORS"
+        assert len(MacroParseFailureReason) == 8
 
     def test_macro_resolution_failure_dataclass(self) -> None:
         """Test creating MacroResolutionFailure with all fields."""
@@ -1208,3 +1223,335 @@ class TestParseSequenceSlotShorthand:
         assert macro.resolve({SEQUENCE_VARIABLE_NAME: 1}, secrets_manager) == "v001.py"
         assert macro.resolve({SEQUENCE_VARIABLE_NAME: 42}, secrets_manager) == "v042.py"
         assert macro.resolve({SEQUENCE_VARIABLE_NAME: 1000}, secrets_manager) == "v1000.py"
+
+
+class TestLeadingSeparatorSyntax:
+    """Parser + resolve + reverse-match tests for `{var?:^prefix}` (issue #5023).
+
+    The leading separator is a `FormatSpec` (``LeadingSeparatorFormat``) marked
+    by a ``^`` at the start of its format-spec text. Prepends the prefix to the
+    variable's rendered value iff the variable emits; the optional-variable
+    omit path erases the whole segment (including this spec) with no work in
+    the resolver.
+
+    Enforces two position invariants at parse time so later specs can't mangle
+    the prefix: at most one per variable, and it must be the last spec.
+    """
+
+    # ----- Parser -----
+
+    def test_parse_leading_separator_basic(self) -> None:
+        """`{shot:^_v}` parses to a variable ending in `LeadingSeparatorFormat("_v")`."""
+        variable = parse_variable("shot:^_v")
+
+        assert variable.info.name == "shot"
+        assert variable.info.is_required is True
+        assert variable.format_specs == [LeadingSeparatorFormat(prefix="_v")]
+        assert variable.default_value is None
+
+    def test_parse_leading_separator_optional(self) -> None:
+        """`{shot?:^_v}` preserves the leading separator and marks optional."""
+        variable = parse_variable("shot?:^_v")
+
+        assert variable.info.name == "shot"
+        assert variable.info.is_required is False
+        assert variable.format_specs == [LeadingSeparatorFormat(prefix="_v")]
+
+    def test_parse_leading_separator_composes_with_sequence_shorthand(self) -> None:
+        """`{###?:^_v}` — sequence-slot shorthand carries a trailing leading-separator spec.
+
+        The parser now splits on ``:`` before running the shorthand regex so the
+        two grammars compose. `SequenceFormat` is first, `LeadingSeparatorFormat`
+        is last — the position invariant that lets ordering "just work".
+        """
+        variable = parse_variable("###?:^_v")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is False
+        assert variable.format_specs == [SequenceFormat(min_width=3), LeadingSeparatorFormat(prefix="_v")]
+
+    def test_parse_leading_separator_after_numeric_padding(self) -> None:
+        """`{shot:03:^_v}` composes numeric padding + leading separator."""
+        variable = parse_variable("shot:03:^_v")
+
+        assert variable.format_specs == [NumericPaddingFormat(width=3), LeadingSeparatorFormat(prefix="_v")]
+
+    def test_parse_leading_separator_after_trailing_separator(self) -> None:
+        """`{shot?:_:^v_}` — trailing separator first, leading separator last.
+
+        Trailing separator's "must be first" convention plus leading separator's
+        "must be last" invariant place them at opposite ends of `format_specs`,
+        which is exactly the mental model authors read from the syntax.
+        """
+        variable = parse_variable("shot?:_:^v_")
+
+        assert variable.info.is_required is False
+        assert variable.format_specs == [SeparatorFormat(separator="_"), LeadingSeparatorFormat(prefix="v_")]
+
+    def test_parse_leading_separator_after_case_transform(self) -> None:
+        """`{shot:upper:^V}` — case transform first, leading separator last."""
+        variable = parse_variable("shot:upper:^V")
+
+        assert isinstance(variable.format_specs[0], UpperCaseFormat)
+        assert variable.format_specs[1] == LeadingSeparatorFormat(prefix="V")
+
+    def test_parse_empty_leading_separator_raises(self) -> None:
+        """`{shot:^}` (just the caret, no payload) raises EMPTY_LEADING_SEPARATOR.
+
+        `error_position` is `None` — `parse_format_spec` receives a spec
+        string without template-relative offset context, so hardcoding `0`
+        would misreport the location. Regression guard against reintroducing
+        a bogus offset.
+        """
+        with pytest.raises(MacroSyntaxError) as exc_info:
+            parse_variable("shot:^")
+
+        assert exc_info.value.failure_reason == MacroParseFailureReason.EMPTY_LEADING_SEPARATOR
+        assert exc_info.value.error_position is None
+
+    def test_parse_multiple_leading_separators_raises(self) -> None:
+        """`{shot:^a:^b}` (two `^` specs) raises MULTIPLE_LEADING_SEPARATORS.
+
+        `error_position` is `None` — the normalizer runs after all format
+        specs are collected, so the template-relative offset of the second
+        `:^` isn't known at this depth. Better honest-unknown than a bogus `0`.
+        """
+        with pytest.raises(MacroSyntaxError) as exc_info:
+            parse_variable("shot:^a:^b")
+
+        assert exc_info.value.failure_reason == MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS
+        assert exc_info.value.error_position is None
+
+    def test_parse_leading_separator_normalized_to_end(self) -> None:
+        """`{shot:^_v:upper}` — leading separator written mid-list — parses with the leading spec at the tail.
+
+        Author-friendliness: a leading separator is semantically a prefix
+        applied to the final rendered value, so `{shot:^_v:upper}` and
+        `{shot:upper:^_v}` mean the same thing. The parser normalizes the
+        list order (moves the `LeadingSeparatorFormat` to the end) rather
+        than making the author remember the "must be last" invariant.
+        """
+        variable = parse_variable("shot:^_v:upper")
+
+        assert variable.format_specs == [UpperCaseFormat(), LeadingSeparatorFormat(prefix="_v")]
+
+    def test_parse_leading_separator_equivalent_regardless_of_position(self) -> None:
+        """`{shot:^_v:upper}` and `{shot:upper:^_v}` produce the same rendered output.
+
+        End-to-end confirmation of the normalization: no matter where the
+        author writes the `:^` spec, the resolved string is identical for
+        the same variable binding. Guards against a future edit that
+        forgets to move the leading separator to the tail before running
+        the resolver.
+        """
+        from unittest.mock import MagicMock
+
+        secrets_manager = MagicMock()
+
+        mid = ParsedMacro("{shot:^_v:upper}").resolve({"shot": "a"}, secrets_manager)
+        end = ParsedMacro("{shot:upper:^_v}").resolve({"shot": "a"}, secrets_manager)
+
+        assert mid == end == "_vA"
+
+    def test_parse_sequence_shorthand_with_trailing_optional_marker(self) -> None:
+        """`{###:upper?}` — trailing `?` on the last format spec — marks the sequence variable optional.
+
+        Before the fix, the sequence-shorthand branch skipped the trailing-`?`
+        handling that the regular-variable branch performed, so `{###:upper?}`
+        would produce a required variable with `SeparatorFormat("upper?")`
+        instead of an optional variable with `UpperCaseFormat`. This asserts
+        the two grammars agree on trailing-`?` semantics.
+        """
+        variable = parse_variable("###:upper?")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is False
+        assert len(variable.format_specs) == 2
+        assert isinstance(variable.format_specs[0], SequenceFormat)
+        assert variable.format_specs[0].min_width == 3
+        assert isinstance(variable.format_specs[1], UpperCaseFormat)
+
+    def test_parse_sequence_shorthand_trailing_and_pre_colon_optional_are_equivalent(self) -> None:
+        """`{###?:upper}` and `{###:upper?}` parse to the same ``ParsedVariable``.
+
+        Locks the grammatical symmetry between sequence-shorthand and
+        regular-variable trailing-`?` handling — Collin's finding on #5026.
+        """
+        pre_colon = parse_variable("###?:upper")
+        post_colon = parse_variable("###:upper?")
+
+        assert pre_colon.info == post_colon.info
+        assert pre_colon.format_specs == post_colon.format_specs
+        assert pre_colon.default_value == post_colon.default_value
+
+    def test_parse_sequence_shorthand_quoted_trailing_question_mark_is_literal(self) -> None:
+        """`{###:'foo?'}` — quoted `?` on sequence shorthand — stays required, `?` is literal.
+
+        Now that the sequence-shorthand branch calls the shared trailing-`?`
+        helper, it needs to respect the same quoted-preserves-literal rule
+        the regular-variable branch does. Guards against a future edit
+        that drops the quoted-check from the helper.
+        """
+        variable = parse_variable("###:'foo?'")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is True  # Quoted `?` doesn't trigger optionality
+        assert len(variable.format_specs) == 2
+        assert isinstance(variable.format_specs[0], SequenceFormat)
+        assert isinstance(variable.format_specs[1], SeparatorFormat)
+        assert variable.format_specs[1].separator == "foo?"
+
+    def test_parse_sequence_shorthand_leading_separator_with_trailing_optional(self) -> None:
+        """`{###:^_v?}` composes leading separator + trailing-`?` optional marker.
+
+        The `?` at the end of `^_v?` must strip cleanly (marking the variable
+        optional) and the surviving `^_v` must parse as
+        `LeadingSeparatorFormat("_v")`. Locks the composition of the two
+        grammar features on the sequence-shorthand branch.
+        """
+        variable = parse_variable("###:^_v?")
+
+        assert variable.info.name == SEQUENCE_VARIABLE_NAME
+        assert variable.info.is_required is False
+        assert variable.format_specs == [SequenceFormat(min_width=3), LeadingSeparatorFormat(prefix="_v")]
+
+    def test_parse_regular_variable_has_no_leading_separator(self) -> None:
+        """Regression check: no `^` spec present means `format_specs` has no `LeadingSeparatorFormat`."""
+        variable = parse_variable("shot")
+
+        assert not any(isinstance(spec, LeadingSeparatorFormat) for spec in variable.format_specs)
+
+    # ----- Resolve -----
+
+    def test_resolve_leading_separator_required_variable(self) -> None:
+        """`{shot:^_v}` with `shot=5` renders as `_v5`."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("{shot:^_v}")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"shot": 5}, secrets_manager) == "_v5"
+
+    def test_resolve_leading_separator_optional_bound(self) -> None:
+        """`{shot?:^_v}` with `shot="alpha"` renders as `_valpha`."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("a{shot?:^_v}b")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"shot": "alpha"}, secrets_manager) == "a_valphab"
+
+    def test_resolve_leading_separator_optional_unbound(self) -> None:
+        """`{shot?:^_v}` with no `shot` renders empty — the whole segment vanishes."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("a{shot?:^_v}b")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({}, secrets_manager) == "ab"
+
+    def test_resolve_leading_separator_with_sequence_shorthand_bound(self) -> None:
+        """`render{###?:^_v}.png` with `_index=1` renders as `render_v001.png`.
+
+        The demo case: exactly why this feature exists. `SequenceFormat.apply`
+        renders "001", then `LeadingSeparatorFormat.apply` prepends "_v".
+        """
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("render{###?:^_v}.png")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({SEQUENCE_VARIABLE_NAME: 1}, secrets_manager) == "render_v001.png"
+
+    def test_resolve_leading_separator_with_sequence_shorthand_unbound(self) -> None:
+        """`render{###?:^_v}.png` with `_index` unbound renders as `render.png` (segment omitted)."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("render{###?:^_v}.png")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({}, secrets_manager) == "render.png"
+
+    def test_resolve_leading_separator_after_numeric_padding(self) -> None:
+        """`{shot:03:^_v}` with `shot=5` renders as `_v005` — padding first, then prepend."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("{shot:03:^_v}")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"shot": 5}, secrets_manager) == "_v005"
+
+    def test_resolve_leading_and_trailing_separators_together(self) -> None:
+        """`{shot:_:^v_}` with `shot=5` renders as `v_5_` — prefix, value, suffix."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("a{shot:_:^v_}b")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"shot": 5}, secrets_manager) == "av_5_b"
+
+    def test_resolve_leading_separator_after_case_transform(self) -> None:
+        """`{shot:upper:^V}` with `shot="a"` renders as `VA` — upper first, then prepend."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("{shot:upper:^V}")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"shot": "a"}, secrets_manager) == "VA"
+
+    def test_resolve_leading_separator_prose_case_bound(self) -> None:
+        """Prose reminder that macros aren't just for filenames.
+
+        Template: `Hello, {name?}!{intro?:^ Nice to meet you.}` — the leading
+        separator renders " Nice to meet you." iff `intro` is bound.
+        """
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("Hello, {name?}!{intro?:^ Nice to meet you.}")
+        secrets_manager = MagicMock()
+
+        both = macro.resolve({"name": "Alice", "intro": "y"}, secrets_manager)
+        assert both == "Hello, Alice! Nice to meet you.y"
+
+    def test_resolve_leading_separator_prose_case_unbound(self) -> None:
+        """Same prose template, `intro` unbound — leading separator vanishes with the segment."""
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("Hello, {name?}!{intro?:^ Nice to meet you.}")
+        secrets_manager = MagicMock()
+
+        assert macro.resolve({"name": "Alice"}, secrets_manager) == "Hello, Alice!"
+
+    # ----- Reverse-match -----
+
+    def test_reverse_match_leading_separator_strips_prefix(self) -> None:
+        """`_v005` reverse-matched against `{shot:03:^_v}` recovers `shot=5`.
+
+        `reverse_format_specs` iterates in reverse order — LeadingSeparatorFormat
+        strips the `_v` first, then NumericPaddingFormat parses `005` as `5`.
+        """
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("v{shot:03:^_v}.py")
+        secrets_manager = MagicMock()
+
+        extracted = macro.extract_variables("v_v005.py", {}, secrets_manager)
+        assert extracted == {"shot": 5}
+
+    def test_reverse_match_leading_separator_absent_prefix_is_idempotent(self) -> None:
+        """A path missing the prefix still reverse-matches — same contract as SeparatorFormat.reverse.
+
+        `LeadingSeparatorFormat.reverse` is idempotent when the prefix isn't
+        present; the raw digits still parse as the padded value. This mirrors
+        the trailing side and keeps reverse-match forgiving of ambiguous
+        filenames (the caller decides whether to trust the extraction).
+        """
+        from unittest.mock import MagicMock
+
+        macro = ParsedMacro("v{shot:03:^_v}.py")
+        secrets_manager = MagicMock()
+
+        # Path has `005` directly, no `_v` prefix — LeadingSeparatorFormat.reverse
+        # returns the value unchanged; NumericPaddingFormat.reverse then parses it.
+        extracted = macro.extract_variables("v005.py", {}, secrets_manager)
+        assert extracted == {"shot": 5}
