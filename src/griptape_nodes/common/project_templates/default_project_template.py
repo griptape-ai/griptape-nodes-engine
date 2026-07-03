@@ -177,7 +177,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
-        # Versioned workflow save: every save bumps the padded `{_index:03}` slot, so
+        # Versioned workflow save: every save bumps the padded `{###}` slot, so
         # successive saves produce a sequence (foo_v001.py, foo_v002.py, ...). Selected
         # via SaveWorkflowRequest.create_versioned=True. The macro and CREATE_NEW policy
         # are user-customizable like any other situation.
@@ -185,7 +185,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         BuiltInSituation.CREATE_VERSIONED_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
             description="Save a new version of a workflow with a padded index suffix",
-            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
