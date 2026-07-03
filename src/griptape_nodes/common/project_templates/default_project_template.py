@@ -388,7 +388,6 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         # successive saves produce a sequence (foo_v001.py, foo_v002.py, ...). Selected
         # via SaveWorkflowRequest.create_versioned=True. The macro and CREATE_NEW policy
         # are user-customizable like any other situation.
-        # https://github.com/griptape-ai/griptape-nodes-engine/issues/4945
         BuiltInSituation.CREATE_VERSIONED_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
             description="Save a new version of a workflow with a padded index suffix",
