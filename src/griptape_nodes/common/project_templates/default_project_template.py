@@ -306,7 +306,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_FILE: SituationTemplate(
             name=BuiltInSituation.SAVE_FILE,
             description="Generic file save operation",
-            macro="{file_name_base}{###?}.{file_extension}",
+            macro="{file_name_base}{###?:^_}.{file_extension}",  # foo.txt, foo_001.txt, foo_002.txt, ...
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
