@@ -392,7 +392,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.CREATE_VERSIONED_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
             description="Save a new version of a workflow with a padded index suffix",
-            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}_v{_index:03}.{file_extension}",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}{###?:^_v}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
