@@ -249,6 +249,11 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             path_macro="{workflow_dir?:/}temp",
             description="Temporary scratch files; safe to delete between runs.",
         ),
+        "workflow_run_failures": DirectoryDefinition(
+            name="workflow_run_failures",
+            path_macro="{workflow_dir?:/}workflow_run_failures",
+            description="Failed workflow snapshots for post-mortem debugging. Saved workflows are suffixed with a padded index (foo_run_001.py, foo_run_002.py, ...).",
+        ),
         "griptape-nodes-previews": DirectoryDefinition(
             name="griptape-nodes-previews",
             path_macro="{workflow_dir?:/}.griptape-nodes-previews",
@@ -411,7 +416,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_FAILED_WORKFLOW: SituationTemplate(
             name=BuiltInSituation.SAVE_FAILED_WORKFLOW,
             description="Save a failed workflow snapshot for post-mortem debugging",
-            macro="{workspace_dir}/failures/{file_name_base}.{file_extension}",
+            macro="{workflow_run_failures}/{file_name_base}_run_{###}.{file_extension}",  # foo_run_001.py, foo_run_002.py, ...
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
