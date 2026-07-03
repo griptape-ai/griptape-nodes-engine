@@ -251,7 +251,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         ),
         "griptape-nodes-previews": DirectoryDefinition(
             name="griptape-nodes-previews",
-            path_macro=".griptape-nodes-previews",
+            path_macro="{workflow_dir?:/}.griptape-nodes-previews",
             description="Generated preview/thumbnail artifacts; mirrors source-file hierarchy.",
         ),
         "griptape-nodes-metadata": DirectoryDefinition(
