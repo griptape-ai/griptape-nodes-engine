@@ -97,7 +97,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         BuiltInSituation.SAVE_FILE: SituationTemplate(
             name=BuiltInSituation.SAVE_FILE,
             description="Generic file save operation",
-            macro="{file_name_base}{_index?:03}.{file_extension}",
+            macro="{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
@@ -107,7 +107,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         BuiltInSituation.COPY_EXTERNAL_FILE: SituationTemplate(
             name=BuiltInSituation.COPY_EXTERNAL_FILE,
             description="User copies external file to project",
-            macro="{inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}{_index?:03}.{file_extension}",
+            macro="{inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
@@ -127,7 +127,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         BuiltInSituation.SAVE_NODE_OUTPUT: SituationTemplate(
             name=BuiltInSituation.SAVE_NODE_OUTPUT,
             description="Node generates and saves output",
-            macro="{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03}.{file_extension}",
+            macro="{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
@@ -215,7 +215,7 @@ DEFAULT_PROJECT_TEMPLATE_V0 = ProjectTemplate(
         BuiltInSituation.SAVE_TEMP_FILE: SituationTemplate(
             name=BuiltInSituation.SAVE_TEMP_FILE,
             description="Save a temporary scratch file (e.g. intermediate processing artifacts)",
-            macro="{temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}",
+            macro="{temp}/{node_name?:_}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
@@ -304,7 +304,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_FILE: SituationTemplate(
             name=BuiltInSituation.SAVE_FILE,
             description="Generic file save operation",
-            macro="{file_name_base}{_index?:03}.{file_extension}",
+            macro="{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
@@ -314,7 +314,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.COPY_EXTERNAL_FILE: SituationTemplate(
             name=BuiltInSituation.COPY_EXTERNAL_FILE,
             description="User copies external file to project",
-            macro="{inputs}/{file_extension_directory?:/}{file_name_base}{_index?:03}.{file_extension}",
+            macro="{inputs}/{file_extension_directory?:/}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
@@ -422,7 +422,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.SAVE_TEMP_FILE: SituationTemplate(
             name=BuiltInSituation.SAVE_TEMP_FILE,
             description="Save a temporary scratch file (e.g. intermediate processing artifacts)",
-            macro="{temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}",
+            macro="{temp}/{node_name?:_}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
                 create_dirs=True,
