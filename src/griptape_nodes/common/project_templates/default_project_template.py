@@ -384,7 +384,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             ),
             fallback=BuiltInSituation.SAVE_FILE,
         ),
-        # Versioned workflow save: every save bumps the padded `{_index:03}` slot, so
+        # Versioned workflow save: every save bumps the padded `{###?:^_v}` slot, so
         # successive saves produce a sequence (foo_v001.py, foo_v002.py, ...). Selected
         # via SaveWorkflowRequest.create_versioned=True. The macro and CREATE_NEW policy
         # are user-customizable like any other situation.
