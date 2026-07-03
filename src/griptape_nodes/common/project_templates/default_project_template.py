@@ -316,7 +316,7 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
         BuiltInSituation.COPY_EXTERNAL_FILE: SituationTemplate(
             name=BuiltInSituation.COPY_EXTERNAL_FILE,
             description="User copies external file to project",
-            macro="{inputs}/{file_extension_directory?:/}{file_name_base}{###?}.{file_extension}",
+            macro="{inputs}/{file_extension_directory?:/}{file_name_base}{###?:^_}.{file_extension}",  # foo.txt, foo_001.txt, foo_002.txt, ...
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
