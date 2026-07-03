@@ -30,7 +30,7 @@ workspace
 
 **Workspace** is the root directory for all work in this project. It is configured in your settings.
 
-**Project template** is the configuration file that governs this project. It is loaded at startup — first the system defaults, then any overrides you've placed in `griptape-nodes-project.yml` inside your workspace. The project template is what lets you control where files land and how they're named.
+**Project template** is the configuration file that governs this project. It is loaded at startup — first the system defaults, then any [parent projects](projects.md#parent-projects) declared via `parent_project_path`, and finally the overrides in this project's `griptape-nodes-project.yml`. The project template is what lets you control where files land and how they're named.
 
 **Situations** are named scenarios for when a file is read or written. Each has a macro template that determines the file path and a policy that determines what happens when a file already exists.
 
@@ -42,8 +42,10 @@ workspace
 
 ## Pages in this section
 
+- [Managing Projects (GUI)](gui_guide.md) — create, view, edit, switch, and remove projects from the GUI
 - [Workspace](workspace.md) — the root working context and how relative paths resolve
 - [Projects](projects.md) — the project file format and the merge model
+- [Version Pinning](version_pinning.md) — pin a project to an engine version and to specific library versions
 - [Macros](macros.md) — template syntax reference for generating file paths
 - [Sequences](sequences.md) — image-sequence patterns and how missing frames are handled
 - [Directories](directories.md) — logical name-to-path mappings

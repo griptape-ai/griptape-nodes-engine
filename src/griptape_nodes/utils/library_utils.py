@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.retained_mode.managers.settings import LibraryRegistration
+from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
 from griptape_nodes.utils.file_utils import find_all_files_in_directory
 from griptape_nodes.utils.git_utils import (
     get_git_repository_root,
@@ -77,8 +77,8 @@ def clone_and_get_library_version(remote_url: str, ref: str = "HEAD") -> Library
     return LibraryVersionInfo(library_version=library_version, commit_sha=commit_sha, engine_version=engine_version)
 
 
-def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], set[str]]:
-    """Filter out old XDG library paths from a list of library paths.
+def filter_old_xdg_library_paths(library_paths: list[Any]) -> tuple[list[Any], set[str]]:
+    """Filter out old XDG library paths from a list of library entries.
 
     Removes library paths that were stored in the deprecated XDG data home location
     (~/.local/share/griptape_nodes/libraries/) for the following libraries:
@@ -86,8 +86,12 @@ def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], s
     - griptape_nodes_advanced_media_library
     - griptape_cloud
 
+    Entries may be bare path strings or object-form entries (dicts or LibraryRegistration
+    instances) carrying a `path`. The path is extracted for comparison while the original
+    entry is preserved in the filtered output.
+
     Args:
-        library_paths: List of library paths to filter.
+        library_paths: List of library entries to filter.
 
     Returns:
         Tuple of (filtered_list, set of removed library names).
@@ -111,8 +115,10 @@ def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], s
 
     for library in library_paths:
         is_old_path = False
-        # Normalize library path for cross-platform comparison
-        normalized_library = str(Path(library))
+        # Extract the path string from string or object-form entries, then normalize
+        # for cross-platform comparison.
+        library_path = extract_library_path(library)
+        normalized_library = str(Path(library_path)) if library_path else ""
 
         for lib_name, prefix in old_path_prefixes.items():
             if normalized_library.startswith(prefix):
@@ -166,6 +172,35 @@ def normalize_library_registrations(raw: list[Any]) -> list[LibraryRegistration]
         else:
             logger.warning(
                 "Skipping libraries_to_register entry of unexpected type %s: %r",
+                type(item).__name__,
+                item,
+            )
+    return entries
+
+
+def normalize_library_downloads(raw: list[Any]) -> list[LibraryDownload]:
+    """Normalize a libraries_to_download config list into LibraryDownload entries.
+
+    Bare strings become git-URL-only entries. Dict-shaped entries are validated
+    against the LibraryDownload schema. Already parsed LibraryDownload instances
+    pass through unchanged. Malformed entries are skipped with a warning so a
+    single bad entry cannot block startup.
+    """
+    entries: list[LibraryDownload] = []
+    for item in raw:
+        if isinstance(item, LibraryDownload):
+            entries.append(item)
+        elif isinstance(item, str):
+            if item:
+                entries.append(LibraryDownload(git_url=item))
+        elif isinstance(item, dict):
+            try:
+                entries.append(LibraryDownload.model_validate(item))
+            except ValidationError as err:
+                logger.warning("Skipping malformed libraries_to_download entry %r: %s", item, err)
+        else:
+            logger.warning(
+                "Skipping libraries_to_download entry of unexpected type %s: %r",
                 type(item).__name__,
                 item,
             )

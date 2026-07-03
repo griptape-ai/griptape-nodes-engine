@@ -10,6 +10,7 @@ import semver
 from pydantic import BaseModel, ValidationError
 
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.path_utils import decompose_source_path
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -79,6 +80,7 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers import (
+    AudioArtifactProvider,
     BaseArtifactPreviewGenerator,
     BaseArtifactProvider,
     BaseGeneratorParameters,
@@ -211,6 +213,28 @@ class ArtifactManager:
                 self.on_app_initialization_complete,
             )
 
+    def sniff_extension(self, data: bytes) -> str | None:
+        """Sniff a canonical on-disk extension for ``data`` from registered providers.
+
+        Iterates the registered providers in registration order and returns the
+        first non-None ``detect_format`` result. Providers own the format
+        knowledge for their media type; this method is a thin dispatcher used
+        by ``File`` to validate that bytes about to be written match the
+        destination's extension.
+
+        Args:
+            data: Raw file bytes (the head of the buffer is sufficient).
+
+        Returns:
+            Canonical lowercase extension WITHOUT a leading dot (e.g. ``"png"``,
+            ``"mp4"``, ``"mp3"``), or ``None`` if no provider recognized the bytes.
+        """
+        for provider_class in self._registry.get_all_provider_classes():
+            sniffed = provider_class.detect_format(data)
+            if sniffed is not None:
+                return sniffed
+        return None
+
     def prepare_content_for_write(self, data: bytes, file_name: str) -> bytes:
         """Process content before writing to disk by dispatching to the appropriate provider.
 
@@ -247,7 +271,7 @@ class ArtifactManager:
         # Register default providers (order matters: Image, Video, Audio)
         # Generator settings are now registered automatically via _register_provider_settings()
         failures = []
-        for provider_class in [ImageArtifactProvider, VideoArtifactProvider]:
+        for provider_class in [ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider]:
             request = RegisterArtifactProviderRequest(provider_class=provider_class)
             result = self.on_handle_register_artifact_provider_request(request)
             if isinstance(result, RegisterArtifactProviderResultFailure):
@@ -313,6 +337,13 @@ class ArtifactManager:
             return GeneratePreviewResultFailure(
                 result_details=f"Attempted to generate preview for '{source_path}'. "
                 f"Failed due to: provider '{request.artifact_provider_name}' not found"
+            )
+
+        # FAILURE CASE: Verify provider generates previews
+        if len(provider_class.get_preview_formats()) == 0:
+            return GeneratePreviewResultFailure(
+                result_details=f"Attempted to generate preview for '{source_path}'. "
+                f"Failed due to: provider '{request.artifact_provider_name}' does not generate previews"
             )
 
         # FAILURE CASE: Verify provider supports this file format
@@ -471,6 +502,13 @@ class ArtifactManager:
                 f"Failed due to: provider '{request.artifact_provider_name}' not found"
             )
 
+        # FAILURE CASE: Verify provider generates previews
+        if len(provider_class.get_preview_formats()) == 0:
+            return GeneratePreviewFromDefaultsResultFailure(
+                result_details=f"Attempted to generate preview using defaults. "
+                f"Failed due to: provider '{request.artifact_provider_name}' does not generate previews"
+            )
+
         # Read settings from config with validation
         try:
             settings = self._get_preview_settings_from_config(provider_class, request.artifact_provider_name)
@@ -541,6 +579,13 @@ class ArtifactManager:
         if provider_class is None:
             return GetPreviewForArtifactResultFailure(
                 result_details=f"Attempted to get preview for '{source_path}'. Failed due to: provider '{request.artifact_provider_name}' not found"
+            )
+
+        # FAILURE CASE: Verify provider generates previews
+        if len(provider_class.get_preview_formats()) == 0:
+            return GetPreviewForArtifactResultFailure(
+                result_details=f"Attempted to get preview for '{source_path}'. "
+                f"Failed due to: provider '{request.artifact_provider_name}' does not generate previews"
             )
 
         # FAILURE CASE: Calculate metadata path using same logic as preview path (metadata uses .json extension)
@@ -979,6 +1024,10 @@ class ArtifactManager:
         provider_schemas: dict[str, ProviderSchema] = {}
 
         for provider_class in self._registry.get_all_provider_classes():
+            # Providers that don't generate previews have no preview schema to publish.
+            if len(provider_class.get_preview_formats()) == 0:
+                continue
+
             provider_friendly_name = provider_class.get_friendly_name()
             provider_key = normalize_friendly_name_to_key(provider_friendly_name)
 
@@ -1042,7 +1091,13 @@ class ArtifactManager:
         Note:
             Default generators are registered WITHOUT instantiating the provider (lazy instantiation).
             Generator settings are registered statically using class methods.
+            Providers that don't generate previews (empty preview-formats set) skip
+            settings registration entirely.
         """
+        # Providers that don't generate previews have no preview settings to register.
+        if len(provider_class.get_preview_formats()) == 0:
+            return
+
         # Validate and write provider-level settings (format, generator name)
         self._validate_and_write_provider_settings(provider_class)
 
@@ -1427,11 +1482,11 @@ class ArtifactManager:
         decomposed = decompose_source_path(source_path_obj, workspace_dir)
 
         # Get save_griptape_nodes_preview situation template
-        get_situation_request = GetSituationRequest(situation_name="save_griptape_nodes_preview")
+        get_situation_request = GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW)
         get_situation_result = GriptapeNodes.handle_request(get_situation_request)
 
         if not isinstance(get_situation_result, GetSituationResultSuccess):
-            msg = "save_griptape_nodes_preview situation not found in project template"
+            msg = f"{BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW} situation not found in project template"
             raise RuntimeError(msg)  # noqa: TRY004
 
         # Build variables dict for macro resolution
@@ -1461,7 +1516,7 @@ class ArtifactManager:
         full_preview_path = path_result.absolute_path
         preview_file_metadata = SidecarContent(
             situation=SituationMetadata(
-                name="save_griptape_nodes_preview",
+                name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW,
                 macro=situation.macro,
                 policy=SituationPolicy(
                     on_collision=situation.policy.on_collision,

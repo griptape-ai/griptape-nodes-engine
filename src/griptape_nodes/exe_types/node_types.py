@@ -4,11 +4,15 @@ import logging
 import threading
 import warnings
 from abc import ABC
-from collections.abc import Callable, Generator, Iterable
+from collections.abc import Callable, Generator, Iterable, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from typing import TYPE_CHECKING, Any, NamedTuple, TypeVar
 
+from griptape_nodes.common.strict_mode import STRICT_MODE
+from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import (
     BaseNodeElement,
     ControlParameterInput,
@@ -24,6 +28,7 @@ from griptape_nodes.exe_types.core_types import (
     ParameterTypeBuiltin,
 )
 from griptape_nodes.exe_types.param_components.execution_status_component import ExecutionStatusComponent
+from griptape_nodes.exe_types.variable_resolver import VariableResolver
 from griptape_nodes.retained_mode.events.base_events import (
     ExecutionEvent,
     ExecutionGriptapeNodeEvent,
@@ -90,6 +95,67 @@ AsyncResult = Generator[Callable[[], T], T]
 LOCAL_EXECUTION = "Local Execution"
 PRIVATE_EXECUTION = "Private Execution"
 CONTROL_INPUT_PARAMETER = "Control Input Selection"
+
+
+# Per-task flag: when set, parameter mutations on a node are explicitly
+# sanctioned by a request handler (AddParameterToNodeRequest /
+# RemoveParameterFromNodeRequest) and the parameter-mutation-during-aprocess
+# detector should not fire. The handler-side path is the legitimate way to
+# mutate parameters because it propagates the change back to the orchestrator
+# via the request bus; direct add_parameter / remove_parameter_element calls
+# from inside aprocess do not, and that is what the rule catches.
+_sanctioned_mutation: ContextVar[bool] = ContextVar("_node_types_sanctioned_mutation", default=False)
+
+# Per-task flag: True only while ``await node.aprocess()`` is on the stack.
+# The detector uses this to distinguish actual aprocess execution from the
+# surrounding RUNTIME_EXECUTE scope, which also wraps input hydration.
+# Hydration-time set_parameter_value calls run before/after_value_set hooks,
+# and many real nodes (e.g. dynamic-pipeline diffuser nodes) legitimately
+# call add_parameter / remove_parameter_element from those hooks; keying off
+# the broader RUNTIME_EXECUTE scope would false-positive on every such node.
+_in_aprocess: ContextVar[bool] = ContextVar("_node_types_in_aprocess", default=False)
+
+
+@contextmanager
+def sanctioned_parameter_mutation() -> Iterator[None]:
+    """Mark the enclosed block as a request-driven parameter mutation.
+
+    Wraps add_parameter / remove_parameter_element calls inside
+    AddParameterToNodeRequest and RemoveParameterFromNodeRequest handlers
+    so the parameter-mutation-during-aprocess detector skips them.
+    """
+    token = _sanctioned_mutation.set(True)
+    try:
+        yield
+    finally:
+        _sanctioned_mutation.reset(token)
+
+
+@contextmanager
+def aprocess_scope(precomputed_variables: dict[str, str | int] | None = None) -> Iterator[None]:
+    """Mark the enclosed block as the actual aprocess() execution.
+
+    The framework wraps ``await node.aprocess()`` with this so the
+    parameter-mutation-during-aprocess detector fires only for mutations
+    that happen inside aprocess itself, not the surrounding hydration
+    pass that also runs under the RUNTIME_EXECUTE strict-mode scope.
+
+    Args:
+        precomputed_variables: Optional variable dict from the orchestrator.
+            When provided, the variable cache is pre-seeded so nodes resolve
+            {VAR} tokens without a NodeManager lookup. This is required for
+            worker-executed nodes (which have no registry access) and is a
+            performance shortcut for in-process nodes.
+    """
+    token = _in_aprocess.set(True)
+    # Pre-seed with orchestrator-resolved variables when provided; otherwise
+    # VariableResolver.get_variables_if_enabled() will populate lazily on first call.
+    cache_token = VariableResolver.seed_cache(precomputed_variables)
+    try:
+        yield
+    finally:
+        _in_aprocess.reset(token)
+        VariableResolver.reset_cache(cache_token)
 
 
 class ImportDependency(NamedTuple):
@@ -588,6 +654,7 @@ class BaseNode(ABC):
 
     def add_parameter(self, param: Parameter) -> None:
         """Adds a Parameter to the Node. Control and Data Parameters are all treated equally."""
+        self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="add_parameter")
         if any(char.isspace() for char in param.name):
             msg = f"Failed to add Parameter `{param.name}`. Parameter names cannot currently any whitespace characters. Please see https://github.com/griptape-ai/griptape-nodes/issues/714 to check the status on a remedy for this issue."
             raise ValueError(msg)
@@ -609,6 +676,7 @@ class BaseNode(ABC):
             self.remove_parameter_element(element)
 
     def remove_parameter_element(self, param: BaseNodeElement) -> None:
+        self._report_parameter_mutation_if_in_aprocess(parameter_name=param.name, mutation="remove_parameter_element")
         # Emit event before removal if it's a Parameter
         if isinstance(param, Parameter):
             self._emit_parameter_lifecycle_event(param)
@@ -948,8 +1016,17 @@ class BaseNode(ABC):
             if value is not None:
                 return value
         if param_name in self.parameter_values:
-            return self.parameter_values[param_name]
-        return param.default_value
+            value = self.parameter_values[param_name]
+        else:
+            value = param.default_value
+        if (
+            isinstance(value, str)
+            and VariableResolver.contains_variable_macro(value)
+            and _in_aprocess.get()
+            and not self._param_has_incoming_connection(param_name)
+        ):
+            value = self._resolve_variables_in_string(value)
+        return value
 
     def get_parameter_list_value(self, param: str) -> list:
         """Flattens the given param from self.params into a single list.
@@ -965,7 +1042,7 @@ class BaseNode(ABC):
             for item in items:
                 if isinstance(item, Iterable) and not isinstance(item, (str, bytes, dict)):
                     yield from _flatten(item)
-                elif item:
+                elif item is not None:
                     yield item
 
         raw = self.get_parameter_value(param) or []  # ← Fallback for None
@@ -1040,6 +1117,17 @@ class BaseNode(ABC):
     # if not implemented, it will return no issues.
     def validate_before_workflow_run(self) -> list[Exception] | None:
         """Runs before the entire workflow is run."""
+        if VariableResolver.is_substitution_enabled():
+            for param in self.parameters:
+                value = self.parameter_values.get(param.name, param.default_value)
+                if VariableResolver.contains_variable_macro(value):
+                    self.make_node_unresolved(
+                        current_states_to_trigger_change_event={
+                            NodeResolutionState.RESOLVED,
+                            NodeResolutionState.RESOLVING,
+                        }
+                    )
+                    break
         return None
 
     def validate_before_node_run(self) -> list[Exception] | None:
@@ -1079,7 +1167,7 @@ class BaseNode(ABC):
     def validate_empty_parameter(self, param: str, additional_msg: str = "") -> Exception | None:
         param_value = self.parameter_values.get(param, None)
         node_name = self.name
-        if not param_value or param_value.isspace():
+        if not isinstance(param_value, str) or not param_value.strip():
             msg = str(f"Parameter \"{param}\" was left blank for node '{node_name}'. {additional_msg}").strip()
             return ValueError(msg)
         return None
@@ -1345,6 +1433,96 @@ class BaseNode(ABC):
         # Use reorder_elements to apply the move
         self.reorder_elements(list(new_order))
 
+    def _param_has_incoming_connection(self, param_name: str) -> bool:
+        # GriptapeNodes import is lazy to avoid circular dependency between exe_types and retained_mode
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        connections = GriptapeNodes.FlowManager().get_connections()
+        node_connections = connections.incoming_index.get(self.name)
+        if node_connections is None:
+            return False
+        return param_name in node_connections
+
+    def _resolve_variables_in_value(self, value: Any) -> Any:
+        """Recursively substitute workflow variables in any str/dict/list value."""
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
+            return value
+        return VariableResolver.resolve_value(value, variables)
+
+    def _resolve_variables_in_string(self, text: str) -> str:
+        variables = VariableResolver.get_variables_if_enabled(self.name)
+        if variables is None:
+            return text
+        return VariableResolver.resolve_string(text, variables)
+
+    def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
+        """Return the UI display value for an output parameter.
+
+        For PROPERTY parameters whose stored template contains a variable macro
+        and the output differs from the template, returns the template so users
+        always see and can edit the {VAR} syntax rather than the resolved value.
+
+        Honors the per-workflow substitution toggle: when substitution is disabled
+        the template is never shown in place of the real output.
+        """
+        if not VariableResolver.is_substitution_enabled():
+            return output_value
+        parameter = self.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            return output_value
+        if ParameterMode.PROPERTY not in parameter.allowed_modes:
+            return output_value
+        raw_value = self.parameter_values.get(parameter_name, parameter.default_value)
+        if VariableResolver.contains_variable_macro(raw_value) and raw_value != output_value:
+            return raw_value
+        return output_value
+
+    def _report_parameter_mutation_if_in_aprocess(self, *, parameter_name: str, mutation: str) -> None:
+        """Report parameter-mutation-during-aprocess when a node mutates its own params directly.
+
+        Request handlers reach ``add_parameter`` / ``remove_parameter_element``
+        via ``AddParameterToNodeRequest`` / ``RemoveParameterFromNodeRequest``
+        and wrap the call in ``sanctioned_parameter_mutation()``. Any call
+        that arrives here from aprocess without that wrapper is a direct
+        mutation, which does not sync back to the orchestrator when the
+        node runs in a worker subprocess.
+
+        Detection keys off ``_in_aprocess`` (set by ``aprocess_scope()`` only
+        around ``await node.aprocess()``) rather than the broader
+        ``RUNTIME_EXECUTE`` strict-mode scope, because that scope also wraps
+        input hydration. Hydration runs ``set_parameter_value`` ->
+        ``before_value_set`` / ``after_value_set``, and dynamic-pipeline
+        nodes legitimately call ``add_parameter`` from those hooks; keying
+        off ``RUNTIME_EXECUTE`` would false-positive on every such node.
+
+        Nested node construction (a node's ``__init__`` declaring parameters
+        from inside another node's ``aprocess``) is handled by the
+        ``is_constructing_node()`` short-circuit: declarative ``__init__``
+        calls to ``add_parameter`` are not violations even when an outer
+        ``aprocess`` is on the stack.
+        """
+        # Lazy import: library_registry imports BaseNode from this module,
+        # so importing at module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        if _sanctioned_mutation.get():
+            return
+        if LibraryRegistry.is_constructing_node():
+            return
+        if not _in_aprocess.get():
+            return
+        rule = RULES["parameter-mutation-during-aprocess"]
+        STRICT_MODE.report(
+            rule_id=rule.rule_id,
+            message=rule.render(
+                node_name=self.name,
+                node_class=type(self).__name__,
+                parameter_name=parameter_name,
+                mutation=mutation,
+            ),
+        )
+
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
         from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
@@ -1507,11 +1685,22 @@ class TrackedParameterOutputValues(dict[str, Any]):
         self._node = node
 
     def __setitem__(self, key: str, value: Any) -> None:
+        had_key = key in self
         old_value = self.get(key)
+        # Substitute variables in dict/list output values so downstream nodes
+        # receive resolved values without the node needing to know about variables.
+        # String values are already substituted in get_parameter_value(); this
+        # handles structured types (JSON Input dicts, list outputs, etc.).
+        if _in_aprocess.get():
+            value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
-        # Only emit event if value actually changed
-        if old_value != value:
+        # Emit if the key is newly added, or if its value actually changed.
+        # `key in self` distinguishes an absent key from one already present as
+        # None -- self.get(key) returns None for both, so without the had_key
+        # check an unset -> None transition would be silently dropped and the UI
+        # would keep showing the stale prior value.
+        if not had_key or old_value != value:
             self._emit_parameter_change_event(key, value)
 
     def __delitem__(self, key: str) -> None:
@@ -1557,7 +1746,18 @@ class TrackedParameterOutputValues(dict[str, Any]):
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
-            event_data["value"] = value
+
+            # When a PROPERTY|OUTPUT parameter contains a variable template (e.g.
+            # "{SHOT}") and substitution ran during execution, the computed output
+            # value would overwrite the template in the UI. Show the raw typed
+            # value instead so users can always see and edit the template they
+            # typed. Only suppress when substitution actually changed the value
+            # (raw contains "{" and differs from the output); other PROPERTY|OUTPUT
+            # parameters like loop counters show their computed value normally.
+            display_value = value
+            if not deleted and _in_aprocess.get():
+                display_value = self._node.get_display_value_for_output(parameter_name, value)
+            event_data["value"] = display_value
 
             # Add modification metadata
             event_data["modification_type"] = "deleted" if deleted else "set"
@@ -1832,43 +2032,71 @@ class EndNode(BaseNode):
 
 
 class ErrorProxyNode(BaseNode):
-    """A proxy node that substitutes for nodes that failed to create due to missing dependencies or errors.
+    """A proxy node that substitutes for nodes that failed to create due to missing dependencies, policy denials, or errors.
 
     This node maintains the original node type information and allows workflows to continue loading
     even when some node types are unavailable. It generates parameters dynamically as connections
     and values are assigned to maintain workflow structure.
+
+    A node denied by an authorization policy is a recoverable restriction rather than a broken node,
+    so `denied_by_policy` substitutes a warning treatment for the hard-error one and explains the
+    cause as a permission gate instead of a load failure. The engine stays policy-agnostic: the
+    specific reason text arrives in `failure_reason` from whatever hook denied the node.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         name: str,
         original_node_type: str,
         original_library_name: str,
         failure_reason: str,
         metadata: dict[Any, Any] | None = None,
+        *,
+        denied_by_policy: bool = False,
     ) -> None:
         super().__init__(name, metadata)
 
         self.original_node_type = original_node_type
         self.original_library_name = original_library_name
         self.failure_reason = failure_reason
+        self.denied_by_policy = denied_by_policy
+
+        # The owning library/node type are normally injected into metadata by
+        # LibraryRegistry.create_node, but a proxy is created precisely because that
+        # path failed, so the keys may be absent. Record the original library and node
+        # type here (without clobbering anything a round-tripped workflow already
+        # carried) so serialization can resolve the library and the proxy round-trips.
+        self.metadata.setdefault("library", original_library_name)
+        self.metadata.setdefault("node_type", original_node_type)
         # Record ALL initial_setup=True requests in order for 1:1 replay
         self._recorded_initialization_requests: list[RequestPayload] = []
 
         # Track if user has made connection modifications after initial setup
         self._has_connection_modifications: bool = False
 
-        # Add error message parameter explaining the failure
+        # A policy denial is a recoverable "not yet permitted" state, not a broken
+        # node, so it surfaces as a warning rather than an error. Markdown lets the
+        # message emphasize that distinction; the editor renders both the variant and the markdown.
         self._error_message = ParameterMessage(
             name="error_proxy_message",
-            variant="error",
+            variant="warning" if denied_by_policy else "error",
             value="",  # Will be set by _update_error_message
+            markdown=denied_by_policy,
         )
         self.add_node_element(self._error_message)
         self._update_error_message()
 
     def _get_base_error_message(self) -> str:
         """Generate the base error message for this ErrorProxyNode."""
+        if self.denied_by_policy:
+            return (
+                f"**Permission denied**\n\n"
+                f"You don't have permission to use the **{self.original_node_type}** node from the "
+                f"**{self.original_library_name}** library, so this placeholder is holding its spot.\n\n"
+                f"{self.failure_reason}\n\n"
+                f"Your original node will be restored automatically once permission is granted. "
+                f"Contact your administrator if you need this capability enabled."
+            )
         return (
             f"This placeholder stands in for the '{self.original_node_type}' node "
             f"from the '{self.original_library_name}' library, which could not be loaded.\n\n"

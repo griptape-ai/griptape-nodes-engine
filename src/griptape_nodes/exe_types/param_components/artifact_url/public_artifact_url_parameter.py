@@ -5,10 +5,12 @@ from urllib.parse import urlparse
 from uuid import uuid4
 
 from griptape.artifacts.audio_url_artifact import AudioUrlArtifact
+from griptape.artifacts.error_artifact import ErrorArtifact
 from griptape.artifacts.image_url_artifact import ImageUrlArtifact
 from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+from griptape_nodes.common.parameter_hydration import hydrate_value
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -116,7 +118,19 @@ class PublicArtifactUrlParameter:
         )
 
     def get_public_url_for_parameter(self) -> str:
-        parameter_value = self._node.get_parameter_value(self._parameter.name)
+        # Parameter values that crossed a JSON boundary (orchestrator <-> worker, workflow load)
+        # arrive as serialized artifact dicts; rehydrate them back into artifacts first.
+        parameter_value = hydrate_value(self._node.get_parameter_value(self._parameter.name))
+
+        # An upstream failure propagates as an ErrorArtifact. Surface the original error
+        # instead of masking it with an AttributeError further down.
+        if isinstance(parameter_value, ErrorArtifact):
+            msg = (
+                f"Attempted to generate a public URL for parameter '{self._parameter.name}' on node "
+                f"'{self._node.name}'. Failed because the upstream value is an error: {parameter_value.value}"
+            )
+            raise RuntimeError(msg)  # noqa: TRY004 the upstream failure is a runtime error, not a type error.
+
         url = parameter_value.value if isinstance(parameter_value, UrlArtifact) else parameter_value
 
         # check if the URL is already public

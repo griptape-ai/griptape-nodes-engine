@@ -322,6 +322,114 @@ directories:
         # Check base directories are still there
         assert len(merged.directories) == len(default_template.directories) + 1
 
+    def test_merge_directory_description_overrides_base(self) -> None:
+        """Overlay description on an existing directory replaces the base description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    description: "Custom description for outputs."
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        # Description was overridden
+        assert merged.directories["outputs"].description == "Custom description for outputs."
+        # Path was inherited from base (overlay didn't set it)
+        assert merged.directories["outputs"].path_macro == default_template.directories["outputs"].path_macro
+
+    def test_merge_directory_description_inherited_when_omitted(self) -> None:
+        """Overlay that omits description preserves the base description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    path_macro: "renders"
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        # Path was overridden, description was inherited from base
+        assert merged.directories["outputs"].path_macro == "renders"
+        assert merged.directories["outputs"].description == default_template.directories["outputs"].description
+
+    def test_merge_directory_description_explicit_null_clears(self) -> None:
+        """Explicit null description in overlay clears an inherited description."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  outputs:
+    description: null
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        # Sanity-check: base has a description for outputs, otherwise this test
+        # would not actually exercise the clear path.
+        assert default_template.directories["outputs"].description is not None
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        assert merged.directories["outputs"].description is None
+        assert merged.directories["outputs"].path_macro == default_template.directories["outputs"].path_macro
+
+    def test_merge_new_directory_with_description(self) -> None:
+        """A new overlay directory carries its description through to the merged result."""
+        yaml_text = """
+project_template_schema_version: "0.1.0"
+name: "Custom Project"
+directories:
+  deliverables:
+    path_macro: "client_deliverables"
+    description: "Files staged for client delivery."
+"""
+        overlay_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(yaml_text, overlay_validation)
+        assert overlay is not None
+
+        default_template = _SYSTEM_DEFAULTS
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+
+        merged = ProjectTemplate.merge(
+            base=default_template,
+            overlay=overlay,
+            validation_info=validation,
+        )
+
+        assert merged.directories["deliverables"].path_macro == "client_deliverables"
+        assert merged.directories["deliverables"].description == "Files staged for client delivery."
+
     def test_merge_environment_variables(self) -> None:
         """Test merging environment variables."""
         yaml_text = """
@@ -815,6 +923,31 @@ class TestProjectTemplateToYaml:
         assert merged.situations["save_file"].policy.on_collision == base_sit.policy.on_collision
 
 
+class TestDefaultProjectTemplate:
+    """Tests for the content of the default project template."""
+
+    def test_save_temp_file_situation_exists(self) -> None:
+        assert "save_temp_file" in DEFAULT_PROJECT_TEMPLATE.situations
+
+    def test_save_temp_file_situation_uses_overwrite_policy(self) -> None:
+        from griptape_nodes.common.project_templates.situation import SituationFilePolicy
+
+        situation = DEFAULT_PROJECT_TEMPLATE.situations["save_temp_file"]
+        assert situation.policy.on_collision == SituationFilePolicy.OVERWRITE
+
+    def test_save_temp_file_situation_creates_dirs(self) -> None:
+        situation = DEFAULT_PROJECT_TEMPLATE.situations["save_temp_file"]
+        assert situation.policy.create_dirs is True
+
+    def test_save_temp_file_situation_falls_back_to_save_file(self) -> None:
+        situation = DEFAULT_PROJECT_TEMPLATE.situations["save_temp_file"]
+        assert situation.fallback == "save_file"
+
+    def test_save_temp_file_macro_uses_temp_directory(self) -> None:
+        situation = DEFAULT_PROJECT_TEMPLATE.situations["save_temp_file"]
+        assert situation.macro.startswith("{temp}/")
+
+
 class TestOverlayDeletions:
     """Overlay/merge symmetry for deletions: removed base items must stay removed on reload."""
 
@@ -895,3 +1028,343 @@ class TestOverlayDeletions:
             and o.action == ProjectOverrideAction.REMOVED
         ]
         assert len(removed) == 1
+
+
+class TestProjectIdAndParentId:
+    """Round-trip and merge behavior for the opaque `id` and id-based parent link.
+
+    `id` is identity: it is always emitted (never diffed away) and the child's
+    own id always wins on merge (never inherited). `parent_project_id` is the
+    portable parent link that supersedes the legacy, machine-specific
+    `parent_project_path` (engine#4806).
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_id_survives_overlay_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "my-guid"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.id == "my-guid"
+
+    def test_id_always_emitted_even_when_matching_base(self) -> None:
+        # id is identity, not a diff: it must be emitted whenever present, even if
+        # the (unusual) base carries the same id. The default base has id=None, so
+        # use a base that already declares the same id to exercise the "matches
+        # base" path.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "same-guid"})
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "same-guid"})
+
+        overlay_yaml = modified.to_overlay_yaml(base)
+
+        assert '"id":' in overlay_yaml
+        assert "same-guid" in overlay_yaml
+
+    def test_parent_project_id_survives_overlay_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "child-guid", "parent_project_id": "parent-guid"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.id == "child-guid"
+        assert merged.parent_project_id == "parent-guid"
+        # The id-based link must not also carry a legacy path.
+        assert merged.parent_project_path is None
+
+    def test_new_save_emits_parent_project_id_not_path(self) -> None:
+        # engine#4806: a child of a non-default parent emits the portable id, never
+        # the author's machine-specific path, so a coworker can open the shared file.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "child-guid", "parent_project_id": "parent-guid"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+        assert "parent_project_id" in overlay_yaml
+        assert "parent_project_path" not in overlay_yaml
+
+    def test_parent_project_id_wins_over_path_on_emit(self) -> None:
+        # parent_project_id and parent_project_path are mutually exclusive on emit:
+        # when both are set, only the id is written.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "id": "child-guid",
+                "parent_project_id": "parent-guid",
+                "parent_project_path": "/abs/parent/griptape-nodes-project.yml",
+            }
+        )
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+        assert "parent_project_id" in overlay_yaml
+        assert "parent_project_path" not in overlay_yaml
+
+    def test_clears_parent_project_id_tombstone(self) -> None:
+        # An explicit `parent_project_id: null` overlay tombstones an inherited
+        # id-based link. The loader records the clear; merge yields None (the link
+        # is never inherited from base regardless, but the tombstone is honored).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"parent_project_id": "parent-guid"})
+        yaml_text = """
+project_template_schema_version: "0.3.3"
+name: "Child"
+parent_project_id: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_parent_project_id is True
+        assert overlay_data.parent_project_id is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.parent_project_id is None
+
+    def test_legacy_parent_project_path_still_round_trips(self) -> None:
+        # Backwards compat: a legacy child with no id and a parent_project_path must
+        # still emit and re-parse the path (the id-based emit must not shadow it).
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={"parent_project_path": "/abs/parent/griptape-nodes-project.yml"}
+        )
+
+        merged = self._roundtrip(modified)
+
+        assert merged.parent_project_path == "/abs/parent/griptape-nodes-project.yml"
+        assert merged.parent_project_id is None
+
+    def test_to_yaml_includes_id(self) -> None:
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "my-guid"})
+
+        yaml_str = template.to_yaml()
+
+        assert '"id":' in yaml_str
+        assert "my-guid" in yaml_str
+
+    def test_to_yaml_omits_none_id(self) -> None:
+        # to_yaml uses exclude_none, so a template with no id (the default) must not
+        # emit an id key.
+        assert '"id":' not in DEFAULT_PROJECT_TEMPLATE.to_yaml()
+
+
+class TestWorkspaceDir:
+    """Round-trip, tombstone, and merge behavior for the per-project `workspace_dir` field.
+
+    `workspace_dir` declares the workspace a project uses. It is the highest-priority
+    workspace source at resolution time, but as a template field it has OWN-node merge
+    semantics (never inherited from base, mirroring the parent link) and the stored value
+    is the raw string/per-platform mapping (never absolutized) so a relative path stays
+    portable across machines.
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_string_workspace_dir_survives_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/abs/workspace"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.workspace_dir == "/abs/workspace"
+
+    def test_relative_workspace_dir_stored_verbatim(self) -> None:
+        # A relative value is persisted as-is (never absolutized): resolution to an
+        # absolute path happens only at resolve time, keeping the project portable.
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "./workspace"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        assert "workspace_dir" in overlay_yaml
+
+        merged = self._roundtrip(modified)
+        assert merged.workspace_dir == "./workspace"
+
+    def test_per_platform_workspace_dir_survives_round_trip(self) -> None:
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        per_platform = PerPlatformProjectPath(linux="/ws/linux", darwin="/ws/darwin", windows="C:\\ws", default="/ws")
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": per_platform})
+
+        merged = self._roundtrip(modified)
+
+        assert isinstance(merged.workspace_dir, PerPlatformProjectPath)
+        assert merged.workspace_dir.linux == "/ws/linux"
+        assert merged.workspace_dir.darwin == "/ws/darwin"
+        assert merged.workspace_dir.windows == "C:\\ws"
+        assert merged.workspace_dir.default == "/ws"
+
+    def test_unset_workspace_dir_not_emitted(self) -> None:
+        # The default has workspace_dir=None; an unset field must not be written.
+        assert "workspace_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_explicit_null_tombstones_inherited_workspace_dir(self) -> None:
+        # An explicit `workspace_dir: null` overlay clears an inherited value.
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/inherited/ws"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+workspace_dir: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_workspace_dir is True
+        assert overlay_data.workspace_dir is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.workspace_dir is None
+
+    def test_child_does_not_inherit_base_workspace_dir(self) -> None:
+        # OWN-node semantics: a child whose overlay omits workspace_dir does NOT
+        # adopt the base's value (cross-project inheritance is the resolution
+        # ladder's job, not merge's).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"workspace_dir": "/base/ws"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.workspace_dir is None
+        assert overlay_data.clears_workspace_dir is False
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.workspace_dir is None
+
+    def test_invalid_workspace_dir_type_records_error(self) -> None:
+        # A non-string, non-mapping workspace_dir is a structural error.
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Bad"
+workspace_dir: 42
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        load_partial_project_template(yaml_text, validation)
+
+        assert validation.status != ProjectValidationStatus.GOOD
+        assert any("workspace_dir" in problem.field_path for problem in validation.problems)
+
+
+class TestLibrariesDir:
+    """Round-trip, tombstone, and merge behavior for the per-project `libraries_dir` field.
+
+    `libraries_dir` declares where a project's libraries install/resolve, decoupled from
+    workspace_dir. Like workspace_dir it has OWN-node merge semantics (never inherited from
+    base; cross-project inheritance is the resolution ladder's job) and the stored value is
+    the raw string/per-platform mapping (never absolutized) so a relative path stays portable.
+    """
+
+    def _roundtrip(
+        self,
+        modified: ProjectTemplate,
+        base: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE,
+    ) -> ProjectTemplate:
+        overlay_yaml = modified.to_overlay_yaml(base)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(overlay_yaml, validation)
+        assert overlay_data is not None
+        assert validation.status == ProjectValidationStatus.GOOD
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+        assert validation.status == ProjectValidationStatus.GOOD
+        return merged
+
+    def test_string_libraries_dir_survives_round_trip(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/abs/libraries"})
+
+        merged = self._roundtrip(modified)
+
+        assert merged.libraries_dir == "/abs/libraries"
+
+    def test_relative_libraries_dir_stored_verbatim(self) -> None:
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "./libraries"})
+
+        overlay_yaml = modified.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        assert "libraries_dir" in overlay_yaml
+
+        merged = self._roundtrip(modified)
+        assert merged.libraries_dir == "./libraries"
+
+    def test_per_platform_libraries_dir_survives_round_trip(self) -> None:
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        per_platform = PerPlatformProjectPath(
+            linux="/lib/linux", darwin="/lib/darwin", windows="C:\\lib", default="/lib"
+        )
+        modified = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": per_platform})
+
+        merged = self._roundtrip(modified)
+
+        assert isinstance(merged.libraries_dir, PerPlatformProjectPath)
+        assert merged.libraries_dir.linux == "/lib/linux"
+        assert merged.libraries_dir.default == "/lib"
+
+    def test_unset_libraries_dir_not_emitted(self) -> None:
+        assert "libraries_dir" not in DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+
+    def test_explicit_null_tombstones_inherited_libraries_dir(self) -> None:
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/inherited/lib"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+libraries_dir: null
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.clears_libraries_dir is True
+        assert overlay_data.libraries_dir is None
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.libraries_dir is None
+
+    def test_child_does_not_inherit_base_libraries_dir(self) -> None:
+        # OWN-node semantics: a child whose overlay omits libraries_dir does NOT adopt the
+        # base's value (cross-project inheritance is the resolution ladder's job, not merge's).
+        base = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"libraries_dir": "/base/lib"})
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Child"
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay_data = load_partial_project_template(yaml_text, validation)
+        assert overlay_data is not None
+        assert overlay_data.libraries_dir is None
+        assert overlay_data.clears_libraries_dir is False
+
+        merged = ProjectTemplate.merge(base=base, overlay=overlay_data, validation_info=validation)
+
+        assert merged.libraries_dir is None
+
+    def test_invalid_libraries_dir_type_records_error(self) -> None:
+        yaml_text = """
+project_template_schema_version: "0.4.1"
+name: "Bad"
+libraries_dir: 42
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        load_partial_project_template(yaml_text, validation)
+
+        assert validation.status != ProjectValidationStatus.GOOD
+        assert any("libraries_dir" in problem.field_path for problem in validation.problems)

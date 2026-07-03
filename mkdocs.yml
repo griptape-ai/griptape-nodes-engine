@@ -27,6 +27,7 @@ plugins:
           - installation.md: Install the engine
         Configuration and CLI:
           - configuration.md: Engine configuration (workspace, secrets, libraries)
+          - libraries.md: Installing and managing node libraries
           - command_line_interface.md: gtn CLI reference
         Scripting (retained mode):
           - retained_mode.md: Engine scripting API for building and running workflows
@@ -34,6 +35,7 @@ plugins:
           - projects/index.md: Project system overview
           - projects/workspace.md: Workspace concepts
           - projects/projects.md: Projects
+          - projects/version_pinning.md: Pinning engine and library versions
           - projects/macros.md: Macros
           - projects/directories.md: Directories
           - projects/situations.md: Situations
@@ -44,6 +46,8 @@ plugins:
           - developing_nodes/index.md: Developing custom nodes overview
           - developing_nodes/getting_started.md: Beginner-friendly intro to node development
           - developing_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - developing_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - developing_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
           - how_to/making_custom_nodes.md: Quick start template for building a custom node
           - how_to/making_custom_scripts.md: Build custom node execution scripts
         Beginner tutorial (FTUE):
@@ -74,6 +78,8 @@ plugins:
           - how_to/mcp/servers/fetch.md
           - how_to/mcp/servers/filesystem.md
           - how_to/mcp/servers/time.md
+        Enterprise:
+          - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -93,7 +99,7 @@ extra:
     - icon: fontawesome/brands/discord
       link: https://discord.gg/gnWRz88eym
     - icon: fontawesome/brands/github
-      link: https://github.com/griptape-ai/griptape-nodes
+      link: https://github.com/griptape-ai/griptape-nodes-engine
 
 theme:
   name: material
@@ -148,12 +154,16 @@ nav:
               - 4. Compare Prompts: ftue/03_compare_prompts/FTUE_03_compare_prompts.md
               - 5. Build a Photography Team: ftue/04_photography_team/FTUE_04_photography_team.md
       - Engine Configuration: configuration.md
+      - Configuration Reference: configuration_reference.md
+      - Libraries: libraries.md
       - Command Line Interface: command_line_interface.md
       - Scripting: retained_mode.md
       - Project System:
           - Overview: projects/index.md
+          - Managing Projects (GUI): projects/gui_guide.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
+          - Version Pinning: projects/version_pinning.md
           - Macros: projects/macros.md
           - Directories: projects/directories.md
           - Situations: projects/situations.md
@@ -190,6 +200,8 @@ nav:
                   - Fetch: how_to/mcp/servers/fetch.md
                   - Filesystem: how_to/mcp/servers/filesystem.md
                   - Time: how_to/mcp/servers/time.md
+  - Enterprise:
+      - Admin Server: enterprise/admin_server.md
   - FAQ: faq.md
   - Nodes Reference:
       - Overview: nodes/overview.md
@@ -346,5 +358,7 @@ nav:
       - Overview: developing_nodes/index.md
       - Getting Started: developing_nodes/getting_started.md
       - Comprehensive Guide: developing_nodes/comprehensive_guide.md
+      - Node Isolation with Workers: developing_nodes/node_isolation_with_workers.md
+      - Strict Mode Reference: developing_nodes/strict_mode.md
       - Example Control Node: developing_nodes/example_control_node.py
   - Glossary: glossary.md

@@ -3,37 +3,44 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Self
 
-from pydantic import BaseModel, Field, ValidationError, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import YAMLLineInfo
     from griptape_nodes.common.project_templates.validation import ProjectValidationInfo
 
 
-class PerPlatformPathMacro(BaseModel):
-    """Per-platform path macro mapping for directory definitions.
+class PerPlatformPathBase(BaseModel):
+    """Shared base for per-platform string mappings (path macros and project paths).
 
     At least one of `linux`, `darwin`, `windows`, or `default` must be set.
-    `default` is consulted when the active platform's key is absent. Field
-    names mirror the `Platform` StrEnum values used elsewhere in the engine.
+    `default` is consulted when the active platform's key is absent. Unknown
+    keys are rejected so a typo like `osx:` surfaces as a validation error
+    instead of silently falling through to `default`.
+
+    Subclasses exist purely to give callers distinct types for two different
+    semantic uses (a directory path macro vs. a project YAML path); they share
+    every field, validator, and the `select()` body.
     """
 
-    linux: str | None = Field(default=None, description="Path macro used on Linux")
-    darwin: str | None = Field(default=None, description="Path macro used on macOS")
-    windows: str | None = Field(default=None, description="Path macro used on Windows")
-    default: str | None = Field(default=None, description="Fallback path macro when the active platform's key is unset")
+    model_config = ConfigDict(extra="forbid")
+
+    linux: str | None = Field(default=None, description="Value used on Linux")
+    darwin: str | None = Field(default=None, description="Value used on macOS")
+    windows: str | None = Field(default=None, description="Value used on Windows")
+    default: str | None = Field(default=None, description="Fallback when the active platform's key is unset")
 
     @model_validator(mode="after")
-    def _at_least_one_key(self) -> PerPlatformPathMacro:
+    def _at_least_one_key(self) -> Self:
         if self.linux is None and self.darwin is None and self.windows is None and self.default is None:
-            msg = "PerPlatformPathMacro requires at least one of 'linux', 'darwin', 'windows', or 'default'"
+            msg = f"{type(self).__name__} requires at least one of 'linux', 'darwin', 'windows', or 'default'"
             raise ValueError(msg)
         return self
 
     def select(self) -> str | None:
-        """Return the path macro for the active platform, falling back to `default`."""
+        """Return the value for the active platform, falling back to `default`."""
         active = _active_platform_key()
         if active == "linux" and self.linux is not None:
             return self.linux
@@ -44,8 +51,12 @@ class PerPlatformPathMacro(BaseModel):
         return self.default
 
 
+class PerPlatformPathMacro(PerPlatformPathBase):
+    """Per-platform path macro mapping for directory definitions."""
+
+
 def _active_platform_key() -> str:
-    """Map sys.platform to one of the PerPlatformPathMacro keys."""
+    """Map sys.platform to one of the per-platform mapping keys."""
     if sys.platform.startswith("win"):
         return "windows"
     if sys.platform.startswith("darwin"):
@@ -62,6 +73,10 @@ class DirectoryDefinition(BaseModel):
     path_macro: str | PerPlatformPathMacro = Field(
         description="Path string (may contain macros/env vars), or a per-platform mapping"
     )
+    description: str | None = Field(
+        default=None,
+        description="Human-readable explanation of what this directory is for and how it's used.",
+    )
 
     @staticmethod
     def merge(
@@ -76,6 +91,8 @@ class DirectoryDefinition(BaseModel):
         Field-level merge behavior:
         - path_macro: Use overlay if present, else base. Atomic — when overlay supplies the
           per-platform mapping form, it fully replaces the base value (no per-key deep merge).
+        - description: Use overlay if the key is present (explicit null clears the inherited
+          value), else inherit base.
 
         Args:
             base: Complete base directory
@@ -88,11 +105,18 @@ class DirectoryDefinition(BaseModel):
             New merged DirectoryDefinition
         """
         # Start with base fields
-        merged_data: dict[str, Any] = {"name": base.name, "path_macro": base.path_macro}
+        merged_data: dict[str, Any] = {
+            "name": base.name,
+            "path_macro": base.path_macro,
+            "description": base.description,
+        }
 
         # Apply overlay if present
         if "path_macro" in overlay_data:
             merged_data["path_macro"] = overlay_data["path_macro"]
+
+        if "description" in overlay_data:
+            merged_data["description"] = overlay_data["description"]
 
         try:
             return DirectoryDefinition.model_validate(merged_data)

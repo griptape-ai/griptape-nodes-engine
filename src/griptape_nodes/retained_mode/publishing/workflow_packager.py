@@ -132,6 +132,13 @@ class WorkflowPackager:
 
     # -- Library bundling --
 
+    def _resolve_all_library_deps(
+        self,
+        initial: list[LibraryNameAndVersion],
+    ) -> list[LibraryNameAndVersion]:
+        """Expand the initial library set to include all transitive library_dependencies."""
+        return GriptapeNodes.LibraryManager().resolve_transitive_library_deps(initial)
+
     def copy_libraries(
         self,
         node_libraries: list[LibraryNameAndVersion],
@@ -340,7 +347,7 @@ class WorkflowPackager:
             f"griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@{engine_version}",
         ]
 
-        for library_ref in workflow.metadata.node_libraries_referenced:
+        for library_ref in self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced):
             library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
             if library_data.metadata and library_data.metadata.dependencies:
                 pip_deps = library_data.metadata.dependencies.pip_dependencies
@@ -354,7 +361,7 @@ class WorkflowPackager:
     def collect_pip_install_flags(self, workflow: Workflow) -> list[str]:
         """Collect all unique pip install flags from the workflow's referenced libraries."""
         flags: list[str] = []
-        for library_ref in workflow.metadata.node_libraries_referenced:
+        for library_ref in self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced):
             library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
             if library_data.metadata and library_data.metadata.dependencies:
                 install_flags = library_data.metadata.dependencies.pip_install_flags
@@ -623,10 +630,11 @@ dependencies = [
         full_path = WorkflowRegistry.get_complete_file_path(workflow_file_path)
         self.copy_file(full_path, destination / Path(full_path).name)
 
-        # Copy libraries
+        # Copy libraries (including transitive library dependencies)
         self.emit_progress(15.0, "Copying libraries...")
+        all_libraries = self._resolve_all_library_deps(workflow.metadata.node_libraries_referenced)
         library_paths = self.copy_libraries(
-            node_libraries=workflow.metadata.node_libraries_referenced,
+            node_libraries=all_libraries,
             destination_path=destination / "libraries",
             workflow=workflow,
         )

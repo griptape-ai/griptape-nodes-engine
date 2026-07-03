@@ -1,16 +1,27 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import logging
 import pickle
 from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Any, NamedTuple, cast
 from uuid import uuid4
 
 from griptape_nodes.common.parameter_hydration import hydrate_parameter_values
+from griptape_nodes.common.strict_mode import (
+    STRICT_MODE,
+    StrictModeScopeKind,
+    StrictModeSeverity,
+)
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
+    from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
@@ -39,6 +50,17 @@ from griptape_nodes.exe_types.node_types import (
     NodeDependencies,
     NodeResolutionState,
     TransformedParameterValue,
+    aprocess_scope,
+    sanctioned_parameter_mutation,
+)
+from griptape_nodes.node_library.library_declarations import (
+    ArbitraryPythonExecutionNodeProperty,
+    LifecycleStageLibraryProperty,
+    LifecycleStageNodeProperty,
+    ModelProviderUsageNodeProperty,
+    ModelUsageNodeProperty,
+    find_model_catalog,
+    resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.retained_mode.events.base_events import (
@@ -59,7 +81,7 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeResultSuccess,
     OutgoingConnection,
 )
-from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+from griptape_nodes.retained_mode.events.event_converter import converter, safe_unstructure
 from griptape_nodes.retained_mode.events.execution_events import (
     CancelExecuteNodeRequest,
     CancelExecuteNodeResultSuccess,
@@ -148,6 +170,9 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetNodeMetadataRequest,
     SetNodeMetadataResultFailure,
     SetNodeMetadataResultSuccess,
+    UnresolveNodeRequest,
+    UnresolveNodeResultFailure,
+    UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import (
     RenameObjectRequest,
@@ -204,6 +229,13 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointDenial,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -260,6 +292,16 @@ class SerializedGroupResult:
         SerializedNodeCommands.NodeUUID, list[SerializedNodeCommands.IndirectSetParameterValueCommand]
     ]
     child_uuids: list[SerializedNodeCommands.NodeUUID]
+
+
+class _NodeInstantiationDeniedError(Exception):
+    """Raised inside node creation when the license policy denies the node type.
+
+    Caught by the same handler path that substitutes an Error Proxy for a node
+    whose library failed to load, so a denied node surfaces identically: a proxy
+    carrying the missing-permission detail, or a failure result when the caller
+    opted out of proxy substitution.
+    """
 
 
 class NodeManager:
@@ -358,6 +400,7 @@ class NodeManager:
             CanResetNodeToDefaultsRequest, self.on_can_reset_node_to_defaults_request
         )
         event_manager.assign_manager_to_request_type(ResetNodeToDefaultsRequest, self.on_reset_node_to_defaults_request)
+        event_manager.assign_manager_to_request_type(UnresolveNodeRequest, self.on_unresolve_node_request)
         event_manager.assign_manager_to_request_type(
             BatchSetNodeLockStateRequest, self.on_batch_set_lock_node_state_request
         )
@@ -437,6 +480,198 @@ class NodeManager:
         for node_name in node_names:
             self._cleanup_node_on_failed_deserialization(node_name)
 
+    @staticmethod
+    def _node_checkpoint_attributes(
+        *,
+        node_type: str,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
+    ) -> dict[str, Any]:
+        """Resolve the facts a hook may gate node instantiation on.
+
+        `id` is the node type (so a policy can match a specific node type).
+        `lifecycle_stage` is the node's effective stage: its own override when
+        declared, else the library stage it inherits, omitted when neither states
+        one. `executes_arbitrary_code` is the node's declared flag (absent means
+        False). `model_ids` / `provider_ids` / `model_families` are the catalog
+        handles a node binds to (see `_node_model_checkpoint_facts`), present only
+        when the node declares model usage. The engine supplies what it resolved; a
+        policy reads what it wants.
+
+        Takes declaration lists rather than a registered `Library` so the identical
+        gate runs from a loaded library (node instantiation) and from a library
+        schema (library-load fitness preview), before any module is imported.
+        """
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: node_type}
+        node_stage = next(
+            (
+                declaration.stage
+                for declaration in node_declarations
+                if isinstance(declaration, LifecycleStageNodeProperty)
+            ),
+            None,
+        )
+        if node_stage is not None:
+            attributes[CheckpointAttribute.LIFECYCLE_STAGE] = node_stage.value
+        else:
+            library_stage = next(
+                (
+                    declaration.stage
+                    for declaration in library_declarations
+                    if isinstance(declaration, LifecycleStageLibraryProperty)
+                ),
+                None,
+            )
+            if library_stage is not None:
+                attributes[CheckpointAttribute.LIFECYCLE_STAGE] = library_stage.value
+        arbitrary = next(
+            (
+                declaration
+                for declaration in node_declarations
+                if isinstance(declaration, ArbitraryPythonExecutionNodeProperty)
+            ),
+            None,
+        )
+        attributes[CheckpointAttribute.EXECUTES_ARBITRARY_CODE] = (
+            bool(arbitrary.executes_arbitrary_python) if arbitrary else False
+        )
+        attributes.update(
+            NodeManager._node_model_checkpoint_facts(
+                node_declarations=node_declarations, library_declarations=library_declarations
+            )
+        )
+        return attributes
+
+    @staticmethod
+    def _node_model_checkpoint_facts(
+        *,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
+    ) -> dict[str, Any]:
+        """The model facts a node binds to, resolved against the library's model catalog.
+
+        A node declares its models via `model_usage` (specific catalog ids) or
+        `model_provider_usage` (whole providers). Resolving those against the
+        library's `model_catalog` yields the concrete provider/model/family handles
+        a policy gates on, so a provider/family/model-specific node is denied by the
+        same `InstantiateNode` checkpoint that gates lifecycle and arbitrary code
+        (and its reasons join the same denial). Returns `model_ids`, `provider_ids`,
+        and `model_families`, each omitted when empty. A node that declares no model
+        usage contributes nothing, so non-model nodes skip catalog resolution.
+        """
+        declared_provider_ids = [
+            provider_id
+            for declaration in node_declarations
+            if isinstance(declaration, ModelProviderUsageNodeProperty)
+            for provider_id in declaration.provider_ids
+        ]
+        declared_model_ids = [
+            model_id
+            for declaration in node_declarations
+            if isinstance(declaration, ModelUsageNodeProperty)
+            for model_id in declaration.model_ids
+        ]
+        if not declared_provider_ids and not declared_model_ids:
+            return {}
+
+        # Directly declared handles match a policy even when the catalog is absent
+        # or a provider declares no concrete models. The catalog enriches them with
+        # the provider a `model_usage` id belongs to and each model's family.
+        model_ids = list(declared_model_ids)
+        provider_ids = list(declared_provider_ids)
+        families: list[str] = []
+        catalog = find_model_catalog(library_declarations)
+        if catalog is not None:
+            for resolved in resolve_node_models(catalog, node_declarations):
+                model_ids.append(resolved.model_id)
+                provider_ids.append(resolved.provider_id)
+                if resolved.model.family:
+                    families.append(resolved.model.family)
+
+        facts: dict[str, Any] = {}
+        if model_ids:
+            facts[CheckpointAttribute.MODEL_IDS] = list(dict.fromkeys(model_ids))
+        if provider_ids:
+            facts[CheckpointAttribute.PROVIDER_IDS] = list(dict.fromkeys(provider_ids))
+        if families:
+            facts[CheckpointAttribute.MODEL_FAMILIES] = list(dict.fromkeys(families))
+        return facts
+
+    @staticmethod
+    def _evaluate_node_instantiation_checkpoint(
+        *,
+        node_type: str,
+        node_declarations: Sequence[NodeDeclaration],
+        library_declarations: Sequence[LibraryDeclaration],
+    ) -> CheckpointDenial | None:
+        """Ask any registered authorization hook whether this node type may be instantiated.
+
+        Single source for the `InstantiateNode` checkpoint, shared by the
+        instantiation path (CreateNode) and the library-load fitness preview so both
+        resolve the same action and facts from whatever declarations they hold.
+        """
+        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.INSTANTIATE_NODE,
+                subject_type=CheckpointSubjectType.NODE_TYPE,
+                subject_id=node_type,
+                attributes=NodeManager._node_checkpoint_attributes(
+                    node_type=node_type,
+                    node_declarations=node_declarations,
+                    library_declarations=library_declarations,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _evaluate_instantiation_checkpoint(
+        *, node_type: str, specific_library_name: str | None
+    ) -> CheckpointDenial | None:
+        """Ask any registered authorization hook whether this node type may be instantiated."""
+        library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
+        return NodeManager._evaluate_node_instantiation_checkpoint(
+            node_type=node_type,
+            node_declarations=library.get_node_metadata(node_type).declarations,
+            library_declarations=library.get_metadata().declarations,
+        )
+
+    @staticmethod
+    def _enforce_instantiation_checkpoint(*, node_type: str, specific_library_name: str | None) -> None:
+        """Raise `_NodeInstantiationDeniedError` when the policy denies this node type.
+
+        Raised rather than returned so a denial joins the Error Proxy substitution
+        path in `on_create_node_request`, identical to a node whose library failed
+        to load. The message lists every missing permission.
+        """
+        denial = NodeManager._evaluate_instantiation_checkpoint(
+            node_type=node_type, specific_library_name=specific_library_name
+        )
+        if denial is not None:
+            message = denial.reason(separator="\n")
+            raise _NodeInstantiationDeniedError(message)
+
+    @staticmethod
+    def evaluate_schema_node_instantiation_denials(schema: LibrarySchema) -> dict[str, CheckpointDenial]:
+        """Denials that would block instantiating each node type a library schema declares.
+
+        Lets library-load fitness preview the node-instantiation gate without
+        importing the library's modules: a denied node type becomes a library
+        problem now and, when later instantiated, an Error Proxy. Returns one entry
+        per denied node type (class name -> denial); permitted node types are
+        omitted. With no authorization hook installed every node is permitted, so
+        the result is empty.
+        """
+        denials: dict[str, CheckpointDenial] = {}
+        for node in schema.nodes:
+            denial = NodeManager._evaluate_node_instantiation_checkpoint(
+                node_type=node.class_name,
+                node_declarations=node.metadata.declarations,
+                library_declarations=schema.metadata.declarations,
+            )
+            if denial is not None:
+                denials[node.class_name] = denial
+        return denials
+
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
         parent_flow_name = request.override_parent_flow_name
@@ -487,6 +722,15 @@ class NodeManager:
         # OK, let's try and create the Node.
         node = None
         try:
+            # License-policy checkpoint: gate instantiating this node type on its
+            # effective lifecycle stage and arbitrary-code flag. A denial raises
+            # (from inside the helper) so it flows into the Error Proxy
+            # substitution below -- the same surface a node whose library failed
+            # to load uses -- and the proxy carries every missing permission.
+            self._enforce_instantiation_checkpoint(
+                node_type=request.node_type,
+                specific_library_name=request.specific_library_name,
+            )
             node = LibraryRegistry.create_node(
                 name=final_node_name,
                 node_type=request.node_type,
@@ -501,17 +745,24 @@ class NodeManager:
             # Check if we should create an Error Proxy node instead of failing
             if request.create_error_proxy_on_failure:
                 try:
-                    # Use fitness problem details if available for a more actionable error message
-                    library_metadata_result = GriptapeNodes.handle_request(
-                        GetLibraryMetadataRequest(library=request.specific_library_name or "")
-                    )
-                    if (
-                        isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
-                        and library_metadata_result.problems is not None
-                    ):
-                        failure_reason = library_metadata_result.problems
-                    else:
+                    # A policy denial is a recoverable restriction rather than a broken
+                    # node, so the proxy carries the denial reason and renders as a warning
+                    # instead of surfacing library-load diagnostics as a hard error.
+                    denied_by_policy = isinstance(err, _NodeInstantiationDeniedError)
+                    if denied_by_policy:
                         failure_reason = str(err)
+                    else:
+                        # Use fitness problem details if available for a more actionable error message
+                        library_metadata_result = GriptapeNodes.handle_request(
+                            GetLibraryMetadataRequest(library=request.specific_library_name or "")
+                        )
+                        if (
+                            isinstance(library_metadata_result, GetLibraryMetadataResultFailure)
+                            and library_metadata_result.problems is not None
+                        ):
+                            failure_reason = library_metadata_result.problems
+                        else:
+                            failure_reason = str(err)
 
                     # Create ErrorProxyNode directly since it needs special initialization
                     node = ErrorProxyNode(
@@ -520,6 +771,7 @@ class NodeManager:
                         original_library_name=request.specific_library_name or "Unknown",
                         failure_reason=failure_reason,
                         metadata=request.metadata,
+                        denied_by_policy=denied_by_policy,
                     )
 
                     logger.warning(
@@ -1540,14 +1792,15 @@ class NodeManager:
             settable=request.settable,
         )
         try:
-            if request.parent_container_name and request.initial_setup:
-                parameter_parent = node.get_parameter_by_name(request.parent_container_name)
-                if parameter_parent is not None:
-                    parameter_parent.add_child(new_param)
-            elif parent_group is not None:
-                parent_group.add_child(new_param)
-            else:
-                node.add_parameter(new_param)
+            with sanctioned_parameter_mutation():
+                if request.parent_container_name and request.initial_setup:
+                    parameter_parent = node.get_parameter_by_name(request.parent_container_name)
+                    if parameter_parent is not None:
+                        parameter_parent.add_child(new_param)
+                elif parent_group is not None:
+                    parent_group.add_child(new_param)
+                else:
+                    node.add_parameter(new_param)
         except Exception as e:
             details = f"Couldn't add parameter with name {request.parameter_name} to Node '{node_name}'. Error: {e}"
             return AddParameterToNodeResultFailure(result_details=details)
@@ -1738,7 +1991,8 @@ class NodeManager:
 
         # Delete the Element itself.
         if element is not None:
-            node.remove_parameter_element(element)
+            with sanctioned_parameter_mutation():
+                node.remove_parameter_element(element)
         else:
             details = f"Attempted to remove Element '{request.parameter_name}' from Node '{node_name}'. Failed because element didn't exist."
 
@@ -1859,7 +2113,14 @@ class NodeManager:
         for parameter in element.find_elements_by_type(Parameter):
             # Check if they have an output value, that takes priority
             if parameter.name in node.parameter_output_values:
-                value = node.parameter_output_values[parameter.name]
+                raw_value = node.parameter_output_values[parameter.name]
+                # Apply display suppression: for PROPERTY parameters whose stored
+                # template (e.g. "{SHOT}") contains a variable macro, return the
+                # template rather than the resolved value (e.g. "25").  This path
+                # is hit on browser refresh and workflow reload, so without this
+                # the reconnect would show the substituted value instead of the
+                # user-editable template.
+                value = node.get_display_value_for_output(parameter.name, raw_value)
             else:
                 # Otherwise grab the set value or default value
                 value = node.get_parameter_value(parameter.name)
@@ -1867,6 +2128,13 @@ class NodeManager:
                 element_id = parameter.element_id
                 # Check if the value is in builtins. If it isn't we need to handle it specially.
                 if value.__class__.__module__ != "builtins":
+                    # Enums (including StrEnum/IntEnum) are not builtins but serialize to
+                    # their underlying value. Without this, the __dict__ fallback below
+                    # would send the raw enum internals (e.g. {"_value_": ..., "_name_": ...})
+                    # to the GUI, which renders them as an object instead of the value.
+                    if isinstance(value, Enum):
+                        param_to_value[element_id] = value.value
+                        continue
                     # Check if it has a to_dict method. Use that, if it's been implemented.
                     if hasattr(value, "to_dict"):
                         # If the object has a __dict__, use that
@@ -2150,16 +2418,13 @@ class NodeManager:
             details = f'"{node_name}.{param_name}" not found'
             return GetParameterValueResultFailure(result_details=details)
 
-        # Values are actually stored on the NODE, so let's ask them.
-        if param_name not in node.parameter_values:
-            # Check if it might be in output values (for output parameters)
-            if param_name in node.parameter_output_values:
-                data_value = node.parameter_output_values[param_name]
-            else:
-                # Use the default if not found in either place
-                data_value = parameter.default_value
-        else:
+        # Output values take priority (they represent the result of execution).
+        if param_name in node.parameter_output_values:
+            data_value = node.parameter_output_values[param_name]
+        elif param_name in node.parameter_values:
             data_value = node.parameter_values[param_name]
+        else:
+            data_value = parameter.default_value
 
         # Cool.
         details = f"{node_name}.{request.parameter_name} = {data_value}"
@@ -2734,7 +2999,7 @@ class NodeManager:
         real "node dropped from the live map" bug with a stub that has no
         connections and no flow parentage.
 
-        On the worker (_is_worker=True) the node is constructed from
+        On the worker (is_worker=True) the node is constructed from
         request.node_metadata on every call, hydrated, executed, and discarded.
         Nothing persists between ExecuteNodeRequests on the worker side -- the
         orchestrator is the single source of truth for node identity and
@@ -2744,31 +3009,58 @@ class NodeManager:
         a worker, the request is forwarded over the wire to that worker.
         """
         library_manager = GriptapeNodes.LibraryManager()
+        is_worker = library_manager.is_worker
 
-        if library_manager._is_worker:
+        if is_worker:
             worker_node = self._materialize_transient_node_from_metadata(request)
             if isinstance(worker_node, ExecuteNodeResultFailure):
                 return worker_node
-            return await self._hydrate_and_run_node(worker_node, request)
-
-        obj_mgr = GriptapeNodes.ObjectManager()
-        node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
-        if node is None:
-            return ExecuteNodeResultFailure(
-                result_details=(
-                    f"Node '{request.node_name}' not found in ObjectManager on orchestrator. "
-                    "Refusing to fabricate a fresh node from metadata; the node was dropped "
-                    "from the live map and must be re-created via CreateNodeRequest."
-                ),
-            )
+            node = worker_node
+        else:
+            obj_mgr = GriptapeNodes.ObjectManager()
+            orchestrator_node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+            if orchestrator_node is None:
+                return ExecuteNodeResultFailure(
+                    result_details=(
+                        f"Node '{request.node_name}' not found in ObjectManager on orchestrator. "
+                        "Refusing to fabricate a fresh node from metadata; the node was dropped "
+                        "from the live map and must be re-created via CreateNodeRequest."
+                    ),
+                )
+            node = orchestrator_node
 
         library_name = node.metadata.get("library")
-        worker = library_manager.get_worker_for_library(library_name) if library_name else None
-        wm = GriptapeNodes.WorkerManager()
-        if wm is not None and worker is not None:
-            return await self._execute_node_via_worker(request, wm, worker)
 
-        return await self._hydrate_and_run_node(node, request)
+        # Forwarding to a worker exits the orchestrator's local code path before
+        # the node runs, so strict-mode attribution belongs to the worker's
+        # scope, not ours. Decide forwarding first; only open a local scope when
+        # this process is actually going to execute the node.
+        if not is_worker:
+            worker = library_manager.get_worker_for_library(library_name) if library_name else None
+            wm = GriptapeNodes.WorkerManager()
+            if wm is not None and worker is not None:
+                return await self._execute_node_via_worker(request, wm, worker)
+
+        async with STRICT_MODE.scoped_execution(
+            kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+            subject=request.node_name,
+            library_name=library_name,
+            is_worker=is_worker,
+        ) as (ctx, scope):
+            ctx.result = await self._hydrate_and_run_node(node, request)
+            # Worker-side correctness policy: an ExecuteNodeResultSuccess that
+            # carries an ERROR-severity violation must be promoted to a
+            # failure. Worker output gets shipped back to the orchestrator,
+            # so a "success" that violated correctness would silently corrupt
+            # downstream state. The orchestrator already has the violation
+            # log; the elevated failure forces the editor to surface it.
+            errors = [v for v in scope.violations if v.severity is StrictModeSeverity.ERROR]
+            if is_worker and errors and isinstance(ctx.result, ExecuteNodeResultSuccess):
+                rules = ", ".join(sorted({v.rule_id for v in errors}))
+                ctx.result = ExecuteNodeResultFailure(
+                    result_details=f"Node '{request.node_name}' violated strict-mode rule(s) [{rules}].",
+                )
+        return ctx.result
 
     def _materialize_transient_node_from_metadata(
         self, request: ExecuteNodeRequest
@@ -2789,6 +3081,24 @@ class NodeManager:
         if not node_type:
             return ExecuteNodeResultFailure(
                 result_details=f"Node '{node_name}' node_metadata is missing 'node_type'.",
+            )
+        # Gate worker-side construction on the same InstantiateNode checkpoint
+        # CreateNode enforces. node_metadata is caller-supplied, so without this
+        # a node the policy denies could be instantiated and executed by sending
+        # ExecuteNodeRequest straight to a worker, never passing through the
+        # gated CreateNode path.
+        try:
+            denial = self._evaluate_instantiation_checkpoint(node_type=node_type, specific_library_name=library_name)
+        except KeyError:
+            # Node type/library not registered here; let create_node below
+            # surface the clearer "node type not found" failure rather than
+            # masking it with a checkpoint-resolution error.
+            denial = None
+        if denial is not None:
+            return ExecuteNodeResultFailure(
+                result_details=(
+                    f"Node '{node_name}' of type '{node_type}' denied by license policy: {denial.reason()}"
+                ),
             )
         try:
             return LibraryRegistry.create_node(
@@ -2845,9 +3155,16 @@ class NodeManager:
             self._orch_worker_requests.pop(request.node_name, None)
         result_type_name = execute_raw.get("result_type", "")
         result_data = execute_raw.get("result", {})
+        # Route through cattrs structure (not ``**result_data`` spread)
+        # so the registered exception hook rebuilds ``self.exception``
+        # into a ``ForwardedException`` carrying the worker-side type
+        # name and traceback. A bare spread would leave ``exception``
+        # as the raw {type, message, traceback} dict, breaking the
+        # worker-frame surfacing in
+        # ``NodeExecutor._format_node_failure_message``.
         if result_type_name == ExecuteNodeResultSuccess.__name__:
-            return ExecuteNodeResultSuccess(**result_data)
-        return ExecuteNodeResultFailure(**result_data)
+            return cast("ExecuteNodeResultSuccess", converter.structure(result_data, ExecuteNodeResultSuccess))
+        return cast("ExecuteNodeResultFailure", converter.structure(result_data, ExecuteNodeResultFailure))
 
     async def cancel_worker_execution(self, node_name: str) -> None:
         """Dispatch CancelExecuteNodeRequest to the worker running node_name.
@@ -2897,14 +3214,15 @@ class NodeManager:
     async def _hydrate_and_run_node(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         """Hydrate a node's input parameters and execute it.
 
-        Hydration and node.aprocess() both run inside worker_node_execution_scope
-        so that any nested handle_request calls originated from node code (on a
-        worker) forward to the orchestrator. Hydration calls set_parameter_value,
-        which cascades into ListConnectionsForNodeRequest and similar cross-node
-        lookups; those must forward because the worker only owns its single node
-        copy and cannot resolve parent-flow or peer-node state locally. On the
-        orchestrator the scope is a no-op because forwarding is not configured
-        there.
+        On a worker, hydration and node.aprocess() both run inside
+        worker_node_execution_scope so that any nested handle_request calls
+        originated from node code forward to the orchestrator. Hydration calls
+        set_parameter_value, which cascades into ListConnectionsForNodeRequest
+        and similar cross-node lookups; those must forward because the worker
+        only owns its single node copy and cannot resolve parent-flow or peer-
+        node state locally. On the orchestrator we skip the scope entirely --
+        there is no RemoteHandler to read the flag, so opening it there would
+        only bump a refcount nothing observes.
         """
         # Register this aprocess task under its request_id so
         # CancelExecuteNodeRequest can locate it. Only populated when the caller
@@ -2923,7 +3241,15 @@ class NodeManager:
 
     async def _hydrate_and_run_node_inner(self, node: BaseNode, request: ExecuteNodeRequest) -> ResultPayload:
         node_name = request.node_name
-        with GriptapeNodes.EventManager().worker_node_execution_scope():
+        # The node-execution scope only has meaning on a worker: it is what
+        # RemoteHandler consults to decide whether to forward a request to the
+        # orchestrator. On the orchestrator itself there is no RemoteHandler
+        # installed (register_remote_handlers is worker-only), so opening the
+        # scope there would just bump a refcount that nothing reads. Skip it
+        # to keep the depth counter accurate to its name.
+        is_worker = GriptapeNodes.LibraryManager()._is_worker
+        scope_cm = GriptapeNodes.EventManager().worker_node_execution_scope() if is_worker else contextlib.nullcontext()
+        with scope_cm:
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
             for param_name, value in parameter_values.items():
@@ -2942,6 +3268,7 @@ class NodeManager:
                 except Exception as e:
                     return ExecuteNodeResultFailure(
                         result_details=f"Attempted to set parameter '{param_name}' on node '{node_name}'. Failed with error: {e}",
+                        exception=e,
                     )
             # Materialize parameter defaults into parameter_values so that user
             # process() code reading self.parameter_values[name] directly (rather
@@ -2956,10 +3283,21 @@ class NodeManager:
                     continue
                 node.parameter_values[param.name] = param.default_value
             try:
-                await node.aprocess()
+                with aprocess_scope(request.variables):
+                    await node.aprocess()
             except Exception as e:
+                # Pass the live exception through ``exception=`` so the
+                # converter can capture worker-side frames into a
+                # ForwardedException on the orchestrator. Without this
+                # the orchestrator only sees the type and message --
+                # PR06's whole reason for the dict wire-format -- and
+                # NodeExecutor._format_node_failure_message would have
+                # nothing to surface. ``__traceback__`` is populated
+                # because ``e`` was actually raised, so the strict-mode
+                # tripwire stays quiet for raise-in-process.
                 return ExecuteNodeResultFailure(
                     result_details=f"Attempted to execute node '{node_name}'. Failed with error: {e}",
+                    exception=e,
                 )
         return ExecuteNodeResultSuccess(
             parameter_output_values=dict(node.parameter_output_values),
@@ -3102,8 +3440,19 @@ class NodeManager:
 
         # This is our current dude.
         with GriptapeNodes.ContextManager().node(node=node):
-            # Get the library and version details for all nodes
-            library_used = node.metadata["library"]
+            # Get the library and version details for all nodes.
+            # A node's owning library is normally injected into metadata by
+            # LibraryRegistry.create_node, but proxy/placeholder nodes can be created
+            # without it when that path fails. Fall back to the proxy's recorded
+            # original library, and tolerate a missing key rather than crashing the
+            # entire save.
+            library_used = node.metadata.get("library")
+            if library_used is None and isinstance(node, ErrorProxyNode):
+                library_used = node.original_library_name
+            if library_used is None:
+                # No owning library could be determined. Use an empty name so the
+                # metadata lookup below fails cleanly instead of crashing the save.
+                library_used = ""
             # For SubflowNodeGroup, also check if execution environment uses a special library
             execution_env_library_details = None
             if isinstance(node, SubflowNodeGroup):
@@ -3193,11 +3542,26 @@ class NodeManager:
                 )
 
             # We're going to compare this node instance vs. a canonical one. Rez that one up.
-            # For ErrorProxyNode, we can't create a reference node, so skip comparison
+            # For ErrorProxyNode, we can't create a reference node, so skip comparison.
+            # Wrap in ``LibraryRegistry.constructing_node()`` so the parameter-mutation
+            # detector skips this ephemeral instance's declarative ``add_parameter``
+            # calls (this construction bypasses ``LibraryRegistry.create_node``).
+            #
+            # Carry the node's library and type so the reference resolves the same
+            # library-backed ``__init__`` data the live node did (e.g. a model
+            # dropdown sourced from the ``model_catalog``); otherwise it would look
+            # mutated.
             if isinstance(node, ErrorProxyNode):
                 reference_node = None
             else:
-                reference_node = type(node)(name="REFERENCE NODE")
+                with LibraryRegistry.constructing_node():
+                    reference_node = type(node)(
+                        name="REFERENCE NODE",
+                        metadata={
+                            "library": node.metadata.get("library"),
+                            "node_type": node.metadata.get("node_type"),
+                        },
+                    )
 
             # Now creation or alteration of all of the elements.
             element_modification_commands = []
@@ -3464,9 +3828,20 @@ class NodeManager:
             return DeserializeNodeFromCommandsResultFailure(result_details=details)
         with GriptapeNodes.ContextManager().node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4862
+                # This isinstance allowlist must be updated by hand for every new
+                # element-modification request type that carries a node_name. Any type
+                # not listed here silently keeps pointing at the original node. Consider
+                # retargeting any element command that exposes a node_name attribute instead.
                 if isinstance(
-                    element_command, (AlterParameterDetailsRequest, AddParameterToNodeRequest)
-                ):  # are there more types of requests we could encounter here?
+                    element_command,
+                    (
+                        AlterParameterDetailsRequest,
+                        AddParameterToNodeRequest,
+                        AddParameterGroupToNodeRequest,
+                        AlterParameterGroupDetailsRequest,
+                    ),
+                ):
                     element_command.node_name = node_name
                 element_result = GriptapeNodes().handle_request(element_command)
                 if element_result.failed():
@@ -3980,48 +4355,88 @@ class NodeManager:
             or (parameter.default_value is not None and effective_value == parameter.default_value)
         ):
             internal_value = effective_value
-        # We have a value. Attempt to get a hash for it to see if it matches one
-        # we've already indexed.
+        # A parameter can have BOTH an internal (set) value and an output value; each is
+        # serialized independently against the same tracker/uniques map.
         commands = []
-        if internal_value is not None:
-            internal_command = NodeManager._handle_value_hashing(
-                value=internal_value,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                parameter=parameter,
-                is_output=False,
-                parameter_name=parameter.name,
-                node_name=node.name,
-                use_pickling=use_pickling,
-            )
-            if internal_command is None:
-                details = f"Attempted to serialize set value for parameter '{parameter.name}' on node '{node.name}'. The set value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
-                logger.warning(details)
-                # Set node to unresolved when serialization fails (only for CreateNodeRequest)
-                if isinstance(create_node_request, CreateNodeRequest):
-                    create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
-            else:
-                commands.append(internal_command)
-        if output_value is not None:
-            output_command = NodeManager._handle_value_hashing(
-                value=output_value,
-                serialized_parameter_value_tracker=serialized_parameter_value_tracker,
-                unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
-                parameter=parameter,
-                is_output=True,
-                parameter_name=parameter.name,
-                node_name=node.name,
-                use_pickling=use_pickling,
-            )
-            if output_command is None:
-                details = f"Attempted to serialize output value for parameter '{parameter.name}' on node '{node.name}'. The output value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
-                logger.warning(details)
-                # Set node to unresolved when serialization fails (only for CreateNodeRequest)
-                if isinstance(create_node_request, CreateNodeRequest):
-                    create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
-            else:
-                commands.append(output_command)
+        internal_command = NodeManager._serialize_one_parameter_value_for_save(
+            value=internal_value,
+            value_kind="set",
+            is_output=False,
+            parameter=parameter,
+            node=node,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            create_node_request=create_node_request,
+            use_pickling=use_pickling,
+        )
+        if internal_command is not None:
+            commands.append(internal_command)
+        output_command = NodeManager._serialize_one_parameter_value_for_save(
+            value=output_value,
+            value_kind="output",
+            is_output=True,
+            parameter=parameter,
+            node=node,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            create_node_request=create_node_request,
+            use_pickling=use_pickling,
+        )
+        if output_command is not None:
+            commands.append(output_command)
         return commands or None
+
+    @staticmethod
+    def _serialize_one_parameter_value_for_save(  # noqa: PLR0913
+        *,
+        value: Any,
+        value_kind: str,
+        is_output: bool,
+        parameter: Parameter,
+        node: BaseNode,
+        unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
+        serialized_parameter_value_tracker: SerializedParameterValueTracker,
+        create_node_request: CreateNodeRequest,
+        use_pickling: bool,
+    ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
+        """Serialize one of a parameter's values (internal-set or output) for workflow save.
+
+        Returns the command to record on success. Returns None when there is nothing to record:
+        either no value was present, the author opted out via serializable=False, or serialization
+        genuinely failed. Whenever a value was present but could not be recorded (opt-out OR
+        genuine failure) the node is marked UNRESOLVED so it re-runs on load and recomputes the
+        missing value; downstream consumers would otherwise see None (issue #4994). Only the
+        genuine-failure branch also emits a warning — opt-outs are silent.
+
+        value_kind is "set" or "output" and is used only in the warning text.
+        """
+        # No value of this kind was set on the node.
+        if value is None:
+            return None
+        command = NodeManager._handle_value_hashing(
+            value=value,
+            serialized_parameter_value_tracker=serialized_parameter_value_tracker,
+            unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
+            parameter=parameter,
+            is_output=is_output,
+            parameter_name=parameter.name,
+            node_name=node.name,
+            use_pickling=use_pickling,
+        )
+        if command is not None:
+            return command
+
+        # Non-serialisable parameter means node must be re-resolved when loaded.
+        if isinstance(create_node_request, CreateNodeRequest):
+            create_node_request.resolution = NodeResolutionState.UNRESOLVED.value
+
+        # Author opted out via serializable=False — silently skip; not a failure.
+        if not parameter.serializable:
+            return None
+        # Genuine serialization failure — warn and mark unresolved.
+        details = f"Attempted to serialize {value_kind} value for parameter '{parameter.name}' on node '{node.name}'. The {value_kind} value will not be restored in anything that attempts to deserialize or save this node. The value for this parameter was not serialized because it did not match Griptape Nodes' criteria for serializability. To remedy, either update the value's type to support serializability or mark the parameter as not serializable by setting serializable=False when creating the parameter."
+        logger.warning(details)
+        return None
 
     @staticmethod
     def serialize_parameter_output_values(node: BaseNode, *, use_pickling: bool = False) -> SerializedParameterValues:
@@ -4246,19 +4661,25 @@ class NodeManager:
         # Update connections that reference this parameter
         if node_name in connections.incoming_index:
             incoming_connections = connections.incoming_index[node_name]
-            for connection_ids in incoming_connections.values():
+            if request.parameter_name in incoming_connections:
+                connection_ids = incoming_connections[request.parameter_name]
                 for connection_id in connection_ids:
                     connection = connections.connections[connection_id]
                     if connection.target_parameter.name == request.parameter_name:
                         connection.target_parameter.name = request.new_parameter_name
+                # Update the index key from old name to new name
+                incoming_connections[request.new_parameter_name] = incoming_connections.pop(request.parameter_name)
 
         if node_name in connections.outgoing_index:
             outgoing_connections = connections.outgoing_index[node_name]
-            for connection_ids in outgoing_connections.values():
+            if request.parameter_name in outgoing_connections:
+                connection_ids = outgoing_connections[request.parameter_name]
                 for connection_id in connection_ids:
                     connection = connections.connections[connection_id]
                     if connection.source_parameter.name == request.parameter_name:
                         connection.source_parameter.name = request.new_parameter_name
+                # Update the index key from old name to new name
+                outgoing_connections[request.new_parameter_name] = outgoing_connections.pop(request.parameter_name)
 
         # Update parameter name
         old_name = parameter.name
@@ -4846,6 +5267,9 @@ class NodeManager:
             return ResetNodeToDefaultsResultFailure(result_details=details)
         parent_flow_name = self._name_to_parent_flow_name[node_name]
 
+        # Preserve parent group membership
+        parent_group_name = node.parent_group.name if node.parent_group else None
+
         # FAILURE CHECK: Create new node with temporary name
         temp_node_name = f"{node_name}_temp"
         create_node_request = CreateNodeRequest(
@@ -4853,6 +5277,7 @@ class NodeManager:
             specific_library_name=library_name,
             node_name=temp_node_name,
             override_parent_flow_name=parent_flow_name,
+            parent_group_name=parent_group_name,
             create_error_proxy_on_failure=False,
         )
         create_result = self.on_create_node_request(create_node_request)
@@ -5011,3 +5436,18 @@ class NodeManager:
         return ReorderParameterListItemResultSuccess(
             result_details=f"Successfully reordered item in ParameterList '{request.parameter_list_name}' on Node '{node_name}' from index {request.from_index} to {request.to_index}."
         )
+
+    def on_unresolve_node_request(self, request: UnresolveNodeRequest) -> ResultPayload:
+        """Mark a single node UNRESOLVED and propagate to downstream nodes."""
+        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        if node is None:
+            return UnresolveNodeResultFailure(
+                result_details=f"Attempted to unresolve Node '{request.node_name}'. Node not found."
+            )
+        if node.state == NodeResolutionState.RESOLVING:
+            return UnresolveNodeResultFailure(
+                result_details=f"Attempted to unresolve Node '{request.node_name}'. Node is currently RESOLVING."
+            )
+        node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
+        GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+        return UnresolveNodeResultSuccess(result_details=f"Node '{request.node_name}' marked as unresolved.")

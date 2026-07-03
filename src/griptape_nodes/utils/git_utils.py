@@ -191,10 +191,12 @@ def extract_repo_name_from_url(url: str) -> str:
         "griptape-ai/repo" -> "repo"
         "griptape-ai/repo@main" -> "repo"
     """
-    url = url.strip().rstrip("/")
+    url = url.strip()
 
-    # Strip @ref suffix if present
+    # Strip @ref suffix first, then trailing slashes: a slash right before the ref
+    # (e.g. "owner/repo/@ref") would otherwise survive and leave an empty repo name.
     url, _ = parse_git_url_with_ref(url)
+    url = url.rstrip("/")
 
     # Remove .git suffix if present
     url = url.removesuffix(".git")
@@ -242,6 +244,69 @@ def is_git_repository(path: Path) -> bool:
             return True
 
     return False
+
+
+def _find_tag_for_commit(repo: pygit2.Repository, head_commit: object) -> str | None:
+    for tag_name in repo.references:
+        if not tag_name.startswith("refs/tags/"):
+            continue
+        tag_ref = repo.references[tag_name]
+        if hasattr(tag_ref, "peel"):
+            tag_target = tag_ref.peel(pygit2.Commit).id
+        else:
+            tag_target = tag_ref.target
+        if tag_target == head_commit:
+            return tag_name.replace("refs/tags/", "")
+    return None
+
+
+def _get_ref_from_repo(repo: pygit2.Repository, library_path: Path) -> str | None:
+    # Called from get_git_info to reuse an already-open repo — do not open a new one here.
+    try:
+        if repo.head_is_unborn:
+            return None
+        if repo.head_is_detached:
+            tag = _find_tag_for_commit(repo, repo.head.target)
+            if tag is not None:
+                return tag
+            return str(repo.head.target)
+        shorthand = repo.head.shorthand
+    except pygit2.GitError as e:
+        logger.debug("Failed to get current git reference for %s: %s", library_path, e)
+        return None
+    else:
+        return shorthand
+
+
+def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
+    """Get both the git remote URL and current ref for a library in a single repo open.
+
+    Prefer this over calling get_git_remote() + get_current_ref() separately when both
+    values are needed: those functions each call is_git_repository(), discover_repository(),
+    and Repository() independently, which triples the I/O cost per library.
+
+    Returns:
+        tuple[str | None, str | None]: (git_remote, git_ref), each None if unavailable.
+    """
+    if not is_git_repository(library_path):
+        return None, None
+
+    try:
+        repo_path = pygit2.discover_repository(str(library_path))
+        if repo_path is None:
+            return None, None
+        repo = pygit2.Repository(repo_path)
+    except pygit2.GitError as e:
+        logger.debug("Failed to open git repository at %s: %s", library_path, e)
+        return None, None
+
+    git_remote: str | None = None
+    try:
+        git_remote = repo.remotes["origin"].url
+    except (KeyError, IndexError, pygit2.GitError) as e:
+        logger.debug("Failed to get git remote for %s: %s", library_path, e)
+
+    return git_remote, _get_ref_from_repo(repo, library_path)
 
 
 def get_git_remote(library_path: Path) -> str | None:
@@ -1046,7 +1111,7 @@ def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
     import json
 
     try:
-        with json_path.open() as f:
+        with json_path.open(encoding="utf-8") as f:
             library_data = json.load(f)
     except json.JSONDecodeError as e:
         msg = f"JSON decode error reading library metadata from {remote_url}: {e}"
@@ -1111,7 +1176,7 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, 
                 "*/griptape-nodes-library.json",
                 "*/*/griptape-nodes-library.json",
             ]
-            sparse_checkout_file.write_text("\n".join(patterns))
+            sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
 
             # Fetch with depth 1 (shallow clone)
             _run_git_command(
@@ -1142,7 +1207,7 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, 
 
             # Read the JSON data before temp directory is deleted
             try:
-                with library_json_path.open() as f:
+                with library_json_path.open(encoding="utf-8") as f:
                     library_data = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 msg = f"Failed to read library file from {remote_url}: {e}"
@@ -1221,7 +1286,7 @@ def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dic
 
             # Read the JSON data before temp directory is deleted
             try:
-                with library_json_path.open() as f:
+                with library_json_path.open(encoding="utf-8") as f:
                     library_data = json.load(f)
             except (OSError, json.JSONDecodeError) as e:
                 msg = f"Failed to read library file from {remote_url}: {e}"
@@ -1262,3 +1327,82 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> tuple[st
 
     logger.debug("Git CLI not available, using pygit2 shallow clone from %s", remote_url)
     return _shallow_clone_with_pygit2(remote_url, ref)
+
+
+def _remote_ref_exists_with_git_cli(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag ref exists on a remote using the git CLI.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    result = subprocess.run(  # noqa: S603
+        ["git", "ls-remote", "--heads", "--tags", remote_url, ref],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        msg = f"Failed to query remote refs from {remote_url}: {result.stderr.strip()}"
+        raise GitRemoteError(msg)
+
+    return bool(result.stdout.strip())
+
+
+def _remote_ref_exists_with_pygit2(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag ref exists on a remote using pygit2.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    candidate_names = {f"refs/heads/{ref}", f"refs/tags/{ref}"}
+    with tempfile.TemporaryDirectory() as temp_dir:
+        repo = pygit2.init_repository(temp_dir, bare=True)
+        try:
+            remote = repo.remotes.create("origin", remote_url)
+            remote_refs = remote.ls_remotes(callbacks=_CredentialCallbacks())
+        except pygit2.GitError as e:
+            msg = f"Failed to query remote refs from {remote_url}: {e}"
+            raise GitRemoteError(msg) from e
+        finally:
+            repo.free()
+
+    return any(remote_ref.get("name") in candidate_names for remote_ref in remote_refs)
+
+
+def remote_ref_exists(remote_url: str, ref: str) -> bool:
+    """Check whether a branch or tag named ``ref`` exists on a git remote.
+
+    Uses the git CLI when available and falls back to pygit2 otherwise, mirroring
+    sparse_checkout_library_json. Commit SHAs are not advertised as named refs, so a
+    detached HEAD pointing at a bare commit reports False.
+
+    Args:
+        remote_url: The git repository URL (HTTPS or SSH).
+        ref: The branch or tag name to look for on the remote.
+
+    Returns:
+        bool: True if a matching branch or tag exists on the remote, False otherwise.
+
+    Raises:
+        GitRemoteError: If the remote cannot be queried.
+    """
+    if _is_git_available():
+        logger.debug("Using git CLI to check remote ref '%s' on %s", ref, remote_url)
+        return _remote_ref_exists_with_git_cli(remote_url, ref)
+
+    logger.debug("Git CLI not available, using pygit2 to check remote ref '%s' on %s", ref, remote_url)
+    return _remote_ref_exists_with_pygit2(remote_url, ref)

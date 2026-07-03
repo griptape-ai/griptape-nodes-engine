@@ -46,7 +46,7 @@ class WorkflowShape(BaseModel):
 
 
 class WorkflowMetadata(BaseModel):
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.19.0"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.20.0"
 
     name: str
     schema_version: str
@@ -58,6 +58,9 @@ class WorkflowMetadata(BaseModel):
     image: str | None = None
     is_griptape_provided: bool | None = False
     is_template: bool | None = False
+    # Hidden from the GUI workflow picker. Set on library-internal workflows (e.g. integration tests)
+    # that ship inside a library directory but should never surface to users.
+    is_internal: bool | None = False
     creation_date: datetime | None = Field(default=None)
     last_modified_date: datetime | None = Field(default=None)
     branched_from: str | None = Field(default=None)
@@ -224,7 +227,20 @@ class WorkflowRegistry(metaclass=SingletonMeta):
     @classmethod
     def list_workflows(cls) -> dict[str, dict]:
         instance = cls()
-        return {key: instance._workflows[key].get_workflow_metadata() for key in instance._workflows}
+
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        # Resolve config once here and pass it down so get_workflow_metadata() can skip
+        # the is_synced property, which instantiates ConfigManager per workflow call.
+        config_mgr = GriptapeNodes.ConfigManager()
+        synced_directory = config_mgr.get_config_value("synced_workflows_directory")
+        synced_path = config_mgr.get_full_path(synced_directory)
+        workspace_path = config_mgr.workspace_path
+
+        return {
+            key: instance._workflows[key].get_workflow_metadata(synced_path=synced_path, workspace_path=workspace_path)
+            for key in instance._workflows
+        }
 
     @classmethod
     def get_complete_file_path(cls, relative_file_path: str) -> str:
@@ -353,13 +369,21 @@ class Workflow:
         # Check if the workflow file is within the synced directory
         return Path(complete_file_path).is_relative_to(synced_path)
 
-    def get_workflow_metadata(self) -> dict:
+    def get_workflow_metadata(self, synced_path: Path | None = None, workspace_path: Path | None = None) -> dict:
         # Convert from the Pydantic schema.
         ret_val = {**self.metadata.model_dump()}
 
         # The schema doesn't have the file path in it, because it is baked into the file itself.
         # Customers of this function need that, so let's stuff it in.
         ret_val["file_path"] = self.file_path
-        ret_val["is_synced"] = self.is_synced
         ret_val["is_saved"] = self.is_saved
+
+        if synced_path is not None and workspace_path is not None and self.file_path is not None:
+            # Pre-computed paths supplied by list_workflows() to avoid a ConfigManager
+            # instantiation per workflow. Falls back to the property for standalone callers.
+            complete_file_path = resolve_workspace_path(Path(self.file_path), workspace_path)
+            ret_val["is_synced"] = complete_file_path.is_relative_to(synced_path)
+        else:
+            ret_val["is_synced"] = self.is_synced
+
         return ret_val

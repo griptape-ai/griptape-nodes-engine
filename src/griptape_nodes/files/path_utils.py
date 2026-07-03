@@ -14,10 +14,11 @@ and are used by OSManager, FileDrivers, and workspace managers.
 
 import os
 import re
-import sys
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 from urllib.parse import unquote, urlparse
+
+from griptape_nodes.files.os_utils import is_windows
 
 # Path decomposition patterns
 _WINDOWS_DRIVE_MATCH_PATTERN = r"^([A-Z]):"
@@ -33,21 +34,46 @@ _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
 
-# Windows MAX_PATH limit - paths at or above this length need the \\?\ prefix.
+# Windows MAX_PATH limit. Retained for documentation/reference only: the historical
+# 260-char threshold at which the \\?\ prefix becomes strictly necessary. We no longer
+# gate on it -- _apply_windows_long_path_prefix applies the prefix unconditionally on
+# Windows (see below) -- but the constant documents where the limit comes from.
 WINDOWS_MAX_PATH = 260
 
 
 def _apply_windows_long_path_prefix(path_str: str) -> str:
-    r"""Prepend the Windows long-path prefix (``\\?\``) when required.
+    r"""Prepend the Windows long-path prefix (``\\?\``) on Windows.
 
-    No-op on non-Windows platforms, on paths shorter than ``WINDOWS_MAX_PATH``,
-    or on paths that already carry the prefix. UNC paths (``\\server\share``)
-    get the ``\\?\UNC\`` variant.
+    No-op on non-Windows platforms and on paths that already carry the prefix.
+    UNC paths (``\\server\share``) get the ``\\?\UNC\`` variant.
+
+    The prefix is applied **unconditionally** on Windows, not only when the
+    string already exceeds ``WINDOWS_MAX_PATH``. The old length gate meant a
+    short root path (e.g. a destination under ``%TEMP%``) was handed to the
+    filesystem unprefixed, and per-file leaf paths built from it later — during
+    a recursive copy that descends into a deep source tree — grew past MAX_PATH
+    without ever inheriting the prefix, raising ``WinError 206``. Applying the
+    prefix at the root lets ``pathlib``/``os.path`` joins carry it through to
+    every leaf. The ``\\?\`` prefix is safe to apply to a sub-MAX_PATH path on
+    modern Windows.
+
+    Precondition: ``path_str`` must be a fully-qualified, backslash-separated
+    Windows path (absolute drive path like ``C:\\dir`` or UNC ``\\\\server\\share``).
+    The ``\\?\`` prefix disables Win32 path normalization, so a relative path
+    (``sub\\file``) or a forward-slash path (``C:/dir``) would become an invalid
+    ``\\?\`` string. Both current callers (``normalize_path_for_platform``,
+    ``canonicalize_for_io``) absolutize and normalize before calling, so this
+    holds; the guard below returns such inputs unchanged rather than producing a
+    broken prefix, so a future caller can't silently create one.
     """
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4418
-    if not sys.platform.startswith("win"):
+    if not is_windows():
         return path_str
-    if len(path_str) < WINDOWS_MAX_PATH or path_str.startswith("\\\\?\\"):
+    if path_str.startswith("\\\\?\\"):
+        return path_str
+    # A relative or forward-slash path is not fully-qualified; prefixing it would
+    # yield an invalid \\?\ string (the prefix disables normalization). Leave it
+    # unchanged rather than corrupt it -- see the precondition above.
+    if not PureWindowsPath(path_str).is_absolute() or "/" in path_str:
         return path_str
     if path_str.startswith("\\\\"):
         return f"\\\\?\\UNC\\{path_str[2:]}"
@@ -406,7 +432,8 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     Same sanitization, expansion, absolutization, and normalization as
     ``canonicalize_for_identity``, but does NOT follow symlinks (safe for
     paths that do not yet exist) and applies the Windows long-path
-    (``\\?\``) prefix when the result exceeds MAX_PATH.
+    (``\\?\``) prefix unconditionally on Windows (see
+    ``_apply_windows_long_path_prefix``).
 
     Use this at the boundary that actually hands the path to the OS (driver
     or request handler). Do NOT call it before constructing a
@@ -431,6 +458,56 @@ def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:
     if prefixed == normalized_str:
         return normalized
     return Path(prefixed)
+
+
+def canonicalize_to_posix(path: str | Path) -> str:
+    r"""Produce a POSIX-form (forward-slash) string from a maybe-Windows-shaped path.
+
+    Routes the input through ``PureWindowsPath.as_posix()``, which understands
+    every Windows path form and preserves them under conversion:
+
+    - Drive-letter: ``C:\path`` → ``C:/path``
+    - UNC: ``\\server\share\file`` → ``//server/share/file``
+    - Long-path prefix: ``\\?\C:\path`` → ``//?/C:/path``
+    - Long-UNC: ``\\?\UNC\server\share`` → ``//?/UNC/server/share/``
+      (``PureWindowsPath`` appends a trailing separator when the input is
+      a bare share root; harmless in practice because callers pass
+      filenames or subpaths past the root)
+    - Mixed separators: ``C:\a/b\c`` → ``C:/a/b/c``
+    - POSIX input is a no-op: ``/some/path`` → ``/some/path``
+
+    Works on any host OS — ``PureWindowsPath`` parses Windows-shaped strings
+    without needing an actual Windows filesystem, so cross-platform tests
+    can exercise the Windows edge cases from macOS or Linux runners.
+
+    **When to reach for this.** Anywhere a filesystem-derived path needs to
+    be compared, joined, or matched against text that uses ``/`` by
+    convention. Concrete cases in the tree:
+
+    - Reverse-matching a filesystem path against a macro template (see
+      ``_extract_index_from_filename`` in ``os_manager.py``) — templates use
+      ``/`` but ``Path.glob()`` output uses ``\`` on Windows.
+    - Constructing URL-shaped strings from filesystem paths.
+    - Deriving registry / cache keys from paths so the same file gets one
+      key regardless of the host's native separator.
+
+    **NOT suitable for I/O.** The returned string uses ``/`` on Windows,
+    which most Windows APIs accept but not all. For handing a path to the
+    OS, use ``canonicalize_for_io``.
+
+    Args:
+        path: Raw path string (possibly Windows-shaped) or Path object.
+
+    Returns:
+        Forward-slash-separated string.
+    """
+    # `Path.as_posix()` on Windows would give the right answer, but on POSIX
+    # hosts a `Path("C:\foo")` becomes `PurePosixPath` and treats the whole
+    # string as a filename. Routing through `PureWindowsPath(str(...))`
+    # forces Windows-aware parsing on every host.
+    if isinstance(path, Path):
+        path = str(path)
+    return PureWindowsPath(path).as_posix()
 
 
 def resolve_file_path(path_str: str, base_dir: Path) -> Path:

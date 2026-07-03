@@ -3,6 +3,11 @@
 Pure functions that take a `fileseq.FileSequence` plus the present-numbers
 map and produce a list of `Sequence` objects shaped according to the chosen
 policy. No I/O, no fileseq state mutation — just transformation.
+
+Path values flowing through this module are *strings in the caller's shape*
+(macro-form when the caller supplied a macro, plain absolute otherwise). The
+scanner's `PathMapping` does the resolved↔caller conversion before handing
+the present-numbers dict in here, so policies don't touch macros directly.
 """
 
 from __future__ import annotations
@@ -18,22 +23,22 @@ from griptape_nodes.common.sequences.models import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
-    from fileseq.filesequence import FileSequence
+    from griptape_nodes.common.sequences.scan import TargetPattern
 
 
 @dataclass(frozen=True)
 class PolicyContext:
     """Bundle of inputs for `apply_policy`.
 
-    Groups the unchanging context (range, discovered range, fileseq object,
-    drop count) so callers and helpers can pass one object instead of nine
-    keyword arguments.
+    Groups the unchanging context (range, discovered range, fileseq-or-literal
+    target, drop count) so callers and helpers can pass one object instead of
+    nine keyword arguments. `fseq` is the structural protocol satisfied by
+    both `fileseq.FileSequence` and `_LiteralTarget`; only its metadata
+    accessors (basename / padding / extension / zfill) are read here.
     """
 
-    fseq: FileSequence
-    present_numbers: dict[int, Path]
+    fseq: TargetPattern
+    present_numbers: dict[int, str]
     directory: str
     policy: MissingItemPolicy
     first: int
@@ -46,10 +51,11 @@ class PolicyContext:
 def apply_policy(context: PolicyContext) -> list[Sequence]:
     """Build the final list of Sequences according to `context.policy`.
 
-    `context.present_numbers` maps each present integer key to its on-disk
-    Path. Numbers may sit inside or outside [first, last]; only those inside
-    the active range are surfaced. SPLIT returns multiple sequences (one per
-    contiguous run). All other policies return exactly one sequence.
+    `context.present_numbers` maps each present integer key to its
+    caller-shaped path string. Numbers may sit inside or outside [first,
+    last]; only those inside the active range are surfaced. SPLIT returns
+    multiple sequences (one per contiguous run). All other policies return
+    exactly one sequence.
 
     `context.fseq` is used only to read its formatting metadata (basename,
     padding, extension, zfill); it is not mutated.
@@ -88,8 +94,17 @@ def _build_split_sequence(run: list[int], context: PolicyContext) -> Sequence:
 
 
 def _apply_single(context: PolicyContext) -> Sequence:
-    """ABORT / SKIP / FILL_NEAREST: emit one Sequence over [first, last] (or raise on ABORT)."""
+    """SKIP / FILL_NEAREST: emit one Sequence over [first, last]; ABORT raises with every gap."""
     in_range_present = {n: p for n, p in context.present_numbers.items() if context.first <= n <= context.last}
+
+    if context.policy is MissingItemPolicy.ABORT:
+        # Collect all gaps in one pass so the failure payload can surface every
+        # missing item at once. Letting `_gap_entry` raise on the first gap (the
+        # old behavior) made artists fix gaps one-re-run-at-a-time.
+        missing = [n for n in range(context.first, context.last + 1) if n not in in_range_present]
+        if missing:
+            raise MissingItemError(missing)
+
     entries: list[SequenceEntry] = []
     for number in range(context.first, context.last + 1):
         if number in in_range_present:
@@ -117,18 +132,18 @@ def _apply_single(context: PolicyContext) -> Sequence:
 def _gap_entry(
     number: int,
     policy: MissingItemPolicy,
-    fseq: FileSequence,
-    in_range_present: dict[int, Path],
+    fseq: TargetPattern,
+    in_range_present: dict[int, str],
 ) -> SequenceEntry | None:
     """Build the SequenceEntry for a missing item, or None to omit it.
 
-    None is returned for the ERROR policy (which drops gaps from `entries`)
-    and for NEAREST when there's no neighbor at all (empty in-range present
-    set).
+    None is returned for SKIP (which drops gaps from `entries`) and for
+    FILL_NEAREST when there's no neighbor at all (empty in-range present set).
+
+    ABORT is not handled here — `_apply_single` collects all gaps in a single
+    pass and raises `MissingItemError` itself before this function is called.
     """
     match policy:
-        case MissingItemPolicy.ABORT:
-            raise MissingItemError(number)
         case MissingItemPolicy.SKIP:
             return None
         case MissingItemPolicy.FILL_NEAREST:
@@ -138,7 +153,7 @@ def _gap_entry(
             return SequenceEntry(
                 number=number,
                 padded_number=_format_number(fseq, number),
-                path=str(neighbor_path),
+                path=neighbor_path,
             )
         case _:
             msg = f"Unknown missing-item policy: {policy}"
@@ -158,7 +173,7 @@ def _contiguous_runs(sorted_numbers: list[int]) -> list[list[int]]:
     return runs
 
 
-def _nearest_path(number: int, present: dict[int, Path]) -> Path | None:
+def _nearest_path(number: int, present: dict[int, str]) -> str | None:
     """Find the nearest present number's path. Backward-first, then forward.
 
     Per the spec: when a missing item needs a NEAREST fill, we prefer the
@@ -176,12 +191,12 @@ def _nearest_path(number: int, present: dict[int, Path]) -> Path | None:
     return None
 
 
-def _present_entry(fseq: FileSequence, number: int, path: Path) -> SequenceEntry:
+def _present_entry(fseq: TargetPattern, number: int, path: str) -> SequenceEntry:
     """Build a SequenceEntry for a present-on-disk item."""
-    return SequenceEntry(number=number, padded_number=_format_number(fseq, number), path=str(path))
+    return SequenceEntry(number=number, padded_number=_format_number(fseq, number), path=path)
 
 
-def _format_number(fseq: FileSequence, number: int) -> str:
+def _format_number(fseq: TargetPattern, number: int) -> str:
     """Render an integer key with the sequence's declared zero-padding.
 
     `fseq.frame(N)` returns the full filename (basename + padded number +
@@ -196,6 +211,6 @@ def _format_number(fseq: FileSequence, number: int) -> str:
     return f"{number:0{width}d}"
 
 
-def _canonical_pattern(fseq: FileSequence) -> str:
+def _canonical_pattern(fseq: TargetPattern) -> str:
     """Reconstruct the basename + padding + extension form (no number range)."""
     return f"{fseq.basename()}{fseq.padding()}{fseq.extension()}"

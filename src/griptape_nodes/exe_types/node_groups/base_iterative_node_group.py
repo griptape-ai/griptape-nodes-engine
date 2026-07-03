@@ -270,9 +270,11 @@ class BaseIterativeNodeGroup(SubflowNodeGroup):
 
     def _output_results_list(self) -> None:
         """Output the current results list to the results parameter."""
-        import copy
-
-        self.parameter_output_values["results"] = copy.deepcopy(self._results_list)
+        # Shallow copy: items are never mutated after append, and the caller always
+        # replaces _results_list via `= []` rather than clearing in-place, so shared
+        # item references are safe. deepcopy was breaking websocket payload deduplication
+        # by creating new object identities for every item on every broadcast.
+        self.parameter_output_values["results"] = list(self._results_list)
 
     def reset_for_workflow_run(self) -> None:
         """Reset state for a fresh workflow run."""

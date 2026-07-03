@@ -36,7 +36,7 @@ def _make_mock_obj_mgr(existing_node: MagicMock | None = None) -> MagicMock:
 
 def _make_mock_library_manager(*, is_worker: bool) -> MagicMock:
     lib_mgr = MagicMock()
-    lib_mgr._is_worker = is_worker
+    lib_mgr.is_worker = is_worker
     lib_mgr.get_worker_for_library.return_value = None
     return lib_mgr
 
@@ -429,7 +429,7 @@ class TestExecuteNodeWorkerRoute:
             }
         )
         lib_mgr = MagicMock()
-        lib_mgr._is_worker = False
+        lib_mgr.is_worker = False
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
         with (
@@ -463,7 +463,7 @@ class TestExecuteNodeWorkerRoute:
             }
         )
         lib_mgr = MagicMock()
-        lib_mgr._is_worker = False
+        lib_mgr.is_worker = False
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
         with (
@@ -497,7 +497,7 @@ class TestExecuteNodeWorkerRoute:
         wm = MagicMock()
         wm.route_to_worker = AsyncMock()
         lib_mgr = MagicMock()
-        lib_mgr._is_worker = True
+        lib_mgr.is_worker = True
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
         with (

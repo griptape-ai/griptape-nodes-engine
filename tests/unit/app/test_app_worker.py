@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
 from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
@@ -40,9 +41,13 @@ class _FakeRequestClient:
     def __init__(self) -> None:
         self._pending_requests: dict[str, _PendingRequest] = {}
 
-    async def track_request(self, request_id: str, tag: str = "") -> asyncio.Future:
+    async def track_request(
+        self, request_id: str, tag: str = "", *, resolve_failures_as_payload: bool = False
+    ) -> asyncio.Future:
         future: asyncio.Future = asyncio.Future()
-        self._pending_requests[request_id] = _PendingRequest(future, tag)
+        self._pending_requests[request_id] = _PendingRequest(
+            future, tag, resolve_failures_as_payload=resolve_failures_as_payload
+        )
         return future
 
     async def cancel_requests_by_tag(self, tag: str) -> None:
@@ -62,6 +67,9 @@ def worker_manager() -> WorkerManager:
     # WorkerManager reads several float config values at construction; hand back
     # the declared default so asyncio.wait_for / time arithmetic gets a real number.
     gtn._config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+    # spawn_worker builds the child env from the orchestrator's pre-project environ;
+    # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
+    gtn.ProjectManager().get_pre_project_environ.return_value = {}
     wm = WorkerManager(griptape_nodes=gtn, event_manager=MagicMock())
     wm.attach_transport(
         ws_outgoing_queue=asyncio.Queue(),
@@ -71,6 +79,17 @@ def worker_manager() -> WorkerManager:
         request_client=_FakeRequestClient(),  # type: ignore[arg-type]
     )
     return wm
+
+
+def _managed_proc_mock() -> MagicMock:
+    """Build a mock worker process whose ``wait()`` is awaitable.
+
+    ``_terminate_managed_process`` awaits ``proc.wait()`` after SIGTERM; a bare
+    MagicMock returns a non-awaitable, so stand in an AsyncMock for ``wait``.
+    """
+    proc = MagicMock()
+    proc.wait = AsyncMock()
+    return proc
 
 
 class TestHandleRegisterWorkerRequest:
@@ -327,7 +346,7 @@ class TestEvictWorker:
 
     @pytest.mark.asyncio
     async def test_terminates_managed_subprocess_for_library(self, worker_manager: WorkerManager) -> None:
-        proc = MagicMock()
+        proc = _managed_proc_mock()
         worker_manager._workers[_ENGINE] = WorkerRegistration(
             request_topic=_WORKER_REQUEST_TOPIC, worker_key="My Library"
         )
@@ -447,7 +466,7 @@ class TestSpawnWorker:
 class TestResetWorkers:
     @pytest.mark.asyncio
     async def test_terminates_all_processes(self, worker_manager: WorkerManager) -> None:
-        proc_a, proc_b = MagicMock(), MagicMock()
+        proc_a, proc_b = _managed_proc_mock(), _managed_proc_mock()
         worker_manager._managed_worker_processes["Lib A"] = proc_a
         worker_manager._managed_worker_processes["Lib B"] = proc_b
 
@@ -458,7 +477,7 @@ class TestResetWorkers:
 
     @pytest.mark.asyncio
     async def test_clears_all_tracking_state(self, worker_manager: WorkerManager) -> None:
-        worker_manager._managed_worker_processes["Lib A"] = MagicMock()
+        worker_manager._managed_worker_processes["Lib A"] = _managed_proc_mock()
         worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key="Lib A")
         worker_manager._worker_last_seen[_ENGINE] = 999.0
 
@@ -487,6 +506,24 @@ class TestResetWorkers:
         assert worker_manager._managed_worker_processes == {}
 
     @pytest.mark.asyncio
+    async def test_escalates_to_sigkill_when_terminate_times_out(self, worker_manager: WorkerManager) -> None:
+        """A worker that ignores SIGTERM must be SIGKILLed after the grace period."""
+        proc = _managed_proc_mock()
+        worker_manager._managed_worker_processes["Lib A"] = proc
+
+        def _close_and_timeout(awaitable: object, *_args: object, **_kwargs: object) -> None:
+            # Close the proc.wait() coroutine we are bypassing so it is not
+            # reported as never-awaited, then simulate the SIGTERM grace expiring.
+            awaitable.close()  # type: ignore[attr-defined]
+            raise TimeoutError
+
+        with patch("asyncio.wait_for", side_effect=_close_and_timeout):
+            await worker_manager.reset_workers()
+
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+
+    @pytest.mark.asyncio
     async def test_unsubscribes_response_topic_for_each_registered_worker(self, worker_manager: WorkerManager) -> None:
         worker_manager._workers["eng-1"] = WorkerRegistration(
             request_topic=f"sessions/{_SESSION}/workers/eng-1/request", worker_key=None
@@ -500,6 +537,149 @@ class TestResetWorkers:
         unsubscribed = {call.args[0] for call in worker_manager._tx.unsubscribe_from_topic.call_args_list}  # type: ignore[union-attr]
         assert f"sessions/{_SESSION}/workers/eng-1/response" in unsubscribed
         assert f"sessions/{_SESSION}/workers/eng-2/response" in unsubscribed
+
+
+class TestTerminateViaSpawnLoop:
+    """Cross-loop worker termination.
+
+    The subprocess binds to its spawning loop, but eviction can run on another
+    loop. _terminate_via_spawn_loop must hop termination back to the spawning loop
+    so proc.wait() never crosses loops, and fall back to a synchronous signal when
+    the spawning loop is gone (shutdown).
+    """
+
+    @pytest.mark.asyncio
+    async def test_hops_termination_to_spawn_loop(self, worker_manager: WorkerManager) -> None:
+        """Termination is hopped onto the spawn loop when it differs from the running loop.
+
+        Avoids awaiting proc.wait() across loops, which would raise.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            # Runs on the test's loop, which is NOT spawn_loop: the hop must engage.
+            await worker_manager.reset_workers()
+
+            proc.terminate.assert_called_once()
+            assert worker_manager._managed_worker_processes == {}
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_sync_signal_when_spawn_loop_closed(self, worker_manager: WorkerManager) -> None:
+        """A closed spawn loop forces the synchronous-signal fallback.
+
+        run_coroutine_threadsafe raises on a closed loop; the dispatcher must
+        swallow it and signal the worker synchronously.
+        """
+        closed_loop = asyncio.new_event_loop()
+        closed_loop.close()
+        worker_manager._spawn_loop = closed_loop
+        proc = _managed_proc_mock()
+        worker_manager._managed_worker_processes["Lib A"] = proc
+
+        await worker_manager.reset_workers()
+
+        proc.terminate.assert_called_once()
+        proc.kill.assert_called_once()
+        assert worker_manager._managed_worker_processes == {}
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_sync_signal_when_hop_times_out(self, worker_manager: WorkerManager) -> None:
+        """A hop that is scheduled but never completes triggers the sync fallback.
+
+        Simulates the spawning loop closing after the hop is scheduled but before
+        it drains: the hopped termination never finishes, so the evicting loop must
+        stop waiting at DEFAULT_TERMINATE_HOP_TIMEOUT_S and signal the worker.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+
+            async def _never_exits() -> None:
+                await asyncio.Event().wait()
+
+            proc.wait = _never_exits  # the hopped termination hangs forever
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            with patch.object(WorkerManager, "DEFAULT_TERMINATE_HOP_TIMEOUT_S", 0.1):
+                await worker_manager.reset_workers()
+
+            # Fallback signalled the worker without awaiting the stuck exit Future.
+            proc.kill.assert_called_once()
+            assert worker_manager._managed_worker_processes == {}
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
+
+    @pytest.mark.asyncio
+    async def test_cancellation_signals_worker_then_propagates(self, worker_manager: WorkerManager) -> None:
+        """A cancelled hop must signal the worker AND re-raise the cancellation.
+
+        Both hop callers run under TaskGroup-driven teardown; swallowing the
+        CancelledError would let cleanup resume in a context that was meant to
+        stop. The fallback kill still fires, but the cancel must propagate.
+        """
+        spawn_loop = asyncio.new_event_loop()
+        ready = threading.Event()
+
+        def _run_spawn_loop() -> None:
+            asyncio.set_event_loop(spawn_loop)
+            ready.set()
+            spawn_loop.run_forever()
+
+        thread = threading.Thread(target=_run_spawn_loop, daemon=True)
+        thread.start()
+        ready.wait()
+        try:
+            worker_manager._spawn_loop = spawn_loop
+            proc = _managed_proc_mock()
+
+            async def _never_exits() -> None:
+                await asyncio.Event().wait()
+
+            proc.wait = _never_exits  # keep the hop pending so we can cancel it
+            worker_manager._managed_worker_processes["Lib A"] = proc
+
+            task = asyncio.ensure_future(worker_manager._terminate_via_spawn_loop("Lib A", proc))
+            # Let the hop reach the await before cancelling.
+            await asyncio.sleep(0.05)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            proc.kill.assert_called_once()
+        finally:
+            spawn_loop.call_soon_threadsafe(spawn_loop.stop)
+            thread.join(timeout=5)
+            spawn_loop.close()
 
 
 class TestSetSessionReady:
@@ -763,3 +943,204 @@ class TestOrchestratorHeartbeatLoop:
         await asyncio.gather(task, return_exceptions=True)
 
         assert _ENGINE in worker_manager._workers
+
+
+class TestBroadcastToWorkers:
+    @pytest.mark.asyncio
+    async def test_no_workers_is_noop(self, worker_manager: WorkerManager) -> None:
+        from griptape_nodes.app.worker_routing import ReloadConfigRequest
+
+        event = EventRequest(request=ReloadConfigRequest())
+
+        await worker_manager.broadcast_to_workers(event)
+
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+    @pytest.mark.asyncio
+    async def test_sends_one_message_per_registered_worker(self, worker_manager: WorkerManager) -> None:
+        from griptape_nodes.app.worker_routing import ReloadConfigRequest
+
+        expected_broadcast_count = 2
+        worker_a, worker_b = "eng-a", "eng-b"
+        worker_manager._workers[worker_a] = WorkerRegistration(
+            request_topic=f"sessions/{_SESSION}/workers/{worker_a}/request", worker_key=None
+        )
+        worker_manager._workers[worker_b] = WorkerRegistration(
+            request_topic=f"sessions/{_SESSION}/workers/{worker_b}/request", worker_key=None
+        )
+        event = EventRequest(request=ReloadConfigRequest())
+
+        await worker_manager.broadcast_to_workers(event)
+
+        assert worker_manager._tx.send_message.call_count == expected_broadcast_count  # type: ignore[union-attr]
+        topics = {call.args[2] for call in worker_manager._tx.send_message.call_args_list}  # type: ignore[union-attr]
+        assert topics == {
+            f"sessions/{_SESSION}/workers/{worker_a}/request",
+            f"sessions/{_SESSION}/workers/{worker_b}/request",
+        }
+
+
+class TestScheduleBroadcast:
+    @pytest.mark.asyncio
+    async def test_fans_out_request_to_each_registered_worker(self, worker_manager: WorkerManager) -> None:
+        from griptape_nodes.app.worker_routing import ReloadConfigRequest
+
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        worker_manager.schedule_broadcast(ReloadConfigRequest)
+        # create_task on the running loop -- let it run.
+        await asyncio.sleep(0)
+
+        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+        sent_payload = json.loads(worker_manager._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
+        assert sent_payload["request_type"] == "ReloadConfigRequest"
+
+    @pytest.mark.asyncio
+    async def test_refresh_secrets_payload_round_trips(self, worker_manager: WorkerManager) -> None:
+        from griptape_nodes.app.worker_routing import RefreshSecretsRequest
+
+        worker_manager._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        worker_manager.schedule_broadcast(RefreshSecretsRequest)
+        await asyncio.sleep(0)
+
+        worker_manager._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+        sent_payload = json.loads(worker_manager._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
+        assert sent_payload["request_type"] == "RefreshSecretsRequest"
+
+    @pytest.mark.asyncio
+    async def test_no_workers_is_noop(self, worker_manager: WorkerManager) -> None:
+        from griptape_nodes.app.worker_routing import ReloadConfigRequest
+
+        worker_manager.schedule_broadcast(ReloadConfigRequest)
+        await asyncio.sleep(0)
+
+        worker_manager._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+
+class TestWorkerManagerDomainEventListeners:
+    """WorkerManager owns the bridge from domain events to worker fan-out.
+
+    ConfigManager and SecretsManager emit ConfigChanged / SecretChanged on
+    successful state mutations; WorkerManager translates those into
+    ReloadConfigRequest / RefreshSecretsRequest broadcasts. The managers
+    themselves know nothing about workers.
+    """
+
+    @pytest.fixture
+    def worker_manager_with_real_events(self) -> WorkerManager:
+        from griptape_nodes.retained_mode.managers.event_manager import EventManager
+
+        gtn = MagicMock()
+        gtn.get_session_id.return_value = _SESSION
+        gtn.get_engine_id.return_value = _ENGINE
+        gtn._config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+        wm = WorkerManager(griptape_nodes=gtn, event_manager=EventManager())
+        wm.attach_transport(
+            ws_outgoing_queue=asyncio.Queue(),
+            send_message=AsyncMock(),
+            subscribe_to_topic=AsyncMock(),
+            unsubscribe_from_topic=AsyncMock(),
+            request_client=_FakeRequestClient(),  # type: ignore[arg-type]
+        )
+        return wm
+
+    @pytest.mark.asyncio
+    async def test_config_changed_event_triggers_reload_config_broadcast(
+        self, worker_manager_with_real_events: WorkerManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        wm = worker_manager_with_real_events
+        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        wm._event_manager.broadcast_app_event(ConfigChanged(key="x.y", old_value=None, new_value="v"))
+        await asyncio.sleep(0)
+
+        wm._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+        sent_payload = json.loads(wm._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
+        assert sent_payload["request_type"] == "ReloadConfigRequest"
+
+    @pytest.mark.asyncio
+    async def test_secret_changed_event_triggers_refresh_secrets_broadcast(
+        self, worker_manager_with_real_events: WorkerManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.app_events import SecretChanged
+
+        wm = worker_manager_with_real_events
+        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        wm._event_manager.broadcast_app_event(SecretChanged(key="MY_KEY"))
+        await asyncio.sleep(0)
+
+        wm._tx.send_message.assert_called_once()  # type: ignore[union-attr]
+        sent_payload = json.loads(wm._tx.send_message.call_args[0][1])  # type: ignore[union-attr]
+        assert sent_payload["request_type"] == "RefreshSecretsRequest"
+
+    @pytest.mark.asyncio
+    async def test_no_broadcast_when_there_are_no_registered_workers(
+        self, worker_manager_with_real_events: WorkerManager
+    ) -> None:
+        """On a worker process there are zero registered workers; the listener fires but is a no-op."""
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        wm = worker_manager_with_real_events
+
+        wm._event_manager.broadcast_app_event(ConfigChanged(key="x", old_value=None, new_value="v"))
+        await asyncio.sleep(0)
+
+        wm._tx.send_message.assert_not_called()  # type: ignore[union-attr]
+
+    def test_broadcast_completes_when_listener_is_dispatched_via_threadrunner(
+        self, worker_manager_with_real_events: WorkerManager
+    ) -> None:
+        """Production path: sync request handler -> sync broadcast_app_event -> ThreadRunner side loop.
+
+        ``EventManager.broadcast_app_event`` detects a running loop and
+        runs the listener fan-out on a transient ``ThreadRunner`` side
+        loop. If the listener schedules its fan-out via
+        ``asyncio.create_task`` and returns, the side loop is torn down
+        before the orphan task ever runs and no broadcast actually goes
+        out. The listener now awaits the broadcast inline; this test
+        confirms the broadcast lands by the time
+        ``broadcast_app_event`` returns control to the caller, even
+        when the underlying transport ``await`` does not resolve
+        synchronously (the production shape -- a real WebSocket send
+        yields back to the loop).
+        """
+        from griptape_nodes.retained_mode.events.app_events import ConfigChanged
+
+        wm = worker_manager_with_real_events
+        wm._workers[_ENGINE] = WorkerRegistration(request_topic=_WORKER_REQUEST_TOPIC, worker_key=None)
+
+        # Force send_message to yield repeatedly before recording the call.
+        # An orphan ``asyncio.create_task`` scheduled inside the listener
+        # would lose its race with ``ThreadRunner.__exit__`` -> ``loop.stop()``
+        # under enough yield points, so the broadcast would silently drop.
+        # ``AsyncMock`` returns synchronously which would mask the bug;
+        # the production transport awaits real I/O and yields many times.
+        send_calls: list[tuple] = []
+
+        async def slow_send(*args: object) -> None:
+            for _ in range(50):
+                await asyncio.sleep(0)
+            send_calls.append(args)
+
+        wm._tx.send_message = slow_send  # type: ignore[union-attr,assignment]
+
+        async def driver() -> None:
+            # Inside this coroutine there is a running loop on the main
+            # thread. ``broadcast_app_event`` is sync; calling it from
+            # here triggers the ThreadRunner side-loop branch -- the same
+            # branch that runs in production when a sync request handler
+            # (e.g. ``on_handle_set_config_value_request``) calls
+            # ``set_config_value`` which calls ``broadcast_app_event``.
+            wm._event_manager.broadcast_app_event(ConfigChanged(key="x.y", old_value=None, new_value="v"))
+
+        asyncio.run(driver())
+
+        # By the time broadcast_app_event returns, the listener (and the
+        # awaited broadcast inside it) must have completed.
+        assert len(send_calls) == 1
+        sent_payload = json.loads(send_calls[0][1])
+        assert sent_payload["request_type"] == "ReloadConfigRequest"

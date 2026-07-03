@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from inspect import getmodule, isclass, iscoroutinefunction
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, TypeVar, cast
 
 import anyio
@@ -23,10 +23,11 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, EndNode, StartNode
-from griptape_nodes.files.file import FileLoadError
+from griptape_nodes.files.file import File, FileLoadError, FileWriteError
 from griptape_nodes.files.path_utils import (
     FilenameParts,
     canonicalize_for_identity,
@@ -77,8 +78,10 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     GetFileInfoResultSuccess,
-    WriteFileRequest,
-    WriteFileResultFailure,
+)
+from griptape_nodes.retained_mode.events.project_events import (
+    GetSituationRequest,
+    GetSituationResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -133,6 +136,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     PublishWorkflowRequest,
     PublishWorkflowResultFailure,
     PublishWorkflowResultSuccess,
+    RefreshWorkflowRegistryRequest,
+    RefreshWorkflowRegistryResultFailure,
+    RefreshWorkflowRegistryResultSuccess,
     RegisterWorkflowRequest,
     RegisterWorkflowResultFailure,
     RegisterWorkflowResultSuccess,
@@ -163,6 +169,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
     SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
+    SetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledResultFailure,
+    SetVariableSubstitutionEnabledResultNotAlteredSuccess,
+    SetVariableSubstitutionEnabledResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
@@ -193,6 +203,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
+from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
 
 if TYPE_CHECKING:
@@ -200,6 +211,7 @@ if TYPE_CHECKING:
     from types import TracebackType
 
     from griptape_nodes.exe_types.core_types import Parameter
+    from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -301,14 +313,29 @@ class WorkflowManager:
         OVERWRITE_EXISTING = "overwrite_existing"  # Save existing workflow to same name
         SAVE_AS = "save_as"  # Save existing workflow with new name
         SAVE_FROM_TEMPLATE = "save_from_template"  # Save from a template
+        CREATE_VERSIONED = "create_versioned"  # Save a new version via create_versioned_workflow situation
 
     @dataclass
     class SaveWorkflowTargetInfo:
-        """Target information for saving a workflow."""
+        """Target information for saving a workflow.
+
+        Exactly one of ``destination`` or ``file_path`` is populated:
+
+        - ``destination`` is set for FIRST_SAVE, SAVE_AS, and SAVE_FROM_TEMPLATE
+          scenarios. It carries the unresolved ``ProjectFileDestination`` from
+          the ``save_workflow`` situation so the macro resolves inside
+          ``OSManager.on_write_file_request`` (seed-and-retry for unresolved
+          required ``{x:NN}`` slots; situation policy honored).
+        - ``file_path`` is set for OVERWRITE_EXISTING. The registry already
+          knows the workflow's on-disk location, so an in-place overwrite is
+          the correct behavior — the situation macro does NOT re-resolve when
+          updating an existing file.
+        """
 
         scenario: WorkflowManager.SaveWorkflowScenario  # Which save scenario we're in
         file_name: str  # Final resolved name to use
-        file_path: Path  # Absolute path where file will be written
+        destination: ProjectFileDestination | None  # Unresolved destination for new saves
+        file_path: Path | None  # Absolute path for in-place overwrite (OVERWRITE_EXISTING)
         relative_file_path: str  # Relative path for registry
         creation_date: datetime  # When workflow was originally created
         branched_from: str | None  # Workflow this was branched from (if any)
@@ -324,6 +351,11 @@ class WorkflowManager:
         # unwind. refresh_workflow_registry clears this while it mutates the registry.
         self._workflows_loading_complete = asyncio.Event()
         self._workflows_loading_complete.set()
+        # Maps workflow registry key → whether variable substitution is enabled.
+        # Set via SetVariableSubstitutionEnabledRequest; defaults to True (substitution on).
+        # Stored here rather than in WorkflowMetadata so it is set by executable code inside
+        # build_workflow() and therefore survives both editor loads and direct script execution.
+        self._variable_substitution_enabled: dict[str, bool] = {}
 
         event_manager.assign_manager_to_request_type(
             RunWorkflowFromScratchRequest, self.on_run_workflow_from_scratch_request
@@ -387,6 +419,10 @@ class WorkflowManager:
             self.on_set_workflow_metadata_request,
         )
         event_manager.assign_manager_to_request_type(
+            SetVariableSubstitutionEnabledRequest,
+            self.on_set_variable_substitution_enabled_request,
+        )
+        event_manager.assign_manager_to_request_type(
             GetWorkflowInfoRequest,
             self.on_get_workflow_info_request,
         )
@@ -431,6 +467,10 @@ class WorkflowManager:
             self.on_compare_workflows_request,
         )
         event_manager.assign_manager_to_request_type(
+            RefreshWorkflowRegistryRequest,
+            self.on_refresh_workflow_registry_request,
+        )
+        event_manager.assign_manager_to_request_type(
             RegisterWorkflowsFromConfigRequest,
             self.on_register_workflows_from_config_request,
         )
@@ -446,6 +486,61 @@ class WorkflowManager:
             IndexError: If no referenced workflow context is active.
         """
         return self._referenced_workflow_stack[-1]
+
+    def _drop_substitution_flag(self, workflow_key: str) -> None:
+        """Remove the substitution flag when a workflow is permanently deleted."""
+        self._variable_substitution_enabled.pop(workflow_key, None)
+
+    def _rekey_substitution_flag(self, old_key: str, new_key: str) -> None:
+        """Transfer the substitution flag when a workflow registry key changes.
+
+        Only moves the entry when a flag was explicitly set; workflows that defaulted
+        to True (no dict entry) stay that way under the new key without polluting the dict.
+        """
+        if old_key in self._variable_substitution_enabled:
+            self._variable_substitution_enabled[new_key] = self._variable_substitution_enabled.pop(old_key)
+
+    def is_variable_substitution_enabled(self) -> bool:
+        """Return whether variable substitution is enabled for the current workflow.
+
+        Reads from the in-memory dict populated by SetVariableSubstitutionEnabledRequest.
+        Defaults to True so existing workflows that have never set the flag get
+        substitution without any migration.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return True
+        workflow_name = context_manager.get_current_workflow_name()
+        # Return the stored value, or True if this workflow has never set the flag.
+        return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_set_variable_substitution_enabled_request(
+        self, request: SetVariableSubstitutionEnabledRequest
+    ) -> ResultPayload:
+        """Enable or disable variable substitution for the current workflow.
+
+        Stores the flag in memory keyed by the current workflow name. When the
+        workflow is saved, the code generator bakes a SetVariableSubstitutionEnabledRequest
+        call into build_workflow() so the flag is restored on every subsequent load,
+        including direct script execution.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return SetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to set variable substitution enabled. Failed because no workflow is active."
+            )
+        workflow_name = context_manager.get_current_workflow_name()
+        self._variable_substitution_enabled[workflow_name] = request.enabled
+        details = (
+            f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
+        )
+        if request.initial_setup:
+            return SetVariableSubstitutionEnabledResultNotAlteredSuccess(result_details=details)
+        return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # All of the libraries have loaded, and any workflows they came with have been registered.
@@ -651,6 +746,10 @@ class WorkflowManager:
 
     def should_squelch_workflow_altered(self) -> bool:
         return self._squelch_workflow_altered_count > 0
+
+    def clear_object_state(self) -> None:
+        """Clear per-workflow state when the engine is reset."""
+        self._variable_substitution_enabled.clear()
 
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""
@@ -898,6 +997,23 @@ class WorkflowManager:
         result_messages.append(ResultDetail(message=execution_result.execution_details, level=logging.DEBUG))
         return RunWorkflowFromRegistryResultSuccess(result_details=ResultDetails(*result_messages))
 
+    def _persist_external_workflow_registration(self, full_path: str) -> None:
+        """Persist an out-of-workspace workflow path to global config so it survives restarts.
+
+        Self-guarding: paths inside the workspace are discovered by directory scan and need
+        no config entry, so this is a no-op for them.
+        """
+        config_manager = GriptapeNodes.ConfigManager()
+        try:
+            canonicalize_for_identity(full_path).relative_to(canonicalize_for_identity(config_manager.workspace_path))
+        except ValueError:
+            existing_workflows = config_manager.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
+            if not existing_workflows:
+                existing_workflows = []
+            if full_path not in existing_workflows:
+                existing_workflows.append(full_path)
+            config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
+
     def on_register_workflow_request(self, request: RegisterWorkflowRequest) -> ResultPayload:
         # The registry key is derived from the file path (minus extension), independent of the display name.
         registry_key = derive_registry_key(request.file_name)
@@ -947,16 +1063,7 @@ class WorkflowManager:
         # Persist external workflows to global config so they survive restarts and appear in all projects.
         # Workspace workflows are discovered by directory scan and don't need an explicit entry.
         full_path = WorkflowRegistry.get_complete_file_path(request.file_path)
-        config_manager = GriptapeNodes.ConfigManager()
-        try:
-            canonicalize_for_identity(full_path).relative_to(canonicalize_for_identity(config_manager.workspace_path))
-        except ValueError:
-            existing_workflows = config_manager.get_config_value(WORKFLOWS_TO_REGISTER_KEY)
-            if not existing_workflows:
-                existing_workflows = []
-            if full_path not in existing_workflows:
-                existing_workflows.append(full_path)
-            config_manager.set_config_value(WORKFLOWS_TO_REGISTER_KEY, existing_workflows)
+        self._persist_external_workflow_registration(full_path)
 
         return ImportWorkflowResultSuccess(
             workflow_name=register_result.workflow_name,
@@ -1033,6 +1140,7 @@ class WorkflowManager:
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
+        self._drop_substitution_flag(request.name)
         return DeleteWorkflowResultSuccess(
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
@@ -1041,27 +1149,54 @@ class WorkflowManager:
         # Preserve the raw user input as the display name (metadata.name).
         display_name = request.requested_name
         # Sanitize to a Python module-friendly name for the file stem (registry key).
-        sanitized_name = normalize_display_name(request.requested_name)
-        if not sanitized_name:
+        sanitized_stem = normalize_display_name(request.requested_name)
+        if not sanitized_stem:
             details = f"Attempted to rename workflow '{request.workflow_name}'. The requested name '{request.requested_name}' produced an empty file name after sanitization."
             return RenameWorkflowResultFailure(result_details=details)
 
+        # Rename keeps the workflow's location (unlike Move). Inherit the source workflow's
+        # directory and prepend it to the sanitized stem so the renamed file stays put:
+        # a workspace sub-dir ("bar/new_name") or an external absolute path ("/ext/new_name").
+        # The combined name is NOT re-run through normalize_display_name, so its "/" survives.
+        requested_file_name = sanitized_stem
+        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
+            source = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            if source.file_path:
+                source_dir = PurePosixPath(source.file_path.replace("\\", "/")).parent
+                if str(source_dir) not in ("", "."):
+                    requested_file_name = f"{source_dir}/{sanitized_stem}"
+
         save_workflow_request = await GriptapeNodes.ahandle_request(
-            SaveWorkflowRequest(file_name=sanitized_name, display_name=display_name)
+            SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name)
         )
 
-        if isinstance(save_workflow_request, SaveWorkflowResultFailure):
-            details = f"Attempted to rename workflow '{request.workflow_name}' to '{sanitized_name}'. Failed while attempting to save."
+        if not isinstance(save_workflow_request, SaveWorkflowResultSuccess):
+            details = f"Attempted to rename workflow '{request.workflow_name}' to '{requested_file_name}'. Failed while attempting to save."
             return RenameWorkflowResultFailure(result_details=details)
 
-        # If the original workflow isn't registered, treat this as a Save As and skip deletion
-        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
+        new_workflow_name = save_workflow_request.workflow_name
+
+        # Transfer the substitution flag to the new name before the delete call removes the old entry.
+        if new_workflow_name != request.workflow_name:
+            self._rekey_substitution_flag(request.workflow_name, new_workflow_name)
+
+        # If the renamed file landed outside the workspace, keep it registered at its new path
+        # (the old path's registration is stripped by the delete below).
+        self._persist_external_workflow_registration(str(save_workflow_request.file_path))
+
+        # If the original workflow isn't registered, treat this as a Save As and skip deletion.
+        # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
+        # don't delete the file we just saved.
+        if (
+            WorkflowRegistry.has_workflow_with_name(request.workflow_name)
+            and new_workflow_name != request.workflow_name
+        ):
             delete_workflow_result = await GriptapeNodes.ahandle_request(
                 DeleteWorkflowRequest(name=request.workflow_name)
             )
             if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
                 details = (
-                    f"Attempted to rename workflow '{request.workflow_name}' to '{sanitized_name}'. "
+                    f"Attempted to rename workflow '{request.workflow_name}' to '{new_workflow_name}'. "
                     "Failed while attempting to remove the original file name from the registry."
                 )
                 return RenameWorkflowResultFailure(result_details=details)
@@ -1073,12 +1208,12 @@ class WorkflowManager:
             context_manager.has_current_workflow()
             and context_manager.get_current_workflow_name() == request.workflow_name
         ):
-            context_manager.set_current_workflow_name(sanitized_name)
+            context_manager.set_current_workflow_name(new_workflow_name)
 
         return RenameWorkflowResultSuccess(
-            new_workflow_name=sanitized_name,
+            new_workflow_name=new_workflow_name,
             result_details=ResultDetails(
-                message=f"Successfully renamed workflow to: {sanitized_name}", level=logging.INFO
+                message=f"Successfully renamed workflow to: {new_workflow_name}", level=logging.INFO
             ),
         )
 
@@ -1346,8 +1481,19 @@ class WorkflowManager:
         if updated_content is None:
             return "Failed to update metadata header."
 
+        # Metadata-header rewrite: we already have the absolute on-disk path of an
+        # existing workflow file. _write_workflow_file's single-destination contract
+        # (so macro-driven saves can thread their unresolved MacroPath through to
+        # OSManager) means we wrap the literal path here. File's constructor stores
+        # non-macro strings verbatim, so the write goes through OSManager's
+        # sanitize-and-write branch with no macro resolution. OVERWRITE matches the
+        # in-place semantics this caller needs.
+        destination = ProjectFileDestination(
+            str(file_path),
+            existing_file_policy=ExistingFilePolicy.OVERWRITE,
+        )
         write_result = self._write_workflow_file(
-            file_path=file_path, content=updated_content, file_name=workflow_metadata.name
+            destination=destination, content=updated_content, file_name=workflow_metadata.name
         )
         if not write_result.success:
             return write_result.error_details
@@ -1495,6 +1641,7 @@ class WorkflowManager:
             # Update registry key if directory changed
             if old_registry_key != new_registry_key:
                 WorkflowRegistry.rekey_workflow(old_registry_key, new_registry_key)
+                self._rekey_substitution_flag(old_registry_key, new_registry_key)
                 context_manager = GriptapeNodes.ContextManager()
                 if (
                     context_manager.has_current_workflow()
@@ -1872,115 +2019,191 @@ class WorkflowManager:
         return True
 
     class WriteWorkflowFileResult(NamedTuple):
-        """Result of writing a workflow file."""
+        """Result of writing a workflow file.
+
+        ``written_file`` is populated on success and carries the post-write
+        location (which may differ from the requested path when CREATE_NEW
+        seeded an index slot or walked past a collision).
+        """
 
         success: bool
         error_details: str
+        written_file: File | None = None
 
     class WorkflowSavePath(NamedTuple):
-        """Absolute save path and its registry-relative form."""
+        """Unresolved workflow save destination plus its registry-relative form.
 
-        file_path: Path
+        ``destination`` carries the unresolved ``MacroPath`` so it can be passed
+        through to the OSManager write handler intact. The handler seeds and
+        walks an unresolved required ``{x:NN}`` slot on CREATE_NEW writes —
+        pre-resolving here would strip that context.
+        """
+
+        destination: ProjectFileDestination
         relative_file_path: str
 
-    def _build_workflow_save_path(self, file_name: str, sub_dirs: str | None = None) -> WorkflowSavePath:
-        """Resolve a workflow save path via the ``save_workflow`` situation.
+    class NamedSavePath(NamedTuple):
+        """Save destination for a user-supplied name, plus the bare file stem."""
 
-        Returns the absolute save path plus a registry-relative form. When the
-        resolved path lives inside the workspace the relative form stays
-        workspace-relative; otherwise it falls back to the absolute path string
-        so registry lookups land at the same location. If the situation cannot
-        resolve (e.g., no project loaded), we fall through to the plain
-        workspace path.
+        file_name: str
+        destination: ProjectFileDestination
+        relative_file_path: str
+
+    def _build_workflow_save_path(
+        self,
+        file_name: str,
+        sub_dirs: str | None = None,
+        situation_name: str = BuiltInSituation.SAVE_WORKFLOW,
+    ) -> WorkflowSavePath:
+        """Build a workflow save destination via a named situation.
+
+        Returns an unresolved ``ProjectFileDestination`` plus a registry-relative
+        display string. The destination's macro is resolved inside
+        ``OSManager.on_write_file_request`` so the seed-and-retry contract for
+        unresolved required ``{x:NN}`` slots applies (see issue #4941).
+
+        ``relative_file_path`` is computed from the user-supplied name and
+        sub-directory directly; out-of-workspace handling and macro-form
+        portability happen post-write via ``ProjectFileDestination._map_to_macro_file``.
+
+        ``situation_name`` defaults to ``save_workflow`` (overwrite-in-place
+        semantics). Pass ``create_versioned_workflow`` for the versioned-save
+        flow that bumps the padded index every save (issue #4945).
         """
         extra_vars: dict[str, str | int] = {}
         if sub_dirs:
             extra_vars["sub_dirs"] = sub_dirs
 
-        destination = ProjectFileDestination.from_situation(file_name, "save_workflow", **extra_vars)
+        destination = ProjectFileDestination.from_situation(file_name, situation_name, **extra_vars)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
-        try:
-            resolved = canonicalize_for_identity(destination.resolve())
-        except FileLoadError as err:
-            workspace_path = GriptapeNodes.ConfigManager().workspace_path
-            fallback_path = workspace_path.joinpath(relative_file_path)
-            logger.debug(
-                "save_workflow situation unavailable for '%s' (%s); falling back to workspace path %s",
-                file_name,
-                err,
-                fallback_path,
-            )
-            return WorkflowManager.WorkflowSavePath(
-                file_path=fallback_path,
-                relative_file_path=relative_file_path,
-            )
+        return WorkflowManager.WorkflowSavePath(
+            destination=destination,
+            relative_file_path=relative_file_path,
+        )
 
+    @staticmethod
+    def _workspace_relative_path(absolute_or_relative_path: str) -> str:
+        """Return the workspace-relative form of a path, or the absolute path if outside.
+
+        Used post-write to reconcile registry state with the actual on-disk
+        location (e.g. when CREATE_NEW seeded an index slot, the written file
+        is ``foo_v001.py`` while the request asked for ``foo.py``).
+        """
+        path = Path(absolute_or_relative_path)
         workspace_path = GriptapeNodes.ConfigManager().workspace_path
         try:
-            workspace_relative = resolved.relative_to(workspace_path)
+            relative = canonicalize_for_identity(path).relative_to(canonicalize_for_identity(workspace_path))
         except ValueError:
             # TODO: store the macro form (e.g. "{workspace_dir}/foo.py") in the
             # registry so out-of-workspace save locations stay portable across
             # machines. Tracked in
             # https://github.com/griptape-ai/griptape-nodes/issues/2047.
-            return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(resolved))
+            return str(path)
+        return str(relative)
 
-        return WorkflowManager.WorkflowSavePath(file_path=resolved, relative_file_path=str(workspace_relative))
+    def _resolve_named_save_path(
+        self,
+        requested_file_name: str,
+        situation_name: str = BuiltInSituation.SAVE_WORKFLOW,
+    ) -> NamedSavePath:
+        """Resolve a user-supplied save name (possibly carrying a directory) to a save destination.
 
-    def _write_workflow_file(self, file_path: Path, content: str, file_name: str) -> WriteWorkflowFileResult:
-        """Write workflow content to file with proper validation and error handling.
+        A relative name like "episode/my_wf" splits into sub-directory + stem and routes
+        through the workspace save situation. An absolute name like "/ext/my_wf" (produced
+        when renaming an externally-registered workflow) is honored verbatim:
+        ProjectFileDestination.from_situation bypasses the workspace macro for absolute
+        filenames.
 
-        Uses OSManager's WriteFileRequest for file writing with exclusive locking.
-        First write wins - if another process is writing, this call fails immediately.
-
-        Args:
-            file_path: Path where to write the file
-            content: Content to write
-            file_name: Name for error messages
-
-        Returns:
-            WriteWorkflowFileResult with success status and error details if failed
+        ``situation_name`` selects which situation drives the save (default
+        ``save_workflow``; pass ``create_versioned_workflow`` for versioned saves).
         """
-        # Check disk space before any file system operations
-        config_manager = GriptapeNodes.ConfigManager()
-        min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_workflows")
-        if not OSManager.check_available_disk_space(file_path.parent, min_space_gb):
-            error_msg = OSManager.format_disk_space_error(file_path.parent)
-            details = f"Attempted to save workflow '{file_name}' (requires {min_space_gb:.1f} GB). Failed due to insufficient disk space: {error_msg}"
-            return self.WriteWorkflowFileResult(success=False, error_details=details)
-
-        # Write file using OSManager's centralized file writing API
-        os_manager = GriptapeNodes.OSManager()
-        write_request = WriteFileRequest(
-            file_path=str(file_path),
-            content=content,
-            encoding="utf-8",
-            append=False,
-            existing_file_policy=ExistingFilePolicy.OVERWRITE,
-            create_parents=True,
+        parts = FilenameParts.from_filename(f"{requested_file_name}.py")
+        if parts.directory.is_absolute():
+            destination, relative_file_path = self._build_workflow_save_path(
+                f"{requested_file_name}.py", situation_name=situation_name
+            )
+        else:
+            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
+            destination, relative_file_path = self._build_workflow_save_path(
+                f"{parts.stem}.py", sub_dirs=sub_dirs, situation_name=situation_name
+            )
+        return WorkflowManager.NamedSavePath(
+            file_name=parts.stem, destination=destination, relative_file_path=relative_file_path
         )
 
-        result = os_manager.on_write_file_request(write_request)
+    def _write_workflow_file(
+        self, destination: ProjectFileDestination, content: str, file_name: str
+    ) -> WriteWorkflowFileResult:
+        """Write workflow content via a ``ProjectFileDestination``.
 
-        if isinstance(result, WriteFileResultFailure):
-            # Map failure reasons to workflow-specific error messages
-            match result.failure_reason:
-                case FileIOFailureReason.IO_ERROR:
-                    # Could be lock exception or other I/O error
-                    error_msg = str(result.result_details)
-                case FileIOFailureReason.PERMISSION_DENIED:
-                    error_msg = f"Permission denied: {result.result_details}"
-                case FileIOFailureReason.IS_DIRECTORY:
-                    error_msg = "Path is a directory, not a file"
-                case FileIOFailureReason.ENCODING_ERROR:
-                    error_msg = f"Content encoding error: {result.result_details}"
-                case _:
-                    error_msg = str(result.result_details)
+        The unresolved macro (when the destination carries one) is threaded
+        through to the OSManager write handler so the seed-and-retry contract
+        for unresolved required ``{x:NN}`` slots applies (#4941) and the
+        situation's collision policy is honored. Callers with a plain on-disk
+        path wrap it as ``ProjectFileDestination(str(path), ...)`` — the
+        ``File`` constructor stores literal paths verbatim, so the write
+        behaves as an in-place overwrite (used by header-only metadata
+        updates).
+        """
+        # Best-effort disk-space probe. When the destination's macro can't yet
+        # resolve (e.g. an unresolved required `{_index:03}` slot is waiting to
+        # be seeded inside OSManager), skip the proactive check and let any
+        # actual disk-full surface as IO_ERROR from the write.
+        check_dir = self._probe_parent_for_disk_check(destination)
+        if check_dir is not None:
+            config_manager = GriptapeNodes.ConfigManager()
+            min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_workflows")
+            if not OSManager.check_available_disk_space(check_dir, min_space_gb):
+                error_msg = OSManager.format_disk_space_error(check_dir)
+                details = f"Attempted to save workflow '{file_name}' (requires {min_space_gb:.1f} GB). Failed due to insufficient disk space: {error_msg}"
+                return self.WriteWorkflowFileResult(success=False, error_details=details)
 
-            details = f"Attempted to save workflow '{file_name}'. {error_msg}"
+        try:
+            written_file = destination.write_text(content, encoding="utf-8")
+        except FileWriteError as err:
+            details = self._format_workflow_write_error(file_name, err.failure_reason, err.result_details)
             return self.WriteWorkflowFileResult(success=False, error_details=details)
+        return self.WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
-        return self.WriteWorkflowFileResult(success=True, error_details="")
+    @staticmethod
+    def _probe_parent_for_disk_check(destination: ProjectFileDestination) -> Path | None:
+        """Return the parent directory to use for the pre-write disk-space probe.
+
+        Returns ``None`` when the destination's macro can't be resolved without
+        seeding (we'd be duplicating OSManager's seed logic here). The actual
+        write will surface a disk-full as IO_ERROR.
+        """
+        try:
+            # Resolve only to learn the target *directory* for the disk-space probe.
+            # The macro may still carry unresolved seed-eligible slots (e.g.
+            # `{_index:03}`); those get seeded later inside OSManager during the
+            # actual write. We don't want to duplicate that seed logic here just
+            # to satisfy a best-effort capacity check.
+            resolved = destination.resolve()
+        except FileLoadError:
+            # Macro couldn't resolve (typically because a required `{x:NN}` slot
+            # is waiting for OSManager's seed-and-retry). Skip the proactive
+            # check and let the write itself raise IO_ERROR if the volume is
+            # actually full — the user still gets a clear failure, just without
+            # the "X.X GB required" pre-flight message.
+            return None
+        return Path(resolved).parent
+
+    @staticmethod
+    def _format_workflow_write_error(file_name: str, failure_reason: FileIOFailureReason, details: str) -> str:
+        """Build the user-facing error string for a workflow write failure."""
+        match failure_reason:
+            case FileIOFailureReason.IO_ERROR:
+                error_msg = details
+            case FileIOFailureReason.PERMISSION_DENIED:
+                error_msg = f"Permission denied: {details}"
+            case FileIOFailureReason.IS_DIRECTORY:
+                error_msg = "Path is a directory, not a file"
+            case FileIOFailureReason.ENCODING_ERROR:
+                error_msg = f"Content encoding error: {details}"
+            case _:
+                error_msg = details
+        return f"Attempted to save workflow '{file_name}'. {error_msg}"
 
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
@@ -1992,23 +2215,42 @@ class WorkflowManager:
             save_target = self._determine_save_target(
                 requested_file_name=request.file_name,
                 current_workflow_name=current_workflow_name,
+                create_versioned=request.create_versioned,
             )
         except ValueError as e:
             details = f"Attempted to save workflow. Failed when determining save target: {e}"
             return SaveWorkflowResultFailure(result_details=details)
 
         file_name = save_target.file_name
-        file_path = save_target.file_path
         relative_file_path = save_target.relative_file_path
         creation_date = save_target.creation_date
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
+        # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
+        # (in-place overwrite) wrapped in a ProjectFileDestination. All other
+        # scenarios carry an unresolved destination so the save_workflow
+        # situation macro resolves at write time, preserving the seed-and-retry
+        # contract for unresolved required `{x:NN}` slots.
+        if save_target.destination is not None:
+            destination = save_target.destination
+        elif save_target.file_path is not None:
+            destination = ProjectFileDestination(
+                str(save_target.file_path),
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
+        else:
+            msg = (
+                f"Save target for '{relative_file_path}' has neither a destination nor a file_path; "
+                "this is a programming error in _determine_save_target."
+            )
+            return SaveWorkflowResultFailure(result_details=msg)
+
         logger.debug(
-            "Save workflow: scenario=%s, file_name=%s, file_path=%s, branched_from=%s",
+            "Save workflow: scenario=%s, file_name=%s, destination=%s, branched_from=%s",
             save_target.scenario.value,
             file_name,
-            str(file_path),
+            destination.location,
             branched_from or "None",
         )
 
@@ -2042,7 +2284,8 @@ class WorkflowManager:
         # Prefer an explicitly provided display_name over the preserved existing value.
         resolved_display_name = request.display_name if request.display_name is not None else existing.display_name
 
-        save_file_request = SaveWorkflowFileFromSerializedFlowRequest(
+        save_file_result = self._save_workflow_file_inline(
+            destination=destination,
             serialized_flow_commands=commands,
             file_name=file_name,
             creation_date=creation_date,
@@ -2050,17 +2293,17 @@ class WorkflowManager:
             image_path=request.image_path if request.image_path is not None else existing.image,
             description=existing.description,
             is_template=existing.is_template,
-            execution_flow_name=top_level_flow_name,
             branched_from=branched_from,
             workflow_shape=workflow_shape,
-            file_path=str(file_path),
             pickle_control_flow_result=(
                 request.pickle_control_flow_result if request.pickle_control_flow_result is not None else False
             ),
         )
-
-        # Execute save and update registry inline
-        save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
+        # _save_workflow_file_inline returns a SaveWorkflowFileFromSerializedFlowResult*
+        # (its native result family). on_save_workflow_request's public contract
+        # returns SaveWorkflowResult*. The check here translates between the two
+        # failure types — it stays outside the helper because the helper is called
+        # from two handlers with different outer result families.
         if not isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
             details = (
                 f"Attempted to save workflow '{relative_file_path}'. "
@@ -2069,6 +2312,16 @@ class WorkflowManager:
             return SaveWorkflowResultFailure(result_details=details)
 
         workflow_metadata = save_file_result.workflow_metadata
+
+        # Reconcile registry key / relative_file_path with the actual written path
+        # for macro-driven saves. CREATE_NEW + `{_index:03}` may produce
+        # `foo_v001.py` from a `foo.py` request; the registry must key by what
+        # ended up on disk, not what was asked for.
+        if save_target.destination is not None:
+            written_relative = self._workspace_relative_path(save_file_result.file_path)
+            if written_relative != relative_file_path:
+                relative_file_path = written_relative
+                registry_key = derive_registry_key(relative_file_path)
 
         # Handle the unsaved -> saved transition: if the current-context workflow is an
         # unsaved entry, swap its registry key to the path-derived key and update its
@@ -2092,8 +2345,10 @@ class WorkflowManager:
             # dropping the unsaved entry and updating the existing saved entry below.
             if registry_key in registered_workflows:
                 WorkflowRegistry.delete_workflow_by_name(unsaved_source_key)
+                self._drop_substitution_flag(unsaved_source_key)
             else:
                 WorkflowRegistry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
+                self._rekey_substitution_flag(unsaved_source_key, registry_key)
                 rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
             for workflow_context_state in GriptapeNodes.ContextManager()._workflow_stack:
@@ -2176,14 +2431,24 @@ class WorkflowManager:
                 return candidate_name
             curr_idx += 1
 
-    def _determine_save_target(  # noqa: PLR0915
-        self, requested_file_name: str | None, current_workflow_name: str | None
+    def _determine_save_target(  # noqa: C901, PLR0912, PLR0915
+        self,
+        requested_file_name: str | None,
+        current_workflow_name: str | None,
+        *,
+        create_versioned: bool = False,
     ) -> SaveWorkflowTargetInfo:
         """Determine the target file path, name, and metadata for saving a workflow.
 
         Args:
             requested_file_name: The name the user wants to save as (can be None)
             current_workflow_name: The workflow currently loaded in context (can be None)
+            create_versioned: When True, route every save through the
+                ``create_versioned_workflow`` situation so each save produces a
+                new versioned file (e.g. ``foo_v001.py``, ``foo_v002.py``, ...).
+                When False (default), the standard scenarios apply
+                (FIRST_SAVE / OVERWRITE_EXISTING / SAVE_AS / SAVE_FROM_TEMPLATE)
+                via the ``save_workflow`` situation.
 
         Returns:
             SaveWorkflowTargetInfo with all information needed to save the workflow
@@ -2206,6 +2471,45 @@ class WorkflowManager:
         if current_workflow_name and WorkflowRegistry.has_workflow_with_name(current_workflow_name):
             current_workflow = WorkflowRegistry.get_workflow_by_name(current_workflow_name)
 
+        # Pick the situation up-front: create_versioned diverts EVERY save through
+        # create_versioned_workflow (with CREATE_NEW + a padded slot) so each save
+        # bumps the version. Without it, the standard save_workflow situation applies.
+        situation_name = (
+            BuiltInSituation.CREATE_VERSIONED_WORKFLOW if create_versioned else BuiltInSituation.SAVE_WORKFLOW
+        )
+        self._warn_if_situation_policy_mismatches_intent(situation_name, create_versioned=create_versioned)
+
+        # CREATE_VERSIONED short-circuits the OVERWRITE_EXISTING branch. Even when
+        # the workflow is already in the registry with a saved file_path, a versioned
+        # save re-resolves the macro so OSManager's seed-and-retry walks past
+        # existing versions and produces the next one. We still need a base filename;
+        # prefer the user's requested name → current workflow's display name →
+        # registry-derived stem from the existing file_path.
+        if create_versioned:
+            base_name = self._derive_versioned_base_name(
+                requested_file_name=requested_file_name,
+                current_workflow=current_workflow,
+                target_workflow=target_workflow,
+            )
+            file_name, destination, relative_file_path = self._resolve_named_save_path(
+                base_name, situation_name=situation_name
+            )
+            creation_date = (
+                current_workflow.metadata.creation_date if current_workflow is not None else datetime.now(tz=UTC)
+            )
+            branched_from = current_workflow.metadata.branched_from if current_workflow is not None else None
+            if (creation_date is None) or (creation_date == WorkflowManager.EPOCH_START):
+                creation_date = datetime.now(tz=UTC)
+            return WorkflowManager.SaveWorkflowTargetInfo(
+                scenario=WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED,
+                file_name=file_name,
+                destination=destination,
+                file_path=None,
+                relative_file_path=relative_file_path,
+                creation_date=creation_date,
+                branched_from=branched_from,
+            )
+
         # Determine scenario and build target info
         # Only treat as SAVE_FROM_TEMPLATE if this is a Griptape-provided template.
         # User-marked templates (is_template=True but is_griptape_provided=False) should be saved normally.
@@ -2217,6 +2521,8 @@ class WorkflowManager:
             and current_workflow.metadata.is_template
             and current_workflow.metadata.is_griptape_provided
         )
+        destination: ProjectFileDestination | None = None
+        file_path: Path | None = None
         if target_is_griptape_template or current_is_griptape_template:
             # Griptape-provided template workflows always create new copies with unique names.
             # Griptape-provided templates are always disk-backed, so file_path is guaranteed.
@@ -2230,7 +2536,7 @@ class WorkflowManager:
             file_name = self._generate_unique_filename(base_name)
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py")
+            destination, relative_file_path = self._build_workflow_save_path(f"{file_name}.py")
 
         elif target_workflow and target_workflow.file_path is not None:
             # Requested name exists in registry as a saved workflow → overwrite it.
@@ -2251,10 +2557,7 @@ class WorkflowManager:
             scenario = WorkflowManager.SaveWorkflowScenario.SAVE_AS
             creation_date = current_workflow.metadata.creation_date
             branched_from = current_workflow.metadata.branched_from
-            parts = FilenameParts.from_filename(f"{requested_file_name}.py")
-            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            file_name = parts.stem
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py", sub_dirs=sub_dirs)
+            file_name, destination, relative_file_path = self._resolve_named_save_path(requested_file_name)
 
         else:
             # No requested name or no current workflow → first save.
@@ -2270,12 +2573,9 @@ class WorkflowManager:
                 raw_name = sanitized or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
             else:
                 raw_name = requested_file_name or datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
-            parts = FilenameParts.from_filename(f"{raw_name}.py")
-            sub_dirs = str(parts.directory) if str(parts.directory) != "." else None
-            file_name = parts.stem
             creation_date = datetime.now(tz=UTC)
             branched_from = None
-            file_path, relative_file_path = self._build_workflow_save_path(f"{file_name}.py", sub_dirs=sub_dirs)
+            file_name, destination, relative_file_path = self._resolve_named_save_path(raw_name)
 
         # Ensure creation date is valid (backcompat)
         if (creation_date is None) or (creation_date == WorkflowManager.EPOCH_START):
@@ -2284,70 +2584,194 @@ class WorkflowManager:
         return WorkflowManager.SaveWorkflowTargetInfo(
             scenario=scenario,
             file_name=file_name,
+            destination=destination,
             file_path=file_path,
             relative_file_path=relative_file_path,
             creation_date=creation_date,
             branched_from=branched_from,
         )
 
+    @staticmethod
+    def _derive_versioned_base_name(
+        *,
+        requested_file_name: str | None,
+        current_workflow: Workflow | None,
+        target_workflow: Workflow | None,
+    ) -> str:
+        """Pick the base filename for a versioned save.
+
+        Priority:
+        1. Explicit ``requested_file_name`` (user typed it).
+        2. The current workflow's display name (``metadata.name``), sanitized.
+        3. The current workflow's existing on-disk stem with any trailing
+           ``_v###`` version suffix stripped — so saving over ``foo_v001.py``
+           produces ``foo_v002.py`` (not ``foo_v001_v001.py``).
+        4. The target workflow's on-disk stem (same suffix strip), if no
+           current workflow is in scope.
+        5. A timestamp fallback when no other source is available.
+        """
+        if requested_file_name:
+            return requested_file_name
+
+        candidate_workflow = current_workflow if current_workflow is not None else target_workflow
+        if candidate_workflow is not None:
+            display_name = (candidate_workflow.metadata.name or "").strip()
+            sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
+            if sanitized:
+                return sanitized
+            if candidate_workflow.file_path is not None:
+                stem = derive_registry_key(candidate_workflow.file_path)
+                # Strip a trailing _v### so the next versioned save bumps the
+                # index against the same base name.
+                return re.sub(r"_v\d+$", "", stem)
+
+        return datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
+
+    def _warn_if_situation_policy_mismatches_intent(self, situation_name: str, *, create_versioned: bool) -> None:
+        """Log a warning when a situation's policy doesn't match the caller's intent.
+
+        - ``create_versioned=True`` expects an unresolved padded slot; warn when
+          the chosen situation uses ``overwrite``.
+        - ``create_versioned=False`` expects in-place overwrite; warn when
+          ``save_workflow`` has been customized to ``create_new``.
+
+        These mismatches are configuration smells, not hard errors:
+        CREATE_NEW without a ``{x:NN}`` slot still works (OSManager's collision
+        fallback synthesizes ``_1``, ``_2``, ...), and OVERWRITE with an
+        ``{_index:NN}`` slot renders a literal ``_v000``. We surface the
+        mismatch so the user can correct the situation if it doesn't reflect
+        their intent.
+        """
+        result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        if not isinstance(result, GetSituationResultSuccess):
+            return  # Missing situation surfaces as a load failure elsewhere; nothing useful to warn about here.
+
+        on_collision = result.situation.policy.on_collision
+        if create_versioned and on_collision != SituationFilePolicy.CREATE_NEW:
+            logger.warning(
+                "Versioned save requested but situation '%s' uses '%s' policy; saves may overwrite in place. "
+                "Set the situation's policy to 'create_new' (with a padded `{_index:NN}` slot) for true versioning.",
+                situation_name,
+                on_collision.value,
+            )
+        elif not create_versioned and on_collision == SituationFilePolicy.CREATE_NEW:
+            logger.warning(
+                "Non-versioned save requested but situation '%s' uses 'create_new' policy; saves will produce "
+                "auto-indexed files instead of overwriting in place. Set the situation's policy to 'overwrite' "
+                "for in-place saves, or use create_versioned=True for explicit versioning.",
+                situation_name,
+            )
+
     async def on_save_workflow_file_from_serialized_flow_request(
         self, request: SaveWorkflowFileFromSerializedFlowRequest
     ) -> ResultPayload:
         """Save a workflow file from serialized flow commands without registry overhead."""
-        # Determine file path
+        # Determine write destination
         if request.file_path:
-            # Use provided file path
-            file_path = Path(request.file_path)
+            # Callers that pre-resolved a file path (rename, failed-workflow saver,
+            # node-executor publishers) save exactly there via in-place overwrite.
+            # File treats literal absolute paths as non-macros, so the write goes
+            # straight through OSManager's sanitize-and-write branch.
+            destination = ProjectFileDestination(
+                request.file_path,
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
         else:
             # Resolve via the save_workflow situation (workspace-relative by default).
-            file_path = self._build_workflow_save_path(f"{request.file_name}.py").file_path
+            destination = self._build_workflow_save_path(f"{request.file_name}.py").destination
 
-        # Use provided creation date or default to current time
-        creation_date = request.creation_date
+        return self._save_workflow_file_inline(
+            destination=destination,
+            serialized_flow_commands=request.serialized_flow_commands,
+            file_name=request.file_name,
+            creation_date=request.creation_date,
+            display_name=request.display_name,
+            image_path=request.image_path,
+            description=request.description,
+            is_template=request.is_template,
+            branched_from=request.branched_from,
+            workflow_shape=request.workflow_shape,
+            pickle_control_flow_result=request.pickle_control_flow_result,
+        )
+
+    def _save_workflow_file_inline(  # noqa: PLR0913
+        self,
+        *,
+        destination: ProjectFileDestination,
+        serialized_flow_commands: SerializedFlowCommands,
+        file_name: str,
+        creation_date: datetime | None,
+        display_name: str | None,
+        image_path: str | None,
+        description: str | None,
+        is_template: bool | None,
+        branched_from: str | None,
+        workflow_shape: WorkflowShape | None,
+        pickle_control_flow_result: bool,
+    ) -> ResultPayload:
+        """Generate the workflow file content and write it to ``destination``.
+
+        Shared by ``on_save_workflow_request`` and
+        ``on_save_workflow_file_from_serialized_flow_request``. Callers with a
+        pre-resolved Path wrap it as ``ProjectFileDestination(str(path), ...)``
+        before calling this helper.
+        """
         if creation_date is None:
             creation_date = datetime.now(tz=UTC)
 
-        # Generate metadata from the serialized commands
         try:
             workflow_metadata = self._generate_workflow_metadata_from_commands(
-                serialized_flow_commands=request.serialized_flow_commands,
-                file_name=request.file_name,
+                serialized_flow_commands=serialized_flow_commands,
+                file_name=file_name,
                 creation_date=creation_date,
-                display_name=request.display_name,
-                image_path=request.image_path,
-                description=request.description,
-                is_template=request.is_template,
-                branched_from=request.branched_from,
-                workflow_shape=request.workflow_shape,
+                display_name=display_name,
+                image_path=image_path,
+                description=description,
+                is_template=is_template,
+                branched_from=branched_from,
+                workflow_shape=workflow_shape,
             )
         except Exception as err:
-            details = f"Attempted to save workflow file '{request.file_name}' from serialized flow commands. Failed during metadata generation: {err}"
+            details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during metadata generation: {err}"
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=details)
 
-        # Use provided execution flow name or default to file name
-        execution_flow_name = request.execution_flow_name
-        if execution_flow_name is None:
-            execution_flow_name = request.file_name
-
-        # Generate the workflow file content
         try:
             final_code_output = self._generate_workflow_file_content(
-                serialized_flow_commands=request.serialized_flow_commands,
+                serialized_flow_commands=serialized_flow_commands,
                 workflow_metadata=workflow_metadata,
-                pickle_control_flow_result=request.pickle_control_flow_result,
+                pickle_control_flow_result=pickle_control_flow_result,
             )
         except Exception as err:
-            details = f"Attempted to save workflow file '{request.file_name}' from serialized flow commands. Failed during content generation: {err}"
+            details = f"Attempted to save workflow file '{file_name}' from serialized flow commands. Failed during content generation: {err}"
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=details)
 
-        # Write the workflow file
-        write_result = self._write_workflow_file(file_path, final_code_output, request.file_name)
+        write_result = self._write_workflow_file(destination, final_code_output, file_name)
         if not write_result.success:
             return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=write_result.error_details)
 
-        details = f"Successfully saved workflow file at: {file_path}"
+        # Prefer the post-write location from ``_write_workflow_file`` — for
+        # macro-driven saves this reflects the resolved-and-possibly-seeded
+        # filename (e.g. ``..._v001.py``), not the unresolved template.
+        if write_result.written_file is not None:
+            try:
+                # Re-resolve to get the absolute on-disk path the write actually
+                # landed at (``_map_to_macro_file`` may have rewritten the
+                # ``File`` to its portable macro form like ``{workspace_dir}/...``).
+                final_file_path = write_result.written_file.resolve()
+            except FileLoadError:
+                # Re-resolution failed (project unloaded between the write and
+                # this re-resolve, or the macro form references a directory that
+                # disappeared). Fall back to the ``File.location`` string —
+                # for non-macro paths it's the absolute path; for macro paths
+                # it's the unresolved template, which is still a meaningful
+                # human-readable answer for the success message.
+                final_file_path = write_result.written_file.location
+        else:
+            final_file_path = destination.location
+
+        details = f"Successfully saved workflow file at: {final_file_path}"
         return SaveWorkflowFileFromSerializedFlowResultSuccess(
-            file_path=str(file_path),
+            file_path=final_file_path,
             workflow_metadata=workflow_metadata,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
@@ -2422,7 +2846,6 @@ class WorkflowManager:
             description=existing.description,
             image_path=existing.image,
             is_template=existing.is_template,
-            execution_flow_name=file_name,
             workflow_shape=workflow_shape,
         )
         save_file_result = await self.on_save_workflow_file_from_serialized_flow_request(save_file_request)
@@ -2477,11 +2900,14 @@ class WorkflowManager:
         # display_name is the human-readable label (metadata.name); falls back to file_name if not provided.
         metadata_name = display_name if display_name is not None else str(file_name)
 
+        direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
+        all_libs = GriptapeNodes.LibraryManager().resolve_transitive_library_deps(direct_libs)
+
         return WorkflowMetadata(
             name=metadata_name,
             schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
             engine_version_created_with=engine_version,
-            node_libraries_referenced=list(serialized_flow_commands.node_dependencies.libraries),
+            node_libraries_referenced=all_libs,
             node_types_used=serialized_flow_commands.node_types_used,
             workflows_referenced=workflows_referenced,
             creation_date=creation_date,
@@ -2529,17 +2955,31 @@ class WorkflowManager:
 
         main_body: list[ast.stmt] = []
 
+        # Snapshot the flag now (at save time) so it's baked into build_workflow().
+        variable_substitution_enabled = self.is_variable_substitution_enabled()
+
         prereq_code = self._generate_workflow_run_prerequisite_code(
-            import_recorder=import_recorder, library_names=library_names
+            import_recorder=import_recorder,
+            library_names=library_names,
+            variable_substitution_enabled=variable_substitution_enabled,
         )
         main_body.extend(cast("ast.stmt", node) for node in prereq_code)
+
+        # Collect library-derived imports separately so they can be emitted inside
+        # build_workflow() after the RegisterLibraryFromFileRequest calls — those calls
+        # are what add the library directory and venv site-packages to sys.path, so the
+        # imports must come after them, not at module top level.
+        deferred_imports: dict[str, set[str]] = {}
 
         # Generate unique values code AST node
         unique_values_node = self._generate_unique_values_code(
             unique_parameter_uuid_to_values=serialized_flow_commands.unique_parameter_uuid_to_values,
             prefix="top_level",
             import_recorder=import_recorder,
+            deferred_imports=deferred_imports,
         )
+        # Emit deferred library imports inside build_workflow(), after sys.path is set up.
+        main_body.extend(self._build_deferred_import_statements(deferred_imports))
         # Helper returns an ast.Module; unpack its body into statements.
         main_body.extend(cast("ast.stmt", stmt) for stmt in unique_values_node.body)
 
@@ -3136,6 +3576,12 @@ class WorkflowManager:
                         # Create CLI argument name: --{param_name}
                         arg_name = f"--{param_name}".lower()
 
+                        # Derive an explicit, identifier-safe dest. Without this, argparse
+                        # derives the dest from the flag name, which can contain characters
+                        # (e.g. parentheses from a node name) that are not valid in a Python
+                        # identifier, making the emitted `args.<dest>` access invalid Python.
+                        arg_dest = self._safe_arg_dest(param_name)
+
                         # Get help text from parameter info
                         help_text = param_info.get("tooltip", f"Parameter {param_name} for node {node_name}")
 
@@ -3149,6 +3595,7 @@ class WorkflowManager:
                                     ),
                                     args=[ast.Constant(arg_name)],
                                     keywords=[
+                                        ast.keyword(arg="dest", value=ast.Constant(arg_dest)),
                                         ast.keyword(arg="default", value=ast.Constant(None)),
                                         ast.keyword(arg="help", value=ast.Constant(help_text)),
                                     ],
@@ -3246,7 +3693,7 @@ class WorkflowManager:
                     test=ast.Compare(
                         left=ast.Attribute(
                             value=ast.Name(id="args", ctx=ast.Load()),
-                            attr=param_name.lower(),
+                            attr=self._safe_arg_dest(param_name),
                             ctx=ast.Load(),
                         ),
                         ops=[ast.IsNot()],
@@ -3267,7 +3714,7 @@ class WorkflowManager:
                             ],
                             value=ast.Attribute(
                                 value=ast.Name(id="args", ctx=ast.Load()),
-                                attr=param_name.lower(),
+                                attr=self._safe_arg_dest(param_name),
                                 ctx=ast.Load(),
                             ),
                         )
@@ -3589,6 +4036,8 @@ class WorkflowManager:
         self,
         import_recorder: ImportRecorder,
         library_names: list[str],
+        *,
+        variable_substitution_enabled: bool = True,
     ) -> list[ast.AST]:
         code_blocks: list[ast.AST] = []
 
@@ -3676,13 +4125,180 @@ class WorkflowManager:
         )
         ast.fix_missing_locations(if_stmt)
         code_blocks.append(if_stmt)
+
+        # When variable substitution is disabled, bake a request call into build_workflow()
+        # so the setting is restored on every load — including running the file as a script.
+        # We only emit the call when disabled (False) because True is the default; omitting
+        # the call for enabled workflows keeps the generated code clean.
+        if not variable_substitution_enabled:
+            import_recorder.add_from_import(
+                "griptape_nodes.retained_mode.events.workflow_events",
+                "SetVariableSubstitutionEnabledRequest",
+            )
+            disable_substitution_call = ast.Expr(
+                value=ast.Await(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
+                            attr="ahandle_request",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            ast.Call(
+                                func=ast.Name(id="SetVariableSubstitutionEnabledRequest", ctx=ast.Load()),
+                                args=[],
+                                keywords=[
+                                    ast.keyword(arg="enabled", value=ast.Constant(value=False)),
+                                    ast.keyword(arg="initial_setup", value=ast.Constant(value=True)),
+                                ],
+                            )
+                        ],
+                        keywords=[],
+                    )
+                )
+            )
+            ast.fix_missing_locations(disable_substitution_call)
+            code_blocks.append(disable_substitution_call)
+
         return code_blocks
+
+    class _ScrubResult(NamedTuple):
+        """Result of scrubbing a value for inline AST emission."""
+
+        value: Any
+        dropped: bool
+
+    @staticmethod
+    def _is_ast_constant_safe(value: Any) -> bool:
+        """True if value is composed only of literals ``ast.unparse`` can round-trip.
+
+        Anything else (e.g. a Button trait object mistakenly placed in ``ui_options``)
+        would be rendered by ``ast.Constant`` via its ``repr()``, which is not valid
+        Python and breaks reopening the saved workflow.
+        """
+        primitives = (str, bytes, bool, int, float, complex, type(None))
+        if isinstance(value, primitives):
+            return True
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return all(WorkflowManager._is_ast_constant_safe(item) for item in value)
+        if isinstance(value, dict):
+            return all(
+                WorkflowManager._is_ast_constant_safe(key) and WorkflowManager._is_ast_constant_safe(item)
+                for key, item in value.items()
+            )
+        return False
+
+    @staticmethod
+    def _scrub_for_ast_constant(value: Any) -> WorkflowManager._ScrubResult:
+        """Return a copy of value with any non-literal leaves removed.
+
+        Recurses through dict/list/tuple/set, dropping keys (for dicts) or elements
+        (for sequences) whose values cannot be emitted as an ``ast.Constant``. The
+        boolean flags whether anything was dropped so callers can warn.
+
+        A bare unsafe scalar with no surrounding container is replaced with ``None``.
+        """
+        if WorkflowManager._is_ast_constant_safe(value):
+            return WorkflowManager._ScrubResult(value=value, dropped=False)
+
+        if isinstance(value, dict):
+            return WorkflowManager._scrub_dict(value)
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return WorkflowManager._scrub_sequence(value)
+
+        # A bare unsafe scalar (e.g. a callable or trait object) with no container to
+        # prune: signal that it was dropped and return None as a safe placeholder.
+        return WorkflowManager._ScrubResult(value=None, dropped=True)
+
+    @staticmethod
+    def _scrub_dict(value: dict) -> WorkflowManager._ScrubResult:
+        """Scrub a dict, dropping entries whose key or (non-container) value is unsafe."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_dict = {}
+        dropped = False
+        for key, item in value.items():
+            # An unsafe key or an unsafe non-container value means we drop the entry entirely.
+            if not WorkflowManager._is_ast_constant_safe(key) or (
+                not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item)
+            ):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_dict[key] = item_result.value
+            dropped = dropped or item_result.dropped
+        return WorkflowManager._ScrubResult(value=scrubbed_dict, dropped=dropped)
+
+    @staticmethod
+    def _scrub_sequence(value: list | tuple | set | frozenset) -> WorkflowManager._ScrubResult:
+        """Scrub a sequence, dropping unsafe non-container elements and recursing into containers."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_items = []
+        dropped = False
+        for item in value:
+            # An unsafe non-container element is dropped; containers are recursed into.
+            if not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_items.append(item_result.value)
+            dropped = dropped or item_result.dropped
+        # Rebuild using the nearest builtin constructor rather than type(value)(...),
+        # so a tuple subclass like a namedtuple (whose __new__ takes positional fields,
+        # not an iterable) becomes a plain tuple instead of raising TypeError.
+        if isinstance(value, list):
+            rebuilt: Any = scrubbed_items
+        elif isinstance(value, tuple):
+            rebuilt = tuple(scrubbed_items)
+        elif isinstance(value, frozenset):
+            rebuilt = frozenset(scrubbed_items)
+        else:
+            rebuilt = set(scrubbed_items)
+        return WorkflowManager._ScrubResult(value=rebuilt, dropped=dropped)
+
+    @staticmethod
+    def _safe_arg_dest(param_name: str) -> str:
+        """Derive a Python-identifier-safe argparse ``dest`` from a parameter name.
+
+        Workflow-input parameter names can contain characters that are invalid in a
+        Python identifier (e.g. ``(``, ``)``, ``.``, ``-``) — this happens when a node
+        name contains them (e.g. ``Generate Media (Diffusion Pipeline)``). argparse
+        would otherwise store the parsed value under an attribute that cannot be read
+        back as ``args.<name>``, and the ``ast.Attribute`` access emitted into the
+        generated workflow is not valid Python, so the file fails to import with
+        ``SyntaxError``. Non-word characters are collapsed to underscores, and a
+        leading digit is prefixed so the result is always a valid identifier.
+        """
+        dest = re.sub(r"\W+", "_", param_name.lower())
+        if dest and dest[0].isdigit():
+            dest = f"_{dest}"
+        return dest
+
+    @staticmethod
+    def _keyword_from_field_value(arg_name: str, field_value: Any, command: Any) -> ast.keyword:
+        """Build an ``ast.keyword`` for a command field, scrubbing unsafe content.
+
+        Non-serializable content (e.g. a Button trait object mistakenly placed in
+        ``ui_options`` instead of attached via ``traits=``) is dropped so the saved
+        workflow stays valid Python and can be reopened.
+        """
+        scrub_result = WorkflowManager._scrub_for_ast_constant(field_value)
+        if scrub_result.dropped:
+            logger.warning(
+                "Omitting non-serializable content from field '%s' of %s while saving the workflow. "
+                "This usually means a UI object (e.g. a Button) was placed in ui_options instead of "
+                "being attached as a trait.",
+                arg_name,
+                type(command).__name__,
+            )
+        return ast.keyword(arg=arg_name, value=ast.Constant(value=scrub_result.value, lineno=1, col_offset=0))
 
     def _generate_unique_values_code(
         self,
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         prefix: str,
         import_recorder: ImportRecorder,
+        deferred_imports: dict[str, set[str]] | None = None,
     ) -> ast.Module:
         if len(unique_parameter_uuid_to_values) == 0:
             return ast.Module(body=[], type_ignores=[])
@@ -3721,7 +4337,7 @@ class WorkflowManager:
             unique_parameter_dict[uuid] = unique_parameter_byte_str
 
             # Collect import statements for all classes in the object tree
-            self._collect_object_imports(unique_parameter_value, import_recorder, global_modules_set)
+            self._collect_object_imports(unique_parameter_value, import_recorder, global_modules_set, deferred_imports)
 
         # Comment lines explaining what we're doing. Each line is emitted as its own bare-string
         # statement so that it unparses onto a single source line. A post-process pass in
@@ -3774,6 +4390,22 @@ class WorkflowManager:
         full_ast = ast.Module(body=module_body, type_ignores=[])
         return full_ast
 
+    def _build_deferred_import_statements(self, deferred_imports: dict[str, set[str]]) -> list[ast.stmt]:
+        """Convert deferred library imports into ast.ImportFrom statements for insertion into build_workflow().
+
+        Sorted by module name (and class names within each module) for deterministic output.
+        """
+        stmts: list[ast.stmt] = []
+        for module, classes in sorted(deferred_imports.items()):
+            node = ast.ImportFrom(
+                module=module,
+                names=[ast.alias(name=cls) for cls in sorted(classes)],
+                level=0,
+            )
+            ast.fix_missing_locations(node)
+            stmts.append(node)
+        return stmts
+
     def _generate_create_flow(
         self,
         create_flow_command: CreateFlowRequest,
@@ -3802,7 +4434,7 @@ class WorkflowManager:
                         )
                     else:
                         create_flow_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_flow_command)
                         )
 
         # Create a comment explaining the behavior
@@ -3895,7 +4527,7 @@ class WorkflowManager:
                 field_value = getattr(import_workflow_command, field.name)
                 if field_value != field.default:
                     import_workflow_request_args.append(
-                        ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                        self._keyword_from_field_value(field.name, field_value, import_workflow_command)
                     )
 
         # Construct the AST for importing the workflow
@@ -4123,7 +4755,7 @@ class WorkflowManager:
                             )
                     else:
                         create_node_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_node_request)
                         )
 
         # After processing all fields, handle subflow_name from metadata
@@ -4230,9 +4862,7 @@ class WorkflowManager:
                         field_value = getattr(element_command, field.name)
                         if field_value != field.default:
                             element_command_args.append(
-                                ast.keyword(
-                                    arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0)
-                                )
+                                self._keyword_from_field_value(field.name, field_value, element_command)
                             )
 
                 # Create the await ahandle_request call
@@ -5226,6 +5856,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=source_workflow.metadata.is_griptape_provided,
                 is_template=source_workflow.metadata.is_template,
+                is_internal=source_workflow.metadata.is_internal,
                 creation_date=source_workflow.metadata.creation_date,
                 last_modified_date=datetime.now(tz=UTC),
                 branched_from=source_workflow.metadata.branched_from,  # Preserve original source chain
@@ -5252,6 +5883,7 @@ class WorkflowManager:
             result_messages = []
             try:
                 WorkflowRegistry.delete_workflow_by_name(request.workflow_name)
+                self._drop_substitution_flag(request.workflow_name)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
                 cleanup_message = f"Deleted branch workflow file and registry entry for '{request.workflow_name}'"
@@ -5325,6 +5957,7 @@ class WorkflowManager:
                 image=source_workflow.metadata.image,
                 is_griptape_provided=branch_workflow.metadata.is_griptape_provided,
                 is_template=branch_workflow.metadata.is_template,
+                is_internal=branch_workflow.metadata.is_internal,
                 creation_date=branch_workflow.metadata.creation_date,
                 last_modified_date=source_workflow.metadata.last_modified_date,
                 branched_from=source_workflow_name,  # Preserve branch relationship
@@ -5530,7 +6163,13 @@ class WorkflowManager:
             for instance_obj, original_name in patched_instances:
                 instance_obj.module_name = original_name
 
-    def _collect_object_imports(self, obj: Any, import_recorder: Any, global_modules_set: set[str]) -> None:
+    def _collect_object_imports(
+        self,
+        obj: Any,
+        import_recorder: Any,
+        global_modules_set: set[str],
+        deferred_imports: dict[str, set[str]] | None = None,
+    ) -> None:
         """Recursively collect import statements needed for all classes in object tree.
 
         This ensures that generated workflows have all necessary import statements,
@@ -5547,6 +6186,9 @@ class WorkflowManager:
             obj: Object tree to analyze for required imports
             import_recorder: Collector that will generate the import statements
             global_modules_set: Built-in modules that don't need explicit imports
+            deferred_imports: If provided, dynamic library imports are collected here instead
+                of import_recorder so the caller can emit them inside build_workflow() after
+                sys.path has been set up by RegisterLibraryFromFileRequest.
 
         Example:
             Input object tree: [ReferenceImageArtifact(), {"data": ImageUrlArtifact()}]
@@ -5560,12 +6202,17 @@ class WorkflowManager:
             module = getmodule(class_type)
             if module and module.__name__ not in global_modules_set:
                 if GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
-                    # Use stable namespace for dynamic modules
+                    # Use stable namespace for dynamic modules. Route into deferred_imports
+                    # so the caller can emit these inside build_workflow() after
+                    # RegisterLibraryFromFileRequest has added the library to sys.path.
                     stable_namespace = GriptapeNodes.LibraryManager().get_stable_namespace_for_dynamic_module(
                         module.__name__
                     )
                     if stable_namespace:
-                        import_recorder.add_from_import(stable_namespace, class_type.__name__)
+                        if deferred_imports is not None:
+                            deferred_imports.setdefault(stable_namespace, set()).add(class_type.__name__)
+                        else:
+                            import_recorder.add_from_import(stable_namespace, class_type.__name__)
                     else:
                         msg = f"Missing stable namespace for {module.__name__} type {class_type.__name__}"
                         logger.error(msg)
@@ -5575,6 +6222,13 @@ class WorkflowManager:
                     import_recorder.add_from_import(module.__name__, class_type.__name__)
 
         self._walk_object_tree(obj, collect_class_import)
+
+    async def on_refresh_workflow_registry_request(self, _request: RefreshWorkflowRegistryRequest) -> ResultPayload:
+        try:
+            await self.refresh_workflow_registry()
+        except Exception as e:
+            return RefreshWorkflowRegistryResultFailure(result_details=f"Failed to refresh workflow registry: {e!s}")
+        return RefreshWorkflowRegistryResultSuccess(result_details="Workflow registry refreshed successfully.")
 
     async def on_register_workflows_from_config_request(
         self, request: RegisterWorkflowsFromConfigRequest
@@ -5631,14 +6285,16 @@ class WorkflowManager:
         # First pass: collect all workflow files to determine total count
         all_workflow_files: set[Path] = set()
 
-        def collect_workflow_files(path: Path) -> None:  # noqa: C901
+        async def collect_workflow_files(path: Path) -> None:  # noqa: C901
             """Collect workflow files from a path."""
-            if not path.exists():
+            apath = anyio.Path(path)
+            if not await apath.exists():
                 return
-            if path.is_dir():
-                for workflow_file in path.rglob("*.py"):
-                    if ".venv" in workflow_file.parts:
-                        continue
+            if await apath.is_dir():
+                # find_files_recursive skips hidden directories (.venv, .git) and
+                # bounds recursion depth, so a deep or symlink-looped tree can't stall
+                # the boot scan.
+                for workflow_file in await find_files_recursive(path, "*.py"):
                     # Unsaved workflows are ephemeral; any file with this prefix is a
                     # leak from a pre-fix save and cannot be registered (the registry
                     # rejects unsaved keys paired with a file path).
@@ -5671,7 +6327,7 @@ class WorkflowManager:
 
         # Collect all workflow files first
         for workflow_to_register in workflows_to_register:
-            collect_workflow_files(Path(workflow_to_register))
+            await collect_workflow_files(Path(workflow_to_register))
 
         # Track progress
         total_workflows = len(all_workflow_files)

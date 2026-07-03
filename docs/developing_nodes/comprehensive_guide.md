@@ -707,6 +707,131 @@ def _update_option_choices(self, param_name: str, choices: list, default_value: 
     self.set_parameter_value(param_name, default_value)
 ```
 
+### Dynamic Parameter Schemas with ParameterTransitionComponent
+
+Some nodes expose a dropdown — a model picker, a mode selector, an operation chooser — where each choice implies a different set of input and output parameters. The naive approach (clear every parameter, rebuild from scratch) destroys every connection the user set up. `ParameterTransitionComponent` solves this by computing the diff between the current parameter surface and the one the new choice needs, then acting one of four ways per name:
+
+- **Preserve** — the name exists on both sides with identical signatures. Nothing is touched.
+- **Replace** — the name exists on both sides but the signature changed (types, modes, or both). The component captures the existing incoming and outgoing connections, removes the old parameter, adds a new one with the new signature, and then re-dispatches each captured connection through `CreateConnectionRequest`. The platform's connection handler validates type compatibility, so connections that are still valid under the new signature come back; connections that are no longer valid are dropped. Because connection re-creation goes through the same path as a fresh connection, values re-flow through incoming edges the normal way.
+- **Remove** — the name no longer exists in the desired schema. Removed via `RemoveParameterFromNodeRequest`, which cleans up all connections.
+- **Add** — the name is new. Added via the caller-supplied factory.
+
+One consequence of always-replace: a replaced parameter's stored *property* value is lost (the new Parameter starts empty). Connections and their re-flowed values are what survive. For nodes that don't want this behavior for certain same-name-same-signature cases, declaring identical signatures keeps the parameter in the preserve bucket.
+
+#### Walkthrough — Multi-model image generation (hypothetical)
+
+> **Note on this example.** The `MultiModelImageGenerator` node used below is **hypothetical** — it does not exist in Griptape today, and this walkthrough is not a description of how any shipped node works. We use a hypothetical consolidated node here because it's the kind of node an author might build *on top of* `ParameterTransitionComponent`, and it makes the "switching between shapes" story concrete for an artist audience.
+
+**The hypothetical node.** `MultiModelImageGenerator` has a **Model** dropdown offering **FLUX**, **SDXL**, and **Stable Diffusion 3**, plus a "— none —" option for an unconfigured starting state. Every model shares some parameters; each has its own extras. Here's the parameter surface per model:
+
+| Parameter         | FLUX  | SDXL          | SD3               |
+| ----------------- | ----- | ------------- | ----------------- |
+| `prompt`          | str   | str           | str               |
+| `width`           | int   | int           | int               |
+| `height`          | int   | int           | int               |
+| `seed`            | int   | int           | int               |
+| `guidance`        | float | —             | —                 |
+| `steps`           | —     | int           | —                 |
+| `cfg_scale`       | —     | float         | —                 |
+| `reference_image` | —     | **str (URL)** | **ImageArtifact** |
+| `negative_prompt` | —     | —             | str               |
+
+Notice `reference_image` appears on both SDXL and SD3 but with different types — SDXL's driver accepts a URL string, SD3's accepts a Griptape-native `ImageArtifact`. Real image-to-image APIs diverge exactly this way: some want a URL, some want uploaded bytes, some want a native artifact object.
+
+**The user session.** An artist opens a workflow. The `MultiModelImageGenerator` node starts with no model selected — its parameter surface is empty apart from the Model dropdown itself.
+
+**Step 1 — First selection (FLUX).** The artist picks **FLUX**. Every FLUX parameter (`prompt`, `width`, `height`, `seed`, `guidance`) appears. They connect a `TextPrompt` node to `prompt`, connect a `ResolutionPicker` node to `width` and `height`, type `42` into `seed`, leave `guidance` at its default. They render.
+
+*Under the hood:* the component sees an empty "current" set and a full "desired" set for FLUX. Every FLUX parameter lands in `to_add`. Nothing in `to_remove` or `to_preserve`.
+
+**Step 2 — Comparing models (FLUX → SDXL).** The artist wants to see how SDXL handles the same prompt. They switch the dropdown to **SDXL**.
+
+- `prompt`, `width`, `height` → `to_preserve`. The connections to `TextPrompt` and `ResolutionPicker` are untouched.
+- `seed` → `to_preserve`. Same name, both `int`. Value `42` survives.
+- `guidance` → `to_remove`. SDXL doesn't have it.
+- `steps`, `cfg_scale`, `reference_image` → `to_add`. The SDXL-specific parameters appear, ready for the artist to tune.
+
+The artist tweaks `steps`, connects an `ImageURL` node to `reference_image`, and renders. Every connection they set up in Step 1 is still live. They didn't have to redo anything.
+
+**Step 3 — Signature change (SDXL → SD3).** Curious about SD3, they switch the dropdown again.
+
+- `prompt`, `width`, `height`, `seed` → `to_preserve`. Signatures unchanged, so nothing is touched.
+- `reference_image` → `to_replace`. Both models use the name `reference_image`, but SDXL's accepts a URL string and SD3's accepts an `ImageArtifact`. The component captures the existing connection from `ImageURL`, removes the old parameter, adds the new `ImageArtifact`-typed one, and then re-dispatches the captured connection through `CreateConnectionRequest`. The connection handler sees the source provides `str` but the new parameter accepts only `ImageArtifact` and rejects it. Net result: `reference_image` exists with the new signature, no connection, ready for the artist to connect an artifact source (e.g., a `LoadImage` node).
+- `steps`, `cfg_scale` → `to_remove`. SD3 doesn't use them.
+- `negative_prompt` → `to_add`. SD3's distinguishing parameter appears, empty and ready for input.
+
+Type narrowing behaves exactly as an artist would expect. If `reference_image` had previously accepted `[ImageArtifact, str]` with a connection providing `ImageArtifact`, and the new schema narrowed it to `[ImageArtifact]`, the replace path captures the connection, rebuilds the parameter, and re-dispatches the connection — the platform's connection handler sees `ImageArtifact` is still valid and the edge comes back automatically. Only connections that are no longer type-compatible get dropped.
+
+**Step 4 — Clearing the node (SD3 → no selection).** The artist decides this node isn't working out and selects "— none —" from the dropdown. Everything the node was managing goes to `to_remove`. `prompt`, `width`, `height`, `seed`, `reference_image`, `negative_prompt` — all gone. The parameter surface returns to just the Model dropdown. The artist can start fresh or pick a different approach.
+
+#### What the node author writes
+
+```python
+from griptape_nodes.exe_types.param_components.parameter_transition_component import (
+    ParameterTransitionComponent,
+    TransitionParameter,
+)
+
+# In MultiModelImageGenerator.__init__:
+self._model_params = ParameterTransitionComponent(
+    self,
+    manages_parameter=lambda p: p.name in self._MODEL_PARAM_NAMES,
+)
+
+# In the model-dropdown change handler:
+desired = self._build_transition_parameters_for_model(selected_model)  # author's domain logic
+self._model_params.transition_to(desired)
+```
+
+`_build_transition_parameters_for_model` is the author's — the component doesn't care how the list is computed (from a dataclass, a config file, a registry, hand-rolled). It only cares about the resulting `list[TransitionParameter]`. The author also decides how `manages_parameter` scopes the component's view of the node's parameters (here: a known set of model-parameter names, excluding the Model dropdown itself and any other ambient parameters the node owns).
+
+#### API reference
+
+**Constructor:**
+
+```python
+ParameterTransitionComponent(
+    node: BaseNode,
+    *,
+    manages_parameter: Callable[[Parameter], bool],
+)
+```
+
+- `node` — the node instance that owns the parameter surface.
+- `manages_parameter` — predicate identifying which of the node's parameters this component manages. Everything outside the predicate is left alone.
+
+**`TransitionParameter` fields:**
+
+- `name: str` — parameter name, must be unique within a single `transition_to` call.
+- `allowed_modes: frozenset[ParameterMode]` — which modes the parameter supports (`INPUT`, `PROPERTY`, `OUTPUT`). Must match the existing Parameter's `allowed_modes` for preservation.
+- `input_types: frozenset[str]` — the set of types the parameter accepts as input, matching what `Parameter.input_types` will return after creation. The property applies fallbacks when no input types are declared on the underlying request, so populate this to reflect the *effective* signature (e.g., for an output-only parameter built with `output_type="X"`, use `frozenset({"X"})` because `Parameter.input_types` falls back to `[output_type]`).
+- `output_type: str` — the type the parameter emits, matching what `Parameter.output_type` will return after creation. For an input-only parameter built with `input_types=[X, Y, Z]`, use `X` because the property falls back to the first input type.
+- `add_request_factory: Callable[[], AddParameterToNodeRequest]` — a zero-arg callable the component invokes only for parameters that actually need adding. Typically a `functools.partial` wrapping the author's builder method.
+
+**`TransitionPlan` fields:**
+
+- `to_preserve: frozenset[str]` — parameters left completely untouched (name + signature both match). Connections and stored values are unaffected because nothing was dispatched.
+- `to_replace: frozenset[str]` — same-named parameters whose signature differed. The component captured their existing connections, removed the old Parameter, added a new one, and re-dispatched each connection through `CreateConnectionRequest` (the platform validates type compatibility and rejects ones that are no longer valid). Stored property values on replaced parameters are lost; connection values re-flow normally.
+- `to_remove: frozenset[str]` — parameters removed via `RemoveParameterFromNodeRequest`.
+- `to_add: frozenset[str]` — parameters added via `AddParameterToNodeRequest`.
+
+**Signature-match check.** Two same-named parameters are considered a match when *all three* of `allowed_modes`, `input_types`, and `output_type` match exactly. The component reads these off the existing Parameter's public properties (the same accessors used elsewhere for connection type checks). Any difference — a widened input-type list, a dropped mode, a changed output type — puts the parameter in the replace bucket. This is identity equality over the effective schema, not directional type-compatibility: two parameters that happen to be assignment-compatible but were declared differently represent different schema intent.
+
+#### When to reach for this
+
+- A single node's parameter surface depends on a **discrete user choice** (model picker, mode selector, operation chooser).
+- Users are expected to switch between choices during normal workflow authoring and should not lose their connections each time.
+
+#### When NOT to reach for this
+
+- You want to **hide or show** parameters based on a value — use the [Dynamic Parameter Visibility](#dynamic-parameter-visibility) pattern with `hide_parameter_by_name` / `show_parameter_by_name`.
+- You only need to **update a dropdown's options** — use the [Dynamic Options Updates](#dynamic-options-updates) pattern.
+- The parameter set is fixed; only values change.
+
+#### Working with ParameterGroups
+
+The component manages individual parameters by name. If your dynamic surface uses groups, pass `parent_element_name` in your `add_request_factory` so newly-added parameters land in the right group; group creation and cleanup are handled by the caller.
+
 ### Advanced ParameterList Usage
 
 Include both individual and list types for maximum flexibility:
@@ -2181,7 +2306,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 ```json
 {
   "name": "Library Name",
-  "library_schema_version": "0.8.0",
+  "library_schema_version": "0.10.0",
   "settings": [
     {
       "description": "API keys required by nodes in this library",
@@ -2202,7 +2327,24 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
       "pip_install_flags": ["--upgrade"]
     },
     "declarations": [
-      { "type": "lifecycle_stage", "stage": "STABLE" }
+      { "type": "lifecycle_stage", "stage": "STABLE" },
+      {
+        "type": "model_catalog",
+        "providers": {
+          "anthropic": {
+            "display_name": "Anthropic",
+            "terms_url": "https://www.anthropic.com/legal/commercial-terms",
+            "models": {
+              "claude_opus_byok": {
+                "display_name": "Claude Opus 4 (BYOK)",
+                "family": "Claude 4",
+                "provider_model_id": "claude-opus-4",
+                "key_support": "REQUIRES_CUSTOMER_KEY"
+              }
+            }
+          }
+        }
+      }
     ]
   },
   "widgets": [
@@ -2233,7 +2375,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
         "icon": "image",
         "group": "processing",
         "declarations": [
-          { "type": "key_support", "support": "REQUIRES_CUSTOMER_KEY" }
+          { "type": "model_usage", "model_ids": ["claude_opus_byok"] }
         ]
       }
     }
@@ -2250,7 +2392,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
     - Category should be `app_events.on_app_initialization_complete`
     - Secrets are accessed via `GriptapeNodes.SecretsManager().get_secret()`
 - **metadata.dependencies**: PIP packages installed on library load
-- **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, key support). See [Library and Node Declarations](#library-and-node-declarations) below.
+- **metadata.declarations** / per-node **metadata.declarations**: typed identity properties (lifecycle stage, arbitrary Python execution) and a library-level model catalog plus per-node references into it. See [Library and Node Declarations](#library-and-node-declarations) below.
 - **widgets**: Register custom JS widget components (see [Custom Widget Components](#custom-widget-components))
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
@@ -2262,7 +2404,7 @@ Use flat directory structures. The engine automatically registers and loads libr
 
 ### Library and Node Declarations
 
-Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers identity properties (lifecycle stage and key support); future engine releases add more declaration types under the same field.
+Declarations attach typed metadata to a library or to an individual node. Each entry in a `declarations` array is an object with a `type` discriminator that selects a declaration class. Today's vocabulary covers a lifecycle-stage property, a library-level model catalog with per-node references, and an arbitrary-Python-execution property; future engine releases add more declaration types under the same field.
 
 Both `metadata.declarations` (library-level) and per-node `metadata.declarations` accept a list. Order in the list does not matter. The field defaults to `[]`, so libraries on older schema versions (`0.6.0`, `0.4.0`, `0.1.0`) load unchanged.
 
@@ -2283,19 +2425,105 @@ Semantics:
 - **Library-level absence is intentionally distinct from `STABLE`.** A library with no `lifecycle_stage` declaration is "unstated" — consumers should surface that explicitly (`<No lifecycle stage provided by library author>`) rather than silently assume `STABLE`.
 - **Node-level absence means "inherit the library's stage."** A node-level `lifecycle_stage` overrides the library's value.
 
-#### `key_support`
+#### `model_catalog`
 
-How a node consumes API keys. Node-level only. Values:
+A library-level declaration of the third-party models nodes in the library can use, organized as a `provider → model` registry. Identifiers at both levels are dict keys (the key *is* the stable handle used by node references and admin policies); each entry carries a `display_name` for UI plus optional `terms_url` and `notes`. Each `Model` additionally declares `key_support` (required), an optional `family` grouping tag, and an optional upstream `provider_model_id`.
 
-| Value                                   | Meaning                                                        |
-| --------------------------------------- | -------------------------------------------------------------- |
-| `REQUIRES_CUSTOMER_KEY`                 | Node needs a customer-supplied API key.                        |
-| `SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY` | Node accepts either a customer key or a Griptape-provided key. |
-| `REQUIRES_GRIPTAPE_KEY`                 | Node only operates with a Griptape-provided key.               |
+The `key_support` value tells admins what kind of API key authorizes the call:
+
+| Value                                   | Meaning                                                                             |
+| --------------------------------------- | ----------------------------------------------------------------------------------- |
+| `REQUIRES_CUSTOMER_KEY`                 | Customer-supplied API key only.                                                     |
+| `SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY` | Customer key or Griptape-provided key both work.                                    |
+| `REQUIRES_GRIPTAPE_KEY`                 | Griptape-provided key only.                                                         |
+| `NO_KEY_REQUIRED`                       | The model runs locally or otherwise needs no API key (e.g. an Ollama-hosted model). |
+
+`notes` (available on both the provider and the model) is free-form author guidance rendered alongside the entry. Use it for caveats that don't fit other fields, like "BYOK requires injecting a provider-specific prompt driver."
+
+```jsonc
+{
+  "type": "model_catalog",
+  "providers": {
+    "anthropic": {
+      "display_name": "Anthropic",
+      "terms_url": "https://www.anthropic.com/legal/commercial-terms",
+      "models": {
+        "claude_opus_byok": {
+          "display_name": "Claude Opus 4 (BYOK)",
+          "family": "Claude 4",
+          "provider_model_id": "claude-opus-4",
+          "key_support": "REQUIRES_CUSTOMER_KEY"
+        },
+        "claude_opus_griptape": {
+          "display_name": "Claude Opus 4 (Griptape Key)",
+          "family": "Claude 4",
+          "provider_model_id": "claude-opus-4",
+          "key_support": "REQUIRES_GRIPTAPE_KEY"
+        }
+      }
+    },
+    "kling": {
+      "display_name": "Kling",
+      "terms_url": "https://app.klingai.com/global/about/terms",
+      "models": {
+        "kling_v2": {
+          "display_name": "Kling v2",
+          "provider_model_id": "kling-v2-master",
+          "key_support": "REQUIRES_GRIPTAPE_KEY"
+        }
+      }
+    },
+    "ollama": {
+      "display_name": "Ollama",
+      "key_support": "NO_KEY_REQUIRED",
+      "notes": "Local runtime; models enumerated at runtime, none declared here."
+    }
+  }
+}
+```
+
+A few rules worth knowing:
+
+- **`family` is just a tag.** It clusters related models for display (e.g. the two Claude 4 entries above). It is not a container and is not part of a model's identity, so providers without meaningful families simply omit it.
+- **`key_support` lives on the model by default.** Every `Model` declares its own value. The same upstream model with two different key requirements becomes two models under two distinct dict keys (see `claude_opus_byok` and `claude_opus_griptape` above). A `ModelProvider` also accepts an optional `key_support` used only when it declares no models at all (e.g. a local-runtime provider like Ollama where `key_support=NO_KEY_REQUIRED` is the only meaningful signal).
+- **Model IDs must be unique across the entire library.** Pydantic enforces uniqueness within each provider's `models` dict for free; collisions across providers are caught at library-load time as `DuplicateModelIdProblem`.
+- **At most one `model_catalog` per library.** Declaring two is rejected at validation time; merge their providers into one.
+
+##### `model_usage`
+
+A node references one or more catalog models by their dict keys. Use this when the node binds to a specific, named set of models. Each entry must resolve to a model somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.
+
+```jsonc
+{ "type": "model_usage", "model_ids": ["claude_opus_byok", "kling_v2"] }
+```
+
+##### `model_provider_usage`
+
+A node references one or more entire providers. Use this when a node dynamically enumerates every model a provider offers at runtime. Each entry must resolve to a provider declared in the catalog; unresolved references surface as `UnresolvedModelProviderUsageReferenceProblem`.
+
+```jsonc
+{ "type": "model_provider_usage", "provider_ids": ["anthropic", "ollama"] }
+```
+
+The two usage declarations are independent. A node can carry any combination — for instance, "every model this provider offers, plus these two specific models from another provider."
+
+#### `arbitrary_python_execution`
+
+Declares that a node executes arbitrary Python code supplied at runtime (for example, an artist-authored script). Node-level only. This is a security-relevant identity fact: consumers (UI) can warn an artist before the node runs. Absence of this declaration means the node does not execute arbitrary Python.
+
+| Field                       | Meaning                                                      |
+| --------------------------- | ------------------------------------------------------------ |
+| `executes_arbitrary_python` | `true` when the node runs unvetted, runtime-supplied Python. |
+
+```jsonc
+"declarations": [
+  { "type": "arbitrary_python_execution", "executes_arbitrary_python": true }
+]
+```
 
 #### Combining declarations
 
-A node can carry any combination of declarations. For example, a Labs node that requires a Griptape key:
+A node can carry any combination of declarations. For example, a Labs node that uses two models:
 
 ```jsonc
 "metadata": {
@@ -2304,7 +2532,7 @@ A node can carry any combination of declarations. For example, a Labs node that 
   "display_name": "Labs Node",
   "declarations": [
     { "type": "lifecycle_stage", "stage": "LABS" },
-    { "type": "key_support", "support": "REQUIRES_GRIPTAPE_KEY" }
+    { "type": "model_usage", "model_ids": ["claude_opus_byok", "kling_v2"] }
   ]
 }
 ```

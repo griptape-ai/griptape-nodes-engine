@@ -4,6 +4,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+
+# Runtime import (not TYPE_CHECKING): the Path-typed request fields below rely on
+# cattrs coercing wire-form strings to Path. cattrs resolves field types via
+# get_type_hints, which needs Path importable at runtime; under TYPE_CHECKING it
+# raises NameError and cattrs silently skips coercion, handing handlers raw strings.
+from pathlib import Path  # noqa: TC003
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.common.macro_parser import MacroMatchFailure, MacroVariables, ParsedMacro, VariableInfo
@@ -17,8 +23,6 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
 
@@ -45,6 +49,43 @@ class PathResolutionFailureReason(StrEnum):
     RESERVED_NAME_COLLISION = "RESERVED_NAME_COLLISION"
 
 
+class UnresolvedSequenceSlotBehavior(StrEnum):
+    """How ``GetPathForMacroRequest`` handles a REQUIRED, unresolved sequence slot.
+
+    A "sequence slot" is a variable whose ``format_specs`` contains a
+    ``SequenceFormat`` — emitted by ``{###}`` / ``{###?}`` shorthand in the
+    macro template. Optional slots (``{###?}``) that aren't bound are always
+    omitted by the resolver, so this enum only takes effect on a required
+    ``{###}`` slot with no value in the ``variables`` dict.
+
+    Values:
+        FAIL — default. Return ``GetPathForMacroResultFailure`` with
+            ``MISSING_REQUIRED_VARIABLES``. This is what the write path (via
+            ``on_write_file_request``) wants: the failure is the signal the
+            seed-and-retry logic uses to auto-allocate the first index.
+        RENDER_SEQUENCE_PATTERN — render the slot as its bare hash glyphs
+            (``###``, ``####``, ...) into the resolved path — the ffmpeg /
+            Houdini / Nuke convention that reads universally as "digits go
+            here." **Presentation only.** The output previews the eventual
+            on-disk shape of the path (a saved file becomes e.g.
+            ``render_v001.png``); it is NOT a valid filesystem path itself
+            and must not be opened, written, or handed to any I/O primitive.
+            Use when showing users a preview of the macro shape (e.g. UI
+            destination fields, path-classification previews).
+        START_AT_ZERO — seed the slot with ``0`` and render it (``000``
+            at min_width=3). Useful for 0-indexed preview flows.
+        START_AT_ONE — seed the slot with ``1`` and render it (``001`` at
+            min_width=3). Matches the write-path seed's starting value,
+            so this is the right choice when previewing "what would my
+            first save land at" (assuming the destination is empty).
+    """
+
+    FAIL = "FAIL"
+    RENDER_SEQUENCE_PATTERN = "RENDER_SEQUENCE_PATTERN"
+    START_AT_ZERO = "START_AT_ZERO"
+    START_AT_ONE = "START_AT_ONE"
+
+
 @dataclass
 @PayloadRegistry.register
 class LoadProjectTemplateRequest(RequestPayload):
@@ -67,7 +108,9 @@ class LoadProjectTemplateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     """Project template loaded successfully.
 
     Args:
-        project_id: The identifier for the loaded project
+        project_id: The opaque id for the loaded project (the registry key).
+            Echoed back so callers can activate/preview by id rather than path.
+            Consumers must not parse or construct it.
         template: The merged ProjectTemplate (system defaults + user customizations)
         validation: Validation info with status and any problems encountered
     """
@@ -97,7 +140,8 @@ class GetProjectTemplateRequest(RequestPayload):
     Use when: Querying current project configuration, checking validation status.
 
     Args:
-        project_id: Identifier of the project
+        project_id: Opaque id of the project (the registry key). Consumers must
+            not parse or construct it.
 
     Results: GetProjectTemplateResultSuccess | GetProjectTemplateResultFailure
     """
@@ -126,12 +170,74 @@ class GetProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 
 
 @dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceRequest(RequestPayload):
+    """Resolve the workspace directory a project would use, WITHOUT loading/activating it.
+
+    Use when: Showing a project's effective workspace in the detail view when the project does not
+    declare its own workspace_dir, so the user can see where its workspace would land.
+
+    Args:
+        project_id: Opaque id of the project (the registry key). Consumers must not parse it.
+
+    Results: ResolveProjectWorkspaceResultSuccess
+    """
+
+    project_id: ProjectID
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Resolved workspace directory for a project.
+
+    Args:
+        workspace_dir: Absolute path string the project would use, or None when the id resolves to
+            no readable project file (matches the resolver's "nothing to resolve" contract).
+    """
+
+    workspace_dir: str | None = None
+
+
+@dataclass
 class ProjectTemplateInfo:
-    """Information about a loaded or failed project template."""
+    """Information about a loaded or failed project template.
+
+    Fields:
+        project_id: The opaque id identifying this template in the registry.
+            Consumers must not parse or construct it. Legacy projects with no id
+            use their canonical file path string as the id (the legacy bridge).
+        validation: Outcome of loading + parsing this template.
+        name: Display name from the template body, when available.
+        project_file_path: Canonical file path locating this template on disk, or
+            None for templates that are not file-backed (e.g. the system
+            defaults). Carried separately from project_id so consumers never have
+            to assume the id is a path.
+        parent_project_id: The parent's id, suitable for direct equality matching
+            against another entry's project_id when reconstructing the
+            parent/child hierarchy. For a legacy child linked by
+            parent_project_path, this is resolved to the parent's id (its
+            canonical path string when the parent itself is legacy). None means no
+            parent (system defaults are the only base).
+        engine_version_compatible: False when the project's project-adjacent
+            config declares a `requires_engine` specifier the running engine
+            fails (or that is malformed). The GUI disables activation for such a
+            project. True when compatible or when no requires_engine is declared.
+        required_engine_version: The declared `requires_engine` specifier, when any.
+        current_engine_version: The running engine version, for display.
+        engine_version_reason: Human-readable detail explaining an incompatibility,
+            None when compatible.
+    """
 
     project_id: ProjectID
     validation: ProjectValidationInfo
     name: str | None = None
+    project_file_path: str | None = None
+    parent_project_id: str | None = None
+    engine_version_compatible: bool = True
+    required_engine_version: str | None = None
+    current_engine_version: str | None = None
+    engine_version_reason: str | None = None
 
 
 @dataclass
@@ -215,12 +321,18 @@ class GetPathForMacroRequest(RequestPayload):
     Args:
         parsed_macro: The parsed macro to resolve
         variables: Variable values for macro substitution (e.g., {"file_name": "output", "file_ext": "png"})
+        unresolved_sequence_slot_behavior: How to handle a required sequence
+            slot (``{###}``) with no value bound. Defaults to ``FAIL`` — the
+            write-path contract. Preview / display callers should pass
+            ``RENDER_SEQUENCE_PATTERN`` so the slot renders as its source
+            pattern instead of failing. See ``UnresolvedSequenceSlotBehavior``.
 
     Results: GetPathForMacroResultSuccess | GetPathForMacroResultFailure
     """
 
     parsed_macro: ParsedMacro
     variables: MacroVariables
+    unresolved_sequence_slot_behavior: UnresolvedSequenceSlotBehavior = UnresolvedSequenceSlotBehavior.FAIL
 
 
 @dataclass
@@ -265,8 +377,9 @@ class SetCurrentProjectRequest(RequestPayload):
     and re-registers workflows from config and the new workspace.
 
     Args:
-        project_id: Identifier of the project to set as current. None lands the
-            engine on the system defaults rather than a "no project" state.
+        project_id: Opaque id of the project to set as current (matched verbatim
+            against the registry; not parsed as a path). None lands the engine on
+            the system defaults rather than a "no project" state.
 
     Results: SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure
     """
@@ -362,11 +475,16 @@ class ValidateProjectTemplateRequest(RequestPayload):
 
     Args:
         template_data: Dict representation of the template to validate
+        project_id: Optional project_id of the template being edited. When provided,
+            it is seeded into the parent-chain visited set so a cycle that includes
+            "myself" (e.g. setting parent to a project that already points back at
+            this one) is detected.
 
     Results: ValidateProjectTemplateResultSuccess | ValidateProjectTemplateResultFailure
     """
 
     template_data: dict[str, Any]
+    project_id: str | None = None
 
 
 @dataclass
@@ -584,7 +702,8 @@ class UnregisterProjectTemplateRequest(RequestPayload):
     Use when: User wants to remove a stale or unwanted project template reference.
 
     Args:
-        project_id: Identifier of the project template to unregister
+        project_id: Opaque id of the project template to unregister (the registry
+            key). Consumers must not parse or construct it.
 
     Results: UnregisterProjectTemplateResultSuccess | UnregisterProjectTemplateResultFailure
     """
@@ -626,3 +745,198 @@ class GetAllSituationsForProjectResultSuccess(WorkflowNotAlteredMixin, ResultPay
 @PayloadRegistry.register
 class GetAllSituationsForProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Failure result when cannot get situations."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectRequest(RequestPayload):
+    """Resolve and activate the workspace project before app initialization completes.
+
+    Emitted by the app orchestrator after role setup but before the
+    AppInitializationComplete broadcast, mirroring the CLI executor which loads
+    its --project-file-path before broadcasting. Establishing the project's
+    config/workspace/env layers first ensures LibraryManager loads libraries
+    against the correct workspace (and enforces the project's engine_version and
+    library pins) instead of the default workspace.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Workspace project activated, or no workspace project found (a no-op is success)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateWorkspaceProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Workspace project activation failed.
+
+    Boot is soft: the app logs this and continues so the engine still starts and
+    the user can switch to a working project.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectRequest(RequestPayload):
+    """Package a loaded project and its dependencies into a portable .zip.
+
+    Use when: User wants to archive or branch an entire project. The package
+    carries the project template, its adjacent config, workflow files, and on-disk
+    assets, plus a true copy of any register-only local libraries. Git-sourced
+    libraries (libraries_to_download) travel by reference and are re-downloaded on
+    import. Required secret KEY NAMES travel in the manifest; secret VALUES never
+    leave the machine and .env is never copied.
+
+    Args:
+        project_id: Opaque id of the loaded project to export (the registry key).
+            Consumers must not parse or construct it.
+        destination_path: Full path to the .zip file to create.
+
+    Results: ExportProjectResultSuccess | ExportProjectResultFailure
+    """
+
+    project_id: ProjectID
+    destination_path: Path
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project exported successfully.
+
+    Args:
+        archive_path: Path to the written .zip.
+        referenced_libraries: Names (or git urls) of libraries shipped by reference.
+        copied_libraries: Registered paths of local libraries true-copied into the zip.
+        required_secret_keys: Names of secrets the project needs (NO values).
+        warnings: Non-fatal issues encountered, e.g. a registered local library
+            whose source was missing on disk and could not be packaged.
+    """
+
+    archive_path: Path
+    referenced_libraries: list[str]
+    copied_libraries: list[str]
+    required_secret_keys: list[str]
+    warnings: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class ExportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project export failed.
+
+    Common causes:
+    - project_id not loaded
+    - project has no backing file (e.g. system defaults)
+    - destination parent directory missing or unwritable
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectRequest(RequestPayload):
+    """Read a project package's manifest without extracting it.
+
+    Use when: The GUI wants to show what a .zip contains (libraries, required
+    secret keys) and which required secrets are unset in the target environment,
+    before committing to an import. Read-only: no files are written.
+
+    Args:
+        archive_path: Path to the project package .zip to inspect.
+
+    Results: PreviewImportProjectResultSuccess | PreviewImportProjectResultFailure
+    """
+
+    archive_path: Path
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Package manifest read successfully.
+
+    Args:
+        manifest: The parsed manifest.json (provenance + flat library/secret summary).
+        unset_secret_keys: Required secret keys with no value in the target
+            environment (computed without writing anything).
+    """
+
+    manifest: dict[str, Any]
+    unset_secret_keys: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Package preview failed.
+
+    Common causes:
+    - archive missing or not a zip
+    - manifest.json absent
+    - incompatible major manifest_schema_version
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectRequest(RequestPayload):
+    """Extract a project package to a target directory and register it.
+
+    Use when: User archives or branches a project. The mirrored base-dir tree is
+    extracted 1:1 at the target, so {inputs}/{outputs}/etc. macro paths re-resolve
+    against the new location automatically. Git-sourced libraries re-provision on
+    activation; copied local libraries register from their package-relative path.
+    Secrets are never auto-created: required/unset keys are returned for the GUI
+    to prompt.
+
+    Args:
+        archive_path: Path to the project package .zip.
+        target_directory: Directory to extract the project into.
+        new_project_name: When set, renames the imported project (duplicate/branch).
+        set_as_current: When True, activates the imported project after import.
+        overwrite_existing: When True, allows extracting over an existing project
+            file in target_directory; otherwise that collision fails.
+
+    Results: ImportProjectResultSuccess | ImportProjectResultFailure
+    """
+
+    archive_path: Path
+    target_directory: Path
+    new_project_name: str | None = None
+    set_as_current: bool = False
+    overwrite_existing: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project imported and registered successfully.
+
+    Args:
+        project_id: Opaque id of the newly registered project (the registry key).
+        project_file_path: Path to the extracted project template file.
+        required_secret_keys: Names of secrets the project needs (NO values).
+        unset_secret_keys: Required secret keys with no value in the current
+            environment, for the GUI to prompt.
+        warnings: Non-fatal issues recorded in the package manifest.
+    """
+
+    project_id: ProjectID
+    project_file_path: Path
+    required_secret_keys: list[str]
+    unset_secret_keys: list[str]
+    warnings: list[str]
+
+
+@dataclass
+@PayloadRegistry.register
+class ImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project import failed.
+
+    Common causes:
+    - archive missing / not a zip / manifest absent / incompatible schema
+    - target project file already exists and overwrite_existing is False
+    - extraction or re-registration failed
+    """

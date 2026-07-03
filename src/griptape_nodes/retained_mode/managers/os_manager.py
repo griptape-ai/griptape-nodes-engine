@@ -19,27 +19,42 @@ import send2trash
 from fileseq.exceptions import FileSeqException
 from rich.console import Console
 
-from griptape_nodes.common.macro_parser import MacroResolutionError, MacroResolutionFailure, MacroVariables, ParsedMacro
+from griptape_nodes.common.macro_parser import (
+    MacroResolutionError,
+    MacroResolutionFailure,
+    MacroSyntaxError,
+    MacroVariables,
+    ParsedMacro,
+)
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailureReason
-from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat
+from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
     InvalidTemplateError,
     MissingItemError,
+    Sequence,
+    SequenceScanOptions,
 )
-from griptape_nodes.common.sequences.scan import DirectoryListingError, scan_sequences
+from griptape_nodes.common.sequences.scan import (
+    DirectoryListingError,
+    PathMapping,
+    scan_sequences,
+    scan_sequences_from_filenames,
+)
+from griptape_nodes.files import os_utils
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
 from griptape_nodes.files.drivers.http_file_driver import HttpFileDriver
 from griptape_nodes.files.drivers.local_file_driver import LocalFileDriver
 from griptape_nodes.files.drivers.static_server_file_driver import StaticServerFileDriver
-from griptape_nodes.files.file import File, FileLoadError
+from griptape_nodes.files.file import File, FileLoadError, canonical_extension
 from griptape_nodes.files.file_driver import FileDriverNotFoundError, FileDriverRegistry
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
+    canonicalize_to_posix,
     normalize_path_for_platform,
     path_needs_expansion,
     resolve_path_safely,
@@ -57,6 +72,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
     CreateFileResultFailure,
     CreateFileResultSuccess,
+    DeduceSequencesFromFileListRequest,
+    DeduceSequencesFromFileListResultFailure,
+    DeduceSequencesFromFileListResultSuccess,
     DeleteFileRequest,
     DeleteFileResultFailure,
     DeleteFileResultSuccess,
@@ -71,9 +89,18 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetNextUnusedFilenameRequest,
     GetNextUnusedFilenameResultFailure,
     GetNextUnusedFilenameResultSuccess,
+    GetNextVersionIndexRequest,
+    GetNextVersionIndexResultFailure,
+    GetNextVersionIndexResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
+    ListDirectorySequencesRequest,
+    ListDirectorySequencesResultFailure,
+    ListDirectorySequencesResultSuccess,
+    MakeDirectoryRequest,
+    MakeDirectoryResultFailure,
+    MakeDirectoryResultSuccess,
     OpenAssociatedFileRequest,
     OpenAssociatedFileResultFailure,
     OpenAssociatedFileResultSuccess,
@@ -94,7 +121,11 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultFailure,
     WriteFileResultSuccess,
 )
-from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.events.project_events import (
+    GetPathForMacroRequest,
+    GetPathForMacroResultSuccess,
+    MacroPath,
+)
 from griptape_nodes.retained_mode.events.resource_events import (
     CreateResourceInstanceRequest,
     CreateResourceInstanceResultSuccess,
@@ -115,6 +146,11 @@ console = Console()
 
 # Maximum number of indexed candidates to try when CREATE_NEW policy is used
 MAX_INDEXED_CANDIDATES = 1000
+
+# How many gap numbers to show inline in the ABORTED_AT_GAP `result_details`
+# string before truncating the rest with "(+N more)". Larger lists overwhelm
+# the artist's status panel; the full list lives on `missing_item_numbers`.
+ABORTED_AT_GAP_PREVIEW_COUNT = 5
 
 
 @dataclass
@@ -138,6 +174,23 @@ class FileWriteAttemptResult(NamedTuple):
     bytes_written: int | None
     failure_reason: FileIOFailureReason | None
     error_message: str | None
+
+
+class ExtensionAlignment(NamedTuple):
+    """Result of aligning a destination path's suffix to the sniffed byte format.
+
+    Attributes:
+        aligned_path: The path the write should target. Equal to the requested path
+            when the suffix already matches, when bytes were unrecognizable, or for
+            non-bytes content. Otherwise the requested path with its suffix replaced
+            by the sniffed extension.
+        sniffed_ext: The sniffed extension (e.g. ``"jpg"``) when a swap occurred,
+            None otherwise. Downstream code carries this forward so the indexed
+            walk and the sidecar update agree on the final extension.
+    """
+
+    aligned_path: Path
+    sniffed_ext: str | None
 
 
 @dataclass
@@ -293,6 +346,16 @@ class OSManager:
             )
 
             event_manager.assign_manager_to_request_type(
+                request_type=ListDirectorySequencesRequest,
+                callback=self.on_list_directory_sequences_request,
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=DeduceSequencesFromFileListRequest,
+                callback=self.on_deduce_sequences_from_file_list_request,
+            )
+
+            event_manager.assign_manager_to_request_type(
                 request_type=ScanSequencesRequest, callback=self.on_scan_sequences_request
             )
 
@@ -330,6 +393,18 @@ class OSManager:
 
             event_manager.assign_manager_to_request_type(
                 request_type=ResolveMacroPathRequest, callback=self.on_handle_resolve_macro_path_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=GetNextUnusedFilenameRequest, callback=self.on_get_next_unused_filename_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=GetNextVersionIndexRequest, callback=self.on_get_next_version_index_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=MakeDirectoryRequest, callback=self.on_make_directory_request
             )
 
             # Store event_manager for direct access during resource registration
@@ -469,38 +544,48 @@ class OSManager:
             # Re-raise the exception for non-workspace mode
             raise
 
-    def _resolve_macro_path_to_string(self, macro_path: MacroPath) -> str | MacroResolutionFailure:
-        """Resolve MacroPath to string, handling missing variables.
+    def _resolve_macro_path_to_string(
+        self, macro_path: MacroPath, *, failure_log_level: int = logging.ERROR
+    ) -> str | MacroResolutionFailure:
+        """Resolve MacroPath to absolute string via ProjectManager.
+
+        Pure resolver: routes through ``GetPathForMacroRequest`` so project
+        directories, builtins, and env vars are applied uniformly. No
+        write-policy awareness lives here — auto-index seeding for CREATE_NEW
+        writes happens in ``on_write_file_request`` instead, where the policy
+        is in scope.
 
         Args:
             macro_path: MacroPath containing parsed macro and variables
+            failure_log_level: Log level for the failure result's
+                ``result_details``. Defaults to ``logging.ERROR`` — the
+                natural level for a failed resolve. Callers that treat a
+                resolution failure as an expected signal (e.g. the
+                ``on_write_file_request`` seed-and-retry path, whose first
+                attempt is intentionally probing for a missing sequence slot)
+                should pass ``logging.DEBUG`` so the noise doesn't surface as
+                a user-facing ERROR when the fallback succeeds.
 
         Returns:
-            str: Successfully resolved path string
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
-
-        Examples:
-            # Success case
-            macro_path = MacroPath(ParsedMacro("{outputs}/file.png"), {"outputs": "/path"})
-            result = self._resolve_macro_path_to_string(macro_path)
-            # Returns: "/path/file.png"
-
-            # Missing variable case
-            macro_path = MacroPath(ParsedMacro("{outputs}/{frame}.png"), {"outputs": "/path"})
-            result = self._resolve_macro_path_to_string(macro_path)
-            # Returns: MacroResolutionFailure(missing_variables={"frame"}, ...)
+            str: Successfully resolved absolute path string (success path; last)
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
-
-        try:
-            return macro_path.parsed_macro.resolve(macro_path.variables, secrets_manager)
-        except MacroResolutionError as e:
-            return MacroResolutionFailure(
-                failure_reason=e.failure_reason or MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
-                variable_name=e.variable_name,
-                missing_variables=e.missing_variables,
-                error_details=str(e),
+        result = GriptapeNodes.handle_request(
+            GetPathForMacroRequest(
+                parsed_macro=macro_path.parsed_macro,
+                variables=macro_path.variables,
+                failure_log_level=failure_log_level,
             )
+        )
+        if not isinstance(result, GetPathForMacroResultSuccess):
+            missing = getattr(result, "missing_variables", None)
+            return MacroResolutionFailure(
+                failure_reason=MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES,
+                variable_name=None,
+                missing_variables=missing,
+                error_details=str(getattr(result, "result_details", "")),
+            )
+        return str(result.absolute_path)
 
     def _validate_file_path_for_write(
         self,
@@ -835,17 +920,31 @@ class OSManager:
                 pattern_parts.append(segment.text)
             elif isinstance(segment, ParsedVariable):
                 if segment.info.name == index_var_name:
-                    # Replace index variable with wildcards based on padding
-                    has_padding = False
+                    # Pick the glob width based on the slot's format spec:
+                    #  - NumericPaddingFormat (legacy `{x:NN}`): exact width via
+                    #    fixed-count `?` wildcards. Matches the original semantics
+                    #    where `:03` means "exactly 3 digits."
+                    #  - SequenceFormat (new `###` shorthand): minimum width, so
+                    #    overflow values like `_v1000` against `###` are valid
+                    #    matches. Use the permissive `*` glob. The `*` may match
+                    #    non-numeric siblings (e.g. `foo_vfinal.py`); those are
+                    #    skipped downstream when `_extract_index_from_filename`
+                    #    catches the MacroResolutionError raised by
+                    #    `SequenceFormat.reverse("final")`.
+                    #  - Neither (no padding info): also `*`; same skip behavior.
+                    matched_spec = False
                     for format_spec in segment.format_specs:
                         if isinstance(format_spec, NumericPaddingFormat):
-                            # Use exact number of wildcards for padding width
                             pattern_parts.append("?" * format_spec.width)
-                            has_padding = True
+                            matched_spec = True
+                            break
+                        if isinstance(format_spec, SequenceFormat):
+                            pattern_parts.append("*")
+                            matched_spec = True
                             break
 
-                    if not has_padding:
-                        # No padding format - match any number of digits
+                    if not matched_spec:
+                        # No padding-style format - match any number of digits
                         pattern_parts.append("*")
                 else:
                     # This shouldn't happen - all non-index variables should be resolved
@@ -882,8 +981,33 @@ class OSManager:
         """
         secrets_manager = GriptapeNodes.SecretsManager()
 
-        # Use macro's extract_variables to reverse-match
-        extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        # Normalize path separators to POSIX form before reverse-matching. The
+        # macro template uses `/` by convention, but the filename comes from
+        # `Path.glob()` on the host filesystem (backslashes on Windows), and
+        # directory-shaped `variables` values (e.g. `{outputs}` bound to
+        # `str(temp_dir)`) may likewise carry `\`. A single-char separator
+        # mismatch causes the reverse-matcher to fail static-text alignment
+        # and return no matches, which manifested as the sequence-slot scan
+        # finding zero existing files on Windows CI.
+        # `canonicalize_to_posix` correctly handles UNC, long-path
+        # prefix (`\\?\`), long-UNC prefix, drive-letter, and mixed-separator
+        # cases — see its docstring for the full contract.
+        normalized_filename = canonicalize_to_posix(filename)
+        normalized_variables: MacroVariables = {
+            key: canonicalize_to_posix(value) if isinstance(value, str) else value for key, value in variables.items()
+        }
+
+        # Use macro's extract_variables to reverse-match. Non-numeric siblings caught
+        # by the permissive `*` glob (e.g. `workflow_vfinal.py` scanning against
+        # `workflow_v{###}.py`) reach `SequenceFormat.reverse()` and raise
+        # MacroResolutionError from int("final"). Treat that as "this file doesn't
+        # match" — same contract as extract_variables returning None. Anything else
+        # matched the glob but isn't a valid sequence entry, so it should be skipped,
+        # not crash the scan.
+        try:
+            extracted = parsed_macro.extract_variables(normalized_filename, normalized_variables, secrets_manager)
+        except MacroResolutionError:
+            return None
 
         if extracted is None:
             # Filename doesn't match template
@@ -994,6 +1118,114 @@ class OSManager:
 
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
+    @staticmethod
+    def _has_sequence_slot_marker(variable: ParsedVariable) -> bool:
+        """Return True when this variable should be treated as a sequence-allocated slot.
+
+        Two paths qualify, ORed together:
+
+        1. **Explicit ``SequenceFormat`` marker** — emitted by ``###`` shorthand in
+           the macro template (issue #4902). Unambiguously says "this slot is
+           system-allocated; OSManager fills it with a sequence number."
+        2. **Legacy ``NumericPaddingFormat`` heuristic** — a ``{x:NN}`` slot that
+           the macro author intended to bind, but which CREATE_NEW has historically
+           treated as auto-indexable when it's the lone unresolved required variable.
+           Kept for backward compatibility with shipping project templates and the
+           documented behavior in [macros.md], [situations.md], and the default
+           situation macros. The OR is the load-bearing piece of #4902's
+           "introduce explicit syntax without breaking existing macros" strategy.
+
+        A follow-up cleanup will retire the heuristic path once project templates
+        and docs migrate to ``###``; until then both routes are equivalent.
+        """
+        return any(isinstance(spec, (SequenceFormat, NumericPaddingFormat)) for spec in variable.format_specs)
+
+    @staticmethod
+    def _find_padded_unresolved_required(
+        parsed_macro: ParsedMacro, missing_required: set[str]
+    ) -> ParsedVariable | None:
+        """Find the single missing required variable that opts into auto-index seeding.
+
+        A macro author opts in by writing either ``###`` shorthand (parsed as a
+        sequence slot — see :class:`SequenceFormat`) or a single unresolved required
+        variable with a ``NumericPaddingFormat`` (``{x:NN}`` — legacy heuristic).
+        Either marker is the safety contract: without it, an unresolved ``{shot}``
+        could just as plausibly be a variable the user forgot to bind, and silently
+        filling it with ``1`` would write data under a name the user never intended.
+
+        Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
+        first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
+        that gets ``1`` stuffed into it for the retry.
+
+        Debugging: a ``None`` return is the most common reason a CREATE_NEW save with
+        what looks like a valid auto-index macro instead surfaces ``MISSING_REQUIRED``.
+        Walk the gates in order.
+        """
+        # Gate 1: heuristic only fires when there is exactly ONE missing required var.
+        # Two or more → ambiguous which is the index slot; refuse and let the caller
+        # surface MISSING_REQUIRED naming every unbound var.
+        if len(missing_required) != 1:
+            return None
+        [name] = missing_required
+
+        # Gate 2: walk the parsed segments to recover the variable's full ParsedVariable
+        # (we need its format_specs; the caller only has the name string from the
+        # failure). The same name can appear in multiple slots; first occurrence is
+        # fine since they all bind to the same value.
+        matching: list[ParsedVariable] = []
+        for segment in parsed_macro.segments:
+            if isinstance(segment, ParsedVariable) and segment.info.name == name:
+                matching.append(segment)  # noqa: PERF401  # explicit loop for breakpoint debugging
+        if not matching:
+            # Shouldn't happen — name came from the parser's own missing set — but
+            # guard so a corrupt failure result can't crash.
+            return None
+        candidate = matching[0]
+
+        # Gate 3: the slot must carry a sequence-allocation marker — either the
+        # explicit ``SequenceFormat`` (from ``###`` shorthand) or the legacy
+        # ``NumericPaddingFormat`` heuristic. Without it the macro author didn't opt in.
+        if not OSManager._has_sequence_slot_marker(candidate):
+            return None
+
+        return candidate
+
+    def _select_collision_walk_macro(
+        self, request: WriteFileRequest, file_path: Path
+    ) -> tuple[MacroPath, ParsedVariable | None]:
+        """Pick the MacroPath the CREATE_NEW collision loop walks forward.
+
+        Returns ``(macro_path, padded_index_var)``. When ``padded_index_var`` is not
+        None, the caller walks *its* slot (using ProjectManager so unresolved project
+        directories like ``{outputs}`` get substituted each iteration).
+
+        When the caller passed a MacroPath whose unresolved variable carries a
+        ``NumericPaddingFormat`` — required ``{x:NN}`` OR optional ``{x?:NN}`` — we
+        walk that slot against the user's ORIGINAL macro. Incrementing it produces
+        consistent zero-padded width across the sequence (``v001 → v002 → v003``).
+
+        The ``is_required`` distinction matters for the SEED step (we only seed required
+        slots; optional slots happily resolve as omitted on the first attempt). It does
+        NOT matter for the walk: by the time we're in collision-fallback the first
+        attempt has already failed via "file exists," and the user's intent for either
+        shape is "give me a padded index here." Walking either kind closes #4544 and
+        #4092 — optional ``{_index?:03}`` collisions previously rendered as ``_1``
+        (unpadded suffix injection) instead of ``_001`` (padded walk).
+
+        Otherwise (plain string path, or a MacroPath without ANY padded slot), fall
+        back to ``_convert_str_path_to_macro_with_index`` which synthesizes
+        ``{stem}_{_index}{ext}`` — original behavior preserved.
+        """
+        if isinstance(request.file_path, MacroPath):
+            for segment in request.file_path.parsed_macro.segments:
+                if (
+                    isinstance(segment, ParsedVariable)
+                    and segment.info.name not in request.file_path.variables
+                    and OSManager._has_sequence_slot_marker(segment)
+                ):
+                    return request.file_path, segment
+        return self._convert_str_path_to_macro_with_index(str(file_path)), None
+
     def _scan_for_next_available_index(
         self,
         parsed_macro: ParsedMacro,
@@ -1068,8 +1300,10 @@ class OSManager:
         existing_indices = []
 
         for filepath in existing_files:
-            filename = Path(filepath).name
-            extracted_index = self._extract_index_from_filename(filename, parsed_macro, index_var_name, variables)
+            # Pass the full path string. _extract_index_from_filename matches against the
+            # FULL template (parent-directory segments and all), so the basename never
+            # matches and the scan would return 1 every call.
+            extracted_index = self._extract_index_from_filename(str(filepath), parsed_macro, index_var_name, variables)
             if extracted_index is not None:
                 existing_indices.append(extracted_index)
 
@@ -1079,18 +1313,17 @@ class OSManager:
     def platform() -> str:
         return sys.platform
 
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4418
     @staticmethod
     def is_windows() -> bool:
-        return sys.platform.startswith("win")
+        return os_utils.is_windows()
 
     @staticmethod
     def is_mac() -> bool:
-        return sys.platform.startswith("darwin")
+        return os_utils.is_mac()
 
     @staticmethod
     def is_linux() -> bool:
-        return sys.platform.startswith("linux")
+        return os_utils.is_linux()
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1163,7 +1396,13 @@ class OSManager:
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
-                os.startfile(normalize_path_for_platform(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
+                #
+                # NOTE: do NOT pass normalize_path_for_platform(path) here. os.startfile is
+                # backed by ShellExecute, which does not understand the \\?\ extended-length
+                # prefix that normalize_path_for_platform now applies unconditionally on
+                # Windows -- a prefixed path makes ShellExecute fail to open the file. The
+                # path is already validated to exist above, so hand it over unprefixed.
+                os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
                 logger.info("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location
@@ -1431,6 +1670,41 @@ class OSManager:
                 logger.error(msg)
                 return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
 
+            # Group sequence files into Sequence objects when requested.
+            sequences: list[Sequence] = []
+            if request.group_sequences:
+                options = request.sequence_options or SequenceScanOptions()
+                bare_names = [e.name for e in entries if not e.is_dir]
+                seq_directory = str(relative_or_abs_path) if request.workspace_only else str(directory)
+                try:
+                    sequences, consumed = scan_sequences_from_filenames(bare_names, seq_directory, options)
+                except InvalidSubsetBoundsError as e:
+                    return ListDirectoryResultFailure(
+                        failure_reason=SequenceScanFailureReason.INVALID_BOUNDS,
+                        result_details=str(e),
+                    )
+                except MissingItemError as e:
+                    gap_count = len(e.numbers)
+                    if gap_count == 1:
+                        summary = f"the sequence has a gap at item {e.numbers[0]}"
+                    else:
+                        sample = ", ".join(str(n) for n in e.numbers[:ABORTED_AT_GAP_PREVIEW_COUNT])
+                        suffix = (
+                            ""
+                            if gap_count <= ABORTED_AT_GAP_PREVIEW_COUNT
+                            else f" (+ {gap_count - ABORTED_AT_GAP_PREVIEW_COUNT} more)"
+                        )
+                        summary = f"the sequence has {gap_count} gaps: items {sample}{suffix}"
+                    return ListDirectoryResultFailure(
+                        failure_reason=SequenceScanFailureReason.ABORTED_AT_GAP,
+                        missing_item_numbers=e.numbers,
+                        result_details=(
+                            f"Attempted to list directory {str(directory)!r} with group_sequences=True, "
+                            f"policy=ABORT. Failed because {summary}."
+                        ),
+                    )
+                entries = [e for e in entries if e.name not in consumed]
+
             # Return appropriate path format based on mode
             if request.workspace_only:
                 # In workspace mode, return relative path if within workspace, absolute if outside
@@ -1438,6 +1712,7 @@ class OSManager:
                     entries=entries,
                     current_path=str(relative_or_abs_path),
                     is_workspace_path=is_workspace_path,
+                    sequences=sequences,
                     result_details="Directory listing retrieved successfully.",
                 )
             # In system-wide mode, always return the full absolute path
@@ -1445,6 +1720,7 @@ class OSManager:
                 entries=entries,
                 current_path=str(directory),
                 is_workspace_path=is_workspace_path,
+                sequences=sequences,
                 result_details="Directory listing retrieved successfully.",
             )
 
@@ -1453,25 +1729,131 @@ class OSManager:
             logger.error(msg)
             return ListDirectoryResultFailure(failure_reason=FileIOFailureReason.UNKNOWN, result_details=msg)
 
-    async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:
-        """Handle a request to scan a directory for sequences matching a fileseq template.
+    def on_list_directory_sequences_request(self, request: ListDirectorySequencesRequest) -> ResultPayload:
+        """Handle a request to list only file sequences in a directory.
 
-        The handler runs `scan_sequences` in a worker thread (`asyncio.to_thread`)
-        so neither the directory listing (via `ListDirectoryRequest`, performed
+        Delegates to `on_list_directory_request` with `group_sequences=True` and
+        re-wraps the result to expose only the detected sequences.
+        """
+        inner = ListDirectoryRequest(
+            directory_path=request.directory_path,
+            show_hidden=request.show_hidden,
+            workspace_only=request.workspace_only,
+            pattern=request.pattern,
+            include_size=request.include_size,
+            include_modified_time=request.include_modified_time,
+            include_mime_type=request.include_mime_type,
+            include_absolute_path=request.include_absolute_path,
+            group_sequences=True,
+            sequence_options=request.sequence_options,
+        )
+        result = self.on_list_directory_request(inner)
+        if isinstance(result, ListDirectoryResultSuccess):
+            return ListDirectorySequencesResultSuccess(
+                sequences=result.sequences,
+                current_path=result.current_path,
+                is_workspace_path=result.is_workspace_path,
+                result_details=result.result_details,
+            )
+        if isinstance(result, ListDirectoryResultFailure):
+            return ListDirectorySequencesResultFailure(
+                failure_reason=result.failure_reason,
+                missing_item_numbers=result.missing_item_numbers,
+                result_details=str(result.result_details),
+            )
+        return ListDirectorySequencesResultFailure(
+            failure_reason=FileIOFailureReason.UNKNOWN,
+            result_details="Unexpected result type from on_list_directory_request.",
+        )
+
+    def on_deduce_sequences_from_file_list_request(self, request: DeduceSequencesFromFileListRequest) -> ResultPayload:
+        """Handle a request to detect sequences from a caller-supplied file list.
+
+        Groups input paths by parent directory, then calls
+        `scan_sequences_from_filenames` per group. No directory I/O is
+        performed.
+        """
+        try:
+            options = request.sequence_options or SequenceScanOptions()
+            dir_groups: dict[str, list[str]] = {}
+            for fp in request.file_paths:
+                p = Path(fp)
+                raw_parent = str(p.parent)
+                parent = "" if raw_parent == "." else raw_parent
+                if parent not in dir_groups:
+                    dir_groups[parent] = []
+                dir_groups[parent].append(p.name)
+
+            all_sequences: list[Sequence] = []
+            for parent_dir, bare_names in dir_groups.items():
+                seqs, _ = scan_sequences_from_filenames(bare_names, parent_dir, options)
+                all_sequences.extend(seqs)
+        except InvalidSubsetBoundsError as e:
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_BOUNDS,
+                result_details=str(e),
+            )
+        except MissingItemError as e:
+            gap_count = len(e.numbers)
+            if gap_count == 1:
+                summary = f"the sequence has a gap at item {e.numbers[0]}"
+            else:
+                sample = ", ".join(str(n) for n in e.numbers[:ABORTED_AT_GAP_PREVIEW_COUNT])
+                suffix = (
+                    ""
+                    if gap_count <= ABORTED_AT_GAP_PREVIEW_COUNT
+                    else f" (+ {gap_count - ABORTED_AT_GAP_PREVIEW_COUNT} more)"
+                )
+                summary = f"the sequence has {gap_count} gaps: items {sample}{suffix}"
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=SequenceScanFailureReason.ABORTED_AT_GAP,
+                missing_item_numbers=e.numbers,
+                result_details=(
+                    f"Attempted to deduce sequences from file list with policy=ABORT. Failed because {summary}."
+                ),
+            )
+        except Exception as e:
+            msg = f"Attempted to deduce sequences from file list. Failed with {type(e).__name__}: {e}"
+            logger.error(msg)
+            return DeduceSequencesFromFileListResultFailure(
+                failure_reason=FileIOFailureReason.UNKNOWN,
+                result_details=msg,
+            )
+
+        return DeduceSequencesFromFileListResultSuccess(
+            sequences=all_sequences,
+            result_details=(f"Deduced {len(all_sequences)} sequence(s) from {len(request.file_paths)} path(s)."),
+        )
+
+    async def on_scan_sequences_request(self, request: ScanSequencesRequest) -> ResultPayload:  # noqa: PLR0911
+        """Handle a request to scan a path or pattern for file sequences.
+
+        The handler does macro resolution itself, builds a `PathMapping`, and
+        runs `scan_sequences` in a worker thread (`asyncio.to_thread`) so
+        neither the directory listing (via `ListDirectoryRequest`, performed
         inside `scan_sequences`) nor fileseq parsing blocks the event loop.
 
-        Routes failures to the appropriate taxonomy: typed exceptions raised by
-        the scanner map to `SequenceScanFailureReason`; OS-layer listing
-        failures (directory not found, permission denied) propagate via
-        `DirectoryListingError` and map to `FileIOFailureReason` so the
-        underlying OS diagnostic isn't lost.
+        Routes failures to the appropriate taxonomy:
+        - Macro syntax / resolution / shape problems → `INVALID_TEMPLATE`
+          (sequence-semantic).
+        - Subset bound problems → `INVALID_BOUNDS`.
+        - ABORT-policy gaps → `ABORTED_AT_GAP` listing every offending item number.
+        - OS-layer listing failures (directory not found, permission denied)
+          propagate via `DirectoryListingError` and surface their original
+          `FileIOFailureReason` so the underlying diagnostic isn't lost.
         """
+        mapping_or_failure = self._build_scan_path_mapping(request.path)
+        if isinstance(mapping_or_failure, ScanSequencesResultFailure):
+            return mapping_or_failure
+        mapping = mapping_or_failure
+
         try:
             outcome = await asyncio.to_thread(
                 scan_sequences,
-                request.directory,
-                request.pattern,
+                mapping,
+                mapping.filename_pattern,
                 policy=request.policy,
+                no_token_behavior=request.no_token_behavior,
                 start=request.start_number,
                 end=request.end_number,
             )
@@ -1494,17 +1876,26 @@ class OSManager:
             return ScanSequencesResultFailure(
                 failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
                 result_details=(
-                    f"Attempted to scan sequences with pattern={request.pattern!r}. "
-                    f"Failed because fileseq could not parse the template: {e}"
+                    f"Attempted to scan sequences with path={request.path!r}. "
+                    f"Failed because fileseq could not parse the path: {e}"
                 ),
             )
         except MissingItemError as e:
+            gap_count = len(e.numbers)
+            if gap_count == 1:
+                summary = f"the sequence has a gap at item {e.numbers[0]}"
+            else:
+                sample = ", ".join(str(n) for n in e.numbers[:ABORTED_AT_GAP_PREVIEW_COUNT])
+                if gap_count <= ABORTED_AT_GAP_PREVIEW_COUNT:
+                    suffix = ""
+                else:
+                    suffix = f" (+ {gap_count - ABORTED_AT_GAP_PREVIEW_COUNT} more)"
+                summary = f"the sequence has {gap_count} gaps: items {sample}{suffix}"
             return ScanSequencesResultFailure(
                 failure_reason=SequenceScanFailureReason.ABORTED_AT_GAP,
-                missing_item_number=e.number,
+                missing_item_numbers=e.numbers,
                 result_details=(
-                    f"Attempted to scan sequences with pattern={request.pattern!r}, policy=ABORT. "
-                    f"Failed because the sequence has a gap at item {e.number}."
+                    f"Attempted to scan sequences with path={request.path!r}, policy=ABORT. Failed because {summary}."
                 ),
             )
 
@@ -1514,10 +1905,7 @@ class OSManager:
         if has_entries:
             details = f"Found {len(outcome.sequences)} sequence(s)."
         else:
-            details = (
-                f"Scanned directory={request.directory!r} with pattern={request.pattern!r}; "
-                f"no matching sequence entries found."
-            )
+            details = f"Scanned path={request.path!r}; no matching sequence entries found."
         return ScanSequencesResultSuccess(
             sequences=outcome.sequences,
             has_entries=has_entries,
@@ -1525,6 +1913,72 @@ class OSManager:
             discovered_first=outcome.discovered_first,
             discovered_last=outcome.discovered_last,
             result_details=details,
+        )
+
+    def _build_scan_path_mapping(self, path: str) -> PathMapping | ScanSequencesResultFailure:  # noqa: PLR0911
+        """Parse `path`, resolve any macro head, and build a `PathMapping`.
+
+        The path is split into a directory portion and a filename portion at
+        the last separator. The directory portion is resolved through
+        `GetPathForMacroRequest` if it carries macros; the filename portion
+        (which holds any sequence token) is preserved verbatim so the macro
+        head survives the round trip.
+
+        Returns either the assembled `PathMapping` or a `ScanSequencesResultFailure`
+        ready to return up the stack.
+        """
+        if not path:
+            return ScanSequencesResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
+                result_details="No path or pattern provided.",
+            )
+
+        sep_index = max(path.rfind("/"), path.rfind("\\"))
+        if sep_index < 0:
+            return ScanSequencesResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
+                result_details=(
+                    f"`{path}` has no directory portion — point at a file or pattern "
+                    "(e.g. `/work/render.####.png` or `{inputs}/render.####.png`)."
+                ),
+            )
+        original_directory = path[:sep_index]
+        filename_pattern = path[sep_index + 1 :]
+        if not filename_pattern:
+            return ScanSequencesResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
+                result_details=(f"`{path}` has no filename to scan — point at a file or pattern, not a directory."),
+            )
+
+        try:
+            parsed_directory = ParsedMacro(original_directory)
+        except MacroSyntaxError as e:
+            return ScanSequencesResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
+                result_details=f"Invalid path or pattern `{path}`: {e}",
+            )
+
+        if not parsed_directory.get_variables():
+            # No macros in the directory portion — treat it as a plain
+            # absolute (or relative) path. Round-trip is a no-op.
+            return PathMapping(
+                original_directory=original_directory,
+                resolved_directory=original_directory,
+                filename_pattern=filename_pattern,
+            )
+
+        resolve_result = GriptapeNodes.handle_request(
+            GetPathForMacroRequest(parsed_macro=parsed_directory, variables={})
+        )
+        if not isinstance(resolve_result, GetPathForMacroResultSuccess):
+            return ScanSequencesResultFailure(
+                failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
+                result_details=(f"Couldn't resolve project variables in `{path}`: {resolve_result.result_details}"),
+            )
+        return PathMapping(
+            original_directory=original_directory,
+            resolved_directory=str(resolve_result.absolute_path),
+            filename_pattern=filename_pattern,
         )
 
     def _detect_mime_type_from_location(self, location: str) -> str:
@@ -1757,7 +2211,7 @@ class OSManager:
         try:
             index_info = self._identify_index_variable(parsed_macro, variables)
         except ValueError as e:
-            msg = str(e)
+            msg = f"Failed to identify index variable in path template: {e}"
             logger.error(msg)
             return GetNextUnusedFilenameResultFailure(
                 failure_reason=FileIOFailureReason.INVALID_PATH,
@@ -1802,6 +2256,38 @@ class OSManager:
             else "Found available filename (no index needed)",
         )
 
+    def on_get_next_version_index_request(self, request: GetNextVersionIndexRequest) -> ResultPayload:
+        """Handle a request to find the next available version index via a single glob pass."""
+        parsed_macro = request.macro_path.parsed_macro
+        variables = request.macro_path.variables
+
+        try:
+            index_info = self._identify_index_variable(parsed_macro, variables)
+        except ValueError as e:
+            msg = f"Attempted to find next version index. Failed: {e}"
+            logger.error(msg)
+            return GetNextVersionIndexResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH,
+                result_details=msg,
+            )
+
+        if index_info is None:
+            msg = "Attempted to find next version index. Failed because no unresolved {_index} variable was found in the macro template."
+            logger.error(msg)
+            return GetNextVersionIndexResultFailure(
+                failure_reason=FileIOFailureReason.INVALID_PATH,
+                result_details=msg,
+            )
+
+        next_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
+
+        return GetNextVersionIndexResultSuccess(
+            index=next_index,
+            result_details=f"Next available version index is {next_index}"
+            if next_index is not None
+            else "Base path is available (no index needed)",
+        )
+
     def on_write_file_request(self, request: WriteFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, PLR0915, C901
         """Handle a request to write content to a file with exclusive locking."""
         # Initialize success tracking variables
@@ -1809,12 +2295,44 @@ class OSManager:
         final_bytes_written: int | None = None
         used_indexed_fallback = False
 
-        # COMMON SETUP: Resolve path for all policies
-        # Resolve MacroPath → str
+        # COMMON SETUP: Resolve path for all policies. For MacroPath inputs we may
+        # auto-seed a single padded missing-required slot — but only for CREATE_NEW
+        # writes, and only if the macro author opted in via `:NN` padding.
         if isinstance(request.file_path, MacroPath):
-            resolution_result = self._resolve_macro_path_to_string(request.file_path)
+            macro_path = request.file_path
+            path_display = f"{macro_path.parsed_macro}"
+            # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
+            # the failure is the signal the seed-and-retry logic below uses to pick which
+            # slot to auto-allocate. Demote the log level so the probing miss doesn't
+            # surface as a user-facing ERROR when the retry succeeds. For any other
+            # policy the failure IS terminal, so it keeps the default ERROR level.
+            first_attempt_log_level = (
+                logging.DEBUG if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW else logging.ERROR
+            )
+            resolution_result = self._resolve_macro_path_to_string(
+                macro_path, failure_log_level=first_attempt_log_level
+            )
+
+            # Seed-and-retry: ONLY for CREATE_NEW + a single padded missing-required
+            # slot. Anything else (other policies, multiple missing, no padding) falls
+            # through to the failure return below.
+            # https://github.com/griptape-ai/griptape-nodes-engine/issues/4875
+            if (
+                isinstance(resolution_result, MacroResolutionFailure)
+                and resolution_result.missing_variables
+                and request.existing_file_policy is ExistingFilePolicy.CREATE_NEW
+            ):
+                candidate = self._find_padded_unresolved_required(
+                    macro_path.parsed_macro, resolution_result.missing_variables
+                )
+                if candidate is not None:
+                    seeded_vars = {**macro_path.variables, candidate.info.name: 1}
+                    seeded_macro = MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
+                    # Second-attempt resolve: if seeding didn't fix it, that's genuinely
+                    # broken — keep the ERROR default so the user sees what went wrong.
+                    resolution_result = self._resolve_macro_path_to_string(seeded_macro)
+
             if isinstance(resolution_result, MacroResolutionFailure):
-                path_display = f"{request.file_path.parsed_macro}"
                 msg = f"Attempted to write to file '{path_display}'. Failed due to missing variables: {resolution_result.error_details}"
                 return WriteFileResultFailure(
                     failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
@@ -1822,7 +2340,6 @@ class OSManager:
                     result_details=msg,
                 )
             resolved_path_str = resolution_result
-            path_display = f"{request.file_path.parsed_macro}"
         else:
             # Sanitize string path (removes shell escapes, quotes, etc.)
             resolved_path_str = sanitize_path_string(request.file_path)
@@ -1861,6 +2378,19 @@ class OSManager:
                 failure_reason=parent_failure_reason,
                 result_details=msg,
             )
+
+        # Sniff bytes ONCE and align the destination suffix to the sniffed format
+        # before any scan, write, or candidate generation runs. Without this, the
+        # scan globs the template's suffix while the post-write rename moves the
+        # file to the sniffed suffix; the next CREATE_NEW save with the same bytes
+        # globs the wrong family, returns an already-used index, writes, and the
+        # rename clobbers the prior save. (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
+        # Strict mode fails here before touching the disk.
+        alignment = self._apply_extension_coercion(request, file_path)
+        if isinstance(alignment, WriteFileResultFailure):
+            return alignment
+        sniffed_ext = alignment.sniffed_ext
+        file_path = alignment.aligned_path
 
         # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
@@ -1931,65 +2461,40 @@ class OSManager:
                     final_bytes_written = result.bytes_written
                 else:
                     # FILE EXISTS OR IS LOCKED. ATTEMPT TO FIND THE NEXT AVAILABLE.
-                    # Convert to indexed MacroPath for scanning. If the user didn't give us a macro to start with,
-                    # we'll take their file name and turn it into a macro that appends _<index> to it.
-                    # (e.g., if they gave us "output.png" we'll convert that to a macro that tries "output_1.png", "output_2.png", etc.)
-                    # For MacroPath inputs, the path is already fully resolved at this point,
-                    # so convert the resolved path string to inject {_index} as well.
-                    macro_path = self._convert_str_path_to_macro_with_index(str(file_path))
+                    # Two ways to discover the index variable to walk:
+                    #
+                    # 1. If the caller passed a MacroPath that already opted into the
+                    #    auto-index seed (one unresolved required `{x:NN}` slot bound to
+                    #    `1` by ProjectManager's seed gate), walk THAT slot — incrementing
+                    #    `_index` against the user's original macro produces consistent
+                    #    zero-padded width across the sequence (`v001 → v002 → v003`).
+                    # 2. Otherwise, synthesize an `{stem}_{_index}{ext}` macro from the
+                    #    resolved string. This is the original behavior for plain string
+                    #    paths (`output.png` → `output_1.png`). For seeded MacroPaths it
+                    #    would lose padding (`v003 → v003_1`), which is why path 1 above
+                    #    catches them first.
+                    macro_path, padded_index_var = self._select_collision_walk_macro(request, file_path)
                     parsed_macro = macro_path.parsed_macro
                     variables = macro_path.variables
 
-                    # Identify index variable
-                    try:
-                        index_info = self._identify_index_variable(parsed_macro, variables)
-                    except ValueError as e:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.INVALID_PATH,
-                            result_details=msg,
-                        )
-                    except Exception as e:
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.IO_ERROR,
-                            result_details=msg,
-                        )
-
-                    if index_info is None:
-                        # This should not happen since we always inject {_index} above
-                        msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
-                        return WriteFileResultFailure(
-                            failure_reason=FileIOFailureReason.INVALID_PATH,
-                            result_details=msg,
-                        )
-
-                    # We have a macro with one and only one index variable on it. The heuristic here is:
-                    # 1. Find the FIRST available file name with our index. We'll start there, but someone else may have
-                    #    ganked it while we were attempting to write to it.
-                    # 2. Try candidates in sequence until we find one that works, or fail if we've tried too many times.
-                    # Note: The user could have specified using the index value as a DIRECTORY,
-                    # so it's not always output_1, output_2, etc. It could be run_1/output.png, run_2/output.png, etc.
-
-                    # Scan for starting index
-                    starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
-
-                    # Try indexed candidates on-demand (up to max attempts)
-                    secrets_manager = GriptapeNodes.SecretsManager()
-                    start_idx = starting_index if starting_index is not None else 1
-                    attempted_count = 0
-
-                    for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
-                        attempted_count += 1
-
-                        # Step 1: Resolve macro with current index
+                    # For the synthesized-macro case (padded_index_var is None) we still
+                    # use _identify_index_variable to find the slot — its variables dict
+                    # is empty by construction so the call is unambiguous. For the
+                    # original-macro case the caller already knows the slot from
+                    # _select_collision_walk_macro, so we skip the call entirely
+                    # (running it against `{outputs}/render_v{_index:NN}.png` with empty
+                    # variables would falsely report ambiguity since `{outputs}` is also
+                    # unresolved at that level — it gets substituted by ProjectManager
+                    # during the per-iteration resolve).
+                    if padded_index_var is not None:
+                        index_info = padded_index_var
+                    else:
                         try:
-                            index_vars = {**variables, index_info.info.name: idx}
-                            candidate_str = parsed_macro.resolve(index_vars, secrets_manager)
-                        except MacroResolutionError as e:
-                            msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
+                            index_info = self._identify_index_variable(parsed_macro, variables)
+                        except ValueError as e:
+                            msg = f"Attempted to write to file '{path_display}'. Failed due to {e}"
                             return WriteFileResultFailure(
-                                failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                failure_reason=FileIOFailureReason.INVALID_PATH,
                                 result_details=msg,
                             )
                         except Exception as e:
@@ -1998,6 +2503,83 @@ class OSManager:
                                 failure_reason=FileIOFailureReason.IO_ERROR,
                                 result_details=msg,
                             )
+
+                        if index_info is None:
+                            # This should not happen since we always inject {_index} above
+                            msg = f"Attempted to write to file '{path_display}'. Failed due to missing index variable after conversion"
+                            return WriteFileResultFailure(
+                                failure_reason=FileIOFailureReason.INVALID_PATH,
+                                result_details=msg,
+                            )
+
+                    # We have a macro with one and only one index variable on it. Two
+                    # walking strategies, picked in `_select_collision_walk_macro`:
+                    #
+                    # A. Original MacroPath with a padded slot — `request.file_path` is
+                    #    the same MacroPath the caller sent. We re-resolve each iteration
+                    #    via `_resolve_macro_path_to_string` so project directories get
+                    #    substituted. Skip the filesystem scan; just walk forward.
+                    #
+                    #    Starting index depends on whether the seed already tried index=1:
+                    #    - Required `{x:NN}`: seed in COMMON SETUP assigned 1 → start at 2.
+                    #    - Optional `{x?:NN}`: seed didn't fire (it's gated on required);
+                    #      the first attempt resolved with the slot OMITTED → start at 1
+                    #      so this loop is the FIRST place we try a value.
+                    # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
+                    #    — variables is empty, template is fully static except `{_index}`.
+                    #    Run the existing scan to find a starting index (`output.png`
+                    #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
+                    walking_original = padded_index_var is not None
+                    if walking_original:
+                        # padded_index_var is the var the walk targets. is_required tells
+                        # us whether the seed already tried 1 in COMMON SETUP.
+                        start_idx = 2 if padded_index_var.info.is_required else 1
+                    else:
+                        starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
+                        start_idx = starting_index if starting_index is not None else 1
+
+                    # Try indexed candidates on-demand (up to max attempts)
+                    secrets_manager = GriptapeNodes.SecretsManager()
+                    attempted_count = 0
+
+                    for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
+                        attempted_count += 1
+
+                        # Step 1: Resolve macro with current index
+                        index_vars = {**variables, index_info.info.name: idx}
+                        if walking_original:
+                            # Original MacroPath: route through ProjectManager so project
+                            # directories (`{outputs}`, …) get substituted along with our
+                            # incremented index. The variable is already bound (we just
+                            # set it ourselves), so the resolver doesn't need any policy
+                            # context — it'll succeed without invoking any seed logic.
+                            resolution = self._resolve_macro_path_to_string(
+                                MacroPath(parsed_macro=parsed_macro, variables=index_vars),
+                            )
+                            if isinstance(resolution, MacroResolutionFailure):
+                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {resolution.error_details}"
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                    result_details=msg,
+                                )
+                            candidate_str = resolution
+                        else:
+                            try:
+                                candidate_str = parsed_macro.resolve(index_vars, secrets_manager)
+                            except MacroResolutionError as e:
+                                msg = f"Attempted to write to file '{path_display}'. Failed due to unable to resolve path template with index {idx}: {e}"
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.MISSING_MACRO_VARIABLES,
+                                    result_details=msg,
+                                )
+                            except Exception as e:
+                                msg = (
+                                    f"Attempted to write to file '{path_display}'. Failed due to unexpected error: {e}"
+                                )
+                                return WriteFileResultFailure(
+                                    failure_reason=FileIOFailureReason.IO_ERROR,
+                                    result_details=msg,
+                                )
 
                         # Step 2: Resolve file path
                         try:
@@ -2014,6 +2596,15 @@ class OSManager:
                                 failure_reason=FileIOFailureReason.IO_ERROR,
                                 result_details=msg,
                             )
+
+                        # Align the candidate suffix with the sniffed extension so the
+                        # walked candidate ends up on disk at the same suffix as the
+                        # try-first attempt. The synthesized-macro path inherits this
+                        # because its template comes from the already-swapped file_path;
+                        # the walking-original path uses the user's original suffix and
+                        # needs this swap every iteration.
+                        if sniffed_ext is not None:
+                            candidate_path = candidate_path.with_suffix(f".{sniffed_ext}")
 
                         # Ensure parent directory for this candidate
                         parent_failure_reason = self._ensure_parent_directory_ready(
@@ -2062,6 +2653,19 @@ class OSManager:
             msg = "Internal error: success path reached but file path or bytes not set"
             raise RuntimeError(msg)
 
+        # Sidecar provenance must reflect the on-disk extension, not the requested one.
+        # The actual reconciliation already happened at the top of the handler via
+        # the sniff-and-swap; this just keeps the sidecar's file_extension variable
+        # (when present) consistent with what the bytes turned out to be.
+        if (
+            sniffed_ext is not None
+            and request.file_metadata is not None
+            and request.file_metadata.situation is not None
+        ):
+            sidecar_variables = request.file_metadata.situation.variables
+            if sidecar_variables is not None and "file_extension" in sidecar_variables:
+                sidecar_variables["file_extension"] = sniffed_ext
+
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
             write_sidecar(final_file_path, request.file_metadata)
@@ -2077,6 +2681,72 @@ class OSManager:
             bytes_written=final_bytes_written,
             result_details=result_details,
         )
+
+    def _apply_extension_coercion(
+        self,
+        request: WriteFileRequest,
+        file_path: Path,
+    ) -> ExtensionAlignment | WriteFileResultFailure:
+        """Reconcile the destination suffix with the sniffed byte format.
+
+        Runs once at the top of ``on_write_file_request`` so the planner and the
+        on-disk filename agree on the extension before any scan or write begins.
+        The two relevant signals are the sniffed canonical extension and the
+        path's current suffix:
+
+        - No bytes / unrecognized bytes / empty suffix → no swap; pass the path
+          through unchanged. An unrecognized-bytes case logs a warning so callers
+          can spot it in logs.
+        - Sniffed matches the path's canonical suffix → no swap.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=True`` (default)
+          → swap to the sniffed suffix and return the new path.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` → return
+          a ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the caller
+          can early-exit before touching the disk.
+        """
+        content = request.content
+        if not isinstance(content, bytes):
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        destination_suffix = file_path.suffix.lstrip(".").lower()
+        if not destination_suffix:
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        sniffed = GriptapeNodes.ArtifactManager().sniff_extension(content)
+        if sniffed is None:
+            logger.warning(
+                "Attempted to identify the format of bytes destined for '%s'. "
+                "Could not recognize the bytes as a known file format, so the file will be written "
+                "with its requested '.%s' extension unchanged.",
+                file_path,
+                destination_suffix,
+            )
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        if canonical_extension(destination_suffix) == canonical_extension(sniffed):
+            return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        if not request.coerce_extension_to_match_bytes:
+            msg = (
+                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
+                f"Failed because the requested extension '.{destination_suffix}' does not match the "
+                f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
+                f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
+            )
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
+                result_details=msg,
+            )
+
+        aligned_path = file_path.with_suffix(f".{sniffed}")
+        logger.warning(
+            "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
+            "adjusted to '%s' to match the byte content.",
+            file_path,
+            sniffed,
+            aligned_path,
+        )
+        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed)
 
     def _ensure_parent_directory_ready(
         self,
@@ -2498,6 +3168,56 @@ class OSManager:
             logger.error("Attempted to clean up old files from %s, but no files could be deleted.")
 
         return removed_count > 0
+
+    def on_make_directory_request(self, request: MakeDirectoryRequest) -> ResultPayload:  # noqa: PLR0911
+        """Handle a request to create a directory."""
+        sanitized = sanitize_path_string(request.path)
+        try:
+            dir_path = self._resolve_file_path(sanitized, workspace_only=False)
+        except (ValueError, RuntimeError) as e:
+            msg = f"Attempted to create directory '{sanitized}'. Failed due to invalid path: {e}"
+            return MakeDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        if dir_path.is_file():
+            msg = f"Attempted to create directory '{dir_path}'. Failed because a file already exists at that path."
+            return MakeDirectoryResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        if dir_path.is_dir() and not request.exist_ok:
+            msg = f"Attempted to create directory '{dir_path}'. Failed because directory already exists."
+            return MakeDirectoryResultFailure(
+                failure_reason=FileIOFailureReason.POLICY_NO_OVERWRITE, result_details=msg
+            )
+
+        if dir_path.is_dir():
+            return MakeDirectoryResultSuccess(
+                created_path=str(dir_path),
+                already_existed=True,
+                result_details=f"Directory already exists at {dir_path}",
+            )
+
+        normalized = normalize_path_for_platform(dir_path)
+        try:
+            Path(normalized).mkdir(parents=request.create_parents, exist_ok=request.exist_ok)
+        except FileNotFoundError as e:
+            msg = f"Attempted to create directory '{dir_path}'. Failed because parent directory does not exist and create_parents is False: {e}"
+            return MakeDirectoryResultFailure(
+                failure_reason=FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS, result_details=msg
+            )
+        except PermissionError as e:
+            msg = f"Attempted to create directory '{dir_path}'. Failed due to permission denied: {e}"
+            return MakeDirectoryResultFailure(failure_reason=FileIOFailureReason.PERMISSION_DENIED, result_details=msg)
+        except OSError as e:
+            if "No space left" in str(e) or "Disk full" in str(e):
+                msg = f"Attempted to create directory '{dir_path}'. Failed due to disk full: {e}"
+                return MakeDirectoryResultFailure(failure_reason=FileIOFailureReason.DISK_FULL, result_details=msg)
+            msg = f"Attempted to create directory '{dir_path}'. Failed due to I/O error: {e}"
+            return MakeDirectoryResultFailure(failure_reason=FileIOFailureReason.IO_ERROR, result_details=msg)
+
+        return MakeDirectoryResultSuccess(
+            created_path=str(dir_path),
+            already_existed=False,
+            result_details=f"Directory created successfully at {dir_path}",
+        )
 
     def on_create_file_request(self, request: CreateFileRequest) -> ResultPayload:  # noqa: PLR0911, PLR0912, C901
         """Handle a request to create a file or directory."""

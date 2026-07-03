@@ -4,7 +4,7 @@ from typing import Any
 
 import pytest
 
-from griptape_nodes.retained_mode.events.base_events import EventRequest
+from griptape_nodes.retained_mode.events.base_events import EventRequest, ForwardedException
 from griptape_nodes.retained_mode.events.event_converter import (
     _is_json_primitive_union,
     converter,
@@ -145,3 +145,63 @@ class TestSetParameterValueRequestStructuring:
         assert event.request.value["type"] == "ImageUrlArtifact"
         expected_width = 3024
         assert event.request.value["width"] == expected_width
+
+
+class TestExceptionWireForm:
+    """Round-trip coverage for the Exception <-> dict converter pair.
+
+    The unstructure hook emits ``{type, message, traceback}`` and the
+    structure hook rebuilds those into ``ForwardedException``'s
+    ``original_type`` / message / ``original_traceback`` slots. Both
+    halves are load-bearing for the orchestrator-side
+    ``[<type>] ... Worker traceback: ...`` rendering in
+    ``NodeExecutor._format_node_failure_message``.
+    """
+
+    @staticmethod
+    def _raise_and_capture(exc: Exception) -> Exception:
+        try:
+            raise exc  # noqa: TRY301
+        except Exception as e:
+            return e
+
+    def test_unstructure_raised_exception_carries_type_message_and_traceback(self) -> None:
+        e = self._raise_and_capture(ValueError("boom"))
+        payload = converter.unstructure(e, Exception)
+
+        assert payload["type"] == "builtins.ValueError"
+        assert payload["message"] == "boom"
+        assert payload["traceback"] is not None
+        assert "ValueError: boom" in payload["traceback"]
+
+    def test_unstructure_unraised_exception_has_null_traceback(self) -> None:
+        # An exception that was constructed but never raised has
+        # ``__traceback__ is None``; the wire form preserves type and
+        # message but the traceback slot is null.
+        payload = converter.unstructure(ValueError("never raised"), Exception)
+
+        assert payload["type"] == "builtins.ValueError"
+        assert payload["message"] == "never raised"
+        assert payload["traceback"] is None
+
+    def test_round_trip_yields_forwarded_exception_with_worker_fields(self) -> None:
+        e = self._raise_and_capture(RuntimeError("worker boom"))
+        payload = converter.unstructure(e, Exception)
+        rebuilt = converter.structure(payload, Exception)
+
+        assert isinstance(rebuilt, ForwardedException)
+        assert str(rebuilt) == "worker boom"
+        assert rebuilt.original_type == "builtins.RuntimeError"
+        assert rebuilt.original_traceback is not None
+        assert "RuntimeError: worker boom" in rebuilt.original_traceback
+
+    def test_structure_tolerates_non_dict_payload(self) -> None:
+        # Old persisted events on disk may carry a bare-string
+        # ``exception`` field; refusing to structure them would abort
+        # deserialization of the whole enclosing event.
+        rebuilt = converter.structure("legacy stringified error", Exception)
+
+        assert isinstance(rebuilt, ForwardedException)
+        assert str(rebuilt) == "legacy stringified error"
+        assert rebuilt.original_type is None
+        assert rebuilt.original_traceback is None

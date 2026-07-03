@@ -245,11 +245,11 @@ class EngineIdentityManager:
 
         if engine_data_file.exists():
             try:
-                with engine_data_file.open("r") as f:
+                with engine_data_file.open("r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict) and "engines" in data:
                         return EnginesStorage.model_validate(data)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 pass
 
         return EnginesStorage(engines=[], default_engine_id=None)
@@ -264,7 +264,7 @@ class EngineIdentityManager:
         engine_data_dir.mkdir(parents=True, exist_ok=True)
 
         engine_data_file = self._get_engine_data_file()
-        with engine_data_file.open("w") as f:
+        with engine_data_file.open("w", encoding="utf-8") as f:
             json.dump(engines_data.model_dump(exclude_none=True), f, indent=2)
 
         # Update in-memory copy

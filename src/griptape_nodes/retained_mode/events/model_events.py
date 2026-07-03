@@ -345,3 +345,61 @@ class GetModelInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @PayloadRegistry.register
 class GetModelInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Model info retrieval failed. Common causes: invalid model ID, network error, authentication required."""
+
+
+@dataclass
+@PayloadRegistry.register
+class DeclareModelInvocationRequest(RequestPayload):
+    """Declare that a node is about to invoke a catalog model, so the call is subject to entitlements.
+
+    This is how a well-intentioned node opts into the permission system: before
+    invoking a model it declares the invocation, and the pre-dispatch hook chain
+    decides whether it is permitted. The node performs the actual inference
+    itself, in its own code; this request runs no backend. A success result
+    means "cleared to proceed"; a failure means the invocation is not permitted
+    and the node should not run it.
+
+    Enforcement is advisory in the sense that it relies on the node to declare.
+    It is the engine-side gate the permission system sees and records every
+    declared invocation through, and the natural place to meter or audit. The
+    proxy independently enforces the calls that flow through it; this is the
+    engine's own gate.
+
+    The declaration identifies the model by its `model_id`: the stable catalog
+    key, unique across the whole library. That key alone resolves to a single
+    catalog entry, so the permission evaluator (which owns the catalog) derives
+    the provider, family, and key support from it -- nothing coarser is
+    declared here. Only catalog models can be declared; the stable key is the
+    contract, and a concrete provider model id or `(provider, model)` pair is
+    deliberately not accepted.
+
+    Use when: A node is about to invoke a catalog model and wants the call
+    gated by (and visible to) the permission system.
+
+    Args:
+        model_id: Stable catalog key of the model being invoked (e.g., "gtc_claude_opus_4_7")
+        node_name: Name of the node instance declaring the invocation, when invoked from a node
+
+    Results: DeclareModelInvocationResultSuccess (cleared to proceed) | DeclareModelInvocationResultFailure (not permitted)
+    """
+
+    model_id: str
+    node_name: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class DeclareModelInvocationResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """The declared model invocation is permitted; the node may proceed.
+
+    Args:
+        model_id: The stable catalog key cleared for invocation
+    """
+
+    model_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class DeclareModelInvocationResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The declared model invocation is not permitted. The node should not invoke the model."""

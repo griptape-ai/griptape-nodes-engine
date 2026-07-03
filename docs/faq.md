@@ -51,6 +51,8 @@ gtn config show
 
 ## How do I install the Advanced Media Library after Initial Setup?
 
+For the broader story on installing and managing libraries (including non-Advanced-Media libraries), see [Libraries](libraries.md).
+
 If you initially declined to install the Advanced Media Library during setup but now want to add it, you can do so by running:
 
 ```bash

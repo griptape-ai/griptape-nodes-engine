@@ -547,3 +547,7 @@ async def _delete_model_status(model_id: str) -> None:
     except Exception as e:
         console.print("[bold red]Unexpected error during download status deletion:[/bold red]")
         console.print(f"[red]{e}[/red]")
+
+
+if __name__ == "__main__":
+    app()

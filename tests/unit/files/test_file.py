@@ -1,13 +1,21 @@
 """Unit tests for File and FileDestination."""
 
 import base64
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from PIL import Image
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
-from griptape_nodes.files.file import File, FileContent, FileDestination, FileLoadError, FileWriteError
+from griptape_nodes.files.file import (
+    File,
+    FileContent,
+    FileDestination,
+    FileLoadError,
+    FileWriteError,
+)
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -1123,3 +1131,116 @@ class TestFileResolve:
             File("{outputs}/image.png").resolve()
 
         assert exc_info.value.failure_reason == FileIOFailureReason.MISSING_MACRO_VARIABLES
+
+
+def _pil_bytes(fmt: str, mode: str = "RGB") -> bytes:
+    buf = BytesIO()
+    Image.new(mode, (1, 1), color=0 if mode == "P" else "white").save(buf, format=fmt)
+    return buf.getvalue()
+
+
+def _png_bytes() -> bytes:
+    return _pil_bytes("PNG")
+
+
+def _jpeg_bytes() -> bytes:
+    return _pil_bytes("JPEG")
+
+
+@pytest.fixture
+def _registered_providers() -> None:
+    """Ensure default artifact providers are registered with the ArtifactManager.
+
+    Validation goes through ``ArtifactManager.sniff_extension``, which dispatches
+    to each registered provider's ``detect_format``. Registration normally
+    happens on ``AppInitializationComplete``, which doesn't fire in unit tests,
+    so we register the default providers manually here.
+    """
+    from griptape_nodes.retained_mode.events.artifact_events import RegisterArtifactProviderRequest
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.managers.artifact_providers import (
+        AudioArtifactProvider,
+        ImageArtifactProvider,
+        VideoArtifactProvider,
+    )
+
+    artifact_manager = GriptapeNodes.ArtifactManager()
+    for provider_class in (ImageArtifactProvider, VideoArtifactProvider, AudioArtifactProvider):
+        artifact_manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=provider_class)
+        )
+
+
+@pytest.mark.usefixtures("_registered_providers")
+class TestFileWriteForwardsCoercionFlag:
+    """File.write_bytes forwards coerce_extension_to_match_bytes to the WriteFileRequest.
+
+    Extension reconciliation itself lives in OSManager; these tests confirm File correctly
+    propagates the flag and surfaces strict-mode failures as FileWriteError.
+    """
+
+    def test_write_bytes_passes_on_match(self) -> None:
+        success_result = WriteFileResultSuccess(
+            result_details="OK",
+            final_file_path="/workspace/output.png",
+            bytes_written=10,
+        )
+        with patch(HANDLE_REQUEST_PATH, return_value=success_result):
+            path = File("/workspace/output.png").write_bytes(_png_bytes())
+        assert path == Path("/workspace/output.png")
+
+    def test_write_bytes_default_request_coerces(self) -> None:
+        success_result = WriteFileResultSuccess(
+            result_details="OK",
+            final_file_path="/workspace/output.jpeg",
+            bytes_written=10,
+        )
+        with patch(HANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
+            path = File("/workspace/output.png").write_bytes(_jpeg_bytes())
+        request = mock_handle.call_args.args[0]
+        assert request.coerce_extension_to_match_bytes is True
+        assert path == Path("/workspace/output.jpeg")
+
+    def test_write_bytes_strict_mode_propagates_flag(self) -> None:
+        success_result = WriteFileResultSuccess(
+            result_details="OK",
+            final_file_path="/workspace/output.png",
+            bytes_written=10,
+        )
+        with patch(HANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
+            File("/workspace/output.png").write_bytes(_png_bytes(), coerce_extension_to_match_bytes=False)
+        request = mock_handle.call_args.args[0]
+        assert request.coerce_extension_to_match_bytes is False
+
+    def test_write_bytes_extension_mismatch_failure_raises_file_write_error(self) -> None:
+        failure_result = WriteFileResultFailure(
+            result_details="Refusing to write JPEG bytes to '/workspace/output.png' (extension '.png').",
+            failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
+        )
+        with patch(HANDLE_REQUEST_PATH, return_value=failure_result), pytest.raises(FileWriteError) as exc_info:
+            File("/workspace/output.png").write_bytes(_jpeg_bytes(), coerce_extension_to_match_bytes=False)
+        assert exc_info.value.failure_reason == FileIOFailureReason.EXTENSION_MISMATCH
+
+    @pytest.mark.asyncio
+    async def test_awrite_bytes_default_request_coerces(self) -> None:
+        success_result = WriteFileResultSuccess(
+            result_details="OK",
+            final_file_path="/workspace/output.jpeg",
+            bytes_written=10,
+        )
+        with patch(AHANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
+            path = await File("/workspace/output.png").awrite_bytes(_jpeg_bytes())
+        request = mock_handle.call_args.args[0]
+        assert request.coerce_extension_to_match_bytes is True
+        assert path == Path("/workspace/output.jpeg")
+
+    @pytest.mark.asyncio
+    async def test_awrite_bytes_passes_on_match(self) -> None:
+        success_result = WriteFileResultSuccess(
+            result_details="OK",
+            final_file_path="/workspace/output.jpg",
+            bytes_written=10,
+        )
+        with patch(AHANDLE_REQUEST_PATH, return_value=success_result):
+            path = await File("/workspace/output.jpg").awrite_bytes(_jpeg_bytes())
+        assert path == Path("/workspace/output.jpg")

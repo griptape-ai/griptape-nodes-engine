@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSenderMixin):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         session_id: str,
         storage_backend: StorageBackend = StorageBackend.LOCAL,
@@ -46,11 +46,13 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         save_on_failure_path: str | None = None,
         *,
         project_file_path: Path | None = None,
+        pickle_control_flow_result: bool = False,
     ):
         super().__init__(
             storage_backend=storage_backend,
             project_file_path=project_file_path,
             save_on_failure_path=save_on_failure_path,
+            pickle_control_flow_result=pickle_control_flow_result,
         )
         self._init_websocket_sender(session_id)
         self._on_start_flow_result = on_start_flow_result
@@ -100,7 +102,9 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
 
         Parameters:
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
+            storage_backend: Accepted for compatibility with the base-class run path,
+                but ignored here: the storage backend is applied once at construction
+                via `_set_storage_backend`. Passing it to the run path has no effect.
             pickle_control_flow_result: Per-call override for the executor's
                 save-time default. None means "use the instance default".
 
@@ -132,15 +136,18 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def _arun(  # noqa: C901, PLR0915
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
+        storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
         pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
     ) -> None:
-        """Internal async run method with detailed event handling and websocket integration."""
+        """Internal async run method with detailed event handling and websocket integration.
+
+        `storage_backend` is accepted for signature parity with `arun`/the base run path,
+        but ignored: the backend is applied once at construction via `_set_storage_backend`.
+        """
         flow_name = await self.aprepare_workflow_for_run(
             flow_input=flow_input,
-            storage_backend=storage_backend,
             **kwargs,
         )
 

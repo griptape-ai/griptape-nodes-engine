@@ -1,33 +1,70 @@
 # Blender MCP Server
 
-The **[Blender MCP Server](https://github.com/ahujasid/blender-mcp)** enables AI agents to directly interact with and control Blender. This integration allows for prompt-assisted 3D modeling, scene creation, and manipulation. This is a third-party server created by [Siddharth Ahuja](https://github.com/ahujasid), and is not made by Blender or Griptape.
+The **[Blender MCP Server](https://www.blender.org/lab/mcp-server/)** is the official MCP integration for [Blender](https://www.blender.org), developed and maintained by the Blender Lab team. It allows AI agents to directly interact with and control Blender for prompt-assisted 3D modeling, scene inspection, and manipulation.
 
 !!! note "Prerequisites"
 
     Before using the Blender MCP server, you must:
 
-    1. Have [Blender](http://blender.org) 3.0 or newer installed
+    1. Have [Blender](https://www.blender.org) 5.1 or newer installed
     1. Install the `uv` package manager ([installation instructions](https://docs.astral.sh/uv/getting-started/installation/))
-    1. Download and install the Blender addon from the [repository](https://github.com/ahujasid/blender-mcp)
+    1. Clone the [Blender MCP repository](https://projects.blender.org/lab/blender_mcp)
+    1. Install the Blender MCP extension (see below)
 
-## Installing the Blender Addon
+## Installing the Blender MCP Extension
 
-1. Download the `addon.py` file from the [Blender MCP repository](https://github.com/ahujasid/blender-mcp)
-1. Open Blender
-1. Go to **Edit** → **Preferences** → **Add-ons**
-1. Click **Install...** and select the `addon.py` file
-1. Enable the addon by checking the box next to "Interface: Blender MCP"
+The Blender MCP server is distributed as a Blender Extension through the official Blender Extensions platform.
 
-## Starting the Blender Connection
+1. Visit [blender.org/lab/mcp-server](https://www.blender.org/lab/mcp-server/#addon) and scroll down to the **Add-on** section
 
-1. In Blender, open the 3D View sidebar (press **N** if not visible)
-1. Find the **BlenderMCP** tab
-1. (Optional) Turn on the **Poly Haven** checkbox if you want to use assets from their API
-1. Click **Connect to Claude**
+1. Choose one of the two installation methods:
 
-![Blender MCP Sidebar](../images/blender_mcp_sidebar.png)
+    **Option A — Drag and Drop**
 
-## Installation
+    Drag the **Drag and Drop into Blender** button onto an open Blender window.
+
+    !!! warning "Drag and drop twice"
+
+        You must drag and drop **twice**: the first drop adds the Blender Lab repository, and the second drop installs the add-on itself.
+
+    **Option B — Install from Disk**
+
+    Click **download** on the page, then in Blender go to **Edit** → **Preferences** → **Get Extensions** → dropdown → **Install from Disk...** and select the downloaded file.
+
+1. In Blender, go to **Edit** → **Preferences** → **Get Extensions**
+
+1. Search for `mcp` — you should see the **MCP** extension listed as Available
+
+1. Click **Install**
+
+![Blender MCP Extension in Get Extensions](../images/blender_mcp_extension.png)
+
+## Starting the MCP Server in Blender
+
+Once the extension is installed, you need to start the MCP server inside Blender before connecting from Griptape Nodes:
+
+1. In Blender, go to **Edit** → **Preferences** → **Add-ons**
+1. Search for `mcp` and expand the **MCP** extension preferences
+1. Configure the **Host** and **Port** if needed (defaults: `localhost` / `9876`)
+1. Optionally enable **Auto Start** so the server starts automatically with Blender
+1. Click **Start MCP Server**
+
+The panel will show **Server is running** when the connection is ready.
+
+![Blender MCP Server running](../images/blender_mcp_server_enabled.png)
+
+## Cloning the MCP Server Code
+
+The Griptape Nodes MCP connection requires a local clone of the Blender MCP repository. Clone it to an easily discoverable location — for example, on a Mac you might use `$HOME/Documents/GitHub`:
+
+```bash
+cd $HOME/Documents/GitHub
+git clone https://projects.blender.org/lab/blender_mcp.git
+```
+
+You will reference the path to the `mcp/` subdirectory inside your clone in the Griptape Nodes configuration below.
+
+## Installation in Griptape Nodes
 
 1. **Open Griptape Nodes** and go to **Settings** → **MCP Servers**
 
@@ -42,166 +79,71 @@ The **[Blender MCP Server](https://github.com/ahujasid/blender-mcp)** enables AI
     ```json
     {
       "transport": "stdio",
-      "command": "uvx",
+      "command": "uv",
       "args": [
+        "--directory",
+        "/path/to/blender_mcp/mcp",
+        "run",
         "blender-mcp"
       ],
-      "env": {
-        "BLENDER_PATH": "/usr/bin/blender"
-      },
+      "env": {},
       "cwd": null,
       "encoding": "utf-8",
       "encoding_error_handler": "strict"
     }
     ```
 
+1. **Replace `/path/to/blender_mcp/mcp`** with the actual path to the `mcp/` subdirectory inside your local clone
+
 1. **Click Create Server**
 
-!!! warning "Blender Path Varies by System"
+!!! example "Example path"
 
-    The `BLENDER_PATH` environment variable should point to your Blender executable. Common locations include:
+    If you cloned the repository to `$HOME/Documents/GitHub/blender_mcp`, the `--directory` value would be:
 
-    - **macOS**: `/Applications/Blender.app/Contents/MacOS/Blender`
-    - **Linux**: `/usr/bin/blender` or `/usr/local/bin/blender`
-    - **Windows**: `C:\Program Files\Blender Foundation\Blender\blender.exe`
-
-    Your installation path may vary depending on how you installed Blender.
-
-## Available Tools
-
-- **`get_scene_info`** - Get detailed information about the current Blender scene
-- **`get_object_info`** - Get information about a specific object in the scene
-- **`get_viewport_screenshot`** - Capture a screenshot of the current 3D viewport
-- **`execute_blender_code`** - Execute arbitrary Python code in Blender
-- **`get_polyhaven_categories`** - Get available asset categories from Poly Haven (requires Poly Haven enabled)
-- **`search_polyhaven_assets`** - Search for assets on Poly Haven (requires Poly Haven enabled)
-- **`download_polyhaven_asset`** - Download and import Poly Haven assets (requires Poly Haven enabled)
-- **`set_texture`** - Apply a downloaded Poly Haven texture to an object (requires Poly Haven enabled)
-- **`get_polyhaven_status`** - Check if Poly Haven integration is enabled
-- **`get_hyper3d_status`** - Check if Hyper3D Rodin integration is enabled
-- **`search_sketchfab_models`** - Search for models on Sketchfab
-- **`download_sketchfab_model`** - Download and import Sketchfab models
-- **`generate_hyper3d_model_via_text`** - Generate 3D models from text descriptions using Hyper3D Rodin
-- **`generate_hyper3d_model_via_images`** - Generate 3D models from images using Hyper3D Rodin
-- **`poll_rodin_job_status`** - Check the status of a Hyper3D Rodin generation task
-- **`import_generated_asset`** - Import a generated Hyper3D Rodin asset into Blender
-
-## Configuration Options
-
-You can configure additional environment variables to customize the Blender connection:
-
-```json
-{
-  "transport": "stdio",
-  "command": "uvx",
-  "args": [
-    "blender-mcp"
-  ],
-  "env": {
-    "BLENDER_PATH": "/Applications/Blender.app/Contents/MacOS/Blender",
-    "BLENDER_HOST": "localhost",
-    "BLENDER_PORT": "9876"
-  },
-  "cwd": null,
-  "encoding": "utf-8",
-  "encoding_error_handler": "strict"
-}
-```
-
-Available environment variables:
-
-- **`BLENDER_PATH`** - Path to your Blender executable
-- **`BLENDER_HOST`** - Host address for Blender socket server (default: `localhost`)
-- **`BLENDER_PORT`** - Port number for Blender socket server (default: `9876`)
-
-## Advanced Features
-
-### Poly Haven Integration
-
-The Blender MCP server can download and import assets (HDRIs, textures, models) from Poly Haven's free library:
-
-1. Enable Poly Haven in the Blender addon by checking the **Poly Haven** checkbox
-1. Use tools like `search_polyhaven_assets` and `download_polyhaven_asset` to find and import assets
-
-Example commands:
-
-- "Download a beach HDRI from Poly Haven and use it as the environment"
-- "Find a wood texture on Poly Haven and apply it to this cube"
-
-### Hyper3D Rodin Integration
-
-Generate 3D models using AI through Hyper3D Rodin:
-
-1. Check the Hyper3D status with `get_hyper3d_status`
-1. Generate models from text descriptions or images
-1. Poll for completion and import the generated asset
-
-!!! info "Hyper3D Free Trial"
-
-    Hyper3D's free trial key allows a limited number of model generations per day. For unlimited access, obtain your own key from [hyper3d.ai](https://hyper3d.ai) and [fal.ai](https://fal.ai).
-
-### Sketchfab Integration
-
-Search and download models from Sketchfab's library:
-
-1. Use `search_sketchfab_models` to find models
-1. Download models with `download_sketchfab_model`
+    ```
+    /Users/yourname/Documents/GitHub/blender_mcp/mcp
+    ```
 
 ## Example Use Cases
 
-Here are some examples of what you can create with the Blender MCP server:
-
-- "Create a low poly scene in a dungeon, with a dragon guarding a pot of gold"
-- "Create a beach vibe using HDRIs, textures, and models like rocks and vegetation from Poly Haven"
-- "Generate a 3D model of a garden gnome through Hyper3D"
-- "Make this car red and metallic"
+- "With the current open Blender file, suggest descriptive names for all data-blocks, and apply if approved"
+- "What is the object with the highest poly-count in this file? Ignore objects which are not linked to any scene"
 - "Create a sphere and place it above the cube"
 - "Make the lighting like a studio"
-- "Point the camera at the scene, and make it isometric"
+- "Point the camera at the scene and make it isometric"
 - "Get information about the current scene and export it as JSON"
 
 ## Troubleshooting
 
 ### Common Issues
 
-- **Connection Issues**: Ensure the Blender addon server is running (check that you clicked "Connect to Claude" in Blender), verify the MCP server is configured correctly in Griptape Nodes, check that the `BLENDER_PATH` environment variable points to the correct Blender executable
-- **First Command Fails**: The first command after connecting sometimes doesn't go through, but subsequent commands typically work. Try running the command again.
-- **Timeout Errors**: Try simplifying your requests or breaking them into smaller steps, complex operations may need to be executed in multiple steps
-- **Poly Haven Not Working**: Ensure the Poly Haven checkbox is enabled in the Blender addon, verify you have an internet connection, note that Claude can be erratic with Poly Haven integration
-- **Code Execution Warnings**: The `execute_blender_code` tool runs arbitrary Python code in Blender, which can be powerful but potentially dangerous. **Always save your work before using it.**
+- **Connection refused**: Ensure the MCP server is running in Blender (check that the extension preferences show **Server is running**)
+- **First command fails**: The first command after connecting sometimes doesn't go through. Try running the command again
+- **Wrong path**: Verify the `--directory` argument points to the `mcp/` subdirectory of your clone, not the repository root
+- **Timeout errors**: Try simplifying your requests or breaking them into smaller steps
+- **Code execution warnings**: If the server exposes code execution tools, always save your Blender work before using them
 
 ### Debug Tips
 
-1. Check that the Blender addon is enabled and running (look for the BlenderMCP tab in the sidebar)
-1. Verify the socket server is active in Blender (status shown in the addon panel)
-1. Test with simple commands first (e.g., "get scene information")
-1. If Poly Haven or Hyper3D features aren't working, check their status with the respective status tools
-1. Restart both Blender and the MCP connection if issues persist
+1. Confirm the extension is installed and enabled under **Edit** → **Preferences** → **Add-ons**
+1. Check the Host and Port match on both sides (Blender extension and Griptape Nodes config)
+1. Test with a simple query first (e.g., "what objects are in the scene?")
+1. Restart both Blender and the MCP server if issues persist
 
 ## Resources
 
-- [Blender MCP Server Repository](https://github.com/ahujasid/blender-mcp) - Official repository and documentation
+- [Blender MCP Server](https://www.blender.org/lab/mcp-server/) - Official page and extension download
+- [Blender MCP Repository](https://projects.blender.org/lab/blender_mcp) - Source code and issue tracker
 - [Blender Python API](https://docs.blender.org/api/current/) - Reference for Blender scripting
-- [Poly Haven](https://polyhaven.com/) - Free 3D assets library
-- [Hyper3D Rodin](https://hyper3d.ai) - AI-powered 3D model generation
-- [Sketchfab](https://sketchfab.com/) - 3D model marketplace
+- [uv Installation](https://docs.astral.sh/uv/getting-started/installation/) - Package manager required to run the MCP server
 
 ## Security Considerations
 
-!!! danger "Arbitrary Code Execution"
+!!! danger "Code Execution"
 
-    The `execute_blender_code` tool allows running arbitrary Python code in Blender. This can be powerful but potentially dangerous:
+    Some MCP tools may execute code directly in Blender. This can be powerful but potentially dangerous:
 
-    - **Always save your Blender work** before using code execution
+    - **Always save your Blender work** before using code execution tools
     - Review generated code when possible
     - Use with caution in production environments
-    - Be aware that malicious code could potentially harm your system or data
-
-!!! info "Asset Downloads"
-
-    Poly Haven and Sketchfab integrations require downloading external assets:
-
-    - Downloads may be large (textures, HDRIs, models)
-    - Ensure you have adequate disk space
-    - Assets are stored in Blender's cache directory
-    - If you don't want to use these features, keep Poly Haven disabled in the addon

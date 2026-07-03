@@ -245,11 +245,11 @@ class SessionManager:
 
         if session_state_file.exists():
             try:
-                with session_state_file.open("r") as f:
+                with session_state_file.open("r", encoding="utf-8") as f:
                     data = json.load(f)
                     if isinstance(data, dict) and "sessions" in data:
                         return SessionsStorage.model_validate(data)
-            except (json.JSONDecodeError, OSError):
+            except (json.JSONDecodeError, OSError, UnicodeDecodeError):
                 pass
 
         return SessionsStorage(sessions=[])
@@ -265,7 +265,7 @@ class SessionManager:
         session_state_dir.mkdir(parents=True, exist_ok=True)
 
         session_state_file = self._get_session_state_file(engine_id)
-        with session_state_file.open("w") as f:
+        with session_state_file.open("w", encoding="utf-8") as f:
             json.dump(sessions_data.model_dump(exclude_none=True), f, indent=2)
 
         # Update in-memory copy

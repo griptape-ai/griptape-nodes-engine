@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml import YAML
 
 from griptape_nodes.common.project_templates.directory import DirectoryDefinition
+from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
 from griptape_nodes.common.project_templates.situation import SituationTemplate
 from griptape_nodes.common.project_templates.validation import (
     ProjectOverrideAction,
@@ -20,14 +21,97 @@ if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
 
 
+def build_project_yaml() -> YAML:
+    """Build a YAML serializer with the shared project-template dump conventions.
+
+    Single-sources the quoting/width rules every project YAML is written with, so
+    standalone dumps (ProjectTemplate._dump_yaml) and in-place edits (the export
+    package's template rename) stay byte-compatible. Callers add their own
+    pre-processing (e.g. nested-key filtering) on top.
+    """
+    yaml = YAML()
+    yaml.default_flow_style = False
+    yaml.width = 4096
+    # Double-quote all strings; bools and ints are left untagged: https://yaml.org/spec/1.2.2/
+    yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
+    # Emit explicit "null" for None (deletion tombstones) so bare keys like `save_file:`
+    # don't look truncated in a hand-read of the file.
+    yaml.representer.add_representer(type(None), lambda r, _d: r.represent_scalar("tag:yaml.org,2002:null", "null"))
+    return yaml
+
+
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.3.1"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.5.2"
 
     project_template_schema_version: str = Field(description="Schema version for the project template")
     name: str = Field(description="Name of the project")
+    id: str | None = Field(
+        default=None,
+        description=(
+            "Opaque identifier for the template, unique per engine. The UI sets a GUID by default, but a "
+            "user may set any unique string. It is the identifier used by project events and referenced by "
+            "external consumers such as policies; consumers must not parse or construct it. Absent on legacy "
+            "projects that predate this field, in which case the engine derives the id from the canonicalized "
+            "project file path. Set once at creation and immutable thereafter."
+        ),
+    )
     description: str | None = Field(default=None, description="Description of the project")
+    parent_project_path: str | PerPlatformProjectPath | None = Field(
+        default=None,
+        description=(
+            "Optional path to a parent project YAML. When set, the parent's merged template is the "
+            "base for this template (instead of system defaults alone). The value may be: "
+            "(1) a string — absolute, or relative to the directory of this project's YAML "
+            "(e.g. `../base/griptape-nodes-project.yml`); or (2) a per-platform mapping with optional "
+            "`linux`, `darwin`, `windows`, and `default` string fields, used when the parent lives at "
+            "different filesystem paths on different OSes. Relative paths are preferred for cross-machine "
+            "portability when both projects live under the same workspace; the per-platform form is "
+            "preferred when the parent lives on shared storage mounted at different paths per OS. "
+            "Macro tokens are not allowed: they would resolve against runtime state (e.g. the active "
+            "workspace) that can change while the project is loaded, which would corrupt parent/child links."
+        ),
+    )
+    parent_project_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional id of a parent project. When set, the parent's merged template is the base for this "
+            "template, located via the engine registry rather than a filesystem path, so the link survives "
+            "moving the file between machines. Mutually exclusive with parent_project_path: when this is set "
+            "the engine ignores parent_project_path. parent_project_path is retained only as a backwards-compat "
+            "fallback for legacy projects that have no parent_project_id."
+        ),
+    )
+    workspace_dir: str | PerPlatformProjectPath | None = Field(
+        default=None,
+        description=(
+            "Optional workspace directory this project uses. When set, it is the highest-priority workspace "
+            "source: it overrides the per-user project_workspaces mapping, the GTN_CONFIG_WORKSPACE_DIRECTORY "
+            "env var, the project-adjacent config, parent inheritance, and the global default. The directory "
+            "need not contain a config file; an empty directory is valid. The value may be: (1) a string — "
+            "absolute, or relative to the directory of this project's YAML (e.g. `./workspace`); or (2) a "
+            "per-platform mapping with optional `linux`, `darwin`, `windows`, and `default` string fields. "
+            "The raw string is stored verbatim and only resolved to an absolute path at workspace-resolution "
+            "time, so a relative value keeps the project portable across machines."
+        ),
+    )
+    libraries_dir: str | PerPlatformProjectPath | None = Field(
+        default=None,
+        description=(
+            "Optional directory where this project's downloaded/registered libraries install and resolve, "
+            "decoupled from workspace_dir. When set, libraries_to_download are provisioned here instead of "
+            "under the workspace-relative libraries_directory, so a child project can share its parent's "
+            "library install location and avoid re-downloading. It inherits down the parent-project chain: a "
+            "child with no libraries_dir of its own adopts the nearest ancestor that declares one, resolved "
+            "against that ancestor's project directory. The value may be: (1) a string — absolute, or relative "
+            "to the directory of this project's YAML (e.g. `./libraries`); or (2) a per-platform mapping with "
+            "optional `linux`, `darwin`, `windows`, and `default` string fields. The raw string is stored "
+            "verbatim and only resolved to an absolute path at resolution time, so a relative value keeps the "
+            "project portable across machines. When unset everywhere in the chain, libraries resolve the legacy "
+            "way: the workspace-relative libraries_directory config value."
+        ),
+    )
     situations: dict[str, SituationTemplate] = Field(description="Situation templates (situation_name -> template)")
     directories: dict[str, DirectoryDefinition] = Field(
         description="Directory definitions (logical_name -> definition)",
@@ -35,7 +119,7 @@ class ProjectTemplate(BaseModel):
     environment: dict[str, str] = Field(default_factory=dict, description="Custom environment variables")
     file_extension_directories: dict[str, str] = Field(
         default_factory=dict,
-        description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable",
+        description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable. This variable is only available inside situation macros (the filename layer, resolved per-file at write time), not in directory or environment path_macros.",
     )
 
     def get_situation(self, situation_name: str) -> SituationTemplate | None:
@@ -46,7 +130,7 @@ class ProjectTemplate(BaseModel):
         """Get a directory definition by logical name."""
         return self.directories.get(directory_name)
 
-    def to_overlay_yaml(self, base: ProjectTemplate) -> str:
+    def to_overlay_yaml(self, base: ProjectTemplate) -> str:  # noqa: C901
         """Export only user customizations relative to a base template as YAML.
 
         Per-item atomicity: if a situation or directory differs from the base
@@ -69,10 +153,39 @@ class ProjectTemplate(BaseModel):
             "name": self_dump["name"],
         }
 
+        # id is identity, never diffed against base: emit it whenever present so
+        # the saved file always declares its own id. Absent only for templates
+        # with no file-backed id (e.g. the in-memory default base).
+        if self_dump.get("id") is not None:
+            output["id"] = self_dump.get("id")
+
         # description: emit only when it diverges from base. Explicit null
         # tombstones a previously-set base description.
         if self_dump.get("description") != base_dump.get("description"):
             output["description"] = self_dump.get("description")
+
+        # Parent link: parent_project_id and parent_project_path are mutually
+        # exclusive, and parent_project_id is preferred (it is what new saves
+        # emit). parent_project_path is emitted only for a legacy template that
+        # has no parent_project_id, preserving backwards-compat round-trips.
+        # Each is emitted only when it diverges from base; an explicit null
+        # tombstones an inherited link.
+        if self_dump.get("parent_project_id") is not None:
+            if self_dump.get("parent_project_id") != base_dump.get("parent_project_id"):
+                output["parent_project_id"] = self_dump.get("parent_project_id")
+        elif self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
+            output["parent_project_path"] = self_dump.get("parent_project_path")
+
+        # workspace_dir: emit only when it diverges from base. The stored value is the
+        # raw string or per-platform mapping (never absolutized), so a relative path
+        # round-trips verbatim. An explicit null tombstones an inherited value.
+        if self_dump.get("workspace_dir") != base_dump.get("workspace_dir"):
+            output["workspace_dir"] = self_dump.get("workspace_dir")
+
+        # libraries_dir: same semantics as workspace_dir. Raw string/mapping stored
+        # verbatim; emitted only when it diverges from base; explicit null tombstones.
+        if self_dump.get("libraries_dir") != base_dump.get("libraries_dir"):
+            output["libraries_dir"] = self_dump.get("libraries_dir")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
         if situations_overlay:
@@ -126,14 +239,7 @@ class ProjectTemplate(BaseModel):
         Loader injects `name` into nested objects from their dict keys, so
         nested `name` keys are filtered out to avoid duplication on round-trip.
         """
-        yaml = YAML()
-        yaml.default_flow_style = False
-        yaml.width = 4096
-        # Double-quote all strings; bools and ints are left untagged: https://yaml.org/spec/1.2.2/
-        yaml.representer.add_representer(str, lambda r, d: r.represent_scalar("tag:yaml.org,2002:str", d, style='"'))
-        # Emit explicit "null" for None (deletion tombstones) so bare keys like `save_file:`
-        # don't look truncated in a hand-read of the file.
-        yaml.representer.add_representer(type(None), lambda r, _d: r.represent_scalar("tag:yaml.org,2002:null", "null"))
+        yaml = build_project_yaml()
 
         nested_skip = frozenset({"name"})
 
@@ -373,9 +479,44 @@ class ProjectTemplate(BaseModel):
         else:
             merged_description = base.description
 
+        # id is identity, not inherited: the child's own id (which may be None for
+        # a legacy overlay) always wins. The engine derives the effective registry
+        # id from this value or the file path; merge never copies base.id down.
+        merged_id = overlay.id
+
+        # Parent links describe the child's OWN tree edge and are never inherited
+        # from the (already-merged) base: a project does not adopt its parent's
+        # parent. Each is taken from the overlay alone, so the merged result
+        # round-trips exactly the child's declared link. An explicit null or an
+        # omitted field both yield None (the clears_* tombstone is preserved for
+        # parity with the loader but collapses to None here). This also keeps
+        # parent_project_path and parent_project_id mutually exclusive on the
+        # result: a legacy path-linked child never inherits an id-linked parent's
+        # parent_project_id, and vice versa.
+        merged_parent_project_path = None if overlay.clears_parent_project_path else overlay.parent_project_path
+        merged_parent_project_id = None if overlay.clears_parent_project_id else overlay.parent_project_id
+
+        # workspace_dir describes the child's OWN workspace and is never inherited from
+        # the base: a child does not adopt its parent's workspace_dir (cross-project
+        # workspace inheritance is handled by the resolution ladder's parent-chain branch,
+        # not by merge). Taken from the overlay alone; an explicit null or omitted field
+        # both yield None.
+        merged_workspace_dir = None if overlay.clears_workspace_dir else overlay.workspace_dir
+
+        # libraries_dir is never merge-inherited, for the same reason as workspace_dir:
+        # cross-project library-root inheritance is handled by the resolution ladder's
+        # parent-chain branch (decide_libraries_root), not by merge. Taken from the
+        # overlay alone; an explicit null or omitted field both yield None.
+        merged_libraries_dir = None if overlay.clears_libraries_dir else overlay.libraries_dir
+
         return ProjectTemplate(
             project_template_schema_version=overlay.project_template_schema_version,
             name=overlay.name,
+            id=merged_id,
+            parent_project_path=merged_parent_project_path,
+            parent_project_id=merged_parent_project_id,
+            workspace_dir=merged_workspace_dir,
+            libraries_dir=merged_libraries_dir,
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,

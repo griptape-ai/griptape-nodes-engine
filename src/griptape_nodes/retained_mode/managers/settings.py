@@ -5,17 +5,23 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, field_validator
 from pydantic import Field as PydanticField
 
+from griptape_nodes.common.project_templates import PerPlatformProjectPath
+from griptape_nodes.node_library.library_declarations import WorkerMode
+
 LIBRARIES_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.libraries_to_register"
 LIBRARIES_TO_DOWNLOAD_KEY = "app_events.on_app_initialization_complete.libraries_to_download"
 WORKFLOWS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.workflows_to_register"
 SECRETS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.secrets_to_register"
 MODELS_TO_DOWNLOAD_KEY = "app_events.on_app_initialization_complete.models_to_download"
 PROJECTS_TO_REGISTER_KEY = "app_events.on_app_initialization_complete.projects_to_register"
+REQUIRES_ENGINE_KEY = "app_events.on_app_initialization_complete.requires_engine"
 PROJECT_WORKSPACES_KEY = "project_workspaces"
 EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 
 
 class Category(BaseModel):
@@ -39,6 +45,8 @@ MCP_SERVERS = Category(name="MCP Servers", description="Model Context Protocol s
 PROJECTS = Category(name="Projects", description="Project template configurations and registrations")
 STATIC_SERVER = Category(name="Static Server", description="Static file server configuration for serving media assets")
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
+AGENT = Category(name="Agent", description="Agent behavior and system prompt")
+LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -111,7 +119,9 @@ class LibraryRegistration(BaseModel):
     """A library entry in libraries_to_register with optional metadata.
 
     Bare path strings remain valid in the config; this object form is used when
-    additional fields (such as `enabled`) need to be set per entry.
+    additional fields (such as `enabled` or `worker_mode_override`) need to be
+    set per entry. Each entry names an already-present local library by `path`;
+    version-pinned remote sources are declared separately in `libraries_to_download`.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -121,19 +131,65 @@ class LibraryRegistration(BaseModel):
         default=True,
         description="When False, the library remains in config but is not loaded on startup.",
     )
+    worker_mode_override: WorkerMode | None = Field(
+        default=None,
+        description=(
+            "Per-library override of the launch mode declared in the library's manifest. "
+            "ORCHESTRATOR or WORKER. Only honored when the manifest declares "
+            "WorkerModeCompatibility.COMPATIBLE; ignored for INCOMPATIBLE libraries. "
+            "None reverts to the manifest's SuggestedWorkerMode."
+        ),
+    )
+
+
+class LibraryDownload(BaseModel):
+    """A library entry in libraries_to_download that the engine provisions to a version.
+
+    Bare git-URL strings remain valid in the config; this object form is used
+    when a version pin (or an explicit manifest `name`) is needed. The engine
+    downloads the library and, when the installed version does not satisfy the
+    pin, overwrites the local copy so the owning project gets the version it
+    declares. Only libraries listed here may be overwritten by project
+    activation; a library that is merely registered (libraries_to_register) is
+    never overwritten.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    git_url: str = Field(
+        description=(
+            "Git source in the engine's `url@ref` form: a full URL or `user/repo` shorthand, "
+            "with an optional `@branch|tag|commit` suffix "
+            "(e.g. 'griptape-ai/griptape-nodes-library-standard@v2.0')."
+        ),
+    )
+    version: str | None = Field(
+        default=None,
+        description=(
+            "PEP 440 version specifier the installed library must satisfy (e.g. '>=1.2,<2'). None pins by source only."
+        ),
+    )
+    name: str | None = Field(
+        default=None,
+        description=(
+            "Library name, matching the library's manifest `name`. When set, the installed "
+            "version is matched by name to decide whether a re-download is needed."
+        ),
+    )
 
 
 class AppInitializationComplete(BaseModel):
-    libraries_to_download: list[str] = Field(
+    libraries_to_download: list[str | LibraryDownload] = Field(
         default_factory=list,
-        description="Git URLs of libraries to automatically download when the engine starts. Downloaded into libraries_directory. Supports full URLs or GitHub shorthand (e.g., 'user/repo'). Optionally specify a branch, tag, or commit with @ref syntax (e.g., 'user/repo@stable' or 'https://github.com/user/repo@v1.0.0'). If no ref is specified, uses the repository's default branch.",
+        description="Libraries to automatically download when the engine starts, into libraries_directory. Each entry is either a bare git URL string or an object with `git_url` plus an optional PEP 440 `version` pin and manifest `name`. Git URLs support full URLs or GitHub shorthand (e.g., 'user/repo'). Optionally specify a branch, tag, or commit with @ref syntax (e.g., 'user/repo@stable' or 'https://github.com/user/repo@v1.0.0'). If no ref is specified, uses the repository's default branch. The engine provisions each entry to its pinned version and may overwrite a wrong installed version; libraries listed only in libraries_to_register are never overwritten.",
     )
     libraries_to_register: list[str | LibraryRegistration] = Field(
         default_factory=list,
         description=(
-            "Libraries to automatically load when the engine starts. Each entry is either a path string "
-            "(loaded as enabled) or an object with `path` and `enabled` fields. Paths may point to a "
-            "griptape_nodes_library.json file or a directory scanned recursively for library JSON files."
+            "Libraries the engine loads on startup. Each entry can be a path to a single "
+            "griptape_nodes_library.json file or a folder containing one or more libraries. "
+            "Use the toggle to enable or skip a library, and pick whether it runs alongside "
+            "the engine or in its own isolated process when the library supports it."
         ),
     )
     workflows_to_register: list[str] = Field(default_factory=list)
@@ -142,10 +198,30 @@ class AppInitializationComplete(BaseModel):
         description="Core secrets to register. Can be a list of secret names (default to empty values) or a dict mapping names to default values. Library-specific secrets are registered automatically from library settings.",
     )
     models_to_download: list[str] = Field(default_factory=list)
-    projects_to_register: list[str] = Field(
+    projects_to_register: list[str | PerPlatformProjectPath] = Field(
         category=PROJECTS,
         default_factory=list,
-        description="List of griptape-nodes-project.yml file paths to load at startup",
+        description=(
+            "List of project entries to load at startup. "
+            "Each entry may be either: "
+            "(1) a single path string (supports `${ENV_VAR}` and `~` expansion), or "
+            "(2) a per-platform mapping with optional `linux`, `darwin`, `windows`, and `default` keys "
+            "for cross-platform deployments where the same project resolves to different paths on each OS. "
+            "A path entry may point to a single griptape-nodes-project.yml file, or to a directory that is "
+            "recursively scanned for all griptape-nodes-project.yml files (each loaded as a registered template). "
+            "Directory entries are kept verbatim and re-scanned each startup; the discovered files are not "
+            "expanded into individual entries. "
+            "Per-platform entries with no key matching the active platform and no `default` are skipped with a warning."
+        ),
+    )
+    requires_engine: str | None = Field(
+        category=PROJECTS,
+        default=None,
+        description=(
+            "PEP 440 version specifier the running engine must satisfy (e.g. '>=0.5,<0.6'). "
+            "A mismatch blocks project activation. Typically set in a project-adjacent config so the "
+            "project becomes the source of truth for the engine version it runs against."
+        ),
     )
 
 
@@ -200,12 +276,48 @@ class WorkerSettings(BaseModel):
     )
 
 
+class AgentSettings(BaseModel):
+    system_prompt: str = Field(
+        default="",
+        description="Additional text appended to the agent's built-in system prompt. Use to customize tone, preferred patterns, or domain context.",
+    )
+
+
+class LibraryDependencyInstallBehavior(StrEnum):
+    ALWAYS = "always"
+    NEVER = "never"
+
+
+class LibrarySettings(BaseModel):
+    dependency_install_behavior: LibraryDependencyInstallBehavior = Field(
+        default=LibraryDependencyInstallBehavior.ALWAYS,
+        description=(
+            "Controls automatic installation of library dependencies declared in library manifests. "
+            "'always' downloads and installs them on registration. "
+            "'never' skips installation and marks the library as degraded if required dependencies are missing."
+        ),
+    )
+
+    @field_validator("dependency_install_behavior", mode="before")
+    @classmethod
+    def validate_dependency_install_behavior(cls, v: Any) -> LibraryDependencyInstallBehavior:
+        if isinstance(v, str):
+            try:
+                return LibraryDependencyInstallBehavior(v.lower())
+            except ValueError:
+                return LibraryDependencyInstallBehavior.ALWAYS
+        elif isinstance(v, LibraryDependencyInstallBehavior):
+            return v
+        return LibraryDependencyInstallBehavior.ALWAYS
+
+
 class Settings(BaseModel):
     model_config = ConfigDict(extra="allow")
 
     workspace_directory: str = Field(
         category=FILE_SYSTEM,
         default=str(Path().cwd() / "GriptapeNodes"),
+        description="Root directory for projects, workflows, and generated assets. Defaults to a GriptapeNodes folder under the current working directory. The other File System paths (libraries_directory, static_files_directory, sandbox_library_directory, synced_workflows_directory) are interpreted relative to this directory unless they are set to absolute paths.",
     )
     static_files_directory: str = Field(
         category=FILE_SYSTEM,
@@ -220,13 +332,17 @@ class Settings(BaseModel):
     libraries_directory: str = Field(
         category=FILE_SYSTEM,
         default="libraries",
-        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is.",
+        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,
         default_factory=AppEvents,
     )
-    log_level: LogLevel = Field(category=EXECUTION, default=LogLevel.INFO)
+    log_level: LogLevel = Field(
+        category=EXECUTION,
+        default=LogLevel.INFO,
+        description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,
         default=WorkflowExecutionMode.SEQUENTIAL,
@@ -274,7 +390,11 @@ class Settings(BaseModel):
         category=EXECUTION,
         default_factory=WorkerSettings,
     )
-    storage_backend: Literal["local", "gtc"] = Field(category=STORAGE, default="local")
+    storage_backend: Literal["local", "gtc"] = Field(
+        category=STORAGE,
+        default="local",
+        description="Backend used to persist workflow data and generated assets. 'local' stores files on the local filesystem under the workspace; 'gtc' uses Griptape Cloud storage.",
+    )
     auto_inject_workflow_metadata: bool = Field(
         category=STORAGE,
         default=True,
@@ -290,16 +410,41 @@ class Settings(BaseModel):
         default=1.0,
         description="Minimum disk space in GB required for saving workflows",
     )
+    discovery_max_depth: int = Field(
+        category=SYSTEM_REQUIREMENTS,
+        default=5,
+        description=(
+            "Maximum directory depth the engine walks when a registered entry points at a directory "
+            "to recursively discover files (e.g. project files under projects_to_register). Bounds boot-time "
+            "scans against pathologically deep trees and symlink loops. 0 scans only the top-level directory; "
+            "each nested level adds 1."
+        ),
+    )
     synced_workflows_directory: str = Field(
         category=FILE_SYSTEM,
         default="synced_workflows",
         description="Path to the synced workflows directory, relative to the workspace directory.",
     )
-    thread_storage_backend: Literal["local", "gtc"] = Field(
+    thread_storage_backend: Literal["local"] = Field(
         category=STORAGE,
         default="local",
-        description="Storage backend for conversation threads: 'local' for filesystem or 'gtc' for Griptape Cloud",
+        description="Storage backend for conversation threads. Only 'local' (filesystem) is supported; "
+        "Griptape Cloud support was removed in the Pydantic AI migration.",
     )
+
+    @field_validator("thread_storage_backend", mode="before")
+    @classmethod
+    def validate_thread_storage_backend(cls, v: Any) -> str:
+        """Coerce legacy/unknown backends (e.g. the removed 'gtc') to 'local'.
+
+        Persisted configs from before Griptape Cloud thread storage was removed
+        carry ``thread_storage_backend: "gtc"``. Without this, validating the
+        whole config fails and the user's entire config is reset to defaults.
+        """
+        if v == "local":
+            return v
+        return "local"
+
     enable_workspace_file_watching: bool = Field(
         category=FILE_SYSTEM,
         default=True,
@@ -323,10 +468,18 @@ class Settings(BaseModel):
     project_file: str | None = Field(
         category=PROJECTS,
         default=None,
-        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default.",
+        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults.",
     )
     project_workspaces: dict[str, str] = Field(
         category=PROJECTS,
         default_factory=dict,
-        description="Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
+        description="Mapping of project identifiers to workspace directory overrides. A key may be either a project ID or a project file path: it is first matched against loaded project IDs, and if none match, treated as a project file path. When a project is loaded, if it matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
+    )
+    agent: AgentSettings = Field(
+        category=AGENT,
+        default_factory=AgentSettings,
+    )
+    library: LibrarySettings = Field(
+        category=LIBRARIES,
+        default_factory=LibrarySettings,
     )

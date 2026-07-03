@@ -24,13 +24,13 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout actions
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Run unit tests with coverage
         run: make test/unit/coverage
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v6
+        uses: codecov/codecov-action@v7
         with:
           file: ./coverage.xml
           flags: unittests
@@ -47,7 +47,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout actions
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Run unit tests
@@ -64,7 +64,7 @@ jobs:
         python-version: ["3.12"]
     steps:
       - name: Checkout actions
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Run e2e tests
@@ -80,7 +80,7 @@ jobs:
         shell: bash
     steps:
       - name: Checkout actions
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
       - name: Init environment
         uses: ./.github/actions/init-environment
       - name: Run e2e tests

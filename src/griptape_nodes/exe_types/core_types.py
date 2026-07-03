@@ -1810,6 +1810,36 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         return validators
 
     @property
+    def has_directly_attached_converters(self) -> bool:
+        """The directly-attached converter list is non-empty.
+
+        Trait-derived converters are merged in by the ``converters``
+        getter; this checks only what was passed to ``__init__`` or
+        appended directly.
+        """
+        return bool(self._converters)
+
+    @property
+    def has_directly_attached_validators(self) -> bool:
+        """The directly-attached validator list is non-empty.
+
+        Trait-derived validators are merged in by the ``validators``
+        getter; this checks only what was passed to ``__init__`` or
+        appended directly.
+        """
+        return bool(self._validators)
+
+    @property
+    def has_traits(self) -> bool:
+        """Any Trait child is attached.
+
+        Walks ``find_elements_by_type(Trait)`` because traits are stored
+        as child node-elements, not in a flat list. Cheap at probe
+        scale (called once per parameter at library load).
+        """
+        return bool(self.find_elements_by_type(Trait))
+
+    @property
     def on_incoming_connection_removed(self) -> list[Callable[[Parameter, str, str], None]]:
         return self._on_incoming_connection_removed
 

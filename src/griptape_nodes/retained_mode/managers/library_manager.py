@@ -20,37 +20,55 @@ from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
 import anyio
 from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import InvalidSpecifier, SpecifierSet
+from packaging.version import InvalidVersion
+from packaging.version import Version as PackagingVersion
 from pydantic import ValidationError
-from rich.align import Align
-from rich.box import HEAVY_EDGE
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 from semver import Version
 from xdg_base_dirs import xdg_data_home
 
+from griptape_nodes.common.strict_mode import (
+    STRICT_MODE,
+    StrictModeScopeKind,
+)
+from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io, resolve_workspace_path
+from griptape_nodes.node_library.library_declarations import (
+    LibraryDeclaration,
+    LibraryDependencyDeclaration,
+    LifecycleStageLibraryProperty,
+    WorkerCompatibility,
+    WorkerMode,
+    WorkerModeCompatibility,
+    requires_worker_process,
+)
 from griptape_nodes.node_library.library_registry import (
     CategoryDefinition,
     Library,
     LibraryMetadata,
+    LibraryNameAndVersion,
     LibraryRegistry,
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
 )
+from griptape_nodes.node_library.library_validation import (
+    detect_retired_node_declarations,
+    validate_library_declarations,
+)
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     AppSessionStartedEvent,
     EngineInitializationProgress,
+    EngineReadyEvent,
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
     InitializationPhase,
     InitializationStatus,
     LibraryLoadedNotification,
+    LibraryLoadStatus,
     WorkerNodeSchema,
     WorkerParameterSchema,
 )
@@ -86,9 +104,15 @@ from griptape_nodes.retained_mode.events.library_events import (
     GetAllInfoForLibraryRequest,
     GetAllInfoForLibraryResultFailure,
     GetAllInfoForLibraryResultSuccess,
+    GetEngineSourceInfoRequest,
+    GetEngineSourceInfoResultFailure,
+    GetEngineSourceInfoResultSuccess,
     GetLibraryMetadataRequest,
     GetLibraryMetadataResultFailure,
     GetLibraryMetadataResultSuccess,
+    GetLibrarySourceInfoRequest,
+    GetLibrarySourceInfoResultFailure,
+    GetLibrarySourceInfoResultSuccess,
     GetNodeMetadataFromLibraryRequest,
     GetNodeMetadataFromLibraryResultFailure,
     GetNodeMetadataFromLibraryResultSuccess,
@@ -98,6 +122,8 @@ from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
+    LibraryProvisioningAction,
+    LibraryProvisioningActionKind,
     ListCapableLibraryEventHandlersRequest,
     ListCapableLibraryEventHandlersResultFailure,
     ListCapableLibraryEventHandlersResultSuccess,
@@ -118,6 +144,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadMetadataForAllLibrariesRequest,
     LoadMetadataForAllLibrariesResultSuccess,
     ParameterDescription,
+    PreviewProjectProvisioningRequest,
+    PreviewProjectProvisioningResultFailure,
+    PreviewProjectProvisioningResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
     RegisterLibraryFromFileResultSuccess,
@@ -162,6 +191,12 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     AdvancedLibraryLoadFailureProblem,
     AfterLibraryCallbackProblem,
@@ -171,6 +206,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     EngineVersionErrorProblem,
     IncompatibleRequirementsProblem,
     InvalidVersionStringProblem,
+    LibraryDependencyProblem,
     LibraryJsonDecodeProblem,
     LibraryLoadExceptionProblem,
     LibraryNotFoundProblem,
@@ -180,19 +216,28 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
+    NodePermissionDeniedProblem,
     OldXdgLocationWarningProblem,
+    PermissionDeniedProblem,
+    RequestHandlerRegistrationProblem,
+    RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
+from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
+    LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
+    REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
+    LibraryDependencyInstallBehavior,
+    LibraryDownload,
     LibraryRegistration,
 )
 from griptape_nodes.utils.async_utils import subprocess_run
-from griptape_nodes.utils.dict_utils import merge_dicts, normalize_secrets_to_register
+from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
@@ -203,11 +248,13 @@ from griptape_nodes.utils.git_utils import (
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
+    get_git_info,
     get_git_remote,
     get_local_commit_sha,
     is_git_url,
     normalize_github_url,
     parse_git_url_with_ref,
+    remote_ref_exists,
     sparse_checkout_library_json,
     switch_branch_or_tag,
     update_library_git,
@@ -218,10 +265,13 @@ from griptape_nodes.utils.library_utils import (
     extract_library_path,
     filter_old_xdg_library_paths,
     is_monorepo,
+    normalize_library_downloads,
     normalize_library_registrations,
 )
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
-from griptape_nodes.utils.version_utils import get_complete_version_string
+from griptape_nodes.utils.version_utils import (
+    engine_version_failure_detail,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
@@ -233,7 +283,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
 logger = logging.getLogger("griptape_nodes")
-console = Console()
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
@@ -334,13 +383,28 @@ class LibraryManager:
 
         lifecycle_state: LibraryManager.LibraryLifecycleState
         fitness: LibraryManager.LibraryFitness
+        # Resolved absolute path to the library JSON file. Used as the dict key in
+        # `_library_file_path_to_info` and for filesystem operations.
         library_path: str
         is_sandbox: bool
         library_name: str | None = None
         library_version: str | None = None
+        # The path string the user wrote in `libraries_to_register` before workspace
+        # resolution / `~`-expansion / symlink-following. Surfaced to the GUI so the
+        # settings panel can match library metadata back to its config row using the
+        # exact key the user sees in their config. None for sandbox libraries
+        # (registered through workspace discovery, not via `libraries_to_register`).
+        registered_path: str | None = None
         problems: list[LibraryProblem] = field(default_factory=list)
-        # True when the library declares worker.enabled = True in its metadata.
-        # Set whenever metadata is first successfully parsed (discovery or lifecycle progression).
+        # Mirrors LibraryRegistration.enabled from the user's libraries_to_register config.
+        # True for sandbox, ad-hoc, and bare-string entries; False only when the user
+        # explicitly set enabled=false on the config object form.
+        enabled: bool = True
+        # True when the library's declarations resolve to launching in a worker
+        # process (compatible per ``WorkerModeCompatibility`` and suggested per
+        # ``SuggestedWorkerMode``). Set whenever metadata is first successfully
+        # parsed (discovery or lifecycle progression). Absence of the relevant
+        # declarations falls through to False.
         requires_worker: bool = False
         # Set when the library enters WORKER_PENDING state. The orchestrator waits on this
         # event before returning RegisterLibraryFromFileResultSuccess so callers see the real
@@ -352,6 +416,34 @@ class LibraryManager:
 
         library_info: LibraryManager.LibraryInfo
         file_path: str
+
+    class DiscoveredLibraryEntry(NamedTuple):
+        """Internal pairing of a discovered library with the user's original config entry path.
+
+        `registration` carries the resolved on-disk path used to load the library.
+        `registered_path` is the verbatim string from `LibraryRegistration.path` (before
+        workspace resolution / `~`-expansion / symlink-following). Surfacing the raw config
+        path lets the GUI match library metadata back to its `libraries_to_register` row
+        by the same key the user sees in their config.
+
+        For directory entries that expand into multiple library files, every discovered
+        child shares the parent directory's `registered_path`.
+        """
+
+        registration: LibraryRegistration
+        registered_path: str
+
+    class ResolvedDiscoveryPath(NamedTuple):
+        """A config `libraries_to_register` entry resolved to a concrete on-disk path.
+
+        `path` is the file or directory to scan for manifests: the
+        workspace-resolved path for a path-backed entry, or the provisioned
+        manifest located by name for a git-sourced entry. `registered_path`
+        is the key the GUI uses to map metadata back to the user's config row.
+        """
+
+        path: Path
+        registered_path: str
 
     # Stable module namespace mappings for workflow serialization
     # These mappings ensure that dynamically loaded modules can be reliably imported
@@ -379,11 +471,27 @@ class LibraryManager:
         self._dynamic_to_stable_module_mapping = {}
         self._stable_to_dynamic_module_mapping = {}
         self._library_to_stable_modules = {}
+        # Two separate handler registration systems exist in this manager:
+        #
+        # 1. EventManager.assign_manager_to_request_type() — singleton (one handler per
+        #    type globally), populated via AdvancedNodeLibrary.get_request_handlers().
+        #    For library-owned services where exactly one library is the provider.
+        #
+        # 2. _library_event_handler_mappings / on_register_event_handler() — multi-provider
+        #    (many libraries can handle the same type, selected by name at dispatch).
+        #    Used by publishing libraries registering PublishWorkflowRequest handlers.
+        #    Libraries call on_register_event_handler() in after_library_nodes_loaded().
+        #
+        # The two systems coexist without conflict. TODO(GH#4785): https://github.com/griptape-ai/griptape-nodes-engine/issues/4785
         self._library_event_handler_mappings: dict[
             type[Payload], dict[str, LibraryManager.RegisteredEventHandler[Any]]
         ] = {}
         self._libraries_loading_complete = asyncio.Event()
         self._libraries_loading_complete.set()  # Not loading initially; load_all_libraries_from_config will clear/set this
+        # True for the duration of the engine's initialization sequence (library + workflow
+        # loading) driven by on_app_initialization_complete. Reported on the engine heartbeat so
+        # a client connecting mid-startup can render a loading state instead of an empty list.
+        self._is_initializing: bool = False
         self._pre_reload_callbacks: list[Callable[[], Awaitable[None]]] = []
         # True when this process is a dedicated worker
         self._is_worker: bool = False
@@ -451,6 +559,13 @@ class LibraryManager:
         )
         event_manager.assign_manager_to_request_type(SyncLibrariesRequest, self.sync_libraries_request)
         event_manager.assign_manager_to_request_type(InspectLibraryRepoRequest, self.inspect_library_repo_request)
+        event_manager.assign_manager_to_request_type(
+            GetLibrarySourceInfoRequest, self.on_get_library_source_info_request
+        )
+        event_manager.assign_manager_to_request_type(GetEngineSourceInfoRequest, self.on_get_engine_source_info_request)
+        event_manager.assign_manager_to_request_type(
+            PreviewProjectProvisioningRequest, self.on_preview_project_provisioning_request
+        )
 
         event_manager.add_listener_to_app_event(
             LibraryLoadedNotification,
@@ -467,6 +582,14 @@ class LibraryManager:
 
         worker_manager.register_worker_evicted_callback(self.on_worker_evicted)
         self._pre_reload_callbacks.append(worker_manager.reset_workers)
+
+    def is_initializing(self) -> bool:
+        """Return True while the engine is running its initialization sequence.
+
+        Covers the full on_app_initialization_complete / reload flow (library and workflow
+        loading), not just the library phase. Reported on the engine heartbeat.
+        """
+        return self._is_initializing
 
     def register_pre_reload_callback(self, callback: Callable[[], Awaitable[None]]) -> None:
         """Register a callback invoked immediately before all libraries are reloaded.
@@ -503,6 +626,18 @@ class LibraryManager:
         # Unblock any code awaiting this library's worker_ready event.
         if library_info.worker_ready is not None:
             library_info.worker_ready.set()
+
+    @property
+    def is_worker(self) -> bool:
+        """True when this process was started as a dedicated worker.
+
+        Set by ``LibrariesInitializeStartRequest`` once the worker bootstrap
+        has identified the process role. Callers outside this manager that
+        need the role (e.g. node-execution strict-mode attribution, request
+        forwarding decisions) should consult this accessor rather than
+        reaching into ``_is_worker``.
+        """
+        return self._is_worker
 
     def get_worker_for_library(self, library_name: str | None) -> tuple[str, str] | None:
         """Return (worker_engine_id, worker_request_topic) for the worker serving library_name, or None.
@@ -568,82 +703,26 @@ class LibraryManager:
                 library_name,
             )
 
-    def print_library_load_status(self) -> None:
-        library_file_paths = self.get_libraries_attempted_to_load()
-        library_infos = []
-        for library_file_path in library_file_paths:
-            library_info = self.get_library_info_for_attempted_load(library_file_path)
-            library_infos.append(library_info)
+    def _collect_library_load_statuses(self) -> list[LibraryLoadStatus]:
+        """Gather the load outcome for every attempted library as serializable data.
 
-        console = Console()
-
-        # Check if the list is empty
-        if not library_infos:
-            # Display a message indicating no libraries are available
-            empty_message = Text("No library information available", style="italic")
-            panel = Panel(empty_message, title="Library Information", border_style="blue")
-            console.print(panel)
-            return
-
-        # Create a table with two columns and row dividers
-        table = Table(show_header=True, box=HEAVY_EDGE, show_lines=True, expand=True)
-        table.add_column("Library", style="green", ratio=1)
-        table.add_column("Problems", style="yellow", ratio=1)
-
-        # Status emojis mapping
-        status_emoji = {
-            LibraryManager.LibraryFitness.GOOD: "[green]OK[/green]",
-            LibraryManager.LibraryFitness.FLAWED: "[yellow]![/yellow]",
-            LibraryManager.LibraryFitness.UNUSABLE: "[red]X[/red]",
-            LibraryManager.LibraryFitness.MISSING: "[red]?[/red]",
-            LibraryManager.LibraryFitness.NOT_EVALUATED: "[cyan]...[/cyan]",
-        }
-
-        # Status text mapping (colored)
-        status_text = {
-            LibraryManager.LibraryFitness.GOOD: "[green](GOOD)[/green]",
-            LibraryManager.LibraryFitness.FLAWED: "[yellow](FLAWED)[/yellow]",
-            LibraryManager.LibraryFitness.UNUSABLE: "[red](UNUSABLE)[/red]",
-            LibraryManager.LibraryFitness.MISSING: "[red](MISSING)[/red]",
-            LibraryManager.LibraryFitness.NOT_EVALUATED: "[cyan](PENDING)[/cyan]",
-        }
-
-        # Add rows for each library info
-        for lib_info in library_infos:
-            # Library column with emoji, name, version, colored status, and file path underneath
-            is_disabled = lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.DISABLED
-            if is_disabled:
-                emoji = "[dim]-[/dim]"
-                colored_status = "[dim](DISABLED)[/dim]"
-            else:
-                emoji = status_emoji.get(lib_info.fitness, "ERROR: Unknown/Unexpected Library Status")
-                colored_status = status_text.get(lib_info.fitness, "(UNKNOWN)")
-            name = lib_info.library_name or "*UNKNOWN*"
-
-            library_version = lib_info.library_version
-            if library_version:
-                version_str = str(library_version)
-            else:
-                version_str = "*UNKNOWN*"
-
-            file_path = lib_info.library_path
-            library_name_with_details = Text.from_markup(
-                f"{emoji} - {name} v{version_str} {colored_status}\n[cyan dim]{file_path}[/cyan dim]"
+        Presentation (icons, colors, table layout) is owned by the application
+        layer; this returns raw data for it to render.
+        """
+        statuses: list[LibraryLoadStatus] = []
+        for library_file_path in self.get_libraries_attempted_to_load():
+            lib_info = self.get_library_info_for_attempted_load(library_file_path)
+            statuses.append(
+                LibraryLoadStatus(
+                    library_name=lib_info.library_name,
+                    library_version=str(lib_info.library_version) if lib_info.library_version else None,
+                    library_path=lib_info.library_path,
+                    fitness=lib_info.fitness.value,
+                    disabled=lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.DISABLED,
+                    problems=self.collate_problems_for_lib_info(lib_info),
+                )
             )
-            library_name_with_details.overflow = "fold"
-
-            # Problems column - collate by type then format
-            collated = self.collate_problems_for_lib_info(lib_info)
-            problems = collated if collated is not None else "No problems detected."
-
-            # Add the row to the table
-            table.add_row(library_name_with_details, problems)
-
-        # Create a panel containing the table
-        panel = Panel(table, title="Library Information", border_style="blue")
-
-        # Display the panel
-        console.print(panel)
+        return statuses
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
@@ -656,6 +735,61 @@ class LibraryManager:
             if library_info.library_name == library_name:
                 return library_info
         return None
+
+    def resolve_transitive_library_deps(
+        self,
+        initial: list[LibraryNameAndVersion],
+    ) -> list[LibraryNameAndVersion]:
+        """Expand an initial library set by following each library's library_dependencies.
+
+        BFS walks declared library_dependencies until no new libraries are found.
+        Unregistered deps are logged and skipped. Cycle-safe via a visited set.
+        """
+        resolved: dict[str, LibraryNameAndVersion] = {ref.library_name: ref for ref in initial}
+        queue = list(initial)
+
+        while queue:
+            library_ref = queue.pop(0)
+            try:
+                library_data = LibraryRegistry.get_library(library_ref.library_name).get_library_data()
+            except KeyError:
+                logger.warning(
+                    "Library '%s' not found in registry during transitive dep resolution, skipping",
+                    library_ref.library_name,
+                )
+                continue
+
+            if not library_data.metadata:
+                continue
+            lib_deps = [
+                d for d in (library_data.metadata.declarations or []) if isinstance(d, LibraryDependencyDeclaration)
+            ]
+            if not lib_deps:
+                continue
+
+            for dep in lib_deps:
+                repo_name = extract_repo_name_from_url(dep.url)
+                dep_info = self.get_library_info_by_library_name(repo_name)
+                if dep_info is None:
+                    logger.warning(
+                        "Library dependency '%s' (resolved as '%s') is not registered; skipping",
+                        dep.url,
+                        repo_name,
+                    )
+                    continue
+                dep_library_name = dep_info.library_name
+                if dep_library_name is None:
+                    logger.warning("Library dependency '%s' has no library_name; skipping", dep.url)
+                    continue
+                if dep_library_name not in resolved:
+                    lib_nav = LibraryNameAndVersion(
+                        library_name=dep_library_name,
+                        library_version=dep_info.library_version or "unknown",
+                    )
+                    resolved[dep_library_name] = lib_nav
+                    queue.append(lib_nav)
+
+        return list(resolved.values())
 
     def collate_problems_for_lib_info(self, lib_info: LibraryInfo) -> str | None:
         """Return a collated display string for a LibraryInfo's problems, or None if there are none."""
@@ -737,6 +871,74 @@ class LibraryManager:
         )
         return result
 
+    async def on_get_library_source_info_request(self, request: GetLibrarySourceInfoRequest) -> ResultPayload:
+        """Return the filesystem paths for a registered library's source files.
+
+        Waits for all libraries to finish loading before resolving the request,
+        ensuring the library registry is in a consistent state.
+
+        The response provides two path variants for the named library:
+        - ``library_json_path``: the absolute path to the library's
+          ``griptape_nodes_library.json`` manifest file.
+        - ``library_directory``: the absolute path to the directory that contains the
+          manifest file (i.e. the library root folder).
+
+        Args:
+            request: A :class:`GetLibrarySourceInfoRequest` carrying the ``library``
+              field — the registered name of the library whose source paths are being
+              queried (e.g. ``"Griptape Nodes Library"``).
+
+        Returns:
+            :class:`GetLibrarySourceInfoResultSuccess` containing ``library_name``,
+              ``library_json_path``, and ``library_directory`` when the library is
+              found.
+
+            :class:`GetLibrarySourceInfoResultFailure` when no library with the
+              requested name has been registered.
+        """
+        await self._libraries_loading_complete.wait()
+        lib_info = self.get_library_info_by_library_name(request.library)
+        if lib_info is None:
+            return GetLibrarySourceInfoResultFailure(
+                result_details=f"Library '{request.library}' not found.",
+            )
+        library_dir = str(Path(lib_info.library_path).parent.absolute())
+        return GetLibrarySourceInfoResultSuccess(
+            library_name=request.library,
+            library_json_path=lib_info.library_path,
+            library_directory=library_dir,
+            result_details=f"Source info for library '{request.library}'.",
+        )
+
+    def on_get_engine_source_info_request(self, _request: GetEngineSourceInfoRequest) -> ResultPayload:
+        """Return the filesystem path of the installed ``griptape_nodes`` package.
+
+        Resolves the location of the ``griptape_nodes`` package on disk. The returned
+        directory is the package root.
+
+        This is useful for tools that need to read engine source files directly, for
+        example to inspect base-class definitions in ``exe_types/node_types.py`` or
+        locate built-in node implementations.
+
+        Args:
+            _request: A :class:`GetEngineSourceInfoRequest` (no fields required; the
+                argument is accepted for handler-dispatch consistency).
+
+        Returns:
+            :class:`GetEngineSourceInfoResultSuccess` containing ``package_directory`` —
+                the absolute path to the ``griptape_nodes`` package root directory.
+        """
+        spec = importlib.util.find_spec("griptape_nodes")
+        if spec is None or spec.origin is None:
+            return GetEngineSourceInfoResultFailure(
+                result_details="Attempted to resolve engine source path. Failed because the griptape_nodes package spec could not be located.",
+            )
+        package_dir = str(Path(spec.origin).parent.absolute())
+        return GetEngineSourceInfoResultSuccess(
+            package_directory=package_dir,
+            result_details="Engine source info.",
+        )
+
     def on_list_node_types_in_library_request(self, request: ListNodeTypesInLibraryRequest) -> ResultPayload:
         # Does this library exist?
         try:
@@ -776,7 +978,7 @@ class LibraryManager:
         result = GetLibraryMetadataResultSuccess(metadata=metadata, result_details=details)
         return result
 
-    def load_library_metadata_from_file_request(  # noqa: PLR0911
+    def load_library_metadata_from_file_request(  # noqa: PLR0911, C901
         self, request: LoadLibraryMetadataFromFileRequest
     ) -> LoadLibraryMetadataFromFileResultSuccess | LoadLibraryMetadataFromFileResultFailure:
         """Load library metadata from a JSON file without loading the actual node modules.
@@ -826,6 +1028,32 @@ class LibraryManager:
         # Try to extract library name from JSON for better error reporting
         library_name = library_json.get("name") if isinstance(library_json, dict) else None
 
+        # Extract the declared version straight from the raw JSON too, so a library whose
+        # schema fails to validate can still report its version in status output instead of
+        # showing '*UNKNOWN*'.
+        raw_metadata = library_json.get("metadata") if isinstance(library_json, dict) else None
+        raw_version = raw_metadata.get("library_version") if isinstance(raw_metadata, dict) else None
+        raw_library_version = raw_version if isinstance(raw_version, str) else None
+
+        # Surface retired declaration types with migration guidance before the
+        # discriminated-union validator rejects them with an opaque message.
+        if isinstance(library_json, dict):
+            retired_problems = detect_retired_node_declarations(library_json)
+            if retired_problems:
+                details = (
+                    f"Attempted to load Library JSON file from '{json_path}'. "
+                    f"Failed because it uses node declaration types removed in a newer schema. "
+                    f"Count: {len(retired_problems)}."
+                )
+                return LoadLibraryMetadataFromFileResultFailure(
+                    library_path=file_path,
+                    library_name=library_name,
+                    status=LibraryManager.LibraryFitness.UNUSABLE,
+                    problems=retired_problems,
+                    library_version=raw_library_version,
+                    result_details=details,
+                )
+
         # Do you comport, my dude
         try:
             library_data = LibrarySchema.model_validate(library_json)
@@ -844,6 +1072,7 @@ class LibraryManager:
                 library_name=library_name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=problems,
+                library_version=raw_library_version,
                 result_details=details,
             )
         except Exception as err:
@@ -853,6 +1082,7 @@ class LibraryManager:
                 library_name=library_name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=[LibrarySchemaExceptionProblem(error_message=str(err))],
+                library_version=raw_library_version,
                 result_details=details,
             )
 
@@ -865,33 +1095,49 @@ class LibraryManager:
                 library_name=library_data.name,
                 status=LibraryManager.LibraryFitness.UNUSABLE,
                 problems=[InvalidVersionStringProblem(version_string=str(library_data.metadata.library_version))],
+                library_version=raw_library_version,
                 result_details=details,
             )
 
-        # Get git remote and ref if this library is in a git repository
+        # Resolve cross-references between declarations (catalog model ids,
+        # node-level model_usage references, etc.). Any problem blocks the load.
+        declaration_problems = validate_library_declarations(library_data)
+        if declaration_problems:
+            details = (
+                f"Attempted to load Library '{library_data.name}' JSON file from '{json_path}'. "
+                f"Failed because declarative references did not resolve. "
+                f"Count: {len(declaration_problems)}."
+            )
+            return LoadLibraryMetadataFromFileResultFailure(
+                library_path=file_path,
+                library_name=library_data.name,
+                status=LibraryManager.LibraryFitness.UNUSABLE,
+                problems=list(declaration_problems),
+                library_version=raw_library_version,
+                result_details=details,
+            )
+
+        # Use get_git_info (not get_git_remote + get_current_ref) to open the repo once
+        # instead of three times — this is called for every library on every metadata load.
         library_dir = json_path.parent.absolute()
-        try:
-            git_remote = get_git_remote(library_dir)
-        except GitRemoteError as e:
-            logger.debug("Failed to get git remote for %s: %s", library_dir, e)
-            git_remote = None
+        git_remote, git_ref = get_git_info(library_dir)
 
-        try:
-            git_ref = get_current_ref(library_dir)
-        except GitRefError as e:
-            logger.debug("Failed to get git ref for %s: %s", library_dir, e)
-            git_ref = None
-
+        existing_info = self._library_file_path_to_info.get(file_path)
+        enabled = existing_info.enabled if existing_info is not None else True
         details = f"Successfully loaded library metadata from JSON file at {json_path}"
         return LoadLibraryMetadataFromFileResultSuccess(
             library_schema=library_data,
             file_path=file_path,
             git_remote=git_remote,
             git_ref=git_ref,
+            enabled=enabled,
             result_details=details,
         )
 
-    def load_metadata_for_all_libraries_request(self, request: LoadMetadataForAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def load_metadata_for_all_libraries_request(
+        self,
+        request: LoadMetadataForAllLibrariesRequest,  # noqa: ARG002
+    ) -> ResultPayload:
         """Load metadata for all libraries from configuration without loading node modules.
 
         This loads metadata from both library JSON files specified in configuration
@@ -901,15 +1147,19 @@ class LibraryManager:
         failed_libraries = []
 
         # Discover library files for metadata loading
-        library_files = self._discover_library_files()
+        library_files = await self._discover_library_files()
 
         # Load metadata for all discovered library files (including disabled ones,
         # so their names/versions can be displayed in status output).
-        for library_file in library_files:
-            metadata_request = LoadLibraryMetadataFromFileRequest(file_path=library_file.path)
+        for discovered in library_files:
+            metadata_request = LoadLibraryMetadataFromFileRequest(file_path=discovered.registration.path)
             metadata_result = self.load_library_metadata_from_file_request(metadata_request)
 
             if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
+                # Stamp the user's verbatim registered_path onto the response so the GUI
+                # can map this metadata back to the matching `libraries_to_register` row
+                # without re-implementing the engine's path resolution logic.
+                metadata_result.registered_path = discovered.registered_path
                 successful_libraries.append(metadata_result)
             else:
                 failed_libraries.append(cast("LoadLibraryMetadataFromFileResultFailure", metadata_result))
@@ -935,6 +1185,7 @@ class LibraryManager:
                         file_path=str(sandbox_json_path),
                         git_remote=None,
                         git_ref=None,
+                        enabled=True,
                         result_details=scan_result.result_details,
                     )
                 # else: Keep the load failure result
@@ -1095,6 +1346,7 @@ class LibraryManager:
             file_path=str(sandbox_directory),
             git_remote=git_remote,
             git_ref=git_ref,
+            enabled=True,
             result_details=details,
         )
 
@@ -1341,9 +1593,12 @@ class LibraryManager:
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
         if not file_path.is_file():
+            # Display file_identity, not file_path: on Windows the latter now carries the
+            # \\?\ long-path prefix (canonicalize_for_io applies it unconditionally), which
+            # is confusing in a user-facing message. file_identity is the un-prefixed form.
             details = (
                 f"Attempted to register a sandbox node with file_path={request.file_path!r}. "
-                f"Failed because no file exists at the resolved path '{file_path}'. Write "
+                f"Failed because no file exists at the resolved path '{file_identity}'. Write "
                 "the source file into the sandbox directory before calling this request."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
@@ -1354,7 +1609,8 @@ class LibraryManager:
         try:
             module = self._load_module_from_file(file_path, LibraryManager.SANDBOX_LIBRARY_NAME)
         except ImportError as err:
-            details = f"Attempted to register a sandbox node from '{file_path}'. Failed at import time: {err}"
+            # Display file_identity (un-prefixed); file_path may carry the \\?\ prefix on Windows.
+            details = f"Attempted to register a sandbox node from '{file_identity}'. Failed at import time: {err}"
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
         # The Sandbox Library must already be registered. It is created as part of normal
@@ -1455,7 +1711,20 @@ class LibraryManager:
         node_class = library.get_node_class(request.node_type)
         probe_name = f"__describe_node_type_probe__{request.node_type}"
         try:
-            probe_node = node_class(name=probe_name)
+            # Wrap in ``LibraryRegistry.constructing_node()`` so the
+            # parameter-mutation detector skips this ephemeral probe's
+            # declarative ``add_parameter`` calls (this construction
+            # bypasses ``LibraryRegistry.create_node``).
+            #
+            # Pass the node's library and type so declarative ``__init__`` logic
+            # that resolves against the library -- e.g. ``get_declared_models``
+            # populating a model dropdown from the ``model_catalog`` -- works
+            # during the probe just as it does under ``create_node``.
+            with LibraryRegistry.constructing_node():
+                probe_node = node_class(
+                    name=probe_name,
+                    metadata={"library": library_name, "node_type": request.node_type},
+                )
         except Exception as err:
             probe_error = f"{type(err).__name__}: {err}"
             return DescribeNodeTypeResultSuccess(
@@ -1618,6 +1887,8 @@ class LibraryManager:
                 )
 
                 if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                    if lib_info is not None:
+                        self._apply_metadata_load_failure(lib_info, metadata_result)
                     return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                 library_name = metadata_result.library_schema.name
@@ -1662,7 +1933,7 @@ class LibraryManager:
 
         # If not found and discovery is allowed, try discovery
         if library_info is None and request.perform_discovery_if_not_found:
-            discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+            discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
             if isinstance(discover_result, DiscoverLibrariesResultSuccess):
                 library_info = self.get_library_info_by_library_name(library_name)
 
@@ -1745,14 +2016,16 @@ class LibraryManager:
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                        self._library_file_path_to_info[library_info.library_path] = library_info
+                        self._apply_metadata_load_failure(library_info, metadata_result)
                         return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                     # Update library_info with metadata results
                     library_info.library_name = metadata_result.library_schema.name
                     library_info.library_version = metadata_result.library_schema.metadata.library_version
-                    worker_cfg = metadata_result.library_schema.metadata.worker
-                    library_info.requires_worker = bool(worker_cfg and worker_cfg.enabled)
+                    library_info.requires_worker = self._resolve_requires_worker(
+                        library_info.registered_path,
+                        metadata_result.library_schema.metadata.declarations,
+                    )
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
                 case LibraryManager.LibraryLifecycleState.METADATA_LOADED:
@@ -1763,7 +2036,7 @@ class LibraryManager:
                     )
 
                     if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                        self._library_file_path_to_info[library_info.library_path] = library_info
+                        self._apply_metadata_load_failure(library_info, metadata_result)
                         return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                     evaluate_result = self.evaluate_library_fitness_request(
@@ -1802,7 +2075,92 @@ class LibraryManager:
                     library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.EVALUATED
 
                 case LibraryManager.LibraryLifecycleState.EVALUATED:
-                    # EVALUATED → DEPENDENCIES_INSTALLED or WORKER_DELEGATED
+                    # EVALUATED -> DEPENDENCIES_INSTALLED or WORKER_DELEGATED
+                    # Resolve library_dependencies before node imports: each dependency library must be
+                    # fully loaded (including its venv added to sys.path via _add_library_paths_to_sys_path)
+                    # before this library's nodes are imported in the LOADED phase. Venvs are completely
+                    # isolated - dependency packages are not accessible to this library's pip install
+                    # subprocess.
+                    dep_metadata_result = self.load_library_metadata_from_file_request(
+                        LoadLibraryMetadataFromFileRequest(file_path=library_info.library_path)
+                    )
+                    if not isinstance(dep_metadata_result, LoadLibraryMetadataFromFileResultFailure):
+                        dep_schema = dep_metadata_result.library_schema
+                        griptape_library_deps = [
+                            d
+                            for d in (dep_schema.metadata.declarations or [])
+                            if isinstance(d, LibraryDependencyDeclaration)
+                        ] or None
+
+                        # Download and install any griptape libraries this library depends on.
+                        if griptape_library_deps:
+                            config_mgr = GriptapeNodes.ConfigManager()
+                            install_behavior = config_mgr.get_config_value(
+                                LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
+                                default=LibraryDependencyInstallBehavior.ALWAYS,
+                                cast_type=str,
+                            )
+                            for dep in griptape_library_deps:
+                                parsed = parse_git_url_with_ref(dep.url)
+                                normalized_url = normalize_github_url(parsed.url)
+                                repo_name = extract_repo_name_from_url(normalized_url)
+                                already_registered = any(
+                                    (info.library_name == repo_name or repo_name in Path(info.library_path).parts)
+                                    and info.lifecycle_state != LibraryManager.LibraryLifecycleState.FAILURE
+                                    and info.fitness
+                                    not in (
+                                        LibraryManager.LibraryFitness.UNUSABLE,
+                                        LibraryManager.LibraryFitness.MISSING,
+                                    )
+                                    for info in self._library_file_path_to_info.values()
+                                )
+                                if already_registered:
+                                    logger.debug(
+                                        "Library dependency '%s' is already registered, skipping download",
+                                        dep.url,
+                                    )
+                                    continue
+                                if install_behavior == LibraryDependencyInstallBehavior.NEVER:
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message="Automatic dependency installation is disabled (library_dependency_install_behavior=never).",
+                                            )
+                                        )
+                                        library_info.fitness = LibraryManager.LibraryFitness.FLAWED
+                                    logger.debug(
+                                        "Skipping download of library dependency '%s' (library_dependency_install_behavior=never)",
+                                        dep.url,
+                                    )
+                                    continue
+                                dep_result = await self.download_library_request(
+                                    DownloadLibraryRequest(
+                                        git_url=normalized_url,
+                                        branch_tag_commit=parsed.ref,
+                                        fail_on_exists=False,
+                                        auto_register=True,
+                                    )
+                                )
+                                if isinstance(dep_result, DownloadLibraryResultFailure):
+                                    if dep.required:
+                                        library_info.problems.append(
+                                            LibraryDependencyProblem(
+                                                dependency_name=dep.url,
+                                                error_message=str(dep_result.result_details),
+                                            )
+                                        )
+                                        library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
+                                        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+                                        self._library_file_path_to_info[library_info.library_path] = library_info
+                                        details = f"Attempted to load Library '{library_info.library_name}'. Failed to load required library dependency '{dep.url}': {dep_result.result_details}"
+                                        return RegisterLibraryFromFileResultFailure(result_details=details)
+                                    logger.warning(
+                                        "Optional library dependency '%s' failed to load: %s",
+                                        dep.url,
+                                        dep_result.result_details,
+                                    )
+
                     # On the orchestrator (_is_worker is False), skip venv creation and pip
                     # install for libraries that require a dedicated worker. The lifecycle still
                     # completes through LOADED so the library is registered in LibraryRegistry
@@ -1834,7 +2192,7 @@ class LibraryManager:
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                            self._library_file_path_to_info[library_info.library_path] = library_info
+                            self._apply_metadata_load_failure(library_info, metadata_result)
                             return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                         library_data = metadata_result.library_schema
@@ -1882,58 +2240,7 @@ class LibraryManager:
 
                         # Check the library's custom config settings
                         if library_data.settings is not None:
-                            for library_data_setting in library_data.settings:
-                                # Does the category exist?
-                                get_category_request = GetConfigCategoryRequest(
-                                    category=library_data_setting.category,
-                                    failure_log_level=logging.DEBUG,
-                                )
-                                get_category_result = GriptapeNodes.handle_request(get_category_request)
-                                if not isinstance(get_category_result, GetConfigCategoryResultSuccess):
-                                    # Create new category
-                                    create_new_category_request = SetConfigCategoryRequest(
-                                        category=library_data_setting.category, contents=library_data_setting.contents
-                                    )
-                                    create_new_category_result = GriptapeNodes.handle_request(
-                                        create_new_category_request
-                                    )
-                                    if not isinstance(create_new_category_result, SetConfigCategoryResultSuccess):
-                                        library_info.problems.append(
-                                            CreateConfigCategoryProblem(category_name=library_data_setting.category)
-                                        )
-                                        details = f"Failed attempting to create new config category '{library_data_setting.category}' for library '{library_data.name}'."
-                                        logger.error(details)
-                                        continue
-                                else:
-                                    # Normalize secrets_to_register before merge (handles list/dict format mismatch)
-                                    library_contents = dict(library_data_setting.contents)
-                                    existing_contents = dict(get_category_result.contents)
-                                    if "secrets_to_register" in library_contents:
-                                        library_contents["secrets_to_register"] = normalize_secrets_to_register(
-                                            library_contents["secrets_to_register"]
-                                        )
-                                    if "secrets_to_register" in existing_contents:
-                                        existing_contents["secrets_to_register"] = normalize_secrets_to_register(
-                                            existing_contents["secrets_to_register"]
-                                        )
-                                    # Merge with existing category
-                                    existing_category_contents = merge_dicts(
-                                        library_contents,
-                                        existing_contents,
-                                        add_keys=True,
-                                        merge_lists=True,
-                                    )
-                                    set_category_request = SetConfigCategoryRequest(
-                                        category=library_data_setting.category, contents=existing_category_contents
-                                    )
-                                    set_category_result = GriptapeNodes.handle_request(set_category_request)
-                                    if not isinstance(set_category_result, SetConfigCategoryResultSuccess):
-                                        library_info.problems.append(
-                                            UpdateConfigCategoryProblem(category_name=library_data_setting.category)
-                                        )
-                                        details = f"Failed attempting to update config category '{library_data_setting.category}' for library '{library_data.name}'."
-                                        logger.error(details)
-                                        continue
+                            library_info.problems.extend(self._persist_library_settings(library_data))
 
                         # For worker-delegated libraries on the orchestrator, skip node module
                         # imports entirely -- importing them would pull heavy deps (torch, triton,
@@ -1983,7 +2290,7 @@ class LibraryManager:
                         )
 
                         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultFailure):
-                            self._library_file_path_to_info[library_info.library_path] = library_info
+                            self._apply_metadata_load_failure(library_info, metadata_result)
                             return RegisterLibraryFromFileResultFailure(result_details=metadata_result.result_details)
 
                         # Add sandbox directory and venv site-packages to sys.path
@@ -2011,6 +2318,102 @@ class LibraryManager:
 
         # Success - progressed to LOADED state
         return None
+
+    def _apply_metadata_load_failure(
+        self,
+        library_info: LibraryManager.LibraryInfo,
+        metadata_result: LoadLibraryMetadataFromFileResultFailure,
+    ) -> None:
+        """Mirror a metadata-load failure onto a LibraryInfo so it surfaces in status output.
+
+        A failed metadata load (e.g. a top-level schema ValidationError) carries the real
+        fitness, library name, version, and problem list. Without copying those onto the
+        LibraryInfo, it stays at its pre-load defaults (NOT_EVALUATED fitness, no name, no
+        version, empty problems) and renders as '*UNKNOWN* v*UNKNOWN* (PENDING) - No problems
+        detected.' even though the load clearly failed. Record the failure's detail and mark
+        the library FAILURE.
+        """
+        if library_info.library_name is None and metadata_result.library_name is not None:
+            library_info.library_name = metadata_result.library_name
+        if library_info.library_version is None and metadata_result.library_version is not None:
+            library_info.library_version = metadata_result.library_version
+        library_info.fitness = metadata_result.status
+        library_info.problems.extend(metadata_result.problems)
+        library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.FAILURE
+        self._library_file_path_to_info[library_info.library_path] = library_info
+
+    def _persist_library_settings(self, library_data: LibrarySchema) -> list[LibraryProblem]:
+        """Inject a library's declared settings into the user config, returning any problems.
+
+        For each declared setting category: when the category does not yet exist,
+        write the library's contents as-is. When it does, persist only what THIS
+        library declares merged onto the GLOBAL user-config layer for the category.
+
+        The existing category is read from the `user_config` layer, NOT the merged
+        config. The merged config folds in the active project's
+        project/workspace/env layers (e.g. libraries_to_download, requires_engine);
+        writing that back through SetConfigCategory (which lands in the global user
+        config) would leak those per-project values into every other project's
+        startup. Reading user_config keeps the write scoped to what is genuinely
+        global plus the library's own declared settings.
+        """
+        if library_data.settings is None:
+            return []
+
+        problems: list[LibraryProblem] = []
+        config_mgr = GriptapeNodes.ConfigManager()
+        for library_data_setting in library_data.settings:
+            get_category_request = GetConfigCategoryRequest(
+                category=library_data_setting.category,
+                failure_log_level=logging.DEBUG,
+            )
+            get_category_result = GriptapeNodes.handle_request(get_category_request)
+            if not isinstance(get_category_result, GetConfigCategoryResultSuccess):
+                # Create new category
+                create_new_category_request = SetConfigCategoryRequest(
+                    category=library_data_setting.category, contents=library_data_setting.contents
+                )
+                create_new_category_result = GriptapeNodes.handle_request(create_new_category_request)
+                if not isinstance(create_new_category_result, SetConfigCategoryResultSuccess):
+                    problems.append(CreateConfigCategoryProblem(category_name=library_data_setting.category))
+                    details = f"Failed attempting to create new config category '{library_data_setting.category}' for library '{library_data.name}'."
+                    logger.error(details)
+                continue
+
+            # Normalize secrets_to_register before merge (handles list/dict format mismatch)
+            library_contents = dict(library_data_setting.contents)
+            existing_contents = dict(
+                config_mgr.get_config_value(
+                    library_data_setting.category,
+                    config_source="user_config",
+                    default={},
+                )
+            )
+            if "secrets_to_register" in library_contents:
+                library_contents["secrets_to_register"] = normalize_secrets_to_register(
+                    library_contents["secrets_to_register"]
+                )
+            if "secrets_to_register" in existing_contents:
+                existing_contents["secrets_to_register"] = normalize_secrets_to_register(
+                    existing_contents["secrets_to_register"]
+                )
+            # Merge with existing category
+            existing_category_contents = merge_dicts(
+                library_contents,
+                existing_contents,
+                add_keys=True,
+                merge_lists=True,
+            )
+            set_category_request = SetConfigCategoryRequest(
+                category=library_data_setting.category, contents=existing_category_contents
+            )
+            set_category_result = GriptapeNodes.handle_request(set_category_request)
+            if not isinstance(set_category_result, SetConfigCategoryResultSuccess):
+                problems.append(UpdateConfigCategoryProblem(category_name=library_data_setting.category))
+                details = f"Failed attempting to update config category '{library_data_setting.category}' for library '{library_data.name}'."
+                logger.error(details)
+
+        return problems
 
     async def register_library_from_requirement_specifier_request(
         self, request: RegisterLibraryFromRequirementSpecifierRequest
@@ -2793,6 +3196,29 @@ class LibraryManager:
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""
+        # Emit the LOADING event BEFORE registering: register_library_from_file_request installs
+        # the library's dependencies (a slow pip/uv step), so emitting after it would leave the
+        # GUI with no progress signal during the longest part of startup. The library name is
+        # populated during discovery; fall back to a path-derived name if it isn't set yet.
+        pre_register_info = self._library_file_path_to_info.get(lib_path)
+        pending_library_name = (
+            pre_register_info.library_name
+            if pre_register_info and pre_register_info.library_name
+            else Path(lib_path).stem
+        )
+        GriptapeNodes.EventManager().put_event(
+            AppEvent(
+                payload=EngineInitializationProgress(
+                    phase=InitializationPhase.LIBRARIES,
+                    item_name=pending_library_name,
+                    status=InitializationStatus.LOADING,
+                    current=index,
+                    total=total,
+                    is_worker=self._is_worker,
+                )
+            )
+        )
+
         load_result = await self.register_library_from_file_request(
             RegisterLibraryFromFileRequest(
                 file_path=lib_path,
@@ -2834,18 +3260,32 @@ class LibraryManager:
                 )
             )
 
-    async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> None:
+    async def load_all_libraries_from_config(self, target_library_names: list[str] | None = None) -> list[str]:
+        """Reconcile sourced libraries, then discover and load every enabled library.
+
+        Reconcile runs first (engine_version gate + provision of git-sourced
+        entries) so freshly provisioned libraries are present on disk for the
+        discovery pass below. Reconcile failure details are returned, not raised:
+        the boot caller logs and continues so a bad pin cannot brick startup,
+        while the interactive reload caller turns non-empty details into a
+        failure result. Library discovery/loading always proceeds regardless so
+        the engine comes up with whatever libraries it can.
+
+        Returns the reconcile failure details (empty list on success).
+        """
         # Recreate the event bound to the current event loop. Calling .clear() on an event
         # created by a previous asyncio.run() call raises RuntimeError when awaited from
         # the new loop (asyncio.Event objects are bound to the loop they were created on).
         self._libraries_loading_complete = asyncio.Event()
 
+        reconcile_failures = await self._reconcile_libraries_from_config()
+
         # Discover all available libraries (config + sandbox)
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             logger.error("Failed to discover libraries: %s", discover_result.result_details)
             self._libraries_loading_complete.set()
-            return
+            return reconcile_failures
 
         # Build list of library paths to load
         libraries_to_load = []
@@ -2859,7 +3299,7 @@ class LibraryManager:
         if not libraries_to_load:
             logger.info("No libraries found in configuration.")
             self._libraries_loading_complete.set()
-            return
+            return reconcile_failures
 
         # Calculate total libraries for progress tracking
         total_libraries = len(libraries_to_load)
@@ -2880,6 +3320,376 @@ class LibraryManager:
         self._remove_missing_libraries_from_config(config_category=user_libraries_section)
 
         self._libraries_loading_complete.set()
+        return reconcile_failures
+
+    async def on_preview_project_provisioning_request(
+        self, request: PreviewProjectProvisioningRequest
+    ) -> PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure:
+        """Compute the library provisioning plan for a loaded project, read-only.
+
+        Sync and side-effect-free. To match what activation will actually do, it
+        reconstructs the same effective config the live reconcile reads:
+        ProjectManager resolves the project (canonically, like
+        on_set_current_project_request) plus its workspace dir, then ConfigManager
+        merges every layer (defaults -> user -> project-adjacent -> workspace ->
+        override -> env) without mutating live state. Reading the project-adjacent
+        file alone diverges whenever a higher-priority layer sets
+        `libraries_to_download`/`engine_version`. It also runs the same
+        engine_version gate (`engine_version_failure_detail`) on that merged config
+        so the preview can warn before the user approves a plan that activation
+        would reject. The GUI calls this before committing to a switch so the user
+        can approve or refuse the changes. System defaults are previewable too:
+        switching to them merges defaults -> user -> env (no project-adjacent or
+        workspace-file layer), and that merged config can still carry a user-config
+        library pin or engine_version, so it gets the same plan + gate. A non-loaded
+        file-backed project (or one with no adjacent config dir) is a Failure.
+        """
+        config_mgr = GriptapeNodes.ConfigManager()
+
+        # System defaults is a synthetic id, not a path, so match it verbatim before
+        # any canonicalization (mirroring on_set_current_project_request). Its activation
+        # reads no project-adjacent or workspace-file config layer, so the preview must
+        # not either, or it would drift from what the reconcile actually provisions.
+        if request.project_id == SYSTEM_DEFAULTS_KEY:
+            merged = config_mgr.compute_system_defaults_provisioning_config()
+        else:
+            dirs = GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
+            if dirs is None:
+                return PreviewProjectProvisioningResultFailure(
+                    result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
+                    f"Failed because the project is not loaded or has no project-adjacent config directory",
+                )
+            merged = config_mgr.compute_project_provisioning_config(
+                dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override
+            )
+
+        engine_version_failure = engine_version_failure_detail(get_dot_value(merged, REQUIRES_ENGINE_KEY, default=None))
+
+        raw_libraries = get_dot_value(merged, LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        downloads = normalize_library_downloads(raw_libraries)
+
+        # Probe the installed versions against the TARGET project's libraries dir, not the
+        # live one, so the plan matches what activation would reconcile in that workspace.
+        # A project's own/inherited libraries_dir (resolved offline so an unloaded target is
+        # honored) takes precedence; otherwise fall back to the workspace-relative default.
+        # Both keys come from Settings defaults, so they are always present in `merged`.
+        libraries_root = None
+        if request.project_id != SYSTEM_DEFAULTS_KEY:
+            libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
+                request.project_id
+            )
+        if libraries_root is not None:
+            libraries_path = libraries_root
+        else:
+            libraries_path = resolve_workspace_path(
+                Path(get_dot_value(merged, "libraries_directory")),
+                Path(get_dot_value(merged, "workspace_directory")),
+            )
+
+        actions = await asyncio.gather(
+            *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
+        )
+        destructive_count = sum(1 for action in actions if action.destructive)
+        change_count = sum(1 for action in actions if action.kind != LibraryProvisioningActionKind.SKIP)
+        return PreviewProjectProvisioningResultSuccess(
+            actions=actions,
+            engine_version_failure=engine_version_failure,
+            result_details=f"Computed provisioning plan for project '{request.project_id}': "
+            f"{change_count} change(s), {destructive_count} destructive",
+        )
+
+    async def _reconcile_libraries_from_config(self) -> list[str]:
+        """Enforce the engine_version gate and provision libraries_to_download from config.
+
+        The project (its adjacent config, already merged into the live config by
+        the time this runs) is the source of truth for the libraries it needs:
+        each `libraries_to_download` entry is provisioned to match its version,
+        which may overwrite a wrong installed copy. A library listed only in
+        `libraries_to_register` is left to normal discovery and is never
+        overwritten. The engine_version gate runs first, before any disk
+        mutation, so a version mismatch blocks provisioning entirely rather than
+        half-applying it.
+
+        Returns a list of failure detail strings (empty on success). Callers
+        decide whether to log-and-continue (boot) or fail (interactive reload).
+        """
+        engine_version_failure = self._check_engine_version()
+        if engine_version_failure is not None:
+            return [engine_version_failure]
+
+        config_mgr = GriptapeNodes.ConfigManager()
+        raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        downloads = normalize_library_downloads(raw_libraries)
+
+        failures: list[str] = []
+        for download in downloads:
+            failure = await self._provision_one_library(download)
+            if failure is not None:
+                failures.append(failure)
+
+        return failures
+
+    def _check_engine_version(self) -> str | None:
+        """Return a failure detail when the running engine fails the configured spec.
+
+        Reads the merged `requires_engine` config key and delegates the PEP 440
+        compare to `engine_version_failure_detail`. No key means no constraint.
+        """
+        spec_string = GriptapeNodes.ConfigManager().get_config_value(REQUIRES_ENGINE_KEY, default=None)
+        return engine_version_failure_detail(spec_string)
+
+    async def _plan_one_library_provisioning(
+        self, download: LibraryDownload, libraries_path: Path | None = None
+    ) -> LibraryProvisioningAction:
+        """Decide what provisioning will do to one download entry, reading only.
+
+        A manifest read for the installed version (under `libraries_directory`)
+        plus a PEP 440 compare. The preview lists this output and the real
+        provisioning path re-runs it at execution time; both read the same
+        on-disk state, which survives the reload's registry unload, so the two
+        cannot drift. Branch order mirrors `_provision_one_library`: the
+        already-satisfied SKIP first, then the git clone/overwrite.
+
+        `libraries_path` is the TARGET project's resolved libraries directory.
+        The preview passes it so the installed-version probe reads the workspace
+        the switch would land in, not the currently-active one; activation runs
+        after the config layers switch, so its reconcile leaves this None and
+        resolves from the (now-target) live config.
+
+        `destructive` is True ONLY for a git OVERWRITE, matching the
+        `overwrite_existing = installed_version is not None` decision in
+        `_provision_git_library` that triggers the local directory delete.
+
+        A LibraryDownload always carries a `git_url`; `name` is optional. When
+        `name` is absent the installed copy is located by its repo-name directory
+        (`_installed_manifest_path_for_download`), the same place the download
+        handler lands it, so a `version` pin is enforced without requiring `name`.
+        The action's `library_name` falls back to the repo name for display.
+        """
+        library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
+        installed_version = await self._installed_download_version(download, libraries_path)
+        parsed = parse_git_url_with_ref(download.git_url)
+        satisfied = self._registration_satisfied_by_installed(download, installed_version)
+        if satisfied:
+            return LibraryProvisioningAction(
+                library_name=library_name,
+                kind=LibraryProvisioningActionKind.SKIP,
+                installed_version=installed_version,
+                pinned_version=download.version,
+                git_url=parsed.url,
+                git_ref=parsed.ref,
+                destructive=False,
+                reason=f"Installed version {installed_version} already satisfies the entry",
+            )
+
+        if installed_version is None:
+            kind = LibraryProvisioningActionKind.INSTALL
+            reason = f"Not installed; will clone from {download.git_url}"
+        else:
+            kind = LibraryProvisioningActionKind.OVERWRITE
+            reason = (
+                f"Installed version {installed_version} does not satisfy the entry; "
+                f"will delete the local library directory and re-clone from {download.git_url}"
+            )
+        return LibraryProvisioningAction(
+            library_name=library_name,
+            kind=kind,
+            installed_version=installed_version,
+            pinned_version=download.version,
+            git_url=parsed.url,
+            git_ref=parsed.ref,
+            destructive=kind == LibraryProvisioningActionKind.OVERWRITE,
+            reason=reason,
+        )
+
+    async def _provision_one_library(self, download: LibraryDownload) -> str | None:
+        """Provision a single git-sourced library, skipping when already satisfied.
+
+        Computes the plan with the same pure decision function the preview uses
+        (`_plan_one_library_provisioning`), then clones/overwrites via the
+        download handler, which recomputes its own `overwrite_existing` so the
+        wire payload is unchanged. Returns a failure detail string, or None on
+        success/skip. A LibraryDownload always carries a `git_url`.
+        """
+        action = await self._plan_one_library_provisioning(download)
+        if action.kind == LibraryProvisioningActionKind.SKIP:
+            return None
+
+        return await self._provision_git_library(
+            download, git_url=download.git_url, installed_version=action.installed_version
+        )
+
+    async def _provision_git_library(
+        self, download: LibraryDownload, *, git_url: str, installed_version: str | None
+    ) -> str | None:
+        """Download a git-sourced entry, overwriting only a wrong installed version.
+
+        The download handler skips its clone when the target directory exists,
+        which would silently keep a stale checkout. So overwrite_existing is set
+        only when a wrong version is already installed; a fresh install lets the
+        handler land the library normally.
+
+        When overwriting, the destructive delete must target the directory the
+        installed library actually lives in. The handler's default guess is
+        `libraries_path/<git-repo-name>`, which is correct for any library this
+        engine downloaded. An explicit `name` overrides that for a library
+        installed under a differently-named directory: the installed manifest is
+        resolved by `name` and its parent directory is passed so the delete hits
+        the stale dir and the re-clone does not orphan the old copy. Without a
+        `name` (the common case) both hints stay None and the handler's repo-name
+        default applies. A fresh install (installed_version is None) also leaves
+        both hints None.
+        """
+        parsed = parse_git_url_with_ref(git_url)
+        overwrite_existing = installed_version is not None
+
+        download_directory: str | None = None
+        target_directory_name: str | None = None
+        if overwrite_existing and download.name is not None:
+            manifest_path = await self._installed_library_manifest_path(download.name)
+            if manifest_path is not None:
+                download_directory = str(manifest_path.parent.parent)
+                target_directory_name = manifest_path.parent.name
+
+        download_request = DownloadLibraryRequest(
+            git_url=parsed.url,
+            branch_tag_commit=parsed.ref,
+            auto_register=False,
+            overwrite_existing=overwrite_existing,
+            fail_on_exists=False,
+            download_directory=download_directory,
+            target_directory_name=target_directory_name,
+        )
+        download_result = await GriptapeNodes.ahandle_request(download_request)
+        if not isinstance(download_result, DownloadLibraryResultSuccess):
+            library_label = download.name if download.name is not None else extract_repo_name_from_url(git_url)
+            return f"Failed to provision library '{library_label}' from '{git_url}': {download_result.result_details}"
+        return None
+
+    @staticmethod
+    async def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
+        """Return the on-disk manifest path for a provisioned library by name, or None.
+
+        Scans the manifests under `libraries_directory` (where reconcile clones
+        git-sourced libraries) rather than the in-memory `LibraryRegistry`,
+        because the reload path
+        unregisters every library before reconcile runs (see
+        `reload_libraries_request`). Returns the first manifest whose `name`
+        matches; None when the directory is unconfigured or missing, or no
+        manifest matches.
+
+        `libraries_path` lets the provisioning preview probe the TARGET project's
+        libraries directory rather than the live one. When None it resolves from
+        the live config, which is correct for the real reconcile (it runs after
+        activation has switched the config layers to the target).
+
+        This is the single source of truth for the provisioning planner
+        (`_installed_library_version`, which decides SKIP/INSTALL/OVERWRITE) and
+        the overwrite path (`_provision_git_library`, which deletes the manifest's
+        directory before re-cloning), guaranteeing the file the planner reasoned
+        about is exactly the file overwrite targets.
+        """
+        if libraries_path is None:
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
+
+        for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+            try:
+                content = manifest_path.read_text(encoding="utf-8")
+                manifest = json.loads(content)
+            except (OSError, json.JSONDecodeError):
+                continue
+            if manifest.get("name") == library_name:
+                return manifest_path
+
+        return None
+
+    @staticmethod
+    async def _installed_library_version(library_name: str) -> str | None:
+        """Return the on-disk version of a library by manifest name, or None when absent.
+
+        Locates the provisioned manifest via `_installed_library_manifest_path`
+        (the shared resolver), then reads `metadata.library_version`. None when no
+        manifest matches or the version is absent/unreadable.
+        """
+        manifest_path = await LibraryManager._installed_library_manifest_path(library_name)
+        return LibraryManager._library_version_from_manifest(manifest_path)
+
+    @staticmethod
+    async def _installed_manifest_path_for_download(
+        download: LibraryDownload, libraries_path: Path | None = None
+    ) -> Path | None:
+        """Return the on-disk manifest path for a download entry, or None when absent.
+
+        Locates the installed copy the same way the download handler lands it:
+        by the repo-name directory `libraries_directory/<repo-name>/`. This keeps
+        the provisioning version-check consistent with the clone/skip/overwrite
+        logic, so a `version` pin works without requiring `name`. An explicit
+        `name` overrides the directory match for a library installed under a
+        differently-named directory, resolving by manifest name instead. None when
+        the directory is unconfigured/missing or no manifest is found.
+
+        `libraries_path` lets the provisioning preview probe the TARGET project's
+        libraries directory; when None it resolves from the live config (correct
+        for the real reconcile, which runs post-activation).
+        """
+        if download.name is not None:
+            return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
+
+        if libraries_path is None:
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
+
+        repo_name = extract_repo_name_from_url(download.git_url)
+        repo_directory = libraries_path / repo_name
+        return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
+
+    @staticmethod
+    async def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
+        """Return the on-disk version for a download entry, or None when absent.
+
+        Resolves the installed manifest via `_installed_manifest_path_for_download`
+        (repo-name directory, or `name` override), then reads
+        `metadata.library_version`. `libraries_path` threads the TARGET project's
+        libraries directory through for the preview; None resolves from live config.
+        """
+        manifest_path = await LibraryManager._installed_manifest_path_for_download(download, libraries_path)
+        return LibraryManager._library_version_from_manifest(manifest_path)
+
+    @staticmethod
+    def _library_version_from_manifest(manifest_path: Path | None) -> str | None:
+        """Read `metadata.library_version` from a manifest path, or None when unreadable/absent."""
+        if manifest_path is None:
+            return None
+
+        try:
+            content = manifest_path.read_text(encoding="utf-8")
+            manifest = json.loads(content)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+        metadata = manifest.get("metadata")
+        if not isinstance(metadata, dict):
+            return None
+        version = metadata.get("library_version")
+        return str(version) if version is not None else None
+
+    @staticmethod
+    def _registration_satisfied_by_installed(download: LibraryDownload, installed_version: str | None) -> bool:
+        """Decide whether the installed library already satisfies the entry.
+
+        Nothing installed is never satisfied. An entry without a version spec is
+        satisfied by any installed version (source-only entry). Otherwise the
+        installed version must fall within the PEP 440 specifier; a malformed
+        spec or version is treated as unsatisfied so provisioning re-runs.
+        """
+        if installed_version is None:
+            return False
+        if download.version is None:
+            return True
+        try:
+            specifier_set = SpecifierSet(download.version)
+            return PackagingVersion(installed_version) in specifier_set
+        except (InvalidSpecifier, InvalidVersion):
+            return False
 
     async def _ensure_libraries_from_config(self) -> None:
         """Ensure libraries from git URLs specified in config are downloaded.
@@ -2893,7 +3703,8 @@ class LibraryManager:
         Libraries are registered later by load_all_libraries_from_config().
         """
         config_mgr = GriptapeNodes.ConfigManager()
-        git_urls = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        raw_downloads = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        git_urls = [download.git_url for download in normalize_library_downloads(raw_downloads)]
 
         if not git_urls:
             logger.debug("No libraries to download from config")
@@ -2944,13 +3755,7 @@ class LibraryManager:
             }
         """
         config_mgr = GriptapeNodes.ConfigManager()
-        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-
-        if not libraries_dir_setting:
-            logger.warning("Cannot download libraries: libraries_directory not configured")
-            return {}
-
-        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+        libraries_path = config_mgr.resolved_libraries_root()
 
         async def download_one(git_url_with_ref: str) -> tuple[str, dict[str, Any]]:
             """Download a single library if not already present."""
@@ -3003,6 +3808,15 @@ class LibraryManager:
         return dict(task.result() for task in tasks)
 
     async def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        # Bracket the whole init sequence so the heartbeat can report is_initializing to clients
+        # that connect mid-startup. finally guarantees the flag clears even if init raises.
+        self._is_initializing = True
+        try:
+            await self._run_app_initialization(payload)
+        finally:
+            self._is_initializing = False
+
+    async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
         if payload.skip_library_loading:
             # Register all secrets even in headless mode
             GriptapeNodes.SecretsManager().register_all_secrets()
@@ -3025,7 +3839,16 @@ class LibraryManager:
         # When running as a dedicated library worker, restrict loading to those libraries.
         self._is_worker = payload.is_worker
         self._target_library_names = payload.libraries_to_register if payload.is_worker else None
-        await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+        reconcile_failures = await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+        # Soft boot: log reconcile failures and continue so the engine still starts and the
+        # user can switch to a working project. Interactive activation hard-fails instead
+        # (see reload_libraries_request).
+        if reconcile_failures:
+            logger.warning(
+                "Library reconcile reported %d problem(s) at startup; continuing so the engine can start:\n%s",
+                len(reconcile_failures),
+                "\n".join(reconcile_failures),
+            )
 
         # When the orchestrator restarts into an already-active session, the GUI will not
         # send AppStartSessionRequest again, so workers must be started here.
@@ -3039,11 +3862,6 @@ class LibraryManager:
         if GriptapeNodes.get_session_id():
             await self._await_pending_workers()
 
-        # Print library status after workers have had a chance to report back so worker
-        # libraries show their real fitness rather than NOT_EVALUATED.
-        if not self._is_worker:
-            self.print_library_load_status()
-
         # Register all secrets now that libraries are loaded and settings are merged
         GriptapeNodes.SecretsManager().register_all_secrets()
 
@@ -3056,8 +3874,21 @@ class LibraryManager:
         # Go tell the Workflow Manager that it's turn is now.
         await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
 
-        # Only print the engine ready banner for the orchestrator — not for dedicated library workers.
-        self._maybe_print_engine_ready_banner(is_worker=self._is_worker)
+        # Signal readiness so the application layer can render its library status
+        # table and "engine ready" banner, and other consumers (the GUI, the
+        # desktop app) can react to the same event. Only the orchestrator
+        # announces readiness; dedicated library workers do not. Presentation is
+        # owned by the app, not the engine. The library statuses reflect real
+        # fitness because workers have already reported back above.
+        if not self._is_worker:
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=True,
+                    )
+                )
+            )
 
     async def _collect_library_workflow_files(self) -> list[str]:
         """Collect workflow file paths declared by all registered libraries.
@@ -3260,37 +4091,6 @@ class LibraryManager:
 
         return type(class_name, (BaseNode,), {"__init__": stub_init, "process": stub_process})
 
-    def _maybe_print_engine_ready_banner(self, *, is_worker: bool) -> None:
-        if is_worker:
-            return
-
-        engine_version = get_complete_version_string()
-
-        # Get current session ID
-        session_id = GriptapeNodes.get_session_id()
-        session_info = f" | Session: {session_id[:8]}..." if session_id else " | No Session"
-
-        # Get user and organization
-        user = GriptapeNodes.UserManager().user
-        user_info = f" | User: {user.email if user else 'Not available'}"
-
-        user_organization = GriptapeNodes.UserManager().user_organization
-        org_info = f" | Org: {user_organization.name if user_organization else 'Not available'}"
-
-        nodes_app_url = os.getenv("GRIPTAPE_NODES_UI_BASE_URL", "https://nodes.griptape.ai")
-        message = Panel(
-            Align.center(
-                f"[bold green]Engine is ready to receive events[/bold green]\n"
-                f"[bold blue]Return to: [link={nodes_app_url}]{nodes_app_url}[/link] to access the Workflow Editor[/bold blue]",
-                vertical="middle",
-            ),
-            title="Griptape Nodes Engine Started",
-            subtitle=f"[green]Version: {engine_version}{session_info}{user_info}{org_info}[/green]",
-            border_style="green",
-            padding=(1, 4),
-        )
-        console.print(message)
-
     def _load_advanced_library_module(
         self,
         library_data: LibrarySchema,
@@ -3469,6 +4269,43 @@ class LibraryManager:
                 details = f"Failed to call after_library_nodes_loaded callback for library '{library_data.name}': {err}"
                 logger.error(details)
 
+        # Register request/response handlers declared by the library
+        if advanced_library:
+            try:
+                # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4744 revisit per-entry error granularity
+                handlers = advanced_library.get_request_handlers()
+                if handlers and library_info.requires_worker:
+                    library_info.problems.append(
+                        RequestHandlersWorkerIncompatibleProblem(
+                            library_name=library_data.name,
+                            handler_count=len(handlers),
+                        )
+                    )
+                    logger.warning(
+                        "Library '%s' declares %d request handler(s) via get_request_handlers() but requires "
+                        "worker mode. Handlers are only registered in the worker process and cannot be reached "
+                        "from the orchestrator. See https://github.com/griptape-ai/griptape-nodes-engine/issues/4748",
+                        library_data.name,
+                        len(handlers),
+                    )
+                for request_type, handler in handlers:
+                    event_manager = GriptapeNodes.EventManager()
+                    event_manager.assign_manager_to_request_type(request_type, handler)
+                    library._registered_request_handler_types.append(request_type)
+                if handlers:
+                    logger.debug(
+                        "Registered %d request handler(s) for library '%s'",
+                        len(handlers),
+                        library_data.name,
+                    )
+            except Exception as err:
+                library_info.problems.append(RequestHandlerRegistrationProblem(error_message=str(err)))
+                logger.error(
+                    "Failed to register request handlers for library '%s': %s",
+                    library_data.name,
+                    err,
+                )
+
         # Update library_info fitness based on load successes and problem count
         if not any_nodes_loaded_successfully:
             library_info.fitness = LibraryManager.LibraryFitness.UNUSABLE
@@ -3487,6 +4324,34 @@ class LibraryManager:
     # await init-time events (e.g. WorkflowManager._workflows_loading_complete),
     # so each probe runs in a worker thread with this ceiling.
     _SCHEMA_PROBE_TIMEOUT_S: float = 10.0
+    # Sentinel name passed to the throwaway node instance built for schema
+    # discovery. The instance is discarded after its parameters are read.
+    _SCHEMA_PROBE_NODE_NAME: str = "__schema_probe__"
+
+    def _report_parameter_behavior_losses(self, probe: BaseNode) -> None:
+        """Report parameter-behaviors-dropped-in-schema for any probe parameter that has live behaviors.
+
+        ``WorkerParameterSchema`` only carries the scalar-shaped fields of a
+        ``Parameter``. Converters, validators, and traits cannot be
+        serialized across the worker boundary and therefore will not run on
+        the orchestrator stub. If a parameter has any of these attached,
+        report it so the author sees a named warning during library load.
+        """
+        rule = RULES["parameter-behaviors-dropped-in-schema"]
+        for param in probe.parameters:
+            dropped: list[str] = []
+            if param.has_directly_attached_converters:
+                dropped.append("converters")
+            if param.has_directly_attached_validators:
+                dropped.append("validators")
+            if param.has_traits:
+                dropped.append("traits")
+            if not dropped:
+                continue
+            STRICT_MODE.report(
+                rule_id=rule.rule_id,
+                message=rule.render(parameter_name=param.name, dropped_attributes=", ".join(dropped)),
+            )
 
     async def _serialize_library_node_schemas(self, library_name: str) -> list[WorkerNodeSchema]:
         """Serialize node parameter schemas for a loaded library.
@@ -3503,24 +4368,51 @@ class LibraryManager:
 
         node_schemas: list[WorkerNodeSchema] = []
         for class_name in library.get_registered_nodes():
-            node_class = library.get_node_class(class_name)
-            try:
-                probe = await asyncio.wait_for(
-                    asyncio.to_thread(node_class, name="__schema_probe__"),
-                    timeout=self._SCHEMA_PROBE_TIMEOUT_S,
-                )
-            except TimeoutError:
-                logger.warning(
-                    "Schema probe for node class '%s' in library '%s' timed out after %.1fs; "
-                    "skipping. The node's __init__ likely makes a blocking call that cannot "
-                    "complete during library load.",
-                    class_name,
-                    library_name,
-                    self._SCHEMA_PROBE_TIMEOUT_S,
-                )
-                continue
-            except Exception:
-                logger.debug("Could not probe node class '%s' for schema serialization.", class_name, exc_info=True)
+            # The is-constructing flag set inside create_node propagates into
+            # the asyncio.to_thread worker via contextvars.copy_context().
+            probe = None
+            with STRICT_MODE.open_scope(
+                kind=StrictModeScopeKind.LOAD_PROBE,
+                subject=class_name,
+                library_name=library_name,
+                is_worker=self.is_worker,
+            ) as scope:
+                try:
+                    probe = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            LibraryRegistry.create_node,
+                            node_type=class_name,
+                            name=self._SCHEMA_PROBE_NODE_NAME,
+                            specific_library_name=library_name,
+                        ),
+                        timeout=self._SCHEMA_PROBE_TIMEOUT_S,
+                    )
+                except TimeoutError:
+                    logger.warning(
+                        "Schema probe for node class '%s' in library '%s' timed out after %.1fs; "
+                        "skipping. The node's __init__ likely makes a blocking call that cannot "
+                        "complete during library load.",
+                        class_name,
+                        library_name,
+                        self._SCHEMA_PROBE_TIMEOUT_S,
+                    )
+                    continue
+                except Exception:
+                    logger.debug("Could not probe node class '%s' for schema serialization.", class_name, exc_info=True)
+                    continue
+                # Run the parameter-behavior-drop detector inside the scope so
+                # warnings attach to the same LOAD_PROBE scope that owns the
+                # probe attempt.
+                self._report_parameter_behavior_losses(probe)
+
+            # Drop the class only when a correctness-class rule fired.
+            # Severity is a logging concern; correctness is the lifecycle
+            # signal ("this class is broken enough to exclude from the
+            # schema"). Gating on severity would also drop the class for
+            # any future ergonomics rule whose worker_escalation flag is
+            # left at the True default.
+            blocking_rule_ids = {rid for rid, r in RULES.items() if r.correctness}
+            if any(v.rule_id in blocking_rule_ids for v in scope.violations):
                 continue
 
             param_schemas: list[WorkerParameterSchema] = []
@@ -3735,6 +4627,56 @@ class LibraryManager:
 
         return True
 
+    def _resolve_requires_worker(
+        self,
+        registered_path: str | None,
+        declarations: list[LibraryDeclaration],
+    ) -> bool:
+        """Apply per-entry worker_mode_override iff the library is worker-compatible; otherwise honor the manifest.
+
+        The override lives on the matching `LibraryRegistration` entry in
+        `libraries_to_register` (keyed by the user's verbatim path, mirroring how `enabled`
+        works). Lookup uses the user's *registered* path -- the same string they typed in
+        config -- not the resolved absolute path, because the engine's path resolution can
+        diverge between sides (workspace-relative, `~`-expansion, symlink-following).
+
+        Returns the load-time `requires_worker` bool used by the lifecycle state machine.
+        Centralized here so both writer sites stay in sync.
+        """
+        manifest_default = requires_worker_process(declarations)
+
+        capability = next((d for d in declarations if isinstance(d, WorkerModeCompatibility)), None)
+        is_incompatible = capability is not None and capability.compatibility is WorkerCompatibility.INCOMPATIBLE
+        if is_incompatible or not registered_path:
+            return manifest_default
+
+        config_mgr = GriptapeNodes.ConfigManager()
+        raw_entries = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY) or []
+        target_path_lower = registered_path.lower()
+        for entry in raw_entries:
+            entry_path = extract_library_path(entry)
+            if not entry_path or entry_path.lower() != target_path_lower:
+                continue
+            override_raw: Any = None
+            if isinstance(entry, LibraryRegistration):
+                override_raw = entry.worker_mode_override
+            elif isinstance(entry, dict):
+                override_raw = entry.get("worker_mode_override")
+            if override_raw is None:
+                return manifest_default
+            try:
+                effective_mode = WorkerMode(override_raw)
+            except ValueError:
+                logger.debug(
+                    "Ignoring invalid worker_mode_override %r on libraries_to_register entry %r; falling back to manifest suggested mode.",
+                    override_raw,
+                    registered_path,
+                )
+                return manifest_default
+            return effective_mode is WorkerMode.WORKER
+
+        return manifest_default
+
     def _remove_missing_libraries_from_config(self, config_category: str) -> None:
         # Now remove all libraries that were missing from the user's config.
         config_mgr = GriptapeNodes.ConfigManager()
@@ -3811,23 +4753,26 @@ class LibraryManager:
 
     def _add_git_urls_for_removed_libraries(
         self,
-        current_downloads: list[str],
+        current_downloads: list[Any],
         removed_library_names: set[str],
-    ) -> list[str]:
+    ) -> list[Any]:
         """Add git URLs for removed libraries if not already present.
 
         Args:
-            current_downloads: Current list of git URLs in libraries_to_download
+            current_downloads: Current libraries_to_download entries (bare git URL strings or object form)
             removed_library_names: Set of library names that were removed (e.g., "griptape_nodes_library")
 
         Returns:
-            Updated list with new git URLs added (deduplicated)
+            Updated list with new git URLs added (deduplicated), preserving existing entry shapes
         """
         if not removed_library_names:
             return current_downloads
 
-        # Get current repository names for deduplication
-        current_repo_names = {extract_repo_name_from_url(url) for url in current_downloads}
+        # Get current repository names for deduplication. Entries may be bare strings or
+        # object form, so normalize to git URLs before deriving repo names.
+        current_repo_names = {
+            extract_repo_name_from_url(download.git_url) for download in normalize_library_downloads(current_downloads)
+        }
 
         new_downloads = current_downloads.copy()
 
@@ -3845,7 +4790,16 @@ class LibraryManager:
 
         return new_downloads
 
-    async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
+    async def reload_libraries_request(self, request: ReloadAllLibrariesRequest) -> ResultPayload:
+        # Bracket the reload like on_app_initialization_complete so the heartbeat reports
+        # is_initializing during a mid-session reload too. finally clears it even on failure.
+        self._is_initializing = True
+        try:
+            return await self._run_reload_libraries(request)
+        finally:
+            self._is_initializing = False
+
+    async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
         clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
@@ -3879,7 +4833,7 @@ class LibraryManager:
 
         # Load (or reload, which should trigger a hot reload) all libraries.
         # Pass _target_library_names so workers reload only their designated libraries.
-        await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
+        reconcile_failures = await self.load_all_libraries_from_config(target_library_names=self._target_library_names)
 
         # Re-spawn workers for libraries that require them; reset_workers terminated them above.
         await self._maybe_start_workers_for_existing_session()
@@ -3889,20 +4843,50 @@ class LibraryManager:
         # must be registered before we respond.
         await self._await_pending_workers()
 
-        # Print after workers have reported back so their real fitness is shown.
-        self.print_library_load_status()
+        # Signal readiness again so the app re-renders the library status table with real
+        # fitness now that workers have reported back. is_initial_start=False so the app
+        # refreshes the table without re-showing the startup banner. Orchestrator only.
+        if not self._is_worker:
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=False,
+                    )
+                )
+            )
+
+        # Hard activation: a reload is interactive (project switch / explicit reload), so a
+        # reconcile failure (bad engine_version gate or a sourced library that could not be
+        # provisioned) surfaces to the caller. ProjectManager turns this into a
+        # SetCurrentProjectResultFailure the GUI can show.
+        if reconcile_failures:
+            details = "Reloaded libraries but reconcile reported problem(s): " + "; ".join(reconcile_failures)
+            return ReloadAllLibrariesResultFailure(result_details=details)
 
         details = (
             "Successfully reloaded all libraries. All object state was cleared and previous libraries were unloaded."
         )
         return ReloadAllLibrariesResultSuccess(result_details=ResultDetails(message=details, level=logging.INFO))
 
-    def _create_library_info_entry(self, file_path_str: str, *, is_sandbox: bool, enabled: bool = True) -> None:
+    def _create_library_info_entry(
+        self,
+        file_path_str: str,
+        *,
+        is_sandbox: bool,
+        enabled: bool = True,
+        registered_path: str | None = None,
+    ) -> None:
         """Create a LibraryInfo entry for a discovered library.
 
         Loads metadata if possible and creates the entry in the appropriate lifecycle state.
         When `enabled` is False, the entry is created in the DISABLED terminal state and
         is skipped by load_all_libraries_from_config.
+
+        `registered_path` is the user's verbatim `LibraryRegistration.path` from
+        `libraries_to_register` before workspace resolution; the GUI uses it to map
+        library metadata back to the user's config row. None for sandbox libraries
+        (registered through workspace discovery, not via `libraries_to_register`).
 
         If an entry already exists for this path, it is preserved unless the requested
         `enabled` flag disagrees with the existing lifecycle state (DISABLED vs. anything
@@ -3933,8 +4917,10 @@ class LibraryManager:
         if isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
             library_name = metadata_result.library_schema.name
             library_version = metadata_result.library_schema.metadata.library_version
-            worker_cfg = metadata_result.library_schema.metadata.worker
-            requires_worker = bool(worker_cfg and worker_cfg.enabled)
+            requires_worker = self._resolve_requires_worker(
+                registered_path,
+                metadata_result.library_schema.metadata.declarations,
+            )
             lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
 
         if not enabled:
@@ -3945,22 +4931,23 @@ class LibraryManager:
             fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
             library_path=file_path_str,
             is_sandbox=is_sandbox,
+            enabled=enabled,
             library_name=library_name,
             library_version=library_version,
+            registered_path=registered_path,
             requires_worker=requires_worker,
         )
 
-    def discover_libraries_request(
+    async def discover_libraries_request(
         self,
         request: DiscoverLibrariesRequest,
     ) -> DiscoverLibrariesResultSuccess | DiscoverLibrariesResultFailure:
         """Discover libraries from config and track them in discovered state.
 
-        This is the event handler for DiscoverLibrariesRequest.
         Scans configured library paths and creates LibraryInfo entries in DISCOVERED state.
         """
         try:
-            config_library_entries = self._discover_library_files()
+            config_library_entries = await self._discover_library_files()
         except Exception as e:
             logger.exception("Failed to discover library files")
             return DiscoverLibrariesResultFailure(
@@ -4005,7 +4992,8 @@ class LibraryManager:
                     self._create_library_info_entry(sandbox_json_path_str, is_sandbox=True)
 
         # Add all regular libraries from config
-        for entry in config_library_entries:
+        for discovered in config_library_entries:
+            entry = discovered.registration
             file_path = Path(entry.path)
             file_path_str = entry.path
 
@@ -4015,7 +5003,12 @@ class LibraryManager:
                 discovered_libraries.append(DiscoveredLibrary(path=file_path, is_sandbox=False, enabled=entry.enabled))
 
             # Create LibraryInfo entry for the library
-            self._create_library_info_entry(file_path_str, is_sandbox=False, enabled=entry.enabled)
+            self._create_library_info_entry(
+                file_path_str,
+                is_sandbox=False,
+                enabled=entry.enabled,
+                registered_path=discovered.registered_path,
+            )
 
         # Success path at the end
         return DiscoverLibrariesResultSuccess(
@@ -4050,6 +5043,38 @@ class LibraryManager:
                 problems=problems,
             )
 
+        # License-policy checkpoint: ask any registered authorization hook (the
+        # app installs one) whether this library may load past its metadata
+        # stage. A denial is rendered as a fitness problem and marks the library
+        # UNUSABLE, so it is not registered and the GUI shows every missing
+        # permission on the failure icon. With no hook installed this allows.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.LOAD_LIBRARY,
+                subject_type=CheckpointSubjectType.LIBRARY,
+                subject_id=schema.name,
+                attributes=self._library_checkpoint_attributes(schema),
+            )
+        )
+        if denial is not None:
+            problems.append(PermissionDeniedProblem(library_name=schema.name, messages=denial.messages()))
+            return EvaluateLibraryFitnessResultFailure(
+                result_details=f"Library '{schema.name}' is not permitted by the license policy",
+                fitness=LibraryManager.LibraryFitness.UNUSABLE,
+                problems=problems,
+            )
+
+        # Per-node license-policy preview. A library may be permitted to load while
+        # still declaring node types the policy forbids (by lifecycle stage or the
+        # arbitrary-code flag). Surface each denied node type as a library problem
+        # now -- so the GUI failure icon lists them and what to ask an admin for --
+        # without blocking the library, which stays usable for its permitted nodes.
+        # Instantiating a denied node later substitutes an Error Proxy via the same
+        # checkpoint. Runs on the schema, so no library module is imported here.
+        node_denials = GriptapeNodes.NodeManager().evaluate_schema_node_instantiation_denials(schema)
+        for node_type, node_denial in node_denials.items():
+            problems.append(NodePermissionDeniedProblem(node_type=node_type, messages=node_denial.messages()))
+
         # Determine fitness based on whether we have any non-disqualifying issues
         fitness = LibraryManager.LibraryFitness.FLAWED if problems else LibraryManager.LibraryFitness.GOOD
 
@@ -4059,6 +5084,28 @@ class LibraryManager:
             problems=problems,
         )
 
+    @staticmethod
+    def _library_checkpoint_attributes(schema: LibrarySchema) -> dict[str, Any]:
+        """Resolve the facts an authorization hook may gate a library load on.
+
+        `id` is the library name (so a policy can match a specific library);
+        `lifecycle_stage` is the library's declared stage when one is present.
+        The engine supplies what it has resolved and does not know which a policy
+        will read.
+        """
+        attributes: dict[str, Any] = {CheckpointAttribute.ID: schema.name}
+        stage = next(
+            (
+                declaration.stage
+                for declaration in schema.metadata.declarations
+                if isinstance(declaration, LifecycleStageLibraryProperty)
+            ),
+            None,
+        )
+        if stage is not None:
+            attributes[CheckpointAttribute.LIFECYCLE_STAGE] = stage.value
+        return attributes
+
     async def load_libraries_request(self, request: LoadLibrariesRequest) -> ResultPayload:  # noqa: ARG002, C901, PLR0912
         """Load all libraries from configuration (backward compatibility wrapper).
 
@@ -4066,7 +5113,7 @@ class LibraryManager:
         New code should use LoadLibraryRequest to load specific libraries instead.
         """
         # First, discover all available libraries
-        discover_result = self.discover_libraries_request(DiscoverLibrariesRequest())
+        discover_result = await self.discover_libraries_request(DiscoverLibrariesRequest())
         if isinstance(discover_result, DiscoverLibrariesResultFailure):
             return LoadLibrariesResultFailure(result_details=f"Discovery failed: {discover_result.result_details}")
 
@@ -4093,6 +5140,30 @@ class LibraryManager:
         total_libraries = len(libraries_to_load)
 
         for current_library_index, lib_path in enumerate(libraries_to_load, start=1):
+            # Emit the LOADING event BEFORE registering: register_library_from_file_request
+            # installs the library's dependencies (a slow pip/uv step), so emitting after it
+            # would leave the GUI with no progress signal during the longest part of startup.
+            # The library name isn't resolved until metadata loads, so fall back to a name
+            # derived from the path; the COMPLETE/FAILED event below reports the resolved name.
+            pre_register_info = self._library_file_path_to_info.get(lib_path)
+            pending_library_name = (
+                pre_register_info.library_name
+                if pre_register_info and pre_register_info.library_name
+                else Path(lib_path).stem
+            )
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineInitializationProgress(
+                        phase=InitializationPhase.LIBRARIES,
+                        item_name=pending_library_name,
+                        status=InitializationStatus.LOADING,
+                        current=current_library_index,
+                        total=total_libraries,
+                        is_worker=self._is_worker,
+                    )
+                )
+            )
+
             load_result = await self.register_library_from_file_request(
                 RegisterLibraryFromFileRequest(
                     file_path=lib_path,
@@ -4106,27 +5177,11 @@ class LibraryManager:
             else:
                 library_name = lib_path
 
-            # Check if library was already loaded (skip event emission if so)
+            # Check if library was already loaded (skip the COMPLETE event so reloads stay quiet).
             if isinstance(load_result, RegisterLibraryFromFileResultSuccess) and load_result.was_already_loaded:
-                # Library was already loaded - skip events and continue
+                # Library was already loaded - already counted, nothing more to emit.
                 loaded_count += 1
                 continue
-
-            # Library was actually loaded or failed - emit appropriate events
-
-            # Emit loading event
-            GriptapeNodes.EventManager().put_event(
-                AppEvent(
-                    payload=EngineInitializationProgress(
-                        phase=InitializationPhase.LIBRARIES,
-                        item_name=library_name,
-                        status=InitializationStatus.LOADING,
-                        current=current_library_index,
-                        total=total_libraries,
-                        is_worker=self._is_worker,
-                    )
-                )
-            )
 
             if isinstance(load_result, RegisterLibraryFromFileResultSuccess):
                 loaded_count += 1
@@ -4179,41 +5234,81 @@ class LibraryManager:
 
         return LoadLibrariesResultSuccess(result_details=ResultDetails(message=message, level=logging.INFO))
 
-    def _discover_library_files(self) -> list[LibraryRegistration]:
+    async def _discover_library_files(self) -> list[LibraryManager.DiscoveredLibraryEntry]:
         """Discover library JSON files from config and workspace recursively.
 
         Returns:
-            List of LibraryRegistration entries (path + enabled flag) in the order they
-            appear in config. Directory entries expand to one entry per discovered library
-            file, inheriting the directory entry's enabled flag.
+            List of DiscoveredLibraryEntry pairing each discovered LibraryRegistration
+            with the user's original `LibraryRegistration.path` string from config (before
+            workspace resolution). Directory entries expand to one entry per discovered
+            library file; every child inherits the parent's `registered_path`.
         """
         config_mgr = GriptapeNodes.ConfigManager()
         user_libraries_section = LIBRARIES_TO_REGISTER_KEY
 
-        discovered_entries: list[LibraryRegistration] = []
+        discovered_entries: list[LibraryManager.DiscoveredLibraryEntry] = []
         seen_paths: set[Path] = set()
 
-        def process_path(path: Path, *, enabled: bool) -> None:
+        async def process_path(path: Path, *, enabled: bool, registered_path: str) -> None:
             """Process a path, handling both files and directories."""
-            if path.is_dir():
-                # Recursively find library files, skipping hidden directories
-                for lib_path in find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
+            if await anyio.Path(path).is_dir():
+                # Recursively find library files. find_files_recursive skips hidden
+                # directories and bounds recursion depth so a deep or symlink-looped
+                # tree can't stall the boot scan.
+                for lib_path in await find_files_recursive(path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
                     if lib_path not in seen_paths:
                         seen_paths.add(lib_path)
-                        discovered_entries.append(LibraryRegistration(path=str(lib_path), enabled=enabled))
+                        discovered_entries.append(
+                            LibraryManager.DiscoveredLibraryEntry(
+                                registration=LibraryRegistration(path=str(lib_path), enabled=enabled),
+                                registered_path=registered_path,
+                            )
+                        )
             elif path.suffix == ".json" and path not in seen_paths:
                 seen_paths.add(path)
-                discovered_entries.append(LibraryRegistration(path=str(path), enabled=enabled))
+                discovered_entries.append(
+                    LibraryManager.DiscoveredLibraryEntry(
+                        registration=LibraryRegistration(path=str(path), enabled=enabled),
+                        registered_path=registered_path,
+                    )
+                )
 
         # Add from config
         config_libraries = config_mgr.get_config_value(user_libraries_section, default=[])
         for entry in normalize_library_registrations(config_libraries):
-            # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
-            library_path = resolve_workspace_path(Path(entry.path), Path(config_mgr.workspace_path))
-            if library_path.exists():
-                process_path(library_path, enabled=entry.enabled)
+            resolved = self._resolve_discovery_path(entry, config_mgr.workspace_path)
+            if resolved is not None:
+                await process_path(resolved.path, enabled=entry.enabled, registered_path=resolved.registered_path)
+
+        # Add provisioned git-sourced libraries. Each libraries_to_download entry is
+        # cloned into the workspace libraries_directory by reconcile; discovery
+        # resolves it to its installed manifest there so it loads scoped to the
+        # workspace that declares it, without ever being written into the global
+        # libraries_to_register config (which would leak it into every project).
+        download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
+        for download in normalize_library_downloads(download_libraries):
+            manifest_path = await self._installed_manifest_path_for_download(download)
+            if manifest_path is not None:
+                await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
 
         return discovered_entries
+
+    @staticmethod
+    def _resolve_discovery_path(entry: LibraryRegistration, workspace_path: Path) -> ResolvedDiscoveryPath | None:
+        """Resolve a `libraries_to_register` entry to a concrete on-disk path to scan.
+
+        A register entry names an already-present local library by `path`, which
+        resolves against the workspace. Libraries pinned to a git source live in
+        `libraries_to_download` and are resolved separately in
+        `_discover_library_files` by locating their provisioned manifest under the
+        workspace libraries directory, so they never need a `libraries_to_register`
+        entry. Returns None when the path does not exist on disk.
+        """
+        # TODO: Update to check on project manager for workspace path. https://github.com/griptape-ai/griptape-nodes/issues/4396
+        library_path = resolve_workspace_path(Path(entry.path), workspace_path)
+        if not library_path.exists():
+            return None
+        return LibraryManager.ResolvedDiscoveryPath(path=library_path, registered_path=entry.path)
 
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
@@ -4285,6 +5380,33 @@ class LibraryManager:
 
         # Get local commit SHA
         local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+
+        # If the current ref does not exist on the remote (e.g. a local-only branch that has
+        # not been pushed, or a detached HEAD on a bare commit), there is nothing on the remote
+        # to compare against. Report no update available instead of failing the check.
+        if git_ref is not None:
+            try:
+                ref_on_remote = await asyncio.to_thread(remote_ref_exists, git_remote, git_ref)
+            except GitRemoteError as e:
+                details = f"Failed to query git remote for Library '{library_name}': {e}"
+                return CheckLibraryUpdateResultFailure(result_details=details)
+
+            if not ref_on_remote:
+                details = (
+                    f"Library '{library_name}' is on git ref '{git_ref}', which does not exist on remote "
+                    f"'{git_remote}'. Updates can only be checked against refs that exist on the remote."
+                )
+                logger.info(details)
+                return CheckLibraryUpdateResultSuccess(
+                    has_update=False,
+                    current_version=current_version,
+                    latest_version=current_version,
+                    git_remote=git_remote,
+                    git_ref=git_ref,
+                    local_commit=local_commit,
+                    remote_commit=None,
+                    result_details=details,
+                )
 
         # Clone remote and get latest version and commit SHA (using current ref or HEAD if detached)
         try:
@@ -4613,12 +5735,9 @@ class LibraryManager:
             # Use custom download directory if provided
             libraries_path = Path(download_directory)
         else:
-            # Use default from config
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                details = "Cannot download library: libraries_directory setting is not configured."
-                return DownloadLibraryResultFailure(result_details=details)
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            # Resolve the libraries root (a project's own/inherited libraries_dir override, else the
+            # workspace-relative libraries_directory).
+            libraries_path = config_mgr.resolved_libraries_root()
 
         # Ensure parent directory exists
         await anyio.Path(libraries_path).mkdir(parents=True, exist_ok=True)
@@ -4680,7 +5799,7 @@ class LibraryManager:
             return DownloadLibraryResultFailure(result_details=details)
 
         try:
-            content = await anyio.Path(library_json_path).read_text()
+            content = await anyio.Path(library_json_path).read_text(encoding="utf-8")
             library_data = json.loads(content)
         except json.JSONDecodeError as e:
             details = f"Failed to parse griptape_nodes_library.json from downloaded library: {e}"
@@ -4709,22 +5828,28 @@ class LibraryManager:
             register_request = RegisterLibraryFromFileRequest(file_path=str(library_json_path))
             register_result = await GriptapeNodes.ahandle_request(register_request)
             if not register_result.succeeded():
-                logger.warning(
-                    "Library '%s' was downloaded but registration failed: %s",
-                    library_name,
-                    register_result.result_details,
+                return DownloadLibraryResultFailure(
+                    result_details=f"Library '{library_name}' downloaded but failed to register: {register_result.result_details}"
                 )
-            else:
-                logger.info("Library '%s' registered successfully", library_name)
+            logger.info("Library '%s' registered successfully", library_name)
 
-        # Add library JSON file path to config so it's registered on future startups
-        libraries_to_register = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
-        library_json_str = str(library_json_path)
-        existing_paths = {extract_library_path(entry) for entry in libraries_to_register}
-        if library_json_str not in existing_paths:
-            libraries_to_register.append(library_json_str)
-            config_mgr.set_config_value(LIBRARIES_TO_REGISTER_KEY, libraries_to_register)
-            logger.info("Added library '%s' to config for auto-registration on startup", library_name)
+        # Persist the path to libraries_to_register only when registering now. The
+        # write lands in the GLOBAL user config (set_config_value -> user config),
+        # so a project-reconcile download (auto_register=False) must NOT touch it:
+        # the project's own libraries_to_download is the per-activation source of
+        # truth, and persisting its clone path here would leak that library into
+        # every other project's startup registration. Reconcile-downloaded
+        # libraries instead reach discovery directly from libraries_to_download
+        # (see _discover_library_files), so they load scoped to the workspace that
+        # declares them without any global config write.
+        if request.auto_register:
+            libraries_to_register = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+            library_json_str = str(library_json_path)
+            existing_paths = {extract_library_path(entry) for entry in libraries_to_register}
+            if library_json_str not in existing_paths:
+                libraries_to_register.append(library_json_str)
+                config_mgr.set_config_value(LIBRARIES_TO_REGISTER_KEY, libraries_to_register)
+                logger.info("Added library '%s' to config for auto-registration on startup", library_name)
 
         if skip_clone:
             details = f"Library '{library_name}' already exists at {target_path} and has been registered"
@@ -4827,11 +5952,13 @@ class LibraryManager:
         # Collect git URLs from both config keys
         download_config = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         register_config = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[])
+        # libraries_to_download entries carry the git URL (bare string or object form).
+        git_urls_from_download = [download.git_url for download in normalize_library_downloads(download_config)]
         # Disabled entries are still synced; disabling only affects loading.
         git_urls_from_register = [path for entry in register_config if is_git_url(path := extract_library_path(entry))]
 
         # Combine and deduplicate
-        all_git_urls = list(set(download_config + git_urls_from_register))
+        all_git_urls = list(set(git_urls_from_download + git_urls_from_register))
 
         # Use shared download method
         update_summary = {}

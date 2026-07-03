@@ -9,12 +9,17 @@ import anyio
 import pytest
 import send2trash
 
+from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior, SequenceScanOptions
 from griptape_nodes.files.path_utils import normalize_path_for_platform, resolve_path_safely
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.os_events import (
     CreateFileRequest,
     CreateFileResultFailure,
     CreateFileResultSuccess,
+    DeduceSequencesFromFileListRequest,
+    DeduceSequencesFromFileListResultFailure,
+    DeduceSequencesFromFileListResultSuccess,
     DeleteFileRequest,
     DeleteFileResultFailure,
     DeleteFileResultSuccess,
@@ -25,19 +30,32 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoRequest,
     GetFileInfoResultFailure,
     GetFileInfoResultSuccess,
+    GetNextUnusedFilenameRequest,
+    GetNextUnusedFilenameResultFailure,
+    GetNextUnusedFilenameResultSuccess,
+    GetNextVersionIndexRequest,
+    GetNextVersionIndexResultFailure,
+    GetNextVersionIndexResultSuccess,
     ListDirectoryRequest,
     ListDirectoryResultFailure,
     ListDirectoryResultSuccess,
+    ListDirectorySequencesRequest,
+    ListDirectorySequencesResultSuccess,
+    MakeDirectoryRequest,
+    MakeDirectoryResultFailure,
+    MakeDirectoryResultSuccess,
     ReadFileRequest,
     ReadFileResultFailure,
     ReadFileResultSuccess,
     RenameFileRequest,
     RenameFileResultFailure,
     RenameFileResultSuccess,
+    SequenceScanFailureReason,
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
 )
+from griptape_nodes.retained_mode.events.project_events import MacroPath
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.os_manager import OSManager, WindowsSpecialFolderError
 
@@ -436,7 +454,7 @@ class TestListDirectoryRequest:
         griptape_nodes.ConfigManager().workspace_path = original_workspace
 
     def test_list_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """Test successfully listing a directory."""
+        """Test successfully listing a directory with sequence grouping disabled."""
         os_manager = griptape_nodes.OSManager()
         # Create some test files
         (temp_dir / "file1.txt").write_text("Content 1")
@@ -450,6 +468,103 @@ class TestListDirectoryRequest:
         assert len(result.entries) == 3  # noqa: PLR2004
         names = {entry.name for entry in result.entries}
         assert names == {"file1.txt", "file2.txt", "subdir"}
+        assert result.sequences == []
+
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Files fully clipped by start_number/end_number remain in entries.
+
+        Regression: consumed_filenames must not be updated before the active-range
+        check — otherwise listing removes sequence-member files from entries even
+        though no Sequence is returned for them.
+        """
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("f1")
+        (temp_dir / "render.0002.exr").write_text("f2")
+
+        request = ListDirectoryRequest(
+            directory_path=str(temp_dir),
+            workspace_only=False,
+            group_sequences=True,
+            sequence_options=SequenceScanOptions(start_number=100),
+        )
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        assert result.sequences == []
+        entry_names = {e.name for e in result.entries}
+        assert "render.0001.exr" in entry_names
+        assert "render.0002.exr" in entry_names
+
+    def test_bounds_partial_clip_out_of_range_files_stay_in_entries(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Files outside the active range remain in entries even when a Sequence is returned.
+
+        Regression: consumed_filenames was populated from the full bare_names set
+        (all frames in the FileSequence) rather than only the frames within
+        [active.first, active.last]. Files clipped by start_number/end_number were
+        silently dropped from entries despite never appearing in any Sequence.
+        """
+        os_manager = griptape_nodes.OSManager()
+        for i in range(1, 6):
+            (temp_dir / f"render.{i:04d}.exr").write_text(f"f{i}")
+
+        request = ListDirectoryRequest(
+            directory_path=str(temp_dir),
+            workspace_only=False,
+            group_sequences=True,
+            sequence_options=SequenceScanOptions(start_number=2),
+        )
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 2  # noqa: PLR2004
+        entry_names = {e.name for e in result.entries}
+        # Frame 1 is outside the active range — it must not be consumed
+        assert "render.0001.exr" in entry_names
+
+    def test_list_directory_groups_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Test that numbered files are grouped into Sequence objects by default."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("frame 1")
+        (temp_dir / "render.0002.exr").write_text("frame 2")
+        (temp_dir / "render.0003.exr").write_text("frame 3")
+        (temp_dir / "readme.txt").write_text("notes")
+        (temp_dir / "subdir").mkdir()
+
+        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=True)
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        # Non-sequence entries only
+        entry_names = {e.name for e in result.entries}
+        assert "readme.txt" in entry_names
+        assert "subdir" in entry_names
+        assert "render.0001.exr" not in entry_names
+        # Sequence detected
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 1
+        assert seq.last == 3  # noqa: PLR2004
+
+    def test_single_sequence_file_stays_in_entries(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A lone file that looks like a sequence pattern must not be grouped into a Sequence."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("frame 1")
+        (temp_dir / "readme.txt").write_text("notes")
+
+        request = ListDirectoryRequest(directory_path=str(temp_dir), workspace_only=False, group_sequences=True)
+        result = os_manager.on_list_directory_request(request)
+
+        assert isinstance(result, ListDirectoryResultSuccess)
+        assert result.sequences == []
+        entry_names = {e.name for e in result.entries}
+        assert "render.0001.exr" in entry_names
+        assert "readme.txt" in entry_names
 
     def test_list_directory_hidden_files(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
         """Test listing directory with hidden files."""
@@ -564,6 +679,361 @@ class TestListDirectoryRequest:
         assert symlink_path.is_symlink()
         assert symlink_path.resolve() == target_dir.resolve()
         assert str(symlink_path) == str(symlink_dir.absolute())
+
+
+class TestListDirectorySequencesRequest:
+    """Test ListDirectorySequencesRequest — sequences-only result."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_returns_only_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Non-sequence files are absent from the result; sequences are present."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.0001.exr").write_text("f1")
+        (temp_dir / "render.0002.exr").write_text("f2")
+        (temp_dir / "readme.txt").write_text("notes")
+        (temp_dir / "subdir").mkdir()
+
+        request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
+        result = os_manager.on_list_directory_sequences_request(request)
+
+        assert isinstance(result, ListDirectorySequencesResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 1
+        assert seq.last == 2  # noqa: PLR2004
+
+    def test_empty_directory_returns_success_with_no_sequences(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """A directory with no sequences returns an empty success, not a failure."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "readme.txt").write_text("notes")
+
+        request = ListDirectorySequencesRequest(directory_path=str(temp_dir), workspace_only=False)
+        result = os_manager.on_list_directory_sequences_request(request)
+
+        assert isinstance(result, ListDirectorySequencesResultSuccess)
+        assert result.sequences == []
+
+    def test_padding_filter_excludes_mismatched_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """sequence_options.padding=4 keeps only #### sequences; ### sequences are excluded."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "hi.0001.exr").write_text("f1")  # 4-digit
+        (temp_dir / "hi.0002.exr").write_text("f2")
+        (temp_dir / "lo.001.exr").write_text("f1")  # 3-digit
+        (temp_dir / "lo.002.exr").write_text("f2")
+
+        request = ListDirectorySequencesRequest(
+            directory_path=str(temp_dir),
+            workspace_only=False,
+            sequence_options=SequenceScanOptions(padding=4),
+        )
+        result = os_manager.on_list_directory_sequences_request(request)
+
+        assert isinstance(result, ListDirectorySequencesResultSuccess)
+        assert len(result.sequences) == 1
+        assert result.sequences[0].padding == 4  # noqa: PLR2004
+
+    def test_delegates_failure_from_inner_request(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A bad directory path surfaces as a failure result."""
+        os_manager = griptape_nodes.OSManager()
+        request = ListDirectorySequencesRequest(directory_path=str(temp_dir / "nonexistent"), workspace_only=False)
+        from griptape_nodes.retained_mode.events.os_events import ListDirectorySequencesResultFailure
+
+        result = os_manager.on_list_directory_sequences_request(request)
+
+        assert isinstance(result, ListDirectorySequencesResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_NOT_FOUND
+
+
+class TestDeduceSequencesFromFileListRequest:
+    """Test DeduceSequencesFromFileListRequest — no-I/O sequence detection."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def _write_frames(self, directory: Path, basename: str, ext: str, frames: list[int]) -> list[str]:
+        paths = []
+        for n in frames:
+            p = directory / f"{basename}.{n:04d}.{ext}"
+            p.write_text(f"frame {n}")
+            paths.append(str(p))
+        return paths
+
+    def test_detects_sequence_from_absolute_paths(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A list of absolute file paths is grouped into a Sequence."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+
+        request = DeduceSequencesFromFileListRequest(file_paths=paths)
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 1
+        assert seq.last == 3  # noqa: PLR2004
+        assert len(seq.entries) == 3  # noqa: PLR2004
+
+    def test_empty_file_list_returns_empty_success(self, griptape_nodes: GriptapeNodes) -> None:
+        """An empty file list returns success with no sequences."""
+        os_manager = griptape_nodes.OSManager()
+        request = DeduceSequencesFromFileListRequest(file_paths=[])
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert result.sequences == []
+
+    def test_bare_filenames_yield_empty_directory(self, griptape_nodes: GriptapeNodes) -> None:
+        """Bare filenames (no directory component) produce Sequence.directory == ''.
+
+        Path('render.0001.exr').parent is '.', which must be normalised to ''
+        so that Sequence.directory and entry paths match the documented contract
+        rather than emitting './render.0001.exr'.
+        """
+        os_manager = griptape_nodes.OSManager()
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=["render.0001.exr", "render.0002.exr"],
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.directory == ""
+        assert not any(e.path.startswith("./") for e in seq.entries)
+
+    def test_non_sequence_names_do_not_produce_sequences(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Plain names without numeric tokens produce no sequences (callers filter directories)."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "frame", "exr", [1, 2])
+        paths.append(str(temp_dir / "subdir"))  # bare name with no sequence token
+
+        request = DeduceSequencesFromFileListRequest(file_paths=paths)
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 1  # subdir produces no sequence
+
+    def test_files_from_multiple_directories(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Files from different parent directories are grouped independently."""
+        os_manager = griptape_nodes.OSManager()
+        dir_a = temp_dir / "a"
+        dir_b = temp_dir / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        paths_a = self._write_frames(dir_a, "render", "exr", [1, 2])
+        paths_b = self._write_frames(dir_b, "comp", "exr", [10, 11])
+
+        request = DeduceSequencesFromFileListRequest(file_paths=paths_a + paths_b)
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 2  # noqa: PLR2004
+
+    def test_no_sequence_files_returns_empty_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Files with no sequence tokens return success with an empty sequences list."""
+        os_manager = griptape_nodes.OSManager()
+        p = temp_dir / "readme.txt"
+        p.write_text("notes")
+
+        request = DeduceSequencesFromFileListRequest(file_paths=[str(p)])
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert result.sequences == []
+
+    def test_padding_filter(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """sequence_options.padding filters to only matching zero-fill width."""
+        os_manager = griptape_nodes.OSManager()
+        paths_4 = self._write_frames(temp_dir, "hi", "exr", [1, 2])  # 4-digit
+        paths_3 = [str(temp_dir / f"lo.{n:03d}.exr") for n in [1, 2]]
+        for p in paths_3:
+            Path(p).write_text("f")
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths_4 + paths_3,
+            sequence_options=SequenceScanOptions(padding=4),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 1
+        assert result.sequences[0].padding == 4  # noqa: PLR2004
+
+    def test_frame_bounds(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """start_number / end_number clip the active range."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3, 4, 5])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(
+                policy=MissingItemPolicy.SKIP,
+                start_number=2,
+                end_number=4,
+            ),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert seq.first == 2  # noqa: PLR2004
+        assert seq.last == 4  # noqa: PLR2004
+        assert [e.number for e in seq.entries] == [2, 3, 4]
+
+    def test_bounds_clip_entire_sequence_files_stay_in_entries(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Files whose sequence is fully clipped by bounds are NOT removed from the result.
+
+        Regression: consumed_filenames must not be updated before the active-range
+        check, otherwise files that produce no Sequence (because start_number >
+        discovered_last) are silently consumed and callers lose them.
+        """
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+
+        # Ask for frames 100+, which clips the entire on-disk range out.
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(start_number=100),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert result.sequences == []
+
+    def test_invalid_bounds_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A negative start_number surfaces as INVALID_BOUNDS failure."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2, 3])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(start_number=-1),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.INVALID_BOUNDS
+
+    def test_abort_policy_with_single_gap_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """ABORT policy with exactly one gap returns ABORTED_AT_GAP with a single-gap message."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3])  # gap at 2
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "gap at item 2" in result.result_details.result_details[0].message
+
+    def test_abort_policy_with_multiple_gaps_returns_failure(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """ABORT policy with multiple gaps lists all gap positions in the message."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5])  # gaps at 2, 4
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "2 gaps" in result.result_details.result_details[0].message
+
+    def test_abort_policy_with_many_gaps_truncates_preview(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """ABORT with more gaps than ABORTED_AT_GAP_PREVIEW_COUNT appends a '+ N more' suffix."""
+        os_manager = griptape_nodes.OSManager()
+        # 6 gaps: missing 2, 4, 6, 8, 10, 12 — exceeds the preview count of 5
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 3, 5, 7, 9, 11, 13])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(policy=MissingItemPolicy.ABORT),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == SequenceScanFailureReason.ABORTED_AT_GAP
+        assert isinstance(result.result_details, ResultDetails)
+        assert "more" in result.result_details.result_details[0].message
+
+    def test_unexpected_exception_returns_unknown_failure(self, griptape_nodes: GriptapeNodes) -> None:
+        """An unexpected exception from the scan is caught and returned as UNKNOWN failure."""
+        os_manager = griptape_nodes.OSManager()
+
+        request = DeduceSequencesFromFileListRequest(file_paths=["render.0001.exr"])
+        with patch(
+            "griptape_nodes.retained_mode.managers.os_manager.scan_sequences_from_filenames",
+            side_effect=RuntimeError("boom"),
+        ):
+            result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultFailure)
+        assert result.failure_reason == FileIOFailureReason.UNKNOWN
+        assert isinstance(result.result_details, ResultDetails)
+        assert "boom" in result.result_details.result_details[0].message
+
+    def test_single_frame_sequence_not_returned(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A sequence with only one present frame is not included in the result."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1])
+
+        request = DeduceSequencesFromFileListRequest(file_paths=paths)
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
+        assert result.sequences == []
+
+    def test_reject_no_token_behavior_skips_token_less_sequences(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """NoTokenBehavior.REJECT causes token-less files to be silently skipped."""
+        os_manager = griptape_nodes.OSManager()
+        paths = self._write_frames(temp_dir, "render", "exr", [1, 2])
+
+        request = DeduceSequencesFromFileListRequest(
+            file_paths=paths,
+            sequence_options=SequenceScanOptions(
+                no_token_behavior=NoTokenBehavior.REJECT,
+                padding=0,  # only match zero-padded (token-less) sequences
+            ),
+        )
+        result = os_manager.on_deduce_sequences_from_file_list_request(request)
+
+        assert isinstance(result, DeduceSequencesFromFileListResultSuccess)
 
 
 class TestNormalizePathPartsForSpecialFolder:
@@ -777,12 +1247,19 @@ class TestWindowsLongPathHandling:
         return Path(*path_parts)
 
     def test_normalize_path_short_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:  # noqa: ARG002
-        """Test that short paths are not modified."""
+        r"""Short paths get the \\?\ prefix on Windows, none elsewhere.
+
+        The prefix is applied unconditionally on Windows (not gated on length):
+        prefixing a short root is what lets a recursive copy carry the prefix
+        down to deep leaf paths that individually exceed MAX_PATH.
+        """
         short_path = temp_dir / "short.txt"
         result = normalize_path_for_platform(short_path)
 
-        # Should return string without \\?\ prefix
-        assert not result.startswith("\\\\?\\")
+        if platform.system() == "Windows":
+            assert result.startswith("\\\\?\\")
+        else:
+            assert not result.startswith("\\\\?\\")
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
     def test_normalize_path_long_path_windows(self, griptape_nodes: GriptapeNodes, long_path: Path) -> None:  # noqa: ARG002
@@ -1450,3 +1927,275 @@ class TestDiskSpaceProbe:
         # probe branch emits "Available:" numbers. We want the probe branch.
         assert "Available:" in message
         assert "Could not determine disk space" not in message
+
+
+class TestGetNextUnusedFilenameRequest:
+    """Test GetNextUnusedFilenameRequest preview behavior."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_base_filename_available_returns_unindexed_path(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When the base filename is free, preview returns that path and no index."""
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "render.png"
+
+        result = os_manager.on_get_next_unused_filename_request(
+            GetNextUnusedFilenameRequest(file_path=str(requested_path))
+        )
+
+        assert isinstance(result, GetNextUnusedFilenameResultSuccess)
+        assert Path(result.available_filename).resolve() == requested_path.resolve()
+        assert result.index_used is None
+        assert not requested_path.exists()
+
+    def test_existing_base_filename_returns_indexed_candidate(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When base exists, preview switches to indexed naming."""
+        os_manager = griptape_nodes.OSManager()
+        (temp_dir / "render.png").write_text("base")
+
+        result = os_manager.on_get_next_unused_filename_request(
+            GetNextUnusedFilenameRequest(file_path=str(temp_dir / "render.png"))
+        )
+
+        assert isinstance(result, GetNextUnusedFilenameResultSuccess)
+        assert result.index_used == 1
+        assert Path(result.available_filename).resolve() == (temp_dir / "render_1.png").resolve()
+
+    def test_macro_without_unresolved_index_fails(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Macro path without an unresolved index variable cannot be auto-incremented."""
+        os_manager = griptape_nodes.OSManager()
+        macro_path = MacroPath(parsed_macro=ParsedMacro(f"{temp_dir}/render.png"), variables={})
+
+        result = os_manager.on_get_next_unused_filename_request(GetNextUnusedFilenameRequest(file_path=macro_path))
+
+        assert isinstance(result, GetNextUnusedFilenameResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_sequence_format_glob_uses_permissive_wildcard(self, griptape_nodes: GriptapeNodes) -> None:
+        """The glob builder emits ``*`` for ``SequenceFormat`` slots, not fixed-width ``?`` chars.
+
+        Pins the new branch added for #4902: ``SequenceFormat`` means
+        *minimum* width N, so the scan must use a permissive wildcard that
+        also matches values whose digit count overflows N. Contrast with
+        the legacy ``NumericPaddingFormat`` glob (fixed-width via N copies
+        of ``?``), which is unchanged.
+        """
+        from griptape_nodes.common.macro_parser.resolution import partial_resolve
+
+        os_manager = griptape_nodes.OSManager()
+        secrets_manager = GriptapeNodes.SecretsManager()
+
+        # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
+        sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
+        sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
+        sequence_glob = os_manager._build_glob_pattern_from_partially_resolved(sequence_partial.segments, "_index")
+        assert sequence_glob == "/anywhere/render_v*.png"
+
+        # `NumericPaddingFormat` (legacy): fixed-width `???` (one `?` per digit).
+        legacy_macro = ParsedMacro("/anywhere/render_v{_index:03}.png")
+        legacy_partial = partial_resolve(legacy_macro.template, legacy_macro.segments, {}, secrets_manager)
+        legacy_glob = os_manager._build_glob_pattern_from_partially_resolved(legacy_partial.segments, "_index")
+        assert legacy_glob == "/anywhere/render_v???.png"
+
+
+class TestGetNextVersionIndexRequest:
+    """Test GetNextVersionIndexRequest index-preview behavior."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_required_index_returns_one_when_no_matches(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Required index templates start at index 1 when nothing exists yet."""
+        os_manager = griptape_nodes.OSManager()
+
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render_v{_index:03}"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 1
+
+    def test_optional_index_is_rejected_as_invalid_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Optional index templates currently fail because no required unresolved index exists."""
+        os_manager = griptape_nodes.OSManager()
+
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render{_index?:_}.png"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_missing_unresolved_index_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Requests without an unresolved {_index} variable should fail as invalid path input."""
+        os_manager = griptape_nodes.OSManager()
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render.png"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_sequence_slot_scan_skips_non_numeric_siblings(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Regression: scanning a `{###}` macro with a non-numeric sibling must not crash.
+
+        `SequenceFormat` slots use a permissive `*` glob, so `render_vfinal.png`
+        matches the shell glob against `render_v{###}.png`. Before the fix,
+        reverse-matching that name routed through `SequenceFormat.reverse("final")`,
+        raising `MacroResolutionError` all the way out to the request handler.
+        The scan now catches that error and treats non-parseable matches as
+        non-matches, so the numeric siblings still drive the next-index result.
+        """
+        (temp_dir / "render_v001.png").touch()
+        (temp_dir / "render_v002.png").touch()
+        (temp_dir / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
+
+        os_manager = griptape_nodes.OSManager()
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render_v{###}.png"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 3  # noqa: PLR2004
+
+
+class TestMakeDirectoryRequest:
+    """Test MakeDirectoryRequest handler."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+        yield
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    def test_create_new_directory_success(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Creating a directory that does not yet exist returns success with already_existed=False."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "new_dir"
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path)))
+
+        assert isinstance(result, MakeDirectoryResultSuccess)
+        assert dir_path.is_dir()
+        assert not result.already_existed
+        assert Path(result.created_path).resolve() == dir_path.resolve()
+
+    def test_directory_already_exists_exist_ok_true(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """When the directory already exists and exist_ok=True, returns success with already_existed=True."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "existing_dir"
+        dir_path.mkdir()
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), exist_ok=True))
+
+        assert isinstance(result, MakeDirectoryResultSuccess)
+        assert result.already_existed
+
+    def test_directory_already_exists_exist_ok_false(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """When the directory already exists and exist_ok=False, returns POLICY_NO_OVERWRITE failure."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "existing_dir"
+        dir_path.mkdir()
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), exist_ok=False))
+
+        assert isinstance(result, MakeDirectoryResultFailure)
+        assert result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
+
+    def test_file_at_path_returns_invalid_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """When a file already exists at the requested path, returns INVALID_PATH failure."""
+        os_manager = griptape_nodes.OSManager()
+        file_path = temp_dir / "not_a_dir.txt"
+        file_path.write_text("content")
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(file_path)))
+
+        assert isinstance(result, MakeDirectoryResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_create_parents_true(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """With create_parents=True, missing intermediate directories are created."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "a" / "b" / "c"
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=True))
+
+        assert isinstance(result, MakeDirectoryResultSuccess)
+        assert dir_path.is_dir()
+
+    def test_create_parents_false_missing_parent(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """With create_parents=False and a missing parent, returns POLICY_NO_CREATE_PARENT_DIRS failure."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "missing_parent" / "child"
+
+        result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path), create_parents=False))
+
+        assert isinstance(result, MakeDirectoryResultFailure)
+        assert result.failure_reason == FileIOFailureReason.POLICY_NO_CREATE_PARENT_DIRS
+
+    def test_invalid_path_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A path that cannot be resolved returns INVALID_PATH before any filesystem operation."""
+        os_manager = griptape_nodes.OSManager()
+
+        with patch.object(OSManager, "_resolve_file_path", side_effect=ValueError("bad path")):
+            result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(temp_dir / "any")))
+
+        assert isinstance(result, MakeDirectoryResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_permission_denied_returns_failure(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A PermissionError from mkdir is surfaced as a PERMISSION_DENIED failure."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "protected_dir"
+
+        with patch.object(Path, "mkdir", side_effect=PermissionError("Permission denied")):
+            result = os_manager.on_make_directory_request(MakeDirectoryRequest(path=str(dir_path)))
+
+        assert isinstance(result, MakeDirectoryResultFailure)
+        assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED

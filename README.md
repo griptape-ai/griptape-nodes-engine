@@ -5,7 +5,7 @@
 
 Griptape Nodes is a powerful, visual, node-based workflow builder designed for professional artists and creators. Build and execute complex AI workflows through the cloud-based [Griptape Nodes IDE](https://app.nodes.griptape.ai/) - an intuitive drag-and-drop interface.
 
-This repository contains the Griptape Nodes Engine - the local component that runs securely on your machine, providing a performant foundation for workflow execution.
+This repository contains the Griptape Nodes Engine - the local component that runs securely on your machine, providing a performant foundation for workflow execution. The engine is published to PyPI as the `griptape-nodes-engine` library and is launched by the `griptape-nodes` application. To develop against the engine with a local checkout, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 [![Griptape Nodes Trailer Preview](docs/assets/img/video-thumbnail.jpg)](https://vimeo.com/1064451891)
 *(Clicking the image opens the video on Vimeo)*

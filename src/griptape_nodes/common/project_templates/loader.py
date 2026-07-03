@@ -15,18 +15,25 @@ from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap, CommentedSeq
 from ruamel.yaml.error import YAMLError
 
+from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
 if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.project import ProjectTemplate
     from griptape_nodes.common.project_templates.validation import ProjectValidationInfo
 
 # Field name constants
 FIELD_NAME = "name"
+FIELD_ID = "id"
 FIELD_SITUATIONS = "situations"
 FIELD_DIRECTORIES = "directories"
 FIELD_PROJECT_TEMPLATE_SCHEMA_VERSION = "project_template_schema_version"
 FIELD_ENVIRONMENT = "environment"
 FIELD_FILE_EXTENSION_DIRECTORIES = "file_extension_directories"
 FIELD_DESCRIPTION = "description"
+FIELD_PARENT_PROJECT_PATH = "parent_project_path"
+FIELD_PARENT_PROJECT_ID = "parent_project_id"
+FIELD_WORKSPACE_DIR = "workspace_dir"
+FIELD_LIBRARIES_DIR = "libraries_dir"
 
 # Special constants
 ROOT_FIELD_PATH = "<root>"
@@ -79,12 +86,21 @@ class ProjectOverlayData(NamedTuple):
     environment: dict[str, str]
     file_extension_directories: dict[str, str]
     description: str | None
+    parent_project_path: str | PerPlatformProjectPath | None
     line_info: YAMLLineInfo
+    id: str | None = None
+    parent_project_id: str | None = None
+    workspace_dir: str | PerPlatformProjectPath | None = None
+    libraries_dir: str | PerPlatformProjectPath | None = None
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
     removed_file_extension_directories: frozenset[str] = frozenset()
     clears_description: bool = False
+    clears_parent_project_path: bool = False
+    clears_parent_project_id: bool = False
+    clears_workspace_dir: bool = False
+    clears_libraries_dir: bool = False
 
 
 def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
@@ -230,7 +246,7 @@ def load_project_template_from_yaml(  # noqa: C901
         return template
 
 
-def load_partial_project_template(  # noqa: C901
+def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
     yaml_text: str,
     validation_info: ProjectValidationInfo,
 ) -> ProjectOverlayData | None:
@@ -351,6 +367,18 @@ def load_partial_project_template(  # noqa: C901
 
     file_extension_directories, removed_file_extension_directories = _split_tombstones(file_extension_directories_raw)
 
+    # Optional field: id. Absent on legacy projects; the manager derives the
+    # id from the canonicalized file path in that case. The id is opaque, so
+    # only a type check is applied here.
+    project_id = data.get(FIELD_ID)
+    if project_id is not None and not isinstance(project_id, str):
+        validation_info.add_error(
+            field_path=FIELD_ID,
+            message=f"Must be string, got {type(project_id).__name__}",
+            line_number=line_info.get_line(FIELD_ID),
+        )
+        project_id = None
+
     # Optional field: description. Distinguish absent (inherit base) from
     # explicit null (clear base value).
     clears_description = FIELD_DESCRIPTION in data and data.get(FIELD_DESCRIPTION) is None
@@ -363,6 +391,116 @@ def load_partial_project_template(  # noqa: C901
         )
         description = None
 
+    # Optional field: parent_project_path. Same absent-vs-null semantics as
+    # description: absent = inherit base, explicit null = tombstone the link.
+    # Accepts a plain string (single path) or a per-platform mapping
+    # (PerPlatformProjectPath) so a child YAML can declare different parent
+    # paths per OS for cross-platform deployments.
+    clears_parent_project_path = FIELD_PARENT_PROJECT_PATH in data and data.get(FIELD_PARENT_PROJECT_PATH) is None
+    raw_parent_project_path = data.get(FIELD_PARENT_PROJECT_PATH)
+    parent_project_path: str | PerPlatformProjectPath | None = None
+    if raw_parent_project_path is not None:
+        if isinstance(raw_parent_project_path, str):
+            parent_project_path = raw_parent_project_path
+        elif isinstance(raw_parent_project_path, dict):
+            try:
+                parent_project_path = PerPlatformProjectPath.model_validate(raw_parent_project_path)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_PARENT_PROJECT_PATH}.{error_field_path}"
+                        if error_field_path
+                        else FIELD_PARENT_PROJECT_PATH
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path)
+                        or line_info.get_line(FIELD_PARENT_PROJECT_PATH),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_PARENT_PROJECT_PATH,
+                message=f"Must be string or per-platform mapping, got {type(raw_parent_project_path).__name__}",
+                line_number=line_info.get_line(FIELD_PARENT_PROJECT_PATH),
+            )
+
+    # Optional field: parent_project_id. Same absent-vs-null semantics as
+    # parent_project_path (absent = inherit base, explicit null = tombstone the
+    # link). Unlike the path form there is no per-platform variant: ids are
+    # engine-global opaque strings.
+    clears_parent_project_id = FIELD_PARENT_PROJECT_ID in data and data.get(FIELD_PARENT_PROJECT_ID) is None
+    parent_project_id = data.get(FIELD_PARENT_PROJECT_ID)
+    if parent_project_id is not None and not isinstance(parent_project_id, str):
+        validation_info.add_error(
+            field_path=FIELD_PARENT_PROJECT_ID,
+            message=f"Must be string, got {type(parent_project_id).__name__}",
+            line_number=line_info.get_line(FIELD_PARENT_PROJECT_ID),
+        )
+        parent_project_id = None
+
+    # Optional field: workspace_dir. Same absent-vs-null semantics as
+    # parent_project_path (absent = inherit base, explicit null = tombstone).
+    # Accepts a plain string (single path, absolute or relative to this YAML's
+    # directory) or a per-platform mapping (PerPlatformProjectPath).
+    clears_workspace_dir = FIELD_WORKSPACE_DIR in data and data.get(FIELD_WORKSPACE_DIR) is None
+    raw_workspace_dir = data.get(FIELD_WORKSPACE_DIR)
+    workspace_dir: str | PerPlatformProjectPath | None = None
+    if raw_workspace_dir is not None:
+        if isinstance(raw_workspace_dir, str):
+            workspace_dir = raw_workspace_dir
+        elif isinstance(raw_workspace_dir, dict):
+            try:
+                workspace_dir = PerPlatformProjectPath.model_validate(raw_workspace_dir)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_WORKSPACE_DIR}.{error_field_path}" if error_field_path else FIELD_WORKSPACE_DIR
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path) or line_info.get_line(FIELD_WORKSPACE_DIR),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_WORKSPACE_DIR,
+                message=f"Must be string or per-platform mapping, got {type(raw_workspace_dir).__name__}",
+                line_number=line_info.get_line(FIELD_WORKSPACE_DIR),
+            )
+
+    # Optional field: libraries_dir. Same absent-vs-null semantics as workspace_dir
+    # (absent = inherit base, explicit null = tombstone). Accepts a plain string or a
+    # per-platform mapping (PerPlatformProjectPath).
+    clears_libraries_dir = FIELD_LIBRARIES_DIR in data and data.get(FIELD_LIBRARIES_DIR) is None
+    raw_libraries_dir = data.get(FIELD_LIBRARIES_DIR)
+    libraries_dir: str | PerPlatformProjectPath | None = None
+    if raw_libraries_dir is not None:
+        if isinstance(raw_libraries_dir, str):
+            libraries_dir = raw_libraries_dir
+        elif isinstance(raw_libraries_dir, dict):
+            try:
+                libraries_dir = PerPlatformProjectPath.model_validate(raw_libraries_dir)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_LIBRARIES_DIR}.{error_field_path}" if error_field_path else FIELD_LIBRARIES_DIR
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path) or line_info.get_line(FIELD_LIBRARIES_DIR),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_LIBRARIES_DIR,
+                message=f"Must be string or per-platform mapping, got {type(raw_libraries_dir).__name__}",
+                line_number=line_info.get_line(FIELD_LIBRARIES_DIR),
+            )
+
     return ProjectOverlayData(
         name=name,
         project_template_schema_version=schema_version,
@@ -371,12 +509,21 @@ def load_partial_project_template(  # noqa: C901
         environment=environment,
         file_extension_directories=file_extension_directories,
         description=description,
+        parent_project_path=parent_project_path,
         line_info=line_info,
+        id=project_id,
+        parent_project_id=parent_project_id,
+        workspace_dir=workspace_dir,
+        libraries_dir=libraries_dir,
         removed_situations=frozenset(removed_situations),
         removed_directories=frozenset(removed_directories),
         removed_environment=frozenset(removed_environment),
         removed_file_extension_directories=frozenset(removed_file_extension_directories),
         clears_description=clears_description,
+        clears_parent_project_path=clears_parent_project_path,
+        clears_parent_project_id=clears_parent_project_id,
+        clears_workspace_dir=clears_workspace_dir,
+        clears_libraries_dir=clears_libraries_dir,
     )
 
 

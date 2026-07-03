@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any, Self
 
 from griptape_nodes.bootstrap.workflow_executors.workflow_executor import WorkflowExecutor
 from griptape_nodes.common.macro_parser.core import ParsedMacro
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -227,7 +228,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     async def aprepare_workflow_for_run(
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
         **kwargs: Any,
     ) -> str:
         """Prepares a local workflow for execution.
@@ -237,15 +237,10 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         workflow, and preparing the specified workflow for execution.
         Parameters:
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
 
         Returns:
             str: The name of the prepared flow.
         """
-        if storage_backend is not None:
-            msg = "The storage_backend parameter is deprecated. Pass `storage_backend` to the constructor instead."
-            raise ValueError(msg)
-
         GriptapeNodes.EventManager().initialize_queue()
 
         # Load workflow from file if workflow_path is provided
@@ -289,10 +284,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
 
         # Empty sentinel — use the save_failed_workflow situation
         situation_result = await GriptapeNodes.ahandle_request(
-            GetSituationRequest(situation_name="save_failed_workflow")
+            GetSituationRequest(situation_name=BuiltInSituation.SAVE_FAILED_WORKFLOW)
         )
         if not isinstance(situation_result, GetSituationResultSuccess):
-            logger.warning("Could not find 'save_failed_workflow' situation; falling back to workspace root.")
+            logger.warning(
+                "Could not find '%s' situation; falling back to workspace root.",
+                BuiltInSituation.SAVE_FAILED_WORKFLOW,
+            )
             return fallback
 
         parsed_macro = ParsedMacro(template=situation_result.situation.macro)
@@ -359,7 +357,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
                     file_name=file_name,
                     file_path=target_path,
                     description=description,
-                    execution_flow_name=top_level_flow_result.flow_name,
                 )
             )
             if isinstance(save_result, SaveWorkflowFileFromSerializedFlowResultSuccess):
@@ -372,7 +369,7 @@ class LocalWorkflowExecutor(WorkflowExecutor):
     async def arun(
         self,
         flow_input: Any,
-        storage_backend: StorageBackend | None = None,
+        storage_backend: StorageBackend | None = None,  # noqa: ARG002
         *,
         pickle_control_flow_result: bool | None = None,
         **kwargs: Any,
@@ -385,7 +382,9 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         Parameters:
             workflow_name: The name of the workflow to execute.
             flow_input: Input data for the flow, typically a dictionary.
-            storage_backend: The storage backend to use for the workflow execution.
+            storage_backend: Accepted for compatibility with the base-class run path,
+                but ignored here: the storage backend is applied once at construction
+                via `_set_storage_backend`. Passing it to the run path has no effect.
             pickle_control_flow_result: Per-call override for the executor's
                 save-time default. None means "use the instance default".
 
@@ -394,7 +393,6 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         """
         flow_name = await self.aprepare_workflow_for_run(
             flow_input=flow_input,
-            storage_backend=storage_backend,
             **kwargs,
         )
 

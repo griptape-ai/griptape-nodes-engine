@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.common.sequences import MissingItemPolicy
+from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior
 from griptape_nodes.retained_mode.events.os_events import (
     FileIOFailureReason,
     FileSystemEntry,
@@ -31,6 +31,10 @@ from griptape_nodes.retained_mode.events.os_events import (
     ScanSequencesResultFailure,
     ScanSequencesResultSuccess,
     SequenceScanFailureReason,
+)
+from griptape_nodes.retained_mode.events.project_events import (
+    GetPathForMacroRequest,
+    GetPathForMacroResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -65,20 +69,77 @@ def _stub_listing(directory: str, filenames: list[str]) -> Any:
     return handle_request
 
 
-async def _scan(
+def _stub_listing_with_macro(
+    *,
+    macro_directory: str,
+    resolved_directory: str,
+    filenames: list[str],
+) -> Any:
+    """Stub both `GetPathForMacroRequest` and `ListDirectoryRequest`.
+
+    Used by the macro-round-trip tests: the handler resolves the macro
+    head via the project's macro resolver, then lists the resolved-on-disk
+    directory. Both dispatches need to be intercepted since the test
+    doesn't bring up a real ProjectManager.
+    """
+
+    def handle_request(request: object) -> object:
+        if isinstance(request, GetPathForMacroRequest):
+            assert request.parsed_macro.template == macro_directory, (
+                f"unexpected macro: {request.parsed_macro.template!r} (expected {macro_directory!r})"
+            )
+            return GetPathForMacroResultSuccess(
+                resolved_path=Path(resolved_directory),
+                absolute_path=Path(resolved_directory),
+                result_details="ok",
+            )
+        if isinstance(request, ListDirectoryRequest):
+            # Path()-normalize both sides: on Windows the handler emits backslashes
+            # via str(WindowsPath(...)), but the test fixture is POSIX-style.
+            # `directory_path` is `str | None`; the macro tests always supply a
+            # string but we narrow defensively so pyright is happy.
+            if request.directory_path is not None and Path(request.directory_path) == Path(resolved_directory):
+                entries = [
+                    FileSystemEntry(name=name, path=str(Path(resolved_directory) / name), is_dir=False)
+                    for name in filenames
+                ]
+                return ListDirectoryResultSuccess(
+                    entries=entries,
+                    current_path=resolved_directory,
+                    is_workspace_path=False,
+                    result_details="ok",
+                )
+            return ListDirectoryResultFailure(
+                failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
+                result_details=f"{request.directory_path} not stubbed",
+            )
+        msg = f"Unexpected request: {type(request).__name__}"
+        raise AssertionError(msg)
+
+    return handle_request
+
+
+async def _scan(  # noqa: PLR0913
     directory: str,
     pattern: str,
     *,
     policy: MissingItemPolicy = MissingItemPolicy.SPLIT,
+    no_token_behavior: NoTokenBehavior = NoTokenBehavior.SINGLE_FILE,
     start_number: int | None = None,
     end_number: int | None = None,
 ) -> ScanSequencesResultSuccess | ScanSequencesResultFailure:
-    """Dispatch a ScanSequencesRequest and narrow the result type for assertions."""
+    """Dispatch a ScanSequencesRequest and narrow the result type for assertions.
+
+    Test helper signature is unchanged for ergonomics — `directory` + `pattern`
+    are concatenated into the new single `path=` field the request actually
+    takes.
+    """
+    path = f"{directory}/{pattern}" if directory else pattern
     result = await GriptapeNodes.ahandle_request(
         ScanSequencesRequest(
-            directory=directory,
-            pattern=pattern,
+            path=path,
             policy=policy,
+            no_token_behavior=no_token_behavior,
             start_number=start_number,
             end_number=end_number,
         )
@@ -235,19 +296,50 @@ class TestFillNearestPolicy:
 
 class TestAbortPolicy:
     @pytest.mark.asyncio
-    async def test_abort_surfaces_failure_at_first_gap(self) -> None:
-        """ABORT surfaces a ScanSequencesResultFailure with the offending number."""
+    async def test_abort_surfaces_all_gaps(self) -> None:
+        """ABORT surfaces a ScanSequencesResultFailure listing every gap.
+
+        With items 1, 2, 4, 5 on disk, the active range 1..5 has exactly one
+        gap (item 3). The failure payload should expose it as a one-element
+        list — no longer the bare integer the previous shape carried.
+        """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 4, 5]]
         with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
             result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.ABORT)
         assert isinstance(result, ScanSequencesResultFailure)
         assert result.failure_reason is SequenceScanFailureReason.ABORTED_AT_GAP
-        assert result.missing_item_number == 3
+        assert result.missing_item_numbers == [3]
+
+    @pytest.mark.asyncio
+    async def test_abort_surfaces_multiple_gaps(self) -> None:
+        """ABORT collects every gap in one pass, sorted ascending.
+
+        Items 1, 2, 5, 7 on disk; active range 1..7. The expected gaps are 3,
+        4, 6 — one continuous range and one singleton, surfaced together so a
+        UI consumer can show the artist all the missing slots in one go
+        instead of fixing them one re-run at a time.
+        """
+        directory = "/work/in"
+        filenames = [f"render.{n:04d}.png" for n in [1, 2, 5, 7]]
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(directory, "render.####.png", policy=MissingItemPolicy.ABORT)
+        assert isinstance(result, ScanSequencesResultFailure)
+        assert result.failure_reason is SequenceScanFailureReason.ABORTED_AT_GAP
+        assert result.missing_item_numbers == [3, 4, 6]
+        # Sanity: result_details summarises the count and shows the list.
+        details = str(result.result_details or "")
+        assert "3 gaps" in details
+        assert "3, 4, 6" in details
 
     @pytest.mark.asyncio
     async def test_abort_succeeds_when_dense(self) -> None:
-        """ABORT returns one Sequence with all entries when there are no gaps."""
+        """ABORT returns one Sequence with all entries when there are no gaps.
+
+        The all-gaps pre-pass runs but finds nothing, so the scanner falls
+        through to the normal entries-build loop and emits a contiguous
+        sequence the same way SKIP would.
+        """
         directory = "/work/in"
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3]]
         with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
@@ -468,18 +560,47 @@ class TestPatternValidation:
         assert "2 sequence tokens" in str(result.result_details or "")
 
     @pytest.mark.asyncio
-    async def test_zero_token_pattern_left_to_fileseq(self) -> None:
-        """A pattern with no token returns empty success.
+    async def test_zero_token_path_one_item_when_present(self) -> None:
+        """A token-less path becomes a one-item sequence when the file exists.
 
-        fileseq itself accepts non-sequence patterns silently; either way, no
-        result-set means a successful scan with `has_entries=False`.
+        The artist pasted in `photo.png` and the file is on disk → produce a
+        Sequence with `entries=[#1]`, `padding=0`, `first=last=1`. This is the
+        path the artist actually traveled most of the time when typing in a
+        single-file path.
         """
         directory = "/work/in"
-        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, [])):
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
+            result = await _scan(directory, "photo.png")
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert result.has_entries is True
+        seqs = result.sequences
+        assert len(seqs) == 1
+        assert seqs[0].first == 1
+        assert seqs[0].last == 1
+        assert seqs[0].padding == 0
+        assert [e.number for e in seqs[0].entries] == [1]
+        # Path round-trips through the scanner — for a plain absolute input
+        # the entry path matches the directory + filename verbatim.
+        assert seqs[0].entries[0].path == "/work/in/photo.png"
+
+    @pytest.mark.asyncio
+    async def test_zero_token_path_empty_when_absent(self) -> None:
+        """A token-less path returns empty success when the file isn't on disk.
+
+        The literal filename is the only way a zero-token target can match;
+        if it's absent, fall back to the same empty-result diagnostic any
+        other miss produces.
+        """
+        directory = "/work/in"
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["other.png"])):
             result = await _scan(directory, "photo.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert result.sequences == []
         assert result.has_entries is False
+        # `directory_had_matching_files` is False here because the prefilter
+        # checks startswith(basename) + endswith(extension), and `other.png`
+        # doesn't share `photo` as a basename prefix.
+        assert result.directory_had_matching_files is False
 
     @pytest.mark.asyncio
     async def test_single_token_passes(self) -> None:
@@ -490,3 +611,197 @@ class TestPatternValidation:
             result = await _scan(directory, "render.####.png")
         assert isinstance(result, ScanSequencesResultSuccess)
         assert len(result.sequences) == 1
+
+
+# --- Path round-trip ---------------------------------------------------
+
+
+class TestPathRoundTrip:
+    """Verify the engine emits paths in the same shape it received them.
+
+    Macros stay macros, plain absolutes stay plain absolutes. This is what
+    makes scan results portable between machines whose `{inputs}` resolve to
+    different absolute roots.
+    """
+
+    @pytest.mark.asyncio
+    async def test_macro_path_preserves_macro_head(self) -> None:
+        """A macro-form input round-trips with the `{inputs}` head intact.
+
+        The handler resolves the macro internally for I/O but rebuilds each
+        emitted entry path off the original (macro) directory, so downstream
+        consumers see the macro shape they supplied.
+        """
+        macro_directory = "{inputs}/xyz"
+        resolved_directory = "/Users/me/project/inputs/xyz"
+        filenames = [f"abc{n:03d}.png" for n in [1, 2, 3]]
+        path = f"{macro_directory}/abc###.png"
+        with patch.object(
+            GriptapeNodes,
+            "handle_request",
+            side_effect=_stub_listing_with_macro(
+                macro_directory=macro_directory,
+                resolved_directory=resolved_directory,
+                filenames=filenames,
+            ),
+        ):
+            result = await GriptapeNodes.ahandle_request(
+                ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT)
+            )
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        # `directory` and every `entry.path` retain the macro head.
+        assert seq.directory == macro_directory
+        assert [e.path for e in seq.entries] == [
+            "{inputs}/xyz/abc001.png",
+            "{inputs}/xyz/abc002.png",
+            "{inputs}/xyz/abc003.png",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_absolute_path_round_trips_unchanged(self) -> None:
+        """A plain absolute path (no macros) round-trips identically.
+
+        The macro-resolver dispatch is skipped entirely — `_build_scan_path_mapping`
+        sees no macro variables in the directory portion and treats `original`
+        and `resolved` as equal. The combined stub here would raise on a
+        macro-resolve dispatch; getting through the test confirms the skip.
+        """
+        directory = "/work/in"
+        filenames = [f"render.{n:04d}.png" for n in [1, 2]]
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(directory, "render.####.png")
+        assert isinstance(result, ScanSequencesResultSuccess)
+        seq = result.sequences[0]
+        assert seq.directory == directory
+        assert [e.path for e in seq.entries] == [
+            "/work/in/render.0001.png",
+            "/work/in/render.0002.png",
+        ]
+
+
+# --- NoTokenBehavior dispatch ------------------------------------------
+
+
+class TestNoTokenBehavior:
+    """Verify the three-way dispatch on `no_token_behavior`.
+
+    A path with zero sequence tokens (e.g. `render.0002.png`) is ambiguous —
+    the user might mean a literal single file, or might be naming one frame of
+    an implicit sequence, or might be expected to add an explicit token. The
+    `no_token_behavior` field on `ScanSequencesRequest` picks which.
+    """
+
+    @pytest.mark.asyncio
+    async def test_single_file_default_ignores_siblings(self) -> None:
+        """SINGLE_FILE: `render.0002.png` returns just that one file.
+
+        This is the regression pin for the bug where fileseq's parse of
+        `render.0002.png` saw zfill=4 and grouped every sibling into a
+        5-item sequence. Default behavior must produce a 1-item sequence
+        containing only the named file.
+        """
+        directory = "/work/in"
+        # Five renders on disk; only the named one should come back.
+        filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(directory, "render.0002.png")
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert result.has_entries is True
+        seqs = result.sequences
+        assert len(seqs) == 1
+        assert seqs[0].first == 1
+        assert seqs[0].last == 1
+        assert seqs[0].padding == 0
+        assert [e.number for e in seqs[0].entries] == [1]
+        # Crucially, only render.0002.png — not the other four siblings.
+        assert [e.path for e in seqs[0].entries] == ["/work/in/render.0002.png"]
+        assert seqs[0].discovered_first == 1
+        assert seqs[0].discovered_last == 1
+
+    @pytest.mark.asyncio
+    async def test_explore_sequence_recovers_implicit_grouping(self) -> None:
+        """EXPLORE_SEQUENCE: `render.0002.png` walks the full sibling sequence.
+
+        Useful when a downstream tool gave the artist one filename but they
+        want the whole take. fileseq parses the digits as a frame token and
+        the scan returns every match (here, all five sibling renders).
+        """
+        directory = "/work/in"
+        filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, filenames)):
+            result = await _scan(
+                directory,
+                "render.0002.png",
+                policy=MissingItemPolicy.SPLIT,
+                no_token_behavior=NoTokenBehavior.EXPLORE_SEQUENCE,
+            )
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert result.has_entries is True
+        seqs = result.sequences
+        assert len(seqs) == 1
+        assert [e.number for e in seqs[0].entries] == [1, 2, 3, 4, 5]
+        assert seqs[0].padding == 4
+        assert seqs[0].discovered_first == 1
+        assert seqs[0].discovered_last == 5
+
+    @pytest.mark.asyncio
+    async def test_reject_fails_with_invalid_template(self) -> None:
+        """REJECT: a token-less path fails fast with INVALID_TEMPLATE.
+
+        For workflows that should never silently widen the artist's intent
+        (e.g. an automated pipeline that requires an explicit token).
+        """
+        result = await _scan(
+            "/work/in",
+            "render.0002.png",
+            no_token_behavior=NoTokenBehavior.REJECT,
+        )
+        assert isinstance(result, ScanSequencesResultFailure)
+        assert result.failure_reason is SequenceScanFailureReason.INVALID_TEMPLATE
+        # Surface useful guidance, not just "rejected".
+        assert "no sequence token" in str(result.result_details or "")
+
+    @pytest.mark.asyncio
+    async def test_single_file_with_no_digits_still_works(self) -> None:
+        """SINGLE_FILE on `photo.png` (no digits at all) — sanity check."""
+        directory = "/work/in"
+        with patch.object(GriptapeNodes, "handle_request", side_effect=_stub_listing(directory, ["photo.png"])):
+            result = await _scan(directory, "photo.png")
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert result.has_entries is True
+        seqs = result.sequences
+        assert len(seqs) == 1
+        assert seqs[0].entries[0].path == "/work/in/photo.png"
+
+    @pytest.mark.asyncio
+    async def test_single_file_macro_path_round_trip(self) -> None:
+        """SINGLE_FILE keeps macro paths macro-shaped on the way back out.
+
+        Mirrors `test_macro_path_preserves_macro_head` for the literal-file
+        branch: an `{inputs}` head supplied on a token-less path should
+        survive into the entry's `path`.
+        """
+        macro_directory = "{inputs}/sequences/01_contiguous"
+        resolved_directory = "/Users/me/project/inputs/sequences/01_contiguous"
+        # Five siblings on disk; SINGLE_FILE should ignore all but the named one.
+        filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
+        path = f"{macro_directory}/render.0002.png"
+        with patch.object(
+            GriptapeNodes,
+            "handle_request",
+            side_effect=_stub_listing_with_macro(
+                macro_directory=macro_directory,
+                resolved_directory=resolved_directory,
+                filenames=filenames,
+            ),
+        ):
+            result = await GriptapeNodes.ahandle_request(
+                ScanSequencesRequest(path=path, policy=MissingItemPolicy.SPLIT)
+            )
+        assert isinstance(result, ScanSequencesResultSuccess)
+        assert len(result.sequences) == 1
+        seq = result.sequences[0]
+        assert [e.path for e in seq.entries] == [f"{macro_directory}/render.0002.png"]
+        assert seq.directory == macro_directory

@@ -52,6 +52,7 @@ class HuggingFaceRepoFileParameter(HuggingFaceModelParameter):
             )
             return
 
+        self._refresh_downloading_model_ids()
         # Get all cached models
         all_choices = self.get_choices()
         if not all_choices:
@@ -86,6 +87,9 @@ class HuggingFaceRepoFileParameter(HuggingFaceModelParameter):
             self._node._update_option_choices(self._parameter_name, filtered_choices, default_value)
         else:
             parameter.add_trait(Options(choices=filtered_choices))
+
+        self._apply_data_choices(parameter, filtered_choices)
+        self._update_download_button_visibility()
 
     def get_download_commands(self) -> list[str]:
         return [

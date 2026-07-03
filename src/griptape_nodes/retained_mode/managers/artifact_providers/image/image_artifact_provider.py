@@ -57,6 +57,10 @@ class ImageArtifactProvider(BaseArtifactProvider):
     def get_friendly_name(cls) -> str:
         return "Image"
 
+    # Minimum bytes needed for the magic-byte sniffer below (the ISO BMFF
+    # brand sits at offset 8-12, which is the longest header we inspect).
+    _SNIFF_MIN_HEADER_BYTES: ClassVar[int] = 12
+
     # Maps PIL image mode to (channels, color_space) for metadata reporting
     _PIL_MODE_INFO: ClassVar[dict[str, tuple[int, str]]] = {
         "L": (1, "Grayscale"),
@@ -129,6 +133,39 @@ class ImageArtifactProvider(BaseArtifactProvider):
         )
 
         return [PILThumbnailGenerator, PILRoundedPreviewGenerator]
+
+    @classmethod
+    def detect_format(cls, data: bytes) -> str | None:  # noqa: C901, PLR0911
+        """Magic-byte sniff for common image formats.
+
+        Pure prefix checks; no PIL parsing or decompression-bomb scans, so this
+        is safe to run on every byte write regardless of payload type. HEIC and
+        AVIF are recognized directly via their ISO BMFF brands so their writes
+        don't depend on optional Pillow plugins (e.g. ``pillow-heif``).
+        """
+        if len(data) < cls._SNIFF_MIN_HEADER_BYTES:
+            return None
+        head = data[: cls._SNIFF_MIN_HEADER_BYTES]
+        if head[:8] == b"\x89PNG\r\n\x1a\n":
+            return "png"
+        if head[:3] == b"\xff\xd8\xff":
+            return "jpg"
+        if head[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        if head[:4] == b"RIFF" and len(data) >= 12 and data[8:12] == b"WEBP":  # noqa: PLR2004
+            return "webp"
+        if head[:2] == b"BM":
+            return "bmp"
+        if head[:4] in (b"II*\x00", b"MM\x00*"):
+            return "tiff"
+        if head[:4] == b"\x00\x00\x01\x00":
+            return "ico"
+        # ISO BMFF image brands (HEIC / HEIF / AVIF).
+        if head[4:8] == b"ftyp" and head[8:12] in (b"heic", b"heix", b"heim", b"heis", b"mif1", b"msf1"):
+            return "heic"
+        if head[4:8] == b"ftyp" and head[8:12] in (b"avif", b"avis"):
+            return "avif"
+        return None
 
     @classmethod
     def get_metadata_formats(cls) -> set[str]:

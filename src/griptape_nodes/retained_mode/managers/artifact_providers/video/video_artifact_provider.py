@@ -6,7 +6,7 @@ import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
@@ -41,6 +41,10 @@ class VideoArtifactProvider(BaseArtifactProvider):
     Uses ffmpeg/ffprobe for metadata extraction and preview generation.
     ffmpeg must be available on the system PATH.
     """
+
+    # Minimum bytes needed for the magic-byte sniffer below. ISO BMFF brand
+    # sits at offset 8-12; EBML/RIFF headers fit comfortably inside 12 bytes.
+    _SNIFF_MIN_HEADER_BYTES: ClassVar[int] = 12
 
     def __init__(self, registry: ProviderRegistry) -> None:
         """Initialize the video artifact provider.
@@ -78,6 +82,37 @@ class VideoArtifactProvider(BaseArtifactProvider):
         )
 
         return [FFmpegPreviewGenerator]
+
+    @classmethod
+    def detect_format(cls, data: bytes) -> str | None:  # noqa: C901, PLR0911
+        """Magic-byte sniff for common video container formats."""
+        if len(data) < cls._SNIFF_MIN_HEADER_BYTES:
+            return None
+        head = data[: cls._SNIFF_MIN_HEADER_BYTES]
+        # ISO BMFF: 'ftyp' at bytes 4-8, brand at bytes 8-12.
+        if head[4:8] == b"ftyp":
+            brand = head[8:12]
+            # Audio-only and image ISO BMFF brands are claimed by their own providers.
+            if brand in (b"M4A ", b"M4B "):
+                return None
+            if brand in (b"heic", b"heix", b"mif1", b"heim", b"heis", b"msf1", b"avif", b"avis"):
+                return None
+            if brand == b"qt  ":
+                return "mov"
+            if brand in (b"M4V ", b"M4VH", b"M4VP"):
+                return "m4v"
+            return "mp4"
+        # Matroska / WebM EBML header.
+        if head[:4] == b"\x1aE\xdf\xa3":
+            if b"webm" in data[:256]:
+                return "webm"
+            return "mkv"
+        # AVI: RIFF....AVI .
+        if head[:4] == b"RIFF" and head[8:12] == b"AVI ":
+            return "avi"
+        if head[:6] in (b"GIF87a", b"GIF89a"):
+            return "gif"
+        return None
 
     @classmethod
     def get_artifact_metadata(cls, source_path: str) -> VideoArtifactMetadata | None:

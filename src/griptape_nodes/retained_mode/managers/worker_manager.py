@@ -4,7 +4,6 @@ import asyncio
 import functools
 import json
 import logging
-import os
 import re
 import sys
 import time
@@ -14,6 +13,7 @@ from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
 from griptape_nodes.retained_mode.events import worker_events
+from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
 from griptape_nodes.retained_mode.managers.settings import (
     WORKER_HEARTBEAT_INTERVAL_KEY,
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from griptape_nodes.api_client.request_client import RequestClient
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -78,6 +79,18 @@ class WorkerManager:
     # this matches the _await_pending_workers() ceiling so a worker never kills
     # itself before the orchestrator gives up waiting for it.
     DEFAULT_HEARTBEAT_STARTUP_GRACE_S: float = 600.0
+    # How long to wait for a worker to exit after SIGTERM before escalating to
+    # SIGKILL. Workers convert SIGTERM into a cooperative shutdown on their event
+    # loop; a wedged loop never services it, so SIGTERM alone can leak the process.
+    DEFAULT_TERMINATE_GRACE_S: float = 10.0
+
+    # Ceiling on awaiting a cross-loop termination hopped onto the spawning loop.
+    # The hopped coroutine itself can take up to DEFAULT_TERMINATE_GRACE_S, so this
+    # must exceed it; the extra margin covers the SIGKILL escalation and reap. It
+    # bounds the case where the spawning loop closes after the hop is scheduled but
+    # before it completes, so the evicting loop never blocks forever on a future
+    # that will never resolve.
+    DEFAULT_TERMINATE_HOP_TIMEOUT_S: float = 15.0
 
     _WORKER_RESPONSE_TOPIC_RE: re.Pattern = re.compile(r"sessions/[^/]+/workers/(?P<worker_engine_id>[^/]+)/response$")
 
@@ -97,6 +110,12 @@ class WorkerManager:
         # Subprocesses spawned by this orchestrator (library_name → process)
         self._managed_worker_processes: dict[str, asyncio.subprocess.Process] = {}
 
+        # The event loop that spawned the worker subprocesses. asyncio.subprocess.Process
+        # binds its exit Future to its creating loop, so proc.wait() is only legal on this
+        # loop. Eviction can run on a different loop (the websocket-tasks loop), which is
+        # why termination is hopped back here. Captured in spawn_worker.
+        self._spawn_loop: asyncio.AbstractEventLoop | None = None
+
         # Orchestrator-side: worker_engine_id → monotonic timestamp of last heartbeat response
         self._worker_last_seen: dict[str, float] = {}
 
@@ -105,6 +124,10 @@ class WorkerManager:
 
         # Callbacks invoked when a worker is evicted: (worker_engine_id, library_name | None)
         self._worker_evicted_callbacks: list[Callable[[str, str | None], None]] = []
+
+        # Fire-and-forget broadcast tasks scheduled from sync callers; held here so
+        # the event loop's weak-ref to tasks does not GC them before completion.
+        self._inflight_broadcast_tasks: set[asyncio.Task] = set()
 
         # Set when an active session becomes available; gates worker spawning.
         self._session_ready_event: asyncio.Event = asyncio.Event()
@@ -132,6 +155,14 @@ class WorkerManager:
             worker_events.UnregisterWorkerRequest, self.handle_unregister_worker_request
         )
         event_manager.assign_manager_to_request_type(worker_events.StartWorkerRequest, self.handle_start_worker_request)
+
+        # Subscribe to domain events from ConfigManager / SecretsManager so
+        # those managers don't have to know workers exist. The listeners are
+        # the single place that translates a "something changed" signal into
+        # a worker fan-out.
+        event_manager.add_listener_to_app_event(ConfigChanged, self._on_config_changed)
+        event_manager.add_listener_to_app_event(SecretChanged, self._on_secret_changed)
+        event_manager.add_listener_to_app_event(CurrentProjectChanged, self._on_current_project_changed)
 
     @property
     def _tx(self) -> _WorkerTransport:
@@ -291,7 +322,15 @@ class WorkerManager:
         if worker_key in self._managed_worker_processes:
             logger.error("Worker for key '%s' already spawned; refusing duplicate spawn.", worker_key)
             return
-        proc = await asyncio.create_subprocess_exec(*args, env={**os.environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        # Spawn with the orchestrator's PRE-project environ so the worker boots with the
+        # same clean env baseline a fresh engine would have. Inheriting the live os.environ
+        # would bake the orchestrator's current-project env vars into the worker's restore
+        # baseline, leaving the worker unable to unset them on a later project switch.
+        base_environ = self._griptape_nodes.ProjectManager().get_pre_project_environ()
+        proc = await asyncio.create_subprocess_exec(*args, env={**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        # Record the loop that owns this subprocess so termination can hop back to it.
+        # All spawns run on the engine event-queue loop, so this is idempotent.
+        self._spawn_loop = asyncio.get_running_loop()
         self._managed_worker_processes[worker_key] = proc
         logger.info("Spawned worker for key '%s' (pid %s)", worker_key, proc.pid)
 
@@ -308,12 +347,12 @@ class WorkerManager:
             len(self._managed_worker_processes),
             list(self._managed_worker_processes.keys()),
         )
-        for library_name, proc in list(self._managed_worker_processes.items()):
-            try:
-                proc.terminate()
-                logger.info("Terminated worker for key '%s' (pid %s)", library_name, proc.pid)
-            except ProcessLookupError:
-                logger.debug("Worker for key '%s' already exited before termination", library_name)
+        await asyncio.gather(
+            *(
+                self._terminate_via_spawn_loop(library_name, proc)
+                for library_name, proc in list(self._managed_worker_processes.items())
+            )
+        )
         session_id = self._griptape_nodes.get_session_id()
         if session_id and self._transport is not None:
             for wid in list(self._workers):
@@ -339,7 +378,16 @@ class WorkerManager:
         returned dict into the appropriate result type.
         """
         request_id = event_request.request_id or str(uuid.uuid4())
-        future = await self._tx.request_client.track_request(request_id, tag=worker_engine_id)
+        # Opt into structured-failure delivery so a worker-side
+        # ResultPayloadFailure arrives as the raw payload dict rather
+        # than being collapsed to a bare ``Exception(error_msg)`` by
+        # ``_try_match``. ``_execute_node_via_worker`` then runs the
+        # dict through ``converter.structure(...)``, which rebuilds
+        # ``self.exception`` into a ForwardedException carrying the
+        # worker-side type name and traceback string.
+        future = await self._tx.request_client.track_request(
+            request_id, tag=worker_engine_id, resolve_failures_as_payload=True
+        )
 
         await self.forward_event_to_worker(
             event_request.model_copy(update={"request_id": request_id}),
@@ -367,8 +415,7 @@ class WorkerManager:
         if lib_name:
             proc = self._managed_worker_processes.pop(lib_name, None)
             if proc is not None:
-                proc.terminate()
-                logger.info("Eviction: terminated managed process for key '%s' (pid %s)", lib_name, proc.pid)
+                await self._terminate_via_spawn_loop(lib_name, proc)
         # Cancel any requests that were awaiting a result from this worker.
         await self._tx.request_client.cancel_requests_by_tag(worker_engine_id)
 
@@ -378,6 +425,122 @@ class WorkerManager:
                 cb(worker_engine_id, lib_name)
             except Exception:
                 logger.warning("Worker-evicted callback raised an exception for worker '%s'", worker_engine_id)
+
+    async def _terminate_via_spawn_loop(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
+        """Terminate a managed worker on the loop that owns its subprocess.
+
+        asyncio.subprocess.Process binds its exit Future to the loop that created
+        it (the engine event-queue loop), so proc.wait() is only legal there.
+        Eviction can run on a different loop (the websocket-tasks loop); awaiting
+        proc.wait() from there raises "got Future attached to a different loop".
+        Hop the termination coroutine back onto the spawning loop via
+        run_coroutine_threadsafe so proc.wait() always touches its own loop.
+
+        During shutdown the spawning loop may be cancelling or closed. If the hop
+        cannot complete, fall back to a loop-agnostic signal (terminate/kill are
+        plain os.kill, safe from any loop) without awaiting the exit Future.
+        """
+        spawn_loop = self._spawn_loop
+        running_loop = asyncio.get_running_loop()
+        # No separate spawn loop (tests / single-loop deploys) or already on it:
+        # proc.wait() is legal here, so run termination inline.
+        if spawn_loop is None or spawn_loop is running_loop:
+            await self._terminate_managed_process(library_name, proc)
+            return
+        coro = self._terminate_managed_process(library_name, proc)
+        try:
+            future = asyncio.run_coroutine_threadsafe(coro, spawn_loop)
+        except RuntimeError as e:
+            # The spawning loop is closed (shutdown). The coroutine was never
+            # scheduled, so close it to avoid a never-awaited warning, then signal
+            # the worker directly without awaiting its exit Future.
+            coro.close()
+            logger.warning(
+                "Spawning loop unavailable to terminate worker for key '%s' (%s); "
+                "sending a synchronous signal without awaiting exit confirmation",
+                library_name,
+                e,
+            )
+            self._terminate_without_wait(library_name, proc)
+            return
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=WorkerManager.DEFAULT_TERMINATE_HOP_TIMEOUT_S)
+        except asyncio.CancelledError:
+            # Termination was cancelled during shutdown; ensure the worker still
+            # gets a kill signal that needs no await on the spawning loop, then
+            # re-raise so cooperative cancellation propagates. Both hop callers run
+            # under TaskGroup-driven teardown (orchestrator_heartbeat_loop and the
+            # reset_workers gather); swallowing the cancel would let cleanup resume
+            # in a context that was supposed to stop and wedge TaskGroup convergence.
+            logger.warning(
+                "Termination of worker for key '%s' was cancelled; sending a "
+                "synchronous signal without awaiting exit confirmation",
+                library_name,
+            )
+            self._terminate_without_wait(library_name, proc)
+            raise
+        except TimeoutError:
+            # The hop was scheduled but never completed: the spawning loop most
+            # likely closed mid-shutdown before draining it. Stop waiting on a
+            # future that will never resolve and signal the worker directly.
+            future.cancel()
+            logger.warning(
+                "Termination of worker for key '%s' did not complete on the spawning loop "
+                "within %.0fs; sending a synchronous signal without awaiting exit confirmation",
+                library_name,
+                WorkerManager.DEFAULT_TERMINATE_HOP_TIMEOUT_S,
+            )
+            self._terminate_without_wait(library_name, proc)
+
+    async def _terminate_managed_process(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
+        """Terminate a managed worker, escalating to SIGKILL if it does not exit.
+
+        SIGTERM is converted by the worker into a cooperative shutdown on its
+        event loop; a wedged loop never services it. After DEFAULT_TERMINATE_GRACE_S
+        we send SIGKILL, which the kernel delivers regardless of loop state, so a
+        hung worker can never leak.
+
+        Must run on the loop that spawned proc, since it awaits proc.wait(). Callers
+        on another loop route through _terminate_via_spawn_loop.
+        """
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            logger.debug("Worker for key '%s' already exited before termination", library_name)
+            return
+        logger.info("Terminated worker for key '%s' (pid %s)", library_name, proc.pid)
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=WorkerManager.DEFAULT_TERMINATE_GRACE_S)
+        except TimeoutError:
+            logger.warning(
+                "Worker for key '%s' (pid %s) did not exit within %.0fs of SIGTERM; sending SIGKILL",
+                library_name,
+                proc.pid,
+                WorkerManager.DEFAULT_TERMINATE_GRACE_S,
+            )
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                return
+            await proc.wait()
+
+    def _terminate_without_wait(self, library_name: str, proc: asyncio.subprocess.Process) -> None:
+        """Signal a worker to die without awaiting its exit Future.
+
+        Shutdown-only fallback for when the spawning loop is unavailable to run
+        proc.wait(). terminate() then kill() are synchronous os.kill calls, safe
+        from any loop; we forgo the graceful grace period and exit confirmation
+        because the orchestrator is tearing down and only needs the worker gone.
+        """
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            logger.debug("Worker for key '%s' already exited before termination", library_name)
+            return
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
 
     def register_worker_evicted_callback(self, callback: Callable[[str, str | None], None]) -> None:
         """Register a callback invoked when a worker is evicted.
@@ -426,7 +589,7 @@ class WorkerManager:
         args = [
             sys.executable,
             "-m",
-            "griptape_nodes",
+            "griptape_nodes_app",
             "engine",
             "--session-id",
             session_id,
@@ -490,6 +653,100 @@ class WorkerManager:
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
         await self._tx.send_message("EventRequest", forwarded.json(), worker_request_topic)
+
+    async def _on_config_changed(self, _event: ConfigChanged) -> None:
+        """Fan out a ReloadConfigRequest after the orchestrator's config mutation succeeded.
+
+        ConfigManager only emits ``ConfigChanged`` after the disk write
+        succeeded, so receiving the event is sufficient evidence that
+        workers should re-read the file.
+
+        Listener is async and awaits the broadcast directly so the work
+        is owned by the listener's own task. ``broadcast_app_event``
+        invokes listeners on a transient ``ThreadRunner`` side loop when
+        called from sync code (the production path); a fire-and-forget
+        ``asyncio.create_task`` from inside the listener would land on
+        that side loop and be killed when ``ThreadRunner.__exit__``
+        stops the loop, so the broadcast must be awaited inline.
+
+        Lazy import breaks a cycle between this module and
+        ``griptape_nodes.app.worker_routing``, which itself imports
+        ``EventManager`` from the retained_mode managers package.
+        """
+        from griptape_nodes.app.worker_routing import ReloadConfigRequest
+
+        if self._transport is None or not self._workers:
+            return
+        await self.broadcast_to_workers(EventRequest(request=ReloadConfigRequest()))
+
+    async def _on_secret_changed(self, _event: SecretChanged) -> None:
+        """Fan out a RefreshSecretsRequest after the orchestrator's secret mutation succeeded.
+
+        SecretsManager raises if the .env write fails, so reaching the
+        event broadcast means disk is up to date. Workers re-read the
+        shared file via ``refresh_from_env_file``. Awaited inline for
+        the same side-loop reason documented on ``_on_config_changed``;
+        lazy import for the same circular-dependency reason.
+        """
+        from griptape_nodes.app.worker_routing import RefreshSecretsRequest
+
+        if self._transport is None or not self._workers:
+            return
+        await self.broadcast_to_workers(EventRequest(request=RefreshSecretsRequest()))
+
+    async def _on_current_project_changed(self, event: CurrentProjectChanged) -> None:
+        """Fan out an ActivateProjectRequest after the orchestrator switched projects.
+
+        ProjectManager only emits ``CurrentProjectChanged`` from a successful
+        post-init activation, so receiving it means workers should adopt the new
+        project. Carries the new project's id; a worker boots like an engine, so
+        the same id is already loaded in its registry. Awaited inline for the same
+        side-loop reason documented on ``_on_config_changed``; lazy import for
+        the same circular-dependency reason.
+        """
+        from griptape_nodes.app.worker_routing import ActivateProjectRequest
+
+        if self._transport is None or not self._workers:
+            return
+        await self.broadcast_to_workers(EventRequest(request=ActivateProjectRequest(project_id=event.project_id)))
+
+    def schedule_broadcast(self, request_type: type[RequestPayload]) -> None:
+        """Tell every registered worker to handle ``request_type`` locally.
+
+        Wraps ``request_type`` in an EventRequest and fans it out to every
+        registered worker as a fire-and-forget background task on the
+        caller's running event loop. On a worker process (no registered
+        workers, or no transport configured) this is a cheap no-op.
+
+        Must be called from inside a running event loop. Every production
+        caller reaches this through EventManager.handle_request /
+        ahandle_request, which itself runs inside the event loop that the
+        launching application drives the engine on.
+        """
+        if self._transport is None or not self._workers:
+            return
+        event = EventRequest(request=request_type())
+        task = asyncio.create_task(self.broadcast_to_workers(event))
+        self._inflight_broadcast_tasks.add(task)
+        task.add_done_callback(self._inflight_broadcast_tasks.discard)
+
+    async def broadcast_to_workers(self, event: EventRequest) -> None:
+        """Fire-and-forget fan out of an EventRequest to every registered worker.
+
+        Used for orchestrator-originated notifications that every worker must
+        act on locally (e.g. reload config, refresh secrets). The request is
+        sent to each worker's dedicated request topic; no response is awaited.
+
+        Safe to call with zero registered workers -- it is a no-op.
+        """
+        if not self._workers:
+            return
+        for wid, registration in list(self._workers.items()):
+            await self.forward_event_to_worker(
+                event,
+                worker_engine_id=wid,
+                worker_request_topic=registration.request_topic,
+            )
 
     async def relay_worker_result(self, payload: dict) -> None:
         """Relay an unmatched worker result to the GUI session response topic.

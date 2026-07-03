@@ -1,5 +1,6 @@
 """Default artifact providers for common media types."""
 
+from griptape_nodes.retained_mode.managers.artifact_providers.audio import AudioArtifactProvider
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
     BaseArtifactPreviewGenerator,
 )
@@ -19,6 +20,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 from griptape_nodes.retained_mode.managers.artifact_providers.video import VideoArtifactProvider
 
 __all__ = [
+    "AudioArtifactProvider",
     "BaseArtifactPreviewGenerator",
     "BaseArtifactProvider",
     "BaseGeneratorParameters",

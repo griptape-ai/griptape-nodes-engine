@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 from huggingface_hub import get_token, list_models, scan_cache_dir, snapshot_download
@@ -20,6 +20,9 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.model_events import (
+    DeclareModelInvocationRequest,
+    DeclareModelInvocationResultFailure,
+    DeclareModelInvocationResultSuccess,
     DeleteModelDownloadRequest,
     DeleteModelDownloadResultFailure,
     DeleteModelDownloadResultSuccess,
@@ -46,6 +49,12 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import MODELS_TO_DOWNLOAD_KEY
 from griptape_nodes.utils.async_utils import cancel_subprocess
 
@@ -239,6 +248,9 @@ class ModelManager:
             event_manager.assign_manager_to_request_type(DeleteModelRequest, self.on_handle_delete_model_request)
             event_manager.assign_manager_to_request_type(SearchModelsRequest, self.on_handle_search_models_request)
             event_manager.assign_manager_to_request_type(GetModelInfoRequest, self.on_handle_get_model_info_request)
+            event_manager.assign_manager_to_request_type(
+                DeclareModelInvocationRequest, self.on_handle_declare_model_invocation_request
+            )
             event_manager.assign_manager_to_request_type(
                 ListModelDownloadsRequest, self.on_handle_list_model_downloads_request
             )
@@ -490,7 +502,13 @@ class ModelManager:
         await asyncio.to_thread(self._write_download_status, status_file, initial_data)
 
         # Build CLI command
-        cmd = [sys.executable, "-m", "griptape_nodes", "models", "download", download_params.model_id]
+        cmd = [
+            sys.executable,
+            "-m",
+            "griptape_nodes.cli.commands.models",
+            "download",
+            download_params.model_id,
+        ]
 
         if download_params.local_dir:
             cmd.extend(["--local-dir", download_params.local_dir])
@@ -712,6 +730,54 @@ class ModelManager:
             result_details=f"Retrieved info for '{request.model_id}'",
         )
 
+    @staticmethod
+    def _model_checkpoint_attributes(request: DeclareModelInvocationRequest) -> dict[str, Any]:
+        """Resolve the facts a hook may gate a model invocation on.
+
+        `id` is the stable catalog key the node declared. The app owns the model
+        catalog and resolves the provider, family, and key support from that key,
+        mapping it onto the `Model in ModelProvider` hierarchy a policy walks via `in`.
+        """
+        return {CheckpointAttribute.ID: request.model_id}
+
+    def on_handle_declare_model_invocation_request(self, request: DeclareModelInvocationRequest) -> ResultPayload:
+        """Acknowledge a node's declaration that it is about to invoke a model.
+
+        This request is how a well-intentioned node opts into the permission
+        system: it declares the invocation and the engine decides whether it is
+        permitted. Enforcement runs entirely in the event manager's
+        pre-dispatch hook chain before this handler is reached, so arriving here
+        means the invocation is sanctioned. The node performs the actual
+        inference itself; this handler does not run any backend.
+
+        Args:
+            request: The declared invocation, identifying the catalog model
+
+        Returns:
+            ResultPayload: Success, meaning the node is cleared to proceed
+        """
+        # License-policy checkpoint: gate the declared invocation on the stable
+        # catalog key. The node already opted in by declaring; a denial returns a
+        # failure so the node does not invoke the model. Provider/family hierarchy
+        # is resolved app-side from the declared model_id.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.INVOKE_MODEL,
+                subject_type=CheckpointSubjectType.MODEL,
+                subject_id=request.model_id,
+                attributes=self._model_checkpoint_attributes(request),
+            )
+        )
+        if denial is not None:
+            reason = denial.reason()
+            return DeclareModelInvocationResultFailure(
+                result_details=f"Model invocation denied for '{request.model_id}'. {reason}"
+            )
+        return DeclareModelInvocationResultSuccess(
+            model_id=request.model_id,
+            result_details=f"Model invocation permitted for '{request.model_id}'.",
+        )
+
     def _search_models(self, request: SearchModelsRequest) -> SearchResultsData:
         """Synchronous model search implementation.
 
@@ -879,7 +945,7 @@ class ModelManager:
             return None
 
         try:
-            with status_file.open() as f:
+            with status_file.open(encoding="utf-8") as f:
                 data = json.load(f)
 
             # Get byte counts from status file
@@ -923,7 +989,7 @@ class ModelManager:
         statuses = []
         for status_file in status_dir.glob("*.json"):
             try:
-                with status_file.open() as f:
+                with status_file.open(encoding="utf-8") as f:
                     data = json.load(f)
 
                 model_id = data.get("model_id", "")
@@ -952,7 +1018,7 @@ class ModelManager:
         unfinished_models = []
         for status_file in status_dir.glob("*.json"):
             try:
-                with status_file.open() as f:
+                with status_file.open(encoding="utf-8") as f:
                     data = json.load(f)
 
                 status = data.get("status", "")

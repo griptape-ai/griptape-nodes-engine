@@ -1,12 +1,20 @@
-"""Base thread storage driver abstract class."""
+"""Base thread storage driver abstract class.
+
+Threads carry a Pydantic AI message history (``list[ModelMessage]``) plus a
+metadata dictionary that the chat sidebar uses for thread listing, archiving,
+and titles. Backends differ in where they put that data (local JSON files,
+Griptape Cloud, etc.) but they all expose the same surface here.
+"""
 
 from abc import ABC, abstractmethod
-
-from griptape.drivers.memory.conversation import BaseConversationMemoryDriver
+from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.events.agent_events import ThreadMetadata
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
+
+if TYPE_CHECKING:
+    from pydantic_ai.messages import ModelMessage
 
 
 class BaseThreadStorageDriver(ABC):
@@ -16,8 +24,8 @@ class BaseThreadStorageDriver(ABC):
         """Initialize the thread storage driver.
 
         Args:
-            config_manager: Configuration manager instance
-            secrets_manager: Secrets manager instance
+            config_manager: Configuration manager instance.
+            secrets_manager: Secrets manager instance.
         """
         self.config_manager = config_manager
         self.secrets_manager = secrets_manager
@@ -27,80 +35,77 @@ class BaseThreadStorageDriver(ABC):
         """Create a new thread with metadata.
 
         Args:
-            title: Optional thread title
-            local_id: Optional client-side identifier
+            title: Optional thread title.
+            local_id: Optional client-side identifier.
 
         Returns:
-            Tuple of (thread_id, metadata_dict)
+            Tuple of (thread_id, metadata_dict).
         """
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def get_thread_metadata(self, thread_id: str) -> dict:
         """Get metadata for a thread.
 
         Args:
-            thread_id: The thread identifier
+            thread_id: The thread identifier.
 
         Returns:
-            Metadata dictionary
+            Metadata dictionary.
         """
-        ...
+        raise NotImplementedError
 
     @abstractmethod
-    def update_thread_metadata(self, thread_id: str, **updates) -> dict:
+    def update_thread_metadata(self, thread_id: str, **updates: object) -> dict:
         """Update thread metadata.
 
         Args:
-            thread_id: The thread identifier
-            **updates: Key-value pairs to update in metadata
+            thread_id: The thread identifier.
+            **updates: Key-value pairs to merge into existing metadata.
 
         Returns:
-            Updated metadata dictionary
+            Updated metadata dictionary.
         """
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def list_threads(self) -> list[ThreadMetadata]:
-        """List all threads with metadata.
-
-        Returns:
-            List of ThreadMetadata objects
-        """
-        ...
+        """List every thread, sorted most-recently-updated first."""
+        raise NotImplementedError
 
     @abstractmethod
     def delete_thread(self, thread_id: str) -> None:
         """Delete a thread.
 
         Args:
-            thread_id: The thread identifier
+            thread_id: The thread identifier.
 
         Raises:
-            ValueError: If thread is not archived or doesn't exist
+            ValueError: If the thread is not archived or does not exist.
         """
-        ...
+        raise NotImplementedError
 
     @abstractmethod
     def thread_exists(self, thread_id: str) -> bool:
-        """Check if a thread exists.
-
-        Args:
-            thread_id: The thread identifier
-
-        Returns:
-            True if thread exists, False otherwise
-        """
-        ...
+        """Return True iff this backend currently holds a thread with this id."""
+        raise NotImplementedError
 
     @abstractmethod
-    def get_conversation_memory_driver(self, thread_id: str | None) -> BaseConversationMemoryDriver:
-        """Get the appropriate conversation memory driver for this thread.
+    def load_history(self, thread_id: str) -> list["ModelMessage"]:
+        """Load the persisted Pydantic AI message history for a thread.
 
-        Args:
-            thread_id: The thread identifier (can be None for GTC backend)
-
-        Returns:
-            Conversation memory driver instance
+        Returns an empty list when the thread has no history yet (e.g. a brand
+        new thread). The caller is responsible for handling missing threads
+        via :meth:`thread_exists`.
         """
-        ...
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_history(self, thread_id: str, messages: list["ModelMessage"]) -> None:
+        """Persist a Pydantic AI message history for a thread.
+
+        Implementations must overwrite, not append: the caller passes the full
+        history every time. Implementations are also responsible for bumping
+        ``updated_at`` in metadata so the thread floats to the top of listings.
+        """
+        raise NotImplementedError

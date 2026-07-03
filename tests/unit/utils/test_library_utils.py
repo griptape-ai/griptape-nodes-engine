@@ -9,8 +9,14 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
 from griptape_nodes.utils.git_utils import GitCloneError
-from griptape_nodes.utils.library_utils import clone_and_get_library_version, filter_old_xdg_library_paths, is_monorepo
+from griptape_nodes.utils.library_utils import (
+    clone_and_get_library_version,
+    filter_old_xdg_library_paths,
+    is_monorepo,
+    normalize_library_downloads,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Generator
@@ -207,3 +213,96 @@ class TestFilterOldXdgLibraryPaths:
 
             assert filtered == [custom_path, git_url]
             assert removed == {"griptape_nodes_library"}
+
+    def test_filter_handles_object_form_dict_entries(self) -> None:
+        """Object-form dict entries are filtered by their `path` and preserved otherwise."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_entry = {"path": f"{xdg_base}/griptape_cloud/lib.json", "enabled": True}
+            custom_entry = {"path": "/custom/path/lib.json", "enabled": False}
+
+            paths = [old_entry, custom_entry]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_entry]
+            assert removed == {"griptape_cloud"}
+
+    def test_filter_handles_library_registration_entries(self) -> None:
+        """Already parsed LibraryRegistration entries are filtered by their `path`."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_entry = LibraryRegistration(path=f"{xdg_base}/griptape_nodes_library/lib.json")
+            custom_entry = LibraryRegistration(path="/custom/path/lib.json")
+
+            paths = [old_entry, custom_entry]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_entry]
+            assert removed == {"griptape_nodes_library"}
+
+    def test_filter_mixed_string_and_object_entries(self) -> None:
+        """A mix of bare strings and object-form entries is handled without error."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_string = f"{xdg_base}/griptape_nodes_advanced_media_library/lib.json"
+            old_dict = {"path": f"{xdg_base}/griptape_cloud/lib.json"}
+            custom_string = "/custom/path"
+
+            paths = [old_string, old_dict, custom_string]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_string]
+            assert removed == {"griptape_nodes_advanced_media_library", "griptape_cloud"}
+
+
+class TestNormalizeLibraryDownloads:
+    """`normalize_library_downloads` turns a raw config list into LibraryDownload entries."""
+
+    def test_bare_string_becomes_git_url_only_entry(self) -> None:
+        entries = normalize_library_downloads(["griptape-ai/git-lib@v2.0"])
+
+        assert len(entries) == 1
+        assert entries[0] == LibraryDownload(git_url="griptape-ai/git-lib@v2.0")
+        assert entries[0].version is None
+        assert entries[0].name is None
+
+    def test_object_form_is_validated(self) -> None:
+        entries = normalize_library_downloads(
+            [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0", "name": "git-lib"}]
+        )
+
+        assert entries == [LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=2.0", name="git-lib")]
+
+    def test_already_parsed_instance_passes_through(self) -> None:
+        download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0")
+
+        entries = normalize_library_downloads([download])
+
+        assert entries == [download]
+
+    def test_empty_string_is_skipped(self) -> None:
+        assert normalize_library_downloads([""]) == []
+
+    def test_malformed_object_is_skipped_with_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Missing the required git_url -> ValidationError -> skipped, not raised.
+        with caplog.at_level("WARNING"):
+            entries = normalize_library_downloads([{"version": ">=1.0"}])
+
+        assert entries == []
+        assert any("libraries_to_download" in message for message in caplog.messages)
+
+    def test_unexpected_type_is_skipped_with_warning(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level("WARNING"):
+            entries = normalize_library_downloads([123])
+
+        assert entries == []
+        assert any("libraries_to_download" in message for message in caplog.messages)

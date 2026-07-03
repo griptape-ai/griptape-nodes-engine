@@ -265,6 +265,52 @@ class TestExecuteSuccessReturnsNone:
         assert result is None
 
 
+class TestFormatNodeFailureMessage:
+    """Worker-side traceback frames have to land in the RuntimeError message.
+
+    Chaining via ``raise RuntimeError(msg) from exc`` is not enough on
+    its own: a ForwardedException is constructed (not raised) on the
+    receiving side, so its ``__traceback__`` is None and Python's
+    chained-exception display prints only the cause's
+    ``Type: message`` line. The helper interpolates
+    ``original_traceback`` so the worker frames are actually visible.
+    """
+
+    def test_includes_original_type_prefix(self) -> None:
+        from griptape_nodes.retained_mode.events.base_events import ForwardedException
+
+        exc = ForwardedException("rebuilt", original_type="builtins.RuntimeError")
+
+        msg = NodeExecutor._format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
+
+        assert "[builtins.RuntimeError]" in msg
+        assert "MyNode" in msg
+
+    def test_appends_worker_traceback_when_present(self) -> None:
+        from griptape_nodes.retained_mode.events.base_events import ForwardedException
+
+        exc = ForwardedException(
+            "rebuilt",
+            original_type="builtins.ValueError",
+            original_traceback='Traceback...\n  File "a.py", line 1, in <module>\nValueError: rebuilt\n',
+        )
+
+        msg = NodeExecutor._format_node_failure_message("MyNode", MagicMock(result_details="oops"), exc)
+
+        assert "Worker traceback:" in msg
+        assert 'File "a.py"' in msg
+
+    def test_omits_worker_block_for_local_exceptions(self) -> None:
+        # Plain Exception (not a ForwardedException) means we're on the
+        # local path. No type prefix, no worker-traceback block.
+        msg = NodeExecutor._format_node_failure_message(
+            "MyNode", MagicMock(result_details="oops"), RuntimeError("local")
+        )
+
+        assert "Worker traceback:" not in msg
+        assert "[" not in msg.split("execution failed:")[1].split(":")[0]
+
+
 class TestControlFlowResolvedEventCattrsRoundTrip:
     """ControlFlowResolvedEvent.unique_parameter_uuid_to_values round-trips through cattrs.
 

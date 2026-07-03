@@ -35,6 +35,14 @@ SITUATION_TO_FILE_POLICY: dict[str, ExistingFilePolicy] = {
 }
 
 
+def _attempt_map_to_project(absolute_path: Path) -> str | None:
+    """Fire AttemptMapAbsolutePathToProjectRequest; return the mapped macro path string or None."""
+    map_result = GriptapeNodes.handle_request(AttemptMapAbsolutePathToProjectRequest(absolute_path=absolute_path))
+    if isinstance(map_result, AttemptMapAbsolutePathToProjectResultSuccess) and map_result.mapped_path is not None:
+        return map_result.mapped_path
+    return None
+
+
 class ProjectFileDestination(FileDestination):
     """A FileDestination that maps written absolute paths back to project macro form.
 
@@ -88,7 +96,10 @@ class ProjectFileDestination(FileDestination):
         """Build a ProjectFileDestination from a project situation template.
 
         Looks up the named situation in the current project to obtain the macro
-        template and write policy, then constructs the destination.
+        template and write policy, then constructs the destination. The
+        resulting destination uses the engine default for extension coercion;
+        callers that need to override (e.g. the FileOutputSettings node) build
+        the destination directly via the constructor.
 
         Args:
             filename: Filename to parse into base and extension components.

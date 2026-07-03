@@ -66,7 +66,8 @@ Subcommands:
 
 ### `libraries`
 
-Manage local libraries.
+Manage local libraries. For the full guide on installing and managing
+libraries, see [Libraries](libraries.md).
 
 ```
 griptape-nodes libraries SUBCOMMAND
@@ -74,7 +75,8 @@ griptape-nodes libraries SUBCOMMAND
 
 Subcommands:
 
-- `sync` - Sync libraries with your current engine version
+- `sync` - Update every registered library to its latest version
+- `download <git_url>` - Clone a library from Git and register it
 
 ## Configuration
 

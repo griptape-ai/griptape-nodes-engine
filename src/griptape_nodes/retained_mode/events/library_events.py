@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.node_library.library_registry import (
@@ -387,15 +388,25 @@ class LoadLibraryMetadataFromFileResultSuccess(WorkflowNotAlteredMixin, ResultPa
     Args:
         library_schema: The validated LibrarySchema object containing all metadata
                        about the library including nodes, categories, and settings.
-        file_path: The file path from which the library metadata was loaded.
+        file_path: The file path from which the library metadata was loaded (resolved
+                   absolute path on disk).
+        registered_path: The user's verbatim `LibraryRegistration.path` from
+                         `libraries_to_register` before workspace resolution / `~`-expansion
+                         / symlink-following. Surfaced so the GUI can match library metadata
+                         back to its `libraries_to_register` row using the exact key the user
+                         sees in their config. None for libraries registered through other
+                         channels (e.g. sandbox, ad-hoc loads).
         git_remote: The git remote URL if the library is in a git repository, None otherwise.
         git_ref: The current git reference (branch, tag, or commit) if the library is in a git repository, None otherwise.
+        enabled: If the current library is enabled or disabled by the user at the time of the request.
     """
 
     library_schema: LibrarySchema
     file_path: str
     git_remote: str | None
     git_ref: str | None
+    enabled: bool
+    registered_path: str | None = None
 
 
 @dataclass
@@ -415,12 +426,17 @@ class LoadLibraryMetadataFromFileResultFailure(WorkflowNotAlteredMixin, ResultPa
                (MISSING, UNUSABLE, etc.).
         problems: List of specific problems encountered during loading
                  (file not found, JSON parse errors, validation failures, etc.).
+        library_version: Version of the library if it could be extracted from the raw JSON,
+                        None if it couldn't be determined (e.g. invalid JSON). Surfaced so
+                        status output can show the real version even when the schema failed to
+                        validate.
     """
 
     library_path: str
     library_name: str | None
     status: LibraryManager.LibraryFitness
     problems: list[LibraryProblem]
+    library_version: str | None = None
 
 
 @dataclass
@@ -1250,3 +1266,153 @@ class InspectLibraryRepoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class InspectLibraryRepoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Library repository inspection failed. Common causes: invalid git URL, network error, no library JSON found, invalid JSON format."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetLibrarySourceInfoRequest(RequestPayload):
+    """Get filesystem paths for a registered library's source code.
+
+    Use when: Locating library source files on disk, reading node source code.
+
+    Args:
+        library: Name of the registered library (e.g. "Griptape Nodes Library")
+
+    Results: GetLibrarySourceInfoResultSuccess (with paths) | GetLibrarySourceInfoResultFailure (library not found)
+    """
+
+    library: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetLibrarySourceInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Library source info retrieved successfully.
+
+    Args:
+        library_name: Echo of the requested library name
+        library_json_path: Absolute path to the library's griptape_nodes_library.json
+        library_directory: Absolute path to the directory containing the JSON file
+    """
+
+    library_name: str
+    library_json_path: str
+    library_directory: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetLibrarySourceInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Library source info retrieval failed. Common causes: library not found, library not yet loaded."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetEngineSourceInfoRequest(RequestPayload):
+    """Get the filesystem path of the griptape_nodes engine source tree.
+
+    Use when: Reading engine base class definitions (e.g. exe_types/node_types.py),
+    inspecting engine internals, locating engine source code on disk.
+
+    Results: GetEngineSourceInfoResultSuccess (with path) | GetEngineSourceInfoResultFailure (resolution error)
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetEngineSourceInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Engine source info retrieved successfully.
+
+    Args:
+        package_directory: Absolute path to the griptape_nodes package root
+    """
+
+    package_directory: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetEngineSourceInfoResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Engine source info retrieval failed. Common causes: package path could not be resolved."""
+
+
+class LibraryProvisioningActionKind(StrEnum):
+    """What provisioning will do to a single sourced library."""
+
+    SKIP = "SKIP"  # installed version already satisfies the entry
+    INSTALL = "INSTALL"  # not installed -> fresh install (non-destructive)
+    OVERWRITE = "OVERWRITE"  # wrong version installed -> replace
+
+
+@dataclass
+class LibraryProvisioningAction:
+    """The planned provisioning outcome for one libraries_to_download entry.
+
+    Computed by a pure registry-read + PEP 440 compare so the preview and the
+    real execution derive from the same decision. `destructive` is True ONLY for
+    a git OVERWRITE, the path that deletes the local library directory before
+    re-cloning; INSTALL/SKIP never are.
+
+    Fields:
+        library_name: Library name, matching the download entry's `name`.
+        kind: SKIP / INSTALL / OVERWRITE.
+        installed_version: Currently registered version, or None when not installed.
+        pinned_version: The download entry's PEP 440 version specifier, or None for a source-only entry.
+        git_url: The download entry's git source (url@ref form).
+        git_ref: The branch/tag/commit parsed from `git_url`, when present.
+        destructive: True only for a git OVERWRITE (deletes the local dir).
+        reason: Human-readable explanation of the decision.
+    """
+
+    library_name: str
+    kind: LibraryProvisioningActionKind
+    installed_version: str | None
+    pinned_version: str | None
+    git_url: str | None
+    git_ref: str | None
+    destructive: bool
+    reason: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningRequest(RequestPayload):
+    """Compute, without touching disk, what activating a project would provision.
+
+    Use when: the UI wants to show the user which libraries_to_download entries
+    will be installed or overwritten before committing to a project switch.
+    Read-only: a registry read plus a PEP 440 compare, no clone/venv/delete work.
+    Reads the target project's project-adjacent config without mutating the live config layers.
+
+    Args:
+        project_id: Identifier of an already-loaded project to preview.
+
+    Results: PreviewProjectProvisioningResultSuccess | PreviewProjectProvisioningResultFailure
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Provisioning plan computed.
+
+    Args:
+        actions: One action per libraries_to_download entry, in config order. Empty when the
+            project declares no libraries to download/provision.
+        engine_version_failure: Non-None when the project's pinned `requires_engine`
+            cannot be satisfied by the running engine. The same text the live
+            reconcile would surface, computed on the same merged config the preview
+            reads, so the UI can warn before the user approves a plan that would
+            fail the engine_version gate on activation.
+    """
+
+    actions: list[LibraryProvisioningAction]
+    engine_version_failure: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class PreviewProjectProvisioningResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Provisioning plan could not be computed (project not loaded)."""

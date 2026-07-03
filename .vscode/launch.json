@@ -16,13 +16,17 @@
             }
         },
         {
-            "name": "Python Debugger: Run Griptape Nodes App",
+            // Requires a one-time persistent install of the published app
+            // with this checkout layered as the editable engine. See
+            // CONTRIBUTING.md → "Debugging in VS Code" for setup steps.
+            "name": "Python Debugger: Run Griptape Nodes Engine (persistent gtn tool)",
             "type": "debugpy",
             "request": "launch",
-            "python": "${command:python.interpreterPath}",
-            "module": "src.griptape_nodes.__main__",
+            "python": "${userHome}/.local/share/uv/tools/griptape-nodes/bin/python",
+            "module": "griptape_nodes_app",
             "console": "integratedTerminal",
             "justMyCode": false,
+            "cwd": "${workspaceFolder}",
             "args": []
         }
     ]

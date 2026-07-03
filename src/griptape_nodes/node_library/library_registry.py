@@ -1,11 +1,23 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
-from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
+from griptape_nodes.node_library.library_declarations import (
+    LibraryDeclaration,
+    ModelCatalogLibraryProperty,
+    NodeDeclaration,
+    SuggestedWorkerMode,
+    WorkerCompatibility,
+    WorkerMode,
+    WorkerModeCompatibility,
+    find_model_catalog,
+    resolve_node_models,
+)
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
     DuplicateNodeRegistrationProblem,
 )
@@ -18,11 +30,16 @@ from griptape_nodes.retained_mode.managers.resource_components.resource_instance
 from griptape_nodes.utils.metaclasses import SingletonMeta
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.node_library.library_declarations import ResolvedModel
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
 
 logger = logging.getLogger("griptape_nodes")
+
+_constructing_node: ContextVar[bool] = ContextVar("_library_registry_constructing_node", default=False)
 
 
 class LibraryNameAndVersion(NamedTuple):
@@ -31,11 +48,7 @@ class LibraryNameAndVersion(NamedTuple):
 
 
 class Dependencies(BaseModel):
-    """Dependencies for the library.
-
-    This can include other libraries, as well as external packages that need to
-    be installed with pip.
-    """
+    """Pip packages that need to be installed for this library."""
 
     pip_dependencies: list[str] | None = None
     pip_install_flags: list[str] | None = None
@@ -75,21 +88,6 @@ class ResourceRequirements(BaseModel):
         return converted
 
 
-class WorkerConfig(BaseModel):
-    """Configuration for running a library in a dedicated worker process.
-
-    When enabled, the library's nodes execute in a separate Python process,
-    providing full dependency isolation.
-
-    Attributes:
-        enabled: If True, the orchestrator spawns a worker process for this library
-            when the library is loaded.
-    """
-
-    enabled: bool = False
-    # Future expansion: additional fields such as count and spinup_policy can be added here.
-
-
 class LibraryMetadata(BaseModel):
     """Metadata that explains details about the library, including versioning and search details."""
 
@@ -103,11 +101,47 @@ class LibraryMetadata(BaseModel):
     is_griptape_nodes_searchable: bool = True
     # Resource requirements for this library. If None, library is assumed to work on any platform.
     resources: ResourceRequirements | None = None
-    # Worker process configuration. If None or disabled, nodes execute in the orchestrator process.
-    worker: WorkerConfig | None = None
     # Declarative properties / capabilities for this library. Applies to all nodes in the library.
-    # See griptape_nodes.node_library.library_declarations for the supported types.
+    # See griptape_nodes.node_library.library_declarations for the supported types,
+    # including WorkerModeCompatibility for orchestrator/worker hosting.
     declarations: list[LibraryDeclaration] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _reject_incompatible_with_suggested_worker(self) -> LibraryMetadata:
+        # A library declared INCOMPATIBLE with worker hosting must not also
+        # suggest WORKER as its launch mode. The two declarations live on
+        # the same metadata block, so the cross-axis check belongs here --
+        # the individual declaration models are independent and can't see
+        # each other.
+        capability = next((d for d in self.declarations if isinstance(d, WorkerModeCompatibility)), None)
+        if capability is None or capability.compatibility is not WorkerCompatibility.INCOMPATIBLE:
+            return self
+        suggested = next(
+            (d for d in self.declarations if isinstance(d, SuggestedWorkerMode)),
+            None,
+        )
+        if suggested is not None and suggested.mode is WorkerMode.WORKER:
+            msg = (
+                "Library declares WorkerModeCompatibility(compatibility=INCOMPATIBLE) but also "
+                "declares SuggestedWorkerMode(mode=WORKER); the two are contradictory."
+            )
+            raise ValueError(msg)
+        return self
+
+    @model_validator(mode="after")
+    def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
+        # Node references and the duplicate-id check assume a single catalog
+        # (see library_declarations.find_model_catalog, which returns the first).
+        # Two catalogs would let the second one's models go unseen, so reject the
+        # ambiguity here where all declarations are visible together.
+        catalog_count = sum(1 for d in self.declarations if isinstance(d, ModelCatalogLibraryProperty))
+        if catalog_count > 1:
+            msg = (
+                f"Library declares {catalog_count} 'model_catalog' declarations; at most one is allowed. "
+                f"Merge the providers into a single 'model_catalog'."
+            )
+            raise ValueError(msg)
+        return self
 
 
 class IconVariant(BaseModel):
@@ -190,7 +224,7 @@ class LibrarySchema(BaseModel):
     library itself.
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.8.0"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.10.0"
 
     name: str
     library_schema_version: str
@@ -213,6 +247,19 @@ class LibraryRegistry(metaclass=SingletonMeta):
     _collision_node_names_to_library_names: ClassVar[dict[str, list[str]]] = {}
     # Track registered widgets per library: {library_name: set(widget_names)}
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
+
+    @classmethod
+    def _clear(cls) -> None:
+        """Drop every registered library and its tracking state.
+
+        Used by tests to reset the singleton between cases. Centralizes the store
+        list here so renaming a `ClassVar` updates this one method rather than
+        silently degrading callers that would otherwise clear stores by name.
+        """
+        cls._libraries.clear()
+        cls._node_aliases.clear()
+        cls._collision_node_names_to_library_names.clear()
+        cls._registered_widgets.clear()
 
     @classmethod
     def generate_new_library(
@@ -240,6 +287,45 @@ class LibraryRegistry(metaclass=SingletonMeta):
         if library_name not in instance._libraries:
             msg = f"Library '{library_name}' was requested to be unregistered, but it wasn't registered in the first place."
             raise KeyError(msg)
+
+        library = instance._libraries[library_name]
+        advanced_library = library.get_advanced_library()
+
+        # Teardown hook — called before any deregistration.
+        if advanced_library:
+            try:
+                advanced_library.before_library_unregistered(library.get_library_data(), library)
+            except Exception as err:
+                logger.error(
+                    "Failed to call before_library_unregistered for library '%s': %s",
+                    library_name,
+                    err,
+                )
+                # Continue — a failing teardown must not prevent unregistration.
+
+        # Deregister tracked handlers. Lazy import required: library_registry is part of the
+        # import chain griptape_nodes → workflow_registry → library_registry, so a top-level
+        # import of GriptapeNodes here would create a circular dependency.
+        from griptape_nodes.retained_mode.griptape_nodes import (
+            GriptapeNodes,
+        )  # circular: griptape_nodes → workflow_registry → library_registry
+
+        event_manager = GriptapeNodes.EventManager()
+
+        if library._registered_app_event_listeners:
+            for event_type, listener in library._registered_app_event_listeners:
+                event_manager.remove_listener_for_app_event(event_type, listener)
+            library._registered_app_event_listeners.clear()
+
+        if library._registered_pre_dispatch_hooks:
+            for hook in library._registered_pre_dispatch_hooks:
+                event_manager.remove_pre_dispatch_hook(hook)
+            library._registered_pre_dispatch_hooks.clear()
+
+        if library._registered_request_handler_types:
+            for request_type in library._registered_request_handler_types:
+                event_manager.remove_manager_from_request_type(request_type)
+            library._registered_request_handler_types.clear()
 
         # Clean up registered widgets for this library
         cls.unregister_widgets_for_library(library_name)
@@ -358,8 +444,43 @@ class LibraryRegistry(metaclass=SingletonMeta):
             node_type=node_type, specific_library_name=specific_library_name
         )
 
-        # Ask the library to create the node.
-        return dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
+        with cls.constructing_node():
+            return dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
+
+    @classmethod
+    @contextmanager
+    def constructing_node(cls) -> Iterator[None]:
+        """Mark the enclosed block as a node ``__init__`` running on the calling task.
+
+        Sets the same task-local flag that ``create_node`` sets. Use at
+        any direct construction site that bypasses ``create_node``
+        (e.g. ``type(node)(name=...)`` or ``node_class(name=...)`` for
+        an ephemeral probe / reference node), so:
+
+        - the parameter-mutation-during-aprocess detector skips the
+          declarative ``add_parameter`` calls inside the constructed
+          node's ``__init__`` (otherwise it would fire once per
+          parameter declared by the helper instance), and
+        - the reentrant-bus-in-init detector still fires for the
+          right reason if the constructed node's ``__init__`` issues
+          a bus request.
+        """
+        token = _constructing_node.set(True)
+        try:
+            yield
+        finally:
+            _constructing_node.reset(token)
+
+    @classmethod
+    def is_constructing_node(cls) -> bool:
+        """Return True if a node ``__init__`` is currently running on the calling task.
+
+        The reentrant-bus-in-init and parameter-mutation-during-aprocess
+        strict-mode detectors consult this so they can fire from outside
+        ``LibraryRegistry`` without owning their own depth counter. The
+        flag is set by ``create_node`` and by ``constructing_node()``.
+        """
+        return _constructing_node.get()
 
     @classmethod
     def get_all_library_schemas(cls) -> dict[str, dict]:
@@ -404,6 +525,11 @@ class Library:
     _node_types: dict[str, type[BaseNode]]
     _node_metadata: dict[str, NodeMetadata]
     _advanced_library: AdvancedNodeLibrary | None
+    # Tracks handlers registered on behalf of this library so they can be
+    # deregistered automatically when the library is unloaded.
+    _registered_app_event_listeners: list[tuple[type, Callable]]
+    _registered_pre_dispatch_hooks: list[Callable]
+    _registered_request_handler_types: list[type]
 
     def __init__(
         self,
@@ -423,6 +549,29 @@ class Library:
         self._node_types = {}
         self._node_metadata = {}
         self._advanced_library = advanced_library
+        self._registered_app_event_listeners = []
+        self._registered_pre_dispatch_hooks = []
+        self._registered_request_handler_types = []
+
+    def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
+        return list(self._registered_app_event_listeners)
+
+    def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
+        return list(self._registered_pre_dispatch_hooks)
+
+    def get_registered_request_handler_types(self) -> list[type]:
+        """Return the request payload types whose handlers this library has registered.
+
+        Tracked for two purposes:
+        - **Teardown**: the engine calls this during ``unregister_library`` to remove
+          all handlers automatically when the library is unloaded.
+        - **Introspection**: other libraries or nodes can call this to discover what
+          request types this library exposes, then use ``dataclasses.fields()`` and
+          ``typing.get_type_hints()`` on each type to inspect its field schema.
+
+        Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._registered_request_handler_types)
 
     def register_new_node_type(self, node_class: type[BaseNode], metadata: NodeMetadata) -> LibraryProblem | None:
         """Register a new node type in this library. Returns a LibraryProblem if registration fails, or None if all clear."""
@@ -458,6 +607,26 @@ class Library:
     def get_library_data(self) -> LibrarySchema:
         return self._library_data
 
+    def get_models_for_node_type(self, node_type: str) -> list[ResolvedModel]:
+        """Resolve the catalog models a node type is declared to use.
+
+        Returns the models referenced by the node's ``model_usage`` /
+        ``model_provider_usage`` declarations, resolved against this library's
+        ``model_catalog`` declaration. Returns an empty list when the node
+        declares no model usage or the library declares no catalog.
+
+        Raises:
+            KeyError: if ``node_type`` is not registered in this library.
+        """
+        node_metadata = self._node_metadata.get(node_type)
+        if node_metadata is None:
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise KeyError(msg)
+        catalog = find_model_catalog(self._library_data.metadata.declarations)
+        if catalog is None:
+            return []
+        return resolve_node_models(catalog, node_metadata.declarations)
+
     def create_node(
         self,
         node_type: str,
@@ -473,8 +642,17 @@ class Library:
         # into the node's metadata blob.
         if metadata is None:
             metadata = {}
-        library_node_metadata = self._node_metadata.get(node_type, {})
-        metadata["library_node_metadata"] = library_node_metadata
+        # Dump to a JSON-safe dict so downstream consumers (and the workflow
+        # serializer in particular) only ever see plain literals — no Pydantic
+        # models, no StrEnum members. Without this, a NodeMetadata carrying a
+        # LifecycleStageNodeProperty would leak through to the generated workflow
+        # as a Python repr (e.g. `<LifecycleStage.BETA: 'BETA'>`), which is not
+        # valid Python.
+        library_node_metadata_model = self._node_metadata.get(node_type)
+        if library_node_metadata_model is None:
+            metadata["library_node_metadata"] = {}
+        else:
+            metadata["library_node_metadata"] = library_node_metadata_model.model_dump(mode="json")
         metadata["library"] = self._library_data.name
         metadata["node_type"] = node_type
         node = node_class(name=name, metadata=metadata)
@@ -496,9 +674,8 @@ class Library:
         """Return the BaseNode subclass registered under `node_type`.
 
         For callers that need the class itself, e.g. classmethod checks like
-        `allow_outgoing_connection_by_class` or building a throwaway probe instance,
-        rather than an instance produced by `create_node` (which also injects library
-        metadata into the node).
+        `allow_outgoing_connection_by_class`, rather than an instance produced
+        by `create_node`.
         """
         if node_type not in self._node_types:
             raise KeyError(self._library_data.name, node_type)
@@ -535,3 +712,34 @@ class Library:
             if issubclass(node_class, base_type):
                 matching_nodes.append(node_type)
         return matching_nodes
+
+
+def get_declared_models(node: BaseNode) -> list[ResolvedModel]:
+    """Resolve the catalog models a node is declared to use.
+
+    Reads the ``library`` and ``node_type`` that ``Library.create_node`` injects
+    into the node's metadata, looks up that library, and resolves the node's
+    ``model_usage`` / ``model_provider_usage`` declarations against its
+    ``model_catalog``. A node calls this to build its model dropdown from the
+    catalog, passing only ``self`` -- it never restates its own library/type,
+    nothing is stored on the node, and nothing is serialized.
+
+    The catalog is library-local, so this is an in-process lookup that resolves
+    correctly in both the orchestrator and a worker subprocess, including from
+    ``__init__``. Each returned ``ResolvedModel`` carries the model descriptor
+    (``model.display_name``, ``model.provider_model_id``) the node needs to map
+    a dropdown selection back to the provider's model id.
+
+    Returns an empty list when the node declares no model usage, its library
+    declares no catalog, or the library/type cannot be resolved (e.g. a node
+    constructed outside the normal library path).
+    """
+    library_name = node.metadata.get("library")
+    node_type = node.metadata.get("node_type")
+    if not isinstance(library_name, str) or not isinstance(node_type, str):
+        return []
+    try:
+        library = LibraryRegistry.get_library(name=library_name)
+        return library.get_models_for_node_type(node_type)
+    except KeyError:
+        return []

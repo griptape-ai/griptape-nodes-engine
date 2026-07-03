@@ -1,13 +1,16 @@
 """Data shapes for the sequences module.
 
-Three concepts:
+Five concepts:
     - `MissingItemPolicy`: how to fill gaps inside a sequence's range.
+    - `NoTokenBehavior`: what to do when the input has no sequence token at all.
+    - `SequenceScanOptions`: bundled options for sequence detection and filtering.
     - `Sequence`: one contiguous-or-gap-aware sequence with metadata.
     - `SequenceEntry`: one item inside a Sequence (number + path).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, Field, computed_field
@@ -18,29 +21,105 @@ class MissingItemPolicy(StrEnum):
 
     The choice changes the *shape* (or even the success) of `scan_sequences` output:
 
-    - `ABORT`: raise `MissingItemError` on the first missing slot in `[first..last]`.
+    - `ABORT`: raise `MissingItemError` carrying every missing slot in `[first..last]`.
     - `SPLIT`: returns multiple Sequences, each contiguous (no gaps inside any).
     - `SKIP`: one Sequence with only the present items; gaps absent from `entries`.
     - `FILL_NEAREST`: one Sequence whose entries span the full [first, last] range,
       with each missing slot's path pointing at the nearest present neighbor.
     """
 
-    ABORT = "abort"  # Raise MissingItemError on the first gap.
+    ABORT = "abort"  # Raise MissingItemError listing every gap inside the active range.
     SPLIT = "split"  # Sparse sequence becomes N contiguous sub-sequences.
     SKIP = "skip"  # Single sequence with only the present items; gaps absent.
     FILL_NEAREST = "fill_nearest"  # Dense sequence; gaps point at the backward-first neighbor.
 
 
-class MissingItemError(Exception):
-    """Raised by `MissingItemPolicy.ABORT` on the first missing slot inside the active range.
+class NoTokenBehavior(StrEnum):
+    """What to do when the caller's path has no sequence token (`####`, `%04d`, etc.).
 
-    Attributes:
-        number: The slot number that triggered the abort.
+    A path with zero tokens is ambiguous: the artist may have typed the
+    literal name of one specific file (`render.0002.png`), or they may have
+    meant to scan the surrounding sequence and forgotten the token, or they
+    may have a workflow that should fail loud if the token is missing. This
+    enum picks which interpretation the scanner uses.
+
+    - `SINGLE_FILE` *(default)*: Treat the whole filename as a literal. The
+      result is a 1-item Sequence (`first=last=1, padding=0`) when the file
+      exists, an empty result when it doesn't. Sibling files in the same
+      directory are ignored.
+    - `EXPLORE_SEQUENCE`: Let fileseq parse digits in the filename as an
+      implicit sequence token. `render.0002.png` is treated as one frame of
+      a `render.####.png` sequence; the scan walks every matching sibling
+      and the result reflects the entire on-disk run. Useful when a
+      downstream tool gave you one filename but you want the whole take.
+    - `REJECT`: Fail with `INVALID_TEMPLATE` and tell the artist the path
+      needs an explicit token. Strict mode for workflows that must not
+      silently widen the artist's intent.
     """
 
-    def __init__(self, number: int) -> None:
-        super().__init__(f"Sequence has a gap at item {number}.")
-        self.number = number
+    SINGLE_FILE = "single_file"
+    EXPLORE_SEQUENCE = "explore_sequence"
+    REJECT = "reject"
+
+
+@dataclass
+class SequenceScanOptions:
+    """Options controlling how sequences are detected and filtered.
+
+    Attributes:
+        policy: How to handle gaps in the detected range.
+        no_token_behavior: Whether to include or reject sequences with no
+            explicit sequence token (e.g. plain ``readme.txt``).
+        start_number: Lower bound (inclusive) for the active frame subset.
+            Must be >= 0 if supplied.
+        end_number: Upper bound (inclusive) for the active frame subset.
+            Must be >= ``start_number`` if both supplied.
+        padding: If set, only include sequences whose zero-fill width equals
+            this value (e.g. ``padding=4`` matches ``####`` sequences only).
+    """
+
+    policy: MissingItemPolicy = MissingItemPolicy.SKIP
+    no_token_behavior: NoTokenBehavior = NoTokenBehavior.REJECT
+    start_number: int | None = None
+    end_number: int | None = None
+    padding: int | None = None
+
+
+# Truncate the inline preview of gap numbers in MissingItemError's __str__
+# after this many entries — the full list lives on `numbers` for callers
+# that need it. Matches the threshold used in
+# `OSManager.on_scan_sequences_request`'s `result_details` summary so the
+# exception text and the handler's user-facing string truncate at the same point.
+_GAP_PREVIEW_COUNT = 5
+
+
+class MissingItemError(Exception):
+    """Raised by `MissingItemPolicy.ABORT` when at least one slot inside the active range is missing.
+
+    Surfaces every gap in one shot so a UI consumer can show the artist all
+    the missing items in a single pass instead of fixing them one-at-a-time
+    across re-runs.
+
+    Attributes:
+        numbers: All missing slot numbers, sorted ascending. Always non-empty
+            — the scanner only raises when at least one gap was found.
+    """
+
+    def __init__(self, numbers: list[int]) -> None:
+        if not numbers:
+            msg = "Attempted to construct MissingItemError with no missing numbers. Pass at least one."
+            raise ValueError(msg)
+        sorted_numbers = sorted(numbers)
+        if len(sorted_numbers) == 1:
+            super().__init__(f"Sequence has a gap at item {sorted_numbers[0]}.")
+        else:
+            preview = ", ".join(str(n) for n in sorted_numbers[:_GAP_PREVIEW_COUNT])
+            if len(sorted_numbers) <= _GAP_PREVIEW_COUNT:
+                tail = ""
+            else:
+                tail = f", … (+{len(sorted_numbers) - _GAP_PREVIEW_COUNT} more)"
+            super().__init__(f"Sequence has gaps at items {preview}{tail}.")
+        self.numbers = sorted_numbers
 
 
 class InvalidSubsetBoundsError(ValueError):

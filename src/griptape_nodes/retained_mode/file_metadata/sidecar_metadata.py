@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from pydantic import BaseModel
 
 from griptape_nodes.common.macro_parser import ParsedMacro
-from griptape_nodes.common.project_templates.situation import SituationFilePolicy
+from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.files.path_utils import decompose_source_path
 from griptape_nodes.retained_mode.events.project_events import (
     GetCurrentProjectRequest,
@@ -90,10 +90,10 @@ def _resolve_sidecar_path(file_path: Path) -> Path:
     decomposed = decompose_source_path(file_path, workspace_dir)
 
     get_situation_result = GriptapeNodes.handle_request(
-        GetSituationRequest(situation_name="save_griptape_nodes_metadata")
+        GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA)
     )
     if not isinstance(get_situation_result, GetSituationResultSuccess):
-        msg = "save_griptape_nodes_metadata situation not found in project template"
+        msg = f"{BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA} situation not found in project template"
         raise RuntimeError(msg)  # noqa: TRY004
 
     variables: dict[str, str | int] = {"source_file_name": decomposed.source_file_name}

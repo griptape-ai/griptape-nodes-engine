@@ -35,11 +35,18 @@ def hydrate_parameter_values(values: dict[str, Any]) -> dict[str, Any]:
     element-wise so parameters like ``list[VideoUrlArtifact]`` work.
     Non-matching values pass through unchanged.
     """
-    return {name: _hydrate(value) for name, value in values.items()}
+    return {name: hydrate_value(value) for name, value in values.items()}
 
 
 # TODO: This is hacky and needs to be solved for non-griptape artifacts as well: https://github.com/griptape-ai/griptape-nodes/issues/4475
-def _hydrate(value: Any) -> Any:
+def hydrate_value(value: Any) -> Any:
+    """Reconstitute a single serialized artifact value.
+
+    Replaces a value that looks like a serialized SerializableMixin (dict with
+    a ``"type"`` key that resolves to an artifact subclass) with the
+    reconstituted object. Lists are walked element-wise. Non-matching values
+    pass through unchanged.
+    """
     if isinstance(value, dict) and "type" in value:
         try:
             return BaseArtifact.from_dict(value)
@@ -47,5 +54,5 @@ def _hydrate(value: Any) -> Any:
             logger.debug("Could not hydrate value as artifact; passing through.", exc_info=True)
             return value
     if isinstance(value, list):
-        return [_hydrate(item) for item in value]
+        return [hydrate_value(item) for item in value]
     return value

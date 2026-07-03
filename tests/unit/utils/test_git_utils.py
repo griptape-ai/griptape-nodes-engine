@@ -20,6 +20,7 @@ from griptape_nodes.utils.git_utils import (
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
+    get_git_info,
     get_git_remote,
     get_git_repository_root,
     git_update_from_remote,
@@ -27,6 +28,7 @@ from griptape_nodes.utils.git_utils import (
     is_git_url,
     normalize_github_url,
     parse_git_url_with_ref,
+    remote_ref_exists,
     switch_branch,
 )
 
@@ -142,6 +144,12 @@ class TestExtractRepoNameFromUrl:
     def test_extract_repo_name_from_ssh_url_with_ref(self) -> None:
         """Test that repo name is extracted from SSH URL with @ref."""
         result = extract_repo_name_from_url("git@github.com:user/my-repo@stable")
+
+        assert result == "my-repo"
+
+    def test_extract_repo_name_from_url_with_trailing_slash_before_ref(self) -> None:
+        """A trailing slash right before the @ref must not swallow the repo name."""
+        result = extract_repo_name_from_url("https://github.com/user/my-repo/@stable")
 
         assert result == "my-repo"
 
@@ -996,3 +1004,217 @@ class TestCloneRepository:
                 clone_repository("https://github.com/user/repo.git", target_path)
 
             assert "Git error while cloning" in str(exc_info.value)
+
+
+class TestGetGitInfo:
+    """Test get_git_info function.
+
+    get_git_info opens the pygit2 repo once and returns both (git_remote, git_ref),
+    replacing the previous pattern of calling get_git_remote + get_current_ref
+    separately (which opened the repo 2-3x per library).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def _make_repo_mock(  # noqa: PLR0913
+        self,
+        *,
+        remote_url: str | None = "https://github.com/user/repo.git",
+        head_is_unborn: bool = False,
+        head_is_detached: bool = False,
+        branch_shorthand: str = "main",
+        head_target: object = "abc123",
+        references: dict | None = None,
+    ) -> Mock:
+        mock_repo = Mock()
+        mock_repo.remotes = {"origin": Mock(url=remote_url)} if remote_url else {}
+        mock_repo.head_is_unborn = head_is_unborn
+        mock_repo.head_is_detached = head_is_detached
+        mock_repo.head = Mock(shorthand=branch_shorthand, target=head_target)
+        mock_repo.references = references if references is not None else {}
+        return mock_repo
+
+    def test_returns_none_none_when_not_git_repository(self, temp_dir: Path) -> None:
+        with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=False):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
+
+    def test_returns_none_none_when_repository_not_discovered(self, temp_dir: Path) -> None:
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=None),
+        ):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
+
+    def test_returns_none_none_on_git_error_opening_repo(self, temp_dir: Path) -> None:
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch(
+                "griptape_nodes.utils.git_utils.pygit2.discover_repository",
+                side_effect=pygit2.GitError("error"),
+            ),
+        ):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
+
+    def test_returns_remote_and_branch_when_on_branch(self, temp_dir: Path) -> None:
+        mock_repo = self._make_repo_mock(remote_url="https://github.com/user/repo.git", branch_shorthand="main")
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
+        ):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote == "https://github.com/user/repo.git"
+        assert git_ref == "main"
+
+    def test_returns_none_remote_when_no_origin(self, temp_dir: Path) -> None:
+        mock_repo = self._make_repo_mock(remote_url=None, branch_shorthand="main")
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
+        ):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref == "main"
+
+    def test_returns_commit_sha_when_head_detached_and_no_tag(self, temp_dir: Path) -> None:
+        expected_sha = "deadbeef1234"
+        mock_repo = self._make_repo_mock(
+            remote_url=None, head_is_detached=True, head_target=expected_sha, references={}
+        )
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
+        ):
+            _git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_ref == expected_sha
+
+    def test_returns_tag_name_when_head_on_tag(self, temp_dir: Path) -> None:
+        expected_sha = "deadbeef1234"
+        expected_tag = "v1.0.0"
+
+        mock_tag_ref = Mock()
+        mock_tag_ref.peel.return_value.id = expected_sha
+
+        mock_repo = self._make_repo_mock(
+            remote_url=None,
+            head_is_detached=True,
+            head_target=expected_sha,
+            references={f"refs/tags/{expected_tag}": mock_tag_ref},
+        )
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
+        ):
+            _git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_ref == expected_tag
+
+    def test_returns_none_ref_when_head_unborn(self, temp_dir: Path) -> None:
+        mock_repo = self._make_repo_mock(remote_url=None, head_is_unborn=True)
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
+        ):
+            _git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_ref is None
+
+    def test_opens_repo_exactly_once(self, temp_dir: Path) -> None:
+        mock_repo = self._make_repo_mock()
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
+            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo) as mock_repo_class,
+        ):
+            get_git_info(temp_dir)
+
+        mock_repo_class.assert_called_once()
+
+
+class TestRemoteRefExists:
+    """Tests for remote_ref_exists."""
+
+    def test_returns_true_when_git_cli_lists_matching_ref(self) -> None:
+        completed = Mock(returncode=0, stdout="abc123\trefs/heads/main\n", stderr="")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed) as mock_run,
+        ):
+            assert remote_ref_exists("git@github.com:owner/repo.git", "main") is True
+
+        args = mock_run.call_args.args[0]
+        assert args == ["git", "ls-remote", "--heads", "--tags", "git@github.com:owner/repo.git", "main"]
+
+    def test_returns_false_when_git_cli_lists_no_matching_ref(self) -> None:
+        completed = Mock(returncode=0, stdout="\n", stderr="")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
+        ):
+            assert remote_ref_exists("git@github.com:owner/repo.git", "local-only-branch") is False
+
+    def test_raises_git_remote_error_when_git_cli_fails(self) -> None:
+        completed = Mock(returncode=128, stdout="", stderr="fatal: could not read from remote\n")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
+            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
+        ):
+            remote_ref_exists("git@github.com:owner/repo.git", "main")
+
+    def test_returns_true_when_pygit2_lists_matching_ref(self) -> None:
+        mock_remote = Mock()
+        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/feature/foo"}, {"name": "refs/heads/main"}]
+        mock_repo = Mock()
+        mock_repo.remotes.create.return_value = mock_remote
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+        ):
+            assert remote_ref_exists("https://github.com/owner/repo.git", "feature/foo") is True
+
+    def test_returns_false_when_pygit2_lists_no_matching_ref(self) -> None:
+        mock_remote = Mock()
+        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/main"}]
+        mock_repo = Mock()
+        mock_repo.remotes.create.return_value = mock_remote
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+        ):
+            assert remote_ref_exists("https://github.com/owner/repo.git", "local-only-branch") is False
+
+    def test_raises_git_remote_error_when_pygit2_fails(self) -> None:
+        mock_repo = Mock()
+        mock_repo.remotes.create.side_effect = pygit2.GitError("auth failed")
+        with (
+            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
+            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
+            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
+        ):
+            remote_ref_exists("https://github.com/owner/repo.git", "main")
