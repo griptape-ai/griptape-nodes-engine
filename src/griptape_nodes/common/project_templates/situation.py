@@ -52,6 +52,7 @@ class BuiltInSituation(StrEnum):
     SAVE_WORKFLOW_THUMBNAIL = "save_workflow_thumbnail"
     SAVE_FAILED_WORKFLOW = "save_failed_workflow"
     SAVE_TEMP_FILE = "save_temp_file"
+    SAVE_WORKFLOW_BACKUP = "save_workflow_backup"
 
 
 class SituationPolicy(BaseModel):

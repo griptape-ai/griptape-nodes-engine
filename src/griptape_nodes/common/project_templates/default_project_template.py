@@ -249,6 +249,11 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             path_macro="{workflow_dir?:/}temp",
             description="Temporary scratch files; safe to delete between runs.",
         ),
+        "backups": DirectoryDefinition(
+            name="backups",
+            path_macro="{workflow_dir?:/}backups",
+            description="Backups of workflow files, preserving any sub-directory hierarchy.",
+        ),
         "workflow_run_failures": DirectoryDefinition(
             name="workflow_run_failures",
             path_macro="{workflow_dir?:/}workflow_run_failures",
@@ -429,6 +434,16 @@ DEFAULT_PROJECT_TEMPLATE_V1 = ProjectTemplate(
             macro="{temp}/{node_name?:_}{file_name_base}{###?}.{file_extension}",
             policy=SituationPolicy(
                 on_collision=SituationFilePolicy.OVERWRITE,
+                create_dirs=True,
+            ),
+            fallback=BuiltInSituation.SAVE_FILE,
+        ),
+        BuiltInSituation.SAVE_WORKFLOW_BACKUP: SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            description="Save a backup of a workflow file, preserving any sub-directory hierarchy",
+            macro="{backups}/{sub_dirs?:/}{file_name_base}_backup_v{_index:1}.{file_extension}",
+            policy=SituationPolicy(
+                on_collision=SituationFilePolicy.CREATE_NEW,
                 create_dirs=True,
             ),
             fallback=BuiltInSituation.SAVE_FILE,
