@@ -420,6 +420,37 @@ class EventRequestBatch(BaseEvent):
         return cls(requests=requests, **event_data)
 
 
+_RESULT_FRAMEWORK_FIELDS = frozenset({"result_details", "altered_workflow_state"})
+
+
+def _build_path_tree(paths: list[str]) -> dict:
+    tree: dict = {}
+    for path in paths:
+        parts = path.split(".")
+        node = tree
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node.setdefault(parts[-1], {})
+    return tree
+
+
+def _apply_path_tree(data: Any, tree: dict) -> Any:
+    if not isinstance(data, dict):
+        return data
+    result = {}
+    for key, subtree in tree.items():
+        if key not in data:
+            continue
+        value = data[key]
+        if not subtree:
+            result[key] = value
+        elif isinstance(value, list):
+            result[key] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in value]
+        else:
+            result[key] = _apply_path_tree(value, subtree)
+    return result
+
+
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events."""
 
@@ -438,7 +469,14 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
         result["request"] = safe_unstructure(self.request)
-        result["result"] = safe_unstructure(self.result)
+        result_dict = safe_unstructure(self.result)
+        if self.request.fields is not None:
+            filtered = _apply_path_tree(result_dict, _build_path_tree(self.request.fields))
+            for fw_field in _RESULT_FRAMEWORK_FIELDS:
+                if fw_field in result_dict:
+                    filtered.setdefault(fw_field, result_dict[fw_field])
+            result_dict = filtered
+        result["result"] = result_dict
         if self.retained_mode:
             result["retained_mode"] = self.retained_mode
         return result

@@ -654,6 +654,7 @@ class EventManager:
             for field in fields(request):
                 if field.metadata.get("omit_from_result", False):
                     setattr(request, field.name, None)
+
             if callback_result.succeeded():
                 result_event = EventResultSuccess(
                     request=request,
