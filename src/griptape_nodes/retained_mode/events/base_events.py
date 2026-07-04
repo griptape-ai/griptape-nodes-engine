@@ -154,6 +154,7 @@ class RequestPayload(Payload, ABC):
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
+    fields: list[str] | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.

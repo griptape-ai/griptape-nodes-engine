@@ -3128,7 +3128,7 @@ class ProjectManager:
         self._initialization_complete = True
 
     def on_get_all_situations_for_project_request(
-        self, _request: GetAllSituationsForProjectRequest
+        self, request: GetAllSituationsForProjectRequest
     ) -> GetAllSituationsForProjectResultSuccess | GetAllSituationsForProjectResultFailure:
         """Get all situation names and schemas from current project template."""
         current_project_request = GetCurrentProjectRequest()
@@ -3141,9 +3141,13 @@ class ProjectManager:
 
         template = current_project_result.project_info.template
         situations = {situation_name: situation.macro for situation_name, situation in template.situations.items()}
-        descriptions = {
-            situation_name: (situation.description or "") for situation_name, situation in template.situations.items()
-        }
+
+        include_descriptions = request.fields is None or "descriptions" in request.fields
+        descriptions = (
+            {situation_name: (situation.description or "") for situation_name, situation in template.situations.items()}
+            if include_descriptions
+            else {}
+        )
 
         return GetAllSituationsForProjectResultSuccess(
             situations=situations,
