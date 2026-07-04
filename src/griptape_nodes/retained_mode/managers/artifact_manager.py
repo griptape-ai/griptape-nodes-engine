@@ -267,7 +267,14 @@ class ArtifactManager:
         provider = self._registry.get_or_create_provider_instance(provider_classes[0])
         return provider.prepare_content_for_write(data, file_name)
 
-    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:
+    def check_write_permission(
+        self,
+        data: bytes,
+        detected_format: str,
+        *,
+        file_name: str,
+        caller_variables: MacroVariables | None = None,
+    ) -> CheckpointDenial | None:
         """Route a pending write through the format's provider for permission checking.
 
         Looks up the provider that claims ``detected_format`` and asks its
@@ -278,6 +285,14 @@ class ArtifactManager:
             data: The full buffered write payload.
             detected_format: The canonical lowercase extension returned by
                 ``sniff_extension`` for ``data`` (e.g. ``"mp4"``).
+            file_name: The caller's intended destination filename, threaded
+                through to the provider so denial messages can name the save
+                that was blocked.
+            caller_variables: The caller's macro variable bindings (from
+                ``WriteFileRequest.file_path`` when it's a ``MacroPath``, else
+                ``None``). Passed through to the provider so a provider that
+                stages bytes at a project temp path can preserve caller context
+                (e.g. ``node_name``) in the temp filename for observability.
 
         Returns:
             A ``CheckpointDenial`` if the provider refuses the write, or
@@ -287,7 +302,9 @@ class ArtifactManager:
         provider = self._provider_for_format(detected_format)
         if provider is None:
             return None
-        return provider.check_write_permission(data, detected_format)
+        return provider.check_write_permission(
+            data, detected_format, file_name=file_name, caller_variables=caller_variables
+        )
 
     def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
         """Route a pending read through the format's provider for permission checking.

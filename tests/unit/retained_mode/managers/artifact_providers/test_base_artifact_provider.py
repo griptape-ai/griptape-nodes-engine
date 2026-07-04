@@ -64,7 +64,7 @@ class TestBaseProviderPermissionDefaults:
         # may hold lazy resources like ffprobe binaries). The base contract is
         # simply "return None to allow"; a fresh instance must honor that.
         provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]
-        assert provider.check_write_permission(b"anything", "bin") is None
+        assert provider.check_write_permission(b"anything", "bin", file_name="thing.bin") is None
 
     def test_check_read_permission_default_allows(self) -> None:
         provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]

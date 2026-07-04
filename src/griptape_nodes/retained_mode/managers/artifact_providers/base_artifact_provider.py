@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.common.macro_parser import MacroVariables
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -245,7 +246,14 @@ class BaseArtifactProvider(ABC):
         """
         return data
 
-    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:  # noqa: ARG002
+    def check_write_permission(
+        self,
+        data: bytes,  # noqa: ARG002
+        detected_format: str,  # noqa: ARG002
+        *,
+        file_name: str,  # noqa: ARG002
+        caller_variables: MacroVariables | None = None,  # noqa: ARG002
+    ) -> CheckpointDenial | None:
         """Ask whether writing ``data`` is permitted before it hits disk.
 
         Override in subclasses that gate writes on media-specific properties
@@ -262,6 +270,16 @@ class BaseArtifactProvider(ABC):
             data: The full buffered write payload.
             detected_format: The lowercase canonical extension the provider
                 returned from ``detect_format`` for these bytes (e.g. ``"mp4"``).
+            file_name: The caller's intended destination filename (not full
+                path). Required so artist-facing denial messages can name the
+                exact save that was blocked -- a gate that can't identify what
+                it refused isn't useful to the person seeing the error.
+            caller_variables: The caller's macro variable bindings (from
+                ``WriteFileRequest.file_path`` when it's a ``MacroPath``, else
+                ``None``). Providers that need to stage bytes to a project temp
+                path can pass this through to ``WriteTempFileRequest`` so the
+                temp filename carries origin context (e.g. ``node_name``) and
+                forward-compat with SAVE_TEMP_FILE extensions comes for free.
 
         Returns:
             A ``CheckpointDenial`` to refuse the write (OSManager converts it

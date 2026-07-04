@@ -436,7 +436,7 @@ class TestPermissionDispatch:
             def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
                 return None
 
-            def check_write_permission(self, data, detected_format):  # noqa: ANN001, ANN202, ARG002
+            def check_write_permission(self, data, detected_format, *, file_name, caller_variables=None):  # noqa: ANN001, ANN202, ARG002
                 self.__class__.calls.append(("write", detected_format))
                 return denial_for_write
 
@@ -460,7 +460,7 @@ class TestPermissionDispatch:
         manager = ArtifactManager()
         self._register(manager, probe_cls)
 
-        denial = manager.check_write_permission(b"any bytes", self._PROBE_FORMAT)
+        denial = manager.check_write_permission(b"any bytes", self._PROBE_FORMAT, file_name="thing.probe")
 
         assert denial is expected_denial
         assert probe_cls.calls == [("write", self._PROBE_FORMAT)]
@@ -470,7 +470,7 @@ class TestPermissionDispatch:
         # not the ArtifactManager's job to know every possible extension.
         manager = ArtifactManager()
 
-        assert manager.check_write_permission(b"data", "unregistered") is None
+        assert manager.check_write_permission(b"data", "unregistered", file_name="thing.dat") is None
 
     def test_check_read_permission_dispatches_by_extension(self) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure

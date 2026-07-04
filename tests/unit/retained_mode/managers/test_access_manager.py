@@ -798,7 +798,7 @@ class TestCodecAccess:
         seen_attributes.clear()
         griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
         try:
-            enforcement_denial = provider.check_write_permission(b"fake mp4 bytes", "mp4")
+            enforcement_denial = provider.check_write_permission(b"fake mp4 bytes", "mp4", file_name="clip.mp4")
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
 

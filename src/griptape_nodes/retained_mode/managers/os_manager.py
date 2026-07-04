@@ -30,6 +30,7 @@ from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailure
 from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
     InvalidTemplateError,
@@ -120,10 +121,15 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
+    WriteTempFileRequest,
+    WriteTempFileResultFailure,
+    WriteTempFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultSuccess,
     MacroPath,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -373,6 +379,10 @@ class OSManager:
 
             event_manager.assign_manager_to_request_type(
                 request_type=WriteFileRequest, callback=self.on_write_file_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=WriteTempFileRequest, callback=self.on_write_temp_file_request
             )
 
             event_manager.assign_manager_to_request_type(
@@ -2398,7 +2408,17 @@ class OSManager:
         # Appends skip the vet: the tail alone has no container header to
         # classify.
         if sniffed_ext is not None and not request.append:
-            denial = GriptapeNodes.ArtifactManager().check_write_permission(request.content, sniffed_ext)  # type: ignore[arg-type]
+            # Thread the caller's macro variables through so a provider that
+            # needs to stage bytes at a project temp path can preserve caller
+            # context in the temp filename (e.g. ``node_name`` for
+            # observability of orphan temp files after a crash).
+            caller_variables = request.file_path.variables if isinstance(request.file_path, MacroPath) else None
+            denial = GriptapeNodes.ArtifactManager().check_write_permission(
+                request.content,  # type: ignore[arg-type]
+                sniffed_ext,
+                file_name=file_path.name,
+                caller_variables=caller_variables,
+            )
             if denial is not None:
                 msg = f"Cannot save '{file_path.name}': {denial.reason()}"
                 return WriteFileResultFailure(
@@ -2707,6 +2727,76 @@ class OSManager:
             final_file_path=str(final_file_path),
             bytes_written=final_bytes_written,
             result_details=result_details,
+        )
+
+    def on_write_temp_file_request(self, request: WriteTempFileRequest) -> ResultPayload:
+        """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path.
+
+        Distinct from ``on_write_file_request``: callers do not choose the
+        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. The
+        handler resolves the situation, passes the caller's ``variables`` to
+        ``GetPathForMacroRequest`` (which merges in project builtins like
+        ``{temp}``), ensures the parent dir exists, and delegates the write
+        to ``_attempt_file_write`` -- the same helper ``on_write_file_request``
+        uses, so exception taxonomy and locking behavior stay identical.
+
+        The handler does NOT synthesize any variable bindings on the caller's
+        behalf. Callers are responsible for supplying enough variables to
+        fully resolve the macro (unresolved required slots surface as a
+        Failure); if a caller wants collision-safe filenames they must include
+        a uuid or similar in ``variables["file_name_base"]``.
+        """
+        situation_result = GriptapeNodes.handle_request(
+            GetSituationRequest(situation_name=BuiltInSituation.SAVE_TEMP_FILE)
+        )
+        if not isinstance(situation_result, GetSituationResultSuccess):
+            msg = (
+                f"Attempted to write temp file. Failed because the '{BuiltInSituation.SAVE_TEMP_FILE}' "
+                f"situation is not registered in the current project template."
+            )
+            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        try:
+            parsed_macro = ParsedMacro(situation_result.situation.macro)
+        except MacroSyntaxError as exc:
+            msg = f"Attempted to write temp file. Failed to parse SAVE_TEMP_FILE macro: {exc}"
+            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        path_result = GriptapeNodes.handle_request(
+            GetPathForMacroRequest(parsed_macro=parsed_macro, variables=request.variables)
+        )
+        if not isinstance(path_result, GetPathForMacroResultSuccess):
+            msg = f"Attempted to write temp file. Failed to resolve SAVE_TEMP_FILE macro: {path_result.result_details}"
+            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+
+        staged_path = path_result.absolute_path
+
+        parent_failure_reason = self._ensure_parent_directory_ready(staged_path, create_parents=True)
+        if parent_failure_reason is not None:
+            msg = f"Attempted to write temp file at '{staged_path}'. Failed to prepare parent directory."
+            return WriteTempFileResultFailure(failure_reason=parent_failure_reason, result_details=msg)
+
+        normalized_path = normalize_path_for_platform(staged_path)
+        attempt = self._attempt_file_write(
+            normalized_path=Path(normalized_path),
+            content=request.content,
+            encoding="utf-8",  # ignored for bytes content
+            mode="w",
+            file_path_display=staged_path,
+            fail_if_file_exists=False,  # uuid stem makes this unreachable, but be explicit
+            fail_if_file_locked=True,
+        )
+        if attempt.failure_reason is not None:
+            # ``error_message`` is guaranteed set when ``failure_reason`` is set.
+            return WriteTempFileResultFailure(
+                failure_reason=attempt.failure_reason,
+                result_details=attempt.error_message,  # type: ignore[arg-type]
+            )
+        # ``bytes_written`` is guaranteed set on the success path.
+        return WriteTempFileResultSuccess(
+            staged_path=str(staged_path),
+            bytes_written=attempt.bytes_written,  # type: ignore[arg-type]
+            result_details=f"Temp file written at {staged_path}",
         )
 
     def _apply_extension_coercion(
