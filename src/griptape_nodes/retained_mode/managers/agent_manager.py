@@ -183,6 +183,63 @@ def _build_agent_instructions(*, include_image_tool: bool) -> str:
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
 
 
+def _underlying_httpx_error(exc: BaseException | None) -> httpx.RequestError | None:
+    """Walk an exception's cause/context chain for an httpx transport error.
+
+    Model clients wrap the raw httpx error (e.g. ``openai.APIConnectionError``
+    raised ``from`` an ``httpx.ConnectError``), so the connection failure is
+    often the ``__cause__`` rather than the exception itself. Bounded walk to
+    avoid pathological cycles.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, httpx.RequestError):
+            return current
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return None
+
+
+def _friendly_provider_error(exc: Exception, base_url: str | None) -> str | None:
+    """Return a user-facing message for a provider failure the user can act on.
+
+    A custom/local provider (LMStudio, Ollama, any OpenAI-compatible endpoint)
+    is commonly unreachable — the app is closed, the machine slept, the port
+    changed. The raw transport error ("All connection attempts failed") means
+    nothing to the person who configured it, so map connection-class failures
+    to plain language that names the endpoint and points at the likely cause.
+
+    Returns ``None`` when the error isn't a recognizable connection failure, so
+    callers fall back to their existing (raw) message for other error classes.
+
+    On the agent-run path the httpx error is typically wrapped by the model
+    client (e.g. ``openai.APIConnectionError``), so we unwrap the ``__cause__``
+    / ``__context__`` chain to find the underlying transport error rather than
+    depending on the client library's own exception types.
+    """
+    exc = _underlying_httpx_error(exc) or exc
+    where = f" at '{base_url}'" if base_url else ""
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            f"Couldn't reach the model provider{where}. Is the local server "
+            "(e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return (
+            f"The model provider{where} didn't respond in time. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    # Other httpx.RequestError subclasses (DNS failures, connection drops, etc.)
+    # are still connection-shaped from the user's perspective.
+    if isinstance(exc, httpx.RequestError):
+        return (
+            f"Couldn't connect to the model provider{where}. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    return None
+
+
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
 # wedge the conversation. The numbers are deliberately generous: 60 model
 # requests is enough for a complex multi-tool task while still protecting the
@@ -311,9 +368,17 @@ class AgentManager:
         try:
             return await self._run_agent(request)
         except Exception as e:
-            err_msg = f"Error running agent: {e}"
-            logger.exception(err_msg)
-            return RunAgentResultFailure(error={"message": str(e)}, result_details=err_msg)
+            # Keep the raw exception in the logs; surface a message the user can
+            # act on when the failure is a provider that's simply unreachable
+            # (a common state for local providers like LMStudio/Ollama).
+            logger.exception("Error running agent")
+            base_url = self._get_provider(request.provider_name).base_url
+            friendly = _friendly_provider_error(e, base_url)
+            user_msg = friendly or str(e)
+            return RunAgentResultFailure(
+                error={"message": user_msg},
+                result_details=friendly or f"Error running agent: {e}",
+            )
 
     async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
@@ -614,8 +679,11 @@ class AgentManager:
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
-            details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
-            logger.warning(details)
+            # Keep the raw exception in the logs for debugging, but surface a
+            # message the user can act on when the provider is simply offline.
+            logger.warning("Attempted to list models from '%s'. Failed with: %s", request.base_url, e)
+            friendly = _friendly_provider_error(e, request.base_url)
+            details = friendly or f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             return ListProviderModelsResultFailure(result_details=details)
 
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
