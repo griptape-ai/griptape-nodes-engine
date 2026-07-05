@@ -92,7 +92,7 @@ class TestListSubstitutablesRequest:
         assert isinstance(result, ListSubstitutablesResultSuccess)
         assert result.substitutables == []
 
-    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
         with patch(_MACRO_PATCH, return_value={}):
             result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
         assert isinstance(result, ListSubstitutablesResultFailure)
