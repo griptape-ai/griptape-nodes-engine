@@ -530,6 +530,9 @@ class VariablesManager:
 
     def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:
         """List all values available for {VAR} substitution, unified across sources."""
+        # Lazy import to avoid circular dependency between retained_mode and exe_types.
+        from griptape_nodes.exe_types.variable_resolver import VariableResolver
+
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
         except ValueError as e:
@@ -540,13 +543,20 @@ class VariablesManager:
         project_vars = self._get_project_macro_variables()
         user_vars = self._get_variables_by_scope(starting_flow, request.lookup_scope)
 
+        # Apply same filter as ResolveSubstitutionRequest (only str/int values substitute).
+        # Exclude user vars whose names collide with a project macro (macro wins, matching
+        # the {**project_vars, **workflow_vars} merge order in on_resolve_substitution_request).
+        raw_user_vars = {v.name: v.value for v in user_vars}
+        filtered_user_vars = VariableResolver._filter_for_substitution(raw_user_vars)
+
         substitutables: list[Substitutable] = [
             Substitutable(name=name, value=value, source="macro", read_only=True)
             for name, value in sorted(project_vars.items())
         ]
         substitutables += [
-            Substitutable(name=v.name, value=v.value, source="variable", read_only=False)
-            for v in sorted(user_vars, key=lambda v: v.name)
+            Substitutable(name=name, value=value, source="variable", read_only=False)
+            for name, value in sorted(filtered_user_vars.items())
+            if name not in project_vars
         ]
 
         return ListSubstitutablesResultSuccess(

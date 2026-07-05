@@ -3213,8 +3213,10 @@ class ProjectManager:
             with contextlib.suppress(RuntimeError, NotImplementedError):
                 variables[name] = resolver._get_builtin(name)
         for name in project_info.template.directories:
-            with contextlib.suppress(Exception):
+            try:
                 variables[name] = resolver.resolve_directory(name)
+            except (RuntimeError, NotImplementedError) as e:
+                logger.debug("Skipping directory variable %r: %s", name, e)
         return variables
 
     # Helper methods (private)
