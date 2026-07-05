@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -377,7 +377,7 @@ class Substitutable:
 
     name: str
     value: str | int
-    source: str
+    source: Literal["variable", "macro"]
     read_only: bool = False
 
 

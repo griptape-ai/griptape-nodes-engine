@@ -122,10 +122,16 @@ In addition to user-defined workflow variables, the substitution context also in
 
 User-defined workflow variables take priority over all project-level variables.
 
-**How it works**: `NodeExecutor._resolve_project_macro_variables()` calls `GetCurrentProjectRequest`, then `ProjectManager.get_project_substitution_variables(project_info)`. That method uses `_build_variable_resolver` to build a resolver and iterates over `BUILTIN_VARIABLES` and `template.directories`, silently skipping anything that can't be resolved. The result is merged under workflow variables in `_resolve_variables_for_node`:
+**How it works**: `NodeExecutor._resolve_variables_for_node` dispatches `ResolveSubstitutionRequest`. Inside `VariablesManager.on_resolve_substitution_request`, `_get_project_macro_variables()` calls `GetCurrentProjectRequest` then `ProjectManager.get_project_substitution_variables(project_info)` — which uses `_build_variable_resolver` and iterates over `BUILTIN_VARIABLES` and `template.directories`, silently skipping anything that can't be resolved. The merge and final filter happen across the two layers:
 
 ```python
-project_vars = NodeExecutor._resolve_project_macro_variables()
-workflow_vars = VariableResolver._filter_for_substitution(var_result.variables)
-return {**project_vars, **workflow_vars}  # workflow vars win
+# Inside VariablesManager.on_resolve_substitution_request:
+project_vars = self._get_project_macro_variables()
+workflow_vars = {v.name: v.value for v in self._get_variables_by_scope(...)}
+all_vars = {**project_vars, **workflow_vars}  # workflow vars win
+return ResolveSubstitutionResultSuccess(variables=all_vars)
+
+# Inside NodeExecutor._resolve_variables_for_node:
+var_result = GriptapeNodes.handle_request(ResolveSubstitutionRequest(...))
+return VariableResolver._filter_for_substitution(var_result.variables)
 ```
