@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
-from griptape_nodes.retained_mode.events.variable_events import GetVariablesRequest, GetVariablesResultSuccess
+from griptape_nodes.retained_mode.events.variable_events import (
+    ResolveSubstitutionRequest,
+    ResolveSubstitutionResultSuccess,
+)
 
 from .mocks import MockNode
 
@@ -60,8 +63,8 @@ def _mock_gn(
     mock_gn = MagicMock()
     mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
     mock_gn.handle_request.side_effect = lambda req: (
-        GetVariablesResultSuccess(variables=variables, result_details="ok")
-        if isinstance(req, GetVariablesRequest)
+        ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
+        if isinstance(req, ResolveSubstitutionRequest)
         else MagicMock()
     )
 
@@ -102,8 +105,8 @@ def _run_tracked_set(
         mock_gn = MagicMock()
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
         mock_gn.handle_request.side_effect = lambda req: (
-            GetVariablesResultSuccess(variables=variables, result_details="ok")
-            if isinstance(req, GetVariablesRequest)
+            ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
+            if isinstance(req, ResolveSubstitutionRequest)
             else MagicMock()
         )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})

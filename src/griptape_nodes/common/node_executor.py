@@ -96,8 +96,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.variable_events import (
-    GetVariablesRequest,
-    GetVariablesResultSuccess,
+    ResolveSubstitutionRequest,
+    ResolveSubstitutionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -312,9 +312,9 @@ class NodeExecutor:
         except KeyError:
             return {}
         var_result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(var_result, GetVariablesResultSuccess):
+        if not isinstance(var_result, ResolveSubstitutionResultSuccess):
             return {}
         return VariableResolver._filter_for_substitution(var_result.variables)
 

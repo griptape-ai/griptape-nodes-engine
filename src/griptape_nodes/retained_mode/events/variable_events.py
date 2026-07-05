@@ -364,15 +364,68 @@ class GetVariableDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
     """Variable details retrieval failed."""
 
 
+@dataclass
+class Substitutable:
+    """A single value available for {VAR} substitution.
+
+    Attributes:
+        name: The token name (what goes inside the braces, e.g. "workspace_dir")
+        value: The resolved value
+        source: Origin of the value ("variable" | "macro" — extensible for future sources)
+        read_only: Whether the user can edit this value (macros are read-only)
+    """
+
+    name: str
+    value: str | int
+    source: str
+    read_only: bool = False
+
+
+@dataclass
+@PayloadRegistry.register
+class ListSubstitutablesRequest(RequestPayload):
+    """List all values available for {VAR} substitution from the starting flow.
+
+    Returns user-defined workflow variables and project macro variables
+    (workspace_dir, workflow_name, template directories, etc.) as a unified
+    list of Substitutable objects. The source field distinguishes them.
+
+    Args:
+        lookup_scope: Variable lookup strategy (default: hierarchical)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ListSubstitutablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Substitutables listed successfully."""
+
+    substitutables: list[Substitutable]
+
+
+@dataclass
+@PayloadRegistry.register
+class ListSubstitutablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Substitutables listing failed."""
+
+
 # Bulk Get/Set Variable Events
 @dataclass
 @PayloadRegistry.register
-class GetVariablesRequest(RequestPayload):
-    """Get variable values visible from the starting flow.
+class ResolveSubstitutionRequest(RequestPayload):
+    """Resolve all values available for {VAR} substitution from the starting flow.
+
+    Returns user-defined workflow variables merged with project macro variables
+    (workspace_dir, workflow_name, template directories, etc.). Project macros
+    are the base layer; workflow variables take priority on conflict.
 
     When ``names`` is non-empty, looks up each name individually via
     ``_find_variable_hierarchical`` and fails (all-or-nothing) if any name is
-    not found. When ``names`` is empty, returns every variable in scope.
+    not found. When ``names`` is empty, returns every substitutable value in scope.
 
     Args:
         names: Specific variable names to retrieve. Empty means "all in scope".
@@ -387,16 +440,16 @@ class GetVariablesRequest(RequestPayload):
 
 @dataclass
 @PayloadRegistry.register
-class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Variables retrieved successfully."""
+class ResolveSubstitutionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Substitution values resolved successfully."""
 
     variables: dict[str, Any]
 
 
 @dataclass
 @PayloadRegistry.register
-class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Variables retrieval failed."""
+class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Substitution value resolution failed."""
 
 
 @dataclass

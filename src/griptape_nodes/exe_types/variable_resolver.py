@@ -144,8 +144,8 @@ class VariableResolver:
             return cached  # type: ignore[return-value]
 
         from griptape_nodes.retained_mode.events.variable_events import (
-            GetVariablesRequest,
-            GetVariablesResultSuccess,
+            ResolveSubstitutionRequest,
+            ResolveSubstitutionResultSuccess,
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -155,9 +155,9 @@ class VariableResolver:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
         result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(result, GetVariablesResultSuccess):
+        if not isinstance(result, ResolveSubstitutionResultSuccess):
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
         resolved = VariableResolver._filter_for_substitution(result.variables)

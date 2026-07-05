@@ -2,6 +2,10 @@ import logging
 from typing import Any, NamedTuple
 
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
+from griptape_nodes.retained_mode.events.project_events import (
+    GetCurrentProjectRequest,
+    GetCurrentProjectResultSuccess,
+)
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
     CreateVariableResultFailure,
@@ -15,9 +19,6 @@ from griptape_nodes.retained_mode.events.variable_events import (
     GetVariableRequest,
     GetVariableResultFailure,
     GetVariableResultSuccess,
-    GetVariablesRequest,
-    GetVariablesResultFailure,
-    GetVariablesResultSuccess,
     GetVariableTypeRequest,
     GetVariableTypeResultFailure,
     GetVariableTypeResultSuccess,
@@ -27,12 +28,18 @@ from griptape_nodes.retained_mode.events.variable_events import (
     HasVariableRequest,
     HasVariableResultFailure,
     HasVariableResultSuccess,
+    ListSubstitutablesRequest,
+    ListSubstitutablesResultFailure,
+    ListSubstitutablesResultSuccess,
     ListVariablesRequest,
     ListVariablesResultFailure,
     ListVariablesResultSuccess,
     RenameVariableRequest,
     RenameVariableResultFailure,
     RenameVariableResultSuccess,
+    ResolveSubstitutionRequest,
+    ResolveSubstitutionResultFailure,
+    ResolveSubstitutionResultSuccess,
     SetVariablesRequest,
     SetVariablesResultFailure,
     SetVariablesResultSuccess,
@@ -42,6 +49,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariableValueRequest,
     SetVariableValueResultFailure,
     SetVariableValueResultSuccess,
+    Substitutable,
     VariableDetails,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -80,7 +88,10 @@ class VariablesManager:
             event_manager.assign_manager_to_request_type(
                 GetVariableDetailsRequest, self.on_get_variable_details_request
             )
-            event_manager.assign_manager_to_request_type(GetVariablesRequest, self.on_get_variables_request)
+            event_manager.assign_manager_to_request_type(
+                ResolveSubstitutionRequest, self.on_resolve_substitution_request
+            )
+            event_manager.assign_manager_to_request_type(ListSubstitutablesRequest, self.on_list_substitutables_request)
             event_manager.assign_manager_to_request_type(SetVariablesRequest, self.on_set_variables_request)
 
     def clear_object_state(self) -> None:
@@ -488,6 +499,18 @@ class VariablesManager:
 
         return variables
 
+    def _get_project_macro_variables(self) -> dict[str, Any]:
+        """Return project-level macro variables available for {VAR} substitution.
+
+        Includes builtin variables (workspace_dir, workflow_name, etc.) and any
+        project template directories (inputs, outputs, etc.). Returns an empty
+        dict when no project is loaded or the project info cannot be retrieved.
+        """
+        result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
+        if not isinstance(result, GetCurrentProjectResultSuccess):
+            return {}
+        return GriptapeNodes.ProjectManager().get_project_substitution_variables(result.project_info)
+
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
@@ -505,35 +528,72 @@ class VariablesManager:
             variables=variables, result_details=f"Successfully listed {len(variables)} variables."
         )
 
-    def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
-        """Get variable values visible from the starting flow."""
+    def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:
+        """List all values available for {VAR} substitution, unified across sources."""
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
         except ValueError as e:
-            return GetVariablesResultFailure(
+            return ListSubstitutablesResultFailure(
+                result_details=f"Attempted to list substitutables. Failed to determine starting flow: {e}"
+            )
+
+        project_vars = self._get_project_macro_variables()
+        user_vars = self._get_variables_by_scope(starting_flow, request.lookup_scope)
+
+        substitutables: list[Substitutable] = [
+            Substitutable(name=name, value=value, source="macro", read_only=True)
+            for name, value in sorted(project_vars.items())
+        ]
+        substitutables += [
+            Substitutable(name=v.name, value=v.value, source="variable", read_only=False)
+            for v in sorted(user_vars, key=lambda v: v.name)
+        ]
+
+        return ListSubstitutablesResultSuccess(
+            substitutables=substitutables,
+            result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
+        )
+
+    def on_resolve_substitution_request(self, request: ResolveSubstitutionRequest) -> ResultPayload:
+        """Get variable values visible from the starting flow.
+
+        The result always includes project-level macro variables (builtins such as
+        workspace_dir, workflow_name, and any project template directories such as
+        inputs, outputs). User-defined workflow variables take priority over project
+        macros when names collide.
+        """
+        try:
+            starting_flow = self._get_starting_flow(request.starting_flow)
+        except ValueError as e:
+            return ResolveSubstitutionResultFailure(
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
             )
+
+        project_vars = self._get_project_macro_variables()
 
         if request.names:
             result: dict[str, Any] = {}
             missing: list[str] = []
             for name in request.names:
                 lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope)
-                if lookup.variable is None:
-                    missing.append(name)
-                else:
+                if lookup.variable is not None:
                     result[name] = lookup.variable.value
+                elif name in project_vars:
+                    result[name] = project_vars[name]
+                else:
+                    missing.append(name)
             if missing:
-                return GetVariablesResultFailure(
+                return ResolveSubstitutionResultFailure(
                     result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
                 )
-            return GetVariablesResultSuccess(
+            return ResolveSubstitutionResultSuccess(
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
             )
 
         variables = self._get_variables_by_scope(starting_flow, request.lookup_scope)
-        all_vars = {v.name: v.value for v in variables}
-        return GetVariablesResultSuccess(
+        workflow_vars = {v.name: v.value for v in variables}
+        all_vars = {**project_vars, **workflow_vars}
+        return ResolveSubstitutionResultSuccess(
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
@@ -596,7 +656,7 @@ class VariablesManager:
 
         flow_manager = GriptapeNodes.FlowManager()
         if flow_manager.check_for_existing_running_flow():
-            # Mid-run: downstream UNRESOLVED nodes pick up new values naturally via GetVariablesRequest.
+            # Mid-run: downstream UNRESOLVED nodes pick up new values naturally via ResolveSubstitutionRequest.
             return
 
         connections = flow_manager.get_connections()
