@@ -509,6 +509,9 @@ class VariablesManager:
         result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
         if not isinstance(result, GetCurrentProjectResultSuccess):
             return {}
+        # Intentional shortcut: get_project_substitution_variables is a pure function
+        # that takes the already-resolved project_info and has no side effects, so
+        # routing it through handle_request would add plumbing without benefit.
         return GriptapeNodes.ProjectManager().get_project_substitution_variables(result.project_info)
 
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
