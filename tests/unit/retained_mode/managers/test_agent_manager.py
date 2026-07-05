@@ -59,8 +59,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     AgentManager,
     _ActiveRun,
     _compose_prompt,
-    _friendly_provider_error,
-    _underlying_httpx_error,
+    _friendly_list_models_error,
 )
 
 
@@ -718,13 +717,15 @@ class TestListProviderModels:
 
 
 # ---------------------------------------------------------------------------
-# Friendly provider-error mapping
+# Friendly list-models error mapping
 # ---------------------------------------------------------------------------
 
 
-class TestFriendlyProviderError:
+class TestFriendlyListModelsError:
     def test_connect_error_maps_to_friendly_message(self) -> None:
-        msg = _friendly_provider_error(httpx.ConnectError("All connection attempts failed"), "http://localhost:1234/v1")
+        msg = _friendly_list_models_error(
+            httpx.ConnectError("All connection attempts failed"), "http://localhost:1234/v1"
+        )
 
         assert msg is not None
         assert "All connection attempts failed" not in msg
@@ -732,19 +733,19 @@ class TestFriendlyProviderError:
         assert "running" in msg.lower()
 
     def test_connect_timeout_maps_to_friendly_message(self) -> None:
-        msg = _friendly_provider_error(httpx.ConnectTimeout("timed out"), "http://localhost:11434/v1")
+        msg = _friendly_list_models_error(httpx.ConnectTimeout("timed out"), "http://localhost:11434/v1")
 
         assert msg is not None
         assert "http://localhost:11434/v1" in msg
 
     def test_read_timeout_maps_to_friendly_message(self) -> None:
-        msg = _friendly_provider_error(httpx.ReadTimeout("slow"), "http://host/v1")
+        msg = _friendly_list_models_error(httpx.ReadTimeout("slow"), "http://host/v1")
 
         assert msg is not None
         assert "didn't respond" in msg
 
     def test_generic_request_error_maps_to_friendly_message(self) -> None:
-        msg = _friendly_provider_error(httpx.RequestError("dns broke"), "http://host/v1")
+        msg = _friendly_list_models_error(httpx.RequestError("dns broke"), "http://host/v1")
 
         assert msg is not None
         assert "connect" in msg.lower()
@@ -752,35 +753,21 @@ class TestFriendlyProviderError:
     def test_non_connection_error_returns_none(self) -> None:
         # A value/parse error is not connection-shaped — caller should fall back
         # to its own (raw) message rather than a misleading "server not running".
-        assert _friendly_provider_error(ValueError("bad json"), "http://host/v1") is None
+        assert _friendly_list_models_error(ValueError("bad json"), "http://host/v1") is None
+
+    def test_http_status_error_returns_none(self) -> None:
+        # An HTTP status error means the server *answered* — it's reachable, so
+        # "is the server running?" would be misleading. Fall back to the raw msg.
+        request = httpx.Request("GET", "http://host/v1/models")
+        response = httpx.Response(500, request=request)
+        status_error = httpx.HTTPStatusError("500", request=request, response=response)
+        assert _friendly_list_models_error(status_error, "http://host/v1") is None
 
     def test_missing_base_url_omits_endpoint(self) -> None:
-        msg = _friendly_provider_error(httpx.ConnectError("x"), None)
+        msg = _friendly_list_models_error(httpx.ConnectError("x"), None)
 
         assert msg is not None
         assert "at ''" not in msg
-
-    def test_wrapped_httpx_error_is_unwrapped(self) -> None:
-        # Model clients (e.g. openai) wrap the transport error; the friendly
-        # mapping should still fire on the underlying cause.
-        wrapped = RuntimeError("APIConnectionError: Connection error.")
-        wrapped.__cause__ = httpx.ConnectError("All connection attempts failed")
-
-        msg = _friendly_provider_error(wrapped, "http://localhost:1234/v1")
-
-        assert msg is not None
-        assert "Connection error" not in msg
-        assert "running" in msg.lower()
-
-    def test_underlying_httpx_error_finds_cause(self) -> None:
-        inner = httpx.ConnectError("boom")
-        outer = RuntimeError("wrapped")
-        outer.__cause__ = inner
-
-        assert _underlying_httpx_error(outer) is inner
-
-    def test_underlying_httpx_error_none_when_absent(self) -> None:
-        assert _underlying_httpx_error(RuntimeError("no transport error here")) is None
 
 
 # ---------------------------------------------------------------------------
