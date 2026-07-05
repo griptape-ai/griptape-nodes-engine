@@ -437,6 +437,18 @@ def _build_path_tree(paths: list[str]) -> dict:
 def _apply_path_tree(data: Any, tree: dict) -> Any:
     if not isinstance(data, dict):
         return data
+    if "*" in tree:
+        # Wildcard: apply subtree to every value in this dict (e.g. dict[str, SomeObject])
+        subtree = tree["*"]
+        if not subtree:
+            return dict(data)
+        filtered = {}
+        for k, v in data.items():
+            if isinstance(v, list):
+                filtered[k] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in v]
+            else:
+                filtered[k] = _apply_path_tree(v, subtree)
+        return filtered
     result = {}
     for key, subtree in tree.items():
         if key not in data:
