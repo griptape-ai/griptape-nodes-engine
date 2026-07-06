@@ -589,10 +589,14 @@ class FlowManager:
         GriptapeNodes.ObjectManager().add_object_by_name(name=final_flow_name, obj=flow)
         self._name_to_parent_name[final_flow_name] = parent_name
 
-        # Track referenced workflow if this flow was created within a referenced workflow context
+        # Track referenced workflow if this flow was created within a referenced workflow context.
+        # The name is also written into flow.metadata so the GUI can read it via GetFlowMetadataRequest
+        # without needing the heavier GetFlowDetailsRequest.  The editor uses this to suppress rendering
+        # nodes that belong to a referenced-workflow subtree on the parent canvas.
         if workflow_manager.has_current_referenced_workflow():
             referenced_workflow_name = workflow_manager.get_current_referenced_workflow()
             self._flow_to_referenced_workflow_name[flow] = referenced_workflow_name
+            flow.metadata["referenced_workflow_name"] = referenced_workflow_name
 
         # See if we need to push it as the current context.
         if request.set_as_new_context:
