@@ -519,13 +519,25 @@ class GetPublishOptionsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 class PublishWorkflowRegisteredEventData:
-    """Data specific to registering a PublishWorkflowRequest event handler."""
+    """Data specific to registering a PublishWorkflowRequest event handler.
+
+    Args:
+        start_flow_node_type: Node type used as the start of the published flow.
+        start_flow_node_library_name: Library that provides the start node type.
+        end_flow_node_type: Node type used as the end of the published flow.
+        end_flow_node_library_name: Library that provides the end node type.
+        get_publish_options: Optional callable returning custom publish options for this target.
+        display_name: Optional human-readable name for the publishing target. When set, the GUI
+            should show this in the publish menu/dialog instead of the raw library name. When None,
+            the frontend falls back to the library name, preserving today's behavior.
+    """
 
     start_flow_node_type: str
     start_flow_node_library_name: str
     end_flow_node_type: str
     end_flow_node_library_name: str
     get_publish_options: Callable[["GetPublishOptionsRequest"], GetPublishOptionsResultSuccess] | None = None
+    display_name: str | None = None
 
 
 @dataclass
