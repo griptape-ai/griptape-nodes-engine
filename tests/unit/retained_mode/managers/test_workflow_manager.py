@@ -2815,10 +2815,10 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             # The destination carries the create_versioned_workflow macro (unresolved
-            # `{_index:03}`), so OSManager's seed walks past existing v001 and lands
-            # at v002 on write.
+            # `{###}` sequence slot), so OSManager's seed walks past existing v001 and
+            # lands at v002 on write.
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            assert "###" in target.destination._file.location
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
@@ -2990,8 +2990,8 @@ class TestCreateVersionedWorkflow:
         situation = DEFAULT_PROJECT_TEMPLATE.situations.get(BuiltInSituation.CREATE_VERSIONED_WORKFLOW)
         assert situation is not None, "create_versioned_workflow missing from DEFAULT_PROJECT_TEMPLATE"
         assert situation.policy.on_collision == SituationFilePolicy.CREATE_NEW
-        # Padded `{_index:NN}` slot is what makes the seed-and-retry produce v001/v002/...
-        assert "_index" in situation.macro
+        # The `{###}` sequence slot is what makes the seed-and-retry produce v001/v002/...
+        assert "###" in situation.macro
 
     def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: GriptapeNodes) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
@@ -3005,7 +3005,7 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            assert "###" in target.destination._file.location
             # Base name comes from the explicit request; relative_file_path reflects
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"

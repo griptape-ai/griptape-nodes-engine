@@ -35,7 +35,9 @@ from griptape_nodes.common.project_templates import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
     SituationTemplate,
+    default_template_for_version,
     load_partial_project_template,
+    schema_major_or_none,
     select_project_path,
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
@@ -109,6 +111,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     UnregisterProjectTemplateResultFailure,
     UnregisterProjectTemplateResultSuccess,
     UnresolvedSequenceSlotBehavior,
+    UpgradeProjectSchemaRequest,
+    UpgradeProjectSchemaResultFailure,
+    UpgradeProjectSchemaResultSuccess,
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
@@ -519,6 +524,9 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(GetCurrentProjectRequest, self.on_get_current_project_request)
         event_manager.assign_manager_to_request_type(SaveProjectTemplateRequest, self.on_save_project_template_request)
         event_manager.assign_manager_to_request_type(
+            UpgradeProjectSchemaRequest, self.on_upgrade_project_schema_request
+        )
+        event_manager.assign_manager_to_request_type(
             AttemptMatchPathAgainstMacroRequest, self.on_match_path_against_macro_request
         )
         event_manager.assign_manager_to_request_type(GetStateForMacroRequest, self.on_get_state_for_macro_request)
@@ -851,14 +859,14 @@ class ProjectManager:
                     "treating as no parent on this OS",
                     overlay.parent_project_path,
                 )
-                return DEFAULT_PROJECT_TEMPLATE
+                return default_template_for_version(overlay.project_template_schema_version)
             parent_label = selected_parent
             parent_path_raw = Path(selected_parent)
             if not parent_path_raw.is_absolute():
                 parent_path_raw = project_file_path.parent / parent_path_raw
             parent_file_path = canonicalize_for_identity(parent_path_raw)
         else:
-            return DEFAULT_PROJECT_TEMPLATE
+            return default_template_for_version(overlay.project_template_schema_version)
 
         if parent_file_path in visited:
             cycle = " -> ".join(str(p) for p in [*sorted(visited, key=str), parent_file_path])
@@ -1569,9 +1577,11 @@ class ProjectManager:
 
         Resolves an ancestor's workspace without forcing that ancestor to be loaded/enabled. The
         chain traversal, cycle guard, and single per-node overlay read live in the shared
-        _nearest_ancestor_value_offline; only the per-node probe (an ancestor's explicit workspace,
-        read from config) is supplied here. The walk begins at the parent: the starting project's own
-        explicit sources are handled by _decide_workspace_pre_inheritance.
+        _nearest_ancestor_value_offline; only the per-node probe is supplied here. Each ancestor is
+        probed the same way (and in the same precedence) as the live walk: its workspace_dir template
+        field first (from the overlay, resolved against the ancestor's dir), then its
+        project_workspaces override, then its adjacent config. The walk begins at the parent: the
+        starting project's own explicit sources are handled by _decide_workspace_pre_inheritance.
 
         Because the shared walker requires each node's overlay to be readable to stay on the chain, an
         ancestor whose project YAML is unreadable is skipped even if it declares a workspace via a
@@ -1585,9 +1595,14 @@ class ProjectManager:
             default={},
         )
 
-        def probe(node_path: Path, _overlay: ProjectOverlayData) -> str | None:
-            # Workspace is read from config, not the overlay; the overlay was read by the walker to
-            # follow the parent link and doubles as the ancestor's readability check.
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+            # The ancestor's workspace_dir template field (branch 0) wins, mirroring how the ancestor
+            # would resolve its own workspace as the active project; the overlay was already read by
+            # the walker to follow the parent link, so the field is free to read here. Falls through
+            # to the ancestor's project_workspaces override / adjacent config when the field is unset.
+            template_workspace = self._resolve_template_workspace_dir(overlay.workspace_dir, node_path)
+            if template_workspace is not None:
+                return template_workspace
             return self._resolve_node_explicit_workspace(node_path, project_workspaces)
 
         return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
@@ -1897,13 +1912,16 @@ class ProjectManager:
     def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:
         """Walk the explicit parent-project chain for the nearest ancestor's workspace.
 
-        Returns the workspace_directory the nearest ancestor would resolve to (its
-        project_workspaces override, else its adjacent griptape_nodes_config.json),
-        or None when no ancestor in the chain defines one. The starting project's OWN
-        explicit sources are handled by the earlier branches of decide_workspace, so the
-        walk begins at the parent. The chain traversal and cycle guard live in the shared
-        _nearest_ancestor_value_live; only the per-node probe (an ancestor's explicit
-        workspace) is supplied here.
+        Returns the workspace the nearest ancestor would resolve to, or None when no ancestor in the
+        chain defines one. Each ancestor is probed the SAME way it resolves its own workspace when it
+        is the active project: its workspace_dir template field first (resolved against that
+        ancestor's dir, so a relative "./" means the ancestor's own folder -- not the child's), then
+        its project_workspaces override, then its adjacent griptape_nodes_config.json. Consulting the
+        template field here is what lets a parent that declares only workspace_dir be inherited (it is
+        the common self-contained case). The starting project's OWN explicit sources are handled by
+        the earlier branches of decide_workspace, so the walk begins at the parent. The chain
+        traversal and cycle guard live in the shared _nearest_ancestor_value_live; only the per-node
+        probe is supplied here.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
@@ -1914,6 +1932,11 @@ class ProjectManager:
         def probe(info: ProjectInfo) -> str | None:
             if info.project_file_path is None:
                 return None
+            template_workspace = self._resolve_template_workspace_dir(
+                info.template.workspace_dir, info.project_file_path
+            )
+            if template_workspace is not None:
+                return template_workspace
             return self._resolve_node_explicit_workspace(info.project_file_path, project_workspaces)
 
         return self._nearest_ancestor_value_live(project_file_path, probe)
@@ -2404,7 +2427,7 @@ class ProjectManager:
         # mappings are reduced to the active platform's value first; a mapping
         # with no matching key and no `default` falls back to system defaults
         # (no parent on this OS).
-        base_template: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE
+        base_template: ProjectTemplate = default_template_for_version(template.project_template_schema_version)
         if template.parent_project_id is not None:
             parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
             if parent_info is None:
@@ -2469,6 +2492,140 @@ class ProjectManager:
 
         return SaveProjectTemplateResultSuccess(
             result_details=f"Successfully saved project template to '{request.project_path}'",
+        )
+
+    async def on_upgrade_project_schema_request(  # noqa: PLR0911
+        self, request: UpgradeProjectSchemaRequest
+    ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
+        """Electively upgrade a loaded project to the latest schema major and re-save.
+
+        A within-major advance happens automatically on save; this performs the explicit,
+        opt-in crossing of a major boundary so the project ADOPTS the new major's defaults.
+
+        It re-reads the project's own on-disk OVERLAY (its explicit customizations only -- NOT
+        the merged template, whose inherited fields were materialized to the old-major values at
+        load), restamps that overlay to the latest version, and re-merges it onto the new-major
+        base. Re-saving that merged template diffs it back against the same new-major base, so a
+        field the user never overrode is omitted and falls through to the NEW default, while
+        genuine user overrides survive. BREAKING: a project's effective workspace/library/file
+        layout can change, which is exactly the point of crossing a major.
+
+        Only a parentless project can adopt the new defaults this way: its merge base is the
+        latest-major default template. A child's merge base is its parent's resolved template, which
+        each ancestor resolves against ITS OWN major, so a child cannot adopt new-major defaults while
+        its parent is still on the old major. Such a child is refused (upgrade the parent first) rather
+        than re-stamped to a version label its inherited layout does not match.
+
+        Failure cases (evaluated first): not loaded, no backing file, already at/ahead of the
+        latest major (or an unparsable version), the overlay can't be re-read, the parent chain is
+        still on an older major, or the re-save fails. Only then is the upgrade performed.
+        """
+        project_info = self._successfully_loaded_project_templates.get(request.project_id)
+        if project_info is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. Failed because it is not loaded."
+                ),
+            )
+        if project_info.project_file_path is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because it has no backing file (e.g. system defaults)."
+                ),
+            )
+
+        previous_version = project_info.template.project_template_schema_version
+        latest_version = ProjectTemplate.LATEST_SCHEMA_VERSION
+        # Only upgrade STRICTLY older majors. A project already at -- or somehow ahead of (a
+        # future major opened on an older engine, which the load path accepts forward-compat)
+        # -- the latest major must not be touched: restamping it down to latest would be a
+        # silent schema DOWNGRADE re-saved against an older baseline, contradicting the
+        # never-downgrade contract in _version_to_write. schema_major_or_none keeps this from
+        # raising on a malformed version (the load path tolerates one, so this must too).
+        previous_major = schema_major_or_none(previous_version)
+        latest_major = schema_major_or_none(latest_version)
+        if previous_major is None or latest_major is None or previous_major >= latest_major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its schema version '{previous_version}' is not an older major "
+                    f"than the latest '{latest_version}' (or is unparsable)."
+                ),
+            )
+
+        # Re-read the project's OWN overlay (explicit fields only) so inherited values are NOT
+        # carried over as old-major pins. Restamp it to the latest version, then re-merge onto
+        # the base for that version + the project's parent chain (the same base the save path
+        # re-diffs against), so un-overridden fields adopt the new-major defaults.
+        project_file_path = project_info.project_file_path
+        overlay_load = await self._read_overlay(project_file_path, record_status=False)
+        if isinstance(overlay_load, LoadProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its project file could not be re-read: {overlay_load.result_details}"
+                ),
+            )
+        _, overlay = overlay_load
+        upgraded_overlay = overlay._replace(project_template_schema_version=latest_version)
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        base_template = await self._resolve_parent_chain(
+            upgraded_overlay, project_file_path, validation, visited={canonicalize_for_identity(project_file_path)}
+        )
+        if base_template is None or not validation.is_usable():
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the upgraded template could not be resolved against the latest base."
+                ),
+            )
+
+        # Refuse to upgrade a child whose parent chain is still on an older major. The merge base is
+        # the parent's fully-resolved template, and each ancestor resolves against ITS OWN declared
+        # major (see _resolve_parent_chain), so a child re-stamped to the latest major but merged onto
+        # a v0-derived base would keep the old-major defaults for every field it never overrode --
+        # reporting a successful major upgrade while its effective layout does not change. Only a
+        # parentless project (whose base is the latest-major default template) can actually adopt the
+        # new defaults here. A parented child must upgrade the top of its chain first. schema_major_or_none
+        # tolerates a malformed base version the same way the guards above tolerate the project's own.
+        base_major = schema_major_or_none(base_template.project_template_schema_version)
+        if base_major is None or base_major < latest_major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its parent project is still on an older schema major "
+                    f"('{base_template.project_template_schema_version}'); a child inherits its parent's "
+                    f"defaults, so upgrade the parent (the top of the chain) to '{latest_version}' first."
+                ),
+            )
+
+        upgraded_template = ProjectTemplate.merge(base_template, upgraded_overlay, validation)
+
+        save_result = self.on_save_project_template_request(
+            SaveProjectTemplateRequest(
+                project_path=project_file_path,
+                template_data=upgraded_template.model_dump(mode="json"),
+            )
+        )
+        if isinstance(save_result, SaveProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the re-save failed: {save_result.result_details}"
+                ),
+            )
+
+        return UpgradeProjectSchemaResultSuccess(
+            project_id=request.project_id,
+            previous_schema_version=previous_version,
+            new_schema_version=latest_version,
+            result_details=(
+                f"Upgraded project '{request.project_id}' from schema '{previous_version}' "
+                f"to '{latest_version}'. The project now adopts the new-major defaults; its "
+                f"effective workspace/library/file layout may have changed."
+            ),
         )
 
     def on_validate_project_template_request(
@@ -3554,7 +3711,9 @@ class ProjectManager:
             )
             return f"its id '{project_id}' is already used by a different project at '{existing.project_file_path}'"
 
-        template = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
+        template = ProjectTemplate.merge(
+            default_template_for_version(overlay.project_template_schema_version), overlay, validation
+        )
 
         if not validation.is_usable():
             problem_details = "; ".join(
