@@ -6,26 +6,34 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
-Composition pattern (like ``huggingface_model_parameter.HuggingFaceModelParameter``):
+Usage — one construction step per parameter:
 
     class DescribeImage(ControlNode):
         def __init__(self, **kwargs) -> None:
             super().__init__(**kwargs)
-            self._model_access = ModelAccessParameter(
-                node=self,
-                model_choices=MODEL_CHOICES,
-                default_model=DEFAULT_MODEL,
-            )
             model_param = Parameter(
                 name="model",
                 type="str",
                 input_types=["str", "Prompt Model Config"],
-                default_value=self._model_access.pick_permitted_default() or DEFAULT_MODEL,
+                default_value=DEFAULT_MODEL,
                 ...,
-                # NO traits={Options(...)} -- helper installs Options + Button
+                # NO traits={Options(...)} -- component adds Options + Button itself.
             )
             self.add_parameter(model_param)
-            self._model_access.install(model_param)
+            self._model_access = ModelAccessComponent(
+                node=self,
+                parameter=model_param,
+                model_choices=MODEL_CHOICES,
+                default_model=DEFAULT_MODEL,
+            )
+
+The component's constructor does everything in one step: fetches the initial
+snapshot, validates the parameter, adds the ``Options`` + ``Button`` traits,
+sets ``ui_options`` for per-row decoration, applies the initial badge for the
+current stored value, and — if the caller's ``default_value`` is denied but a
+different value is currently permitted — resets the parameter's stored value
+to a permitted alternative via ``set_parameter_value(..., initial_setup=True)``.
+The parameter's declarative ``default_value`` is untouched.
 
 Nodes then forward ``after_value_set`` for the model parameter to
 ``self._model_access.on_value_changed(value)``, and pick a failure-routing
@@ -37,8 +45,24 @@ idiom that matches their base class:
     result_details=denial.reason())``.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
-disconnect) call ``reinstall_options()`` to put the helper's trait + decoration
-+ badge back in place.
+disconnect) call ``reinstall_options()`` to put the component's trait +
+decoration + badge back in place.
+
+Composition (not inheritance) is deliberate. Three reasons:
+
+1. **Base class diversity.** The candidate node set inherits from at least
+   4 different bases -- ``ControlNode``, ``GriptapeProxyNode`` (3 levels deep
+   over ``SuccessFailureNode(BaseNode)``), and config-node bases. A mixin
+   would force an MRO on every consumer and collide with existing hierarchies
+   (especially ``GriptapeProxyNode``'s). Composition is base-class-agnostic.
+2. **Namespace hygiene.** A mixin adds ~7 public methods (``refresh``,
+   ``on_value_changed``, ``query_for_denial``, ``raise_if_denied``, etc.) to
+   the node's public surface. ``refresh`` in particular is a common name that
+   could clash with existing node methods. Composition keeps them scoped to
+   ``self._model_access.foo(...)``.
+3. **Multiple instances per node.** A node with two model-selection
+   parameters (a prompt model + an image model, for example) trivially holds
+   two component instances. A mixin can't be instantiated twice on one class.
 """
 
 from __future__ import annotations
@@ -80,18 +104,18 @@ class _AccessSnapshot:
     policy matches on.
 
     Grouped so the "refresh replaces both atomically" contract is visible:
-    ``ModelAccessParameter._fetch_snapshot()`` returns a whole new snapshot,
-    which the helper assigns to ``self._snapshot`` in one step. The tables
+    ``ModelAccessComponent._fetch_snapshot()`` returns a whole new snapshot,
+    which the component assigns to ``self._snapshot`` in one step. The tables
     never drift because they're never mutated in place.
 
     ``resolution_failure_detail`` is set (non-``None``) when the engine could
     not answer the query at all -- e.g. the node's class name isn't registered
     against a library, or the manifest declaration is missing. In that case
     both lookup tables are empty (we know NOTHING about denials or catalog
-    ids), but the helper must NOT treat "no denials known" as "no denials" at
-    runtime. ``ModelAccessParameter.query_for_denial()`` synthesizes a denial
-    from this detail so the run fails closed with a clear error, rather than
-    silently letting a would-be-gated model through.
+    ids), but the component must NOT treat "no denials known" as "no denials"
+    at runtime. ``ModelAccessComponent.query_for_denial()`` synthesizes a
+    denial from this detail so the run fails closed with a clear error, rather
+    than silently letting a would-be-gated model through.
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
@@ -99,98 +123,80 @@ class _AccessSnapshot:
     resolution_failure_detail: str | None = None
 
 
-class ModelAccessParameter:
+class ModelAccessComponent:
     """Composition helper for a model-selection dropdown that respects license policy.
 
-    Attaches to a Parameter the node has already added, via ``install(parameter)``.
-    Owns the model list, installs the ``Options`` and ``Button`` traits, applies
-    per-row decoration + badge, and exposes ``query_for_denial()`` /
-    ``raise_if_denied()`` for the node's execute path.
+    Node constructs its Parameter (owning name / type / input_types / tooltip /
+    default_value / ui_options), calls ``node.add_parameter(parameter)``, then
+    passes the Parameter to this component's constructor. The constructor
+    installs an ``Options`` trait with the component's ``model_choices``,
+    installs a ``Button`` refresh trait, sets ``ui_options`` for per-row
+    entitlement decoration, and applies the initial badge if the current
+    stored value is denied. If the parameter's ``default_value`` is denied but
+    a different choice is currently permitted, the constructor resets the
+    stored value to that permitted default (the declarative ``default_value``
+    is left unchanged).
+
+    Runtime methods -- ``query_for_denial(value)`` / ``raise_if_denied(value)``
+    -- gate the node's execute path against the current policy.
     """
 
     def __init__(
         self,
         *,
         node: BaseNode,
+        parameter: Parameter,
         model_choices: list[str],
         default_model: str,
     ) -> None:
-        # Constructor inputs -- immutable across the helper's lifetime.
+        """Attach the component to an already-added Parameter and decorate it.
+
+        Preconditions (checked; a misuse raises rather than silently misbehaving):
+
+        - ``parameter`` must already be attached to ``node`` (via
+          ``node.add_parameter(parameter)``). Traits + badges applied to an
+          unattached parameter would not emit UI events.
+        - ``parameter`` must not already carry an ``Options`` or ``Button``
+          trait. Adding a second ``Options`` results in an ambiguous dropdown;
+          adding a second ``Button`` overloads the refresh row. Migrate the
+          node to construct the parameter without those traits and let the
+          component add them.
+        """
+        # Constructor inputs -- immutable across the component's lifetime.
         self._node = node
+        self._parameter = parameter
         self._model_choices = list(model_choices)
         self._default_model = default_model
-        # Set by install(). Held so we don't call get_parameter_by_name on every
-        # operation. The reference is stable across the node's lifetime;
-        # removing the parameter from the node would be a node-side lifecycle
-        # decision we don't try to detect here.
-        self._parameter: Parameter | None = None
+
+        # Fail-fast preconditions -- see docstring.
+        if self._node.get_parameter_by_name(parameter.name) is not parameter:
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' is not attached to node "
+                f"'{self._node.name}'. Call node.add_parameter(parameter) BEFORE constructing "
+                "the component."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Options):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries an Options trait. Remove traits={Options(...)} from the "
+                "Parameter constructor -- ModelAccessComponent adds Options itself."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Button):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries a Button trait. Remove it -- ModelAccessComponent adds the "
+                "refresh Button itself."
+            )
+            raise ValueError(msg)
+
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
         # _AccessSnapshot's docstring for the contract.
         self._snapshot: _AccessSnapshot = self._fetch_snapshot()
 
-    @property
-    def model_choices(self) -> list[str]:
-        """The helper's copy of the dropdown-name list. Read-only view.
-
-        Node code that needs the list (validation branches, connection-removal
-        handlers) should read from here so the helper stays the single source
-        of truth for what's on offer.
-        """
-        return list(self._model_choices)
-
-    def install(self, parameter: Parameter) -> None:
-        """Attach to the given parameter and install its access-related pieces.
-
-        Adds an ``Options`` trait with the helper's ``model_choices``, a
-        ``Button`` refresh trait, sets ``ui_options`` with per-row decoration,
-        and applies the initial badge if the parameter's current value is
-        denied.
-
-        Preconditions (checked; a misuse raises rather than silently misbehaving):
-
-        - ``parameter`` must already be attached to the node (via
-          ``node.add_parameter(parameter)``). Traits + badges applied to an
-          unattached parameter would not emit UI events.
-        - ``install()`` must not have been called before. Re-installing on a
-          different parameter would leave the first one with orphaned traits.
-        - The parameter must not already carry an ``Options`` or ``Button``
-          trait. Adding a second ``Options`` results in an ambiguous dropdown;
-          adding a second ``Button`` overloads the refresh row. Migrate the
-          node to construct the parameter without those traits and let
-          ``install()`` add them.
-        """
-        # Fail-fast preconditions -- see docstring.
-        if self._parameter is not None:
-            msg = (
-                f"ModelAccessParameter.install() was already called for parameter "
-                f"'{self._parameter.name}' on node '{self._node.name}'. "
-                "Call install() exactly once."
-            )
-            raise RuntimeError(msg)
-        if self._node.get_parameter_by_name(parameter.name) is not parameter:
-            msg = (
-                f"ModelAccessParameter.install() received a Parameter ('{parameter.name}') "
-                f"that is not attached to node '{self._node.name}'. "
-                "Call node.add_parameter(parameter) BEFORE install(parameter)."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Options):
-            msg = (
-                f"ModelAccessParameter.install(): parameter '{parameter.name}' on node "
-                f"'{self._node.name}' already carries an Options trait. Remove traits="
-                "{Options(...)} from the Parameter constructor -- install() adds Options itself."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Button):
-            msg = (
-                f"ModelAccessParameter.install(): parameter '{parameter.name}' on node "
-                f"'{self._node.name}' already carries a Button trait. Remove it -- "
-                "install() adds the refresh Button itself."
-            )
-            raise ValueError(msg)
-
-        self._parameter = parameter
+        # Install decoration + traits.
         parameter.add_trait(Options(choices=list(self._model_choices)))
         parameter.add_trait(
             Button(
@@ -202,19 +208,42 @@ class ModelAccessParameter:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
-        self.on_value_changed(self._node.get_parameter_value(parameter.name))
+
+        # If the caller's declared default_value is denied but another choice
+        # IS permitted, move the parameter's stored value to that permitted
+        # alternative so the artist opens the node with a usable selection.
+        # The Parameter's declarative default_value is untouched -- the
+        # override is a stored-value change only, via set_parameter_value
+        # with initial_setup=True so no change events fire.
+        current_value = self._node.get_parameter_value(parameter.name)
+        if isinstance(current_value, str) and current_value in self._snapshot.denial_by_provider_id:
+            replacement = self.pick_permitted_default()
+            if replacement is not None and replacement != current_value:
+                self._node.set_parameter_value(parameter.name, replacement, initial_setup=True)
+                current_value = replacement
+
+        # Apply the initial badge for whatever the (possibly-moved) current value is.
+        self.on_value_changed(current_value)
+
+    @property
+    def model_choices(self) -> list[str]:
+        """The component's copy of the dropdown-name list. Read-only view.
+
+        Node code that needs the list (validation branches, connection-removal
+        handlers) should read from here so the component stays the single
+        source of truth for what's on offer.
+        """
+        return list(self._model_choices)
 
     def reinstall_options(self) -> None:
         """Reinstall the ``Options`` trait and reapply decoration + badge.
 
         Nodes that remove and later re-add ``Options`` on the model parameter
         (e.g. after a driver connection is dropped) call this to put the
-        helper's state back. Idempotent: safe to call when ``Options`` is
+        component's state back. Idempotent: safe to call when ``Options`` is
         already present -- ``add_trait`` will replace the existing instance.
         """
         parameter = self._parameter
-        if parameter is None:
-            return
         parameter.add_trait(Options(choices=list(self._model_choices)))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
@@ -228,8 +257,6 @@ class ModelAccessParameter:
         dropdown isn't the source of truth in that state.
         """
         parameter = self._parameter
-        if parameter is None:
-            return
         if not isinstance(value, str):
             parameter.clear_badge()
             return
@@ -252,9 +279,8 @@ class ModelAccessParameter:
         """
         self._snapshot = self._fetch_snapshot()
         parameter = self._parameter
-        if parameter is not None:
-            parameter.update_ui_options(self._build_ui_options())
-            self.on_value_changed(self._node.get_parameter_value(parameter.name))
+        parameter.update_ui_options(self._build_ui_options())
+        self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
     def query_for_denial(self, value: Any) -> CheckpointDenial | None:
         """Ask the engine whether ``value`` is currently permitted.
@@ -265,9 +291,9 @@ class ModelAccessParameter:
         stored value straight through (``self.get_parameter_value("model")``),
         and that value can legitimately be either a ``str`` (the dropdown
         selection) OR a driver object (when a Prompt Model Config / Agent is
-        connected upstream). The helper only gates the ``str`` case; other
+        connected upstream). The component only gates the ``str`` case; other
         shapes bypass the gate, because a connected driver carries its own
-        model identity that the helper isn't the source of truth for.
+        model identity that the component isn't the source of truth for.
 
         Semantics:
 
@@ -330,10 +356,12 @@ class ModelAccessParameter:
 
         Prefers the node's ``default_model`` when it's currently allowed. Falls
         back to the first allowed entry in ``model_choices``. Returns ``None``
-        when every declared choice is currently denied -- the caller decides
-        what to do in that case (typically: fall back to the node's own
-        ``DEFAULT_MODEL`` so the parameter has a value the badge can render
-        against; the runtime gate will still deny on run).
+        when every declared choice is currently denied.
+
+        Called internally by ``__init__`` to move the parameter's stored value
+        off a denied default. Kept public for callers that want to consult the
+        permitted-default separately (e.g. logging, picking a value for a
+        related parameter).
         """
         denials = self._snapshot.denial_by_provider_id
         if self._default_model not in denials:
@@ -362,7 +390,7 @@ class ModelAccessParameter:
         if not isinstance(result, QueryModelAccessForNodeResultSuccess):
             details = getattr(result, "result_details", None) or type(result).__name__
             logger.warning(
-                "ModelAccessParameter: engine could not resolve access for node type '%s' (%s). "
+                "ModelAccessComponent: engine could not resolve access for node type '%s' (%s). "
                 "Dropdown decoration is empty and runtime denial checks fail closed for this node. "
                 "Verify that the node's class is registered and its griptape_nodes_library.json "
                 "entry declares a model_usage block.",

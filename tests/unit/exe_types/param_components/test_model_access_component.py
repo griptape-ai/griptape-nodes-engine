@@ -1,8 +1,13 @@
-"""Unit tests for `ModelAccessParameter`.
+"""Unit tests for `ModelAccessComponent`.
 
 Focused on:
-- install() decorates an already-added parameter without touching its identity
-  (name / type / input_types / tooltip / stored value)
+- __init__ decorates an already-added parameter (Options + Button traits,
+  ui_options data + row icons + subtitles) without touching its identity
+  (name / type / input_types / tooltip / declarative default_value)
+- __init__ moves the parameter's stored value off a denied default when a
+  permitted alternative exists; declarative default_value is left alone
+- constructor preconditions: parameter must be attached to node, must not
+  already carry Options / Button
 - on_value_changed() sets and clears the badge from the cached denial map
 - refresh() re-queries the engine and rebuilds decoration + badge
 - query_for_denial() returns a live verdict; falls through to None on failure
@@ -10,8 +15,8 @@ Focused on:
 - pick_permitted_default() prefers the node's DEFAULT_MODEL, falls back to
   the first allowed choice, and returns None when every declared choice is denied
 - SuccessFailure-style usage: node calls query_for_denial and routes into
-  _set_status_results (validated indirectly -- the helper itself never raises,
-  so the node's failure branch stays reachable)
+  _set_status_results (validated indirectly -- the component itself never
+  raises, so the node's failure branch stays reachable)
 """
 
 from __future__ import annotations
@@ -20,7 +25,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.exe_types.param_components.model_access_parameter import ModelAccessParameter
+from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -28,7 +33,7 @@ _LIBRARY_NAME = "model-access-param-test-library"
 
 
 class _AccessProbeNode(BaseNode):
-    """Concrete BaseNode used to exercise ModelAccessParameter."""
+    """Concrete BaseNode used to exercise ModelAccessComponent."""
 
     def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
         super().__init__(name=name, metadata=metadata)
@@ -108,16 +113,22 @@ def _catalog():  # noqa: ANN202
     )
 
 
-def _build_probe_node_with_helper(
+def _build_probe_node_with_component(
     *,
     model_choices: list[str],
     default_model: str,
-) -> tuple[_AccessProbeNode, ModelAccessParameter, Parameter]:
-    """Build a node + helper, add the model parameter, return all three.
+    initial_stored_value: str | None = None,
+) -> tuple[_AccessProbeNode, ModelAccessComponent, Parameter]:
+    """Build node + parameter + component (fully installed) and return all three.
 
-    Does NOT call ``helper.install()`` so tests that want to observe pre-install
-    behavior can. Tests that need the installed state call ``helper.install(param)``
-    themselves.
+    Under the new one-step construction API, the component installs its
+    ``Options`` + ``Button`` traits and applies the initial badge inside
+    ``__init__``. There is no observable "pre-install" state.
+
+    ``initial_stored_value``: if set, the parameter's stored value is set to
+    this via ``set_parameter_value(initial_setup=True)`` BEFORE the component
+    is constructed, so the constructor sees it as the current value. Use this
+    to test the "born with a denied value" path.
     """
     from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
 
@@ -127,33 +138,35 @@ def _build_probe_node_with_helper(
     )
 
     node = _AccessProbeNode(name="probe")
-    helper = ModelAccessParameter(
-        node=node,
-        model_choices=model_choices,
-        default_model=default_model,
-    )
     param = Parameter(
         name="model",
         type="str",
-        default_value=helper.pick_permitted_default() or default_model,
+        default_value=default_model,
         tooltip="Choose a model",
         ui_options={"display_name": "prompt model"},
     )
     node.add_parameter(param)
-    return node, helper, param
+    if initial_stored_value is not None:
+        node.set_parameter_value(param.name, initial_stored_value, initial_setup=True)
+    component = ModelAccessComponent(
+        node=node,
+        parameter=param,
+        model_choices=model_choices,
+        default_model=default_model,
+    )
+    return node, component, param
 
 
 def _install_probe_node_with_helper(
     *,
     model_choices: list[str],
     default_model: str,
-) -> tuple[_AccessProbeNode, ModelAccessParameter]:
-    """Build + install. Returns just (node, helper) for tests that don't need the Parameter object."""
-    node, helper, param = _build_probe_node_with_helper(
+) -> tuple[_AccessProbeNode, ModelAccessComponent]:
+    """Legacy tuple-of-2 shim over _build_probe_node_with_component for tests that don't want the Parameter object."""
+    node, helper, _param = _build_probe_node_with_component(
         model_choices=model_choices,
         default_model=default_model,
     )
-    helper.install(param)
     return node, helper
 
 
@@ -260,57 +273,101 @@ class TestInstall:
         # update_ui_options merges; display_name set by the node must survive.
         assert post_param.ui_options.get("display_name") == pre_display_name
 
-    def test_install_applies_initial_badge_when_default_denied(self, griptape_nodes) -> None:  # noqa: ANN001
-        """A node born with the denied model as its stored value shows the badge on install."""
+    def test_install_applies_initial_badge_when_stored_value_denied(self, griptape_nodes) -> None:  # noqa: ANN001
+        """A node born with a denied stored value shows the badge immediately.
+
+        Setup: every choice is denied so ``pick_permitted_default()`` returns
+        None and the constructor cannot relocate the stored value to a
+        permitted alternative. The badge therefore fires against the
+        original stored value.
+        """
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
-        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
-            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
-                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
-            return None
+        def deny_everything(_checkpoint: object) -> CheckpointDenial:
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
 
-        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        griptape_nodes.EventManager().add_authorization_hook(deny_everything)
         try:
-            # Set the stored value to the denied model BEFORE install so install() sees it.
-            node, helper, param = _build_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
-            node.set_parameter_value("model", "alpha", initial_setup=True)
-            helper.install(param)
+            _node, _component, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"],
+                default_model="alpha",
+                initial_stored_value="alpha",
+            )
 
             badge = param.get_badge()
             assert badge is not None
             assert "not permitted" in badge.message.lower()
             assert "Alpha not enabled." in badge.message
         finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_everything)
+
+    def test_constructor_relocates_stored_value_off_denied_default(self, griptape_nodes) -> None:  # noqa: ANN001
+        """Constructor moves the stored value off a denied default to a permitted alternative.
+
+        The parameter's declarative default_value is preserved (unchanged); only
+        the stored value is relocated. This is how a legacy workflow that saved
+        a since-denied model gets an initial usable selection when it reloads.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha denied."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            node, _component, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="alpha"
+            )
+
+            # Stored value moved to permitted 'beta'.
+            assert node.get_parameter_value("model") == "beta"
+            # No badge -- the current stored value is permitted.
+            assert param.get_badge() is None
+            # Declarative default_value on the Parameter is untouched.
+            assert param.default_value == "alpha"
+        finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
 
-class TestInstallPreconditions:
-    """install() rejects misuse rather than silently misbehaving."""
+class TestConstructorPreconditions:
+    """The component's constructor rejects misuse rather than silently misbehaving.
+
+    Under the one-step API, ``install()`` is folded into ``__init__``. The four
+    precondition checks (parameter-not-attached, pre-existing Options trait,
+    pre-existing Button trait, second-instance-on-same-parameter) all fire
+    from the constructor.
+    """
 
     def test_raises_when_parameter_is_not_on_node(self) -> None:
-        """Parameter must be attached to the node (via add_parameter) before install()."""
+        """Parameter must be attached to the node (via add_parameter) before component construction."""
         _register_probe_node()
         node = _AccessProbeNode(name="probe")
-        helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
-        # Build a Parameter but do NOT add it to the node.
         orphan = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        # Note: no node.add_parameter(orphan) call.
 
         with pytest.raises(ValueError, match="not attached to node"):
-            helper.install(orphan)
+            ModelAccessComponent(node=node, parameter=orphan, model_choices=["alpha"], default_model="alpha")
 
-    def test_raises_on_second_install(self) -> None:
-        """A second install() call is a misuse -- helper is single-use."""
-        _node, helper, param = _build_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
-        helper.install(param)
+    def test_raises_when_second_component_attaches_to_same_parameter(self) -> None:
+        """Constructing a second component against the same parameter raises.
 
-        with pytest.raises(RuntimeError, match="already called"):
-            helper.install(param)
+        The first component adds an Options trait, so the second construction
+        trips the pre-existing-Options precondition — same error, same reason
+        as if the caller had attached Options themselves before construction.
+        """
+        _node, _first_component, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="alpha"
+        )
+
+        with pytest.raises(ValueError, match="already carries an Options trait"):
+            ModelAccessComponent(node=_node, parameter=param, model_choices=["alpha", "beta"], default_model="alpha")
 
     def test_raises_when_parameter_already_has_options(self) -> None:
         """A Parameter constructed with traits={Options(...)} would end up with two Options."""
         _register_probe_node()
         node = _AccessProbeNode(name="probe")
-        helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
 
         param = Parameter(
             name="model",
@@ -322,13 +379,12 @@ class TestInstallPreconditions:
         node.add_parameter(param)
 
         with pytest.raises(ValueError, match="already carries an Options trait"):
-            helper.install(param)
+            ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
 
     def test_raises_when_parameter_already_has_button(self) -> None:
         """A Parameter constructed with a Button trait would end up with two Buttons."""
         _register_probe_node()
         node = _AccessProbeNode(name="probe")
-        helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
 
         param = Parameter(
             name="model",
@@ -340,7 +396,7 @@ class TestInstallPreconditions:
         node.add_parameter(param)
 
         with pytest.raises(ValueError, match="already carries a Button trait"):
-            helper.install(param)
+            ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
 
 
 class TestEngineFailureIsFailClosedAtRuntime:
@@ -382,6 +438,13 @@ class TestEngineFailureIsFailClosedAtRuntime:
         )
         LibraryRegistry.generate_new_library(library_data=schema)
 
+    def _build_component_against_unresolved_node(self) -> ModelAccessComponent:
+        """Node whose class isn't registered -> engine returns Failure at construction."""
+        node = _AccessProbeNode(name="probe")
+        param = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        node.add_parameter(param)
+        return ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
+
     def test_unknown_node_type_logs_warning(self, caplog) -> None:  # noqa: ANN001
         """Failure result -> warning logged, message names the node type."""
         import logging
@@ -389,8 +452,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         self._register_library_without_probe_node()
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            node = _AccessProbeNode(name="probe")
-            ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
+            self._build_component_against_unresolved_node()
 
         matches = [r for r in caplog.records if "engine could not resolve access" in r.message]
         assert matches, "Expected a warning log about unresolved access; got none."
@@ -403,8 +465,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         self._register_library_without_probe_node()
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            node = _AccessProbeNode(name="probe")
-            helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
+            helper = self._build_component_against_unresolved_node()
 
         denial = helper.query_for_denial("alpha")
         assert denial is not None, "Fail-closed contract: unresolved node type must not return None."
@@ -418,8 +479,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         self._register_library_without_probe_node()
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            node = _AccessProbeNode(name="probe")
-            helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
+            helper = self._build_component_against_unresolved_node()
 
         with pytest.raises(RuntimeError, match="could not be evaluated"):
             helper.raise_if_denied("alpha")
@@ -431,8 +491,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         self._register_library_without_probe_node()
 
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
-            node = _AccessProbeNode(name="probe")
-            helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
+            helper = self._build_component_against_unresolved_node()
 
         # A connected Prompt Model Config driver / Agent replaces the string
         # value with an object that carries its own model identity. The helper
@@ -451,7 +510,9 @@ class TestEngineFailureIsFailClosedAtRuntime:
         _register_probe_node()  # empty declarations by default
 
         node = _AccessProbeNode(name="probe")
-        helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
+        param = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        node.add_parameter(param)
+        helper = ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
 
         # No synthesized denial -- everything is genuinely allowed.
         assert helper.query_for_denial("alpha") is None
@@ -494,15 +555,16 @@ class TestOnValueChanged:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            # Set value BEFORE install so the initial badge lands on 'alpha'.
-            node, helper, param = _build_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
-            node.set_parameter_value("model", "alpha", initial_setup=True)
-            helper.install(param)
-
+            # default_model="beta" (permitted) so the constructor doesn't auto-move away
+            # from a denied initial value. We then simulate the artist manually selecting
+            # 'alpha' by calling on_value_changed directly.
+            _node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            helper.on_value_changed("alpha")
             assert param.get_badge() is not None
 
             helper.on_value_changed("beta")
-
             assert param.get_badge() is None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
@@ -719,9 +781,14 @@ class TestReinstallOptions:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            node, helper, param = _build_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
-            node.set_parameter_value("model", "alpha", initial_setup=True)
-            helper.install(param)
+            # default_model="beta" (permitted) so construction doesn't relocate away
+            # from a denied initial value. Then flip the stored value to denied 'alpha'
+            # so the reinstall path has a badge to restore.
+            _node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            helper.on_value_changed("alpha")  # apply the "we're viewing alpha" state
+            _node.set_parameter_value("model", "alpha", initial_setup=True)
 
             # Simulate what a node does when a driver connects: strip Options entirely.
             options_traits = param.find_elements_by_type(Options)
@@ -741,11 +808,3 @@ class TestReinstallOptions:
             assert "Alpha not enabled." in badge.message
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
-
-    def test_reinstall_no_op_before_install(self) -> None:
-        """reinstall_options() is a no-op if install() was never called."""
-        _register_probe_node()
-        node = _AccessProbeNode(name="probe")
-        helper = ModelAccessParameter(node=node, model_choices=["alpha"], default_model="alpha")
-        # Should not raise:
-        helper.reinstall_options()
