@@ -4,6 +4,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -420,7 +421,7 @@ class EventRequestBatch(BaseEvent):
         return cls(requests=requests, **event_data)
 
 
-_RESULT_FRAMEWORK_FIELDS = frozenset({"result_details", "altered_workflow_state"})
+_RESULT_FRAMEWORK_FIELDS = frozenset(f.name for f in dataclass_fields(ResultPayload))
 
 
 def _build_path_tree(paths: list[str]) -> dict:
