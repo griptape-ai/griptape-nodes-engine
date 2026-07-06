@@ -534,9 +534,10 @@ class PublishWorkflowRegisteredEventData:
             it alongside the target in the publish menu/dialog (e.g. as a subtitle or tooltip). When
             None, no description is shown, preserving today's behavior.
         icon: Optional icon identifier for the publishing target. When set, the GUI may render it
-            next to the target in the publish menu/dropdown. The value is an icon name the frontend
-            knows how to resolve (e.g. a Lucide icon name), not raw image data. When None, the GUI
-            uses its default/no icon, preserving today's behavior.
+            next to the target in the publish menu/dropdown. The value is either a Lucide icon name
+            (e.g. "rocket") or a path/URL to an image the frontend renders as-is (e.g.
+            "logos/my-target.svg" or "https://example.com/logo.png") — not raw image data. When
+            None, the GUI uses its default/no icon, preserving today's behavior.
     """
 
     start_flow_node_type: str
