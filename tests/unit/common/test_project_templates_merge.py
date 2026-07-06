@@ -1363,6 +1363,18 @@ class TestDefaultTemplateByMajor:
         # The frozen v0 layout: dirs are NOT workflow-relative and routing is absent.
         assert DEFAULT_PROJECT_TEMPLATE_V0.directories["inputs"].path_macro == "inputs"
 
+    def test_v0_sequence_macros_use_legacy_index_syntax(self) -> None:
+        # v0 is a FROZEN baseline: its sequence slots must stay the legacy `{_index:NN}` spelling
+        # exactly as shipped in v0.90.0, never the `{###}` shorthand (which is v1's syntax). Although
+        # `{###}` parses to the same `_index` variable, migrating v0's literal macros would change the
+        # frozen baseline and shift the to_overlay_yaml diff base for existing v0 projects. This guards
+        # against an accidental v0 -> `###` migration.
+        for name, situation in DEFAULT_PROJECT_TEMPLATE_V0.situations.items():
+            assert "###" not in situation.macro, f"v0 situation '{name}' must not use the ### shorthand"
+        # The known sequence situations must carry the padded legacy slot verbatim.
+        assert "{_index?:03}" in DEFAULT_PROJECT_TEMPLATE_V0.situations["save_node_output"].macro
+        assert "_v{_index:03}" in DEFAULT_PROJECT_TEMPLATE_V0.situations["create_versioned_workflow"].macro
+
     def test_v1_default_is_workflow_relative(self) -> None:
         assert DEFAULT_PROJECT_TEMPLATE_V1.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
 
