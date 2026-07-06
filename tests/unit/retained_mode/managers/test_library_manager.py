@@ -3555,9 +3555,11 @@ class TestLibraryManagerDuplicateEntryHygiene:
             )
 
         assert result == "0.81.0"
-        # Exactly one entry for MyLib, keyed under the reloaded filename.
+        # Exactly one entry for MyLib, keyed under the reloaded filename. The reload stores
+        # str(Path(...)), so normalize the expected key the same way for cross-platform parity
+        # (Windows renders the separators as backslashes).
         mylib_paths = [path for path, info in entries.items() if info.library_name == "MyLib"]
-        assert mylib_paths == [new_path]
+        assert mylib_paths == [str(Path(new_path))]
 
     def test_resolver_prefers_loaded_copy_over_failed_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
         """The resolver must return the LOADED copy, not a dead duplicate.
