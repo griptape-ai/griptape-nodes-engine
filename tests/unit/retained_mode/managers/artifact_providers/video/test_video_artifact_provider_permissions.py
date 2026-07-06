@@ -401,12 +401,13 @@ class TestCallerVariablesThreading:
 
 
 class TestStagingCleanup:
-    """Zero-out + delete cleanup runs on every path (approve, deny, ffprobe fail, hook absent).
+    """Truncate + delete cleanup runs on every path (approve, deny, ffprobe fail, hook absent).
 
     The temp file exists between the stage and the finally block; after
     _extract_codec_via_staging returns, whatever landed on disk during
-    staging must either be gone (delete succeeded) or all zeros (delete
-    failed but zero-out ran). Either way, no leftover file usable as video.
+    staging must either be gone (delete succeeded) or truncated to a single
+    null byte (delete failed but truncate ran). Either way, no leftover file
+    usable as video.
     """
 
     def test_staged_file_is_removed_after_successful_probe(
@@ -456,18 +457,21 @@ class TestStagingCleanup:
         assert len(captured_paths) == 1
         assert not Path(captured_paths[0]).exists()
 
-    def test_staged_file_is_zeroed_out_when_delete_fails(
+    def test_staged_file_is_truncated_when_delete_fails(
         self,
         griptape_nodes: GriptapeNodes,
         monkeypatch: pytest.MonkeyPatch,
         _project_workspace: Path,  # noqa: PT019
     ) -> None:
-        """Belt-and-suspenders: if the delete somehow doesn't remove the file, its bytes are zeros.
+        """Belt-and-suspenders: if the delete somehow doesn't remove the file, it's truncated to 1 null byte.
 
         Simulate a delete failure by replacing the DeleteFileRequest handler
         in the EventManager's registry with a no-op that returns Success but
-        does not touch disk. Zero-out must have already run before the delete
-        attempt, so the file left on disk is all null bytes.
+        does not touch disk. The truncate step must have already run before
+        the delete attempt, so the file left on disk is a single null byte --
+        ffprobe on a 1-byte file finds no container, matching the
+        "cannot be interpreted as a video" invariant without allocating a
+        multi-GB buffer to overwrite the original payload.
         """
         from griptape_nodes.retained_mode.events.os_events import (
             DeleteFileRequest,
@@ -506,9 +510,10 @@ class TestStagingCleanup:
 
         assert codec == "h264"
         assert len(captured_paths) == 1
-        # File is still there (our noop delete kept it) -- but zero-out ran
-        # first so its contents are all null bytes, matching the original size.
+        # File is still there (our noop delete kept it) -- but the truncate
+        # step ran first, so the file is a single null byte regardless of
+        # what the original payload was.
         leftover = Path(captured_paths[0])
         assert leftover.exists(), "test setup: fake delete should have kept the file"
         contents = leftover.read_bytes()
-        assert contents == b"\x00" * len(original_payload)
+        assert contents == b"\x00"

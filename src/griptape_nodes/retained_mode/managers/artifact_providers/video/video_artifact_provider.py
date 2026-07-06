@@ -150,9 +150,10 @@ class VideoArtifactProvider(BaseArtifactProvider):
            directory, NOT the OS temp dir -- avoids exhausting a small
            system-wide temp partition when videos are multi-GB.
         2. Run ffprobe on the staged path to extract the primary video codec.
-        3. In ``finally``, unconditionally zero-out the staged file and delete
-           it. Zero-out first, then delete: if delete fails for any reason,
-           the file left behind is unusable as a video.
+        3. In ``finally``, unconditionally truncate the staged file to a
+           single null byte and then delete it. Truncate first, then delete:
+           if delete fails for any reason, the file left behind is unusable
+           as a video.
         4. If a codec was extracted, evaluate the WRITE_VIDEO_CODEC checkpoint.
            If codec extraction failed, FAIL CLOSED with a synthetic denial: an
            unclassified video write cannot be verified as compliant, so a
@@ -227,7 +228,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
         file_name: str,
         caller_variables: MacroVariables | None,
     ) -> str | None:
-        """Stage bytes at the project temp path, run ffprobe, then zero-out + delete.
+        """Stage bytes at the project temp path, run ffprobe, then truncate + delete.
 
         Returns the extracted codec name, or ``None`` when any step failed
         (stage failure, ffprobe failure, no video stream). The caller
@@ -266,22 +267,27 @@ class VideoArtifactProvider(BaseArtifactProvider):
         try:
             probe_data = cls._run_ffprobe(staged_path)
         finally:
-            cls._zero_out_and_delete(staged_path, byte_count=stage_result.bytes_written, file_name=file_name)
+            cls._truncate_and_delete(staged_path, file_name=file_name)
 
         return cls._codec_from_probe_data(probe_data)
 
     @classmethod
-    def _zero_out_and_delete(cls, staged_path: str, *, byte_count: int, file_name: str) -> None:
-        """Overwrite ``staged_path`` with null bytes, then delete it.
+    def _truncate_and_delete(cls, staged_path: str, *, file_name: str) -> None:
+        r"""Truncate ``staged_path`` to a single null byte, then delete it.
 
-        Zero-out first so that even if the delete fails, whatever remains on
-        disk cannot be interpreted as a video: ffprobe on an all-zero file
-        finds no streams. Delete second so the normal case leaves nothing
+        Truncate first so that even if the delete fails, whatever remains on
+        disk cannot be interpreted as a video: ffprobe on a 1-byte file finds
+        no container header. Delete second so the normal case leaves nothing
         behind. Both steps inspect the request result (``handle_request``
         already catches all exceptions internally and returns a Failure
         payload -- no try/except needed here). A failure at either step is
         logged as an ERROR: leaving disallowed bytes on disk is a real
-        problem, even if zero-out already neutralized the file's contents.
+        problem, even if the truncate already neutralized the file's contents.
+
+        Writing a single ``\x00`` byte in OVERWRITE mode truncates whatever
+        size the staged file had (potentially multi-GB for real customer
+        video assets), avoiding a large in-memory buffer and a second big
+        disk write.
         """
         from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
         from griptape_nodes.retained_mode.events.os_events import (  # avoid circular import
@@ -292,17 +298,15 @@ class VideoArtifactProvider(BaseArtifactProvider):
         )
 
         # Use a plain WriteFileRequest (OVERWRITE is the default) so this
-        # doesn't re-enter the codec vet: null bytes sniff to no known
-        # format and don't reach VideoArtifactProvider anyway.
-        zero_out_result = GriptapeNodes.handle_request(
-            WriteFileRequest(file_path=staged_path, content=b"\x00" * byte_count)
-        )
-        if isinstance(zero_out_result, (WriteFileResultFailure, ResultPayloadFailure)):
+        # doesn't re-enter the codec vet: a lone null byte sniffs to no known
+        # format and doesn't reach VideoArtifactProvider anyway.
+        truncate_result = GriptapeNodes.handle_request(WriteFileRequest(file_path=staged_path, content=b"\x00"))
+        if isinstance(truncate_result, (WriteFileResultFailure, ResultPayloadFailure)):
             logger.error(
-                "Attempted to zero-out staged video temp for '%s' at '%s'. Failed: %s",
+                "Attempted to truncate staged video temp for '%s' at '%s'. Failed: %s",
                 file_name,
                 staged_path,
-                zero_out_result.result_details,
+                truncate_result.result_details,
             )
 
         from griptape_nodes.retained_mode.events.os_events import DeleteFileResultFailure  # avoid circular import
@@ -316,7 +320,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
         )
         if isinstance(delete_result, (DeleteFileResultFailure, ResultPayloadFailure)):
             logger.error(
-                "Attempted to delete staged video temp for '%s' at '%s'. Failed: %s (file has been zeroed).",
+                "Attempted to delete staged video temp for '%s' at '%s'. Failed: %s (file has been truncated).",
                 file_name,
                 staged_path,
                 delete_result.result_details,
