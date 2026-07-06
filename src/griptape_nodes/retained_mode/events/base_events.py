@@ -432,7 +432,12 @@ def _build_path_tree(paths: list[str]) -> dict:
         parts = path.split(".")
         node = tree
         for part in parts[:-1]:
+            # setdefault: create the branch with {} if missing, otherwise return the existing
+            # branch unchanged. This is what lets ["a.b", "a.c"] share the same "a" node
+            # instead of the second path overwriting the first.
             node = node.setdefault(part, {})
+        # Same at the leaf: don't overwrite if "a.b" was already added before "a.b.c"
+        # (which would delete the "c" child we just built).
         node.setdefault(parts[-1], {})
     return tree
 
