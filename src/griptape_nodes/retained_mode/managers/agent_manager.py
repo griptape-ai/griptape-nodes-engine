@@ -183,6 +183,43 @@ def _build_agent_instructions(*, include_image_tool: bool) -> str:
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
 
 
+def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | None:
+    """Return a user-facing message when listing a provider's models fails.
+
+    Scoped to the model-listing path only: that request's whole job is "reach
+    this one endpoint and list its models", so a connection-class failure here
+    unambiguously means *that* provider is unreachable. A custom/local provider
+    (LMStudio, Ollama, any OpenAI-compatible endpoint) is commonly offline — the
+    app is closed, the machine slept, the port changed — and the raw transport
+    error ("All connection attempts failed") means nothing to the person who
+    configured it. Map connection-class failures to plain language that names
+    the endpoint and points at the likely cause.
+
+    Returns ``None`` when the error isn't a recognizable connection failure, so
+    the caller falls back to its existing (raw) message for other error classes
+    (e.g. an HTTP status error or a bad JSON body — those aren't "server down").
+    """
+    where = f" at '{base_url}'" if base_url else ""
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            f"Couldn't reach the model provider{where}. Is the local server "
+            "(e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return (
+            f"The model provider{where} didn't respond in time. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    # Other httpx.RequestError subclasses (DNS failures, connection drops, etc.)
+    # are still connection-shaped from the user's perspective.
+    if isinstance(exc, httpx.RequestError):
+        return (
+            f"Couldn't connect to the model provider{where}. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    return None
+
+
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
 # wedge the conversation. The numbers are deliberately generous: 60 model
 # requests is enough for a complex multi-tool task while still protecting the
@@ -614,8 +651,11 @@ class AgentManager:
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
-            details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
-            logger.warning(details)
+            # Keep the raw exception in the logs for debugging, but surface a
+            # message the user can act on when the provider is simply offline.
+            logger.warning("Attempted to list models from '%s'. Failed with: %s", request.base_url, e)
+            friendly = _friendly_list_models_error(e, request.base_url)
+            details = friendly or f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             return ListProviderModelsResultFailure(result_details=details)
 
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
