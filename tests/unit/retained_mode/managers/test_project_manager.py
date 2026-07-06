@@ -9799,3 +9799,123 @@ class TestListRelatedProjectFiles:
         assert result.failure_reason == ListRelatedProjectFilesFailureReason.SCAN_FAILED
         # The underlying scan failure reason is preserved for callers to branch on.
         assert result.scan_failure_reason == ScanSituationSequenceFailureReason.MACRO_RESOLUTION_ERROR
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_absolute_path_outside_project_reports_path_map_failed(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """An absolute path outside all project directories short-circuits with PATH_MAP_FAILED."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        # An absolute path outside `/workspace` (the fixture's workspace root)
+        # means AttemptMapAbsolutePathToProjectRequest returns mapped_path=None.
+        # The handler surfaces that as PATH_MAP_FAILED. We avoid `/tmp/...` here
+        # so the tmp-dir linter (S108) doesn't fire — the branch only cares that
+        # Path.is_absolute() is True and the path is outside the project.
+        outside_path = "/somewhere-not-in-workspace/wf.py"
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename=outside_path,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.PATH_MAP_FAILED
+        assert outside_path in str(result.result_details)
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_unknown_source_situation_reports_source_macro_mismatch(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """A `source_situation` not in the template fails at SOURCE_MACRO_MISMATCH."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{workspace_dir}/wf.py",
+                source_situation="not_a_real_situation_name",
+                target_situation="save_workflow_backup",
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH
+        assert "not_a_real_situation_name" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_no_current_project_reports_source_macro_mismatch(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """No current project → SOURCE_MACRO_MISMATCH.
+
+        If the project cache resolves the situation but no *current* project is set,
+        the directory-name enumeration step fails and the handler surfaces that as
+        SOURCE_MACRO_MISMATCH.
+        """
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        # Simulate "current project was cleared after the situation lookup."
+        # We patch `on_get_current_project_request` to return a Failure directly,
+        # bypassing the situation-lookup path (which also relies on it).
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetCurrentProjectRequest,
+            GetCurrentProjectResultFailure,
+        )
+
+        original = project_manager_with_template.on_get_current_project_request
+        call_count = {"n": 0}
+
+        def fake_get_current(request: GetCurrentProjectRequest) -> object:
+            call_count["n"] += 1
+            # First call is inside on_get_situation_request; let it through.
+            # Second call is the one inside on_list_related_project_files_request
+            # itself, at the "build known_variables" step — fail that one.
+            if call_count["n"] < 2:  # noqa: PLR2004
+                return original(request)
+            return GetCurrentProjectResultFailure(result_details="project cache was cleared")
+
+        with patch.object(
+            project_manager_with_template, "on_get_current_project_request", side_effect=fake_get_current
+        ):
+            result = await project_manager_with_template.on_list_related_project_files_request(
+                ListRelatedProjectFilesRequest(
+                    source_filename="{workspace_dir}/wf.py",
+                    source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                    target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                )
+            )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH
+        assert "project cache was cleared" in str(result.result_details)

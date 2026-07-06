@@ -24,6 +24,7 @@ from rich.table import Table
 from rich.text import Text
 
 from griptape_nodes.common.macro_parser import SEQUENCE_VARIABLE_NAME
+from griptape_nodes.common.project_templates import SUB_DIRS_VARIABLE_NAME
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -2085,8 +2086,8 @@ class WorkflowManager:
         pre-compute the target index).
         """
         combined_vars: dict[str, str | int] = dict(extra_vars) if extra_vars else {}
-        if sub_dirs and "sub_dirs" not in combined_vars:
-            combined_vars["sub_dirs"] = sub_dirs
+        if sub_dirs and SUB_DIRS_VARIABLE_NAME not in combined_vars:
+            combined_vars[SUB_DIRS_VARIABLE_NAME] = sub_dirs
 
         destination = ProjectFileDestination.from_situation(file_name, situation_name, **combined_vars)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
@@ -2393,18 +2394,22 @@ class WorkflowManager:
                 file_content=save_file_result.file_content,
             )
 
-        detail_entries: list[ResultDetail] = [
-            ResultDetail(
-                level=logging.INFO,
-                message=f"Successfully saved workflow to: {save_file_result.file_path}",
-            )
-        ]
-        detail_entries.extend(ResultDetail(level=logging.WARNING, message=warning) for warning in backup_warnings)
+        # Collate save + any backup warnings into a single ResultDetail. If any
+        # backup warning fired, the whole result is WARNING (and every failure
+        # message is appended below the save-success line so the artist sees
+        # both the successful primary save AND every backup issue). Otherwise
+        # a plain INFO detail.
+        primary_save_line = f"Successfully saved workflow to: {save_file_result.file_path}"
+        if backup_warnings:
+            combined_message = "\n".join([primary_save_line, *backup_warnings])
+            result_detail = ResultDetail(level=logging.WARNING, message=combined_message)
+        else:
+            result_detail = ResultDetail(level=logging.INFO, message=primary_save_line)
 
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_name=registry_key,
-            result_details=ResultDetails(*detail_entries),
+            result_details=ResultDetails(result_detail),
         )
 
     async def _apply_workflow_backup(  # noqa: PLR0911
@@ -2441,8 +2446,9 @@ class WorkflowManager:
         config_result = GriptapeNodes.handle_request(GetConfigValueRequest(category_and_key=MAX_WORKFLOW_BACKUPS_KEY))
         if not isinstance(config_result, GetConfigValueResultSuccess):
             return [
-                f"Backup skipped: could not read the '{MAX_WORKFLOW_BACKUPS_KEY}' setting "
-                f"({config_result.result_details})."
+                f"Attempted to read the '{MAX_WORKFLOW_BACKUPS_KEY}' setting to determine backup retention. "
+                f"Failed with details '{config_result.result_details}' — the backup step was skipped, "
+                "but the primary save succeeded."
             ]
         max_backups = int(config_result.value)
         if max_backups <= 0:
@@ -2465,7 +2471,10 @@ class WorkflowManager:
             )
         )
         if not isinstance(pre_scan, ListRelatedProjectFilesResultSuccess):
-            return [f"Backup could not look up existing backups: {pre_scan.result_details}"]
+            return [
+                f"Attempted to list existing backups for '{source_filename}' before writing a new one. "
+                f"Failed with details '{pre_scan.result_details}' — no backup was written for this save."
+            ]
 
         present_numbers = pre_scan.sequence.present_numbers if pre_scan.sequence is not None else set()
         next_index = (max(present_numbers) + 1) if present_numbers else 1
@@ -2484,7 +2493,11 @@ class WorkflowManager:
             f"backup v{next_index:03}",
         )
         if not write_result.success:
-            return [f"Backup file could not be written to your project's backups folder: {write_result.error_details}"]
+            return [
+                f"Attempted to write a backup copy of '{source_filename}' to your project's backups folder "
+                f"as slot v{next_index:03}. Failed with details '{write_result.error_details}' — "
+                "no backup was written for this save."
+            ]
 
         # Step 4 — re-scan post-write. Between our pre-scan and now, a concurrent
         # save may have written another backup. Re-scanning ensures the retention
@@ -2499,23 +2512,30 @@ class WorkflowManager:
         )
         if not isinstance(post_scan, ListRelatedProjectFilesResultSuccess):
             return [
-                "Backup file was written, but the list of backups could not be re-checked, "
-                f"so older backups were not pruned: {post_scan.result_details}"
+                f"Attempted to re-check the backups folder for '{source_filename}' after writing "
+                f"backup v{next_index:03}, so older backups could be pruned. "
+                f"Failed with details '{post_scan.result_details}' — the new backup was written, "
+                "but you may now have more than the configured maximum until the next successful save."
             ]
         if post_scan.sequence is None:
             return [
-                "Backup file was written, but the list of backups came back empty on re-check, "
-                "so older backups were not pruned."
+                f"Attempted to re-check the backups folder for '{source_filename}' after writing "
+                f"backup v{next_index:03}. Failed because the re-check returned no entries at all — "
+                "the new backup was written, but retention could not be enforced this save."
             ]
 
-        # Step 5 — prune anything past the retention count.
-        # `sorted[:-max_backups]` keeps the newest `max_backups` numbers and marks
-        # everything older for deletion. We attempt EVERY deletion regardless of
-        # individual failures and record each failure separately so the artist can
-        # see exactly which files couldn't be cleaned up.
+        # Step 5 — prune anything past the retention count. Sort entries
+        # oldest-first (by numeric slot); the leading `overflow_count` entries
+        # are the ones exceeding the ceiling. Every deletion is attempted
+        # independently — a single failure records a warning and the loop keeps
+        # going so the artist sees exactly which files were left behind.
         entries_by_number = {entry.number: entry for entry in post_scan.sequence.entries}
         sorted_numbers = sorted(entries_by_number.keys())
-        doomed_numbers = sorted_numbers[:-max_backups] if len(sorted_numbers) > max_backups else []
+        overflow_count = len(sorted_numbers) - max_backups
+        if overflow_count <= 0:
+            return []
+
+        doomed_numbers = sorted_numbers[:overflow_count]
 
         warnings: list[str] = []
         for doomed in doomed_numbers:
@@ -2529,8 +2549,9 @@ class WorkflowManager:
             )
             if isinstance(delete_result, DeleteFileResultFailure):
                 warnings.append(
-                    f"Older backup file could not be removed: {entry.path} ({delete_result.result_details}). "
-                    "You may end up with more than the configured maximum until it is removed manually."
+                    f"Attempted to remove older backup '{entry.path}' as part of retention pruning. "
+                    f"Failed with details '{delete_result.result_details}' — you may have more than the "
+                    "configured maximum until this file is removed manually."
                 )
 
         return warnings

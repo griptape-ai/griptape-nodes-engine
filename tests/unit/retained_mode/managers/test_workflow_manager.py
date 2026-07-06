@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.settings import MAX_WORKFLOW_BACKUPS_KEY
 from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder, WorkflowManager
 
 
@@ -3302,7 +3303,9 @@ class TestApplyWorkflowBackup:
             )
 
         assert len(warnings) == 1
-        assert "could not read" in warnings[0]
+        assert warnings[0].startswith("Attempted to read the")
+        assert MAX_WORKFLOW_BACKUPS_KEY in warnings[0]
+        assert "config not loaded" in warnings[0]
         mock_gn.ahandle_request.assert_not_called()
 
     @pytest.mark.asyncio
@@ -3341,7 +3344,7 @@ class TestApplyWorkflowBackup:
             )
 
         assert len(warnings) == 1
-        assert "look up existing backups" in warnings[0]
+        assert warnings[0].startswith("Attempted to list existing backups for 'my_wf.py'")
         assert "situation missing" in warnings[0]
 
     @pytest.mark.asyncio
@@ -3364,7 +3367,7 @@ class TestApplyWorkflowBackup:
         from griptape_nodes.retained_mode.events.project_events import ListRelatedProjectFilesRequest
 
         assert len(warnings) == 1
-        assert "could not be written" in warnings[0]
+        assert warnings[0].startswith("Attempted to write a backup copy of 'my_wf.py'")
         assert "disk full" in warnings[0]
         # Post-scan and delete must not run when the write itself failed — only the pre-scan.
         scan_requests = [r for r in captured if isinstance(r, ListRelatedProjectFilesRequest)]
@@ -3531,3 +3534,77 @@ class TestApplyWorkflowBackup:
         assert warnings == []
         # Every key from the writer's bag survived; the helper only added `_index`.
         assert captured_variables == {**custom_bag, "_index": 1}
+
+    @pytest.mark.asyncio
+    async def test_post_scan_failure_returns_warning_but_save_succeeded(
+        self, workflow_manager: WorkflowManager
+    ) -> None:
+        """Pre-scan + write succeed, but re-check fails. Backup was written; retention couldn't be enforced.
+
+        The artist sees a warning saying so. The primary save (upstream of this helper)
+        is unaffected — no warning here promotes the outer save to a failure.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        pre_scan_success = self._related_files_result_success([])
+        post_scan_failure = ListRelatedProjectFilesResultFailure(
+            failure_reason=ListRelatedProjectFilesFailureReason.SCAN_FAILED,
+            result_details="disk went away between pre-scan and post-scan",
+        )
+
+        with patch("griptape_nodes.retained_mode.managers.workflow_manager.GriptapeNodes") as mock_gn:
+            self._install_config_value(mock_gn, 5)
+            self._install_scan_and_delete(
+                mock_gn,
+                scan_results=[pre_scan_success, post_scan_failure],
+            )
+
+            write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
+            with patch.object(workflow_manager, "_write_workflow_file", return_value=write_success):
+                warnings = await workflow_manager._apply_workflow_backup(
+                    source_filename="my_wf.py",
+                    file_content="content",
+                )
+
+        assert len(warnings) == 1
+        # Message names what was attempted (re-check), what triggered the attempt (the newly
+        # written slot v001), and the underlying failure (the details string).
+        assert warnings[0].startswith("Attempted to re-check the backups folder for 'my_wf.py'")
+        assert "v001" in warnings[0]
+        assert "disk went away between pre-scan and post-scan" in warnings[0]
+
+    @pytest.mark.asyncio
+    async def test_post_scan_returns_no_sequence_reports_retention_could_not_be_enforced(
+        self, workflow_manager: WorkflowManager
+    ) -> None:
+        """Post-scan succeeds but returns ``sequence=None`` (empty re-check) — treat as a retention warning.
+
+        This is the edge case where the write was concurrent with an external clean-up that removed
+        every backup — including the one we just wrote — before we got to re-check. Rare, but
+        surfaced to the artist so they see something went sideways.
+        """
+        pre_scan_success = self._related_files_result_success([])
+        # Empty helper: sequence=None, source_variables={} → the "no entries" branch.
+        post_scan_empty = self._related_files_result_success([])
+
+        with patch("griptape_nodes.retained_mode.managers.workflow_manager.GriptapeNodes") as mock_gn:
+            self._install_config_value(mock_gn, 5)
+            self._install_scan_and_delete(
+                mock_gn,
+                scan_results=[pre_scan_success, post_scan_empty],
+            )
+
+            write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
+            with patch.object(workflow_manager, "_write_workflow_file", return_value=write_success):
+                warnings = await workflow_manager._apply_workflow_backup(
+                    source_filename="my_wf.py",
+                    file_content="content",
+                )
+
+        assert len(warnings) == 1
+        assert warnings[0].startswith("Attempted to re-check the backups folder for 'my_wf.py'")
+        assert "v001" in warnings[0]
+        assert "no entries" in warnings[0]
