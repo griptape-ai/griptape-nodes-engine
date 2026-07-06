@@ -530,6 +530,13 @@ class PublishWorkflowRegisteredEventData:
         display_name: Optional human-readable name for the publishing target. When set, the GUI
             should show this in the publish menu/dialog instead of the raw library name. When None,
             the frontend falls back to the library name, preserving today's behavior.
+        description: Optional short description of the publishing target. When set, the GUI may show
+            it alongside the target in the publish menu/dialog (e.g. as a subtitle or tooltip). When
+            None, no description is shown, preserving today's behavior.
+        icon: Optional icon identifier for the publishing target. When set, the GUI may render it
+            next to the target in the publish menu/dropdown. The value is an icon name the frontend
+            knows how to resolve (e.g. a Lucide icon name), not raw image data. When None, the GUI
+            uses its default/no icon, preserving today's behavior.
     """
 
     start_flow_node_type: str
@@ -538,6 +545,8 @@ class PublishWorkflowRegisteredEventData:
     end_flow_node_library_name: str
     get_publish_options: Callable[["GetPublishOptionsRequest"], GetPublishOptionsResultSuccess] | None = None
     display_name: str | None = None
+    description: str | None = None
+    icon: str | None = None
 
 
 @dataclass
