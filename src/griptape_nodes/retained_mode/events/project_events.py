@@ -23,6 +23,14 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
+    from griptape_nodes.common.sequences.models import Sequence
+
+    # Circular import: os_events already imports MacroPath from this module, so the
+    # sequence-scan failure enums come in under TYPE_CHECKING to keep runtime imports
+    # one-way. `from __future__ import annotations` (top of file) preserves the
+    # runtime type hints for dataclass fields without requiring the enums.
+    from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, SequenceScanFailureReason
+
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
     from griptape_nodes.retained_mode.managers.project_manager import ProjectID, ProjectInfo
 
@@ -363,6 +371,95 @@ class GetPathForMacroResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure
     failure_reason: PathResolutionFailureReason
     missing_variables: set[str] | None = None
     conflicting_variables: set[str] | None = None
+
+
+class ScanSituationSequenceFailureReason(StrEnum):
+    """Why a ``ScanSituationSequenceRequest`` could not produce a sequence view.
+
+    Separated by stage so callers can distinguish a wiring problem (situation not
+    registered, macro doesn't declare a sequence slot) from a data-layer problem
+    (directory unreadable, invalid template) without parsing detail strings.
+    """
+
+    SITUATION_NOT_FOUND = "situation_not_found"  # `GetSituationRequest` failed (missing situation, missing project).
+    MACRO_PARSE_ERROR = "macro_parse_error"  # Situation's stored macro string did not parse.
+    NO_SEQUENCE_SLOT = "no_sequence_slot"  # Macro has no required `{###}` slot; this call has no meaning for it.
+    MACRO_RESOLUTION_ERROR = "macro_resolution_error"  # `GetPathForMacroRequest` failed to render the pattern.
+    SCAN_FAILED = "scan_failed"  # Underlying `ScanSequencesRequest` failed; see `scan_failure_reason`.
+
+
+@dataclass
+@PayloadRegistry.register
+class ScanSituationSequenceRequest(RequestPayload):
+    """Resolve a situation's macro to a fileseq pattern and scan for on-disk instances.
+
+    Use when: You want the full list of on-disk numbered files matching a
+    situation (e.g. all backups, all versioned saves, all numbered outputs)
+    without hand-composing ``GetSituationRequest`` → ``GetPathForMacroRequest``
+    → ``ScanSequencesRequest`` at the call site.
+
+    Mirrors ``ProjectFileDestination.from_situation``: the handler derives
+    ``file_name_base`` / ``file_extension`` / ``sub_dirs`` from ``filename`` and
+    binds any additional ``extra_vars`` on top. The sequence slot (``_index``)
+    must remain unbound so ``RENDER_SEQUENCE_PATTERN`` can render it as ``####``
+    for the scanner.
+
+    Args:
+        situation_name: Situation to look up (e.g. ``BuiltInSituation.SAVE_WORKFLOW_BACKUP``).
+        filename: Workspace-relative filename that seeds the derived variables.
+        extra_vars: Additional macro variables to bind alongside the derived ones.
+
+    Results: ScanSituationSequenceResultSuccess (with sequence + rendered pattern) |
+    ScanSituationSequenceResultFailure (see ``failure_reason`` for which stage failed).
+    """
+
+    situation_name: str
+    filename: str
+    extra_vars: MacroVariables | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class ScanSituationSequenceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Successful scan of a situation's sequence.
+
+    Attributes:
+        sequence: On-disk entries for the resolved sequence pattern. ``None`` when
+            nothing on disk matched — a legitimate result, not a failure.
+        pattern: Rendered fileseq pattern (e.g. ``/ws/backups/wf_backup_v####.py``)
+            that was scanned. Preserved so callers can log or re-scan the same shape.
+    """
+
+    sequence: Sequence | None
+    pattern: str
+
+    @property
+    def present_numbers(self) -> set[int]:
+        """Empty set when the sequence was empty — safe to use directly for retention math."""
+        if self.sequence is None:
+            return set()
+        return self.sequence.present_numbers
+
+
+@dataclass
+@PayloadRegistry.register
+class ScanSituationSequenceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """A stage of ``ScanSituationSequenceRequest`` failed. See ``failure_reason``.
+
+    Attributes:
+        failure_reason: Which stage failed (situation lookup, macro parse, no
+            sequence slot, macro resolution, or the underlying scan).
+        pattern: Rendered pattern when the failure happened after render (e.g.
+            ``SCAN_FAILED``), else ``None``. Useful for log lines identifying
+            which pattern the scanner rejected.
+        scan_failure_reason: When ``failure_reason == SCAN_FAILED``, the
+            underlying ``ScanSequencesRequest`` failure reason. ``None`` for
+            every other stage.
+    """
+
+    failure_reason: ScanSituationSequenceFailureReason
+    pattern: str | None = None
+    scan_failure_reason: SequenceScanFailureReason | FileIOFailureReason | None = None
 
 
 @dataclass

@@ -311,6 +311,7 @@ class SaveWorkflowRequest(RequestPayload):
         pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
+        attempt_create_backup: When True, write a ``save_workflow_backup`` copy after the primary save succeeds and prune older backups per the ``max_workflow_backups`` config value. Opt-in so packaging/batch callers get no backup side effects by default; interactive save paths pass True. If the config value is 0 or negative, the backup step is skipped even when this flag is True.
 
     Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
     """
@@ -320,6 +321,7 @@ class SaveWorkflowRequest(RequestPayload):
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
     create_versioned: bool = False
+    attempt_create_backup: bool = False
 
 
 @dataclass
@@ -1096,10 +1098,15 @@ class SaveWorkflowFileFromSerializedFlowResultSuccess(WorkflowNotAlteredMixin, R
     Args:
         file_path: Path where the workflow file was written
         workflow_metadata: The metadata that was generated for the workflow
+        file_content: The exact content that was written to ``file_path``. Callers
+            performing follow-on writes (e.g. backup copies) can reuse this string
+            instead of re-serializing the flow or reading the file back from disk,
+            guaranteeing the follow-on write matches the primary write byte-for-byte.
     """
 
     file_path: str
     workflow_metadata: WorkflowMetadata
+    file_content: str
 
 
 @dataclass
