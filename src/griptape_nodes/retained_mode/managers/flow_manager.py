@@ -5,6 +5,7 @@ import base64
 import copy
 import logging
 import pickle
+from contextlib import contextmanager
 from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
@@ -177,12 +178,21 @@ from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
+
+# Marker stamped into a Flow's metadata when it is created purely as execution
+# scaffolding (e.g. the per-iteration flows a parallel ForEach group deserializes,
+# runs, and deletes within a single node execution). Flows carrying this marker are
+# hidden from the editor-facing flow enumerators so the canvas never discovers,
+# renders, or polls metadata for flows that are about to be torn down.
+TRANSIENT_EXECUTION_FLOW_METADATA_KEY = "transient_execution_flow"
 
 
 class DagExecutionType(StrEnum):
@@ -263,6 +273,10 @@ class FlowManager:
     _global_dag_builder: DagBuilder
     _node_executor: NodeExecutor
 
+    # Reference count for the transient-flow scope. While > 0, flows created via
+    # on_create_flow_request are stamped with TRANSIENT_EXECUTION_FLOW_METADATA_KEY.
+    _transient_flow_scope_depth: int
+
     def __init__(self, event_manager: EventManager) -> None:
         event_manager.assign_manager_to_request_type(CreateFlowRequest, self.on_create_flow_request)
         event_manager.assign_manager_to_request_type(DeleteFlowRequest, self.on_delete_flow_request)
@@ -314,6 +328,7 @@ class FlowManager:
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
+        self._transient_flow_scope_depth = 0
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -440,7 +455,9 @@ class FlowManager:
 
     def on_get_top_level_flow_request(self, request: GetTopLevelFlowRequest) -> ResultPayload:  # noqa: ARG002 (the request has to be assigned to the method)
         for flow_name, parent in self._name_to_parent_name.items():
-            if parent is None:
+            # Skip transient execution scaffolding so the canvas root is never reported as a
+            # per-iteration flow that is about to be deleted.
+            if parent is None and not self._flow_is_transient(flow_name):
                 return GetTopLevelFlowResultSuccess(
                     flow_name=flow_name, result_details=f"Successfully found top level flow: '{flow_name}'"
                 )
@@ -543,6 +560,29 @@ class FlowManager:
         """Determines if there is already an existing flow with no parent flow.Returns True if there is an existing flow with no parent flow.Return False if there is no existing flow with no parent flow."""
         return any([parent is None for parent in self._name_to_parent_name.values()])  # noqa: C419
 
+    @contextmanager
+    def transient_flow_scope(self) -> Iterator[None]:
+        """Mark every Flow created within this scope as transient execution scaffolding.
+
+        Parallel/iterative execution deserializes a fresh Flow per iteration, runs it, and
+        deletes it, all within a single node execution. Without a marker these Flows are
+        indistinguishable from user Flows, so the editor discovers them through the flow
+        enumerators and polls their metadata, then errors once they are torn down. Wrapping
+        the deserialize region in this scope stamps TRANSIENT_EXECUTION_FLOW_METADATA_KEY onto
+        each created Flow so the editor-facing enumerators skip it.
+
+        Reference-counted so nested loops (a ForEach inside a ForEach) compose correctly.
+        """
+        self._transient_flow_scope_depth += 1
+        try:
+            yield
+        finally:
+            self._transient_flow_scope_depth -= 1
+
+    def is_in_transient_flow_scope(self) -> bool:
+        """Return True while a transient_flow_scope() is active on this manager."""
+        return self._transient_flow_scope_depth > 0
+
     def on_create_flow_request(self, request: CreateFlowRequest) -> ResultPayload:
         # Who is the parent?
         parent_name = request.parent_flow_name
@@ -591,6 +631,7 @@ class FlowManager:
         # when serializing it. It may inform the editor to render it differently.
         workflow_manager = GriptapeNodes.WorkflowManager()
         flow = ControlFlow(name=final_flow_name, metadata=request.metadata)
+        self._mark_flow_transient_if_in_scope(flow)
         GriptapeNodes.ObjectManager().add_object_by_name(name=final_flow_name, obj=flow)
         self._name_to_parent_name[final_flow_name] = parent_name
 
@@ -784,15 +825,33 @@ class FlowManager:
                 return result
 
         # Create a list of all child flow names that point DIRECTLY to us.
+        # Transient execution scaffolding (e.g. per-iteration loop flows) is excluded so the
+        # editor never discovers flows that are about to be torn down.
         ret_list = []
         for flow_name, parent_name in self._name_to_parent_name.items():
-            if parent_name == request.parent_flow_name:
+            if parent_name == request.parent_flow_name and not self._flow_is_transient(flow_name):
                 ret_list.append(flow_name)
 
         details = f"Successfully got the list of Flows that are direct children of Flow '{request.parent_flow_name}'."
 
         result = ListFlowsInFlowResultSuccess(flow_names=ret_list, result_details=details)
         return result
+
+    def _flow_is_transient(self, flow_name: str) -> bool:
+        """Return True when the named Flow is marked as transient execution scaffolding."""
+        flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+        if flow is None:
+            return False
+        return bool(flow.metadata.get(TRANSIENT_EXECUTION_FLOW_METADATA_KEY))
+
+    def _mark_flow_transient_if_in_scope(self, flow: ControlFlow) -> None:
+        """Stamp the transient marker onto a Flow when a transient_flow_scope() is active.
+
+        Flows created while the scope is active (e.g. per-iteration flows for a parallel loop)
+        are hidden from the editor-facing enumerators.
+        """
+        if self.is_in_transient_flow_scope():
+            flow.metadata[TRANSIENT_EXECUTION_FLOW_METADATA_KEY] = True
 
     def get_flow_by_name(self, flow_name: str) -> ControlFlow:
         obj_mgr = GriptapeNodes.ObjectManager()

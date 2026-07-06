@@ -1107,7 +1107,10 @@ class NodeExecutor:
         # Deserialize flow once
         context_manager = GriptapeNodes.ContextManager()
         event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            GriptapeNodes.FlowManager().transient_flow_scope(),
+        ):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
             )
@@ -1693,7 +1696,10 @@ class NodeExecutor:
         """
         context_manager = GriptapeNodes.ContextManager()
         event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            GriptapeNodes.FlowManager().transient_flow_scope(),
+        ):
             deserialize_request = DeserializeFlowFromCommandsRequest(
                 serialized_flow_commands=package_result.serialized_flow_commands
             )
@@ -2979,7 +2985,10 @@ class NodeExecutor:
 
         # Suppress events during deserialization to prevent sending them to websockets
         event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+        with (
+            EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS),
+            GriptapeNodes.FlowManager().transient_flow_scope(),
+        ):
             for iteration_index in range(total_iterations):
                 # Restore context before each deserialization to ensure all iteration flows
                 # are created at the same level (not as children of each other)
