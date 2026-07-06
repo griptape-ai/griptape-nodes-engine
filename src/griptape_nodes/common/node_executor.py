@@ -45,6 +45,8 @@ from griptape_nodes.retained_mode.events.base_events import ForwardedException, 
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultFailure,
     CreateConnectionResultSuccess,
+    DeleteConnectionResultFailure,
+    DeleteConnectionResultSuccess,
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
@@ -83,13 +85,25 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeResultFailure,
+    CreateNodeResultSuccess,
+    DeleteNodeResultFailure,
+    DeleteNodeResultSuccess,
     DeserializeNodeFromCommandsResultFailure,
     DeserializeNodeFromCommandsResultSuccess,
     SetLockNodeStateResultFailure,
     SetLockNodeStateResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
+    AddParameterGroupToNodeResultFailure,
+    AddParameterGroupToNodeResultSuccess,
+    AddParameterToNodeResultFailure,
+    AddParameterToNodeResultSuccess,
     AlterElementEvent,
+    AlterParameterDetailsResultFailure,
+    AlterParameterDetailsResultSuccess,
+    AlterParameterGroupDetailsResultFailure,
+    AlterParameterGroupDetailsResultSuccess,
     RemoveElementEvent,
     SetParameterValueRequest,
     SetParameterValueResultFailure,
@@ -145,16 +159,41 @@ LOOP_EVENTS_TO_SUPPRESS = {
     CreateFlowResultFailure,
     ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowAsReferencedSubFlowResultFailure,
+    CreateNodeResultSuccess,
+    CreateNodeResultFailure,
     DeserializeNodeFromCommandsResultSuccess,
     DeserializeNodeFromCommandsResultFailure,
     CreateConnectionResultSuccess,
     CreateConnectionResultFailure,
+    AddParameterToNodeResultSuccess,
+    AddParameterToNodeResultFailure,
+    AddParameterGroupToNodeResultSuccess,
+    AddParameterGroupToNodeResultFailure,
+    AlterParameterDetailsResultSuccess,
+    AlterParameterDetailsResultFailure,
+    AlterParameterGroupDetailsResultSuccess,
+    AlterParameterGroupDetailsResultFailure,
     SetParameterValueResultSuccess,
     SetParameterValueResultFailure,
     SetLockNodeStateResultSuccess,
     SetLockNodeStateResultFailure,
+    AlterElementEvent,
+    RemoveElementEvent,
     DeserializeFlowFromCommandsResultSuccess,
     DeserializeFlowFromCommandsResultFailure,
+}
+
+# Events emitted while tearing down iteration flows. DeleteFlow cascades into
+# DeleteNode and DeleteConnection, so all three result types must be suppressed
+# to keep cleanup from flooding the editor with events for flows it is about to
+# lose (which otherwise surfaces as "no such Flow was found" metadata lookups).
+LOOP_CLEANUP_EVENTS_TO_SUPPRESS = {
+    DeleteFlowResultSuccess,
+    DeleteFlowResultFailure,
+    DeleteNodeResultSuccess,
+    DeleteNodeResultFailure,
+    DeleteConnectionResultSuccess,
+    DeleteConnectionResultFailure,
 }
 
 EXECUTION_EVENTS_TO_SUPPRESS = {
@@ -1231,7 +1270,7 @@ class NodeExecutor:
 
         finally:
             # Cleanup - delete the flow
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
+            with EventSuppressionContext(event_manager, LOOP_CLEANUP_EVENTS_TO_SUPPRESS):
                 delete_request = DeleteFlowRequest(flow_name=flow_name)
                 delete_result = await GriptapeNodes.ahandle_request(delete_request)
                 if not isinstance(delete_result, DeleteFlowResultSuccess):
@@ -2989,46 +3028,50 @@ class NodeExecutor:
                 return iteration_index, success
 
         try:
-            # Step 3: Set input values on start nodes for each iteration
-            for iteration_index, _, node_name_mappings in deserialized_flows:
-                parameter_values = parameter_values_per_iteration[iteration_index]
+            # Step 3: Set input values on start nodes for each iteration.
+            # Suppress the resulting value/element events so 61 iterations' worth of
+            # SetParameterValue results (which can carry large payloads like images)
+            # don't flood the editor with updates for nodes it never learned about.
+            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+                for iteration_index, _, node_name_mappings in deserialized_flows:
+                    parameter_values = parameter_values_per_iteration[iteration_index]
 
-                # Get Start node mapping (index 0 in the list)
-                start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-                start_node_name = start_node_mapping.node_name
-                start_params = start_node_mapping.parameter_mappings
+                    # Get Start node mapping (index 0 in the list)
+                    start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+                    start_node_name = start_node_mapping.node_name
+                    start_params = start_node_mapping.parameter_mappings
 
-                # Find the deserialized name for the Start node
-                deserialized_start_node_name = node_name_mappings.get(start_node_name)
-                if deserialized_start_node_name is None:
-                    logger.warning(
-                        "Could not find deserialized Start node (original: '%s') for iteration %d",
-                        start_node_name,
-                        iteration_index,
-                    )
-                    continue
-
-                # Set all parameter values on the deserialized Start node
-                for startflow_param_name in start_params:
-                    if startflow_param_name not in parameter_values:
+                    # Find the deserialized name for the Start node
+                    deserialized_start_node_name = node_name_mappings.get(start_node_name)
+                    if deserialized_start_node_name is None:
+                        logger.warning(
+                            "Could not find deserialized Start node (original: '%s') for iteration %d",
+                            start_node_name,
+                            iteration_index,
+                        )
                         continue
 
-                    value_to_set = parameter_values[startflow_param_name]
+                    # Set all parameter values on the deserialized Start node
+                    for startflow_param_name in start_params:
+                        if startflow_param_name not in parameter_values:
+                            continue
 
-                    set_value_request = SetParameterValueRequest(
-                        node_name=deserialized_start_node_name,
-                        parameter_name=startflow_param_name,
-                        value=value_to_set,
-                    )
-                    set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
-                    if not isinstance(set_value_result, SetParameterValueResultSuccess):
-                        logger.warning(
-                            "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
-                            startflow_param_name,
-                            deserialized_start_node_name,
-                            iteration_index,
-                            set_value_result.result_details,
+                        value_to_set = parameter_values[startflow_param_name]
+
+                        set_value_request = SetParameterValueRequest(
+                            node_name=deserialized_start_node_name,
+                            parameter_name=startflow_param_name,
+                            value=value_to_set,
                         )
+                        set_value_result = await GriptapeNodes.ahandle_request(set_value_request)
+                        if not isinstance(set_value_result, SetParameterValueResultSuccess):
+                            logger.warning(
+                                "Failed to set parameter '%s' on Start node '%s' for iteration %d: %s",
+                                startflow_param_name,
+                                deserialized_start_node_name,
+                                iteration_index,
+                                set_value_result.result_details,
+                            )
 
             logger.info("Successfully set input values for %d iterations", total_iterations)
             # Step 4: Run all iterations concurrently
@@ -3094,7 +3137,7 @@ class NodeExecutor:
         finally:
             # Step 8: Cleanup - delete all iteration flows
             # Suppress events during deletion to prevent sending them to websockets
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
+            with EventSuppressionContext(event_manager, LOOP_CLEANUP_EVENTS_TO_SUPPRESS):
                 for iteration_index, flow_name, _ in deserialized_flows:
                     delete_request = DeleteFlowRequest(flow_name=flow_name)
                     delete_result = await GriptapeNodes.ahandle_request(delete_request)
