@@ -241,6 +241,7 @@ from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normaliz
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
+    GitError,
     GitPullError,
     GitRefError,
     GitRemoteError,
@@ -252,6 +253,7 @@ from griptape_nodes.utils.git_utils import (
     get_git_remote,
     get_local_commit_sha,
     is_git_url,
+    is_on_tag,
     normalize_github_url,
     parse_git_url_with_ref,
     remote_ref_exists,
@@ -731,10 +733,21 @@ class LibraryManager:
         return self._library_file_path_to_info[library_file_path]
 
     def get_library_info_by_library_name(self, library_name: str) -> LibraryInfo | None:
-        for library_info in self._library_file_path_to_info.values():
-            if library_info.library_name == library_name:
+        # A library name can have more than one entry: a duplicate install registers a second
+        # copy that fails with DuplicateLibraryProblem but is deliberately kept in the dict
+        # (marked FAILURE) so the GUI can surface it, and filename variations / download +
+        # discovery collisions can key the same name under two paths. Prefer the copy that is
+        # actually LOADED (the one in LibraryRegistry, whose version the update-check reads) so
+        # every caller resolves the live copy rather than a dead duplicate. This keeps the
+        # update path, the update-check path, and the on-disk copy consistent (issue #5039).
+        # Fall back to first-match when nothing is loaded yet (e.g. discovery / worker-pending).
+        matches = [info for info in self._library_file_path_to_info.values() if info.library_name == library_name]
+        if not matches:
+            return None
+        for library_info in matches:
+            if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED:
                 return library_info
-        return None
+        return matches[0]
 
     def resolve_transitive_library_deps(
         self,
@@ -2737,10 +2750,17 @@ class LibraryManager:
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
         # Remove the library from our library info list. This prevents it from still showing
-        # up in the table of attempted library loads.
-        lib_info = self.get_library_info_by_library_name(request.library_name)
-        if lib_info:
-            del self._library_file_path_to_info[lib_info.library_path]
+        # up in the table of attempted library loads. Remove ALL entries for this name, not
+        # just the first: a duplicately-registered library (e.g. two on-disk copies, or a
+        # filename variation left behind by a git operation) would otherwise keep a stale
+        # entry alive, which desynchronizes the update and update-check paths.
+        stale_paths = [
+            file_path
+            for file_path, library_info in self._library_file_path_to_info.items()
+            if library_info.library_name == request.library_name
+        ]
+        for file_path in stale_paths:
+            del self._library_file_path_to_info[file_path]
         details = f"Successfully unloaded (and unregistered) library '{request.library_name}'."
         return UnloadLibraryFromRegistryResultSuccess(result_details=details)
 
@@ -5321,16 +5341,14 @@ class LibraryManager:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no Library with that name was registered."
             return CheckLibraryUpdateResultFailure(result_details=details)
 
-        # Find the library file path
-        library_file_path = None
-        for file_path, library_info in self._library_file_path_to_info.items():
-            if library_info.library_name == library_name:
-                library_file_path = file_path
-                break
-
-        if library_file_path is None:
+        # Find the library file path. Route through the shared resolver so the update path
+        # (_validate_and_prepare_library_for_git_operation) and this check path can never
+        # disagree about which on-disk copy a duplicately-registered library maps to.
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no file path could be found for this library."
             return CheckLibraryUpdateResultFailure(result_details=details)
+        library_file_path = library_info.library_path
 
         # Get the library directory (parent of the JSON file)
         library_dir = Path(library_file_path).parent.absolute()
@@ -5503,16 +5521,14 @@ class LibraryManager:
             details = f"Library '{library_name}' has no version information."
             return failure_result_class(result_details=details)
 
-        # Find the library file path
-        library_file_path = None
-        for file_path, library_info in self._library_file_path_to_info.items():
-            if library_info.library_name == library_name:
-                library_file_path = file_path
-                break
-
-        if library_file_path is None:
+        # Find the library file path. Route through the shared resolver so this update path
+        # and check_library_update_request can never disagree about which on-disk copy a
+        # duplicately-registered library maps to.
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
             details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no file path could be found for this library."
             return failure_result_class(result_details=details)
+        library_file_path = library_info.library_path
 
         # Get the library directory (parent of the JSON file)
         library_dir = Path(library_file_path).parent.absolute()
@@ -5561,6 +5577,20 @@ class LibraryManager:
 
         # Use the found file path for reloading
         actual_library_file_path = str(actual_library_file)
+
+        # Drop any lingering entries for this library before reinserting. The git operation may
+        # resolve the JSON under a different filename (griptape_nodes_library.json vs
+        # griptape-nodes-library.json), which would otherwise leave the pre-operation entry keyed
+        # under the old filename alongside the new one. Two live entries for one name let the
+        # update and update-check paths resolve different on-disk copies, producing a permanent
+        # "update available" loop.
+        stale_paths = [
+            file_path
+            for file_path, existing_info in self._library_file_path_to_info.items()
+            if existing_info.library_name == library_name
+        ]
+        for file_path in stale_paths:
+            del self._library_file_path_to_info[file_path]
 
         # Create LibraryInfo for tracking this library reload
         lib_info = LibraryManager.LibraryInfo(
@@ -5639,6 +5669,31 @@ class LibraryManager:
                 retryable=retryable,
                 existing_path=str(library_dir) if retryable else None,
             )
+
+        # After a moving-tag update, the local HEAD should match the commit the remote tag
+        # resolves to. If it does not, the next update check will report "update available"
+        # forever (the loop from issue #5039). Surface it loudly rather than looping silently.
+        # This is diagnostic only and never fails the update. Restricted to tag-based (detached
+        # HEAD) libraries: a branch update does `git reset --hard` to remote HEAD, so it always
+        # converges and would only pay for an extra remote clone with nothing to report.
+        try:
+            if await asyncio.to_thread(is_on_tag, library_dir):
+                local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+                git_remote = await asyncio.to_thread(get_git_remote, library_dir)
+                git_ref = await asyncio.to_thread(get_current_ref, library_dir)
+                if local_commit is not None and git_remote is not None:
+                    version_info = await asyncio.to_thread(clone_and_get_library_version, git_remote, git_ref or "HEAD")
+                    if local_commit != version_info.commit_sha:
+                        logger.warning(
+                            "After updating Library '%s' on ref '%s', local commit %s does not match "
+                            "remote commit %s. Update checks may keep reporting an available update.",
+                            library_name,
+                            git_ref,
+                            local_commit,
+                            version_info.commit_sha,
+                        )
+        except GitError as e:
+            logger.debug("Skipped post-update commit verification for Library '%s': %s", library_name, e)
 
         # Reload library
         reload_result = await self._reload_library_after_git_operation(
