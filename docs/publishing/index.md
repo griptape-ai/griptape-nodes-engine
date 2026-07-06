@@ -1,25 +1,22 @@
 # Publishing a workflow
 
-Publishing takes a saved workflow and hands it to a *publisher* that bundles it —
-together with the libraries, Python dependencies, configuration, and files it
-needs — and sends it to a destination. Where the workflow ends up depends on the
-publisher you choose: one publisher writes a self-contained folder to your disk,
-another deploys the workflow to Griptape Cloud, another installs it as a gizmo in
-Foundry Nuke, and a node library can provide its own publisher for any other
-target.
+Publishing turns a saved workflow into a self-contained bundle — the workflow
+plus the libraries, Python dependencies, configuration, and files it needs — and
+delivers it somewhere it can run: a folder on your disk, a Structure on Griptape
+Cloud, or a gizmo inside Foundry Nuke. The component that packages and delivers
+the bundle is called a *publisher*, and each destination has its own.
 
-This page explains what's common to every publisher — the publish lifecycle and
-how dependencies are discovered — and how the publishers you'll encounter differ.
-It is for anyone who publishes a workflow. If your published workflow is missing
-a media file (an image, audio clip, video, or text file it loads), skip ahead to
-[Static files: the known gap and the workaround](#static-files-the-known-gap-and-the-workaround).
+Every publisher follows the same lifecycle and discovers dependencies the same
+way. This page covers that shared behavior, then where each publisher differs. If
+your published workflow is missing a media file it loads (an image, audio clip,
+video, or text file), skip ahead to
+[Static files: making sure they get bundled](#static-files-making-sure-they-get-bundled).
 
 ## Publishers
 
-Publishing itself is built into the engine, but the *publisher* — what actually
-packages your workflow and where it sends it — is provided by a node library. Any
-library can register a publisher, so the list you see depends on which libraries
-are installed. Several publishers ship with Griptape libraries:
+Publishing is built into the engine, but publishers come from node libraries. Any
+library can register one, so the list you see depends on which libraries are
+installed. Griptape ships several:
 
 | Publisher             | Provided by            | Where the workflow goes                                                                   |
 | --------------------- | ---------------------- | ----------------------------------------------------------------------------------------- |
@@ -36,8 +33,10 @@ existing version or publish a new one.
 
 ## Before you publish
 
-- **Save your workflow first.** Publishing operates on the workflow as it exists
-    on disk. An unsaved workflow cannot be published — save it, then publish.
+- **Your workflow must have been saved at least once** so it has a file on disk.
+    Any unsaved changes are saved automatically when you publish, so you don't
+    need to save again right before publishing — but a workflow that has never
+    been saved has no file path and cannot be published until you save it once.
 - **Choose a publisher.** Pick the publisher for where you want the workflow to
     go (see the table above). If only one library provides a publisher, it is
     selected for you.
@@ -48,13 +47,13 @@ existing version or publish a new one.
 ## What happens when you publish
 
 Regardless of which publisher you pick, the lifecycle is the same. The engine
-saves your workflow, hands off to the selected publisher, and the publisher walks
-the workflow to discover and bundle everything it depends on before delivering it
-to its destination:
+saves any unsaved changes to your workflow's file, hands off to the selected
+publisher, and the publisher walks the workflow to discover and bundle everything
+it depends on before delivering it to its destination:
 
 ```mermaid
 flowchart TD
-    A[You click Publish] --> B[Engine saves the workflow to disk]
+    A[You click Publish] --> B[Engine saves unsaved changes to the workflow file]
     B --> C[Engine hands off to the selected publisher]
     C --> D[Publisher walks every node in the workflow]
     D --> E[Discovers dependencies:<br/>libraries, pip packages, static files]
@@ -75,15 +74,29 @@ Every publisher assembles the same core ingredients, because a workflow needs al
 of them to run anywhere:
 
 - The **workflow file** itself.
-- The **node libraries** the workflow references, including transitive
-    dependencies.
+- The **node libraries** the workflow references, including their transitive
+    dependencies — the libraries those libraries depend on in turn, so nothing the
+    workflow relies on indirectly is left out.
 - **Configuration** telling the engine which libraries to load.
-- An **`.env` file** merging your workspace environment with the secrets the
-    workflow needs.
-- A **project template** so directory macros and situations resolve at runtime.
+- An **`.env` file** containing your **entire** workspace environment plus **all**
+    of your configured secrets, written in plaintext. See the security warning
+    below.
+- A **project template** so
+    [directory macros](../projects/macros.md) and
+    [situations](../projects/situations.md) resolve at runtime.
 - **Python dependencies**, pinned to the engine and library versions the workflow
     was built against.
 - A **Hugging Face model download step**, when the workflow uses such models.
+
+!!! warning "The bundle contains all of your secrets, in plaintext"
+
+    The packaged `.env` is **not** filtered to what the workflow uses. It merges
+    your whole workspace `.env` with every secret configured in the Secrets
+    Manager, in plaintext — including API keys for services this workflow never
+    touches. Anyone you hand a published folder to (or anyone on a machine where a
+    gizmo is installed) gets all of those credentials. **Review the bundled `.env`
+    and remove anything the workflow doesn't need before sharing a published
+    bundle.**
 
 What differs is the *shape* of the delivered result:
 
@@ -118,39 +131,43 @@ on. It aggregates three kinds of dependency across the whole workflow:
 That last point is where publishing can surprise you, and it applies to every
 publisher equally.
 
-## Static files: the known gap and the workaround
+## Static files: making sure they get bundled
 
 !!! warning "Referenced files can be missing from the bundle"
 
     A static file is only included in the bundle if the node that uses it
-    *declares* it as a dependency. Not every node does this yet. If a node loads a
+    *declares* it as a dependency, and not every node does so. If a node loads a
     file but doesn't declare it, that file is **left out**, and the published
     workflow breaks when it tries to read a file that isn't there. This is true
     whichever publisher you use.
 
-Until every node declares its file dependencies, the reliable workaround is to
-route the file through the **`SelectFromProject`** node, which ships with the
+The reliable way to guarantee a file is bundled is to route it through the
+**`SelectFromProject`** node, which ships with the
 [Griptape Nodes Library](https://github.com/griptape-ai/griptape-nodes-library-standard):
 
-1. Add a `SelectFromProject` node and set its **selected path** to the file (or
-    directory) you want to include.
+1. Add a `SelectFromProject` node and set its `selected_path` input to the file
+    (or directory) you want to include.
 1. Connect its `project_path` output into the node that consumes the file.
 
-`SelectFromProject` explicitly declares its selected path as a static-file
+`SelectFromProject` explicitly declares its `selected_path` as a static-file
 dependency, so the publisher always bundles that file. Feeding your file through
 it guarantees the file travels with the published workflow.
 
 !!! tip "Files inside your project stay portable"
 
     When the selected file lives inside your project, `SelectFromProject`
-    resolves it to a project-relative *macro* path rather than an absolute path.
-    That keeps the reference valid after the bundle is moved to another machine or
-    deployed to the cloud.
+    resolves it to a project-relative [macro](../projects/macros.md) path rather
+    than an absolute path. That keeps the reference valid after the bundle is
+    moved to another machine or deployed to the cloud.
 
 **When do I need this?** Use `SelectFromProject` for any file loaded from your
 project that doesn't show up in the published bundle — for example an image,
 audio clip, video, or text file that a node reads but that goes missing after you
 publish.
+
+If you write nodes yourself, the durable fix is to have your node declare the
+files it uses so users never need the workaround. See
+[For library authors](#for-library-authors) below.
 
 ## For library authors
 
@@ -205,6 +222,12 @@ def get_node_dependencies(self) -> NodeDependencies | None:
 ```
 
 Always call `super().get_node_dependencies()` first so library and widget
-dependencies are preserved, then add your own. See the
-[Comprehensive Guide](../developing_nodes/comprehensive_guide.md) for the full
-node-development reference.
+dependencies are preserved, then add your own.
+
+For a node that does this correctly, look at `SelectFromProject` in the
+[Griptape Nodes Library](https://github.com/griptape-ai/griptape-nodes-library-standard)
+(`griptape_nodes_library/files/select_from_project.py`) — it declares its
+`selected_path` as a static-file dependency, which is exactly why routing a file
+through it guarantees the file is bundled. The
+[Comprehensive Guide](../developing_nodes/comprehensive_guide.md) covers node
+development in general.
