@@ -1972,6 +1972,282 @@ situations:
         assert pm._current_project_id == str(workspace_project_path)
 
 
+class TestLoadSelectsDefaultByMajor:
+    """End-to-end: loading a project file merges it onto the default for its OWN major.
+
+    Guards the integration the unit tests for default_template_for_version cannot: that
+    the real load path (_load_and_cache_project_template -> _resolve_parent_chain -> merge)
+    actually picks the v0 baseline for a v0 project and the v1 baseline for a v1 project.
+    A v0 project keeps the legacy workspace-root-relative dirs; a v1 project gets the
+    workflow-relative dirs. Both are parentless, so the base is the major-selected default.
+    """
+
+    V0_PROJECT_YAML = """\
+project_template_schema_version: "0.5.1"
+name: Legacy Project
+"""
+
+    V1_PROJECT_YAML = """\
+project_template_schema_version: "1.0.0"
+name: Modern Project
+"""
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = {}
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    async def _load_yaml(self, pm: ProjectManager, tmp_path: Path, yaml_text: str):  # noqa: ANN202
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        project_path = tmp_path / "griptape-nodes-project.yml"
+        project_path.write_text(yaml_text)
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=yaml_text)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        return pm._successfully_loaded_project_templates[str(project_path)].template
+
+    @pytest.mark.asyncio
+    async def test_v0_project_loads_onto_v0_layout(self, pm: ProjectManager, tmp_path: Path) -> None:
+        template = await self._load_yaml(pm, tmp_path, self.V0_PROJECT_YAML)
+        # Legacy baseline: dirs are workspace-root relative (not workflow-relative).
+        assert template.directories["inputs"].path_macro == "inputs"
+        assert "{file_extension_directory" not in template.situations["save_node_output"].macro
+
+    @pytest.mark.asyncio
+    async def test_v1_project_loads_onto_v1_layout(self, pm: ProjectManager, tmp_path: Path) -> None:
+        template = await self._load_yaml(pm, tmp_path, self.V1_PROJECT_YAML)
+        # v1 baseline: workflow-relative dirs and file_extension_directory routing.
+        assert template.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+        assert "{file_extension_directory" in template.situations["save_node_output"].macro
+
+    @pytest.mark.asyncio
+    async def test_malformed_version_loads_against_latest_without_crashing(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        # Version strings are user-controlled. The per-major merge-base selection must not raise
+        # on a non-semver value (it would crash the load / boot); it falls back to the latest
+        # default instead.
+        template = await self._load_yaml(
+            pm, tmp_path, 'project_template_schema_version: "not-a-version"\nname: Garbage\n'
+        )
+        # Fell back to the latest (v1) baseline rather than raising.
+        assert template.directories["inputs"].path_macro == "{workflow_dir?:/}inputs"
+
+
+class TestUpgradeProjectSchema:
+    """Elective v0 -> v1 schema upgrade: restamp to latest major and re-save."""
+
+    V0_PROJECT_YAML = """\
+project_template_schema_version: "0.5.1"
+name: Legacy Project
+"""
+
+    @pytest.fixture
+    def pm(self) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.get_config_value.return_value = {}
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    async def _load(self, pm: ProjectManager, tmp_path: Path, yaml_text: str) -> str:
+        """Load a project from disk and return its registry id."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        project_path = tmp_path / "griptape-nodes-project.yml"
+        project_path.write_text(yaml_text)
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=yaml_text)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        return next(
+            pid
+            for pid, info in pm._successfully_loaded_project_templates.items()
+            if info.project_file_path == canonicalize_for_identity(project_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_upgrade_v0_to_latest_writes_new_major(self, pm: ProjectManager, tmp_path: Path) -> None:
+        from griptape_nodes.common.project_templates import ProjectTemplate
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultSuccess,
+        )
+
+        # A minimal v0 project: only name + version, no explicit directory/situation overrides.
+        # On upgrade it must ADOPT the v1 layout, not pin the materialized v0 defaults.
+        project_id = await self._load(pm, tmp_path, self.V0_PROJECT_YAML)
+
+        written: dict[str, str] = {}
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.write_text = lambda content: written.update(yaml=content)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultSuccess)
+        assert result.previous_schema_version == "0.5.1"
+        assert result.new_schema_version == ProjectTemplate.LATEST_SCHEMA_VERSION
+        # The re-saved file carries the new major version.
+        assert f'"project_template_schema_version": "{ProjectTemplate.LATEST_SCHEMA_VERSION}"' in written["yaml"]
+        # ADOPTION, not relabel: the project had no explicit directory override, so the upgraded
+        # overlay must NOT pin the old v0 "inputs" macro -- it falls through to the v1 default.
+        assert '"inputs"' not in written["yaml"]
+        assert "directories" not in written["yaml"]
+
+    @pytest.mark.asyncio
+    async def test_upgrade_already_latest_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
+        from griptape_nodes.common.project_templates import ProjectTemplate
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        latest_yaml = f'project_template_schema_version: "{ProjectTemplate.LATEST_SCHEMA_VERSION}"\nname: Modern\n'
+        project_id = await self._load(pm, tmp_path, latest_yaml)
+
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "is not an older major than the latest" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_upgrade_unloaded_project_is_failure(self, pm: ProjectManager) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id="not-loaded"))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "not loaded" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_upgrade_future_major_is_refused_not_downgraded(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # The load path forward-compat-accepts an unknown future major; the upgrade handler must
+        # NOT restamp it DOWN to the (older) latest, which would be a silent schema downgrade.
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        future_yaml = 'project_template_schema_version: "2.0.0"\nname: FromTheFuture\n'
+        project_id = await self._load(pm, tmp_path, future_yaml)
+
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "is not an older major than the latest" in str(result.result_details)
+        # The on-disk file is untouched (no downgrade).
+        assert "2.0.0" in (tmp_path / "griptape-nodes-project.yml").read_text()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_malformed_version_fails_gracefully(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # The load path tolerates a malformed version, so the upgrade handler must not raise on
+        # one -- it returns a failure result instead of crashing the request dispatch.
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        bad_yaml = 'project_template_schema_version: "not-a-version"\nname: Garbage\n'
+        project_id = await self._load(pm, tmp_path, bad_yaml)
+
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=project_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+
+    async def _load_at(self, pm: ProjectManager, project_dir: Path, yaml_text: str) -> str:
+        """Load a project from its own directory and return its registry id.
+
+        Distinct from _load (which uses a single fixed path) so a parent and child can be loaded at
+        separate dirs and linked by parent_project_id.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        project_dir.mkdir(parents=True, exist_ok=True)  # noqa: ASYNC240
+        project_path = project_dir / "griptape-nodes-project.yml"
+        project_path.write_text(yaml_text)
+        result = await pm._load_and_cache_project_template(project_path, persist_path=False)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        return next(
+            pid
+            for pid, info in pm._successfully_loaded_project_templates.items()
+            if info.project_file_path == canonicalize_for_identity(project_path)
+        )
+
+    @pytest.mark.asyncio
+    async def test_upgrade_child_with_older_major_parent_is_refused(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # A child re-stamped to the latest major but merged onto a still-v0 parent would keep the
+        # old-major defaults for every un-overridden field while its version label says v1. Refuse it
+        # (upgrade the parent first) rather than report a hollow success.
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultFailure,
+        )
+
+        parent_id = await self._load_at(
+            pm, tmp_path / "parent", 'project_template_schema_version: "0.5.1"\nname: Parent\nid: parent-id\n'
+        )
+        child_id = await self._load_at(
+            pm,
+            tmp_path / "child",
+            f'project_template_schema_version: "0.5.1"\nname: Child\nid: child-id\nparent_project_id: "{parent_id}"\n',
+        )
+
+        result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=child_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultFailure)
+        assert "parent" in str(result.result_details).lower()
+        # The child's on-disk file is untouched (not re-stamped to a version its layout doesn't match).
+        assert '"0.5.1"' in (tmp_path / "child" / "griptape-nodes-project.yml").read_text()
+
+    @pytest.mark.asyncio
+    async def test_upgrade_child_succeeds_once_parent_is_new_major(self, pm: ProjectManager, tmp_path: Path) -> None:
+        # With the parent already on the latest major, the child's merge base is new-major, so the
+        # child CAN adopt the new defaults -- the upgrade succeeds.
+        from griptape_nodes.common.project_templates import ProjectTemplate
+        from griptape_nodes.retained_mode.events.project_events import (
+            UpgradeProjectSchemaRequest,
+            UpgradeProjectSchemaResultSuccess,
+        )
+
+        latest = ProjectTemplate.LATEST_SCHEMA_VERSION
+        parent_id = await self._load_at(
+            pm, tmp_path / "parent", f'project_template_schema_version: "{latest}"\nname: Parent\nid: parent-id\n'
+        )
+        child_id = await self._load_at(
+            pm,
+            tmp_path / "child",
+            f'project_template_schema_version: "0.5.1"\nname: Child\nid: child-id\nparent_project_id: "{parent_id}"\n',
+        )
+
+        written: dict[str, str] = {}
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.write_text = lambda content: written.update(yaml=content)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm.on_upgrade_project_schema_request(UpgradeProjectSchemaRequest(project_id=child_id))
+
+        assert isinstance(result, UpgradeProjectSchemaResultSuccess)
+        assert result.new_schema_version == latest
+        assert f'"project_template_schema_version": "{latest}"' in written["yaml"]
+
+
 class TestLoadSystemDefaults:
     """Test _load_system_defaults uses resolved workspace path for project_base_dir."""
 
@@ -2122,7 +2398,11 @@ class TestDecideWorkspace:
             file_path = spec.get("file")
             base_dir = Path(file_path).parent if file_path is not None else Path("/")
             template = DEFAULT_PROJECT_TEMPLATE.model_copy(
-                update={"parent_project_id": spec.get("parent_id"), "libraries_dir": spec.get("libraries_dir")}
+                update={
+                    "parent_project_id": spec.get("parent_id"),
+                    "libraries_dir": spec.get("libraries_dir"),
+                    "workspace_dir": spec.get("workspace_dir"),
+                }
             )
             pm._successfully_loaded_project_templates[spec["id"]] = ProjectInfo(
                 project_id=spec["id"],
@@ -2268,6 +2548,87 @@ class TestDecideWorkspace:
         decision = pm.decide_workspace(c_file, project_config={}, env_config={})
 
         assert decision.workspace_dir == Path("/ws/a")
+        assert decision.apply_override is True
+
+    def test_inherits_parent_template_workspace_dir_resolved_against_parent(self, tmp_path: Path) -> None:
+        """A child with no workspace_dir inherits the parent's workspace_dir TEMPLATE FIELD.
+
+        Regression: previously the parent-chain walk only read an ancestor's project_workspaces
+        override / adjacent config, NOT its workspace_dir template field. A parent that declared only
+        workspace_dir (the common self-contained "./" case) was therefore not inheritable, so the
+        child fell through to the global workspace and scanned the whole workspace tree for workflows.
+        The parent's relative "./" must resolve against the PARENT's dir, not the child's.
+        """
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "P", "file": parent_file, "parent_id": None, "workspace_dir": "./", "config": {}},
+                {"id": "C", "file": child_file, "parent_id": "P", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(child_file, project_config={}, env_config={})
+
+        # Parent's "./" resolves to the PARENT's dir -- not the child's, not the global default.
+        assert decision.workspace_dir == Path(str(canonicalize_for_identity(parent_file.parent)))
+        assert decision.workspace_dir != Path(str(canonicalize_for_identity(child_file.parent)))
+        assert decision.apply_override is True
+
+    def test_ancestor_template_workspace_dir_beats_its_adjacent_config(self, tmp_path: Path) -> None:
+        """On one ancestor, the workspace_dir template field wins over its adjacent config.
+
+        Mirrors branch-0-beats-branch-3 precedence for the active project: an ancestor resolves its
+        own workspace the same way whether it is active or inherited-from.
+        """
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {
+                    "id": "P",
+                    "file": parent_file,
+                    "parent_id": None,
+                    "workspace_dir": "./from-template",
+                    "config": {"workspace_directory": "/from/adjacent"},
+                },
+                {"id": "C", "file": child_file, "parent_id": "P", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(child_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path(str(canonicalize_for_identity(parent_file.parent / "from-template")))
+        assert decision.apply_override is True
+
+    def test_skips_to_grandparent_template_workspace_dir(self, tmp_path: Path) -> None:
+        """C inherits A's workspace_dir field when B (its parent) declares neither field nor config."""
+        a_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        b_file = tmp_path / "a" / "b" / "griptape-nodes-project.yml"
+        c_file = tmp_path / "a" / "b" / "c" / "griptape-nodes-project.yml"
+        for f in (a_file, b_file, c_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._pm_with_chain(
+            [
+                {"id": "A", "file": a_file, "parent_id": None, "workspace_dir": "./", "config": {}},
+                {"id": "B", "file": b_file, "parent_id": "A", "config": {}},
+                {"id": "C", "file": c_file, "parent_id": "B", "config": {}},
+            ],
+            configured_root="/global/ws",
+        )
+        decision = pm.decide_workspace(c_file, project_config={}, env_config={})
+
+        assert decision.workspace_dir == Path(str(canonicalize_for_identity(a_file.parent)))
         assert decision.apply_override is True
 
     def test_chain_exhausted_uses_global_default(self, tmp_path: Path) -> None:
@@ -2934,6 +3295,58 @@ class TestResolveWorkspaceDirForProjectId:
 
         assert offline_result == self._resolved(str(live_decision.workspace_dir))
         assert offline_result == self._resolved("/ws/a")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_child_inherits_parent_template_workspace_dir(self, tmp_path: Path) -> None:
+        """Offline: an unloaded child inherits the parent's workspace_dir TEMPLATE FIELD from disk.
+
+        Offline analogue of the live regression: the parent declares only workspace_dir "./" (no
+        adjacent config, no project_workspaces), and the child must inherit it resolved against the
+        PARENT's dir, not fall through to the global workspace.
+        """
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "P", "file": parent_file, "workspace_dir": "./", "config": {}},
+                {"id": "C", "file": child_file, "parent_id": "P", "config": {}},
+            ],
+            registered=[str(parent_file), str(child_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved(str(canonicalize_for_identity(parent_file.parent)))
+
+    @pytest.mark.asyncio
+    async def test_matches_decide_workspace_for_template_field_inheritance(self, tmp_path: Path) -> None:
+        """Parity: live and offline agree when the child inherits the parent's workspace_dir field."""
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "P", "file": parent_file, "workspace_dir": "./", "config": {}},
+                {"id": "C", "file": child_file, "parent_id": "P", "config": {}},
+            ],
+            registered=[str(parent_file), str(child_file)],
+            loaded=["P", "C"],
+            configured_root="/global/ws",
+        )
+
+        child_canonical = canonicalize_for_identity(child_file)
+        live_decision = pm.decide_workspace(child_canonical, project_config={}, env_config={})
+        offline_result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert offline_result == self._resolved(str(live_decision.workspace_dir))
+        assert offline_result == self._resolved(str(canonicalize_for_identity(parent_file.parent)))
 
     @pytest.mark.asyncio
     async def test_unloaded_skips_to_grandparent_workspace(self, tmp_path: Path) -> None:
@@ -3683,6 +4096,95 @@ class TestProjectManagerProjectWorkspaces:
         # override is re-applied, so the pinned project's own workspace config layer loads.
         mock_config.clear_project_layers.assert_called_once()
         mock_config.set_workspace_override.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_activation_sets_libraries_root_override_from_inherited_parent(self, tmp_path: Path) -> None:
+        """Activating a child pins the libraries root to the parent's dir (the sharing seam).
+
+        End-to-end wiring test for _activate_project's libraries block: activation must call
+        decide_libraries_root (which walks the parent chain) and push the result into
+        set_libraries_root_override, so resolved_libraries_root() then returns the shared tree. The
+        child declares no libraries_dir of its own; the parent declares "./libraries", so the child
+        inherits the PARENT's dir. Guards against the override being dropped, ordered wrongly relative
+        to clear_project_layers, or fed the wrong value -- none of which the isolated
+        decide_libraries_root tests would catch.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        parent_file = tmp_path / "parent" / "project.yml"
+        parent_file.parent.mkdir()
+        parent_file.touch()
+        child_file = tmp_path / "parent" / "child" / "project.yml"
+        child_file.parent.mkdir()
+        child_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
+        # griptape_nodes_config.json, so it must return a real dict (not a Mock) for the child's
+        # branch-4 workspace inheritance. The child inherits the parent's workspace here (neither
+        # declares workspace_dir), which is orthogonal to the libraries_dir seam under test.
+        mock_config.read_config_file.return_value = {}
+
+        # Parent declares libraries_dir "./libraries"; child inherits (declares none).
+        parent_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "P", "libraries_dir": "./libraries"})
+        child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "C", "parent_project_id": "P"})
+        pm = self._make_project_manager_with_project(child_file, mock_config)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        # Re-key the child's registry entry to its opaque id (parent link resolves by id), and add parent.
+        del pm._successfully_loaded_project_templates[str(child_file)]
+        for pid, f, tmpl in [("P", parent_file, parent_template), ("C", child_file, child_template)]:
+            pm._successfully_loaded_project_templates[pid] = ProjectInfo(
+                project_id=pid,
+                project_file_path=f,
+                project_base_dir=f.parent,
+                template=tmpl,
+                validation=validation,
+                parsed_situation_schemas=pm._parse_situation_macros(tmpl.situations, validation),
+                parsed_directory_schemas=pm._parse_directory_macros(tmpl.directories, validation),
+            )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        # The override is set to the PARENT's libraries dir, resolved against the parent -- not the
+        # child's own dir, and not None (which would fall back to the workspace-relative default).
+        mock_config.set_libraries_root_override.assert_called_once_with(
+            Path(str(canonicalize_for_identity(parent_file.parent / "libraries")))
+        )
+
+    @pytest.mark.asyncio
+    async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
+        """Activating a project with no libraries_dir anywhere pins the override to None (fallback).
+
+        The other half of the seam: when decide_libraries_root returns None (no own or inherited
+        libraries_dir), activation must still call set_libraries_root_override(None) so a stale
+        override from a previously-active sharing project is dropped and resolved_libraries_root()
+        falls back to the workspace-relative default.
+        """
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        project_file = tmp_path / "solo" / "project.yml"
+        project_file.parent.mkdir()
+        project_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
+
+        # _make_project_manager_with_project registers a bare DEFAULT_PROJECT_TEMPLATE (no libraries_dir).
+        pm = self._make_project_manager_with_project(project_file, mock_config)
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
+
+        mock_config.set_libraries_root_override.assert_called_once_with(None)
 
     @pytest.mark.asyncio
     async def test_switch_to_system_defaults_drops_prior_project_library_pins(self, tmp_path: Path) -> None:

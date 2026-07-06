@@ -61,12 +61,13 @@ Fill in the basics:
 
 ### Advanced Settings
 
-Most artists never need to open this. Expand **Advanced Settings** to reveal two fields:
+Most artists never need to open this. Expand **Advanced Settings** to reveal:
 
 - **Project ID**: a unique, permanent identifier for the project. It is generated automatically from the name plus a short random suffix, and you can leave it as-is. Click it to type your own (lowercase letters, numbers, and dashes; it must be unique). Once a project is created, its ID does not change.
 - **Inherits settings from**: the parent project. A child project starts from its parent's setup and only stores the things you change. This is linked to the location by default, so choosing a location also sets the parent; pick **Default Project** here if you don't want inheritance. See [Projects](projects.md#parent-projects) for how inheritance works.
+- **Workspace directory**: where the new project keeps its workflows and generated files. A new project defaults to `./` — its own folder — so it is self-contained. Change it to point elsewhere, or clear it to inherit the workspace from the parent project. (Shown only for current-schema projects; see [Schema versions](projects.md#schema-versions).)
 
-![Advanced Settings expanded, showing the Project ID and Inherits-settings-from fields](../assets/img/projects/projects-gui-create-advanced.png)
+![Advanced Settings expanded, showing the Project ID, Inherits-settings-from, and Workspace directory fields](../assets/img/projects/projects-gui-create-advanced.png)
 
 Click **Create**. A progress panel walks through saving the project, registering it with the engine, activating it, and finishing up. Creating a project makes it the active project, so the engine reloads (the same reload that happens on any switch); if you have an unsaved workflow open, you'll be prompted to save first.
 
@@ -97,6 +98,16 @@ Leave it blank and the project uses the workspace the engine works out from your
 ![The Workspace dir field showing the calculated workspace as grey placeholder text](../assets/img/projects/projects-gui-workspace-dir.png)
 
 For the full reference, see [Workspace directory](projects.md#workspace-directory) and [Workspace](workspace.md).
+
+### Libraries directory
+
+The **Libraries dir** field sets where this project installs and resolves its libraries, separate from the workspace. Use it so related projects can share one library install location instead of each re-downloading its own copy.
+
+Leave it blank and the project inherits its parent's libraries directory, falling back to a `libraries` folder inside the workspace when nothing is declared up the chain. A new top-level project is pre-filled with `./libraries` so its child projects inherit that shared location by default; child projects are created blank. Type a path to pin a specific location, or use the folder button to browse for one. Like the workspace field, it has a per-platform toggle for different paths on Linux, macOS, and Windows.
+
+![The Libraries dir field in the project detail view](../assets/img/projects/projects-gui-libraries-dir.png)
+
+For the full reference, see [Libraries directory](projects.md#libraries-directory).
 
 ### Directories
 
@@ -139,6 +150,7 @@ A toolbar across the top of the detail view holds the actions for the project yo
 - **Validate**: check the project for problems without saving. Issues are listed with the field and a description; a clean check reports **Template is valid**.
 - **Reload from Disk**: discard your in-window edits and reload the file as it is saved on disk.
 - **Save Changes**: write your edits back to the project file. (Enabled only when there are unsaved changes.)
+- **Upgrade schema**: appears only when the project is on an older schema version than the engine's current one. See [Upgrading a project's schema](#upgrading-a-projects-schema) below.
 - **Back to Projects**: return to the list. If you have unsaved changes, you'll be asked to confirm before discarding them.
 
 ![The detail-view toolbar with Back to Projects, Validate, Reload from Disk, and Save Changes](../assets/img/projects/projects-gui-detail-toolbar.png)
@@ -146,6 +158,16 @@ A toolbar across the top of the detail view holds the actions for the project yo
 If a project pins specific library versions, a **Library Pins** panel shows what those pins are.
 
 ![The Library Pins panel listing the project's pinned library versions](../assets/img/projects/projects-gui-library-pins.png)
+
+### Upgrading a project's schema
+
+When a project was created against an older major schema version than the engine ships (for example a `0.x` project on an engine whose current schema is `1.x`), an **Upgrade schema** button appears in the toolbar. Upgrading re-bases the project on the current defaults: the settings you explicitly customized are kept, and everything you left at the old defaults adopts the new ones.
+
+This is a **breaking** change — it can move where the project resolves its workspace, libraries, and saved files — so it is never automatic. A confirmation dialog spells out the consequences before anything is written; you can cancel. (Staying on an older version is fully supported; upgrade only when you want the new behavior.)
+
+The button is disabled while you have unsaved changes — save or reload first, since the upgrade re-reads the project from disk.
+
+![The Upgrade schema confirmation dialog warning that the upgrade is breaking](../assets/img/projects/projects-gui-upgrade-schema.png)
 
 ## Registering an existing project
 

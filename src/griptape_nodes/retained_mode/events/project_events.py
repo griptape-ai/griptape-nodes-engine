@@ -940,3 +940,60 @@ class ImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     - target project file already exists and overwrite_existing is False
     - extraction or re-registration failed
     """
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaRequest(RequestPayload):
+    """Electively upgrade a loaded project to the latest schema MAJOR version.
+
+    A within-major version advance happens automatically on save; crossing a MAJOR
+    (e.g. 0.x -> 1.0.0) does not, because the new major carries a different defaults
+    baseline that can change where the project resolves its workspace, libraries, and
+    file destinations. This request performs that crossing explicitly: it re-reads the
+    project's explicit overrides (its own overlay, not the materialized old-major
+    defaults), restamps to the latest version, and re-merges onto the new-major base, so
+    the project ADOPTS the new-major defaults for everything it did not explicitly override.
+
+    BREAKING: this is opt-in and may change the project's effective layout. Only the
+    project's explicit overrides are preserved; previously-default values are dropped so
+    they pick up the new-major defaults (it does not pin old behavior).
+
+    Use when: the user explicitly chooses to upgrade an outdated project.
+
+    Args:
+        project_id: Opaque id of the loaded project template to upgrade.
+
+    Results: UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project upgraded to the latest schema major.
+
+    Args:
+        project_id: The upgraded project's id.
+        previous_schema_version: The schema version before the upgrade.
+        new_schema_version: The schema version written (the latest).
+    """
+
+    project_id: str
+    previous_schema_version: str
+    new_schema_version: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project schema upgrade failed.
+
+    Common causes:
+    - project_id not loaded
+    - project has no backing file (e.g. system defaults)
+    - already at the latest major
+    - save/write failure
+    """

@@ -403,6 +403,188 @@ class TestArtifactManager:
         assert "Video" in str(result.result_details)
 
 
+class TestPermissionDispatch:
+    """ArtifactManager routes write/read permission checks through the matching provider.
+
+    A provider is looked up by format (bytes for writes, extension for reads);
+    the provider's hook decides. Unknown format / unknown extension falls
+    through to allow so callers don't need to special-case unregistered types.
+    """
+
+    _PROBE_FORMAT = "probe"
+
+    def _make_probe_provider_class(self, denial_for_write=None, denial_for_read=None):  # noqa: ANN001, ANN202
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        probe_format = self._PROBE_FORMAT
+
+        class _ProbeProvider(BaseArtifactProvider):
+            calls: list[tuple[str, object]] = []  # noqa: RUF012
+
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Probe"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {probe_format}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+            def check_write_permission(self, data, detected_format):  # noqa: ANN001, ANN202, ARG002
+                self.__class__.calls.append(("write", detected_format))
+                return denial_for_write
+
+            def check_read_permission(self, source_path):  # noqa: ANN001, ANN202
+                self.__class__.calls.append(("read", source_path))
+                return denial_for_read
+
+        return _ProbeProvider
+
+    def _register(self, manager: ArtifactManager, provider_class: type) -> None:
+        result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=provider_class)
+        )
+        assert isinstance(result, RegisterArtifactProviderResultSuccess)
+
+    def test_check_write_permission_dispatches_to_provider_by_format(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
+        probe_cls = self._make_probe_provider_class(denial_for_write=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_write_permission(b"any bytes", self._PROBE_FORMAT)
+
+        assert denial is expected_denial
+        assert probe_cls.calls == [("write", self._PROBE_FORMAT)]
+
+    def test_check_write_permission_no_provider_falls_through(self) -> None:
+        # An unregistered format must not raise or reach any provider -- it's
+        # not the ArtifactManager's job to know every possible extension.
+        manager = ArtifactManager()
+
+        assert manager.check_write_permission(b"data", "unregistered") is None
+
+    def test_check_read_permission_dispatches_by_extension(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe reads are locked"),))
+        probe_cls = self._make_probe_provider_class(denial_for_read=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_read_permission(f"/some/file.{self._PROBE_FORMAT}")
+
+        assert denial is expected_denial
+        # The provider is called with the same path the manager was given,
+        # verbatim -- provider does its own inspection (e.g. ffprobe).
+        assert probe_cls.calls == [("read", f"/some/file.{self._PROBE_FORMAT}")]
+
+    def test_check_read_permission_unknown_extension_falls_through(self) -> None:
+        manager = ArtifactManager()
+        assert manager.check_read_permission("/some/file.unregistered") is None
+
+    def test_check_read_permission_no_extension_falls_through(self) -> None:
+        # A path with no extension cannot be routed to any provider; allow
+        # rather than raising so path-less inputs don't crash the check.
+        manager = ArtifactManager()
+        assert manager.check_read_permission("/some/file_without_ext") is None
+
+
+class TestCheckArtifactReadPermissionHandler:
+    """The request-based read-permission check.
+
+    Library code sends this instead of importing a provider directly, so it
+    stays media-agnostic. The handler wraps ``check_read_permission`` and
+    returns the denial (if any) on the Success payload.
+    """
+
+    def test_empty_path_returns_failure(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            CheckArtifactReadPermissionRequest,
+            CheckArtifactReadPermissionResultFailure,
+        )
+
+        manager = ArtifactManager()
+        result = manager.on_check_artifact_read_permission_request(CheckArtifactReadPermissionRequest(source_path=""))
+
+        assert isinstance(result, CheckArtifactReadPermissionResultFailure)
+        assert "no source path" in str(result.result_details)
+
+    def test_no_provider_returns_success_with_no_denial(self) -> None:
+        # Unregistered extension: allow. The handler must NOT return Failure --
+        # the request itself is well-formed; the answer is just "not gated".
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            CheckArtifactReadPermissionRequest,
+            CheckArtifactReadPermissionResultSuccess,
+        )
+
+        manager = ArtifactManager()
+        result = manager.on_check_artifact_read_permission_request(
+            CheckArtifactReadPermissionRequest(source_path="/x/y.unregistered")
+        )
+
+        assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
+        assert result.denial is None
+
+    def test_denial_is_threaded_through_success_payload(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            CheckArtifactReadPermissionRequest,
+            CheckArtifactReadPermissionResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        expected_denial = CheckpointDenial(
+            failures=(CheckpointFailure(detail="You are not licensed for probe reads."),)
+        )
+
+        class _DenyProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Deny"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"deny"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+            def check_read_permission(self, source_path):  # noqa: ANN001, ANN202, ARG002
+                return expected_denial
+
+        manager = ArtifactManager()
+        register_result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_DenyProvider)
+        )
+        assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
+
+        result = manager.on_check_artifact_read_permission_request(
+            CheckArtifactReadPermissionRequest(source_path="/x/y.deny")
+        )
+
+        assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
+        assert result.denial is expected_denial
+        # The result_details includes the denial's reason so callers logging
+        # the result get useful text without inspecting the payload.
+        assert "probe reads" in str(result.result_details)
+
+
 class TestGeneratePreview:
     """Tests for preview generation functionality."""
 
