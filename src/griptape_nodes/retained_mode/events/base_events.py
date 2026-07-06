@@ -425,6 +425,8 @@ _RESULT_FRAMEWORK_FIELDS = frozenset(f.name for f in dataclass_fields(ResultPayl
 
 
 def _build_path_tree(paths: list[str]) -> dict:
+    # ["a.b", "a.c.d"] -> {"a": {"b": {}, "c": {"d": {}}}}
+    # Empty {} at a leaf = keep the value whole. setdefault merges shared prefixes.
     tree: dict = {}
     for path in paths:
         parts = path.split(".")
@@ -436,10 +438,16 @@ def _build_path_tree(paths: list[str]) -> dict:
 
 
 def _apply_path_tree(data: Any, tree: dict) -> Any:
+    # Called by EventResult.dict() to prune the unstructured result dict before WebSocket broadcast.
+    # Frontend sets RequestPayload.fields (e.g. ["workflows.*.name"]) to avoid sending 256KB+
+    # payloads when only a few fields are needed. Framework fields are re-added by the caller.
     if not isinstance(data, dict):
         return data
+
     if "*" in tree:
-        # Wildcard: apply subtree to every value in this dict (e.g. dict[str, SomeObject])
+        # result.workflows is dict[str, WorkflowMetadata] keyed by file path — the keys are
+        # not field names, so "workflows.name" would look for a key literally called "name" and
+        # return {}. "*" means: apply the subtree to every value, ignoring the key.
         subtree = tree["*"]
         if not subtree:
             return dict(data)
@@ -450,13 +458,15 @@ def _apply_path_tree(data: Any, tree: dict) -> Any:
             else:
                 filtered[k] = _apply_path_tree(v, subtree)
         return filtered
+
+    # Named-key traversal: keep only fields present in the tree, drop everything else.
     result = {}
     for key, subtree in tree.items():
         if key not in data:
             continue
         value = data[key]
         if not subtree:
-            result[key] = value
+            result[key] = value  # leaf — keep value whole
         elif isinstance(value, list):
             result[key] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in value]
         else:
