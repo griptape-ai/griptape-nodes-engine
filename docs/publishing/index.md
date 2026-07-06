@@ -38,6 +38,8 @@ the sidebar panels (next to the engine status indicator). It's a global editor
 action — the button and its location are the same no matter which library or
 publisher you end up choosing in the dialog.
 
+![The Publish Workflow button in the top toolbar, at the far right above the sidebar panels, next to the engine status indicator](../assets/img/publishing/publish-workflow-button.png)
+
 - **Your workflow must have been saved at least once** so it has a file on disk.
     Any unsaved changes are saved automatically when you publish, so you don't
     need to save again right before publishing — but a workflow that has never
