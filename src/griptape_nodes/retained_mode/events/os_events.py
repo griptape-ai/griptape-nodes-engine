@@ -32,6 +32,7 @@ class FileIOFailureReason(StrEnum):
     # Policy violations
     POLICY_NO_OVERWRITE = "policy_no_overwrite"  # File exists and policy prohibits overwrite
     POLICY_NO_CREATE_PARENT_DIRS = "policy_no_create_parent_dirs"  # Parent dir missing and policy prohibits creation
+    CODEC_NOT_PERMITTED = "codec_not_permitted"  # Sniffed media codec is denied by the authorization hook chain
 
     # Permission/access errors
     PERMISSION_DENIED = "permission_denied"  # No read/write permission
