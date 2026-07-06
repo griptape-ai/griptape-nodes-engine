@@ -46,6 +46,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
+    RegisterLibraryFromFileResultSuccess,
+    UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
@@ -3452,3 +3455,164 @@ class TestLibraryFitnessAuthorizationCheckpoint:
         assert len(problems) == 1
         assert problems[0].node_type == "LabsNode"
         assert "Ask your admin to enable Labs nodes." in problems[0].collate_problems_for_display(problems)
+
+
+class TestLibraryManagerDuplicateEntryHygiene:
+    """Regression tests for issue #5039.
+
+    A library that ends up with more than one entry in `_library_file_path_to_info` (a duplicate
+    install, or a filename variation left behind by a git operation) desynchronizes the update and
+    update-check paths, producing a permanent "update available" loop. The fix keeps the dict free
+    of duplicates and routes both paths through the same resolver.
+    """
+
+    def _lib_info(
+        self,
+        library_manager: _LibraryManager,
+        path: str,
+        name: str,
+        lifecycle_state: _LibraryManager.LibraryLifecycleState = _LibraryManager.LibraryLifecycleState.LOADED,
+    ) -> _LibraryManager.LibraryInfo:
+        return library_manager.LibraryInfo(
+            lifecycle_state=lifecycle_state,
+            library_path=path,
+            is_sandbox=False,
+            library_name=name,
+            library_version="0.81.0",
+            fitness=_LibraryManager.LibraryFitness.GOOD,
+            problems=[],
+        )
+
+    def test_unload_removes_all_entries_for_library_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """Unload must drop every entry for the name, not just the first, so no stale copy lingers."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        # Two on-disk copies registered under one name: one on `main`, one on `stable`. Both
+        # report the same version but live at different paths (the #5039 scenario).
+        entries = {
+            "/libs/copyA/griptape_nodes_library.json": self._lib_info(
+                library_manager, "/libs/copyA/griptape_nodes_library.json", "MyLib"
+            ),
+            "/libs/copyB/griptape-nodes-library.json": self._lib_info(
+                library_manager, "/libs/copyB/griptape-nodes-library.json", "MyLib"
+            ),
+        }
+
+        with (
+            patch.object(library_manager, "_library_file_path_to_info", entries),
+            patch.object(LibraryRegistry, "unregister_library"),
+            patch.object(library_manager, "_unregister_all_stable_module_aliases_for_library"),
+        ):
+            result = library_manager.unload_library_from_registry_request(
+                UnloadLibraryFromRegistryRequest(library_name="MyLib")
+            )
+
+        assert isinstance(result, UnloadLibraryFromRegistryResultSuccess)
+        # No entry for MyLib should survive the unload.
+        remaining = [info for info in entries.values() if info.library_name == "MyLib"]
+        assert remaining == []
+        assert entries == {}
+
+    def test_reload_collapses_duplicate_entries_to_one(self, griptape_nodes: GriptapeNodes) -> None:
+        """Reload must collapse duplicate entries to one.
+
+        It must not leave a pre-operation entry alongside the reloaded one when the git operation
+        resolves the JSON under a different filename.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+
+        # Pre-operation entry keyed under the dashed filename.
+        old_path = "/libs/copy/griptape-nodes-library.json"
+        # The git operation resolves the underscore filename on disk.
+        new_path = "/libs/copy/griptape_nodes_library.json"
+        entries = {old_path: self._lib_info(library_manager, old_path, "MyLib")}
+
+        mock_library = MagicMock()
+        mock_library.get_metadata.return_value = MagicMock(library_version="0.81.0")
+
+        with (
+            patch.object(library_manager, "_library_file_path_to_info", entries),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.handle_request",
+                return_value=UnloadLibraryFromRegistryResultSuccess(result_details="ok"),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.find_file_in_directory",
+                return_value=Path(new_path),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ahandle_request",
+                AsyncMock(return_value=RegisterLibraryFromFileResultSuccess(library_name="MyLib", result_details="ok")),
+            ),
+            patch.object(LibraryRegistry, "get_library", return_value=mock_library),
+        ):
+            result = asyncio.run(
+                library_manager._reload_library_after_git_operation(
+                    library_name="MyLib",
+                    library_file_path=old_path,
+                    failure_result_class=RegisterLibraryFromFileResultFailure,
+                )
+            )
+
+        assert result == "0.81.0"
+        # Exactly one entry for MyLib, keyed under the reloaded filename.
+        mylib_paths = [path for path, info in entries.items() if info.library_name == "MyLib"]
+        assert mylib_paths == [new_path]
+
+    def test_resolver_prefers_loaded_copy_over_failed_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
+        """The resolver must return the LOADED copy, not a dead duplicate.
+
+        A duplicate install keeps a second entry marked FAILURE (DuplicateLibraryProblem) in the
+        dict, inserted BEFORE the loaded copy in some orderings. First-match would resolve the
+        dead copy whose on-disk state the update path can never make agree with the loaded copy's
+        version, producing a permanent "update available" loop (issue #5039). Preferring the LOADED
+        entry keeps path resolution consistent with the copy whose version the check reads.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+
+        # The FAILURE duplicate is inserted first, so first-match would pick it.
+        entries = {
+            "/libs/dead/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/dead/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.FAILURE,
+            ),
+            "/libs/loaded/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/loaded/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.LOADED,
+            ),
+        }
+
+        with patch.object(library_manager, "_library_file_path_to_info", entries):
+            info = library_manager.get_library_info_by_library_name("MyLib")
+
+        assert info is not None
+        assert info.library_path == "/libs/loaded/griptape_nodes_library.json"
+
+    def test_resolver_falls_back_to_first_match_when_none_loaded(self, griptape_nodes: GriptapeNodes) -> None:
+        """With no LOADED copy (e.g. discovery / worker-pending), the resolver keeps first-match."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        entries = {
+            "/libs/copyA/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/copyA/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.WORKER_PENDING,
+            ),
+            "/libs/copyB/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/copyB/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+            ),
+        }
+
+        with patch.object(library_manager, "_library_file_path_to_info", entries):
+            info = library_manager.get_library_info_by_library_name("MyLib")
+
+        assert info is not None
+        assert info.library_path == "/libs/copyA/griptape_nodes_library.json"
