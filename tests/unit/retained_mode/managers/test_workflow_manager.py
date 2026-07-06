@@ -3174,7 +3174,7 @@ class TestApplyWorkflowBackup:
 
     The helper returns ``[]`` on full success or a list of artist-facing warnings
     when any step failed. Tests drive the helper directly and mock the collaborators
-    via the event dispatch: ``GetConfigValueRequest`` (sync), ``ScanSituationSequenceRequest``
+    via the event dispatch: ``GetConfigValueRequest`` (sync), ``ListRelatedProjectFilesRequest``
     and ``DeleteFileRequest`` (async), plus ``WorkflowManager._write_workflow_file``.
     """
 
@@ -3184,15 +3184,24 @@ class TestApplyWorkflowBackup:
         return WorkflowManager(mock_event_manager)
 
     @staticmethod
-    def _scan_result_success(entries: list[tuple[int, str]]) -> object:
-        """Build a ScanSituationSequenceResultSuccess carrying the given (number, path) entries."""
+    def _related_files_result_success(
+        entries: list[tuple[int, str]],
+        source_variables: dict[str, str | int] | None = None,
+    ) -> object:
+        """Build a ListRelatedProjectFilesResultSuccess carrying the given (number, path) entries.
+
+        ``source_variables`` defaults to the standard SAVE_WORKFLOW bag for
+        ``my_wf.py`` — override to test name-agnostic passthrough.
+        """
         from griptape_nodes.common.sequences.models import MissingItemPolicy, Sequence, SequenceEntry
-        from griptape_nodes.retained_mode.events.project_events import ScanSituationSequenceResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import ListRelatedProjectFilesResultSuccess
+
+        vars_bag: dict[str, str | int] = source_variables or {"file_name_base": "my_wf", "file_extension": "py"}
 
         if not entries:
-            return ScanSituationSequenceResultSuccess(
+            return ListRelatedProjectFilesResultSuccess(
                 sequence=None,
-                pattern="/workspace/backups/my_wf_backup_v####.py",
+                source_variables=vars_bag,
                 result_details="scanned",
             )
 
@@ -3210,9 +3219,9 @@ class TestApplyWorkflowBackup:
             policy=MissingItemPolicy.SKIP,
             present_numbers=numbers,
         )
-        return ScanSituationSequenceResultSuccess(
+        return ListRelatedProjectFilesResultSuccess(
             sequence=sequence,
-            pattern="/workspace/backups/my_wf_backup_v####.py",
+            source_variables=vars_bag,
             result_details="scanned",
         )
 
@@ -3237,22 +3246,22 @@ class TestApplyWorkflowBackup:
         scan_results: list[object],
         delete_side_effect: object = None,
     ) -> list[object]:
-        """Wire ``GriptapeNodes.ahandle_request`` for ScanSituationSequence + DeleteFile requests.
+        """Wire ``GriptapeNodes.ahandle_request`` for ListRelatedProjectFiles + DeleteFile requests.
 
-        - ``scan_results`` is popped in FIFO order for successive scan requests.
+        - ``scan_results`` is popped in FIFO order for successive list-related-files requests.
         - ``delete_side_effect`` is a callable ``(request) -> ResultPayload``; if None, every
           delete resolves to ``DeleteFileResultSuccess``.
 
         Returns the ``captured_requests`` list so callers can assert on what was dispatched.
         """
         from griptape_nodes.retained_mode.events.os_events import DeleteFileRequest, DeleteFileResultSuccess
-        from griptape_nodes.retained_mode.events.project_events import ScanSituationSequenceRequest
+        from griptape_nodes.retained_mode.events.project_events import ListRelatedProjectFilesRequest
 
         captured_requests: list[object] = []
 
         async def fake_ahandle(request: object) -> object:
             captured_requests.append(request)
-            if isinstance(request, ScanSituationSequenceRequest):
+            if isinstance(request, ListRelatedProjectFilesRequest):
                 return scan_results.pop(0)
             if isinstance(request, DeleteFileRequest):
                 if delete_side_effect is not None:
@@ -3288,7 +3297,7 @@ class TestApplyWorkflowBackup:
             mock_gn.handle_request.side_effect = fake_handle
 
             warnings = await workflow_manager._apply_workflow_backup(
-                relative_file_path="my_wf.py",
+                source_filename="my_wf.py",
                 file_content="content",
             )
 
@@ -3303,7 +3312,7 @@ class TestApplyWorkflowBackup:
             self._install_config_value(mock_gn, 0)
 
             warnings = await workflow_manager._apply_workflow_backup(
-                relative_file_path="my_wf.py",
+                source_filename="my_wf.py",
                 file_content="content",
             )
 
@@ -3313,12 +3322,12 @@ class TestApplyWorkflowBackup:
     @pytest.mark.asyncio
     async def test_pre_scan_failure_returns_warning(self, workflow_manager: WorkflowManager) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
-            ScanSituationSequenceFailureReason,
-            ScanSituationSequenceResultFailure,
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesResultFailure,
         )
 
-        pre_scan_failure = ScanSituationSequenceResultFailure(
-            failure_reason=ScanSituationSequenceFailureReason.SITUATION_NOT_FOUND,
+        pre_scan_failure = ListRelatedProjectFilesResultFailure(
+            failure_reason=ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH,
             result_details="situation missing",
         )
 
@@ -3327,7 +3336,7 @@ class TestApplyWorkflowBackup:
             self._install_scan_and_delete(mock_gn, scan_results=[pre_scan_failure])
 
             warnings = await workflow_manager._apply_workflow_backup(
-                relative_file_path="my_wf.py",
+                source_filename="my_wf.py",
                 file_content="content",
             )
 
@@ -3337,7 +3346,7 @@ class TestApplyWorkflowBackup:
 
     @pytest.mark.asyncio
     async def test_write_failure_returns_warning_and_skips_prune(self, workflow_manager: WorkflowManager) -> None:
-        pre_scan_success = self._scan_result_success([])
+        pre_scan_success = self._related_files_result_success([])
 
         with patch("griptape_nodes.retained_mode.managers.workflow_manager.GriptapeNodes") as mock_gn:
             self._install_config_value(mock_gn, 5)
@@ -3348,17 +3357,17 @@ class TestApplyWorkflowBackup:
             )
             with patch.object(workflow_manager, "_write_workflow_file", return_value=write_failure):
                 warnings = await workflow_manager._apply_workflow_backup(
-                    relative_file_path="my_wf.py",
+                    source_filename="my_wf.py",
                     file_content="content",
                 )
 
-        from griptape_nodes.retained_mode.events.project_events import ScanSituationSequenceRequest
+        from griptape_nodes.retained_mode.events.project_events import ListRelatedProjectFilesRequest
 
         assert len(warnings) == 1
         assert "could not be written" in warnings[0]
         assert "disk full" in warnings[0]
         # Post-scan and delete must not run when the write itself failed — only the pre-scan.
-        scan_requests = [r for r in captured if isinstance(r, ScanSituationSequenceRequest)]
+        scan_requests = [r for r in captured if isinstance(r, ListRelatedProjectFilesRequest)]
         assert len(scan_requests) == 1
 
     @pytest.mark.asyncio
@@ -3366,11 +3375,11 @@ class TestApplyWorkflowBackup:
         """Ten backups on disk, max=5 → the five lowest-numbered are deleted."""
         from griptape_nodes.retained_mode.events.os_events import DeleteFileRequest
 
-        pre_scan = self._scan_result_success(
+        pre_scan = self._related_files_result_success(
             [(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 10)]  # 1..9 already present
         )
         # After writing v10, disk has 1..10.
-        post_scan = self._scan_result_success(
+        post_scan = self._related_files_result_success(
             [(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 11)]
         )
 
@@ -3381,7 +3390,7 @@ class TestApplyWorkflowBackup:
             write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
             with patch.object(workflow_manager, "_write_workflow_file", return_value=write_success):
                 warnings = await workflow_manager._apply_workflow_backup(
-                    relative_file_path="my_wf.py",
+                    source_filename="my_wf.py",
                     file_content="content",
                 )
 
@@ -3394,16 +3403,20 @@ class TestApplyWorkflowBackup:
 
     @pytest.mark.asyncio
     async def test_first_backup_uses_next_index_one(self, workflow_manager: WorkflowManager) -> None:
-        """No backups on disk → next_index=1, no prune step needed."""
-        pre_scan_empty = self._scan_result_success([])
-        post_scan_after_write = self._scan_result_success([(1, "/workspace/backups/my_wf_backup_v001.py")])
+        """No backups on disk → next_index=1, and the writer's bag passes through.
 
-        captured_build_kwargs: dict = {}
-        original_build = workflow_manager._build_workflow_save_path
+        The write MUST bind ``_index=1`` explicitly so CREATE_NEW's gap-fill doesn't
+        reuse a freed slot, and the rest of the source variables bag passes through
+        opaquely to ``from_situation_with_variables``.
+        """
+        pre_scan_empty = self._related_files_result_success([])
+        post_scan_after_write = self._related_files_result_success([(1, "/workspace/backups/my_wf_backup_v001.py")])
 
-        def build_spy(*args: object, **kwargs: object) -> WorkflowManager.WorkflowSavePath:
-            captured_build_kwargs.update(kwargs)
-            return original_build(*args, **kwargs)  # type: ignore[arg-type]
+        captured_variables: dict = {}
+
+        def from_situation_spy(*, situation: str, variables: dict) -> MagicMock:  # noqa: ARG001
+            captured_variables.update(variables)
+            return MagicMock()
 
         with patch("griptape_nodes.retained_mode.managers.workflow_manager.GriptapeNodes") as mock_gn:
             self._install_config_value(mock_gn, 5)
@@ -3412,17 +3425,18 @@ class TestApplyWorkflowBackup:
             write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
             with (
                 patch.object(workflow_manager, "_write_workflow_file", return_value=write_success),
-                patch.object(workflow_manager, "_build_workflow_save_path", side_effect=build_spy),
+                patch(
+                    "griptape_nodes.retained_mode.managers.workflow_manager.ProjectFileDestination.from_situation_with_variables",
+                    side_effect=from_situation_spy,
+                ),
             ):
                 warnings = await workflow_manager._apply_workflow_backup(
-                    relative_file_path="my_wf.py",
+                    source_filename="my_wf.py",
                     file_content="content",
                 )
 
         assert warnings == []
-        # The write destination MUST bind _index=1 explicitly so CREATE_NEW's gap-fill
-        # doesn't reuse a freed slot.
-        assert captured_build_kwargs.get("extra_vars") == {"_index": 1}
+        assert captured_variables == {"file_name_base": "my_wf", "file_extension": "py", "_index": 1}
 
     @pytest.mark.asyncio
     async def test_multiple_deletion_failures_each_get_their_own_warning(
@@ -3441,8 +3455,12 @@ class TestApplyWorkflowBackup:
 
         # Six on-disk, retention=5, so v001 is doomed for prune. We'll also mark v002 as
         # doomed by writing v007 — that gives us TWO doomed entries and we fail both.
-        pre_scan = self._scan_result_success([(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 7)])
-        post_scan = self._scan_result_success([(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 8)])
+        pre_scan = self._related_files_result_success(
+            [(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 7)]
+        )
+        post_scan = self._related_files_result_success(
+            [(i, f"/workspace/backups/my_wf_backup_v{i:03}.py") for i in range(1, 8)]
+        )
 
         def delete_always_fails(request: DeleteFileRequest) -> object:
             return DeleteFileResultFailure(
@@ -3461,7 +3479,7 @@ class TestApplyWorkflowBackup:
             write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
             with patch.object(workflow_manager, "_write_workflow_file", return_value=write_success):
                 warnings = await workflow_manager._apply_workflow_backup(
-                    relative_file_path="my_wf.py",
+                    source_filename="my_wf.py",
                     file_content="content",
                 )
 
@@ -3470,3 +3488,46 @@ class TestApplyWorkflowBackup:
         assert len(warnings) == expected_warning_count
         assert any("v001.py" in msg for msg in warnings)
         assert any("v002.py" in msg for msg in warnings)
+
+    @pytest.mark.asyncio
+    async def test_source_variables_pass_through_opaquely_to_write(self, workflow_manager: WorkflowManager) -> None:
+        """Backup helper hands the reverse-matched bag through to the write verbatim.
+
+        If a customised template binds a variable named ``episode_name`` instead of
+        ``file_name_base``, the request's response carries ``episode_name`` and the
+        backup write receives ``episode_name`` — no downstream code knows or cares
+        what the writer's macro chose to name things.
+        """
+        custom_bag: dict[str, str | int] = {"episode_name": "wf", "custom_slot": "act_one", "file_extension": "py"}
+        pre_scan = self._related_files_result_success([], source_variables=custom_bag)
+        post_scan_after_write = self._related_files_result_success(
+            [(1, "/workspace/backups/wf_backup_v001.py")],
+            source_variables=custom_bag,
+        )
+
+        captured_variables: dict = {}
+
+        def from_situation_spy(*, situation: str, variables: dict) -> MagicMock:  # noqa: ARG001
+            captured_variables.update(variables)
+            return MagicMock()
+
+        with patch("griptape_nodes.retained_mode.managers.workflow_manager.GriptapeNodes") as mock_gn:
+            self._install_config_value(mock_gn, 5)
+            self._install_scan_and_delete(mock_gn, scan_results=[pre_scan, post_scan_after_write])
+
+            write_success = WorkflowManager.WriteWorkflowFileResult(success=True, error_details="", written_file=None)
+            with (
+                patch.object(workflow_manager, "_write_workflow_file", return_value=write_success),
+                patch(
+                    "griptape_nodes.retained_mode.managers.workflow_manager.ProjectFileDestination.from_situation_with_variables",
+                    side_effect=from_situation_spy,
+                ),
+            ):
+                warnings = await workflow_manager._apply_workflow_backup(
+                    source_filename="wf.py",
+                    file_content="content",
+                )
+
+        assert warnings == []
+        # Every key from the writer's bag survived; the helper only added `_index`.
+        assert captured_variables == {**custom_bag, "_index": 1}

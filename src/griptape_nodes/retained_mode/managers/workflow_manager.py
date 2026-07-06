@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from griptape_nodes.common.macro_parser import SEQUENCE_VARIABLE_NAME
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -86,8 +87,8 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import (
     GetSituationRequest,
     GetSituationResultSuccess,
-    ScanSituationSequenceRequest,
-    ScanSituationSequenceResultSuccess,
+    ListRelatedProjectFilesRequest,
+    ListRelatedProjectFilesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -2388,7 +2389,7 @@ class WorkflowManager:
         backup_warnings: list[str] = []
         if request.attempt_create_backup:
             backup_warnings = await self._apply_workflow_backup(
-                relative_file_path=relative_file_path,
+                source_filename=relative_file_path,
                 file_content=save_file_result.file_content,
             )
 
@@ -2409,10 +2410,16 @@ class WorkflowManager:
     async def _apply_workflow_backup(  # noqa: PLR0911
         self,
         *,
-        relative_file_path: str,
+        source_filename: str,
         file_content: str,
     ) -> list[str]:
         """Write a ``save_workflow_backup`` copy of the just-saved workflow and prune older backups.
+
+        Name-agnostic: consumes the ``source_variables`` bag reverse-matched by
+        ``ListRelatedProjectFilesRequest`` verbatim, so the mapping between
+        ``FilenameParts`` and macro variable names lives in exactly one place
+        (``ProjectFileDestination.from_situation``) and this helper doesn't need
+        to know what the writer's macro chose to name its variables.
 
         Returns an empty list on full success. Returns a list of artist-facing
         warning messages when one or more steps failed — one message per failure,
@@ -2443,56 +2450,54 @@ class WorkflowManager:
             # so we return an empty list and the outer save reports plain success.
             return []
 
-        # Step 2 — see what backups already exist on disk.
-        # We scan BEFORE our own write so we can pick a monotonically increasing
-        # `_index` and bypass the situation's CREATE_NEW gap-fill behavior. Without
-        # this, deleting v001 during a later prune would make the next save reuse
-        # slot v001 — which contradicts the artist's mental model of "oldest is
-        # v001, newest is vNNN".
+        # Step 2 — see what backups already exist on disk. The request derives the
+        # writer's variables bag from `source_filename` via reverse-match, then
+        # scans SAVE_WORKFLOW_BACKUP against that bag. Scanning BEFORE our own
+        # write lets us pick a monotonically increasing `_index` and bypass the
+        # situation's CREATE_NEW gap-fill — so deleting v001 during a later prune
+        # doesn't cause the next save to reuse slot v001 (contradicting the
+        # artist's "oldest is v001, newest is vNNN" mental model).
         pre_scan = await GriptapeNodes.ahandle_request(
-            ScanSituationSequenceRequest(
-                situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
-                filename=relative_file_path,
+            ListRelatedProjectFilesRequest(
+                source_filename=source_filename,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
             )
         )
-        if not isinstance(pre_scan, ScanSituationSequenceResultSuccess):
+        if not isinstance(pre_scan, ListRelatedProjectFilesResultSuccess):
             return [f"Backup could not look up existing backups: {pre_scan.result_details}"]
 
-        present_numbers = pre_scan.present_numbers
+        present_numbers = pre_scan.sequence.present_numbers if pre_scan.sequence is not None else set()
         next_index = (max(present_numbers) + 1) if present_numbers else 1
 
-        # Step 3 — write the backup copy at the exact slot we chose.
-        # Binding `_index` explicitly means OSManager's seed step is a no-op and the
-        # write lands at `_backup_v{next_index}.py` even if lower slots are free.
-        # `_build_workflow_save_path` → `ProjectFileDestination.from_situation` runs
-        # its own `FilenameParts.from_filename(relative_file_path)`, so we hand the
-        # relative path in as-is and let the situation machinery derive
-        # `file_name_base` / `file_extension` / `sub_dirs`.
-        backup_save_path = self._build_workflow_save_path(
-            file_name=relative_file_path,
-            situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
-            extra_vars={"_index": next_index},
+        # Step 3 — write the backup copy at the exact slot we chose. The
+        # reverse-matched bag came from SAVE_WORKFLOW's macro (which has no
+        # `{###}` slot), so it never contains `_index`. We bind it here for
+        # CREATE_NEW's benefit; the bag is otherwise passed through opaquely.
+        backup_destination = ProjectFileDestination.from_situation_with_variables(
+            situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            variables={**pre_scan.source_variables, SEQUENCE_VARIABLE_NAME: next_index},
         )
         write_result = self._write_workflow_file(
-            backup_save_path.destination,
+            backup_destination,
             file_content,
-            relative_file_path,
+            f"backup v{next_index:03}",
         )
         if not write_result.success:
             return [f"Backup file could not be written to your project's backups folder: {write_result.error_details}"]
 
-        # Step 4 — re-scan post-write.
-        # Between our pre-scan and now, a concurrent save may have written another
-        # backup. Re-scanning ensures the retention decision reflects everything
-        # actually on disk right now, so we never delete a valid backup out from
-        # under a parallel save.
+        # Step 4 — re-scan post-write. Between our pre-scan and now, a concurrent
+        # save may have written another backup. Re-scanning ensures the retention
+        # decision reflects everything actually on disk right now, so we never
+        # delete a valid backup out from under a parallel save.
         post_scan = await GriptapeNodes.ahandle_request(
-            ScanSituationSequenceRequest(
-                situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
-                filename=relative_file_path,
+            ListRelatedProjectFilesRequest(
+                source_filename=source_filename,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
             )
         )
-        if not isinstance(post_scan, ScanSituationSequenceResultSuccess):
+        if not isinstance(post_scan, ListRelatedProjectFilesResultSuccess):
             return [
                 "Backup file was written, but the list of backups could not be re-checked, "
                 f"so older backups were not pruned: {post_scan.result_details}"

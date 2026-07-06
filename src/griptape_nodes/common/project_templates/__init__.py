@@ -32,11 +32,19 @@ from griptape_nodes.common.project_templates.validation import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
 )
+from griptape_nodes.common.project_templates.variable_names import (
+    FILE_EXTENSION_VARIABLE_NAME,
+    FILE_NAME_BASE_VARIABLE_NAME,
+    SUB_DIRS_VARIABLE_NAME,
+)
 
 __all__ = [
     "DEFAULT_PROJECT_TEMPLATE",
     "DEFAULT_PROJECT_TEMPLATE_V0",
     "DEFAULT_PROJECT_TEMPLATE_V1",
+    "FILE_EXTENSION_VARIABLE_NAME",
+    "FILE_NAME_BASE_VARIABLE_NAME",
+    "SUB_DIRS_VARIABLE_NAME",
     "DirectoryDefinition",
     "PerPlatformPathMacro",
     "PerPlatformProjectPath",

@@ -3,7 +3,12 @@
 import logging
 from pathlib import Path
 
-from griptape_nodes.common.macro_parser import ParsedMacro
+from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
+from griptape_nodes.common.project_templates import (
+    FILE_EXTENSION_VARIABLE_NAME,
+    FILE_NAME_BASE_VARIABLE_NAME,
+    SUB_DIRS_VARIABLE_NAME,
+)
 from griptape_nodes.common.project_templates.situation import SituationFilePolicy
 from griptape_nodes.files.file import File, FileDestination
 from griptape_nodes.files.path_utils import FilenameParts
@@ -93,18 +98,88 @@ class ProjectFileDestination(FileDestination):
         situation: str,
         **extra_vars: str | int,
     ) -> "ProjectFileDestination":
-        """Build a ProjectFileDestination from a project situation template.
+        """Build a ProjectFileDestination from a filename + situation template.
 
-        Looks up the named situation in the current project to obtain the macro
-        template and write policy, then constructs the destination. The
-        resulting destination uses the engine default for extension coercion;
-        callers that need to override (e.g. the FileOutputSettings node) build
-        the destination directly via the constructor.
+        Splits ``filename`` via ``FilenameParts`` into the canonical variables
+        the write path binds (``file_name_base``, ``file_extension``, and
+        ``sub_dirs`` when the filename carries a relative directory), merges
+        ``extra_vars`` on top, and delegates to ``_build_from_situation``.
+
+        Absolute filenames bypass the situation macro (caller is declaring an
+        on-disk location); ``_build_from_situation`` handles that via its
+        ``override_absolute`` argument.
 
         Args:
             filename: Filename to parse into base and extension components.
             situation: Situation name to look up in the current project.
             **extra_vars: Additional macro variables (e.g., node_name="MyNode", _index=1).
+        """
+        parts = FilenameParts.from_filename(filename)
+        variables: dict[str, str | int] = {
+            FILE_NAME_BASE_VARIABLE_NAME: parts.stem,
+            FILE_EXTENSION_VARIABLE_NAME: parts.extension,
+            **extra_vars,
+        }
+        # When the filename carries its own relative directory component (e.g.
+        # "foo/bar/output.png"), populate sub_dirs so situations with {sub_dirs?:/}
+        # route the file into that sub-directory. An explicit sub_dirs kwarg in
+        # extra_vars takes precedence. Absolute filenames still flow through the
+        # macro; we skip the sub_dirs override for them so we don't feed a
+        # leading-slash value into the macro substitution.
+        directory_str = str(parts.directory)
+        if (
+            directory_str
+            and directory_str != "."
+            and not parts.directory.is_absolute()
+            and SUB_DIRS_VARIABLE_NAME not in variables
+        ):
+            variables[SUB_DIRS_VARIABLE_NAME] = directory_str
+
+        override_absolute = filename if parts.directory.is_absolute() else None
+        return cls._build_from_situation(situation, variables, override_absolute=override_absolute)
+
+    @classmethod
+    def from_situation_with_variables(
+        cls,
+        situation: str,
+        variables: MacroVariables,
+    ) -> "ProjectFileDestination":
+        """Build a ProjectFileDestination from a pre-computed variables bag.
+
+        Used by callers who already have the writer's bag (typically returned
+        by ``ListRelatedProjectFilesRequest``) and want to reuse it verbatim
+        for a follow-on write (backups, versioned re-saves). Skips the filename
+        split — the bag *is* the input, opaque to variable-name conventions.
+
+        The situation's macro is resolved verbatim against these variables at
+        write time. Callers who need to bind the sequence slot include
+        ``SEQUENCE_VARIABLE_NAME`` in the bag.
+
+        Args:
+            situation: Situation name to look up in the current project.
+            variables: Variables bag to pass through to the macro resolver.
+        """
+        return cls._build_from_situation(situation, dict(variables), override_absolute=None)
+
+    @classmethod
+    def _build_from_situation(
+        cls,
+        situation: str,
+        variables: dict[str, str | int],
+        override_absolute: str | None,
+    ) -> "ProjectFileDestination":
+        """Shared plumbing for ``from_situation`` and ``from_situation_with_variables``.
+
+        Fetches the situation template, maps its policy to an ExistingFilePolicy,
+        builds a MacroPath from the caller's variables, and records the sidecar
+        SituationMetadata. When ``override_absolute`` is set (an absolute filename
+        from ``from_situation``'s bypass path), returns a destination that writes
+        to that path verbatim with sidecar metadata suppressed — the situation's
+        macro won't re-resolve to it, so recording variables would be dishonest.
+
+        Derivation rules (e.g. ``file_extension_directory``) run centrally inside
+        the ``GetPathForMacroRequest`` handler, so any MacroPath stored here gets
+        its derived variables filled in at resolution time; callers don't pre-apply.
         """
         result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation))
 
@@ -121,27 +196,9 @@ class ProjectFileDestination(FileDestination):
             existing_file_policy = ExistingFilePolicy.CREATE_NEW
             create_dirs = True
 
-        parts = FilenameParts.from_filename(filename)
-        variables: dict[str, str | int] = {
-            "file_name_base": parts.stem,
-            "file_extension": parts.extension,
-            **extra_vars,
-        }
-        # When the filename carries its own relative directory component (e.g.
-        # "foo/bar/output.png"), populate sub_dirs so situations with {sub_dirs?:/}
-        # route the file into that sub-directory. An explicit sub_dirs kwarg in
-        # extra_vars takes precedence. Absolute filenames still flow through the
-        # macro; we skip the sub_dirs override for them so we don't feed a
-        # leading-slash value into the macro substitution.
-        directory_str = str(parts.directory)
-        if directory_str and directory_str != "." and not parts.directory.is_absolute() and "sub_dirs" not in variables:
-            variables["sub_dirs"] = directory_str
-
-        # Derived variables (e.g. file_extension_directory) are injected by the
-        # GetPathForMacroRequest handler at resolve time, so we store only the
-        # caller-supplied variables here. The sidecar records the raw inputs;
-        # anyone re-resolving the path against the current project gets the
-        # same derived values the write used.
+        # Store only caller-supplied variables here; derived values (e.g.
+        # file_extension_directory) are injected at resolve time so they stay
+        # tied to the project's *current* taxonomy, not what it was at write time.
         macro_path = MacroPath(ParsedMacro(macro_template), variables)
 
         file_metadata = (
@@ -160,15 +217,13 @@ class ProjectFileDestination(FileDestination):
             else None
         )
 
-        # Absolute filenames bypass the situation macro: the caller is declaring
-        # an explicit on-disk location, so honor it verbatim rather than treating
-        # the leading-slash directory as sub_dirs within {outputs}/etc. Drop the
-        # sidecar metadata too -- the situation macro + variables we computed
-        # above won't re-resolve to the actual on-disk location, so recording
-        # them would produce a dishonest provenance trail.
-        if parts.directory.is_absolute():
+        # Absolute filenames (from `from_situation`'s bypass path) get written
+        # verbatim with no sidecar — the situation's macro + variables we built
+        # above wouldn't re-resolve to the caller's declared on-disk location,
+        # so recording them would produce a dishonest provenance trail.
+        if override_absolute is not None:
             return cls(
-                filename,
+                override_absolute,
                 existing_file_policy=existing_file_policy,
                 create_parents=create_dirs,
                 file_metadata=None,

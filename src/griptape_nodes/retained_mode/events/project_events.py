@@ -377,13 +377,12 @@ class ScanSituationSequenceFailureReason(StrEnum):
     """Why a ``ScanSituationSequenceRequest`` could not produce a sequence view.
 
     Separated by stage so callers can distinguish a wiring problem (situation not
-    registered, macro doesn't declare a sequence slot) from a data-layer problem
-    (directory unreadable, invalid template) without parsing detail strings.
+    registered, macro didn't parse) from a data-layer problem (directory
+    unreadable, invalid template) without parsing detail strings.
     """
 
     SITUATION_NOT_FOUND = "situation_not_found"  # `GetSituationRequest` failed (missing situation, missing project).
     MACRO_PARSE_ERROR = "macro_parse_error"  # Situation's stored macro string did not parse.
-    NO_SEQUENCE_SLOT = "no_sequence_slot"  # Macro has no required `{###}` slot; this call has no meaning for it.
     MACRO_RESOLUTION_ERROR = "macro_resolution_error"  # `GetPathForMacroRequest` failed to render the pattern.
     SCAN_FAILED = "scan_failed"  # Underlying `ScanSequencesRequest` failed; see `scan_failure_reason`.
 
@@ -391,31 +390,36 @@ class ScanSituationSequenceFailureReason(StrEnum):
 @dataclass
 @PayloadRegistry.register
 class ScanSituationSequenceRequest(RequestPayload):
-    """Resolve a situation's macro to a fileseq pattern and scan for on-disk instances.
+    """Programmatic scan: enumerate on-disk files for a situation given a variables bag.
 
-    Use when: You want the full list of on-disk numbered files matching a
-    situation (e.g. all backups, all versioned saves, all numbered outputs)
-    without hand-composing ``GetSituationRequest`` → ``GetPathForMacroRequest``
-    → ``ScanSequencesRequest`` at the call site.
+    Use when: You already have a variables bag (from your own state, from user
+    input in a search UI, or from a prior ``ListRelatedProjectFilesRequest``) and
+    want to list on-disk files the situation's macro produces for it. If instead
+    you're starting from a *filename* and want files a related situation produced
+    for it, use ``ListRelatedProjectFilesRequest`` — that handler derives the
+    bag via reverse-match before delegating here.
 
-    Mirrors ``ProjectFileDestination.from_situation``: the handler derives
-    ``file_name_base`` / ``file_extension`` / ``sub_dirs`` from ``filename`` and
-    binds any additional ``extra_vars`` on top. The sequence slot (``_index``)
-    must remain unbound so ``RENDER_SEQUENCE_PATTERN`` can render it as ``####``
-    for the scanner.
+    The handler composes ``GetSituationRequest`` → ``GetPathForMacroRequest``
+    (with ``UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN``) →
+    ``ScanSequencesRequest`` (with ``policy=SKIP``, ``no_token_behavior=SINGLE_FILE``).
+    Situations whose macro has no ``{###}`` slot resolve to a literal path and
+    return 0 or 1 entries — same shape as any empty scan.
+
+    The sequence slot (``_index``) must remain unbound in ``variables`` so
+    ``RENDER_SEQUENCE_PATTERN`` can render it as ``####`` for the scanner.
 
     Args:
         situation_name: Situation to look up (e.g. ``BuiltInSituation.SAVE_WORKFLOW_BACKUP``).
-        filename: Workspace-relative filename that seeds the derived variables.
-        extra_vars: Additional macro variables to bind alongside the derived ones.
+        variables: Variables bag to bind against the situation's macro. All
+            required non-sequence variables must be present; the sequence key
+            (if the macro has a sequence slot) must be absent.
 
-    Results: ScanSituationSequenceResultSuccess (with sequence + rendered pattern) |
-    ScanSituationSequenceResultFailure (see ``failure_reason`` for which stage failed).
+    Results: ScanSituationSequenceResultSuccess (sequence + rendered pattern) |
+        ScanSituationSequenceResultFailure (see ``failure_reason`` for which stage failed).
     """
 
     situation_name: str
-    filename: str
-    extra_vars: MacroVariables | None = None
+    variables: MacroVariables
 
 
 @dataclass
@@ -447,8 +451,8 @@ class ScanSituationSequenceResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     """A stage of ``ScanSituationSequenceRequest`` failed. See ``failure_reason``.
 
     Attributes:
-        failure_reason: Which stage failed (situation lookup, macro parse, no
-            sequence slot, macro resolution, or the underlying scan).
+        failure_reason: Which stage failed (situation lookup, macro parse,
+            macro resolution, or the underlying scan).
         pattern: Rendered pattern when the failure happened after render (e.g.
             ``SCAN_FAILED``), else ``None``. Useful for log lines identifying
             which pattern the scanner rejected.
@@ -460,6 +464,138 @@ class ScanSituationSequenceResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
     failure_reason: ScanSituationSequenceFailureReason
     pattern: str | None = None
     scan_failure_reason: SequenceScanFailureReason | FileIOFailureReason | None = None
+
+
+class ListRelatedProjectFilesFailureReason(StrEnum):
+    """Why a ``ListRelatedProjectFilesRequest`` could not produce a related-files view.
+
+    One reason per pipeline stage so callers can act on the specific problem
+    without parsing detail strings.
+    """
+
+    # Absolute source_filename couldn't be mapped to a project directory
+    # (`AttemptMapAbsolutePathToProjectRequest` failed or returned no mapping).
+    PATH_MAP_FAILED = "path_map_failed"
+    # Reverse-match against source_situation's macro failed — source_filename
+    # doesn't fit the shape that source_situation would have produced.
+    SOURCE_MACRO_MISMATCH = "source_macro_mismatch"
+    # Underlying `ScanSituationSequenceRequest` failed; see `scan_failure_reason`
+    # for the specific downstream stage.
+    SCAN_FAILED = "scan_failed"
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRelatedProjectFilesRequest(RequestPayload):
+    """List on-disk files that one situation produced *for* a file another situation produced.
+
+    Use when: You have a filename that some source situation wrote (a saved
+    workflow, a saved node output, etc.) and you want to enumerate all the
+    on-disk files a *related* target situation produces for that same source.
+    The handler reverse-matches the source filename against the source
+    situation's macro to derive the variables bag, then scans the target
+    situation's macro for on-disk files sharing that bag.
+
+    Five example call shapes (backups, versions, node-output history,
+    cross-situation preview, cross-situation sidecar metadata)::
+
+        # 1. List the backups of a workflow.
+        await handle_request(ListRelatedProjectFilesRequest(
+            source_filename="{workspace_dir}/episodes/scene_one.py",
+            source_situation=BuiltInSituation.SAVE_WORKFLOW,
+            target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+        ))
+        # → sequence lists scene_one_backup_v001.py, scene_one_backup_v002.py, ...
+        # → source_variables = {"file_name_base": "scene_one",
+        #                       "file_extension": "py",
+        #                       "sub_dirs": "episodes"}
+
+        # 2. List all versioned saves of a workflow (absolute path also OK).
+        await handle_request(ListRelatedProjectFilesRequest(
+            source_filename="/abs/path/to/workspace/wf.py",
+            source_situation=BuiltInSituation.SAVE_WORKFLOW,
+            target_situation=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
+        ))
+        # → sequence lists wf_v001.py, wf_v002.py, ...
+
+        # 3. List a node's past outputs sharing a name (self-related — the same
+        #    situation for source and target: "give me all numbered siblings").
+        await handle_request(ListRelatedProjectFilesRequest(
+            source_filename="{outputs}/render.png",
+            source_situation=BuiltInSituation.SAVE_NODE_OUTPUT,
+            target_situation=BuiltInSituation.SAVE_NODE_OUTPUT,
+        ))
+        # → sequence lists render_v001.png, render_v002.png, ...
+
+        # 4. Find the preview file for a saved output (cross-situation).
+        await handle_request(ListRelatedProjectFilesRequest(
+            source_filename="{outputs}/render.png",
+            source_situation=BuiltInSituation.SAVE_NODE_OUTPUT,
+            target_situation=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW,
+        ))
+        # → sequence lists the preview file(s) for render.png (usually 0 or 1).
+
+        # 5. Find the sidecar metadata for a project file (cross-situation).
+        await handle_request(ListRelatedProjectFilesRequest(
+            source_filename="{workspace_dir}/foo.py",
+            source_situation=BuiltInSituation.SAVE_WORKFLOW,
+            target_situation=BuiltInSituation.SAVE_GRIPTAPE_NODES_METADATA,
+        ))
+        # → sequence points at foo.py's sidecar JSON (0 or 1 entry).
+
+    Args:
+        source_filename: The file to look up. Macro-form ("{workspace_dir}/foo.py")
+            or a plain absolute path. Absolute paths are converted to macro form
+            via ``AttemptMapAbsolutePathToProjectRequest`` internally.
+        source_situation: The situation whose macro should be reverse-matched
+            against ``source_filename`` to derive the variables bag. Typically
+            the situation that *wrote* ``source_filename``.
+        target_situation: The situation whose macro to scan for on-disk files
+            matching the derived bag.
+
+    Results: ListRelatedProjectFilesResultSuccess (sequence + source_variables) |
+        ListRelatedProjectFilesResultFailure (see ``failure_reason`` for which stage failed).
+    """
+
+    source_filename: str
+    source_situation: str
+    target_situation: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRelatedProjectFilesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Related-files listing produced successfully.
+
+    Attributes:
+        sequence: On-disk entries for the target situation's macro, keyed by
+            the reverse-matched source variables. ``None`` when nothing on disk
+            matched — a legitimate result, not a failure.
+        source_variables: The variables bag reverse-matched from
+            ``source_filename`` against ``source_situation``'s macro. Callers
+            doing a follow-on write (e.g. a backup write after listing existing
+            backups) can hand this bag to
+            ``ProjectFileDestination.from_situation_with_variables`` verbatim.
+    """
+
+    sequence: Sequence | None
+    source_variables: MacroVariables
+
+
+@dataclass
+@PayloadRegistry.register
+class ListRelatedProjectFilesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """A stage of ``ListRelatedProjectFilesRequest`` failed. See ``failure_reason``.
+
+    Attributes:
+        failure_reason: Which pipeline stage failed. See ``ListRelatedProjectFilesFailureReason``.
+        scan_failure_reason: When ``failure_reason == SCAN_FAILED``, the
+            downstream ``ScanSituationSequenceRequest`` failure reason.
+            ``None`` for every other stage.
+    """
+
+    failure_reason: ListRelatedProjectFilesFailureReason
+    scan_failure_reason: ScanSituationSequenceFailureReason | None = None
 
 
 @dataclass
