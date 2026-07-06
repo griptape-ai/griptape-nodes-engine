@@ -9726,3 +9726,76 @@ class TestListRelatedProjectFiles:
         # The reverse-match extracted "episode_name" (not "file_name_base") —
         # proving the pipeline is name-agnostic.
         assert result.source_variables == {"episode_name": "scene_one", "file_extension": "py"}
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_source_and_target_must_agree_on_variable_name(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Contract: source and target situations must agree on variable names.
+
+        The name-agnosticism claim is that Python code doesn't hardcode variable
+        names — but the *templates themselves* must agree, because they share the
+        variables bag through the pipeline. If SAVE_WORKFLOW binds ``episode_name``
+        but SAVE_WORKFLOW_BACKUP still expects ``file_name_base``, the reverse-match
+        succeeds (extracts ``episode_name``) but the target scan fails because its
+        macro references an unbound ``file_name_base``. That failure lands at the
+        scan stage, forwarded as ``SCAN_FAILED`` with the underlying
+        ``MACRO_RESOLUTION_ERROR`` reason preserved.
+
+        This test proves the *load-bearing* thing is name-agreement between source
+        and target — not any Python-side convention. Rename one macro but not the
+        other, and the pipeline fails at scan-stage the way you'd expect.
+        """
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+            ScanSituationSequenceFailureReason,
+        )
+
+        # Rename the variable in SAVE_WORKFLOW ONLY. SAVE_WORKFLOW_BACKUP retains
+        # the default `{file_name_base}` reference — so the target scan will fail
+        # with MISSING_REQUIRED_VARIABLES / MACRO_RESOLUTION_ERROR when it tries to
+        # render its macro with `episode_name` bound but not `file_name_base`.
+        current_project = project_manager_with_template._successfully_loaded_project_templates[
+            project_manager_with_template._current_project_id
+        ]
+        template = current_project.template
+        original_save = template.situations[BuiltInSituation.SAVE_WORKFLOW]
+        template.situations[BuiltInSituation.SAVE_WORKFLOW] = SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW,
+            macro="{workspace_dir}/{episode_name}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        try:
+            mock_context_manager = Mock()
+            mock_context_manager.has_current_workflow.return_value = False
+            mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+            # No scan-result install; the scan should never reach ScanSequencesRequest —
+            # it should bail at GetPathForMacroRequest when file_name_base is missing.
+
+            result = await project_manager_with_template.on_list_related_project_files_request(
+                ListRelatedProjectFilesRequest(
+                    source_filename="{workspace_dir}/scene_one.py",
+                    source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                    target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                )
+            )
+        finally:
+            template.situations[BuiltInSituation.SAVE_WORKFLOW] = original_save
+
+        # The pipeline fails at the scan stage — the reverse-match succeeded (extracted
+        # `episode_name`), but the target macro couldn't be rendered because it
+        # references `file_name_base` which isn't in the bag.
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SCAN_FAILED
+        # The underlying scan failure reason is preserved for callers to branch on.
+        assert result.scan_failure_reason == ScanSituationSequenceFailureReason.MACRO_RESOLUTION_ERROR

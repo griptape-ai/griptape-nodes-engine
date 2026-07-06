@@ -392,12 +392,17 @@ class ScanSituationSequenceFailureReason(StrEnum):
 class ScanSituationSequenceRequest(RequestPayload):
     """Programmatic scan: enumerate on-disk files for a situation given a variables bag.
 
-    Use when: You already have a variables bag (from your own state, from user
-    input in a search UI, or from a prior ``ListRelatedProjectFilesRequest``) and
-    want to list on-disk files the situation's macro produces for it. If instead
-    you're starting from a *filename* and want files a related situation produced
-    for it, use ``ListRelatedProjectFilesRequest`` — that handler derives the
-    bag via reverse-match before delegating here.
+    | You have...                                    | Use this                             |
+    | ---------------------------------------------- | ------------------------------------ |
+    | A variables bag (from state, user input, ...)  | ``ScanSituationSequenceRequest``     |
+    | A filename produced by *some* source situation | ``ListRelatedProjectFilesRequest``   |
+
+    Callers with a bag hit this request directly. Callers holding a filename
+    reach for ``ListRelatedProjectFilesRequest`` instead — that handler reverse-matches
+    the filename against a source situation's macro to derive the bag, then
+    delegates here. Typical bag-first callers: search UIs building a bag from
+    user input, library-side node code with its own parameter state, slot-less
+    situations (``SAVE_TEMP_FILE`` etc.) that have no natural source file.
 
     The handler composes ``GetSituationRequest`` → ``GetPathForMacroRequest``
     (with ``UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN``) →
