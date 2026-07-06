@@ -50,6 +50,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SetVariableValueResultFailure,
     SetVariableValueResultSuccess,
     Substitutable,
+    SubstitutableSource,
     VariableDetails,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -553,11 +554,11 @@ class VariablesManager:
         filtered_user_vars = VariableResolver._filter_for_substitution(raw_user_vars)
 
         substitutables: list[Substitutable] = [
-            Substitutable(name=name, value=value, source="macro", read_only=True)
+            Substitutable(name=name, value=value, source=SubstitutableSource.MACRO, read_only=True)
             for name, value in sorted(project_vars.items())
         ]
         substitutables += [
-            Substitutable(name=name, value=value, source="variable", read_only=False)
+            Substitutable(name=name, value=value, source=SubstitutableSource.VARIABLE, read_only=False)
             for name, value in sorted(filtered_user_vars.items())
             if name not in project_vars
         ]

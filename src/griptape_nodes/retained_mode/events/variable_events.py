@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from enum import StrEnum
+from typing import Any
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -364,6 +365,11 @@ class GetVariableDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
     """Variable details retrieval failed."""
 
 
+class SubstitutableSource(StrEnum):
+    VARIABLE = "variable"
+    MACRO = "macro"
+
+
 @dataclass
 class Substitutable:
     """A single value available for {VAR} substitution.
@@ -371,13 +377,13 @@ class Substitutable:
     Attributes:
         name: The token name (what goes inside the braces, e.g. "workspace_dir")
         value: The resolved value
-        source: Origin of the value ("variable" | "macro" — extensible for future sources)
+        source: Origin of the value (see SubstitutableSource)
         read_only: Whether the user can edit this value (macros are read-only)
     """
 
     name: str
     value: str | int
-    source: Literal["variable", "macro"]
+    source: SubstitutableSource
     read_only: bool = False
 
 
