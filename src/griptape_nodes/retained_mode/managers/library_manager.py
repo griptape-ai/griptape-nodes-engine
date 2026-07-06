@@ -122,6 +122,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
+    LibraryEventHandlerDetails,
     LibraryProvisioningAction,
     LibraryProvisioningActionKind,
     ListCapableLibraryEventHandlersRequest,
@@ -865,8 +866,23 @@ class LibraryManager:
             details = f"Request type '{request.request_type}' is not registered in the PayloadRegistry."
             return ListCapableLibraryEventHandlersResultFailure(exception=KeyError(details), result_details=details)
         handler_mappings = self.get_registered_event_handlers(request_type)
+        # Surface any presentation metadata a library registered alongside its handler
+        # (currently PublishWorkflowRegisteredEventData's display_name/description/icon)
+        # so a frontend can render richer menu entries. Read the fields defensively:
+        # event_data may be None or a type without these attributes, in which case the
+        # handler still gets an entry keyed only by its library name.
+        handler_details = [
+            LibraryEventHandlerDetails(
+                library_name=library_name,
+                display_name=getattr(registered.event_data, "display_name", None),
+                description=getattr(registered.event_data, "description", None),
+                icon=getattr(registered.event_data, "icon", None),
+            )
+            for library_name, registered in handler_mappings.items()
+        ]
         return ListCapableLibraryEventHandlersResultSuccess(
             handlers=list(handler_mappings.keys()),
+            handler_details=handler_details,
             result_details=f"Successfully listed {len(handler_mappings)} capable library event handlers",
         )
 
