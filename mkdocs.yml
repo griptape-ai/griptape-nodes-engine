@@ -80,6 +80,8 @@ plugins:
           - how_to/mcp/servers/time.md
         Enterprise:
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
+        Publishing:
+          - publishing/index.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -202,6 +204,8 @@ nav:
                   - Time: how_to/mcp/servers/time.md
   - Enterprise:
       - Admin Server: enterprise/admin_server.md
+  - Publishing:
+      - Overview: publishing/index.md
   - FAQ: faq.md
   - Nodes Reference:
       - Overview: nodes/overview.md
