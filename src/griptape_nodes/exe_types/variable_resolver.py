@@ -63,8 +63,10 @@ class VariableResolver:
         # one ParsedVariable segment. Iterate segments directly (not get_variables()) to retain
         # format_specs, which are stripped by get_variables().
         parsed_var = next((seg for seg in parsed.segments if isinstance(seg, ParsedVariable)), None)
-        if parsed_var is None or parsed_var.info.name not in variables:
+        if parsed_var is None:
             return token
+        if parsed_var.info.name not in variables:
+            return "" if not parsed_var.info.is_required else token
         value: str | int = variables[parsed_var.info.name]
         try:
             for format_spec in parsed_var.format_specs:
