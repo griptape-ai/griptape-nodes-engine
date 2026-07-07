@@ -18,6 +18,8 @@ from griptape_nodes.retained_mode.events.event_converter import (
 if TYPE_CHECKING:
     import builtins
 
+logger = logging.getLogger(__name__)
+
 
 def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
     """Resolve a payload type from a type-name field in the event data.
@@ -499,7 +501,15 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         result["request"] = safe_unstructure(self.request)
         result_dict = safe_unstructure(self.result)
         if self.request.fields is not None and self.result.succeeded():
-            filtered = _apply_path_tree(result_dict, _build_path_tree(self.request.fields))
+            tree = _build_path_tree(self.request.fields)
+            for top_key in tree:
+                if top_key != "*" and top_key not in result_dict:
+                    logger.warning(
+                        "fields filter: '%s' not found in %s result — typo or version skew?",
+                        top_key,
+                        type(self.result).__name__,
+                    )
+            filtered = _apply_path_tree(result_dict, tree)
             for fw_field in _RESULT_FRAMEWORK_FIELDS:
                 if fw_field in result_dict:
                     filtered.setdefault(fw_field, result_dict[fw_field])
