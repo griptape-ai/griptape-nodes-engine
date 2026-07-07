@@ -785,7 +785,7 @@ class TestCodecAccess:
         assert query_result.verdicts[0].denial is not None
         query_attrs = seen_attributes[-1]
 
-        # --- Enforcement path: VideoArtifactProvider.check_write_permission ---
+        # --- Enforcement path: VideoArtifactProvider.check_write_format_from_path ---
         # Monkeypatch ffprobe so we can inject a canned codec without shelling
         # out. The read-side path is functionally identical (both go through
         # ``_evaluate_codec_checkpoint``), so exercising the write side is
@@ -798,7 +798,9 @@ class TestCodecAccess:
         seen_attributes.clear()
         griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
         try:
-            enforcement_denial = provider.check_write_permission(b"fake mp4 bytes", "mp4", file_name="clip.mp4")
+            # OSManager stages before calling this; a stand-in path is fine
+            # since ffprobe is mocked.
+            enforcement_denial = provider.check_write_format_from_path("/tmp/staged.mp4", "mp4")  # noqa: S108
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
 

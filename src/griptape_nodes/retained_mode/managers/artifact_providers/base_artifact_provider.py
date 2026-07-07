@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from pydantic import BaseModel
@@ -12,12 +13,24 @@ from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.common.macro_parser import MacroVariables
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
     from griptape_nodes.retained_mode.managers.artifact_providers.provider_registry import ProviderRegistry
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+
+class WriteVettingPolicy(StrEnum):
+    """How a provider wants pending writes vetted.
+
+    Providers that gate writes declare which vetting mode they need by
+    overriding ``BaseArtifactProvider.get_write_vetting_policy``. OSManager
+    reads the policy up front, prepares the appropriate inputs, and then
+    dispatches to the matching provider hook.
+    """
+
+    FROM_BYTES = "from_bytes"
+    FROM_PATH = "from_path"
 
 
 class BaseArtifactMetadata(BaseModel):
@@ -246,44 +259,79 @@ class BaseArtifactProvider(ABC):
         """
         return data
 
-    def check_write_permission(
+    @staticmethod
+    def get_write_vetting_policy() -> WriteVettingPolicy | None:
+        """Return the vetting mode this provider needs, or ``None`` to opt out.
+
+        Override in subclasses that gate writes. The default returns ``None``,
+        which tells OSManager to skip vetting entirely for this format --
+        neither staging nor a provider hook call happens. This keeps providers
+        without a write policy (e.g. images, audio) at zero cost even when a
+        policy hook is installed globally.
+
+        Returns:
+            ``WriteVettingPolicy.FROM_PATH`` when the provider needs a
+            filesystem path (e.g. ffprobe on a video), ``FROM_BYTES`` when the
+            provider can inspect raw bytes without touching disk, or ``None``
+            to opt out.
+        """
+        return None
+
+    def check_write_format_from_bytes(
         self,
         data: bytes,  # noqa: ARG002
         detected_format: str,  # noqa: ARG002
-        *,
-        file_name: str,  # noqa: ARG002
-        caller_variables: MacroVariables | None = None,  # noqa: ARG002
     ) -> CheckpointDenial | None:
-        """Ask whether writing ``data`` is permitted before it hits disk.
+        """Confirm the pending write's format is allowed to be written, given the raw byte buffer.
 
-        Override in subclasses that gate writes on media-specific properties
-        (e.g., legally-encumbered video codecs). The default implementation
-        returns ``None`` (allow), so providers without a policy pay no cost.
-
-        Called by ``OSManager`` after the incoming bytes have been recognized
-        as a format this provider claims, and before the disk write occurs.
-        The implementation may inspect ``data`` (e.g. run ffprobe on a spooled
-        temp file) to extract facts a policy hook cares about, then evaluate
-        an ``AuthorizationCheckpoint`` via ``EventManager``.
+        Called by ``OSManager`` when ``get_write_vetting_policy`` returned
+        ``WriteVettingPolicy.FROM_BYTES``. Providers that pick this policy
+        commit to inspecting ``data`` directly (parsing headers, running an
+        in-process decoder) rather than staging to disk. The default returns
+        ``None`` (allow); providers overriding ``get_write_vetting_policy``
+        to ``FROM_BYTES`` are expected to override this method too.
 
         Args:
             data: The full buffered write payload.
             detected_format: The lowercase canonical extension the provider
-                returned from ``detect_format`` for these bytes (e.g. ``"mp4"``).
-            file_name: The caller's intended destination filename (not full
-                path). Required so artist-facing denial messages can name the
-                exact save that was blocked -- a gate that can't identify what
-                it refused isn't useful to the person seeing the error.
-            caller_variables: The caller's macro variable bindings (from
-                ``WriteFileRequest.file_path`` when it's a ``MacroPath``, else
-                ``None``). Providers that need to stage bytes to a project temp
-                path can pass this through to ``WriteTempFileRequest`` so the
-                temp filename carries origin context (e.g. ``node_name``) and
-                forward-compat with SAVE_TEMP_FILE extensions comes for free.
+                returned from ``detect_format`` (e.g. ``"mp4"``).
 
         Returns:
-            A ``CheckpointDenial`` to refuse the write (OSManager converts it
-            to a ``WriteFileResultFailure``), or ``None`` to allow.
+            A ``CheckpointDenial`` to refuse the write (OSManager wraps it
+            with the destination filename), or ``None`` to allow. Provider
+            denial messages should be generic ("Codec 'h264' is not
+            permitted."); the "which file" framing is added by OSManager.
+        """
+        return None
+
+    def check_write_format_from_path(
+        self,
+        source_path: str,  # noqa: ARG002
+        detected_format: str,  # noqa: ARG002
+    ) -> CheckpointDenial | None:
+        """Confirm the pending write's format is allowed to be written, given a staged filesystem path.
+
+        Called by ``OSManager`` when ``get_write_vetting_policy`` returned
+        ``WriteVettingPolicy.FROM_PATH``. OSManager stages the pending bytes
+        at a project-scoped temp path (via ``SAVE_TEMP_FILE``), invokes this
+        hook, then truncates + deletes the staged file regardless of outcome
+        -- so the provider must NOT retain the path or write to it. The
+        provider is trusted to open it read-only (e.g. shell ffprobe at it).
+
+        The default returns ``None`` (allow); providers overriding
+        ``get_write_vetting_policy`` to ``FROM_PATH`` are expected to override
+        this method too.
+
+        Args:
+            source_path: Absolute path to the staged bytes on disk.
+            detected_format: The lowercase canonical extension the provider
+                returned from ``detect_format`` (e.g. ``"mp4"``).
+
+        Returns:
+            A ``CheckpointDenial`` to refuse the write (OSManager wraps it
+            with the destination filename), or ``None`` to allow. Provider
+            denial messages should be generic; the "which file" framing is
+            added by OSManager.
         """
         return None
 
@@ -307,6 +355,8 @@ class BaseArtifactProvider(ABC):
 
         Returns:
             A ``CheckpointDenial`` to refuse the read, or ``None`` to allow.
+            Provider denial messages should be generic; the caller wraps the
+            denial with any "which file" framing.
         """
         return None
 

@@ -8,10 +8,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import anyio
 import portalocker
@@ -140,10 +141,14 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes, logger
+from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
@@ -238,6 +243,30 @@ class FilePathValidationError(Exception):
         """
         super().__init__(message)
         self.reason = reason
+
+
+class StagingFailedError(Exception):
+    """Raised when ``OSManager._stage_bytes_at_temp`` cannot land bytes on disk.
+
+    The on-disk vet path catches this to fail closed: if the bytes cannot even
+    be staged for inspection, the write cannot be verified as compliant and
+    must be refused. Carries the ``FileIOFailureReason`` that would have
+    appeared in a ``WriteTempFileResultFailure`` so the public
+    ``on_write_temp_file_request`` handler can preserve the failure reason
+    when translating the exception back into a request result.
+    """
+
+    def __init__(self, message: str, failure_reason: FileIOFailureReason) -> None:
+        super().__init__(message)
+        self.failure_reason = failure_reason
+
+
+@dataclass(frozen=True)
+class _StagedTempOutcome:
+    """Result of ``OSManager._stage_bytes_at_temp`` on the success path."""
+
+    staged_path: str
+    bytes_written: int
 
 
 @dataclass
@@ -2419,23 +2448,14 @@ class OSManager:
         # that's acceptable -- the alternative is running an expensive vet on
         # every write forever.
         if sniffed_ext is not None and not request.append and GriptapeNodes.EventManager().has_authorization_hooks():
-            # Thread the caller's macro variables through so a provider that
-            # needs to stage bytes at a project temp path can preserve caller
-            # context in the temp filename (e.g. ``node_name`` for
-            # observability of orphan temp files after a crash).
-            caller_variables = request.file_path.variables if isinstance(request.file_path, MacroPath) else None
-            denial = GriptapeNodes.ArtifactManager().check_write_permission(
-                request.content,  # type: ignore[arg-type]
-                sniffed_ext,
-                file_name=file_path.name,
-                caller_variables=caller_variables,
+            vet_failure = self._run_write_vet(
+                content=request.content,  # type: ignore[arg-type]
+                sniffed_ext=sniffed_ext,
+                file_path=file_path,
+                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
             )
-            if denial is not None:
-                msg = f"Cannot save '{file_path.name}': {denial.reason()}"
-                return WriteFileResultFailure(
-                    failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
-                    result_details=msg,
-                )
+            if vet_failure is not None:
+                return vet_failure
 
         # Align the destination suffix to the sniffed format before any scan,
         # write, or candidate generation runs. Without this, the scan globs
@@ -2744,18 +2764,43 @@ class OSManager:
         """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path.
 
         Distinct from ``on_write_file_request``: callers do not choose the
-        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. The
-        handler resolves the situation, passes the caller's ``variables`` to
-        ``GetPathForMacroRequest`` (which merges in project builtins like
-        ``{temp}``), ensures the parent dir exists, and delegates the write
-        to ``_attempt_file_write`` -- the same helper ``on_write_file_request``
-        uses, so exception taxonomy and locking behavior stay identical.
+        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. Thin
+        wrapper around ``_stage_bytes_at_temp``; the shared helper is what the
+        internal codec-vet path calls without re-entering ``handle_request``.
 
         The handler does NOT synthesize any variable bindings on the caller's
         behalf. Callers are responsible for supplying enough variables to
         fully resolve the macro (unresolved required slots surface as a
         Failure); if a caller wants collision-safe filenames they must include
         a uuid or similar in ``variables["file_name_base"]``.
+        """
+        try:
+            outcome = self._stage_bytes_at_temp(request.content, request.variables)
+        except StagingFailedError as exc:
+            return WriteTempFileResultFailure(
+                failure_reason=exc.failure_reason,
+                result_details=str(exc),
+            )
+        return WriteTempFileResultSuccess(
+            staged_path=outcome.staged_path,
+            bytes_written=outcome.bytes_written,
+            result_details=f"Temp file written at {outcome.staged_path}",
+        )
+
+    def _stage_bytes_at_temp(self, content: bytes, variables: MacroVariables) -> _StagedTempOutcome:
+        """Land ``content`` at the SAVE_TEMP_FILE path resolved with ``variables``.
+
+        Resolves the SAVE_TEMP_FILE situation, resolves its macro against the
+        caller's variables (merged with project builtins by
+        ``GetPathForMacroRequest``), ensures the parent dir, and delegates the
+        write to ``_attempt_file_write``. Called by both the public
+        ``on_write_temp_file_request`` handler and the internal codec-vet path
+        in ``on_write_file_request``. The vet path calls this directly rather
+        than round-tripping through ``handle_request`` so a provider vetting a
+        path never re-enters the request dispatcher.
+
+        Raises ``StagingFailedError`` on any failure, tagged with the
+        ``FileIOFailureReason`` that would have appeared in the request result.
         """
         situation_result = GriptapeNodes.handle_request(
             GetSituationRequest(situation_name=BuiltInSituation.SAVE_TEMP_FILE)
@@ -2765,32 +2810,32 @@ class OSManager:
                 f"Attempted to write temp file. Failed because the '{BuiltInSituation.SAVE_TEMP_FILE}' "
                 f"situation is not registered in the current project template."
             )
-            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
 
         try:
             parsed_macro = ParsedMacro(situation_result.situation.macro)
         except MacroSyntaxError as exc:
             msg = f"Attempted to write temp file. Failed to parse SAVE_TEMP_FILE macro: {exc}"
-            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH) from exc
 
         path_result = GriptapeNodes.handle_request(
-            GetPathForMacroRequest(parsed_macro=parsed_macro, variables=request.variables)
+            GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables)
         )
         if not isinstance(path_result, GetPathForMacroResultSuccess):
             msg = f"Attempted to write temp file. Failed to resolve SAVE_TEMP_FILE macro: {path_result.result_details}"
-            return WriteTempFileResultFailure(failure_reason=FileIOFailureReason.INVALID_PATH, result_details=msg)
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
 
         staged_path = path_result.absolute_path
 
         parent_failure_reason = self._ensure_parent_directory_ready(staged_path, create_parents=True)
         if parent_failure_reason is not None:
             msg = f"Attempted to write temp file at '{staged_path}'. Failed to prepare parent directory."
-            return WriteTempFileResultFailure(failure_reason=parent_failure_reason, result_details=msg)
+            raise StagingFailedError(msg, parent_failure_reason)
 
         normalized_path = normalize_path_for_platform(staged_path)
         attempt = self._attempt_file_write(
             normalized_path=Path(normalized_path),
-            content=request.content,
+            content=content,
             encoding="utf-8",  # ignored for bytes content
             mode="w",
             file_path_display=staged_path,
@@ -2799,15 +2844,126 @@ class OSManager:
         )
         if attempt.failure_reason is not None:
             # ``error_message`` is guaranteed set when ``failure_reason`` is set.
-            return WriteTempFileResultFailure(
-                failure_reason=attempt.failure_reason,
-                result_details=attempt.error_message,  # type: ignore[arg-type]
-            )
+            raise StagingFailedError(attempt.error_message or "unknown write failure", attempt.failure_reason)
         # ``bytes_written`` is guaranteed set on the success path.
-        return WriteTempFileResultSuccess(
-            staged_path=str(staged_path),
-            bytes_written=attempt.bytes_written,  # type: ignore[arg-type]
-            result_details=f"Temp file written at {staged_path}",
+        return _StagedTempOutcome(staged_path=str(staged_path), bytes_written=attempt.bytes_written)  # type: ignore[arg-type]
+
+    def _truncate_and_delete_staged(self, staged_path: str) -> None:
+        r"""Neutralize and remove a staged codec-vet temp file.
+
+        Truncate the file to a single ``\x00`` byte, then delete it. Truncate
+        first so that even if the delete fails, whatever remains on disk
+        cannot be interpreted as a video: ffprobe on a 1-byte file finds no
+        container header. Delete second so the normal case leaves nothing
+        behind.
+
+        Bypasses ``on_write_file_request`` on purpose -- calling the public
+        write handler here would re-run the sniff/vet/extension-coercion
+        pipeline against a single null byte. Sniffing that byte is harmless
+        (returns None) but any future check added to the write handler would
+        run against this cleanup path too. ``_attempt_file_write`` is the
+        actual disk-I/O helper both write handlers delegate to, so calling it
+        directly performs the write with the same locking and exception
+        taxonomy while skipping the vet funnel.
+
+        Best-effort: logs on failure, never raises. A cleanup failure must
+        not mask the vet's real result.
+        """
+        try:
+            normalized = Path(normalize_path_for_platform(Path(staged_path)))
+            attempt = self._attempt_file_write(
+                normalized_path=normalized,
+                content=b"\x00",
+                encoding="utf-8",
+                mode="w",
+                file_path_display=staged_path,
+                fail_if_file_exists=False,
+                fail_if_file_locked=True,
+            )
+            if attempt.failure_reason is not None:
+                logger.error(
+                    "Attempted to truncate staged codec-vet temp at '%s'. Failed: %s",
+                    staged_path,
+                    attempt.error_message,
+                )
+        except OSError as exc:
+            logger.error("Attempted to truncate staged codec-vet temp at '%s'. Failed: %s", staged_path, exc)
+
+        try:
+            Path(staged_path).unlink(missing_ok=True)
+        except OSError as exc:
+            logger.error(
+                "Attempted to delete staged codec-vet temp at '%s'. Failed: %s (file has been truncated).",
+                staged_path,
+                exc,
+            )
+
+    def _run_write_vet(
+        self,
+        *,
+        content: bytes,
+        sniffed_ext: str,
+        file_path: Path,
+        caller_variables: MacroVariables | None,
+    ) -> WriteFileResultFailure | None:
+        """Ask the format's provider to vet the pending write.
+
+        Reads the provider's declared ``WriteVettingPolicy`` and dispatches
+        accordingly:
+
+        - ``None`` -- provider opts out. No staging, no dispatch, no cost.
+        - ``FROM_BYTES`` -- hand the raw bytes to the provider directly.
+        - ``FROM_PATH`` -- stage bytes at the SAVE_TEMP_FILE path, hand the
+          resulting path to the provider, and truncate + delete the staged
+          file in a ``finally`` regardless of outcome. Staging failure is
+          treated as fail-closed: an unstageable vet cannot verify the write.
+
+        Returns a ``WriteFileResultFailure`` when the vet refuses (or fails
+        closed), or ``None`` when the write is permitted.
+
+        An unrecognized ``WriteVettingPolicy`` raises loudly: silently
+        falling through would let a policy variant added without updating
+        this switch bless every write that reached it.
+        """
+        artifact_manager = GriptapeNodes.ArtifactManager()
+        policy = artifact_manager.get_write_vetting_policy(sniffed_ext)
+        denial: CheckpointDenial | None = None
+
+        match policy:
+            case None:
+                return None
+            case WriteVettingPolicy.FROM_BYTES:
+                denial = artifact_manager.check_write_format_from_bytes(content, sniffed_ext)
+            case WriteVettingPolicy.FROM_PATH:
+                staging_variables: MacroVariables = dict(caller_variables) if caller_variables else {}
+                # Vet's required overrides sit on top of caller variables --
+                # ``file_name_base`` must be a uuid to keep concurrent vet
+                # stagings from colliding under SAVE_TEMP_FILE's OVERWRITE
+                # policy; ``file_extension`` must match the sniffed container
+                # so ffprobe's extension-based demuxer dispatch picks correctly.
+                staging_variables["file_name_base"] = uuid.uuid4().hex
+                staging_variables["file_extension"] = sniffed_ext
+
+                try:
+                    outcome = self._stage_bytes_at_temp(content, staging_variables)
+                except StagingFailedError as exc:
+                    return WriteFileResultFailure(
+                        failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                        result_details=(f"Cannot save '{file_path.name}': staging for verification failed ({exc})."),
+                    )
+                try:
+                    denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
+                finally:
+                    self._truncate_and_delete_staged(outcome.staged_path)
+            case _:
+                msg = f"Unrecognized WriteVettingPolicy '{policy}' returned by provider for format '{sniffed_ext}'."
+                raise RuntimeError(msg)
+
+        if denial is None:
+            return None
+        return WriteFileResultFailure(
+            failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+            result_details=f"Cannot save '{file_path.name}': {denial.reason()}",
         )
 
     def _apply_extension_coercion(

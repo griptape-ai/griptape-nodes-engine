@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
-import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -15,6 +14,7 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
+    WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -26,7 +26,6 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.common.macro_parser import MacroVariables
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -134,62 +133,30 @@ class VideoArtifactProvider(BaseArtifactProvider):
 
         return cls._parse_probe_data(probe_data, source_path)
 
-    def check_write_permission(
+    @staticmethod
+    def get_write_vetting_policy() -> WriteVettingPolicy | None:
+        """Videos need a filesystem path -- ffprobe reads containers, not raw buffers."""
+        return WriteVettingPolicy.FROM_PATH
+
+    def check_write_format_from_path(
         self,
-        data: bytes,
+        source_path: str,
         detected_format: str,
-        *,
-        file_name: str,
-        caller_variables: MacroVariables | None = None,
     ) -> CheckpointDenial | None:
         """Gate a pending video write against the WRITE_VIDEO_CODEC checkpoint.
 
-        Flow:
-        1. Stage ``data`` at the project's SAVE_TEMP_FILE path via
-           ``WriteTempFileRequest``. The temp lives in the project's temp
-           directory, NOT the OS temp dir -- avoids exhausting a small
-           system-wide temp partition when videos are multi-GB.
-        2. Run ffprobe on the staged path to extract the primary video codec.
-        3. In ``finally``, unconditionally truncate the staged file to a
-           single null byte and then delete it. Truncate first, then delete:
-           if delete fails for any reason, the file left behind is unusable
-           as a video.
-        4. If a codec was extracted, evaluate the WRITE_VIDEO_CODEC checkpoint.
-           If codec extraction failed, FAIL CLOSED with a synthetic denial: an
-           unclassified video write cannot be verified as compliant, so a
-           legally-encumbered codec must not slip through on a broken probe.
+        Runs ffprobe on the OSManager-staged path to extract the primary
+        video codec and evaluates the ``WRITE_VIDEO_CODEC`` checkpoint. OSManager
+        owns the staged file's lifecycle (create + truncate + delete); this
+        method must not write to or delete ``source_path``.
 
-        Args:
-            data: The bytes about to be written.
-            detected_format: The container extension (mp4, mov, ...).
-            file_name: Filename of the caller's intended destination, used in
-                error messages so the artist sees which save was blocked.
-            caller_variables: The caller's macro variable bindings, threaded
-                into ``WriteTempFileRequest`` so the temp filename inherits
-                caller context (``node_name`` etc.) and any additional
-                SAVE_TEMP_FILE slots the caller happens to bind get resolved.
-
-        The known cost is speed (one extra full-buffer write to disk per gated
-        write). Users chose this over the OS-temp-doubling problem in the
-        previous approach.
+        Fails closed when the codec cannot be extracted -- an unclassified
+        write cannot be verified as compliant, so a legally-encumbered codec
+        must not slip through on a broken probe.
         """
-        codec = self._extract_codec_via_staging(
-            data, detected_format, file_name=file_name, caller_variables=caller_variables
-        )
-        if codec is None:
-            # Fail closed: if we can't identify the codec, we can't confirm the
-            # write is compliant with the policy. For a gate that exists to
-            # protect against legally-encumbered codecs, defaulting to permit
-            # would silently bless disallowed writes whenever ffprobe hiccups.
-            return CheckpointDenial(
-                failures=(
-                    CheckpointFailure(detail=f"Cannot save '{file_name}': the video codec could not be verified."),
-                )
-            )
-
-        return self._evaluate_codec_checkpoint(
+        return self._check_codec(
+            source_path,
             action=CheckpointAction.WRITE_VIDEO_CODEC,
-            codec=codec,
             container_format=detected_format,
         )
 
@@ -199,132 +166,44 @@ class VideoArtifactProvider(BaseArtifactProvider):
         Runs ffprobe on the source (no staging -- we already have a path)
         and consults the hook chain. Fails closed when the codec cannot be
         extracted: an unverifiable read is refused for the same reason writes
-        are (see ``check_write_permission``).
+        are.
         """
-        probe_data = self._run_ffprobe(source_path)
-        codec = self._codec_from_probe_data(probe_data)
-        if codec is None:
-            return CheckpointDenial(
-                failures=(
-                    CheckpointFailure(
-                        detail=(f"Cannot load '{Path(source_path).name}': the video codec could not be verified.")
-                    ),
-                )
-            )
-
         container_format = Path(source_path).suffix.lstrip(".").lower() or "unknown"
-        return self._evaluate_codec_checkpoint(
+        return self._check_codec(
+            source_path,
             action=CheckpointAction.READ_VIDEO_CODEC,
-            codec=codec,
             container_format=container_format,
         )
 
     @classmethod
-    def _extract_codec_via_staging(
+    def _check_codec(
         cls,
-        data: bytes,
-        detected_format: str,
+        source_path: str,
         *,
-        file_name: str,
-        caller_variables: MacroVariables | None,
-    ) -> str | None:
-        """Stage bytes at the project temp path, run ffprobe, then truncate + delete.
+        action: CheckpointAction,
+        container_format: str,
+    ) -> CheckpointDenial | None:
+        """Probe ``source_path`` for its video codec and evaluate ``action``.
 
-        Returns the extracted codec name, or ``None`` when any step failed
-        (stage failure, ffprobe failure, no video stream). The caller
-        translates None into a fail-closed denial that names ``file_name``.
+        Fail-closed on unverifiable codecs: if ffprobe cannot identify a
+        video stream, return a synthetic denial rather than allow the
+        operation. For a gate that exists to protect against
+        legally-encumbered codecs, defaulting to permit would silently
+        bless disallowed operations whenever ffprobe hiccups. Denial detail
+        is generic ("The video codec could not be verified."); the caller
+        (OSManager on the write side, library code on the read side) is
+        expected to wrap it with any file-name framing.
         """
-        from griptape_nodes.retained_mode.events.os_events import (  # avoid circular import
-            WriteTempFileRequest,
-            WriteTempFileResultSuccess,
+        probe_data = cls._run_ffprobe(source_path)
+        codec = cls._codec_from_probe_data(probe_data)
+        if codec is None:
+            return CheckpointDenial(failures=(CheckpointFailure(detail="The video codec could not be verified."),))
+
+        return cls._evaluate_codec_checkpoint(
+            action=action,
+            codec=codec,
+            container_format=container_format,
         )
-
-        # Start with the caller's variables (so slots like ``node_name`` land
-        # in the temp filename for observability) and then apply the vet's
-        # required overrides. ``file_name_base`` is a uuid so concurrent
-        # codec-vet stagings never collide (SAVE_TEMP_FILE's on-collision
-        # policy is OVERWRITE, which would otherwise let one probe silently
-        # trample another's bytes). ``file_extension`` is the sniffed
-        # container so ffprobe's extension-based dispatch picks the right
-        # demuxer. Vet overrides win over caller values on those two keys --
-        # a caller-supplied ``file_name_base`` would defeat the uniqueness
-        # guarantee and a caller-supplied ``file_extension`` would lie to
-        # ffprobe about the container.
-        variables: MacroVariables = dict(caller_variables) if caller_variables else {}
-        variables["file_name_base"] = uuid.uuid4().hex
-        variables["file_extension"] = detected_format
-
-        stage_result = GriptapeNodes.handle_request(WriteTempFileRequest(content=data, variables=variables))
-        if not isinstance(stage_result, WriteTempFileResultSuccess):
-            logger.error(
-                "Attempted to stage bytes for codec verification of '%s'. Failed: %s",
-                file_name,
-                stage_result.result_details,
-            )
-            return None
-
-        staged_path = stage_result.staged_path
-        try:
-            probe_data = cls._run_ffprobe(staged_path)
-        finally:
-            cls._truncate_and_delete(staged_path, file_name=file_name)
-
-        return cls._codec_from_probe_data(probe_data)
-
-    @classmethod
-    def _truncate_and_delete(cls, staged_path: str, *, file_name: str) -> None:
-        r"""Truncate ``staged_path`` to a single null byte, then delete it.
-
-        Truncate first so that even if the delete fails, whatever remains on
-        disk cannot be interpreted as a video: ffprobe on a 1-byte file finds
-        no container header. Delete second so the normal case leaves nothing
-        behind. Both steps inspect the request result (``handle_request``
-        already catches all exceptions internally and returns a Failure
-        payload -- no try/except needed here). A failure at either step is
-        logged as an ERROR: leaving disallowed bytes on disk is a real
-        problem, even if the truncate already neutralized the file's contents.
-
-        Writing a single ``\x00`` byte in OVERWRITE mode truncates whatever
-        size the staged file had (potentially multi-GB for real customer
-        video assets), avoiding a large in-memory buffer and a second big
-        disk write.
-        """
-        from griptape_nodes.retained_mode.events.base_events import ResultPayloadFailure
-        from griptape_nodes.retained_mode.events.os_events import (  # avoid circular import
-            DeleteFileRequest,
-            DeletionBehavior,
-            WriteFileRequest,
-            WriteFileResultFailure,
-        )
-
-        # Use a plain WriteFileRequest (OVERWRITE is the default) so this
-        # doesn't re-enter the codec vet: a lone null byte sniffs to no known
-        # format and doesn't reach VideoArtifactProvider anyway.
-        truncate_result = GriptapeNodes.handle_request(WriteFileRequest(file_path=staged_path, content=b"\x00"))
-        if isinstance(truncate_result, (WriteFileResultFailure, ResultPayloadFailure)):
-            logger.error(
-                "Attempted to truncate staged video temp for '%s' at '%s'. Failed: %s",
-                file_name,
-                staged_path,
-                truncate_result.result_details,
-            )
-
-        from griptape_nodes.retained_mode.events.os_events import DeleteFileResultFailure  # avoid circular import
-
-        delete_result = GriptapeNodes.handle_request(
-            DeleteFileRequest(
-                path=staged_path,
-                workspace_only=False,
-                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
-            )
-        )
-        if isinstance(delete_result, (DeleteFileResultFailure, ResultPayloadFailure)):
-            logger.error(
-                "Attempted to delete staged video temp for '%s' at '%s'. Failed: %s (file has been truncated).",
-                file_name,
-                staged_path,
-                delete_result.result_details,
-            )
 
     @staticmethod
     def _codec_from_probe_data(probe_data: dict | None) -> str | None:

@@ -46,9 +46,11 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationPolicy,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
@@ -835,16 +837,19 @@ class TestOSWritePermissionVet:
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
-        # Force the ImageArtifactProvider instance's check_write_permission to
-        # deny. We patch on the instance retrieved through the same lookup path
-        # the manager uses so we intercept the exact object it will call.
+        # Image provider defaults to ``None`` policy (no vet). Override its
+        # policy to ``FROM_BYTES`` and its from-bytes hook to deny -- keeps the
+        # test focused on the vet dispatch without dragging in disk staging.
         provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
         assert provider_classes, "PNG must resolve to the registered image provider"
         provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
             provider,
-            "check_write_permission",
-            lambda data, detected_format, *, file_name, caller_variables=None: expected_denial,  # noqa: ARG005
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
         # Register a sentinel hook so the has_authorization_hooks() short-circuit
@@ -867,11 +872,14 @@ class TestOSWritePermissionVet:
         # The user-facing message must include the denial's own reason string
         # (owned by the policy) so an artist sees plain English, not "sniffed".
         assert "This codec is not licensed." in str(result.result_details)
+        # And OSManager owns the "Cannot save '...'" framing -- the provider
+        # denial detail is generic; the file-name wrapping happens here.
+        assert "image.png" in str(result.result_details)
         assert "sniffed" not in str(result.result_details).lower()
         assert not requested_path.exists()
 
     def test_allow_writes_normally(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """The default BaseArtifactProvider.check_write_permission returns None -> allow."""
+        """The default ``None`` policy skips the vet entirely -> allow."""
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "image.png"
 
@@ -888,13 +896,13 @@ class TestOSWritePermissionVet:
         """If sniff returns None (no provider claims the bytes), the vet is never invoked."""
         called: list[bool] = []
 
-        def spy(data: bytes, detected_format: str, *, file_name: str, caller_variables: object = None) -> None:  # noqa: ARG001
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
             called.append(True)
 
-        # Attach the spy to any provider instance we might reach; if the vet
-        # were ever invoked for unrecognized bytes we'd catch it here. Simpler:
-        # spy on ArtifactManager.check_write_permission at the dispatch layer.
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+        # Spy on ArtifactManager.get_write_vetting_policy: if OSManager ever
+        # asks about an unrecognized format, we'd see it here. sniff on the
+        # blob returns None, so the vet block never even reads the policy.
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
 
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "blob.dat"
@@ -929,9 +937,12 @@ class TestOSWritePermissionVet:
         assert provider_classes, "PNG must resolve to the registered image provider"
         provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
         monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
             provider,
-            "check_write_permission",
-            lambda data, detected_format, *, file_name, caller_variables=None: expected_denial,  # noqa: ARG005
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
         def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
@@ -960,10 +971,10 @@ class TestOSWritePermissionVet:
         """Appends skip the codec vet: the tail alone has no container header to classify."""
         called: list[bool] = []
 
-        def spy(data: bytes, detected_format: str, *, file_name: str, caller_variables: object = None) -> None:  # noqa: ARG001
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
             called.append(True)
 
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
 
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "image.png"
@@ -978,7 +989,7 @@ class TestOSWritePermissionVet:
     def test_vet_skipped_when_no_authorization_hook_registered(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Perf short-circuit: with no auth hook, `check_write_permission` is never called.
+        """Perf short-circuit: with no auth hook, the vet dispatch is never invoked.
 
         The dispatcher call is expensive for video (spools bytes to project
         temp + shells out to ffprobe). When no policy is installed the vet's
@@ -986,10 +997,10 @@ class TestOSWritePermissionVet:
         """
         called: list[bool] = []
 
-        def spy(data: bytes, detected_format: str, *, file_name: str, caller_variables: object = None) -> None:  # noqa: ARG001
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
             called.append(True)
 
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
 
         # Baseline: no hook registered. EventManager fixture starts clean.
         assert griptape_nodes.EventManager().has_authorization_hooks() is False
@@ -1003,7 +1014,146 @@ class TestOSWritePermissionVet:
         result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
-        assert called == [], "check_write_permission must not be called when no hook is registered"
+        assert called == [], "vet policy lookup must not happen when no hook is registered"
+
+    def test_unrecognized_policy_variant_raises_loudly(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A future ``WriteVettingPolicy`` variant OSManager doesn't know how to dispatch must fail loud.
+
+        Silently falling through would let an unrecognized policy bless every
+        write that reached it. Simulate the future variant by returning a
+        sentinel string the switch doesn't recognize.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        monkeypatch.setattr(
+            griptape_nodes.ArtifactManager(),
+            "get_write_vetting_policy",
+            lambda fmt: "future_variant",  # noqa: ARG005
+        )
+
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            os_manager = griptape_nodes.OSManager()
+            requested_path = temp_dir / "image.png"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            with pytest.raises(RuntimeError, match="Unrecognized WriteVettingPolicy"):
+                os_manager.on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+
+        assert not requested_path.exists()
+
+    def test_from_path_policy_stages_bytes_and_provides_path_to_provider(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When a provider declares ``FROM_PATH`` OSManager stages bytes, hands the provider a path, and truncates + deletes after.
+
+        The provider must (a) receive a filesystem path that exists at call
+        time, (b) never see the raw bytes, (c) never re-enter ``handle_request``
+        for cleanup: OSManager owns the whole staged-file lifecycle.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        seen_paths: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            # Path must exist at hook-call time.
+            assert Path(source_path).exists()
+            assert Path(source_path).read_bytes() == _png_bytes()
+            seen_paths.append(source_path)
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            os_manager = griptape_nodes.OSManager()
+            requested_path = temp_dir / "image.png"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            result = os_manager.on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+
+        # Allowed: the write proceeds to the real destination.
+        assert isinstance(result, WriteFileResultSuccess)
+        assert requested_path.exists()
+        # The staged temp path must have been truncated + deleted after the vet.
+        assert len(seen_paths) == 1
+        assert not Path(seen_paths[0]).exists(), "staged codec-vet temp must be cleaned up"
+
+    def test_from_path_policy_staging_failure_fails_closed(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If staging the vet's temp file blows up, the write must be refused, not permitted.
+
+        An unstageable vet cannot verify the write is compliant -- fail closed
+        rather than silently blessing bytes because we couldn't run the check.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+
+        provider_hook_calls: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            provider_hook_calls.append(source_path)
+
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        # Break the staging step by making the SAVE_TEMP_FILE macro resolve fail.
+        # Easiest: monkeypatch _stage_bytes_at_temp on the manager to raise.
+        os_manager = griptape_nodes.OSManager()
+
+        def raise_staging(*_args, **_kwargs):  # type: ignore[no-untyped-def]  # noqa: ANN202
+            msg = "simulated staging outage"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        monkeypatch.setattr(os_manager, "_stage_bytes_at_temp", raise_staging)
+
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            requested_path = temp_dir / "image.png"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            result = os_manager.on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "staging for verification failed" in str(result.result_details)
+        assert not requested_path.exists()
+        # Provider hook must not have been called if we couldn't stage.
+        assert provider_hook_calls == []
 
 
 class TestExtensionCoercionDoesNotClobberPriorSave:

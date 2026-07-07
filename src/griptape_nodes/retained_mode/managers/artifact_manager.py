@@ -90,6 +90,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     ImageArtifactProvider,
     ProviderRegistry,
     VideoArtifactProvider,
+    WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_models import (
     ArtifactSchemas,
@@ -267,44 +268,52 @@ class ArtifactManager:
         provider = self._registry.get_or_create_provider_instance(provider_classes[0])
         return provider.prepare_content_for_write(data, file_name)
 
-    def check_write_permission(
-        self,
-        data: bytes,
-        detected_format: str,
-        *,
-        file_name: str,
-        caller_variables: MacroVariables | None = None,
-    ) -> CheckpointDenial | None:
-        """Route a pending write through the format's provider for permission checking.
+    def get_write_vetting_policy(self, detected_format: str) -> WriteVettingPolicy | None:
+        """Return the vetting mode the format's provider needs, or ``None``.
 
-        Looks up the provider that claims ``detected_format`` and asks its
-        ``check_write_permission`` hook whether the write is allowed. Providers
-        without a policy fall through to the default ``None`` (allow).
-
-        Args:
-            data: The full buffered write payload.
-            detected_format: The canonical lowercase extension returned by
-                ``sniff_extension`` for ``data`` (e.g. ``"mp4"``).
-            file_name: The caller's intended destination filename, threaded
-                through to the provider so denial messages can name the save
-                that was blocked.
-            caller_variables: The caller's macro variable bindings (from
-                ``WriteFileRequest.file_path`` when it's a ``MacroPath``, else
-                ``None``). Passed through to the provider so a provider that
-                stages bytes at a project temp path can preserve caller context
-                (e.g. ``node_name``) in the temp filename for observability.
-
-        Returns:
-            A ``CheckpointDenial`` if the provider refuses the write, or
-            ``None`` when the write is permitted (including when no provider
-            handles this format).
+        Resolves the provider that claims ``detected_format`` and returns the
+        result of ``get_write_vetting_policy``. Returns ``None`` when no
+        provider handles the format -- OSManager treats that identically to a
+        provider opting out.
         """
         provider = self._provider_for_format(detected_format)
         if provider is None:
             return None
-        return provider.check_write_permission(
-            data, detected_format, file_name=file_name, caller_variables=caller_variables
-        )
+        return provider.get_write_vetting_policy()
+
+    def check_write_format_from_bytes(
+        self,
+        data: bytes,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-bytes write vet through the format's provider.
+
+        Called by OSManager when the provider's ``get_write_vetting_policy``
+        returned ``FROM_BYTES``. Providers without a policy (or no provider at
+        all) fall through to ``None`` (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_bytes(data, detected_format)
+
+    def check_write_format_from_path(
+        self,
+        source_path: str,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-path write vet through the format's provider.
+
+        Called by OSManager after staging the pending bytes at ``source_path``.
+        The provider is trusted to read ``source_path`` but must not write to
+        or delete it -- OSManager owns the staged file's lifecycle. Providers
+        without a policy (or no provider at all) fall through to ``None``
+        (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_path(source_path, detected_format)
 
     def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
         """Route a pending read through the format's provider for permission checking.

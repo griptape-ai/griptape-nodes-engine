@@ -414,13 +414,20 @@ class TestPermissionDispatch:
 
     _PROBE_FORMAT = "probe"
 
-    def _make_probe_provider_class(self, denial_for_write=None, denial_for_read=None):  # noqa: ANN001, ANN202
+    def _make_probe_provider_class(  # noqa: ANN202
+        self,
+        denial_for_write_from_bytes=None,  # noqa: ANN001
+        denial_for_write_from_path=None,  # noqa: ANN001
+        denial_for_read=None,  # noqa: ANN001
+        write_vetting_policy=None,  # noqa: ANN001
+    ):
         from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
             BaseArtifactMetadata,
             BaseArtifactProvider,
         )
 
         probe_format = self._PROBE_FORMAT
+        declared_policy = write_vetting_policy
 
         class _ProbeProvider(BaseArtifactProvider):
             calls: list[tuple[str, object]] = []  # noqa: RUF012
@@ -437,9 +444,17 @@ class TestPermissionDispatch:
             def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
                 return None
 
-            def check_write_permission(self, data, detected_format, *, file_name, caller_variables=None):  # noqa: ANN001, ANN202, ARG002
-                self.__class__.calls.append(("write", detected_format))
-                return denial_for_write
+            @staticmethod
+            def get_write_vetting_policy():  # noqa: ANN205
+                return declared_policy
+
+            def check_write_format_from_bytes(self, data, detected_format):  # noqa: ANN001, ANN202, ARG002
+                self.__class__.calls.append(("write_from_bytes", detected_format))
+                return denial_for_write_from_bytes
+
+            def check_write_format_from_path(self, source_path, detected_format):  # noqa: ANN001, ANN202, ARG002
+                self.__class__.calls.append(("write_from_path", detected_format))
+                return denial_for_write_from_path
 
             def check_read_permission(self, source_path):  # noqa: ANN001, ANN202
                 self.__class__.calls.append(("read", source_path))
@@ -453,25 +468,56 @@ class TestPermissionDispatch:
         )
         assert isinstance(result, RegisterArtifactProviderResultSuccess)
 
-    def test_check_write_permission_dispatches_to_provider_by_format(self) -> None:
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+    def test_get_write_vetting_policy_reflects_provider(self) -> None:
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 
-        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
-        probe_cls = self._make_probe_provider_class(denial_for_write=expected_denial)
+        probe_cls = self._make_probe_provider_class(write_vetting_policy=WriteVettingPolicy.FROM_PATH)
         manager = ArtifactManager()
         self._register(manager, probe_cls)
 
-        denial = manager.check_write_permission(b"any bytes", self._PROBE_FORMAT, file_name="thing.probe")
+        assert manager.get_write_vetting_policy(self._PROBE_FORMAT) is WriteVettingPolicy.FROM_PATH
+
+    def test_get_write_vetting_policy_none_when_no_provider(self) -> None:
+        manager = ArtifactManager()
+        assert manager.get_write_vetting_policy("unregistered") is None
+
+    def test_check_write_format_from_bytes_dispatches_to_provider_by_format(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
+        probe_cls = self._make_probe_provider_class(denial_for_write_from_bytes=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_write_format_from_bytes(b"any bytes", self._PROBE_FORMAT)
 
         assert denial is expected_denial
-        assert probe_cls.calls == [("write", self._PROBE_FORMAT)]
+        assert probe_cls.calls == [("write_from_bytes", self._PROBE_FORMAT)]
 
-    def test_check_write_permission_no_provider_falls_through(self) -> None:
+    def test_check_write_format_from_path_dispatches_to_provider_by_format(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
+        probe_cls = self._make_probe_provider_class(denial_for_write_from_path=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_write_format_from_path("/tmp/staged.probe", self._PROBE_FORMAT)  # noqa: S108
+
+        assert denial is expected_denial
+        assert probe_cls.calls == [("write_from_path", self._PROBE_FORMAT)]
+
+    def test_check_write_format_from_bytes_no_provider_falls_through(self) -> None:
         # An unregistered format must not raise or reach any provider -- it's
         # not the ArtifactManager's job to know every possible extension.
         manager = ArtifactManager()
 
-        assert manager.check_write_permission(b"data", "unregistered", file_name="thing.dat") is None
+        assert manager.check_write_format_from_bytes(b"data", "unregistered") is None
+
+    def test_check_write_format_from_path_no_provider_falls_through(self) -> None:
+        manager = ArtifactManager()
+
+        assert manager.check_write_format_from_path("/tmp/nothing.dat", "unregistered") is None  # noqa: S108
 
     def test_check_read_permission_dispatches_by_extension(self) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
