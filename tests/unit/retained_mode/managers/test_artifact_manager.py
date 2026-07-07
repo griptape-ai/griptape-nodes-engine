@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager, PreviewMetadata
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
@@ -534,7 +535,7 @@ class TestCheckArtifactReadPermissionHandler:
         assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
         assert result.denial is None
 
-    def test_denial_is_threaded_through_success_payload(self) -> None:
+    def test_denial_is_threaded_through_success_payload(self, griptape_nodes: GriptapeNodes) -> None:
         from griptape_nodes.retained_mode.events.artifact_events import (
             CheckArtifactReadPermissionRequest,
             CheckArtifactReadPermissionResultSuccess,
@@ -544,6 +545,7 @@ class TestCheckArtifactReadPermissionHandler:
             BaseArtifactProvider,
         )
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
             CheckpointDenial,
             CheckpointFailure,
         )
@@ -574,15 +576,76 @@ class TestCheckArtifactReadPermissionHandler:
         )
         assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
 
-        result = manager.on_check_artifact_read_permission_request(
-            CheckArtifactReadPermissionRequest(source_path="/x/y.deny")
-        )
+        # Register a sentinel hook so the short-circuit doesn't skip the vet.
+        # The hook itself isn't consulted here (the provider returns its own
+        # denial before the checkpoint would fire) -- it just satisfies
+        # ``has_authorization_hooks()``.
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            result = manager.on_check_artifact_read_permission_request(
+                CheckArtifactReadPermissionRequest(source_path="/x/y.deny")
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
 
         assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
         assert result.denial is expected_denial
         # The result_details includes the denial's reason so callers logging
         # the result get useful text without inspecting the payload.
         assert "probe reads" in str(result.result_details)
+
+    def test_vet_skipped_when_no_authorization_hook_registered(self, griptape_nodes: GriptapeNodes) -> None:
+        """Perf short-circuit: with no auth hook registered, the provider's check_read_permission is not called.
+
+        The read-side gate has the same short-circuit as the write-side vet.
+        Without a hook the provider's read check (ffprobe subprocess) is
+        skipped -- outcome is guaranteed to be None anyway.
+        """
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            CheckArtifactReadPermissionRequest,
+            CheckArtifactReadPermissionResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        called: list[bool] = []
+
+        class _SpyProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Spy"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"spy"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+            def check_read_permission(self, source_path):  # noqa: ANN001, ANN202, ARG002
+                called.append(True)
+
+        manager = ArtifactManager()
+        manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_SpyProvider)
+        )
+
+        # Baseline: no hook registered.
+        assert griptape_nodes.EventManager().has_authorization_hooks() is False
+
+        result = manager.on_check_artifact_read_permission_request(
+            CheckArtifactReadPermissionRequest(source_path="/x/y.spy")
+        )
+
+        assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
+        assert result.denial is None
+        assert called == [], "check_read_permission must not be called when no hook is registered"
 
 
 class TestGeneratePreview:

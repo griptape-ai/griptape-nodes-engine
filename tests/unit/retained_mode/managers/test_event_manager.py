@@ -746,3 +746,22 @@ class TestAuthorizationCheckpointHooks:
         second = manager.evaluate_authorization_checkpoint(self._checkpoint())
         assert second is None
         assert len(calls) == 2  # noqa: PLR2004
+
+    def test_has_authorization_hooks_false_when_none_registered(self) -> None:
+        assert EventManager().has_authorization_hooks() is False
+
+    def test_has_authorization_hooks_true_after_add(self) -> None:
+        manager = EventManager()
+        manager.add_authorization_hook(lambda _checkpoint: None)
+        assert manager.has_authorization_hooks() is True
+
+    def test_has_authorization_hooks_false_after_remove(self) -> None:
+        manager = EventManager()
+
+        def hook(_checkpoint: AuthorizationCheckpoint) -> None:
+            return None
+
+        manager.add_authorization_hook(hook)
+        assert manager.has_authorization_hooks() is True
+        manager.remove_authorization_hook(hook)
+        assert manager.has_authorization_hooks() is False

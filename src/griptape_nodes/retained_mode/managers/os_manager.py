@@ -2407,7 +2407,18 @@ class OSManager:
         # the gate -- sniff on bytes is independent of the destination suffix.
         # Appends skip the vet: the tail alone has no container header to
         # classify.
-        if sniffed_ext is not None and not request.append:
+        #
+        # Short-circuit when no authorization hook is installed: with no hook,
+        # ``evaluate_authorization_checkpoint`` deterministically returns None
+        # (allow), so the vet would spool bytes to disk and shell out to
+        # ffprobe purely to arrive at a foregone conclusion. Skipping saves
+        # the ffprobe subprocess + temp-file IO on every video write when the
+        # host has no policy installed (the common case for individual-tier
+        # users). Hooks are typically registered at engine startup and stable
+        # thereafter; a hook registered mid-write races with this check, but
+        # that's acceptable -- the alternative is running an expensive vet on
+        # every write forever.
+        if sniffed_ext is not None and not request.append and GriptapeNodes.EventManager().has_authorization_hooks():
             # Thread the caller's macro variables through so a provider that
             # needs to stage bytes at a project temp path can preserve caller
             # context in the temp filename (e.g. ``node_name`` for

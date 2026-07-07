@@ -901,10 +901,22 @@ class ArtifactManager:
     def on_check_artifact_read_permission_request(
         self, request: CheckArtifactReadPermissionRequest
     ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
-        """Handle a read-permission check request by dispatching to the provider."""
+        """Handle a read-permission check request by dispatching to the provider.
+
+        Short-circuits when no authorization hook is registered: with no hook,
+        the provider's checkpoint call deterministically returns None (allow),
+        so probing the file (ffprobe subprocess) would be wasted work. Saves
+        the subprocess on every video-read gate call in engines that have no
+        policy installed.
+        """
         if not request.source_path:
             return CheckArtifactReadPermissionResultFailure(
                 result_details="Attempted to check read permission. Failed because no source path was provided."
+            )
+        if not GriptapeNodes.EventManager().has_authorization_hooks():
+            return CheckArtifactReadPermissionResultSuccess(
+                denial=None,
+                result_details=f"Read allowed for '{request.source_path}' (no authorization hook registered).",
             )
         denial = self.check_read_permission(request.source_path)
         if denial is None:

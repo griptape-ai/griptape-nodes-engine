@@ -827,7 +827,11 @@ class TestOSWritePermissionVet:
         self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A provider that denies must abort the write before any bytes hit disk."""
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
@@ -843,11 +847,20 @@ class TestOSWritePermissionVet:
             lambda data, detected_format, *, file_name, caller_variables=None: expected_denial,  # noqa: ARG005
         )
 
-        os_manager = griptape_nodes.OSManager()
-        requested_path = temp_dir / "image.png"
-        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        # Register a sentinel hook so the has_authorization_hooks() short-circuit
+        # doesn't skip the vet. The hook isn't consulted (the provider returns
+        # the denial before the checkpoint would fire) -- it just gates the vet.
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
 
-        result = os_manager.on_write_file_request(request)
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            os_manager = griptape_nodes.OSManager()
+            requested_path = temp_dir / "image.png"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            result = os_manager.on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
@@ -904,7 +917,11 @@ class TestOSWritePermissionVet:
         lives in ``on_write_file_request`` and runs BEFORE coercion, so an
         extensionless destination is protected.
         """
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
@@ -917,14 +934,20 @@ class TestOSWritePermissionVet:
             lambda data, detected_format, *, file_name, caller_variables=None: expected_denial,  # noqa: ARG005
         )
 
-        os_manager = griptape_nodes.OSManager()
-        # Destination has NO extension. Sniff on bytes classifies as PNG,
-        # provider denies, OSManager must refuse the write. Before finding 1
-        # this would return Success and leave the file on disk.
-        requested_path = temp_dir / "movie"
-        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
 
-        result = os_manager.on_write_file_request(request)
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            os_manager = griptape_nodes.OSManager()
+            # Destination has NO extension. Sniff on bytes classifies as PNG,
+            # provider denies, OSManager must refuse the write. Before finding 1
+            # this would return Success and leave the file on disk.
+            requested_path = temp_dir / "movie"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            result = os_manager.on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
@@ -951,6 +974,36 @@ class TestOSWritePermissionVet:
         os_manager.on_write_file_request(request)
 
         assert called == []
+
+    def test_vet_skipped_when_no_authorization_hook_registered(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Perf short-circuit: with no auth hook, `check_write_permission` is never called.
+
+        The dispatcher call is expensive for video (spools bytes to project
+        temp + shells out to ffprobe). When no policy is installed the vet's
+        outcome is guaranteed to be None anyway, so skipping saves the work.
+        """
+        called: list[bool] = []
+
+        def spy(data: bytes, detected_format: str, *, file_name: str, caller_variables: object = None) -> None:  # noqa: ARG001
+            called.append(True)
+
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+
+        # Baseline: no hook registered. EventManager fixture starts clean.
+        assert griptape_nodes.EventManager().has_authorization_hooks() is False
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+
+        # Recognized PNG bytes (sniff would return "png") but no auth hook, so
+        # the entire vet block short-circuits before dispatching to the provider.
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        assert called == [], "check_write_permission must not be called when no hook is registered"
 
 
 class TestExtensionCoercionDoesNotClobberPriorSave:
