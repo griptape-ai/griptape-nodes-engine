@@ -151,9 +151,7 @@ class TestApplyPathTree:
 
     def test_list_traversal(self) -> None:
         data = {"items": [{"name": "x", "size": 10}, {"name": "y", "size": 20}]}
-        assert _apply_path_tree(data, {"items": {"name": {}}}) == {
-            "items": [{"name": "x"}, {"name": "y"}]
-        }
+        assert _apply_path_tree(data, {"items": {"name": {}}}) == {"items": [{"name": "x"}, {"name": "y"}]}
 
     def test_list_non_dict_items_pass_through(self) -> None:
         data = {"tags": ["a", "b", "c"]}
