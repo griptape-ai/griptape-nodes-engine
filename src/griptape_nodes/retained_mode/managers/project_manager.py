@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -3354,6 +3355,26 @@ class ProjectManager:
             mapped_path=mapped_path,
             result_details=f"Successfully mapped absolute path to '{mapped_path}'",
         )
+
+    def get_project_substitution_variables(self, project_info: ProjectInfo) -> dict[str, str | int]:
+        """Return all project-level variables available for {VAR} substitution.
+
+        Collects builtin variables (workspace_dir, workflow_name, etc.) and
+        project template directories (inputs, outputs, etc.). Variables that
+        cannot be resolved in the current context (e.g. workflow_dir before a
+        workflow is saved) are silently omitted.
+        """
+        resolver = self._build_variable_resolver(project_info.template, project_info)
+        variables: dict[str, str | int] = {}
+        for name in BUILTIN_VARIABLES:
+            with contextlib.suppress(RuntimeError, NotImplementedError):
+                variables[name] = resolver._get_builtin(name)
+        for name in project_info.template.directories:
+            try:
+                variables[name] = resolver.resolve_directory(name)
+            except (RuntimeError, NotImplementedError) as e:
+                logger.debug("Skipping directory variable %r: %s", name, e)
+        return variables
 
     # Helper methods (private)
 
