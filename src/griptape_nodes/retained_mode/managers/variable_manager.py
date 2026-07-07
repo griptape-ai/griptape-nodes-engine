@@ -637,7 +637,9 @@ class VariablesManager:
                     missing.append(name)
             if missing:
                 return ResolveSubstitutionResultFailure(
-                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
+                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}",
+                    resolved=result,
+                    unresolved=missing,
                 )
             return ResolveSubstitutionResultSuccess(
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."

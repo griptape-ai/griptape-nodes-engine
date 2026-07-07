@@ -486,7 +486,15 @@ class ResolveSubstitutionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @dataclass
 @PayloadRegistry.register
 class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Substitution value resolution failed."""
+    """Substitution value resolution failed.
+
+    Attributes:
+        resolved: Variables that were found before the failure.
+        unresolved: Names that could not be found.
+    """
+
+    resolved: dict[str, Any] = field(default_factory=dict)
+    unresolved: list[str] = field(default_factory=list)
 
 
 @dataclass

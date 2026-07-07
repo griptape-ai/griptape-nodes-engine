@@ -168,11 +168,14 @@ class TestResolveSubstitutionRequest:
         assert result.variables == {"workspace_dir": "/workspace"}
 
     def test_named_lookup_fails_if_not_in_vars_or_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        with patch(_MACRO_PATCH, return_value={}):
+        _add_variable(griptape_nodes, "SHOT", "sc001")
+        with patch(_MACRO_PATCH, return_value={"workspace_dir": "/workspace"}):
             result = griptape_nodes.handle_request(
-                ResolveSubstitutionRequest(starting_flow=flow_name, names=["MISSING"])
+                ResolveSubstitutionRequest(starting_flow=flow_name, names=["SHOT", "workspace_dir", "MISSING"])
             )
         assert isinstance(result, ResolveSubstitutionResultFailure)
+        assert result.unresolved == ["MISSING"]
+        assert result.resolved == {"SHOT": "sc001", "workspace_dir": "/workspace"}
 
     def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
         with patch(_MACRO_PATCH, return_value={}):
