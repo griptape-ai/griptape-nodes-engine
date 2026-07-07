@@ -146,12 +146,32 @@ class RequestPayload(Payload, ABC):
         failure_log_level: If set, override the log level for failure results.
                           Use logging.DEBUG (10) or logging.INFO (20) to suppress error toasts.
                           Default: None (use handler's default, typically ERROR).
-
         broadcast_result: Whether handle_request should queue the result event for broadcast
                           (e.g. to connected WebSocket clients). Defaults to True. Request types
                           whose results are large or only relevant to the direct caller can
                           default this to False on the subclass to avoid unnecessary serialization
                           and transmission. Can also be set per-instance at construction time.
+        fields: **Wire-only** dot-path filter applied to the broadcast JSON before it is sent
+                over the WebSocket. Has no effect on in-process/retained-mode callers, which
+                always receive the full result object. Like broadcast_result and failure_log_level,
+                this is a transport-layer concern, not part of the request logic.
+
+                Syntax:
+                  - ``None`` (default) — return all fields.
+                  - ``[]`` (empty list) — return only framework fields (result_details,
+                    altered_workflow_state). Useful to trigger side effects without caring
+                    about the result payload.
+                  - ``["a", "a.b.c"]`` — dot-paths select nested fields. An empty list
+                    entry keeps the whole value; a more-specific sibling narrows it.
+                    Prefix-wins: if both ``"workflows"`` and ``"workflows.name"`` are
+                    listed, the full ``workflows`` value is kept.
+                  - ``"*"`` wildcard — for ``dict[str, SomeObject]`` where keys are
+                    arbitrary (e.g. file paths). ``"workflows.*.name"`` plucks ``name``
+                    from each value without knowing the keys in advance.
+
+                Framework fields (result_details, altered_workflow_state) are always
+                included regardless of what fields specifies. Filtering is skipped
+                entirely on failure results.
     """
 
     broadcast_result: bool = True
