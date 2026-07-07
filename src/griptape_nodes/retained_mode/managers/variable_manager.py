@@ -636,6 +636,7 @@ class VariablesManager:
                 else:
                     missing.append(name)
             if missing:
+                logger.warning("Variable substitution incomplete: resolved %s, missing %s", list(result), missing)
                 return ResolveSubstitutionResultFailure(
                     result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}",
                     resolved=result,

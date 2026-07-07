@@ -315,6 +315,7 @@ class NodeExecutor:
             ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(var_result, ResolveSubstitutionResultSuccess):
+            logger.debug("Variable substitution skipped for node %s: %s", node_name, var_result.result_details)
             return {}
         return VariableResolver._filter_for_substitution(var_result.variables)
 

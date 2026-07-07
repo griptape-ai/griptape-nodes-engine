@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from contextvars import ContextVar
 from typing import Any, ClassVar
@@ -7,6 +8,8 @@ from typing import Any, ClassVar
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
+
+logger = logging.getLogger("griptape_nodes")
 
 # Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
 _NO_FLOW: object = object()
@@ -160,6 +163,7 @@ class VariableResolver:
             ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
         if not isinstance(result, ResolveSubstitutionResultSuccess):
+            logger.debug("Variable substitution skipped for node %s: %s", node_name, result.result_details)
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
         resolved = VariableResolver._filter_for_substitution(result.variables)
