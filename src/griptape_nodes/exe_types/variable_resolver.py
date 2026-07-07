@@ -45,7 +45,7 @@ class VariableResolver:
         return False
 
     @staticmethod
-    def resolve_macro_token(token: str, variables: dict[str, str | int]) -> str:
+    def resolve_macro_token(token: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
 
         Returns the resolved string on success, or the original token if the variable
@@ -69,6 +69,17 @@ class VariableResolver:
         if parsed_var is None:
             return token
         if parsed_var.info.name not in variables:
+            if parsed_var.info.is_required:
+                # DEBUG intentionally — unresolved tokens are common during partial setup and shouldn't flood the UI.
+                if node_name:
+                    logger.debug(
+                        "Node %r: variable %r not found; leaving token %r unresolved",
+                        node_name,
+                        parsed_var.info.name,
+                        token,
+                    )
+                else:
+                    logger.debug("Variable %r not found; leaving token %r unresolved", parsed_var.info.name, token)
             return "" if not parsed_var.info.is_required else token
         value: str | int = variables[parsed_var.info.name]
         try:
@@ -79,24 +90,24 @@ class VariableResolver:
         return str(value)
 
     @staticmethod
-    def resolve_string(text: str, variables: dict[str, str | int]) -> str:
+    def resolve_string(text: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Substitute all {VAR} tokens in text using the provided variable dict."""
         return VariableResolver._MACRO_TOKEN.sub(
-            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables),
+            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables, node_name),
             text,
         )
 
     @staticmethod
-    def resolve_value(value: Any, variables: dict[str, str | int]) -> Any:
+    def resolve_value(value: Any, variables: dict[str, str | int], node_name: str | None = None) -> Any:
         """Recursively substitute {VAR} references in any str/dict/list value."""
         if isinstance(value, str):
             if VariableResolver._HAS_VARIABLE_MACRO.search(value):
-                return VariableResolver.resolve_string(value, variables)
+                return VariableResolver.resolve_string(value, variables, node_name)
             return value
         if isinstance(value, dict):
-            return {k: VariableResolver.resolve_value(v, variables) for k, v in value.items()}
+            return {k: VariableResolver.resolve_value(v, variables, node_name) for k, v in value.items()}
         if isinstance(value, list):
-            return [VariableResolver.resolve_value(item, variables) for item in value]
+            return [VariableResolver.resolve_value(item, variables, node_name) for item in value]
         return value
 
     @staticmethod
