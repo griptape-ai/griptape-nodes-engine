@@ -417,6 +417,27 @@ class TestCreateAgentProvider:
         assert isinstance(result, CreateAgentProviderResultFailure)
         assert "vllm" in str(result.result_details)
 
+    def test_create_persists_enabled_and_icon(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="home-ollama", type="ollama", enabled=False, icon="server")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultSuccess)
+        created = next(p for p in providers_manager._providers if p.name == "home-ollama")
+        assert created.enabled is False
+        assert created.icon == "server"
+
+    def test_create_defaults_to_enabled(self, providers_manager: AgentManager) -> None:
+        providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="home-ollama", type="ollama"))
+        )
+
+        created = next(p for p in providers_manager._providers if p.name == "home-ollama")
+        assert created.enabled is True
+        assert created.icon is None
+
     def test_create_all_valid_types_accepted(self, providers_manager: AgentManager) -> None:
         for provider_type in _VALID_PROVIDER_TYPES:
             unique_name = f"test-{provider_type}"
@@ -479,6 +500,56 @@ class TestUpdateAgentProvider:
 
         assert isinstance(result, UpdateAgentProviderResultFailure)
         assert "sglang" in str(result.result_details)
+
+    def test_update_toggles_enabled(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(enabled=False))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultSuccess)
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.enabled is False
+        assert updated.model == "llama3.2"  # untouched
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(enabled=True))
+        )
+
+        assert updated.enabled is True
+
+    def test_update_preserves_enabled_when_omitted(self, providers_manager: AgentManager) -> None:
+        provider = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        provider.enabled = False
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="phi3"))
+        )
+
+        assert provider.enabled is False
+
+    def test_update_sets_and_clears_icon(self, providers_manager: AgentManager) -> None:
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(icon="server"))
+        )
+
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.icon == "server"
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(icon=""))
+        )
+
+        assert updated.icon is None
+
+    def test_update_fails_when_disabling_protected_provider(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="griptape_cloud", provider=UpdateProviderPayload(enabled=False))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultFailure)
+        assert "protected" in str(result.result_details)
+        protected = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert protected.enabled is True
 
     def test_update_valid_type_change_succeeds(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(
