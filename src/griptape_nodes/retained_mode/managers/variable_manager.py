@@ -626,7 +626,7 @@ class VariablesManager:
 
         if request.names:
             result: dict[str, Any] = {}
-            missing: list[str] = []
+            missing: set[str] = set()
             for name in request.names:
                 lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope)
                 if lookup.variable is not None:
@@ -634,13 +634,14 @@ class VariablesManager:
                 elif name in project_vars:
                     result[name] = project_vars[name]
                 else:
-                    missing.append(name)
+                    missing.add(name)
             if missing:
-                logger.warning("Variable substitution incomplete: resolved %s, missing %s", list(result), missing)
+                missing_list = sorted(missing)
+                logger.warning("Variable substitution incomplete: resolved %s, missing %s", list(result), missing_list)
                 return ResolveSubstitutionResultFailure(
-                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}",
+                    result_details=f"Attempted to get variables. Failed because variables not found: {missing_list!r}",
                     resolved=result,
-                    unresolved=missing,
+                    unresolved=missing_list,
                 )
             return ResolveSubstitutionResultSuccess(
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
