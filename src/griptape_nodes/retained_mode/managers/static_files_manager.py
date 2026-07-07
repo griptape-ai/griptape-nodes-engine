@@ -2,6 +2,7 @@ import base64
 import binascii
 import logging
 import threading
+from asyncio import to_thread
 from pathlib import Path
 from typing import NamedTuple
 
@@ -204,6 +205,32 @@ class StaticFilesManager:
         logger.debug("Serving preview for %s -> %s", file_path, preview_path)
         return preview_path, result.artifact_metadata
 
+    async def _extract_metadata_only(self, file_path: Path) -> tuple[Path, dict | None]:
+        """Extract artifact metadata without generating a preview.
+
+        Returns (original_file_path, artifact_metadata_dict or None).
+        Falls back to (file_path, None) if no provider supports the format or extraction fails.
+
+        Args:
+            file_path: Path to the original file.
+
+        Returns:
+            Tuple of (original file path, extracted metadata dict or None).
+        """
+        extension = file_path.suffix.lstrip(".").lower()
+        if not extension:
+            return file_path, None
+
+        registry = GriptapeNodes.ArtifactManager()._registry
+        provider_classes = registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            logger.debug("Skipping metadata extraction for unsupported file format: %s", file_path)
+            return file_path, None
+
+        provider_class = provider_classes[0]
+        metadata = await to_thread(provider_class.get_artifact_metadata, str(file_path))
+        return file_path, metadata.model_dump() if metadata else None
+
     def on_handle_create_static_file_request(
         self,
         request: CreateStaticFileRequest,
@@ -312,16 +339,27 @@ class StaticFilesManager:
             static_files_directory=static_files_directory,
         )
 
-    async def _resolve_preview_path(self, file_path: Path, *, preview: bool) -> tuple[Path, dict | None]:
+    async def _resolve_preview_path(
+        self, file_path: Path, *, preview: bool, metadata_only: bool = False
+    ) -> tuple[Path, dict | None]:
         """Return the path to serve and any source metadata, generating a preview when requested.
 
         Args:
             file_path: Path to the original file.
             preview: Whether to generate and serve a preview.
+            metadata_only: When True, extract metadata without generating a preview. The
+                returned path is always the original file. Takes precedence over preview.
 
         Returns:
             Tuple of (path to serve, artifact metadata or None).
         """
+        if metadata_only:
+            try:
+                _, artifact_metadata = await self._extract_metadata_only(file_path)
+            except Exception as e:
+                logger.warning("Metadata extraction failed for %s: %s", file_path, e)
+                artifact_metadata = None
+            return file_path, artifact_metadata
         if not preview:
             logger.debug("Serving full image for %s", file_path)
             return file_path, None
@@ -347,7 +385,12 @@ class StaticFilesManager:
             Result with download URL or failure message.
         """
         file_path = request.file_path
-        logger.debug("CreateStaticFileDownloadUrlFromPath: file_path=%s, preview=%s", file_path, request.preview)
+        logger.debug(
+            "CreateStaticFileDownloadUrlFromPath: file_path=%s, preview=%s, metadata_only=%s",
+            file_path,
+            request.preview,
+            request.metadata_only,
+        )
 
         # Resolve macro paths (e.g. "{outputs}/file.png") before further processing
         try:
@@ -382,9 +425,10 @@ class StaticFilesManager:
             # For local paths, convert URI to path
             file_path_for_driver = Path(uri_to_path(file_path))
 
-        # If preview requested, generate preview and get preview path + artifact metadata
+        # If preview requested, generate preview and get preview path + artifact metadata.
+        # If metadata_only requested, extract metadata without generating a preview.
         file_path_to_use, artifact_metadata = await self._resolve_preview_path(
-            file_path_for_driver, preview=request.preview
+            file_path_for_driver, preview=request.preview, metadata_only=request.metadata_only
         )
 
         try:
