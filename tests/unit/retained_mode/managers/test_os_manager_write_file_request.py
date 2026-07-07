@@ -1155,6 +1155,85 @@ class TestOSWritePermissionVet:
         # Provider hook must not have been called if we couldn't stage.
         assert provider_hook_calls == []
 
+    def test_from_path_policy_cleanup_dispatches_delete_file_request(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup must go through ``DeleteFileRequest``, not raw ``Path.unlink``.
+
+        Routing the delete through the request handler is what gets us the
+        workspace containment, permanent-vs-trash policy, and audit logging
+        that ``on_delete_file_request`` enforces. If a future change swapped
+        the dispatch for a raw ``unlink``, codec-vet cleanups would silently
+        opt out of that policy -- this test catches that regression.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            DeleteFileRequest,
+            DeleteFileResultSuccess,
+            DeletionBehavior,
+            DeletionOutcome,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_path",
+            lambda source_path, detected_format: None,  # noqa: ARG005
+        )
+
+        # Intercept DeleteFileRequest at the event dispatcher and record every
+        # call. Handler returns Success so the vet's cleanup logs no error.
+        seen_deletes: list[DeleteFileRequest] = []
+
+        def spy_delete_handler(request: DeleteFileRequest) -> DeleteFileResultSuccess:
+            seen_deletes.append(request)
+            # OSManager always passes ``path`` (not the file_entry alternative)
+            # for codec-vet cleanup -- narrow the type for the rest of this handler.
+            assert request.path is not None
+            # Real unlink so the file is actually gone -- keeps the "staged
+            # file must be cleaned up" invariant from the sibling test intact.
+            Path(request.path).unlink(missing_ok=True)
+            return DeleteFileResultSuccess(
+                deleted_path=request.path,
+                was_directory=False,
+                deleted_paths=[request.path],
+                outcome=DeletionOutcome.PERMANENTLY_DELETED,
+                result_details="delete recorded by spy",
+            )
+
+        event_manager = griptape_nodes.EventManager()
+        registry = event_manager._request_type_to_manager
+        monkeypatch.setitem(registry, DeleteFileRequest, spy_delete_handler)
+
+        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
+        try:
+            requested_path = temp_dir / "image.png"
+            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+            result = griptape_nodes.OSManager().on_write_file_request(request)
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # Exactly one DeleteFileRequest for the staged temp; not more (would
+        # indicate double-cleanup) and not zero (would indicate unlink bypass).
+        assert len(seen_deletes) == 1
+        # PERMANENTLY_DELETE -- codec-vet temps should never land in the trash
+        # where an artist could recover legally-encumbered bytes.
+        assert seen_deletes[0].deletion_behavior == DeletionBehavior.PERMANENTLY_DELETE
+        # The staged path (not the destination) is what's being deleted.
+        assert seen_deletes[0].path != str(requested_path)
+
 
 class TestExtensionCoercionDoesNotClobberPriorSave:
     """Regression for issue #4924.

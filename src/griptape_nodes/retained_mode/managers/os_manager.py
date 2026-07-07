@@ -2857,14 +2857,19 @@ class OSManager:
         container header. Delete second so the normal case leaves nothing
         behind.
 
-        Bypasses ``on_write_file_request`` on purpose -- calling the public
-        write handler here would re-run the sniff/vet/extension-coercion
-        pipeline against a single null byte. Sniffing that byte is harmless
-        (returns None) but any future check added to the write handler would
-        run against this cleanup path too. ``_attempt_file_write`` is the
-        actual disk-I/O helper both write handlers delegate to, so calling it
-        directly performs the write with the same locking and exception
-        taxonomy while skipping the vet funnel.
+        The truncate calls ``_attempt_file_write`` directly rather than
+        dispatching ``WriteFileRequest`` -- routing a single null byte back
+        through ``on_write_file_request`` would re-run the sniff / vet /
+        extension-coercion pipeline against the very cleanup path that just
+        stripped the bytes we care about. Sniffing that byte is harmless
+        today (returns None), but any future check bolted onto the write
+        handler would fire on cleanup too.
+
+        The delete dispatches ``DeleteFileRequest`` via ``handle_request``,
+        specifically so it flows through ``on_delete_file_request``: that's
+        where workspace containment, permanent-vs-trash policy, and audit
+        logging live. Skipping the request layer here would silently opt
+        codec-vet cleanup out of every one of those.
 
         Best-effort: logs on failure, never raises. A cleanup failure must
         not mask the vet's real result.
@@ -2889,13 +2894,18 @@ class OSManager:
         except OSError as exc:
             logger.error("Attempted to truncate staged codec-vet temp at '%s'. Failed: %s", staged_path, exc)
 
-        try:
-            Path(staged_path).unlink(missing_ok=True)
-        except OSError as exc:
+        delete_result = GriptapeNodes.handle_request(
+            DeleteFileRequest(
+                path=staged_path,
+                workspace_only=False,
+                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+            )
+        )
+        if not isinstance(delete_result, DeleteFileResultSuccess):
             logger.error(
                 "Attempted to delete staged codec-vet temp at '%s'. Failed: %s (file has been truncated).",
                 staged_path,
-                exc,
+                delete_result.result_details,
             )
 
     def _run_write_vet(
