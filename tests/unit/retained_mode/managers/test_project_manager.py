@@ -9803,7 +9803,7 @@ class TestListRelatedProjectFiles:
     @pytest.mark.asyncio
     @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     async def test_absolute_path_outside_project_reports_path_map_failed(
-        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager, tmp_path: Path
     ) -> None:
         """An absolute path outside all project directories short-circuits with PATH_MAP_FAILED."""
         from griptape_nodes.common.project_templates.situation import BuiltInSituation
@@ -9818,11 +9818,16 @@ class TestListRelatedProjectFiles:
         mock_griptape_nodes.ContextManager.return_value = mock_context_manager
 
         # An absolute path outside `/workspace` (the fixture's workspace root)
-        # means AttemptMapAbsolutePathToProjectRequest returns mapped_path=None.
-        # The handler surfaces that as PATH_MAP_FAILED. We avoid `/tmp/...` here
-        # so the tmp-dir linter (S108) doesn't fire — the branch only cares that
-        # Path.is_absolute() is True and the path is outside the project.
-        outside_path = "/somewhere-not-in-workspace/wf.py"
+        # means AttemptMapAbsolutePathToProjectRequest returns mapped_path=None,
+        # and the handler surfaces that as PATH_MAP_FAILED. The path needs to be
+        # absolute on BOTH POSIX and Windows — a Unix-style leading-slash path is
+        # NOT absolute on Windows (which requires a drive letter), so we anchor
+        # off a well-known guaranteed-absolute-and-outside-workspace location.
+        # tmp_path is per-test and never under /workspace, and is guaranteed
+        # absolute on both platforms. We don't need it to exist on disk — the
+        # is_absolute() check + workspace-containment check are both purely
+        # structural.
+        outside_path = str(tmp_path / "outside_project" / "wf.py")
         result = await project_manager_with_template.on_list_related_project_files_request(
             ListRelatedProjectFilesRequest(
                 source_filename=outside_path,
