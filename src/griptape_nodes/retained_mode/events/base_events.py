@@ -498,7 +498,7 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         result = super().dict(*args, **kwargs)
         result["request"] = safe_unstructure(self.request)
         result_dict = safe_unstructure(self.result)
-        if self.request.fields is not None:
+        if self.request.fields is not None and self.result.succeeded():
             filtered = _apply_path_tree(result_dict, _build_path_tree(self.request.fields))
             for fw_field in _RESULT_FRAMEWORK_FIELDS:
                 if fw_field in result_dict:
