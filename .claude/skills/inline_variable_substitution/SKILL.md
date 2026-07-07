@@ -20,7 +20,7 @@ Users write `{VAR_NAME}` tokens inside node parameter values. At node execution 
 | `src/griptape_nodes/retained_mode/managers/node_manager.py` | On the worker side, `on_execute_node_request` enters `aprocess_scope(request.variables)` before calling `aprocess()` |
 | `src/griptape_nodes/retained_mode/managers/variable_manager.py` | Handles `SetVariableValueRequest` / `SetVariablesRequest` and calls `_unresolve_nodes_referencing_variables()` for dirty tracking |
 | `src/griptape_nodes/exe_types/node_types.py` | `BaseNode.validate_before_workflow_run()` marks nodes with `{VAR}` in parameters as UNRESOLVED before each run |
-| `src/griptape_nodes/retained_mode/events/variable_events.py` | `ResolveSubstitutionRequest` (supports `names=[]` for "all" or `names=[...]` for targeted lookup), `ResolveSubstitutionResultSuccess`; `ListSubstitutablesRequest` / `Substitutable` for frontend pickers |
+| `src/griptape_nodes/retained_mode/events/variable_events.py` | Three "get variables" events: `GetVariablesRequest` (user vars only), `ResolveSubstitutionRequest` (user vars + project macros, for execution), `ListSubstitutablesRequest` / `Substitutable` (for frontend pickers). See the block comment above these classes for the full decision guide. |
 
 ## Data flow
 
@@ -98,14 +98,19 @@ Runtime re-queuing is not possible: the flow engine populates the execution queu
 - `names=[]` (default): returns all variables in scope — never errors, even if scope is empty
 - `names=["FOO", "BAR"]`: per-name hierarchical lookup, all-or-nothing — fails if any name is not found (mirrors `SetVariablesRequest` semantics)
 
-## Frontend variable listing
+## Choosing the right "get variables" event
 
-The frontend uses two distinct requests depending on context:
+Three events exist — pick exactly one:
 
-- **`ListVariablesRequest`** — returns `list[FlowVariable]` (user-defined variables only, typed objects). Used for the variable manager panel where users create/edit variables.
-- **`ListSubstitutablesRequest`** — returns `list[Substitutable]` (user variables + project macros, unified). Use this for any picker/autocomplete that shows what can go in a `{VAR}` token. Each `Substitutable` has `name`, `value`, `source` (`"variable"` | `"macro"`), and `read_only`.
+| Event | Returns | Use when |
+|---|---|---|
+| `GetVariablesRequest` | `dict` of user-defined vars only | Variable panel, GetVariable node, any caller that works with variables the user explicitly created |
+| `ResolveSubstitutionRequest` | `dict` of user vars + project macros merged | Execution time — seeding a node run with the full `{VAR}` substitution context |
+| `ListSubstitutablesRequest` | `list[Substitutable]` with metadata | Frontend pickers and autocomplete; carries `source` (`SubstitutableSource.VARIABLE` / `SubstitutableSource.MACRO`) and `read_only` so the UI can render them differently |
 
-The `source` field exists so the frontend can render macros differently (e.g., a read-only badge). Future sources (files, env vars, etc.) add to this list without changing the response shape.
+`ListVariablesRequest` (separate, not in the table above) returns `list[FlowVariable]` typed objects for the variable manager panel where users create/edit variables.
+
+The `SubstitutableSource` StrEnum values compare equal to their string equivalents (`"variable"`, `"macro"`), so existing JSON serialization round-trips without changes. Future sources (files, env vars, etc.) add members to the enum without changing the response shape.
 
 ## Project macro variables
 
