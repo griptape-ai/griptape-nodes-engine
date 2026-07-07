@@ -554,6 +554,9 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
                         type(self.result).__name__,
                     )
             filtered = _apply_path_tree(result_dict, tree)
+            # Re-add framework fields unconditionally — callers always need result_details
+            # and altered_workflow_state to handle the response, regardless of what they put
+            # in fields. setdefault avoids overwriting if the caller explicitly requested them.
             for fw_field in _RESULT_FRAMEWORK_FIELDS:
                 if fw_field in result_dict:
                     filtered.setdefault(fw_field, result_dict[fw_field])
