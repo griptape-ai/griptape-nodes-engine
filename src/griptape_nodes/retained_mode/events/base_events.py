@@ -455,6 +455,20 @@ def _build_path_tree(paths: list[str]) -> dict:
     return tree
 
 
+def _apply_wildcard_tree(data: dict, subtree: dict) -> dict:
+    # Applies subtree to every value in data, used when the dict's keys are arbitrary
+    # (e.g. workflow file paths) rather than fixed field names. See _apply_path_tree.
+    if not subtree:
+        return dict(data)
+    filtered = {}
+    for k, v in data.items():
+        if isinstance(v, list):
+            filtered[k] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in v]
+        else:
+            filtered[k] = _apply_path_tree(v, subtree)
+    return filtered
+
+
 def _apply_path_tree(data: Any, tree: dict) -> Any:
     # Called by EventResult.dict() to prune the unstructured result dict before WebSocket broadcast.
     # Frontend sets RequestPayload.fields (e.g. ["workflows.*.name"]) to avoid sending 256KB+
@@ -463,19 +477,16 @@ def _apply_path_tree(data: Any, tree: dict) -> Any:
         return data
 
     if "*" in tree:
-        # result.workflows is dict[str, WorkflowMetadata] keyed by file path — the keys are
-        # not field names, so "workflows.name" would look for a key literally called "name" and
-        # return {}. "*" means: apply the subtree to every value, ignoring the key.
-        subtree = tree["*"]
-        if not subtree:
-            return dict(data)
-        filtered = {}
-        for k, v in data.items():
-            if isinstance(v, list):
-                filtered[k] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in v]
-            else:
-                filtered[k] = _apply_path_tree(v, subtree)
-        return filtered
+        # "*" must be the only key at its level — mixing it with named keys is contradictory
+        # ("*" is for dicts with arbitrary keys; named siblings would be silently dropped).
+        named_siblings = [k for k in tree if k != "*"]
+        if named_siblings:
+            logger.warning(
+                "fields filter: '*' mixed with named keys %s at the same level — named keys are ignored. "
+                "Use '*' only when all keys in the dict are arbitrary (e.g. file paths).",
+                named_siblings,
+            )
+        return _apply_wildcard_tree(data, tree["*"])
 
     # Named-key traversal: keep only fields present in the tree, drop everything else.
     result = {}
