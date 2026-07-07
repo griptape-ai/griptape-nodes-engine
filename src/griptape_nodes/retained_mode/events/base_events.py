@@ -428,19 +428,30 @@ _RESULT_FRAMEWORK_FIELDS = frozenset(f.name for f in dataclass_fields(ResultPayl
 
 def _build_path_tree(paths: list[str]) -> dict:
     # ["a.b", "a.c.d"] -> {"a": {"b": {}, "c": {"d": {}}}}
-    # Empty {} at a leaf = keep the value whole. setdefault merges shared prefixes.
+    # Empty {} at a leaf = keep the value whole.
+    #
+    # Prefix-wins rule: if "workflows" (keep-whole) and "workflows.name" (narrow) are both
+    # requested, "workflows" wins regardless of order. Implemented two ways:
+    #   - Skip a child path if any ancestor is already a {} leaf (broad path was added first).
+    #   - Always assign the leaf with = {} rather than setdefault, so a later broad path
+    #     overwrites children that a narrower path already built.
     tree: dict = {}
     for path in paths:
         parts = path.split(".")
         node = tree
+        skip = False
         for part in parts[:-1]:
-            # setdefault: create the branch with {} if missing, otherwise return the existing
-            # branch unchanged. This is what lets ["a.b", "a.c"] share the same "a" node
-            # instead of the second path overwriting the first.
+            if node.get(part) == {}:
+                # An ancestor is already a keep-whole leaf; this child path is dominated.
+                skip = True
+                break
+            # setdefault: create the branch if missing, or return the existing one so shared
+            # prefixes like ["a.b", "a.c"] converge on the same "a" node.
             node = node.setdefault(part, {})
-        # Same at the leaf: don't overwrite if "a.b" was already added before "a.b.c"
-        # (which would delete the "c" child we just built).
-        node.setdefault(parts[-1], {})
+        if not skip:
+            # Unconditional assignment so a broad path ("workflows") that arrives after a
+            # narrow one ("workflows.name") still wins by replacing the subtree with {}.
+            node[parts[-1]] = {}
     return tree
 
 
