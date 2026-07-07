@@ -78,6 +78,10 @@ plugins:
           - how_to/mcp/servers/fetch.md
           - how_to/mcp/servers/filesystem.md
           - how_to/mcp/servers/time.md
+        Enterprise:
+          - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
+        Publishing:
+          - publishing/index.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -152,11 +156,13 @@ nav:
               - 4. Compare Prompts: ftue/03_compare_prompts/FTUE_03_compare_prompts.md
               - 5. Build a Photography Team: ftue/04_photography_team/FTUE_04_photography_team.md
       - Engine Configuration: configuration.md
+      - Configuration Reference: configuration_reference.md
       - Libraries: libraries.md
       - Command Line Interface: command_line_interface.md
       - Scripting: retained_mode.md
       - Project System:
           - Overview: projects/index.md
+          - Managing Projects (GUI): projects/gui_guide.md
           - Workspace: projects/workspace.md
           - Projects: projects/projects.md
           - Version Pinning: projects/version_pinning.md
@@ -196,6 +202,10 @@ nav:
                   - Fetch: how_to/mcp/servers/fetch.md
                   - Filesystem: how_to/mcp/servers/filesystem.md
                   - Time: how_to/mcp/servers/time.md
+  - Enterprise:
+      - Admin Server: enterprise/admin_server.md
+  - Publishing:
+      - Overview: publishing/index.md
   - FAQ: faq.md
   - Nodes Reference:
       - Overview: nodes/overview.md

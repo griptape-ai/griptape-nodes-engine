@@ -1,0 +1,46 @@
+{
+  "name": "Subflow Dataflow Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library for the data-only subflow regression test (issue #4993)",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "DataStartNode",
+      "file_path": "subflow_dataflow_nodes.py",
+      "metadata": {"category": "test", "description": "data start", "display_name": "Data Start"}
+    },
+    {
+      "class_name": "DataPassNode",
+      "file_path": "subflow_dataflow_nodes.py",
+      "metadata": {"category": "test", "description": "data pass", "display_name": "Data Pass"}
+    },
+    {
+      "class_name": "DataEndNode",
+      "file_path": "subflow_dataflow_nodes.py",
+      "metadata": {"category": "test", "description": "data end", "display_name": "Data End"}
+    },
+    {
+      "class_name": "RunSubflowNode",
+      "file_path": "subflow_dataflow_nodes.py",
+      "metadata": {"category": "test", "description": "subflow driver", "display_name": "Run Subflow"}
+    }
+  ]
+}

@@ -128,6 +128,52 @@ class AppConnectionEstablished(AppPayload):
 
 
 @dataclass
+class LibraryLoadStatus:
+    """Load outcome for a single library, used to render the startup status table.
+
+    Carries raw data only; how each fitness value maps to icons, colors, and
+    labels is a presentation choice owned by the application layer.
+
+    Args:
+        library_name: Library name from metadata, or None if never resolved.
+        library_version: Library version string, or None if unknown.
+        library_path: Path to the library JSON file or sandbox directory.
+        fitness: LibraryFitness value (e.g. "GOOD", "FLAWED", "UNUSABLE").
+        disabled: True when the library is disabled in the user's config.
+        problems: Collated problem summary, or None when there are none.
+    """
+
+    library_name: str | None
+    library_version: str | None
+    library_path: str | None
+    fitness: str
+    disabled: bool
+    problems: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class EngineReadyEvent(AppPayload):
+    """Event signaling the engine finished initialization and can receive events.
+
+    Broadcast by the orchestrator at the end of app initialization and again after
+    a library reload, once libraries and workflows have loaded. The application
+    layer listens for this to render its library status table and (on initial
+    start) its "engine ready" banner; presentation is owned by the app, not the
+    engine. Other consumers (the GUI, the desktop app) can react to the same
+    event and its structured library data.
+
+    Args:
+        libraries: Load outcome for every library attempted this pass.
+        is_initial_start: True on first engine startup, False on a reload. The app
+            uses this to show the ready banner only on the initial start.
+    """
+
+    libraries: list[LibraryLoadStatus] = field(default_factory=list)
+    is_initial_start: bool = True
+
+
+@dataclass
 @PayloadRegistry.register
 class AppSessionStartedEvent(AppPayload):
     """Notification that a session has started and workers can be spawned."""
@@ -253,6 +299,30 @@ class SecretChanged(AppPayload):
     """
 
     key: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CurrentProjectChanged(AppPayload):
+    """Current project switched notification.
+
+    Emitted by the orchestrator's ProjectManager after a post-init project
+    activation succeeds. WorkerManager listens for this and fans out an
+    ActivateProjectRequest to every registered worker so they adopt the
+    orchestrator's project even on a "shallow" switch (same workspace and
+    library config) that would not otherwise restart them.
+
+    Boot-time activation is handled separately: a worker boots like any engine
+    and re-derives the orchestrator's project from shared on-disk config, so
+    ProjectManager only emits this after _initialization_complete.
+
+    Args:
+        project_id: The opaque id of the new current project (SYSTEM_DEFAULTS_KEY
+            for system defaults). A worker boots like the orchestrator, so the
+            same registry id resolves in both processes.
+    """
+
+    project_id: str
 
 
 @dataclass

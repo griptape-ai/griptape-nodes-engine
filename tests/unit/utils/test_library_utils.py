@@ -9,7 +9,7 @@ from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.retained_mode.managers.settings import LibraryDownload
+from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
 from griptape_nodes.utils.git_utils import GitCloneError
 from griptape_nodes.utils.library_utils import (
     clone_and_get_library_version,
@@ -213,6 +213,55 @@ class TestFilterOldXdgLibraryPaths:
 
             assert filtered == [custom_path, git_url]
             assert removed == {"griptape_nodes_library"}
+
+    def test_filter_handles_object_form_dict_entries(self) -> None:
+        """Object-form dict entries are filtered by their `path` and preserved otherwise."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_entry = {"path": f"{xdg_base}/griptape_cloud/lib.json", "enabled": True}
+            custom_entry = {"path": "/custom/path/lib.json", "enabled": False}
+
+            paths = [old_entry, custom_entry]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_entry]
+            assert removed == {"griptape_cloud"}
+
+    def test_filter_handles_library_registration_entries(self) -> None:
+        """Already parsed LibraryRegistration entries are filtered by their `path`."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_entry = LibraryRegistration(path=f"{xdg_base}/griptape_nodes_library/lib.json")
+            custom_entry = LibraryRegistration(path="/custom/path/lib.json")
+
+            paths = [old_entry, custom_entry]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_entry]
+            assert removed == {"griptape_nodes_library"}
+
+    def test_filter_mixed_string_and_object_entries(self) -> None:
+        """A mix of bare strings and object-form entries is handled without error."""
+        with patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg:
+            mock_xdg.return_value = Path("/home/user/.local/share")
+
+            xdg_base = "/home/user/.local/share/griptape_nodes/libraries"
+            old_string = f"{xdg_base}/griptape_nodes_advanced_media_library/lib.json"
+            old_dict = {"path": f"{xdg_base}/griptape_cloud/lib.json"}
+            custom_string = "/custom/path"
+
+            paths = [old_string, old_dict, custom_string]
+
+            filtered, removed = filter_old_xdg_library_paths(paths)
+
+            assert filtered == [custom_string]
+            assert removed == {"griptape_nodes_advanced_media_library", "griptape_cloud"}
 
 
 class TestNormalizeLibraryDownloads:

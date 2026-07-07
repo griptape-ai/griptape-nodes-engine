@@ -4,6 +4,7 @@ Wraps a MacroPath into a FileDestination with a baked-in write policy, deferring
 path resolution to execution time via the situation-based macro system.
 """
 
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.project_output_parameter import ProjectOutputParameter
@@ -32,7 +33,7 @@ class ProjectFileParameter(ProjectOutputParameter):
         output_file = self._file_param.build_file(sub_dirs="renders")
     """
 
-    DEFAULT_SITUATION = "save_node_output"
+    DEFAULT_SITUATION = BuiltInSituation.SAVE_NODE_OUTPUT
 
     def __init__(  # noqa: PLR0913
         self,

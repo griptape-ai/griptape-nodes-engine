@@ -88,15 +88,49 @@ class ListCapableLibraryEventHandlersRequest(RequestPayload):
 
 
 @dataclass
+class LibraryEventHandlerDetails:
+    """Presentation metadata for a single capable library event handler.
+
+    Carries the optional, human-facing fields a library may register alongside its
+    handler so a frontend can render the handler in a menu/dropdown without falling
+    back to the raw library name. All presentation fields are optional; when they are
+    None the frontend should preserve today's behavior (render the library name, no
+    description, no icon).
+
+    Args:
+        library_name: Name of the library that registered the handler. Matches the
+            corresponding entry in ListCapableLibraryEventHandlersResultSuccess.handlers.
+        display_name: Optional human-readable name for the handler (e.g. a publishing
+            target). None means fall back to library_name.
+        description: Optional short description shown alongside the handler. None means
+            no description.
+        icon: Optional icon identifier — a Lucide icon name or a path/URL to an image
+            the frontend renders as-is (not raw image data). None means no icon.
+    """
+
+    library_name: str
+    display_name: str | None = None
+    description: str | None = None
+    icon: str | None = None
+
+
+@dataclass
 @PayloadRegistry.register
 class ListCapableLibraryEventHandlersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Event handlers listed successfully.
 
     Args:
-        handlers: List of library names capable of handling the event type
+        handlers: List of library names capable of handling the event type.
+        handler_details: Per-handler presentation metadata, one entry per library in
+            ``handlers`` (same order). Present so a frontend can render richer menu
+            entries (display name, description, icon) for handlers whose registration
+            supplied them. Handlers that registered no presentation metadata still get
+            an entry with only ``library_name`` populated, so existing consumers that
+            read only ``handlers`` are unaffected.
     """
 
     handlers: list[str]
+    handler_details: list[LibraryEventHandlerDetails] = field(default_factory=list)
 
 
 @dataclass
@@ -426,12 +460,17 @@ class LoadLibraryMetadataFromFileResultFailure(WorkflowNotAlteredMixin, ResultPa
                (MISSING, UNUSABLE, etc.).
         problems: List of specific problems encountered during loading
                  (file not found, JSON parse errors, validation failures, etc.).
+        library_version: Version of the library if it could be extracted from the raw JSON,
+                        None if it couldn't be determined (e.g. invalid JSON). Surfaced so
+                        status output can show the real version even when the schema failed to
+                        validate.
     """
 
     library_path: str
     library_name: str | None
     status: LibraryManager.LibraryFitness
     problems: list[LibraryProblem]
+    library_version: str | None = None
 
 
 @dataclass

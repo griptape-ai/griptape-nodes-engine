@@ -2,6 +2,7 @@
 
 from .advanced_library_load_failure_problem import AdvancedLibraryLoadFailureProblem
 from .after_library_callback_problem import AfterLibraryCallbackProblem
+from .app_event_listener_registration_problem import AppEventListenerRegistrationProblem
 from .before_library_callback_problem import BeforeLibraryCallbackProblem
 from .create_config_category_problem import CreateConfigCategoryProblem
 from .dependency_installation_failed_problem import DependencyInstallationFailedProblem
@@ -26,7 +27,12 @@ from .modified_parameters_set_removed_problem import ModifiedParametersSetRemove
 from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
 from .node_class_not_found_problem import NodeClassNotFoundProblem
 from .node_module_import_problem import NodeModuleImportProblem
+from .node_permission_denied_problem import NodePermissionDeniedProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
+from .permission_denied_problem import PermissionDeniedProblem
+from .pre_dispatch_hook_registration_problem import PreDispatchHookRegistrationProblem
+from .request_handler_registration_problem import RequestHandlerRegistrationProblem
+from .request_handlers_worker_incompatible_problem import RequestHandlersWorkerIncompatibleProblem
 from .retired_node_declaration_problem import RetiredNodeDeclarationProblem
 from .sandbox_directory_missing_problem import SandboxDirectoryMissingProblem
 from .ui_options_field_modified_incompatible_problem import UiOptionsFieldModifiedIncompatibleProblem
@@ -39,6 +45,7 @@ from .venv_creation_failed_problem import VenvCreationFailedProblem
 __all__ = [
     "AdvancedLibraryLoadFailureProblem",
     "AfterLibraryCallbackProblem",
+    "AppEventListenerRegistrationProblem",
     "BeforeLibraryCallbackProblem",
     "CreateConfigCategoryProblem",
     "DependencyInstallationFailedProblem",
@@ -63,7 +70,12 @@ __all__ = [
     "NodeClassNotBaseNodeProblem",
     "NodeClassNotFoundProblem",
     "NodeModuleImportProblem",
+    "NodePermissionDeniedProblem",
     "OldXdgLocationWarningProblem",
+    "PermissionDeniedProblem",
+    "PreDispatchHookRegistrationProblem",
+    "RequestHandlerRegistrationProblem",
+    "RequestHandlersWorkerIncompatibleProblem",
     "RetiredNodeDeclarationProblem",
     "SandboxDirectoryMissingProblem",
     "UiOptionsFieldModifiedIncompatibleProblem",

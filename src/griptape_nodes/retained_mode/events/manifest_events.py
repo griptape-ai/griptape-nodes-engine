@@ -29,12 +29,15 @@ class GenerateManifestRequest(RequestPayload):
     Args:
         include_libraries: Include registered libraries in the manifest.
         include_project_templates: Include loaded project templates in the manifest.
+        include_model_catalog: Include the aggregated model catalog (providers and
+            models declared by loaded libraries) in the manifest.
 
     Results: GenerateManifestResultSuccess | GenerateManifestResultFailure
     """
 
     include_libraries: bool = True
     include_project_templates: bool = True
+    include_model_catalog: bool = True
 
 
 @dataclass

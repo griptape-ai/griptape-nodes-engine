@@ -1,13 +1,18 @@
 import contextlib
 import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
     BatchSetNodeMetadataResultFailure,
     BatchSetNodeMetadataResultSuccess,
+    UnresolveNodeRequest,
+    UnresolveNodeResultFailure,
+    UnresolveNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -129,6 +134,246 @@ class TestNodeManagerResolutionStateSerialization:
 
         # Resolution should be reset to UNRESOLVED due to serialization failure
         assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
+
+    def test_serializable_false_param_does_not_warn_but_becomes_unresolved(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A parameter opting out via serializable=False must not warn but MUST mark the node UNRESOLVED.
+
+        The value is intentionally not persisted, so the node must be re-run on load to
+        recompute it. Keeping the node RESOLVED would cause downstream consumers to see
+        None instead of the recomputed value (issue #4994).
+        """
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, SerializedParameterValueTracker
+
+        mock_parameter = MagicMock(spec=Parameter)
+        mock_parameter.name = "session"
+        mock_parameter.serializable = False
+
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.parameter_values = {}
+        mock_node.parameter_output_values = {"session": object()}
+        mock_node.get_parameter_value.return_value = None
+
+        create_node_request = CreateNodeRequest(
+            node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
+        )
+
+        mock_tracker = MagicMock()
+        mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER
+
+        caplog.clear()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        NodeManager.handle_parameter_value_saving(
+            parameter=mock_parameter,
+            node=mock_node,
+            unique_parameter_uuid_to_values={},
+            serialized_parameter_value_tracker=mock_tracker,
+            create_node_request=create_node_request,
+        )
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert not any("Attempted to serialize" in msg for msg in warning_messages)
+        assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
+
+    def test_serializable_true_param_with_pickle_failure_still_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        """Genuine serialization failures (serializable=True) must still emit the warning."""
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, SerializedParameterValueTracker
+
+        mock_parameter = MagicMock(spec=Parameter)
+        mock_parameter.name = "test_param"
+        mock_parameter.serializable = True
+
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.parameter_values = {"test_param": "has_value"}
+        mock_node.parameter_output_values = {}
+        mock_node.get_parameter_value.return_value = "some_value"
+
+        create_node_request = CreateNodeRequest(
+            node_type="TestNode", node_name="test_node", resolution=NodeResolutionState.RESOLVED.value
+        )
+
+        mock_tracker = MagicMock()
+        mock_tracker.get_tracker_state.return_value = SerializedParameterValueTracker.TrackerState.NOT_SERIALIZABLE
+
+        caplog.clear()
+        caplog.set_level(logging.WARNING, logger="griptape_nodes")
+
+        NodeManager.handle_parameter_value_saving(
+            parameter=mock_parameter,
+            node=mock_node,
+            unique_parameter_uuid_to_values={},
+            serialized_parameter_value_tracker=mock_tracker,
+            create_node_request=create_node_request,
+        )
+
+        warning_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("Attempted to serialize set value for parameter 'test_param'" in msg for msg in warning_messages)
+        assert create_node_request.resolution == NodeResolutionState.UNRESOLVED.value
+
+
+class TestSerializeNodeWithoutLibraryMetadata:
+    """Serializing a node whose metadata lacks a 'library' key must not crash the save."""
+
+    def test_error_proxy_node_records_original_library_in_metadata(self) -> None:
+        """A proxy created without library metadata adopts its original library/node type."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+
+        assert node.metadata["library"] == "Missing Library"
+        assert node.metadata["node_type"] == "ExecutePython"
+
+    def test_error_proxy_node_does_not_clobber_existing_metadata(self) -> None:
+        """Library/node type already present in metadata (e.g. from a round trip) is preserved."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={"library": "Original Library", "node_type": "OriginalType"},
+        )
+
+        assert node.metadata["library"] == "Original Library"
+        assert node.metadata["node_type"] == "OriginalType"
+
+    def test_serialize_node_without_library_metadata_does_not_crash(self, griptape_nodes: GriptapeNodes) -> None:
+        """Regression for griptape-ai/griptape-nodes-app#154: a missing 'library' key must not raise."""
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.retained_mode.events.context_events import EnsureWorkflowAndFlowRequest
+        from griptape_nodes.retained_mode.events.node_events import (
+            SerializeNodeToCommandsRequest,
+            SerializeNodeToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        griptape_nodes.handle_request(
+            EnsureWorkflowAndFlowRequest(workflow_name="proxy_workflow", flow_name="proxy_flow")
+        )
+
+        node = ErrorProxyNode(
+            name="Execute Python",
+            original_node_type="ExecutePython",
+            original_library_name="Missing Library",
+            failure_reason="library failed to load",
+            metadata={},
+        )
+        # Simulate a proxy whose metadata never received a 'library' key, which is the
+        # exact condition that previously raised KeyError: 'library' during serialization.
+        node.metadata.pop("library", None)
+        assert "library" not in node.metadata
+
+        GriptapeNodes.ObjectManager().add_object_by_name(node.name, node)
+
+        result = griptape_nodes.NodeManager().on_serialize_node_to_commands(
+            SerializeNodeToCommandsRequest(node_name=node.name)
+        )
+
+        assert isinstance(result, SerializeNodeToCommandsResultSuccess)
+        create_command = result.serialized_node_commands.create_node_command
+        assert create_command.node_type == "ExecutePython"
+        assert create_command.specific_library_name == "Missing Library"
+
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestUnresolveNodeRequest:
+    """Tests for the on_unresolve_node_request handler."""
+
+    def test_node_not_found_returns_failure(self) -> None:
+        result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="nonexistent_node"))
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "nonexistent_node" in str(result.result_details)
+
+    def test_resolving_node_returns_failure_without_side_effects(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVING
+        mock_node.parameter_output_values = MagicMock()
+        with patch.object(
+            GriptapeNodes.ObjectManager(),
+            "attempt_get_object_by_name_as_type",
+            return_value=mock_node,
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultFailure)
+        assert "test_node" in str(result.result_details)
+        mock_node.make_node_unresolved.assert_not_called()
+        mock_node.parameter_output_values.clear.assert_not_called()
+
+    def test_resolved_node_unresolves_and_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.RESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.make_node_unresolved.assert_called_once_with(
+            current_states_to_trigger_change_event={NodeResolutionState.RESOLVED}
+        )
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
+
+    def test_unresolved_node_still_cascades_downstream(self) -> None:
+        mock_node = MagicMock(spec=BaseNode)
+        mock_node.name = "test_node"
+        mock_node.state = NodeResolutionState.UNRESOLVED
+        mock_node.parameter_output_values = MagicMock()
+        mock_connections = MagicMock()
+        with (
+            patch.object(
+                GriptapeNodes.ObjectManager(),
+                "attempt_get_object_by_name_as_type",
+                return_value=mock_node,
+            ),
+            patch.object(
+                GriptapeNodes.FlowManager(),
+                "get_connections",
+                return_value=mock_connections,
+            ),
+        ):
+            result = GriptapeNodes.handle_request(UnresolveNodeRequest(node_name="test_node"))
+
+        assert isinstance(result, UnresolveNodeResultSuccess)
+        mock_node.parameter_output_values.silent_clear.assert_not_called()
+        mock_connections.unresolve_future_nodes.assert_called_once_with(mock_node)
 
 
 class TestNodeManagerAlterParameterDetailsClearDefaultValue:
@@ -405,3 +650,329 @@ class TestDeserializeNodeFromCommandsRetargetsElementCommands:
         # Every element command must have been retargeted at the new copy, not the original node.
         for command in element_commands:
             assert command.node_name == copy_name
+
+
+class _GateProbe(BaseNode):
+    """Concrete BaseNode used to exercise node-instantiation checkpoint resolution."""
+
+    def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
+        super().__init__(name=name, metadata=metadata)
+
+
+class TestNodeInstantiationAuthorizationCheckpoint:
+    """The license-policy checkpoint wired into node instantiation."""
+
+    _LIBRARY_NAME = "node-checkpoint-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register(self, node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN202
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=list(library_declarations),
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _GateProbe,
+            NodeMetadata(category="t", description="d", display_name="Probe", declarations=list(node_declarations)),
+        )
+        return LibraryRegistry.get_library_for_node_type(_GateProbe.__name__, self._LIBRARY_NAME)
+
+    @staticmethod
+    def _attrs(library):  # noqa: ANN001, ANN205
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        return NodeManager._node_checkpoint_attributes(
+            node_type=_GateProbe.__name__,
+            node_declarations=library.get_node_metadata(_GateProbe.__name__).declarations,
+            library_declarations=library.get_metadata().declarations,
+        )
+
+    def test_node_override_stage_wins(self) -> None:
+        from griptape_nodes.node_library.library_declarations import (
+            LifecycleStage,
+            LifecycleStageLibraryProperty,
+            LifecycleStageNodeProperty,
+        )
+
+        library = self._register(
+            node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)],
+            library_declarations=[LifecycleStageLibraryProperty(stage=LifecycleStage.STABLE)],
+        )
+        attrs = self._attrs(library)
+        assert attrs["id"] == _GateProbe.__name__
+        assert attrs["lifecycle_stage"] == "LABS"
+        assert attrs["executes_arbitrary_code"] is False
+
+    def test_inherits_library_stage_then_unstated(self) -> None:
+        from griptape_nodes.node_library.library_declarations import (
+            LifecycleStage,
+            LifecycleStageLibraryProperty,
+        )
+
+        inherit = self._register(library_declarations=[LifecycleStageLibraryProperty(stage=LifecycleStage.BETA)])
+        assert self._attrs(inherit)["lifecycle_stage"] == "BETA"
+
+        # Re-register with neither stated -> lifecycle_stage omitted entirely.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        LibraryRegistry._clear()
+        unstated = self._register()
+        assert "lifecycle_stage" not in self._attrs(unstated)
+
+    def test_arbitrary_code_flag(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ArbitraryPythonExecutionNodeProperty
+
+        library = self._register(
+            node_declarations=[ArbitraryPythonExecutionNodeProperty(executes_arbitrary_python=True)]
+        )
+        assert self._attrs(library)["executes_arbitrary_code"] is True
+
+    def test_enforce_raises_on_denial(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager, _NodeInstantiationDeniedError
+
+        self._register(node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)])
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: object) -> CheckpointDenial:
+            seen["action"] = checkpoint.action  # type: ignore[attr-defined]
+            seen["stage"] = checkpoint.attributes.get("lifecycle_stage")  # type: ignore[attr-defined]
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to enable Labs nodes."),))
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        with pytest.raises(_NodeInstantiationDeniedError, match="Ask your admin to enable Labs nodes"):
+            NodeManager._enforce_instantiation_checkpoint(
+                node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME
+            )
+        assert seen == {"action": "InstantiateNode", "stage": "LABS"}
+
+    def test_enforce_allows_without_hook(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        self._register()
+        # No hook registered -> no denial, no raise.
+        NodeManager._enforce_instantiation_checkpoint(
+            node_type=_GateProbe.__name__, specific_library_name=self._LIBRARY_NAME
+        )
+
+    def test_worker_materialize_denied_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:
+        """Worker-side construction from caller-supplied metadata is gated by the same checkpoint."""
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.retained_mode.events.execution_events import (
+            ExecuteNodeRequest,
+            ExecuteNodeResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        self._register(node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)])
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.action == "InstantiateNode":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Labs nodes are disabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        request = ExecuteNodeRequest(
+            node_name="probe-1",
+            node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+        )
+        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        assert isinstance(result, ExecuteNodeResultFailure)
+        assert "Labs nodes are disabled." in str(result.result_details)
+
+    def test_worker_materialize_allows_without_hook(self, griptape_nodes: GriptapeNodes) -> None:
+        """With no policy hook the worker path builds the node, matching the no-denial contract."""
+        from griptape_nodes.exe_types.node_types import BaseNode
+        from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeRequest
+
+        self._register()
+        request = ExecuteNodeRequest(
+            node_name="probe-1",
+            node_metadata={"node_type": _GateProbe.__name__, "library": self._LIBRARY_NAME},
+        )
+        result = griptape_nodes.NodeManager()._materialize_transient_node_from_metadata(request)
+        assert isinstance(result, BaseNode)
+        assert result.name == "probe-1"
+
+    def test_schema_preview_returns_denied_node_types(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import LifecycleStage, LifecycleStageNodeProperty
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        schema = self._schema_with_node(node_declarations=[LifecycleStageNodeProperty(stage=LifecycleStage.LABS)])
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("lifecycle_stage") == "LABS":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Labs nodes are disabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        denials = NodeManager.evaluate_schema_node_instantiation_denials(schema)
+        assert set(denials) == {_GateProbe.__name__}
+        assert denials[_GateProbe.__name__].messages() == ["Labs nodes are disabled."]
+
+    def test_schema_preview_empty_without_hook(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        # No hook -> nothing denied.
+        assert NodeManager.evaluate_schema_node_instantiation_denials(self._schema_with_node()) == {}
+
+    def test_model_usage_resolves_catalog_facts(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ModelNode",
+            node_declarations=[ModelUsageNodeProperty(model_ids=["claude-opus-4"])],
+            library_declarations=[self._catalog()],
+        )
+        assert attrs["model_ids"] == ["claude-opus-4"]
+        assert attrs["provider_ids"] == ["anthropic"]
+        assert attrs["model_families"] == ["Claude 4"]
+
+    def test_provider_usage_resolves_provider_and_its_models(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelProviderUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ProviderNode",
+            node_declarations=[ModelProviderUsageNodeProperty(provider_ids=["anthropic"])],
+            library_declarations=[self._catalog()],
+        )
+        assert attrs["provider_ids"] == ["anthropic"]
+        # The whole provider expands to its catalog models.
+        assert attrs["model_ids"] == ["claude-opus-4", "claude-sonnet-4"]
+        assert attrs["model_families"] == ["Claude 4"]
+
+    def test_provider_usage_without_catalog_models_still_gates_provider(self) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelProviderUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        # No catalog declared: the directly declared provider id is still surfaced
+        # so a provider-level policy can match, but no model ids or families exist.
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="ProviderNode",
+            node_declarations=[ModelProviderUsageNodeProperty(provider_ids=["ollama"])],
+            library_declarations=[],
+        )
+        assert attrs["provider_ids"] == ["ollama"]
+        assert "model_ids" not in attrs
+        assert "model_families" not in attrs
+
+    def test_non_model_node_has_no_model_facts(self) -> None:
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        attrs = NodeManager._node_checkpoint_attributes(
+            node_type="Plain", node_declarations=[], library_declarations=[self._catalog()]
+        )
+        assert "model_ids" not in attrs
+        assert "provider_ids" not in attrs
+        assert "model_families" not in attrs
+
+    def test_model_facts_reach_the_checkpoint_and_can_be_denied(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+        from griptape_nodes.retained_mode.managers.node_manager import NodeManager
+
+        schema = self._schema_with_node(
+            node_declarations=[ModelUsageNodeProperty(model_ids=["claude-opus-4"])],
+            library_declarations=[self._catalog()],
+        )
+
+        seen: dict[str, object] = {}
+
+        def deny(checkpoint: object) -> CheckpointDenial | None:
+            seen["provider_ids"] = checkpoint.attributes.get("provider_ids")  # type: ignore[attr-defined]
+            seen["model_families"] = checkpoint.attributes.get("model_families")  # type: ignore[attr-defined]
+            if "anthropic" in (checkpoint.attributes.get("provider_ids") or []):  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Anthropic is not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        denials = NodeManager.evaluate_schema_node_instantiation_denials(schema)
+        assert seen == {"provider_ids": ["anthropic"], "model_families": ["Claude 4"]}
+        assert set(denials) == {_GateProbe.__name__}
+        assert denials[_GateProbe.__name__].messages() == ["Anthropic is not enabled."]
+
+    @staticmethod
+    def _catalog():  # noqa: ANN205
+        from griptape_nodes.node_library.library_declarations import (
+            KeySupport,
+            Model,
+            ModelCatalogLibraryProperty,
+            ModelProvider,
+        )
+
+        return ModelCatalogLibraryProperty(
+            providers={
+                "anthropic": ModelProvider(
+                    display_name="Anthropic",
+                    models={
+                        "claude-opus-4": Model(
+                            display_name="Opus", family="Claude 4", key_support=KeySupport.REQUIRES_CUSTOMER_KEY
+                        ),
+                        "claude-sonnet-4": Model(
+                            display_name="Sonnet", family="Claude 4", key_support=KeySupport.REQUIRES_CUSTOMER_KEY
+                        ),
+                    },
+                )
+            }
+        )
+
+    @staticmethod
+    def _schema_with_node(node_declarations=(), library_declarations=()):  # noqa: ANN001, ANN205
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibrarySchema,
+            NodeDefinition,
+            NodeMetadata,
+        )
+
+        return LibrarySchema(
+            name="preview-lib",
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=list(library_declarations),
+            ),
+            categories=[],
+            nodes=[
+                NodeDefinition(
+                    class_name=_GateProbe.__name__,
+                    file_path="probe.py",
+                    metadata=NodeMetadata(
+                        category="t", description="d", display_name="Probe", declarations=list(node_declarations)
+                    ),
+                )
+            ],
+        )

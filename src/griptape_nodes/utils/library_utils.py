@@ -77,8 +77,8 @@ def clone_and_get_library_version(remote_url: str, ref: str = "HEAD") -> Library
     return LibraryVersionInfo(library_version=library_version, commit_sha=commit_sha, engine_version=engine_version)
 
 
-def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], set[str]]:
-    """Filter out old XDG library paths from a list of library paths.
+def filter_old_xdg_library_paths(library_paths: list[Any]) -> tuple[list[Any], set[str]]:
+    """Filter out old XDG library paths from a list of library entries.
 
     Removes library paths that were stored in the deprecated XDG data home location
     (~/.local/share/griptape_nodes/libraries/) for the following libraries:
@@ -86,8 +86,12 @@ def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], s
     - griptape_nodes_advanced_media_library
     - griptape_cloud
 
+    Entries may be bare path strings or object-form entries (dicts or LibraryRegistration
+    instances) carrying a `path`. The path is extracted for comparison while the original
+    entry is preserved in the filtered output.
+
     Args:
-        library_paths: List of library paths to filter.
+        library_paths: List of library entries to filter.
 
     Returns:
         Tuple of (filtered_list, set of removed library names).
@@ -111,8 +115,10 @@ def filter_old_xdg_library_paths(library_paths: list[str]) -> tuple[list[str], s
 
     for library in library_paths:
         is_old_path = False
-        # Normalize library path for cross-platform comparison
-        normalized_library = str(Path(library))
+        # Extract the path string from string or object-form entries, then normalize
+        # for cross-platform comparison.
+        library_path = extract_library_path(library)
+        normalized_library = str(Path(library_path)) if library_path else ""
 
         for lib_name, prefix in old_path_prefixes.items():
             if normalized_library.startswith(prefix):

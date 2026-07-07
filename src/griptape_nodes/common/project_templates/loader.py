@@ -32,6 +32,8 @@ FIELD_FILE_EXTENSION_DIRECTORIES = "file_extension_directories"
 FIELD_DESCRIPTION = "description"
 FIELD_PARENT_PROJECT_PATH = "parent_project_path"
 FIELD_PARENT_PROJECT_ID = "parent_project_id"
+FIELD_WORKSPACE_DIR = "workspace_dir"
+FIELD_LIBRARIES_DIR = "libraries_dir"
 
 # Special constants
 ROOT_FIELD_PATH = "<root>"
@@ -88,6 +90,8 @@ class ProjectOverlayData(NamedTuple):
     line_info: YAMLLineInfo
     id: str | None = None
     parent_project_id: str | None = None
+    workspace_dir: str | PerPlatformProjectPath | None = None
+    libraries_dir: str | PerPlatformProjectPath | None = None
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
@@ -95,6 +99,8 @@ class ProjectOverlayData(NamedTuple):
     clears_description: bool = False
     clears_parent_project_path: bool = False
     clears_parent_project_id: bool = False
+    clears_workspace_dir: bool = False
+    clears_libraries_dir: bool = False
 
 
 def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
@@ -176,6 +182,7 @@ def load_project_template_from_yaml(  # noqa: C901
     """
     # Lazy import required: circular dependency between this module and project.py
     # project.py imports ProjectOverlayData from this file, and we need ProjectTemplate from project.py
+    from griptape_nodes.common.project_templates.default_project_template import latest_version_for_major
     from griptape_nodes.common.project_templates.project import ProjectTemplate
 
     # Pass 1: Load YAML with line tracking
@@ -225,12 +232,14 @@ def load_project_template_from_yaml(  # noqa: C901
 
         return None
     else:
-        # Add warnings for schema version mismatches
-        if template.project_template_schema_version != ProjectTemplate.LATEST_SCHEMA_VERSION:
-            message = (
-                f"Schema version '{template.project_template_schema_version}' "
-                f"differs from latest '{ProjectTemplate.LATEST_SCHEMA_VERSION}'"
-            )
+        # Warn only when the project is behind the latest version WITHIN ITS OWN MAJOR -- the
+        # version it will roll up to on the next save. A project intentionally staying on an
+        # older major (the version-fork design) is NOT a mismatch and must not warn; crossing a
+        # major is a separate, elective upgrade surfaced in the UI, not a load-time warning.
+        version = template.project_template_schema_version
+        latest_in_major = latest_version_for_major(version)
+        if latest_in_major is not None and version != latest_in_major:
+            message = f"Schema version '{version}' is behind the latest '{latest_in_major}' for its major"
             validation_info.add_warning(
                 field_path=FIELD_PROJECT_TEMPLATE_SCHEMA_VERSION,
                 message=message,
@@ -434,6 +443,67 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         )
         parent_project_id = None
 
+    # Optional field: workspace_dir. Same absent-vs-null semantics as
+    # parent_project_path (absent = inherit base, explicit null = tombstone).
+    # Accepts a plain string (single path, absolute or relative to this YAML's
+    # directory) or a per-platform mapping (PerPlatformProjectPath).
+    clears_workspace_dir = FIELD_WORKSPACE_DIR in data and data.get(FIELD_WORKSPACE_DIR) is None
+    raw_workspace_dir = data.get(FIELD_WORKSPACE_DIR)
+    workspace_dir: str | PerPlatformProjectPath | None = None
+    if raw_workspace_dir is not None:
+        if isinstance(raw_workspace_dir, str):
+            workspace_dir = raw_workspace_dir
+        elif isinstance(raw_workspace_dir, dict):
+            try:
+                workspace_dir = PerPlatformProjectPath.model_validate(raw_workspace_dir)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_WORKSPACE_DIR}.{error_field_path}" if error_field_path else FIELD_WORKSPACE_DIR
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path) or line_info.get_line(FIELD_WORKSPACE_DIR),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_WORKSPACE_DIR,
+                message=f"Must be string or per-platform mapping, got {type(raw_workspace_dir).__name__}",
+                line_number=line_info.get_line(FIELD_WORKSPACE_DIR),
+            )
+
+    # Optional field: libraries_dir. Same absent-vs-null semantics as workspace_dir
+    # (absent = inherit base, explicit null = tombstone). Accepts a plain string or a
+    # per-platform mapping (PerPlatformProjectPath).
+    clears_libraries_dir = FIELD_LIBRARIES_DIR in data and data.get(FIELD_LIBRARIES_DIR) is None
+    raw_libraries_dir = data.get(FIELD_LIBRARIES_DIR)
+    libraries_dir: str | PerPlatformProjectPath | None = None
+    if raw_libraries_dir is not None:
+        if isinstance(raw_libraries_dir, str):
+            libraries_dir = raw_libraries_dir
+        elif isinstance(raw_libraries_dir, dict):
+            try:
+                libraries_dir = PerPlatformProjectPath.model_validate(raw_libraries_dir)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = (
+                        f"{FIELD_LIBRARIES_DIR}.{error_field_path}" if error_field_path else FIELD_LIBRARIES_DIR
+                    )
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=line_info.get_line(full_field_path) or line_info.get_line(FIELD_LIBRARIES_DIR),
+                    )
+        else:
+            validation_info.add_error(
+                field_path=FIELD_LIBRARIES_DIR,
+                message=f"Must be string or per-platform mapping, got {type(raw_libraries_dir).__name__}",
+                line_number=line_info.get_line(FIELD_LIBRARIES_DIR),
+            )
+
     return ProjectOverlayData(
         name=name,
         project_template_schema_version=schema_version,
@@ -446,6 +516,8 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         line_info=line_info,
         id=project_id,
         parent_project_id=parent_project_id,
+        workspace_dir=workspace_dir,
+        libraries_dir=libraries_dir,
         removed_situations=frozenset(removed_situations),
         removed_directories=frozenset(removed_directories),
         removed_environment=frozenset(removed_environment),
@@ -453,6 +525,8 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         clears_description=clears_description,
         clears_parent_project_path=clears_parent_project_path,
         clears_parent_project_id=clears_parent_project_id,
+        clears_workspace_dir=clears_workspace_dir,
+        clears_libraries_dir=clears_libraries_dir,
     )
 
 

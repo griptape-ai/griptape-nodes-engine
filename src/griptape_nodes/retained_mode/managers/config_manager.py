@@ -8,6 +8,7 @@ from typing import Any, Literal
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_config_home
 
+from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
@@ -92,6 +93,7 @@ class ConfigManager:
         self._project_config_path: Path | None = None
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
+        self._libraries_root_override: str | None = None
         self.load_configs()
 
         self._set_log_level(self.merged_config.get("log_level", logging.INFO))
@@ -155,6 +157,36 @@ class ConfigManager:
             self._workspace_dir_override = resolved
             self._workspace_path = resolved
 
+    def set_libraries_root_override(self, path: Path | None) -> None:
+        """Set a runtime override for where libraries install and resolve.
+
+        When set, it is the absolute root used by resolved_libraries_root() in place
+        of the workspace-relative libraries_directory. Used by ProjectManager to apply
+        a project's own (or inherited) libraries_dir so a child project can share its
+        parent's library install location. Pass None to clear it, restoring the
+        workspace-relative default.
+
+        Args:
+            path: The absolute libraries root override, or None to clear it.
+        """
+        if path is None:
+            self._libraries_root_override = None
+        else:
+            self._libraries_root_override = str(Path(path).expanduser().resolve())
+
+    def resolved_libraries_root(self) -> Path:
+        """Return the absolute directory under which libraries install and resolve.
+
+        When a libraries-root override is set (from a project's own or inherited
+        libraries_dir), it is returned verbatim. Otherwise the legacy behavior applies:
+        the workspace-relative libraries_directory config value resolved against the
+        workspace path.
+        """
+        if self._libraries_root_override is not None:
+            return Path(self._libraries_root_override)
+        libraries_dir = self.get_config_value("libraries_directory", default="libraries")
+        return resolve_workspace_path(Path(libraries_dir), self.workspace_path)
+
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.
 
@@ -164,6 +196,7 @@ class ConfigManager:
         load_configs()/load_project_config()/load_workspace_config() right after.
         """
         self._workspace_dir_override = None
+        self._libraries_root_override = None
         self._project_config_path = None
         self._workspace_config_path = None
 
@@ -316,12 +349,13 @@ class ConfigManager:
 
         `workspace_dir` and `apply_override` come from ProjectManager.decide_workspace,
         the same decision the live activation applies. The override is applied here only
-        when `apply_override` is True (the project_workspaces mapping and auto-default
-        branches), exactly as _activate_project calls set_workspace_override; for an
-        env/project-adjacent workspace_directory it is False so the workspace config layer
-        can re-point workspace_directory, matching the live path. When applied, the value
-        is resolved the same way set_workspace_override resolves it (expanduser + resolve),
-        so the merged workspace_directory matches the live merged config byte-for-byte.
+        when `apply_override` is True (the project_workspaces mapping, parent-chain
+        inheritance, and global-default branches), exactly as _activate_project calls
+        set_workspace_override; for an env/project-adjacent workspace_directory it is False
+        so the workspace config layer can re-point workspace_directory, matching the live
+        path. When applied, the value is resolved the same way set_workspace_override
+        resolves it (expanduser + resolve), so the merged workspace_directory matches the
+        live merged config byte-for-byte.
 
         Args:
             project_dir: Directory holding the project YAML and its adjacent config.
@@ -344,9 +378,9 @@ class ConfigManager:
             merged = merge_dicts(merged, self._load_config_from_file(workspace_config_path, "workspace"))
 
         # Apply the runtime workspace override conditionally, mirroring _activate_project:
-        # only the project_workspaces and auto-default branches pin it (apply_override),
-        # and the value is resolved exactly as set_workspace_override would so preview and
-        # live agree. It sits above config files but below env vars.
+        # only the project_workspaces, parent-chain inheritance, and global-default branches
+        # pin it (apply_override), and the value is resolved exactly as set_workspace_override
+        # would so preview and live agree. It sits above config files but below env vars.
         if apply_override:
             merged["workspace_directory"] = str(Path(workspace_dir).expanduser().resolve())
 
@@ -400,6 +434,7 @@ class ConfigManager:
             )
         )
         self._workspace_dir_override = None
+        self._libraries_root_override = None
         self.load_configs()
 
     def delete_user_workflow(self, workflow_file_name: str) -> None:

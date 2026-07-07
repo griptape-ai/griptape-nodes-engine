@@ -190,6 +190,24 @@ class ModelCatalogLibraryProperty(BaseModel):
     providers: dict[str, ModelProvider] = Field(default_factory=dict)
 
 
+class SidebarModelProvider(ModelProvider):
+    """Extends ModelProvider with UI fields used by the engine's chat sidebar.
+
+    These fields are engine/sidebar-specific and do not belong in a library's
+    griptape_nodes_library.json declaration.
+    """
+
+    default_base_url: str | None = None
+    has_model_list: bool = False
+    default_model: str = ""
+
+
+class ModelCatalogSidebarProperty(BaseModel):
+    """Engine-side catalog that merges library provider metadata with sidebar UI fields."""
+
+    providers: dict[str, SidebarModelProvider] = Field(default_factory=dict)
+
+
 class LibraryDependencyDeclaration(BaseModel):
     """Declares another Griptape Node Library that this library depends on.
 
@@ -245,6 +263,16 @@ def requires_worker_process(declarations: Sequence[LibraryDeclaration]) -> bool:
     if suggested is None:
         return False
     return suggested.mode is WorkerMode.WORKER
+
+
+def find_model_catalog(declarations: Sequence[LibraryDeclaration]) -> ModelCatalogLibraryProperty | None:
+    """Return the library's `model_catalog` declaration, or `None` when it declares none.
+
+    The single primitive every catalog consumer builds on: callers that want the
+    resolved models pair this with `iter_catalog_models` / `resolve_node_models`,
+    callers that only need the declaration (e.g. an existence check) use it alone.
+    """
+    return next((d for d in declarations if isinstance(d, ModelCatalogLibraryProperty)), None)
 
 
 class ResolvedModel(NamedTuple):

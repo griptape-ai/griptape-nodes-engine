@@ -141,6 +141,18 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
         """Return list of model names for download."""
         return [self._repo_id]
 
+    def get_not_downloaded_choices(self) -> list[str]:
+        downloaded_keys = {key for key, _ in self.list_repo_revisions()}
+        return [
+            self._repo_variant_to_key(self._repo_id, v)
+            for v in self._variants
+            if self._repo_variant_to_key(self._repo_id, v) not in downloaded_keys
+        ]
+
+    def _get_model_search_term(self, choice: str) -> str:
+        repo_id, _ = self._key_to_repo_variant(choice)
+        return repo_id
+
     def get_repo_variant_revision(self) -> tuple[str, str, str]:
         """Get the selected repo_id, variant, and revision.
 

@@ -1,14 +1,16 @@
 """Data shapes for the sequences module.
 
-Four concepts:
+Five concepts:
     - `MissingItemPolicy`: how to fill gaps inside a sequence's range.
     - `NoTokenBehavior`: what to do when the input has no sequence token at all.
+    - `SequenceScanOptions`: bundled options for sequence detection and filtering.
     - `Sequence`: one contiguous-or-gap-aware sequence with metadata.
     - `SequenceEntry`: one item inside a Sequence (number + path).
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
 from pydantic import BaseModel, Field, computed_field
@@ -58,6 +60,29 @@ class NoTokenBehavior(StrEnum):
     SINGLE_FILE = "single_file"
     EXPLORE_SEQUENCE = "explore_sequence"
     REJECT = "reject"
+
+
+@dataclass
+class SequenceScanOptions:
+    """Options controlling how sequences are detected and filtered.
+
+    Attributes:
+        policy: How to handle gaps in the detected range.
+        no_token_behavior: Whether to include or reject sequences with no
+            explicit sequence token (e.g. plain ``readme.txt``).
+        start_number: Lower bound (inclusive) for the active frame subset.
+            Must be >= 0 if supplied.
+        end_number: Upper bound (inclusive) for the active frame subset.
+            Must be >= ``start_number`` if both supplied.
+        padding: If set, only include sequences whose zero-fill width equals
+            this value (e.g. ``padding=4`` matches ``####`` sequences only).
+    """
+
+    policy: MissingItemPolicy = MissingItemPolicy.SKIP
+    no_token_behavior: NoTokenBehavior = NoTokenBehavior.REJECT
+    start_number: int | None = None
+    end_number: int | None = None
+    padding: int | None = None
 
 
 # Truncate the inline preview of gap numbers in MissingItemError's __str__

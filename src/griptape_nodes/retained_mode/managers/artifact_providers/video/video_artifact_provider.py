@@ -5,14 +5,23 @@ from __future__ import annotations
 import json
 import logging
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
+)
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointDenial,
+    CheckpointSubjectType,
 )
 
 if TYPE_CHECKING:
@@ -122,6 +131,87 @@ class VideoArtifactProvider(BaseArtifactProvider):
             return None
 
         return cls._parse_probe_data(probe_data, source_path)
+
+    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:
+        """Gate a pending video write against the WRITE_VIDEO_CODEC checkpoint.
+
+        Spools ``data`` to a temp file so ffprobe can seek (mp4/mov require it),
+        extracts the primary video codec, and asks the authorization hook chain
+        whether writing that codec is permitted in the current context. The
+        temp file is removed before returning regardless of outcome.
+
+        Falls open (returns None) when the codec cannot be extracted -- if we
+        cannot identify what we are writing, we cannot make a permission
+        decision. The write proceeds and any downstream policy that keys on
+        codec must accept that some writes are unclassified.
+        """
+        codec = self._extract_codec_from_bytes(data, detected_format)
+        if codec is None:
+            return None
+
+        return self._evaluate_codec_checkpoint(
+            action=CheckpointAction.WRITE_VIDEO_CODEC,
+            codec=codec,
+            container_format=detected_format,
+        )
+
+    def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
+        """Gate a pending video read against the READ_VIDEO_CODEC checkpoint.
+
+        Runs ffprobe on the source (no spooling -- we already have a path)
+        and consults the hook chain. Falls open when the codec cannot be
+        extracted, mirroring ``check_write_permission``.
+        """
+        probe_data = self._run_ffprobe(source_path)
+        codec = self._codec_from_probe_data(probe_data)
+        if codec is None:
+            return None
+
+        container_format = Path(source_path).suffix.lstrip(".").lower() or "unknown"
+        return self._evaluate_codec_checkpoint(
+            action=CheckpointAction.READ_VIDEO_CODEC,
+            codec=codec,
+            container_format=container_format,
+        )
+
+    @classmethod
+    def _extract_codec_from_bytes(cls, data: bytes, detected_format: str) -> str | None:
+        """Spool bytes to a temp file, run ffprobe, and return the primary video codec."""
+        with tempfile.NamedTemporaryFile(suffix=f".{detected_format}", delete=False) as spool:
+            spool.write(data)
+            spool_path = spool.name
+
+        try:
+            probe_data = cls._run_ffprobe(spool_path)
+        finally:
+            Path(spool_path).unlink(missing_ok=True)
+
+        return cls._codec_from_probe_data(probe_data)
+
+    @staticmethod
+    def _codec_from_probe_data(probe_data: dict | None) -> str | None:
+        """Pull the first video stream's codec_name from an ffprobe payload."""
+        if probe_data is None:
+            return None
+        for stream in probe_data.get("streams", []):
+            if stream.get("codec_type") == "video":
+                codec = stream.get("codec_name")
+                if isinstance(codec, str) and codec:
+                    return codec
+        return None
+
+    @staticmethod
+    def _evaluate_codec_checkpoint(
+        action: CheckpointAction, codec: str, container_format: str
+    ) -> CheckpointDenial | None:
+        """Build the checkpoint and ask the event manager's hook chain for a verdict."""
+        checkpoint = AuthorizationCheckpoint(
+            action=action,
+            subject_type=CheckpointSubjectType.VIDEO_CODEC,
+            subject_id=codec,
+            attributes={CheckpointAttribute.CONTAINER_FORMAT: container_format},
+        )
+        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(checkpoint)
 
     @classmethod
     def _run_ffprobe(cls, source_path: str) -> dict | None:

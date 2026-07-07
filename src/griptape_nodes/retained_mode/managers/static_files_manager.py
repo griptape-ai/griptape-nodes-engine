@@ -8,7 +8,7 @@ from typing import NamedTuple
 from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
-from griptape_nodes.common.project_templates.situation import SituationFilePolicy
+from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
@@ -54,8 +54,6 @@ from griptape_nodes.servers.static import STATIC_SERVER_HOST, STATIC_SERVER_PORT
 from griptape_nodes.utils.url_utils import uri_to_path
 
 logger = logging.getLogger("griptape_nodes")
-
-SAVE_STATIC_FILE_SITUATION = "save_static_file"
 
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
 
@@ -452,7 +450,7 @@ class StaticFilesManager:
         """
         resolved = self._resolve_static_file_path(file_name)
         if resolved is None:
-            msg = f"Attempted to save static file '{file_name}'. Failed because the project template is missing the '{SAVE_STATIC_FILE_SITUATION}' situation."
+            msg = f"Attempted to save static file '{file_name}'. Failed because the project template is missing the '{BuiltInSituation.SAVE_STATIC_FILE}' situation."
             raise RuntimeError(msg)
 
         file_path = resolved.path
@@ -479,7 +477,7 @@ class StaticFilesManager:
         return self.storage_driver.create_signed_download_url(Path(saved_path))
 
     def _resolve_static_file_path(
-        self, file_name: str, situation_name: str = SAVE_STATIC_FILE_SITUATION
+        self, file_name: str, situation_name: str = BuiltInSituation.SAVE_STATIC_FILE
     ) -> ResolvedStaticFilePath | None:
         """Resolve the file path for a static file using the given situation.
 

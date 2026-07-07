@@ -317,6 +317,7 @@ class Settings(BaseModel):
     workspace_directory: str = Field(
         category=FILE_SYSTEM,
         default=str(Path().cwd() / "GriptapeNodes"),
+        description="Root directory for projects, workflows, and generated assets. Defaults to a GriptapeNodes folder under the current working directory. The other File System paths (libraries_directory, static_files_directory, sandbox_library_directory, synced_workflows_directory) are interpreted relative to this directory unless they are set to absolute paths.",
     )
     static_files_directory: str = Field(
         category=FILE_SYSTEM,
@@ -331,13 +332,17 @@ class Settings(BaseModel):
     libraries_directory: str = Field(
         category=FILE_SYSTEM,
         default="libraries",
-        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is.",
+        description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,
         default_factory=AppEvents,
     )
-    log_level: LogLevel = Field(category=EXECUTION, default=LogLevel.INFO)
+    log_level: LogLevel = Field(
+        category=EXECUTION,
+        default=LogLevel.INFO,
+        description="Logging verbosity for the engine. One of CRITICAL, ERROR, WARNING, INFO, or DEBUG, from least to most verbose.",
+    )
     workflow_execution_mode: WorkflowExecutionMode = Field(
         category=EXECUTION,
         default=WorkflowExecutionMode.SEQUENTIAL,
@@ -385,7 +390,11 @@ class Settings(BaseModel):
         category=EXECUTION,
         default_factory=WorkerSettings,
     )
-    storage_backend: Literal["local", "gtc"] = Field(category=STORAGE, default="local")
+    storage_backend: Literal["local", "gtc"] = Field(
+        category=STORAGE,
+        default="local",
+        description="Backend used to persist workflow data and generated assets. 'local' stores files on the local filesystem under the workspace; 'gtc' uses Griptape Cloud storage.",
+    )
     auto_inject_workflow_metadata: bool = Field(
         category=STORAGE,
         default=True,
@@ -459,12 +468,12 @@ class Settings(BaseModel):
     project_file: str | None = Field(
         category=PROJECTS,
         default=None,
-        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default.",
+        description="Path to the project file (griptape-nodes-project.yml) to load initially when the engine starts. When set, overrides the default location of <workspace_directory>/griptape-nodes-project.yml. If the specified path does not exist, falls back to the workspace default. The sentinel value '<system-defaults>' means the engine deliberately stays on system defaults and suppresses the workspace-default fallback (so a workspace griptape-nodes-project.yml is not auto-discovered); this is what the engine persists when it is intentionally on system defaults.",
     )
     project_workspaces: dict[str, str] = Field(
         category=PROJECTS,
         default_factory=dict,
-        description="Mapping of project file paths to workspace directory overrides. When a project is loaded, if its resolved path matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
+        description="Mapping of project identifiers to workspace directory overrides. A key may be either a project ID or a project file path: it is first matched against loaded project IDs, and if none match, treated as a project file path. When a project is loaded, if it matches a key here, the corresponding value is used as the workspace directory instead of the project-adjacent config or auto-default.",
     )
     agent: AgentSettings = Field(
         category=AGENT,

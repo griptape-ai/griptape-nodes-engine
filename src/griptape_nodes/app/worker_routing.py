@@ -74,9 +74,16 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueRequest,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
+from griptape_nodes.retained_mode.events.project_events import (
+    SetCurrentProjectRequest,
+)
 from griptape_nodes.retained_mode.events.secrets_events import (
     DeleteSecretValueRequest,
     SetSecretValueRequest,
+)
+from griptape_nodes.retained_mode.events.variable_events import (
+    GetVariablesRequest,
+    SetVariablesRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
 from griptape_nodes.utils.async_utils import call_function
@@ -86,6 +93,7 @@ logger = logging.getLogger("griptape_nodes")
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 
@@ -124,6 +132,9 @@ FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         # secrets_events
         SetSecretValueRequest,
         DeleteSecretValueRequest,
+        # variable_events
+        GetVariablesRequest,
+        SetVariablesRequest,
     }
 )
 
@@ -182,6 +193,41 @@ class RefreshSecretsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 @PayloadRegistry.register
 class RefreshSecretsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Worker failed to refresh its secrets."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateProjectRequest(RequestPayload, SkipTheLineMixin):
+    """Sent by the orchestrator to each registered worker after it switches projects.
+
+    The orchestrator is the single source of truth for the current project, but a
+    worker is only restarted on a switch that changes library config. A switch that
+    keeps the same workspace and library config (only environment / directories /
+    situations differ) leaves the worker on a stale project. This tells the worker
+    to adopt the orchestrator's new project so env vars, directory macros, and
+    situation/path macros resolve against the right project.
+
+    project_id is the opaque id of the new current project (SYSTEM_DEFAULTS_KEY for
+    system defaults). A worker boots like an engine off the same shared on-disk
+    config, so the orchestrator's registry id is already loaded in the worker.
+
+    Uses SkipTheLineMixin so the worker activates the new project immediately, ahead
+    of any queued ExecuteNodeRequest that would otherwise run against the stale one.
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Worker adopted the orchestrator's current project."""
+
+
+@dataclass
+@PayloadRegistry.register
+class ActivateProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Worker failed to adopt the orchestrator's current project."""
 
 
 @dataclass
@@ -265,13 +311,15 @@ def register_broadcast_handlers(
     *,
     config_manager: ConfigManager,
     secrets_manager: SecretsManager,
+    project_manager: ProjectManager,
 ) -> None:
     """Install worker-side handlers for orchestrator-originated broadcasts.
 
-    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` from
-    the orchestrator and respond by re-reading the shared on-disk state. The
-    actual reload is delegated to the corresponding manager so domain logic
-    stays in the manager and routing decisions stay here.
+    Workers receive ``ReloadConfigRequest`` / ``RefreshSecretsRequest`` /
+    ``ActivateProjectRequest`` from the orchestrator and respond by re-reading
+    the shared on-disk state or adopting the orchestrator's current project. The
+    actual work is delegated to the corresponding manager so domain logic stays
+    in the manager and routing decisions stay here.
     """
 
     def handle_reload_config(request: ReloadConfigRequest) -> ResultPayload:  # noqa: ARG001
@@ -292,5 +340,42 @@ def register_broadcast_handlers(
             return RefreshSecretsResultFailure(result_details=details)
         return RefreshSecretsResultSuccess(result_details="Refreshed secrets from shared .env file.")
 
+    async def handle_activate_project(request: ActivateProjectRequest) -> ResultPayload:
+        # A ReloadConfigRequest may land concurrently: a post-init orchestrator switch
+        # persists project_file, which emits ConfigChanged -> ReloadConfigRequest to every
+        # worker, right alongside this activation. Both are SkipTheLine and run as separate
+        # tasks, so they interleave. It is safe because _activate_project below does
+        # clear_project_layers() + a full re-merge, so a concurrent load_configs() only
+        # refreshes the user layer idempotently and cannot leave layers half-applied.
+        #
+        # A worker boots like an engine off the same shared on-disk config, so the
+        # orchestrator's project id is usually already loaded in the worker's registry.
+        # But a worker's registry is frozen at boot: if the orchestrator switched to a
+        # project it registered AFTER this worker spawned, the id is absent here. Re-read
+        # the shared config and re-run registered-project discovery (engine-style) so the
+        # worker learns it. Fail loud if the id is still unknown -- silently landing on a
+        # stale project while reporting success is exactly the divergence we must avoid.
+        if not await project_manager.ensure_project_loaded(request.project_id):
+            details = (
+                f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                f"Failed because the id is absent from the worker's registry even after "
+                f"reloading config and re-running registered-project discovery."
+            )
+            logger.error(details)
+            return ActivateProjectResultFailure(result_details=details)
+
+        set_result = await project_manager.on_set_current_project_request(
+            SetCurrentProjectRequest(project_id=request.project_id)
+        )
+        if set_result.failed():
+            details = (
+                f"Attempted to adopt orchestrator project '{request.project_id}'. "
+                f"Failed with result: {set_result.result_details}"
+            )
+            logger.error(details)
+            return ActivateProjectResultFailure(result_details=details)
+        return ActivateProjectResultSuccess(result_details=f"Adopted project from orchestrator: {request.project_id}.")
+
     event_manager.assign_manager_to_request_type(ReloadConfigRequest, handle_reload_config)
     event_manager.assign_manager_to_request_type(RefreshSecretsRequest, handle_refresh_secrets)
+    event_manager.assign_manager_to_request_type(ActivateProjectRequest, handle_activate_project)

@@ -12,6 +12,24 @@ Griptape Cloud's ServiceModelConfig table. When Cloud's catalog changes
 every consumer picks up the change.
 """
 
+from enum import StrEnum
+
+from pydantic import BaseModel
+
+from griptape_nodes.node_library.library_declarations import (
+    KeySupport,
+    ModelCatalogSidebarProperty,
+    SidebarModelProvider,
+)
+
+
+class ProviderID(StrEnum):
+    GRIPTAPE_CLOUD = "griptape_cloud"
+    OLLAMA = "ollama"
+    LMSTUDIO = "lmstudio"
+    CUSTOM = "custom"
+
+
 # --- Per-family arg presets ---
 
 _CLAUDE_ARGS = {"stream": True, "structured_output_strategy": "tool", "max_tokens": 64000}
@@ -103,3 +121,87 @@ IMAGE_DEPRECATED_MODELS = {
 # Model IDs whose backend does not accept top_p (the OpenAI o-series).
 # Kept in sync with the o-entries in MODEL_CHOICES_ARGS.
 O_SERIES_MODELS = {"o1", "o3", "o3-mini", "o4-mini"}
+
+
+OLLAMA_DEFAULT_BASE_URL = "http://localhost:11434/v1"
+LM_STUDIO_DEFAULT_BASE_URL = "http://localhost:1234/v1"
+
+# Source of truth for the sidebar's provider catalog.
+# Provider IDs here must match the model_catalog declaration keys used in
+# griptape-nodes-library-standard so that admin enforcement applies uniformly
+# when the enforcement PR lands.
+PROVIDER_CATALOG = ModelCatalogSidebarProperty(
+    providers={
+        ProviderID.GRIPTAPE_CLOUD: SidebarModelProvider(
+            display_name="Griptape Cloud",
+            terms_url="https://www.griptape.ai/legal/terms",
+            notes="Routes upstream models through Griptape's hosted proxy.",
+            key_support=KeySupport.REQUIRES_GRIPTAPE_KEY,
+            default_base_url=None,
+            has_model_list=True,
+            default_model=MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o",
+        ),
+        ProviderID.OLLAMA: SidebarModelProvider(
+            display_name="Ollama (local)",
+            terms_url="https://ollama.com/terms",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            notes="Models are dynamically discovered from the local Ollama installation.",
+            default_base_url=OLLAMA_DEFAULT_BASE_URL,
+            has_model_list=False,
+            default_model="llama3.2",
+        ),
+        ProviderID.LMSTUDIO: SidebarModelProvider(
+            display_name="LM Studio (local)",
+            terms_url="https://lmstudio.ai/app-terms",
+            key_support=KeySupport.NO_KEY_REQUIRED,
+            notes="Models are dynamically discovered from the local LM Studio installation.",
+            default_base_url=LM_STUDIO_DEFAULT_BASE_URL,
+            has_model_list=False,
+            default_model="",
+        ),
+        ProviderID.CUSTOM: SidebarModelProvider(
+            display_name="Custom (OpenAI-compatible)",
+            key_support=KeySupport.REQUIRES_CUSTOMER_KEY,
+            default_base_url="",
+            has_model_list=False,
+            default_model="",
+        ),
+    }
+)
+
+
+class ProviderCatalogEntry(BaseModel):
+    """Serialization-ready response shape for a single provider catalog entry."""
+
+    id: str
+    display_name: str
+    terms_url: str | None = None
+    key_support: KeySupport | None = None
+    notes: str | None = None
+    requires_api_key: bool
+    default_base_url: str | None = None
+    has_model_list: bool = False
+    default_model: str = ""
+
+
+def provider_accepts_customer_key(provider_id: str) -> bool:
+    """Return True only if this provider expects the user to supply their own API key."""
+    provider = PROVIDER_CATALOG.providers.get(provider_id)
+    return provider is not None and provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY
+
+
+def provider_catalog_entries() -> list[ProviderCatalogEntry]:
+    """Return the full provider list for the ListAgentModelsResultSuccess response.
+
+    Each entry includes catalog fields and sidebar-specific fields.
+    requires_api_key is a convenience bool so the frontend doesn't have to
+    parse key_support itself.
+    """
+    return [
+        ProviderCatalogEntry(
+            id=provider_id,
+            requires_api_key=provider.key_support == KeySupport.REQUIRES_CUSTOMER_KEY,
+            **provider.model_dump(exclude={"models"}),
+        )
+        for provider_id, provider in PROVIDER_CATALOG.providers.items()
+    ]

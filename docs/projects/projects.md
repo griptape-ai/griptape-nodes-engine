@@ -17,7 +17,7 @@ Place this file in your workspace directory. It is optional — if absent, the [
 ## Project file structure
 
 ```yaml
-project_template_schema_version: "0.3.2"
+project_template_schema_version: "1.0.0"
 name: "My Project"
 description: "Optional description"
 
@@ -46,16 +46,18 @@ file_extension_directories:
 
 ### Fields reference
 
-| Field                             | Required | Description                                                                                                                         |
-| --------------------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------- |
-| `project_template_schema_version` | Yes      | Must match the supported version (`"0.3.2"`)                                                                                        |
-| `name`                            | Yes      | Human-readable name for this project                                                                                                |
-| `description`                     | No       | Optional description                                                                                                                |
-| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects). |
-| `situations`                      | No       | Dict of situation overrides and additions                                                                                           |
-| `directories`                     | No       | Dict of directory overrides and additions                                                                                           |
-| `environment`                     | No       | Dict of custom key-value variables                                                                                                  |
-| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                        |
+| Field                             | Required | Description                                                                                                                                                                                                                                                                                          |
+| --------------------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `project_template_schema_version` | Yes      | The project's schema version. Its **major** selects the defaults baseline (see [Schema versions](#schema-versions)); new projects are created at the latest (`"1.0.0"`). Older majors (e.g. `"0.5.1"`) still load against their own baseline.                                                        |
+| `name`                            | Yes      | Human-readable name for this project                                                                                                                                                                                                                                                                 |
+| `description`                     | No       | Optional description                                                                                                                                                                                                                                                                                 |
+| `parent_project_path`             | No       | Path to a parent project YAML; the parent's merged template becomes the base for this one. See [Parent projects](#parent-projects).                                                                                                                                                                  |
+| `workspace_dir`                   | No       | Directory this project uses as its workspace; the highest-priority workspace source. A string (absolute or relative to this YAML) or a per-platform mapping. Not inherited from a parent. See [Workspace directory](#workspace-directory).                                                           |
+| `libraries_dir`                   | No       | Directory this project installs and resolves its libraries under. A string (absolute or relative to this YAML) or a per-platform mapping. **Inherited** down the parent chain (unlike `workspace_dir`), so children can share a parent's libraries. See [Libraries directory](#libraries-directory). |
+| `situations`                      | No       | Dict of situation overrides and additions                                                                                                                                                                                                                                                            |
+| `directories`                     | No       | Dict of directory overrides and additions                                                                                                                                                                                                                                                            |
+| `environment`                     | No       | Dict of custom key-value variables                                                                                                                                                                                                                                                                   |
+| `file_extension_directories`      | No       | Extension-to-folder routing; see [File Extension Directories](file_extension_directories.md)                                                                                                                                                                                                         |
 
 ### Situation fields
 
@@ -104,7 +106,7 @@ You never need to repeat inherited values. Your project file only needs to conta
 A project can declare another project as its parent. The parent's fully merged template (after the parent has resolved its *own* parent chain) becomes the base, and this project's overlay is applied on top. This lets you keep a shared base configuration in one place — a team-wide directory layout, a fixed set of environment variables, a custom situation — and let derived projects inherit from it instead of restating every field.
 
 ```yaml
-project_template_schema_version: "0.3.2"
+project_template_schema_version: "1.0.0"
 name: "Marketing Renders"
 parent_project_path: "../team-base/griptape-nodes-project.yml"
 
@@ -150,19 +152,92 @@ A parent that cannot be read or parsed surfaces as a validation error on the chi
 
 A workspace zipped on one machine and unpacked on another will keep parent links intact as long as the parent is referenced with a relative path and travels alongside the child inside the workspace. Absolute paths break across machines (different home directories, different drive letters); the relative form is what makes parent chains portable.
 
+## Workspace directory
+
+The optional `workspace_dir` field names the directory this project uses as its [workspace](workspace.md). When set, it is the **highest-priority** workspace source — it overrides the per-user `project_workspaces` mapping, the `GTN_CONFIG_WORKSPACE_DIRECTORY` env var, the project-adjacent config, parent inheritance, and the global default.
+
+When you create a **v1** project, the creation UI writes `workspace_dir: "./"` into it, which makes it self-contained: the workspace resolves to the project's own folder. It is still an ordinary, optional field — clear it (or set it to `null`) to fall back to inheriting the workspace from a parent or the global default. **v0** projects are not given a default `workspace_dir`. (The engine's default template itself leaves `workspace_dir` unset for every major; the `./` is supplied at creation, not inherited from the default.)
+
+The value takes one of two forms:
+
+```yaml
+# A string: absolute, or relative to this project file's directory.
+workspace_dir: "./workspace"
+
+# Or a per-platform mapping with optional linux / darwin / windows / default keys.
+workspace_dir:
+  darwin: "/Volumes/fast/ProjectA"
+  windows: "D:/ProjectA"
+  default: "./workspace"
+```
+
+A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` uses — so a relative value travels with the project across machines and operating systems. The raw value is stored verbatim and only resolved to an absolute path at workspace-resolution time; it is never absolutized on save. The target directory does not need to contain a `griptape_nodes_config.json`; an empty directory is valid.
+
+For the per-platform form, the engine picks the entry matching the current platform. When that platform's key is unset it falls back to `default`. If neither the platform key nor `default` is set, the field yields no value on that platform and workspace resolution falls through to the next source (see [Workspace resolution](workspace.md#workspace-resolution)).
+
+Unlike most fields, `workspace_dir` is **not inherited** from a parent project. It describes this project's own workspace and is taken from this project's overlay alone — a child does not adopt its parent's `workspace_dir`. (Cross-project workspace inheritance is handled separately by the resolution ladder's parent-chain step, not by the merge model.) Setting `workspace_dir: null` or omitting the field both leave the project with no declared workspace.
+
+## Libraries directory
+
+The optional `libraries_dir` field names the directory this project installs and resolves its libraries under, decoupled from the workspace. Use it so a group of related projects can share one library install location — a library is downloaded once and every project that points at the same directory reuses it instead of re-downloading.
+
+The value takes one of two forms:
+
+```yaml
+# A string: absolute, or relative to this project file's directory.
+libraries_dir: "./libraries"
+
+# Or a per-platform mapping with optional linux / darwin / windows / default keys.
+libraries_dir:
+  darwin: "/Volumes/fast/shared-libraries"
+  windows: "D:/shared-libraries"
+  default: "./libraries"
+```
+
+A relative path resolves against the directory of *this* project's YAML file — the same rule `parent_project_path` and `workspace_dir` use — so a relative value travels with the project across machines. The raw value is stored verbatim and only resolved to an absolute path at resolution time; it is never absolutized on save. For the per-platform form, the engine picks the entry matching the current platform, falling back to `default`.
+
+### Inheritance and resolution
+
+`libraries_dir` resolves by the following order, **highest priority first**:
+
+1. The project's **own** `libraries_dir` field.
+1. The nearest ancestor that declares a `libraries_dir`, walking the [parent-project chain](#parent-projects) — resolved against **that ancestor's** directory. This is what lets a child adopt its parent's library tree.
+1. No declared value anywhere in the chain: libraries fall back to the workspace-relative `libraries_directory` config value (default `libraries`, i.e. `<workspace>/libraries`). See [Configuration](../configuration.md#separating-libraries-from-the-workspace).
+
+This is the **key difference from `workspace_dir`**: `workspace_dir` is never inherited from a parent, but `libraries_dir` **is**. A child that declares no `libraries_dir` of its own adopts the nearest ancestor that declares one (only an *explicit* value is inheritable — a parent that leaves the field unset contributes nothing, and the walk continues past it). This is why the creation UI writes `libraries_dir: "./libraries"` into a **top-level** project (whose parent is the system defaults) but leaves it unset on a child: the top-level project declares an explicit, inheritable library root, and each child under it shares that root by default. A child can still declare its own `libraries_dir` to opt out, or set `libraries_dir: null` to tombstone an inherited value and fall back to the workspace-relative default.
+
+Like `workspace_dir`, `libraries_dir` is **not merge-inherited**: it is taken from this project's overlay alone and a child does not pick up the base's value through the [merge model](#the-merge-model). Cross-project inheritance is handled by the resolution order above (the parent-chain walk), not by merge.
+
 ## Validation status
 
 When a project file is loaded, it receives one of four statuses:
 
-| Status     | Meaning                                                                |
-| ---------- | ---------------------------------------------------------------------- |
-| `GOOD`     | Loaded and fully valid                                                 |
-| `FLAWED`   | Loaded but has warnings (e.g., schema version mismatch) — still usable |
-| `UNUSABLE` | Errors prevent the template from being used                            |
-| `MISSING`  | The project file was not found                                         |
+| Status     | Meaning                                                                                |
+| ---------- | -------------------------------------------------------------------------------------- |
+| `GOOD`     | Loaded and fully valid                                                                 |
+| `FLAWED`   | Loaded but has warnings (e.g., behind the latest version for its major) — still usable |
+| `UNUSABLE` | Errors prevent the template from being used                                            |
+| `MISSING`  | The project file was not found                                                         |
 
 When a project file has `UNUSABLE` or `MISSING` status, Griptape Nodes falls back to the system defaults. You can inspect validation problems (with field paths and line numbers) to diagnose issues.
 
 ## The system defaults
 
 The system defaults define these situations and directories out of the box. See [Situations](situations.md) and [Directories](directories.md) for full details.
+
+## Schema versions
+
+`project_template_schema_version` is read as a [semantic version](https://semver.org); its **major** component selects which defaults baseline the project merges onto. This lets the defaults change in a breaking way under a new major while existing projects keep the behavior they were written against:
+
+- **v0 (`0.x`)** — the legacy baseline. File destinations are workspace-root-relative and files are not routed into per-type subfolders by default.
+- **v1 (`1.x`)** — the current baseline. File destinations are workflow-relative, output files route through [file-extension directories](file_extension_directories.md), and a new project is **self-contained by default** — the creation UI writes [`workspace_dir`](#workspace-directory): `./` into a new v1 project so it resolves its workspace to its own folder (the field is an ordinary, removable override, not baked into the default template). A new **top-level** v1 project also gets [`libraries_dir`](#libraries-directory): `./libraries` so its child projects can inherit and share its library tree. New projects are created at `1.0.0`.
+
+A project always merges onto the baseline for **its own** major, so opening an older-major project never silently shifts its layout.
+
+### Saving and version roll-forward
+
+Saving a project rolls its version forward to the latest **within its own major** (an additive change — e.g. a `0.4.0` project becomes `0.5.2` on save). Saving never crosses a major: a v0 project is never silently turned into v1, because that would change where its files land. A project behind the latest version for its major loads with a `FLAWED` warning (still fully usable).
+
+### Upgrading across a major
+
+Moving a project to a new major is **explicit and opt-in** (in the GUI, the "Upgrade schema" action in [Manage Projects](gui_guide.md)). Upgrading re-bases the project on the new major's defaults: only the values you explicitly overrode are kept; everything else adopts the new defaults. This is a **breaking** change — the project's effective workspace, library, and file locations can move — which is why it never happens automatically.

@@ -17,6 +17,12 @@ import os
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from griptape_nodes.drivers.cloud_models import (
+    LM_STUDIO_DEFAULT_BASE_URL,
+    OLLAMA_DEFAULT_BASE_URL,
+    ProviderID,
+)
+
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
 """Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
 
@@ -51,3 +57,62 @@ def build_griptape_cloud_model(
         model_name,
         provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
     )
+
+
+def build_model(
+    model_name: str,
+    *,
+    provider: str = ProviderID.GRIPTAPE_CLOUD,
+    api_key: str | None = None,
+    base_url: str | None = None,
+) -> OpenAIChatModel:
+    """Return an :class:`OpenAIChatModel` for the given provider.
+
+    Args:
+        model_name: Model identifier sent to the API.
+        provider: One of ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``,
+            or ``"custom"``.
+        api_key: API key for the target endpoint. Required for
+            ``"griptape_cloud"`` (falls back to ``GT_CLOUD_API_KEY``) and
+            ``"custom"``. Ignored for ``"ollama"`` and ``"lmstudio"``
+            (no auth needed).
+        base_url: Base URL of the endpoint. For ``"griptape_cloud"`` the
+            ``/api/v1`` suffix is appended automatically. For ``"ollama"``
+            defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. For ``"lmstudio"``
+            defaults to :data:`LM_STUDIO_DEFAULT_BASE_URL`. Required for
+            ``"custom"``.
+
+    Raises:
+        ValueError: If required credentials or URLs are missing.
+    """
+    # Pylance may warn "explicit returns mixed with implicit returns" here, but every
+    # branch either raises or returns — case _: is exhaustive. Pyright agrees.
+    match provider:
+        case ProviderID.GRIPTAPE_CLOUD:
+            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
+        case ProviderID.OLLAMA:
+            resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
+            # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+            )
+        case ProviderID.LMSTUDIO:
+            resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
+            # LM Studio doesn't require auth but the OpenAI client needs a non-empty key.
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
+            )
+        case _:
+            # "custom" or any future provider: caller must supply both url and key.
+            if not base_url:
+                msg = f"base_url is required for provider '{provider}'."
+                raise ValueError(msg)
+            if not api_key:
+                msg = f"api_key is required for provider '{provider}'."
+                raise ValueError(msg)
+            return OpenAIChatModel(
+                model_name,
+                provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
+            )

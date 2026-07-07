@@ -15,6 +15,7 @@ from griptape_nodes.node_library.library_declarations import (
     WorkerCompatibility,
     WorkerMode,
     WorkerModeCompatibility,
+    find_model_catalog,
     resolve_node_models,
 )
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_node_registration_problem import (
@@ -29,7 +30,7 @@ from griptape_nodes.retained_mode.managers.resource_components.resource_instance
 from griptape_nodes.utils.metaclasses import SingletonMeta
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -130,9 +131,9 @@ class LibraryMetadata(BaseModel):
     @model_validator(mode="after")
     def _reject_multiple_model_catalogs(self) -> LibraryMetadata:
         # Node references and the duplicate-id check assume a single catalog
-        # (see library_validation._find_model_catalog). Two catalogs would let
-        # the second one's models go unseen, so reject the ambiguity here where
-        # all declarations are visible together.
+        # (see library_declarations.find_model_catalog, which returns the first).
+        # Two catalogs would let the second one's models go unseen, so reject the
+        # ambiguity here where all declarations are visible together.
         catalog_count = sum(1 for d in self.declarations if isinstance(d, ModelCatalogLibraryProperty))
         if catalog_count > 1:
             msg = (
@@ -248,6 +249,19 @@ class LibraryRegistry(metaclass=SingletonMeta):
     _registered_widgets: ClassVar[dict[str, set[str]]] = {}
 
     @classmethod
+    def _clear(cls) -> None:
+        """Drop every registered library and its tracking state.
+
+        Used by tests to reset the singleton between cases. Centralizes the store
+        list here so renaming a `ClassVar` updates this one method rather than
+        silently degrading callers that would otherwise clear stores by name.
+        """
+        cls._libraries.clear()
+        cls._node_aliases.clear()
+        cls._collision_node_names_to_library_names.clear()
+        cls._registered_widgets.clear()
+
+    @classmethod
     def generate_new_library(
         cls,
         library_data: LibrarySchema,
@@ -273,6 +287,45 @@ class LibraryRegistry(metaclass=SingletonMeta):
         if library_name not in instance._libraries:
             msg = f"Library '{library_name}' was requested to be unregistered, but it wasn't registered in the first place."
             raise KeyError(msg)
+
+        library = instance._libraries[library_name]
+        advanced_library = library.get_advanced_library()
+
+        # Teardown hook — called before any deregistration.
+        if advanced_library:
+            try:
+                advanced_library.before_library_unregistered(library.get_library_data(), library)
+            except Exception as err:
+                logger.error(
+                    "Failed to call before_library_unregistered for library '%s': %s",
+                    library_name,
+                    err,
+                )
+                # Continue — a failing teardown must not prevent unregistration.
+
+        # Deregister tracked handlers. Lazy import required: library_registry is part of the
+        # import chain griptape_nodes → workflow_registry → library_registry, so a top-level
+        # import of GriptapeNodes here would create a circular dependency.
+        from griptape_nodes.retained_mode.griptape_nodes import (
+            GriptapeNodes,
+        )  # circular: griptape_nodes → workflow_registry → library_registry
+
+        event_manager = GriptapeNodes.EventManager()
+
+        if library._registered_app_event_listeners:
+            for event_type, listener in library._registered_app_event_listeners:
+                event_manager.remove_listener_for_app_event(event_type, listener)
+            library._registered_app_event_listeners.clear()
+
+        if library._registered_pre_dispatch_hooks:
+            for hook in library._registered_pre_dispatch_hooks:
+                event_manager.remove_pre_dispatch_hook(hook)
+            library._registered_pre_dispatch_hooks.clear()
+
+        if library._registered_request_handler_types:
+            for request_type in library._registered_request_handler_types:
+                event_manager.remove_manager_from_request_type(request_type)
+            library._registered_request_handler_types.clear()
 
         # Clean up registered widgets for this library
         cls.unregister_widgets_for_library(library_name)
@@ -472,6 +525,11 @@ class Library:
     _node_types: dict[str, type[BaseNode]]
     _node_metadata: dict[str, NodeMetadata]
     _advanced_library: AdvancedNodeLibrary | None
+    # Tracks handlers registered on behalf of this library so they can be
+    # deregistered automatically when the library is unloaded.
+    _registered_app_event_listeners: list[tuple[type, Callable]]
+    _registered_pre_dispatch_hooks: list[Callable]
+    _registered_request_handler_types: list[type]
 
     def __init__(
         self,
@@ -491,6 +549,29 @@ class Library:
         self._node_types = {}
         self._node_metadata = {}
         self._advanced_library = advanced_library
+        self._registered_app_event_listeners = []
+        self._registered_pre_dispatch_hooks = []
+        self._registered_request_handler_types = []
+
+    def get_registered_app_event_listeners(self) -> list[tuple[type, Callable]]:
+        return list(self._registered_app_event_listeners)
+
+    def get_registered_pre_dispatch_hooks(self) -> list[Callable]:
+        return list(self._registered_pre_dispatch_hooks)
+
+    def get_registered_request_handler_types(self) -> list[type]:
+        """Return the request payload types whose handlers this library has registered.
+
+        Tracked for two purposes:
+        - **Teardown**: the engine calls this during ``unregister_library`` to remove
+          all handlers automatically when the library is unloaded.
+        - **Introspection**: other libraries or nodes can call this to discover what
+          request types this library exposes, then use ``dataclasses.fields()`` and
+          ``typing.get_type_hints()`` on each type to inspect its field schema.
+
+        Returns a copy; mutating the returned list has no effect.
+        """
+        return list(self._registered_request_handler_types)
 
     def register_new_node_type(self, node_class: type[BaseNode], metadata: NodeMetadata) -> LibraryProblem | None:
         """Register a new node type in this library. Returns a LibraryProblem if registration fails, or None if all clear."""
@@ -541,10 +622,7 @@ class Library:
         if node_metadata is None:
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
             raise KeyError(msg)
-        catalog = next(
-            (d for d in self._library_data.metadata.declarations if isinstance(d, ModelCatalogLibraryProperty)),
-            None,
-        )
+        catalog = find_model_catalog(self._library_data.metadata.declarations)
         if catalog is None:
             return []
         return resolve_node_models(catalog, node_metadata.declarations)

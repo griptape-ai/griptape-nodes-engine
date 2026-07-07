@@ -27,6 +27,34 @@ class SituationFilePolicy(StrEnum):
     PROMPT = "prompt"  # Special UI handling
 
 
+class BuiltInSituation(StrEnum):
+    """Names of the situations shipped in ``DEFAULT_PROJECT_TEMPLATE``.
+
+    Use these constants instead of raw strings when registering a situation,
+    looking one up via ``GetSituationRequest``, or wiring a destination via
+    ``ProjectFileDestination.from_situation``. The enum members are ``str``
+    subclasses (``StrEnum``), so existing string-typed APIs accept them
+    without changes.
+
+    Projects may add or override situations beyond these built-ins; this
+    enum is only the canonical name registry for the defaults.
+    """
+
+    SAVE_FILE = "save_file"
+    COPY_EXTERNAL_FILE = "copy_external_file"
+    DOWNLOAD_URL = "download_url"
+    SAVE_NODE_OUTPUT = "save_node_output"
+    SAVE_GRIPTAPE_NODES_PREVIEW = "save_griptape_nodes_preview"
+    SAVE_STATIC_FILE = "save_static_file"
+    SAVE_GRIPTAPE_NODES_METADATA = "save_griptape_nodes_metadata"
+    SAVE_WORKFLOW = "save_workflow"
+    CREATE_VERSIONED_WORKFLOW = "create_versioned_workflow"
+    SAVE_WORKFLOW_THUMBNAIL = "save_workflow_thumbnail"
+    SAVE_FAILED_WORKFLOW = "save_failed_workflow"
+    SAVE_TEMP_FILE = "save_temp_file"
+    SAVE_WORKFLOW_BACKUP = "save_workflow_backup"
+
+
 class SituationPolicy(BaseModel):
     """Policy for file operations in a situation."""
 
