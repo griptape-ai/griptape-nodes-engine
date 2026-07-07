@@ -1,4 +1,4 @@
-"""Tests for VariablesManager.on_list_substitutables_request."""
+"""Tests for VariablesManager request handlers."""
 
 from unittest.mock import patch
 
@@ -9,9 +9,15 @@ from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStat
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
     CreateVariableResultSuccess,
+    GetVariablesRequest,
+    GetVariablesResultFailure,
+    GetVariablesResultSuccess,
     ListSubstitutablesRequest,
     ListSubstitutablesResultFailure,
     ListSubstitutablesResultSuccess,
+    ResolveSubstitutionRequest,
+    ResolveSubstitutionResultFailure,
+    ResolveSubstitutionResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -96,3 +102,79 @@ class TestListSubstitutablesRequest:
         with patch(_MACRO_PATCH, return_value={}):
             result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow="does_not_exist"))
         assert isinstance(result, ListSubstitutablesResultFailure)
+
+
+class TestGetVariablesRequest:
+    """GetVariablesRequest returns user-defined variables only — no project macros."""
+
+    def test_returns_user_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "SHOT", "sc001")
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert result.variables == {"SHOT": "sc001"}
+
+    def test_does_not_include_project_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        with patch(_MACRO_PATCH, return_value={"workspace_dir": "/workspace"}):
+            result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert "workspace_dir" not in result.variables
+
+    def test_named_lookup_returns_requested_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "SHOT", "sc001")
+        _add_variable(griptape_nodes, "SHOW", "myshow")
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert result.variables == {"SHOT": "sc001"}
+
+    def test_named_lookup_fails_if_any_name_missing(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "SHOT", "sc001")
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT", "MISSING"]))
+        assert isinstance(result, GetVariablesResultFailure)
+
+    def test_returns_empty_when_no_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert result.variables == {}
+
+    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow="does_not_exist"))
+        assert isinstance(result, GetVariablesResultFailure)
+
+
+class TestResolveSubstitutionRequest:
+    """ResolveSubstitutionRequest merges project macros with user vars; user vars win on collision."""
+
+    def test_returns_user_vars_and_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "SHOT", "sc001")
+        with patch(_MACRO_PATCH, return_value={"workspace_dir": "/workspace"}):
+            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
+        assert isinstance(result, ResolveSubstitutionResultSuccess)
+        assert result.variables["SHOT"] == "sc001"
+        assert result.variables["workspace_dir"] == "/workspace"
+
+    def test_user_var_wins_on_name_collision(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "workspace_dir", "/my/override")
+        with patch(_MACRO_PATCH, return_value={"workspace_dir": "/workspace"}):
+            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
+        assert isinstance(result, ResolveSubstitutionResultSuccess)
+        assert result.variables["workspace_dir"] == "/my/override"
+
+    def test_named_lookup_finds_macro(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        with patch(_MACRO_PATCH, return_value={"workspace_dir": "/workspace"}):
+            result = griptape_nodes.handle_request(
+                ResolveSubstitutionRequest(starting_flow=flow_name, names=["workspace_dir"])
+            )
+        assert isinstance(result, ResolveSubstitutionResultSuccess)
+        assert result.variables == {"workspace_dir": "/workspace"}
+
+    def test_named_lookup_fails_if_not_in_vars_or_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        with patch(_MACRO_PATCH, return_value={}):
+            result = griptape_nodes.handle_request(
+                ResolveSubstitutionRequest(starting_flow=flow_name, names=["MISSING"])
+            )
+        assert isinstance(result, ResolveSubstitutionResultFailure)
+
+    def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
+        with patch(_MACRO_PATCH, return_value={}):
+            result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow="does_not_exist"))
+        assert isinstance(result, ResolveSubstitutionResultFailure)

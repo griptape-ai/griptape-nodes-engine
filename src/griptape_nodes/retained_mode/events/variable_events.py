@@ -390,11 +390,18 @@ class Substitutable:
 @dataclass
 @PayloadRegistry.register
 class ListSubstitutablesRequest(RequestPayload):
-    """List all values available for {VAR} substitution from the starting flow.
+    """List every value that can go inside a {VAR} token, with UI metadata attached.
 
-    Returns user-defined workflow variables and project macro variables
-    (workspace_dir, workflow_name, template directories, etc.) as a unified
-    list of Substitutable objects. The source field distinguishes them.
+    USE THIS for any frontend picker, autocomplete, or display that shows what
+    the user can type inside braces. Returns a unified list of Substitutable
+    objects covering both user-defined workflow variables and project macros
+    (workspace_dir, workflow_name, template directories, etc.). Each entry
+    carries source ("variable" | "macro") and read_only so the UI can render
+    them differently.
+
+    DO NOT use this for execution-time substitution — the list format with
+    metadata is for display, not for fast dict lookup. Use ResolveSubstitutionRequest
+    for that.
 
     Args:
         lookup_scope: Variable lookup strategy (default: hierarchical)
@@ -419,22 +426,46 @@ class ListSubstitutablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
     """Substitutables listing failed."""
 
 
-# Bulk Get/Set Variable Events
+# ---------------------------------------------------------------------------
+# Three events cover "get variables" — pick the right one:
+#
+#   GetVariablesRequest        → user-defined variables only, as a flat dict.
+#                                Use for anything that works with variables the
+#                                user explicitly created (variable panel, nodes).
+#
+#   ResolveSubstitutionRequest → user variables + project macros merged, as a
+#                                flat dict. Use at execution time when you need
+#                                the complete set of values that can substitute
+#                                into {VAR} tokens. Project macros are the base
+#                                layer; user variables override on conflict.
+#
+#   ListSubstitutablesRequest  → same combined set, but as list[Substitutable]
+#                                with source/read_only metadata. Use for any
+#                                frontend picker or autocomplete — not for
+#                                execution paths.
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 @PayloadRegistry.register
 class ResolveSubstitutionRequest(RequestPayload):
-    """Resolve all values available for {VAR} substitution from the starting flow.
+    """Resolve the complete {VAR} substitution context for execution.
 
-    Returns user-defined workflow variables merged with project macro variables
-    (workspace_dir, workflow_name, template directories, etc.). Project macros
-    are the base layer; workflow variables take priority on conflict.
+    USE THIS when a node is about to run and you need every value that can
+    substitute into a {VAR} token — user-defined variables and project macros
+    (workspace_dir, workflow_name, template directories, etc.) merged into one
+    dict. User variables take priority over project macros on name conflict.
 
-    When ``names`` is non-empty, looks up each name individually via
-    ``_find_variable_hierarchical`` and fails (all-or-nothing) if any name is
-    not found. When ``names`` is empty, returns every substitutable value in scope.
+    DO NOT use this to inspect what variables a user has defined — use
+    GetVariablesRequest for that. DO NOT use this to populate a UI picker —
+    use ListSubstitutablesRequest for that (it carries source/read_only metadata).
+
+    When ``names`` is non-empty, looks up each name individually and fails
+    (all-or-nothing) if any name is not found in either user vars or macros.
+    When ``names`` is empty, returns every substitutable value in scope.
 
     Args:
-        names: Specific variable names to retrieve. Empty means "all in scope".
+        names: Specific names to retrieve. Empty means "all in scope".
         lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
     """
@@ -456,6 +487,48 @@ class ResolveSubstitutionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
 @PayloadRegistry.register
 class ResolveSubstitutionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Substitution value resolution failed."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesRequest(RequestPayload):
+    """Get user-defined variable values visible from the starting flow.
+
+    USE THIS when you want only the variables a user explicitly created —
+    the variable panel, the GetVariable node, anything that works with the
+    user's own variable definitions. Returns a flat dict; no project macros
+    (workspace_dir, workflow_name, etc.) are included.
+
+    DO NOT use this at execution time when you need the full substitution
+    context — use ResolveSubstitutionRequest for that.
+
+    When ``names`` is non-empty, looks up each name individually and fails
+    (all-or-nothing) if any name is not found. When ``names`` is empty,
+    returns every variable in scope.
+
+    Args:
+        names: Specific variable names to retrieve. Empty means "all in scope".
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        starting_flow: Starting flow name (None for current flow in the Context Manager)
+    """
+
+    names: list[str] = field(default_factory=list)
+    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
+    starting_flow: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variables retrieved successfully."""
+
+    variables: dict[str, Any]
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Variables retrieval failed."""
 
 
 @dataclass

@@ -19,6 +19,9 @@ from griptape_nodes.retained_mode.events.variable_events import (
     GetVariableRequest,
     GetVariableResultFailure,
     GetVariableResultSuccess,
+    GetVariablesRequest,
+    GetVariablesResultFailure,
+    GetVariablesResultSuccess,
     GetVariableTypeRequest,
     GetVariableTypeResultFailure,
     GetVariableTypeResultSuccess,
@@ -89,6 +92,7 @@ class VariablesManager:
             event_manager.assign_manager_to_request_type(
                 GetVariableDetailsRequest, self.on_get_variable_details_request
             )
+            event_manager.assign_manager_to_request_type(GetVariablesRequest, self.on_get_variables_request)
             event_manager.assign_manager_to_request_type(
                 ResolveSubstitutionRequest, self.on_resolve_substitution_request
             )
@@ -566,6 +570,41 @@ class VariablesManager:
         return ListSubstitutablesResultSuccess(
             substitutables=substitutables,
             result_details=f"Successfully listed {len(substitutables)} substitutable(s).",
+        )
+
+    def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
+        """Get user-defined variable values visible from the starting flow.
+
+        Returns only user-defined workflow variables — no project macros.
+        """
+        try:
+            starting_flow = self._get_starting_flow(request.starting_flow)
+        except ValueError as e:
+            return GetVariablesResultFailure(
+                result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
+            )
+
+        if request.names:
+            result: dict[str, Any] = {}
+            missing: list[str] = []
+            for name in request.names:
+                lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope)
+                if lookup.variable is None:
+                    missing.append(name)
+                else:
+                    result[name] = lookup.variable.value
+            if missing:
+                return GetVariablesResultFailure(
+                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
+                )
+            return GetVariablesResultSuccess(
+                variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
+            )
+
+        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope)
+        all_vars = {v.name: v.value for v in variables}
+        return GetVariablesResultSuccess(
+            variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
 
     def on_resolve_substitution_request(self, request: ResolveSubstitutionRequest) -> ResultPayload:
