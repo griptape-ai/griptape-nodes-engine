@@ -781,6 +781,8 @@ class AgentManager:
             model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
             base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
+            enabled=pd.enabled,
+            icon=pd.icon or None,
         )
         self._providers.append(provider)
         self._persist_providers()
@@ -798,6 +800,10 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
+        if pd.enabled is False and request.name == _PROTECTED_PROVIDER_NAME:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because it is a protected provider and cannot be disabled."
+            )
         if pd.type is not None:
             existing.type = pd.type
         if pd.model is not None:
@@ -807,6 +813,10 @@ class AgentManager:
         if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):
             raw = pd.api_key_secret_name or ""
             existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
+        if pd.enabled is not None:
+            existing.enabled = pd.enabled
+        if "icon" in pd.model_fields_set:
+            existing.icon = pd.icon or None
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
