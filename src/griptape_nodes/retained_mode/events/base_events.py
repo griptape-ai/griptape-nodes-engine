@@ -475,6 +475,10 @@ def _build_path_tree(paths: list[str]) -> dict:
     return tree
 
 
+def _filter_list(items: list, subtree: dict) -> list:
+    return [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in items]
+
+
 def _apply_wildcard_tree(data: dict, subtree: dict) -> dict:
     # Applies subtree to every value in data, used when the dict's keys are arbitrary
     # (e.g. workflow file paths) rather than fixed field names. See _apply_path_tree.
@@ -482,17 +486,15 @@ def _apply_wildcard_tree(data: dict, subtree: dict) -> dict:
         return dict(data)
     filtered = {}
     for k, v in data.items():
-        if isinstance(v, list):
-            filtered[k] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in v]
-        else:
-            filtered[k] = _apply_path_tree(v, subtree)
+        filtered[k] = _filter_list(v, subtree) if isinstance(v, list) else _apply_path_tree(v, subtree)
     return filtered
 
 
 def _apply_path_tree(data: Any, tree: dict) -> Any:
     # Called by EventResult.dict() to prune the unstructured result dict before WebSocket broadcast.
-    # Frontend sets RequestPayload.fields (e.g. ["workflows.*.name"]) to avoid sending 256KB+
-    # payloads when only a few fields are needed. Framework fields are re-added by the caller.
+    # Frontend sets RequestPayload.fields (e.g. ["workflows.*.name"]) to shrink the wire payload;
+    # safe_unstructure still materializes the full result in memory — only transmission is reduced.
+    # Framework fields are re-added by the caller after this returns.
     if not isinstance(data, dict):
         return data
 
@@ -517,7 +519,7 @@ def _apply_path_tree(data: Any, tree: dict) -> Any:
         if not subtree:
             result[key] = value  # leaf — keep value whole
         elif isinstance(value, list):
-            result[key] = [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in value]
+            result[key] = _filter_list(value, subtree)
         else:
             result[key] = _apply_path_tree(value, subtree)
     return result
