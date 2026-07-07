@@ -182,6 +182,7 @@ def load_project_template_from_yaml(  # noqa: C901
     """
     # Lazy import required: circular dependency between this module and project.py
     # project.py imports ProjectOverlayData from this file, and we need ProjectTemplate from project.py
+    from griptape_nodes.common.project_templates.default_project_template import latest_version_for_major
     from griptape_nodes.common.project_templates.project import ProjectTemplate
 
     # Pass 1: Load YAML with line tracking
@@ -231,12 +232,14 @@ def load_project_template_from_yaml(  # noqa: C901
 
         return None
     else:
-        # Add warnings for schema version mismatches
-        if template.project_template_schema_version != ProjectTemplate.LATEST_SCHEMA_VERSION:
-            message = (
-                f"Schema version '{template.project_template_schema_version}' "
-                f"differs from latest '{ProjectTemplate.LATEST_SCHEMA_VERSION}'"
-            )
+        # Warn only when the project is behind the latest version WITHIN ITS OWN MAJOR -- the
+        # version it will roll up to on the next save. A project intentionally staying on an
+        # older major (the version-fork design) is NOT a mismatch and must not warn; crossing a
+        # major is a separate, elective upgrade surfaced in the UI, not a load-time warning.
+        version = template.project_template_schema_version
+        latest_in_major = latest_version_for_major(version)
+        if latest_in_major is not None and version != latest_in_major:
+            message = f"Schema version '{version}' is behind the latest '{latest_in_major}' for its major"
             validation_info.add_warning(
                 field_path=FIELD_PROJECT_TEMPLATE_SCHEMA_VERSION,
                 message=message,

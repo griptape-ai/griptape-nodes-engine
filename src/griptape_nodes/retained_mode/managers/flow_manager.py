@@ -477,9 +477,14 @@ class FlowManager:
         if self.is_referenced_workflow(flow):
             referenced_workflow_name = self.get_referenced_workflow_name(flow)
 
+        flow_type = flow.metadata.get("flow_type")
+
         details = f"Successfully retrieved Flow details for '{flow_name}'."
         return GetFlowDetailsResultSuccess(
-            referenced_workflow_name=referenced_workflow_name, parent_flow_name=parent_flow_name, result_details=details
+            referenced_workflow_name=referenced_workflow_name,
+            parent_flow_name=parent_flow_name,
+            flow_type=flow_type,
+            result_details=details,
         )
 
     def on_get_flow_metadata_request(self, request: GetFlowMetadataRequest) -> ResultPayload:
