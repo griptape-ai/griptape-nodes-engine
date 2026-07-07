@@ -74,3 +74,59 @@ class TestGetPublicUrlForParameter:
         # The error should name the parameter so the editor points at the real cause.
         assert "image" in str(excinfo.value)
         driver.upload_file.assert_not_called()
+
+
+class TestGetBucketId:
+    """Covers GT_CLOUD_BUCKET_ID resolution -- see griptape-ai/griptape-nodes-engine#5074.
+
+    A blank or invalid bucket secret used to be returned verbatim and only failed later
+    as an opaque 404 from a `/api/buckets//assets/...` URL. These tests pin the fail-fast
+    behavior: a valid ID passes through, a blank one falls back to auto-select, and an
+    invalid/unmatched one raises a clear, actionable error.
+    """
+
+    MODULE = "griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_parameter"
+
+    def _patch(self, mocker: Any, *, bucket_id_value: str | None, buckets: list[dict]) -> None:
+        mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=bucket_id_value)
+        mocker.patch(
+            f"{self.MODULE}.GriptapeCloudStorageDriver.list_buckets",
+            return_value=buckets,
+        )
+
+    def test_valid_bucket_id_passes_through(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="bucket-123", buckets=[{"bucket_id": "bucket-123"}])
+
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "bucket-123"
+
+    def test_unset_secret_auto_selects_first_bucket(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value=None, buckets=[{"bucket_id": "auto-1"}, {"bucket_id": "auto-2"}])
+
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "auto-1"
+
+    def test_blank_secret_auto_selects_first_bucket(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="   ", buckets=[{"bucket_id": "auto-1"}])
+
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "auto-1"
+
+    def test_invalid_bucket_id_raises_clear_error(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="does-not-exist", buckets=[{"bucket_id": "real-1"}])
+
+        with pytest.raises(RuntimeError, match="invalid bucket ID") as excinfo:
+            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+
+        message = str(excinfo.value)
+        assert PublicArtifactUrlParameter.BUCKET_ID_NAME in message
+        assert "does-not-exist" in message
+
+    def test_blank_secret_with_no_buckets_names_the_secret(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="", buckets=[])
+
+        with pytest.raises(RuntimeError, match=PublicArtifactUrlParameter.BUCKET_ID_NAME):
+            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
+
+    def test_unset_secret_with_no_buckets_raises_original_message(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value=None, buckets=[])
+
+        with pytest.raises(RuntimeError, match="No Griptape Cloud storage buckets found"):
+            PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
