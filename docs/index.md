@@ -12,5 +12,5 @@ With Griptape Nodes, you can connect visual building blocks that represent powe
 
 Whether you're a creative who wants to explore new AI-powered possibilities, a knowledge worker looking to automate tedious tasks, or a curious mind wanting to experiment with cutting-edge technology, Griptape Nodes opens doors you might have thought were locked to all but professional programmers.
 
-And for those who want to go deeper? A little Python knowledge goes a long way here. Our [simple scripting interface](retained_mode.md) lets you customize and extend what's possible, turning your big ideas into working solutions without requiring an engineering degree.
+And for those who want to go deeper? A little Python knowledge goes a long way here. Our [simple scripting interface](development/retained_mode.md) lets you customize and extend what's possible, turning your big ideas into working solutions without requiring an engineering degree.
 Griptape Nodes is where your imagination meets AI capability. Let's build something amazing together.
