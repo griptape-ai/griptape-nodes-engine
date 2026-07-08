@@ -303,7 +303,7 @@ class LibrarySettings(BaseModel):
         default=False,
         description=(
             "When True, a library update is withheld until the commit it would update to is at least "
-            "`update_min_age_hours` old (a soak period). This guards against automatically adopting a "
+            "`update_min_age_hours` old (a minimum release age). This guards against automatically adopting a "
             "freshly-pushed release before there is time to catch and yank a bad one. When False (default), "
             "updates apply as soon as they are available. If the target commit's age cannot be determined "
             "(e.g. the remote timestamp is unreadable), the update is allowed (fail-open) and a warning is "

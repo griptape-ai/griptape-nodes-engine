@@ -1253,5 +1253,5 @@ class TestParseCommitDatetime:
         assert parse_commit_datetime("") is None
         assert parse_commit_datetime("   ") is None
 
-    def test_returns_none_for_unparseable_string(self) -> None:
+    def test_returns_none_for_unparsable_string(self) -> None:
         assert parse_commit_datetime("not-a-date") is None

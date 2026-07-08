@@ -186,7 +186,7 @@ class TestUpdateLibraryRequestAgeGate:
 
     @pytest.mark.asyncio
     async def test_young_target_commit_blocks_update(self, griptape_nodes: GriptapeNodes) -> None:
-        """A target commit younger than the soak period blocks the update without touching git."""
+        """A target commit younger than the minimum age blocks the update without touching git."""
         library_manager = griptape_nodes.LibraryManager()
         library_dir = Path("/var/lib/test_lib")
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
@@ -218,7 +218,7 @@ class TestUpdateLibraryRequestAgeGate:
 
     @pytest.mark.asyncio
     async def test_old_target_commit_allows_update(self, griptape_nodes: GriptapeNodes) -> None:
-        """A target commit older than the soak period is allowed through to the git update."""
+        """A target commit older than the minimum age is allowed through to the git update."""
         library_manager = griptape_nodes.LibraryManager()
         library_dir = Path("/var/lib/test_lib")
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)

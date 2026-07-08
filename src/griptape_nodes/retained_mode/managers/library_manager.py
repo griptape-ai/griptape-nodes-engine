@@ -5589,7 +5589,7 @@ class LibraryManager:
             return CheckLibraryUpdateResultFailure(result_details=details)
 
         # Evaluate the age gate only when an update actually exists, so callers can surface a
-        # "pending soak" state. Skipping the evaluation when up to date avoids a spurious
+        # "pending age gate" state. Skipping the evaluation when up to date avoids a spurious
         # "timestamp could not be determined" warning (there is simply nothing to gate) and the
         # cost of the decision on the common no-update path.
         if has_update:
@@ -5606,7 +5606,7 @@ class LibraryManager:
             details = (
                 f"Update available for Library '{library_name}' ({current_version} -> {latest_version}), but the "
                 f"target commit is {target_commit_age_hours:.1f}h old, younger than the required "
-                f"{update_min_age_hours:.1f}h soak period. Update will be available once the target commit ages."
+                f"{update_min_age_hours:.1f}h minimum age. Update will be available once the target commit ages."
             )
             logger.info(details)
         else:
@@ -5786,7 +5786,7 @@ class LibraryManager:
             details = f"Cannot update Library '{library_name}'. Repository contains multiple libraries and must be updated manually."
             return UpdateLibraryResultFailure(result_details=details)
 
-        # Enforce the update age gate (soak period) before mutating the working tree. Only pay the
+        # Enforce the update age gate before mutating the working tree. Only pay the
         # remote round-trip when gating is actually enabled, so the common (disabled) path is free.
         age_gate_config = self._read_age_gate_config()
         if age_gate_config.enabled:
@@ -5796,7 +5796,7 @@ class LibraryManager:
                 details = (
                     f"Cannot update Library '{library_name}' yet: the target commit is "
                     f"{age_gate.age_hours:.1f}h old, younger than the required {age_gate.min_age_hours:.1f}h "
-                    f"soak period (library.update_age_gating_enabled). Try again once the target commit ages."
+                    f"minimum age (library.update_age_gating_enabled). Try again once the target commit ages."
                 )
                 logger.info(details)
                 return UpdateLibraryResultFailure(result_details=details, age_gated=True)
@@ -6247,7 +6247,7 @@ class LibraryManager:
 
             # An update exists but is withheld by the age gate: skip it this cycle rather than
             # attempting an update that update_library_request would refuse. It will apply on a
-            # later sync once the target commit clears the soak period.
+            # later sync once the target commit reaches the minimum age.
             if check_result.update_gated_by_age:
                 libraries_deferred += 1
                 logger.info(
