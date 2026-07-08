@@ -319,7 +319,7 @@ class WorkflowPackager:
                 git_root = next(p for p in (pkg_dir, *pkg_dir.parents) if (p / ".git").is_dir())
                 commit = (
                     subprocess.check_output(  # noqa: S603
-                        [git_exe, "rev-parse", "--short", "HEAD"],
+                        [git_exe, "rev-parse", "HEAD"],
                         cwd=git_root,
                         stderr=subprocess.DEVNULL,
                     )
@@ -332,7 +332,9 @@ class WorkflowPackager:
                 return "git", commit
 
         if "vcs_info" in direct_url_info:
-            commit_id = direct_url_info["vcs_info"].get("commit_id", "")[:7]
+            commit_id = direct_url_info["vcs_info"].get("commit_id", "")
+            if not commit_id:
+                return "pypi", None
             return "git", commit_id
 
         return "pypi", None
