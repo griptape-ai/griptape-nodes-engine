@@ -376,6 +376,13 @@ class UndoManager:
         if self._is_replaying:
             return None
 
+        # Nothing to track: no recording frame is open and this dispatch cannot open one (only a
+        # user-initiated request, which carries a request_id, opens a frame). Returning None keeps
+        # internal dispatches (e.g. execution-time events) off the shared dispatch stack, so
+        # concurrently-interleaved begin/end calls cannot orphan captures on it.
+        if self._active_frame is None and request_id is None:
+            return None
+
         opened_frame = False
         records = False
         if self._active_frame is None:
@@ -467,6 +474,14 @@ class UndoManager:
             self.clear_history()
             details = f"Attempted to undo '{batch.label}'. Failed because {err}. Undo history has been cleared."
             return UndoResultFailure(result_details=details)
+        except Exception as err:
+            # An entry raised something other than UndoEntryReplayError (e.g. an un-deep-copyable
+            # redo request). The workflow is now partially reverted, so history can no longer be
+            # trusted; clear it and surface a typed failure rather than leaking the raw exception.
+            logger.exception("Unexpected error while undoing '%s'; clearing undo history.", batch.label)
+            self.clear_history()
+            details = f"Attempted to undo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
+            return UndoResultFailure(result_details=details)
         finally:
             self._is_replaying = False
 
@@ -492,6 +507,14 @@ class UndoManager:
         except UndoEntryReplayError as err:
             self.clear_history()
             details = f"Attempted to redo '{batch.label}'. Failed because {err}. Undo history has been cleared."
+            return RedoResultFailure(result_details=details)
+        except Exception as err:
+            # An entry raised something other than UndoEntryReplayError. The workflow is now
+            # partially re-applied, so history can no longer be trusted; clear it and surface a
+            # typed failure rather than leaking the raw exception.
+            logger.exception("Unexpected error while redoing '%s'; clearing undo history.", batch.label)
+            self.clear_history()
+            details = f"Attempted to redo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
             return RedoResultFailure(result_details=details)
         finally:
             self._is_replaying = False

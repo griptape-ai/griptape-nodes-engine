@@ -384,6 +384,44 @@ class TestUndoManager:
         assert isinstance(redo_result, RedoResultSuccess)
         assert self._connection_exists("Target", "text")
 
+    def test_undo_create_connection_restores_overwritten_property_value(self, griptape_nodes: GriptapeNodes) -> None:
+        """Undoing a connection restores the PROPERTY value the connection overwrote on the target."""
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+
+        assert self._user_request(
+            SetParameterValueRequest(node_name="Target", parameter_name="text", value="typed")
+        ).succeeded()
+        assert self._user_request(
+            SetParameterValueRequest(node_name="Source", parameter_name="text", value="world")
+        ).succeeded()
+
+        # Connecting overwrites Target.text with Source's value.
+        assert isinstance(
+            self._user_request(
+                CreateConnectionRequest(
+                    source_node_name="Source",
+                    source_parameter_name="text",
+                    target_node_name="Target",
+                    target_parameter_name="text",
+                )
+            ),
+            CreateConnectionResultSuccess,
+        )
+        overwritten = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="Target", parameter_name="text"))
+        assert isinstance(overwritten, GetParameterValueResultSuccess)
+        assert overwritten.value == "world"
+
+        # Undo removes the edge and restores the value the connection overwrote.
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert not self._connection_exists("Target", "text")
+        restored = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="Target", parameter_name="text"))
+        assert isinstance(restored, GetParameterValueResultSuccess)
+        assert restored.value == "typed"
+
     def test_undo_delete_connection_restores_it(self, griptape_nodes: GriptapeNodes) -> None:
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)

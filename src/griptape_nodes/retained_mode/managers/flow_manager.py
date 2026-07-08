@@ -177,7 +177,7 @@ from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
@@ -1117,6 +1117,22 @@ class FlowManager:
             ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
         )
         is_dest_node_locked = target_node.lock
+        # Capture the target's prior property value so undoing this connection can restore it.
+        # Deleting a connection does not wipe a PROPERTY parameter's value, so without this the
+        # value the connection is about to overwrite would be lost on undo. Non-PROPERTY targets
+        # are wiped on disconnect, which already matches their pre-connection state.
+        target_prior_value_for_undo = None
+        target_had_prior_value_for_undo = False
+        if (
+            not request.initial_setup
+            and ParameterMode.PROPERTY in target_param.allowed_modes
+            and target_param.name in target_node.parameter_values
+        ):
+            try:
+                target_prior_value_for_undo = copy.deepcopy(target_node.get_parameter_value(target_param.name))
+                target_had_prior_value_for_undo = True
+            except Exception:
+                target_had_prior_value_for_undo = False
         if (not is_control_parameter) and (not is_dest_node_locked) and (not request.initial_setup):
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
@@ -1152,13 +1168,27 @@ class FlowManager:
 
         # Record how to reverse this connection for undo: the inverse is deleting it, and redo
         # re-creates it with the resolved names (so it does not depend on the Current Context).
-        GriptapeNodes.UndoManager().record_inverse(
+        undo_requests: list[RequestPayload] = [
             DeleteConnectionRequest(
                 source_node_name=source_node_name,
                 source_parameter_name=request.source_parameter_name,
                 target_node_name=target_node_name,
                 target_parameter_name=request.target_parameter_name,
-            ),
+            )
+        ]
+        if target_had_prior_value_for_undo:
+            # Restore the property value the connection overwrote, after the edge is removed so the
+            # INPUT+PROPERTY "connected, cannot set as property" guard no longer blocks the set.
+            undo_requests.append(
+                SetParameterValueRequest(
+                    node_name=target_node_name,
+                    parameter_name=request.target_parameter_name,
+                    value=target_prior_value_for_undo,
+                    data_type=target_param.type,
+                )
+            )
+        GriptapeNodes.UndoManager().record_inverse(
+            undo_requests,
             label=f"Connect '{source_node_name}.{request.source_parameter_name}' to '{target_node_name}.{request.target_parameter_name}'",
             forward=CreateConnectionRequest(
                 source_node_name=source_node_name,
