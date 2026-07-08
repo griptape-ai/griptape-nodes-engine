@@ -237,7 +237,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.undo.node import (
+from griptape_nodes.retained_mode.managers.undo.recorders.node import (
     CreateNodeRecorder,
     DeleteNodeRecorder,
     SetParameterValueRecorder,
