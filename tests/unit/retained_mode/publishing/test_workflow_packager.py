@@ -4,8 +4,6 @@ import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from urllib.parse import urlparse
-from urllib.request import url2pathname
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
 from griptape_nodes.retained_mode.publishing.workflow_packager import WorkflowPackager
@@ -226,6 +224,7 @@ class TestGetInstallSource:
         packager = WorkflowPackager("test_workflow")
         full_sha = "a11a1dd14af250387e60127a1ed63841f0950db3"
         url = "file:///Users/dev/griptape-nodes-engine"
+        checkout = "/checkout/griptape-nodes-engine"
         dist = MagicMock()
         dist.read_text.return_value = json.dumps({"url": url, "dir_info": {"editable": True}})
 
@@ -236,6 +235,10 @@ class TestGetInstallSource:
                 return_value="/usr/bin/git",
             ),
             patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.url2pathname",
+                return_value=checkout,
+            ) as mock_url2pathname,
+            patch(
                 "griptape_nodes.retained_mode.publishing.workflow_packager.subprocess.check_output",
                 return_value=(full_sha + "\n").encode(),
             ) as mock_check_output,
@@ -244,11 +247,11 @@ class TestGetInstallSource:
 
         assert source == "git"
         assert commit == full_sha
-        # The commit is resolved against the checkout path from the url, not site-packages.
-        # Compare against the same file://-to-path conversion the code uses so the assertion
-        # holds on both POSIX and Windows path separators.
-        expected_checkout = str(Path(url2pathname(urlparse(url).path)))
-        assert mock_check_output.call_args.args[0] == ["/usr/bin/git", "-C", expected_checkout, "rev-parse", "HEAD"]
+        # The path handed to the filesystem converter comes from the url's path component
+        # (the checkout), not from dist.locate_file()/site-packages.
+        mock_url2pathname.assert_called_once_with("/Users/dev/griptape-nodes-engine")
+        # git resolves the commit in that checkout directory.
+        assert mock_check_output.call_args.args[0] == ["/usr/bin/git", "-C", str(Path(checkout)), "rev-parse", "HEAD"]
 
     def test_editable_install_without_git_repo_falls_back_to_file(self) -> None:
         """A file:// install whose checkout is not a git repo reports 'file' with no commit."""
