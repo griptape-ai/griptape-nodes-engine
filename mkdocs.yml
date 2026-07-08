@@ -173,10 +173,17 @@ nav:
           - File Extension Directories: projects/file_extension_directories.md
           - Customization Guide: projects/customization.md
   - How-To:
+      - Agent Sidebar: how_to/agent_sidebar.md
       - Making Custom Nodes: how_to/making_custom_nodes.md
       - Making Custom Scripts: how_to/making_custom_scripts.md
       - For Agents: for_agents.md
       - External Resources:
+          - AI Providers:
+              - Overview: how_to/ai_providers/index.md
+              - Griptape Cloud: how_to/ai_providers/griptape_cloud.md
+              - Ollama: how_to/ai_providers/ollama.md
+              - LM Studio: how_to/ai_providers/lm_studio.md
+              - Custom (OpenAI-compatible): how_to/ai_providers/custom.md
           - Keys:
               - OpenAI: how_to/keys/openai.md
               - Grok: how_to/keys/grok.md
