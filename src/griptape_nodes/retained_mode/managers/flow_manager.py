@@ -179,6 +179,7 @@ from griptape_nodes.retained_mode.variable_types import VariableScope
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
@@ -263,7 +264,7 @@ class FlowManager:
     _global_dag_builder: DagBuilder
     _node_executor: NodeExecutor
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, undo_manager: UndoManager | None = None) -> None:
         event_manager.assign_manager_to_request_type(CreateFlowRequest, self.on_create_flow_request)
         event_manager.assign_manager_to_request_type(DeleteFlowRequest, self.on_delete_flow_request)
         event_manager.assign_manager_to_request_type(ListNodesInFlowRequest, self.on_list_nodes_in_flow_request)
@@ -314,6 +315,18 @@ class FlowManager:
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
+
+        # Connection and execution requests alter workflow state but are not yet undoable. Declaring
+        # them keeps them from invalidating undo history. Each becomes a recorder as coverage grows.
+        # undo_manager is None in isolated unit tests that construct FlowManager directly.
+        if undo_manager is not None:
+            undo_manager.register_non_undoable(
+                CreateConnectionRequest,
+                DeleteConnectionRequest,
+                StartFlowRequest,
+                CancelFlowRequest,
+                UnresolveFlowRequest,
+            )
 
     @property
     def global_single_node_resolution(self) -> bool:
