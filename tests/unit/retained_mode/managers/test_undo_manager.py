@@ -280,6 +280,76 @@ class TestUndoManager:
         assert isinstance(redo_result, RedoResultSuccess)
         assert not GriptapeNodes.ObjectManager().has_object_with_name("ProbeA")
 
+    # ---------- Parameter value ----------
+
+    def test_set_parameter_value_records_batch(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="ProbeA")
+
+        set_result = self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="hello")
+        )
+        assert set_result.succeeded()
+
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert state.undo_labels == ["Create node 'ProbeA'", "Set 'ProbeA.text'"]
+
+    def test_undo_set_parameter_value_restores_previous_value(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="ProbeA")
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="first")
+        ).succeeded()
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="second")
+        ).succeeded()
+
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert undo_result.undone_label == "Set 'ProbeA.text'"
+
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value == "first"
+
+    def test_undo_redo_parameter_value_roundtrip(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="ProbeA")
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="hello")
+        ).succeeded()
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        after_undo = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(after_undo, GetParameterValueResultSuccess)
+        assert after_undo.value == ""
+
+        redo_result = GriptapeNodes.handle_request(RedoRequest())
+        assert isinstance(redo_result, RedoResultSuccess)
+        assert redo_result.redone_label == "Set 'ProbeA.text'"
+        after_redo = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(after_redo, GetParameterValueResultSuccess)
+        assert after_redo.value == "hello"
+
+    def test_internal_parameter_set_not_recorded(self, griptape_nodes: GriptapeNodes) -> None:
+        """A set with no request_id (internal origin) is not recorded."""
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="ProbeA")
+
+        result = griptape_nodes.handle_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="internal")
+        )
+        assert result.succeeded()
+
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert state.undo_labels == ["Create node 'ProbeA'"]
+
     # ---------- Recording eligibility ----------
 
     def test_internal_request_not_recorded(self, griptape_nodes: GriptapeNodes) -> None:
@@ -323,20 +393,21 @@ class TestUndoManager:
         undo_result = GriptapeNodes.handle_request(UndoRequest())
         assert isinstance(undo_result, UndoResultFailure)
 
-    def test_ignored_user_mutation_preserves_history(self, griptape_nodes: GriptapeNodes) -> None:
-        """A user mutation on the ignored list neither records nor clears history."""
+    def test_noop_parameter_set_preserves_history(self, griptape_nodes: GriptapeNodes) -> None:
+        """Setting a parameter to its current value changes nothing, so it neither records nor clears."""
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)
         self._create_node(flow_name, node_name="ProbeA")
 
+        # The parameter already holds its default (""); setting it again is a no-op.
         set_value_result = self._user_request(
-            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="hello")
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="")
         )
         assert set_value_result.succeeded()
 
         state = GriptapeNodes.handle_request(GetUndoStateRequest())
         assert isinstance(state, GetUndoStateResultSuccess)
-        # Create is still undoable; the set-value did not clear it or add an entry.
+        # Create is still undoable; the no-op set neither cleared it nor added an entry.
         assert state.undo_labels == ["Create node 'ProbeA'"]
 
     def test_new_recorded_action_clears_redo_stack(self, griptape_nodes: GriptapeNodes) -> None:
@@ -396,34 +467,6 @@ class TestUndoManager:
             undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
 
     # ---------- record_inverse (in-handler declaration) ----------
-
-    def test_record_inverse_records_and_undoes(self, griptape_nodes: GriptapeNodes) -> None:
-        """record_inverse attaches an inverse to the active dispatch frame; undo replays it."""
-        self._register_library()
-        flow_name = self._make_flow(griptape_nodes)
-        self._create_node(flow_name, node_name="ProbeA")
-        undo_manager = griptape_nodes.UndoManager()
-
-        # Simulate a handler that, while servicing a user request, mutates state and declares its
-        # inverse. No handler calls record_inverse yet (Phase 3), so drive the frame API directly.
-        forward = SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="new")
-        capture = undo_manager.begin_request_dispatch(forward, request_id="sim")
-        result = griptape_nodes.handle_request(forward)
-        assert result.succeeded()
-        undo_manager.record_inverse(
-            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="old"),
-            label="Set ProbeA.text",
-        )
-        undo_manager.end_request_dispatch(capture, forward, result)
-
-        state = GriptapeNodes.handle_request(GetUndoStateRequest())
-        assert isinstance(state, GetUndoStateResultSuccess)
-        assert state.undo_labels[-1] == "Set ProbeA.text"
-
-        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
-        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
-        assert isinstance(value_result, GetParameterValueResultSuccess)
-        assert value_result.value == "old"
 
     def test_record_inverse_noop_outside_frame(self, griptape_nodes: GriptapeNodes) -> None:
         """record_inverse is a safe no-op when nothing is being recorded."""

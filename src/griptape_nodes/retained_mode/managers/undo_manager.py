@@ -303,12 +303,19 @@ class UndoManager:
             return
         capture = self._dispatch_stack[-1]
         forward_source = forward if forward is not None else capture.request
-        undo_requests = [_prepare_replay_request(request) for request in _as_sequence(inverse)]
-        redo_requests = (
-            [_prepare_replay_request(request) for request in _as_sequence(forward_source)]
-            if forward_source is not None
-            else []
-        )
+        try:
+            undo_requests = [_prepare_replay_request(request) for request in _as_sequence(inverse)]
+            redo_requests = (
+                [_prepare_replay_request(request) for request in _as_sequence(forward_source)]
+                if forward_source is not None
+                else []
+            )
+        except Exception:
+            # Snapshotting must never break the operation being handled. If a value cannot be
+            # deep-copied, this action simply will not be undoable; history is left untouched
+            # (types that record inline are declared non-undoable, so they will not invalidate it).
+            logger.exception("Failed to snapshot requests for undo of '%s'; this action will not be undoable.", label)
+            return
         self._active_frame.entries.append(
             RequestReplayUndoEntry(undo_requests=undo_requests, redo_requests=redo_requests)
         )

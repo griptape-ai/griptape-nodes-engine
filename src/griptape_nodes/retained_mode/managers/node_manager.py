@@ -415,8 +415,11 @@ class NodeManager:
         if undo_manager is not None:
             undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
             undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
-            # Node mutations that alter workflow state but are not yet undoable. Declaring them keeps
-            # them from invalidating history. Each becomes a recorder as undo coverage grows.
+            # Node mutations declared non-undoable act as the floor for the undo system: a user
+            # mutation of one of these neither records nor invalidates history. SetParameterValueRequest
+            # is recorded inline via record_inverse when the value actually changes (see the handler);
+            # it stays listed here so no-op sets (unchanged value) do not invalidate history. The
+            # others are not yet undoable and become recorders as coverage grows.
             undo_manager.register_non_undoable(
                 SetParameterValueRequest,
                 SetNodeMetadataRequest,
@@ -2610,6 +2613,13 @@ class NodeManager:
         should_check_output_side_effects = not request.initial_setup and not request.is_output
         output_snapshot = dict(node.parameter_output_values) if should_check_output_side_effects else None
 
+        # Capture the pre-set value so a user property edit can be reversed by undo. Skip internal
+        # writes: workflow load (initial_setup), output-value writes, and downstream propagation
+        # (incoming_node_set), which are reproduced when the originating edit is undone rather than
+        # reverted individually.
+        is_user_property_edit = not request.initial_setup and not request.is_output and not incoming_node_set
+        old_value_for_undo = node.get_parameter_value(request.parameter_name) if is_user_property_edit else None
+
         try:
             finalized_value, modified = self._set_and_pass_through_values(request, node)
         except Exception as err:
@@ -2683,6 +2693,20 @@ class NodeManager:
                     )
 
         # Cool.
+        # Record how to reverse this edit for undo. Only genuine user property edits that actually
+        # changed the value are recorded; a no-op set (unchanged value) records nothing and, because
+        # SetParameterValueRequest is declared non-undoable, does not invalidate history either.
+        if is_user_property_edit and modified:
+            GriptapeNodes.UndoManager().record_inverse(
+                SetParameterValueRequest(
+                    node_name=node_name,
+                    parameter_name=request.parameter_name,
+                    value=old_value_for_undo,
+                    data_type=parameter.type,
+                ),
+                label=f"Set '{node_name}.{request.parameter_name}'",
+            )
+
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
         result = SetParameterValueResultSuccess(
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
