@@ -1,5 +1,7 @@
 """Tests for WorkflowPackager transitive library dependency resolution."""
 
+import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -183,3 +185,133 @@ class TestCopyStaticFiles:
 
         mock_copy_file.assert_called_once_with(source, destination / relative)
         mock_copy_tree.assert_not_called()
+
+
+class TestGetInstallSource:
+    """get_install_source pins the full commit SHA so the git ref is fetchable from the remote."""
+
+    def test_vcs_info_returns_full_commit_id(self) -> None:
+        """A git install exposes the full 40-char commit SHA, not an abbreviated one."""
+        packager = WorkflowPackager("test_workflow")
+        full_sha = "d1e0a500e25ced659d30d82f0cae4073523e42a5"
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps(
+            {"url": "https://github.com/griptape-ai/griptape-nodes.git", "vcs_info": {"commit_id": full_sha}}
+        )
+
+        with patch.object(packager, "find_griptape_nodes_distribution", return_value=dist):
+            source, commit = packager.get_install_source()
+
+        assert source == "git"
+        assert commit == full_sha
+
+    def test_vcs_info_without_commit_falls_back_to_pypi(self) -> None:
+        """A git install missing its commit id falls back to pypi instead of an empty ref."""
+        packager = WorkflowPackager("test_workflow")
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps(
+            {"url": "https://github.com/griptape-ai/griptape-nodes.git", "vcs_info": {}}
+        )
+
+        with patch.object(packager, "find_griptape_nodes_distribution", return_value=dist):
+            source, commit = packager.get_install_source()
+
+        assert source == "pypi"
+        assert commit is None
+
+    def test_editable_install_resolves_commit_from_source_checkout(self) -> None:
+        """An editable (file://) install resolves the commit from the checkout url, not site-packages."""
+        packager = WorkflowPackager("test_workflow")
+        full_sha = "a11a1dd14af250387e60127a1ed63841f0950db3"
+        url = "file:///Users/dev/griptape-nodes-engine"
+        checkout = "/checkout/griptape-nodes-engine"
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps({"url": url, "dir_info": {"editable": True}})
+
+        with (
+            patch.object(packager, "find_griptape_nodes_distribution", return_value=dist),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.which",
+                return_value="/usr/bin/git",
+            ),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.url2pathname",
+                return_value=checkout,
+            ) as mock_url2pathname,
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.subprocess.check_output",
+                return_value=(full_sha + "\n").encode(),
+            ) as mock_check_output,
+        ):
+            source, commit = packager.get_install_source()
+
+        assert source == "git"
+        assert commit == full_sha
+        # The path handed to the filesystem converter comes from the url's path component
+        # (the checkout), not from dist.locate_file()/site-packages.
+        mock_url2pathname.assert_called_once_with("/Users/dev/griptape-nodes-engine")
+        # git resolves the commit in that checkout directory.
+        assert mock_check_output.call_args.args[0] == ["/usr/bin/git", "-C", str(Path(checkout)), "rev-parse", "HEAD"]
+
+    def test_editable_install_without_git_repo_falls_back_to_file(self) -> None:
+        """A file:// install whose checkout is not a git repo reports 'file' with no commit."""
+        packager = WorkflowPackager("test_workflow")
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps(
+            {"url": "file:///Users/dev/griptape-nodes-engine", "dir_info": {"editable": True}}
+        )
+
+        with (
+            patch.object(packager, "find_griptape_nodes_distribution", return_value=dist),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.which",
+                return_value="/usr/bin/git",
+            ),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.subprocess.check_output",
+                side_effect=subprocess.CalledProcessError(128, "git"),
+            ),
+        ):
+            source, commit = packager.get_install_source()
+
+        assert source == "file"
+        assert commit is None
+
+
+class TestCollectDependenciesEnginePin:
+    """collect_dependencies pins the engine to the full commit SHA for git installs."""
+
+    def test_pins_full_git_sha(self) -> None:
+        """The engine dependency uses the full SHA returned by get_install_source verbatim."""
+        packager = WorkflowPackager("test_workflow")
+        workflow = _make_workflow_mock([])
+        full_sha = "d1e0a500e25ced659d30d82f0cae4073523e42a5"
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
+                return_value=_make_lib_manager_mock([]),
+            ),
+            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
+            patch.object(packager, "get_install_source", return_value=("git", full_sha)),
+        ):
+            result = packager.collect_dependencies(workflow)
+
+        assert f"griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@{full_sha}" in result
+
+    def test_pins_engine_version_tag_for_pypi(self) -> None:
+        """A pypi install pins the released version tag rather than a commit."""
+        packager = WorkflowPackager("test_workflow")
+        workflow = _make_workflow_mock([])
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.LibraryManager",
+                return_value=_make_lib_manager_mock([]),
+            ),
+            patch.object(packager, "get_engine_version", return_value="v0.92.0"),
+            patch.object(packager, "get_install_source", return_value=("pypi", None)),
+        ):
+            result = packager.collect_dependencies(workflow)
+
+        assert "griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@v0.92.0" in result

@@ -106,4 +106,4 @@ Your installation is now complete and you're ready to proceed to creating your f
 
 ![A Blank Griptape_nodes_ editor](assets/img/getting_started/getting_started-blank_editor.png)
 
-Next, on to learning how to actually work inside Griptape Nodes! [Begin](ftue/FTUE.md)
+Next, on to learning how to actually work inside Griptape Nodes! [Begin](tutorials/index.md)
