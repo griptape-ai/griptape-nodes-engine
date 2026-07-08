@@ -21,6 +21,8 @@ from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
+    DeleteConnectionRequest,
+    DeleteConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.node_events import (
@@ -156,6 +158,11 @@ class TestUndoManager:
         )
         assert isinstance(result, CreateNodeResultSuccess)
         return result
+
+    @staticmethod
+    def _connection_exists(target_node: str, target_param: str) -> bool:
+        incoming = GriptapeNodes.FlowManager().get_connections().incoming_index.get(target_node, {})
+        return target_param in incoming
 
     # ---------- Create node ----------
 
@@ -349,6 +356,125 @@ class TestUndoManager:
         state = GriptapeNodes.handle_request(GetUndoStateRequest())
         assert isinstance(state, GetUndoStateResultSuccess)
         assert state.undo_labels == ["Create node 'ProbeA'"]
+
+    # ---------- Connections ----------
+
+    def test_undo_create_connection_removes_it(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+
+        connect_result = self._user_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="text",
+                target_node_name="Target",
+                target_parameter_name="text",
+            )
+        )
+        assert isinstance(connect_result, CreateConnectionResultSuccess)
+        assert self._connection_exists("Target", "text")
+
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert not self._connection_exists("Target", "text")
+
+        redo_result = GriptapeNodes.handle_request(RedoRequest())
+        assert isinstance(redo_result, RedoResultSuccess)
+        assert self._connection_exists("Target", "text")
+
+    def test_undo_delete_connection_restores_it(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+        assert isinstance(
+            self._user_request(
+                CreateConnectionRequest(
+                    source_node_name="Source",
+                    source_parameter_name="text",
+                    target_node_name="Target",
+                    target_parameter_name="text",
+                )
+            ),
+            CreateConnectionResultSuccess,
+        )
+
+        delete_result = self._user_request(
+            DeleteConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="text",
+                target_node_name="Target",
+                target_parameter_name="text",
+            )
+        )
+        assert isinstance(delete_result, DeleteConnectionResultSuccess)
+        assert not self._connection_exists("Target", "text")
+
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert self._connection_exists("Target", "text")
+
+        redo_result = GriptapeNodes.handle_request(RedoRequest())
+        assert isinstance(redo_result, RedoResultSuccess)
+        assert not self._connection_exists("Target", "text")
+
+    def test_connection_records_batch_label(self, griptape_nodes: GriptapeNodes) -> None:
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+
+        self._user_request(
+            CreateConnectionRequest(
+                source_node_name="Source",
+                source_parameter_name="text",
+                target_node_name="Target",
+                target_parameter_name="text",
+            )
+        )
+
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert state.undo_labels[-1] == "Connect 'Source.text' to 'Target.text'"
+
+    def test_delete_node_cascade_does_not_double_record_connections(self, griptape_nodes: GriptapeNodes) -> None:
+        """Deleting a connected node records only the delete; its connection cascade must not add entries.
+
+        Regression guard for record_inverse attributing a nested cascade dispatch to the outer frame:
+        undoing the delete must restore the node and its connection exactly once.
+        """
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+        assert isinstance(
+            self._user_request(
+                CreateConnectionRequest(
+                    source_node_name="Source",
+                    source_parameter_name="text",
+                    target_node_name="Target",
+                    target_parameter_name="text",
+                )
+            ),
+            CreateConnectionResultSuccess,
+        )
+
+        # Deleting Target cascades a DeleteConnection internally. That cascade must not record a
+        # separate entry attributed to the delete's frame.
+        delete_result = self._user_request(DeleteNodeRequest(node_name="Target"))
+        assert isinstance(delete_result, DeleteNodeResultSuccess)
+
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert state.undo_labels[-1] == "Delete node 'Target'"
+
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert undo_result.undone_label == "Delete node 'Target'"
+        assert GriptapeNodes.ObjectManager().has_object_with_name("Target")
+        assert self._connection_exists("Target", "text")
 
     # ---------- Recording eligibility ----------
 
