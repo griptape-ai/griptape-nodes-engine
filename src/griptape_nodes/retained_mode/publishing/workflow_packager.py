@@ -17,6 +17,8 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from dotenv import set_key
 from dotenv.main import DotEnv
@@ -309,24 +311,26 @@ class WorkflowPackager:
             return "pypi", None
         direct_url_info = json.loads(direct_url_text)
         url = direct_url_info.get("url", "")
-        commit = None
         if url.startswith("file://"):
             git_exe = shutil.which("git")
             if git_exe is None:
                 return "file", None
+            # For editable installs, dist.locate_file("") points at the ephemeral venv's
+            # site-packages, not the source checkout. The checkout (which holds the .git
+            # metadata) is recorded in direct_url.json's url, so resolve the commit from
+            # there. `git -C ... rev-parse` also handles worktrees, whose .git is a file
+            # rather than a directory.
+            source_dir = Path(url2pathname(urlparse(url).path))
             try:
-                pkg_dir = Path(str(dist.locate_file(""))).resolve()
-                git_root = next(p for p in (pkg_dir, *pkg_dir.parents) if (p / ".git").is_dir())
                 commit = (
                     subprocess.check_output(  # noqa: S603
-                        [git_exe, "rev-parse", "HEAD"],
-                        cwd=git_root,
+                        [git_exe, "-C", str(source_dir), "rev-parse", "HEAD"],
                         stderr=subprocess.DEVNULL,
                     )
                     .decode()
                     .strip()
                 )
-            except (StopIteration, subprocess.CalledProcessError):
+            except (subprocess.CalledProcessError, OSError):
                 return "file", None
             else:
                 return "git", commit

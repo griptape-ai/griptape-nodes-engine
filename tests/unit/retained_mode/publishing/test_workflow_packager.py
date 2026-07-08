@@ -1,6 +1,7 @@
 """Tests for WorkflowPackager transitive library dependency resolution."""
 
 import json
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -216,6 +217,59 @@ class TestGetInstallSource:
             source, commit = packager.get_install_source()
 
         assert source == "pypi"
+        assert commit is None
+
+    def test_editable_install_resolves_commit_from_source_checkout(self) -> None:
+        """An editable (file://) install resolves the commit from the checkout url, not site-packages."""
+        packager = WorkflowPackager("test_workflow")
+        full_sha = "a11a1dd14af250387e60127a1ed63841f0950db3"
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps(
+            {"url": "file:///Users/dev/griptape-nodes-engine", "dir_info": {"editable": True}}
+        )
+
+        with (
+            patch.object(packager, "find_griptape_nodes_distribution", return_value=dist),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.which",
+                return_value="/usr/bin/git",
+            ),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.subprocess.check_output",
+                return_value=(full_sha + "\n").encode(),
+            ) as mock_check_output,
+        ):
+            source, commit = packager.get_install_source()
+
+        assert source == "git"
+        assert commit == full_sha
+        # The commit is resolved against the checkout path from the url, not site-packages.
+        called_args = mock_check_output.call_args.args[0]
+        assert called_args[:3] == ["/usr/bin/git", "-C", "/Users/dev/griptape-nodes-engine"]
+        assert called_args[-2:] == ["rev-parse", "HEAD"]
+
+    def test_editable_install_without_git_repo_falls_back_to_file(self) -> None:
+        """A file:// install whose checkout is not a git repo reports 'file' with no commit."""
+        packager = WorkflowPackager("test_workflow")
+        dist = MagicMock()
+        dist.read_text.return_value = json.dumps(
+            {"url": "file:///Users/dev/griptape-nodes-engine", "dir_info": {"editable": True}}
+        )
+
+        with (
+            patch.object(packager, "find_griptape_nodes_distribution", return_value=dist),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.which",
+                return_value="/usr/bin/git",
+            ),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.subprocess.check_output",
+                side_effect=subprocess.CalledProcessError(128, "git"),
+            ),
+        ):
+            source, commit = packager.get_install_source()
+
+        assert source == "file"
         assert commit is None
 
 
