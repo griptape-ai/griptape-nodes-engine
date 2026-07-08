@@ -2470,18 +2470,17 @@ class TestPreviewProjectProvisioning:
         assert result.actions[0].kind == LibraryProvisioningActionKind.INSTALL
 
     @pytest.mark.asyncio
-    async def test_probes_target_workspace_not_live_for_destructive_plan(
+    async def test_probes_global_workspace_for_unset_libraries_fallback(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
-        """The installed-version probe reads the TARGET project's libraries dir.
+        """The unset-libraries_dir probe reads the GLOBAL workspace's libraries dir.
 
-        Guards the defect where the preview resolved the probe against the live
-        (active) workspace: a stale version sitting in the target workspace would
-        be missed, so a destructive OVERWRITE would be under-reported as a
-        non-destructive INSTALL. This exercises the real on-disk probe (no mock of
-        _installed_download_version): the target workspace holds an unsatisfying
-        version, the live config points at an empty dir, and the plan must still be
-        a destructive OVERWRITE.
+        With no own/inherited libraries_dir, the preview fallback resolves libraries_directory against
+        the GLOBAL configured workspace (configured_global_workspace_path), mirroring the live
+        ConfigManager.resolved_libraries_root fallback. A stale, unsatisfying version sitting in the
+        GLOBAL workspace's libraries dir must be found so the plan is a destructive OVERWRITE, not a
+        under-reported non-destructive INSTALL. Exercises the real on-disk probe (no mock of
+        _installed_download_version).
         """
         from griptape_nodes.retained_mode.events.library_events import (
             LibraryProvisioningActionKind,
@@ -2490,18 +2489,19 @@ class TestPreviewProjectProvisioning:
         )
 
         library_manager = griptape_nodes.LibraryManager()
-        target_ws = tmp_path / "target"
-        TestInstalledLibraryVersion._write_manifest(target_ws / "libraries" / "git-lib", "git-lib", "1.0.0")
+        global_ws = tmp_path / "global"
+        TestInstalledLibraryVersion._write_manifest(global_ws / "libraries" / "git-lib", "git-lib", "1.0.0")
         merged = self._merged_config(
             [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}],
-            workspace_directory=str(target_ws),
+            # A self-contained target pins merged workspace_directory to its own dir; the fallback must
+            # NOT probe here (it holds no installed lib), it must probe the global workspace below.
+            workspace_directory=str(tmp_path / "target"),
             libraries_directory="libraries",
         )
-        # Live config points at a different, empty workspace; if the probe used it the
-        # plan would wrongly be a non-destructive INSTALL.
+        # The live config's global workspace is where the stale version actually lives. If the probe
+        # used the target/merged workspace instead, the plan would wrongly be a non-destructive INSTALL.
         live_config = MagicMock()
-        live_config.get_config_value.return_value = str(tmp_path / "live" / "libraries")
-        live_config.workspace_path = str(tmp_path / "live")
+        live_config.configured_global_workspace_path.return_value = global_ws
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
@@ -2957,6 +2957,10 @@ class TestDiscoverDownloadedLibraries:
                 return ["owner/remote_lib"]
             if key == "libraries_directory":
                 return str(libraries_dir)
+            if key == "workspace_directory":
+                # libraries_directory is absolute here, so the global-workspace base is unused for
+                # resolution, but configured_global_workspace_path() must get a real path, not None.
+                return str(tmp_path)
             return None
 
         with patch.object(config_mgr, "get_config_value", side_effect=get_config_value):

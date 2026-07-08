@@ -174,18 +174,37 @@ class ConfigManager:
         else:
             self._libraries_root_override = str(Path(path).expanduser().resolve())
 
+    def configured_global_workspace_path(self) -> Path:
+        """Return the absolute GLOBAL configured workspace_directory, ignoring per-project overrides.
+
+        Reads workspace_directory from the user config, then the default config, mirroring
+        ProjectManager._decide_workspace_post_inheritance's global-default branch. Unlike
+        `workspace_path`, this never reflects the runtime `_workspace_dir_override` (which pins the
+        active workspace to a self-contained project's own folder), so it is the shared, project-
+        independent workspace root. The Settings default always populates default_config, so
+        workspace_directory is present in at least one layer.
+        """
+        configured = self.get_config_value("workspace_directory", config_source="user_config", default=None)
+        if configured is None:
+            configured = self.get_config_value("workspace_directory", config_source="default_config", default=None)
+        return Path(configured).expanduser().resolve()
+
     def resolved_libraries_root(self) -> Path:
         """Return the absolute directory under which libraries install and resolve.
 
         When a libraries-root override is set (from a project's own or inherited
-        libraries_dir), it is returned verbatim. Otherwise the legacy behavior applies:
-        the workspace-relative libraries_directory config value resolved against the
-        workspace path.
+        libraries_dir), it is returned verbatim. Otherwise the fallback resolves the
+        workspace-relative libraries_directory config value against the GLOBAL configured
+        workspace (configured_global_workspace_path), NOT the active per-project workspace.
+        This keeps libraries in the shared global-workspace `libraries/` folder even for a
+        self-contained project whose workspace_dir pins the active workspace to its own folder,
+        preserving the pre-v1 shared-libraries behavior. A project opts into a project-local
+        libraries dir by declaring an explicit libraries_dir (which sets the override above).
         """
         if self._libraries_root_override is not None:
             return Path(self._libraries_root_override)
         libraries_dir = self.get_config_value("libraries_directory", default="libraries")
-        return resolve_workspace_path(Path(libraries_dir), self.workspace_path)
+        return resolve_workspace_path(Path(libraries_dir), self.configured_global_workspace_path())
 
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.

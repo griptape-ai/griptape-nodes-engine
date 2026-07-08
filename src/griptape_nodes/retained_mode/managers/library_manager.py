@@ -3407,8 +3407,11 @@ class LibraryManager:
         # Probe the installed versions against the TARGET project's libraries dir, not the
         # live one, so the plan matches what activation would reconcile in that workspace.
         # A project's own/inherited libraries_dir (resolved offline so an unloaded target is
-        # honored) takes precedence; otherwise fall back to the workspace-relative default.
-        # Both keys come from Settings defaults, so they are always present in `merged`.
+        # honored) takes precedence; otherwise fall back to libraries_directory resolved against
+        # the GLOBAL configured workspace (NOT the target's own workspace_dir), mirroring the live
+        # ConfigManager.resolved_libraries_root fallback so the previewed plan cannot diverge from
+        # activation for a self-contained project. libraries_directory still comes from `merged`
+        # (a layer may re-point it); only the base dir is the shared global workspace.
         libraries_root = None
         if request.project_id != SYSTEM_DEFAULTS_KEY:
             libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
@@ -3419,7 +3422,7 @@ class LibraryManager:
         else:
             libraries_path = resolve_workspace_path(
                 Path(get_dot_value(merged, "libraries_directory")),
-                Path(get_dot_value(merged, "workspace_directory")),
+                config_mgr.configured_global_workspace_path(),
             )
 
         actions = await asyncio.gather(
