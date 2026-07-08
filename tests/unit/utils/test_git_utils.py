@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
@@ -27,6 +28,7 @@ from griptape_nodes.utils.git_utils import (
     is_git_repository,
     is_git_url,
     normalize_github_url,
+    parse_commit_datetime,
     parse_git_url_with_ref,
     remote_ref_exists,
     switch_branch,
@@ -1218,3 +1220,38 @@ class TestRemoteRefExists:
             pytest.raises(GitRemoteError, match="Failed to query remote refs"),
         ):
             remote_ref_exists("https://github.com/owner/repo.git", "main")
+
+
+class TestParseCommitDatetime:
+    """Test parse_commit_datetime function."""
+
+    def test_parses_iso_8601_with_offset(self) -> None:
+        result = parse_commit_datetime("2024-01-15T12:30:00+00:00")
+
+        assert result == datetime(2024, 1, 15, 12, 30, 0, tzinfo=UTC)
+        assert result is not None
+        assert result.tzinfo is not None
+
+    def test_parses_iso_8601_with_non_utc_offset(self) -> None:
+        result = parse_commit_datetime("2024-01-15T12:30:00-05:00")
+
+        assert result is not None
+        # Same instant, expressed in UTC.
+        assert result.astimezone(UTC) == datetime(2024, 1, 15, 17, 30, 0, tzinfo=UTC)
+
+    def test_assumes_utc_for_naive_timestamp(self) -> None:
+        result = parse_commit_datetime("2024-01-15T12:30:00")
+
+        assert result == datetime(2024, 1, 15, 12, 30, 0, tzinfo=UTC)
+
+    def test_strips_surrounding_whitespace(self) -> None:
+        result = parse_commit_datetime("  2024-01-15T12:30:00+00:00\n")
+
+        assert result == datetime(2024, 1, 15, 12, 30, 0, tzinfo=UTC)
+
+    def test_returns_none_for_empty_string(self) -> None:
+        assert parse_commit_datetime("") is None
+        assert parse_commit_datetime("   ") is None
+
+    def test_returns_none_for_unparseable_string(self) -> None:
+        assert parse_commit_datetime("not-a-date") is None

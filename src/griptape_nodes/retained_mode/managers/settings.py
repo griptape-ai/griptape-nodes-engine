@@ -22,6 +22,8 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY = "library.update_age_gating_enabled"
+LIBRARY_UPDATE_MIN_AGE_HOURS_KEY = "library.update_min_age_hours"
 
 
 class Category(BaseModel):
@@ -295,6 +297,22 @@ class LibrarySettings(BaseModel):
             "Controls automatic installation of library dependencies declared in library manifests. "
             "'always' downloads and installs them on registration. "
             "'never' skips installation and marks the library as degraded if required dependencies are missing."
+        ),
+    )
+    update_age_gating_enabled: bool = Field(
+        default=False,
+        description=(
+            "When True, a library update is withheld until the commit it would update to is at least "
+            "`update_min_age_hours` old (a soak period). This guards against automatically adopting a "
+            "freshly-pushed release before there is time to catch and yank a bad one. When False (default), "
+            "updates apply as soon as they are available."
+        ),
+    )
+    update_min_age_hours: float = Field(
+        default=24.0,
+        description=(
+            "Minimum age, in hours, of the target commit before an update may be applied. Only enforced when "
+            "`update_age_gating_enabled` is True. Age is measured from the target commit's git timestamp."
         ),
     )
 

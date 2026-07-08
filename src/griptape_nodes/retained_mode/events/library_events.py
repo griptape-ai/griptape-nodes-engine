@@ -985,6 +985,12 @@ class CheckLibraryUpdateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
         git_ref: The current git reference (branch, tag, or commit)
         local_commit: The local HEAD commit SHA (None if not a git repository)
         remote_commit: The remote HEAD commit SHA (None if not available)
+        update_gated_by_age: True when an update exists but is withheld because the target commit
+            is younger than the configured soak period (library.update_age_gating_enabled). When
+            True, has_update is also True.
+        target_commit_age_hours: Age in hours of the target commit at check time, or None when
+            unknown (e.g. no update available or the commit timestamp could not be read).
+        update_min_age_hours: The configured minimum age in hours, or None when age gating is disabled.
     """
 
     has_update: bool
@@ -994,6 +1000,9 @@ class CheckLibraryUpdateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
     git_ref: str | None
     local_commit: str | None
     remote_commit: str | None
+    update_gated_by_age: bool = False
+    target_commit_age_hours: float | None = None
+    update_min_age_hours: float | None = None
 
 
 @dataclass
@@ -1050,10 +1059,14 @@ class UpdateLibraryResultFailure(ResultPayloadFailure):
             the absolute path of that directory. Provided as a structured field so clients do not
             have to parse it out of the human-readable error message (which is unreliable for paths
             containing ``:``, e.g. Windows drive letters).
+        age_gated: True when the update was withheld because the target commit is younger than the
+            configured soak period (library.update_age_gating_enabled). This is not a hard error;
+            the update will succeed once the target commit is old enough.
     """
 
     retryable: bool = False
     existing_path: str | None = None
+    age_gated: bool = False
 
 
 @dataclass
