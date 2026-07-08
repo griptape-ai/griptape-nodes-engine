@@ -38,6 +38,7 @@ For example, you can ask it to:
 - **"Explain what this workflow does"** — it reads your workflow structure and gives you a plain-language summary
 
 !!! tip "How does the agent control my workflow?"
+
     Griptape Nodes runs a built-in **MCP server** alongside the engine. MCP (Model Context Protocol) is an open standard that lets AI models call tools — in this case, tools for reading your canvas, creating nodes, running workflows, and more. The agent connects to this server automatically; there's nothing to configure.
 
 ## What's next

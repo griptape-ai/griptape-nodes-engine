@@ -18,10 +18,10 @@ Threads are saved to your local filesystem and persist across sessions. Each thr
 
 The storage location follows the [XDG Base Directory](https://specifications.freedesktop.org/basedir-spec/latest/) convention:
 
-| Platform | Path                                                     |
-| -------- | -------------------------------------------------------- |
+| Platform | Path                                                    |
+| -------- | ------------------------------------------------------- |
 | macOS    | `~/Library/Application Support/griptape_nodes/threads/` |
-| Linux    | `~/.local/share/griptape_nodes/threads/`                 |
-| Windows  | `%LOCALAPPDATA%\griptape_nodes\threads\`                 |
+| Linux    | `~/.local/share/griptape_nodes/threads/`                |
+| Windows  | `%LOCALAPPDATA%\griptape_nodes\threads\`                |
 
 If a history file becomes corrupt, Griptape Nodes moves it aside automatically (renamed with a `.corrupt-<timestamp>` suffix) so your other threads are unaffected.
