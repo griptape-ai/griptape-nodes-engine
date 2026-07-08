@@ -257,8 +257,9 @@ nav:
                   - Ollama: guides/agent/providers/ollama.md
                   - LM Studio: guides/agent/providers/lm_studio.md
                   - Custom (OpenAI-compatible): guides/agent/providers/custom.md
-      - Configuration: guides/configuration.md
-      - Libraries: guides/libraries.md
+      - Engine:
+          - Configuration: guides/configuration.md
+          - Libraries: guides/libraries.md
       - Projects:
           - Overview: guides/projects/index.md
           - Managing Projects in the GUI: guides/projects/gui_guide.md
