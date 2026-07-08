@@ -2,8 +2,10 @@
 
 This module holds the node domain's knowledge of how to reverse its own request types. The
 UndoManager owns the mechanism (stacks, batching, replay); NodeManager registers these recorders
-with it from its __init__. Keeping this beside NodeManager (rather than inside undo_manager) means
-adding undo support for a node request is a local change in the domain that owns that request.
+with it from its __init__. The recorders live in the undo package alongside the mechanism they
+plug into, but stay decoupled from it: nothing in the undo core imports this module -- NodeManager
+is the sole wiring point, so adding undo support for a node request touches only this file and that
+registration call.
 """
 
 from __future__ import annotations
@@ -34,7 +36,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetLockNodeStateRequest,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.undo_manager import (
+from griptape_nodes.retained_mode.managers.undo import (
     RecorderCapture,
     UndoBatch,
     UndoEntry,

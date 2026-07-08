@@ -23,7 +23,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
@@ -237,7 +237,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.node_manager_undo import CreateNodeRecorder, DeleteNodeRecorder
+from griptape_nodes.retained_mode.managers.undo.node import CreateNodeRecorder, DeleteNodeRecorder
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")

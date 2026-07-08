@@ -1,9 +1,15 @@
+"""The recording state machine: turning a stream of dispatches into undo batches.
+
+`RecordingSession` owns the per-action framing -- opening a frame for a user-initiated request,
+folding that request's cascade into it, and finalizing it into an UndoBatch (or invalidating
+history). It is deliberately decoupled from the undo/redo stacks: it reads whether a replay is in
+progress and reports completed batches / invalidation through callbacks supplied by UndoManager.
+"""
+
 from __future__ import annotations
 
 import copy
 import logging
-from abc import ABC, abstractmethod
-from collections import deque
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
@@ -12,15 +18,9 @@ from griptape_nodes.retained_mode.events.context_events import SetWorkflowContex
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.undo_events import (
     ClearUndoStateRequest,
-    ClearUndoStateResultSuccess,
     GetUndoStateRequest,
-    GetUndoStateResultSuccess,
     RedoRequest,
-    RedoResultFailure,
-    RedoResultSuccess,
     UndoRequest,
-    UndoResultFailure,
-    UndoResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     ImportWorkflowRequest,
@@ -28,48 +28,19 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromScratchRequest,
     RunWorkflowWithCurrentStateRequest,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.undo.undo import (
+    RequestReplayUndoEntry,
+    UndoBatch,
+    UndoEntry,
+    UndoRecorder,
+)
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Sequence
+    from collections.abc import Callable, Iterator, Sequence
 
-    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
-    from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 
 logger = logging.getLogger("griptape_nodes")
-
-# Maximum number of undoable user actions retained. Oldest entries are dropped first.
-MAX_UNDO_BATCHES = 100
-
-
-class UndoEntryReplayError(RuntimeError):
-    """Raised when replaying an undo/redo entry fails and the undo history can no longer be trusted."""
-
-
-def dispatch_expecting[T: "ResultPayloadSuccess"](
-    request: RequestPayload, success_type: type[T], action_description: str
-) -> T:
-    """Dispatch a request during undo/redo replay, raising if it does not produce the expected success result.
-
-    Domain-defined undo entries use this to replay a specific inverse and assert its result type.
-    """
-    result = GriptapeNodes.handle_request(request)
-    if not isinstance(result, success_type):
-        msg = f"Attempted to {action_description}. Failed with result details: {result.result_details}"
-        raise UndoEntryReplayError(msg)
-    return result
-
-
-def dispatch_expecting_success(request: RequestPayload, action_description: str) -> ResultPayload:
-    """Dispatch a request during undo/redo replay, raising if it fails.
-
-    Used by the generic RequestReplayUndoEntry, which does not care about the concrete result type.
-    """
-    result = GriptapeNodes.handle_request(request)
-    if result.failed():
-        msg = f"Attempted to {action_description}. Failed with result details: {result.result_details}"
-        raise UndoEntryReplayError(msg)
-    return result
 
 
 def _as_sequence(value: RequestPayload | Sequence[RequestPayload]) -> list[RequestPayload]:
@@ -87,88 +58,6 @@ def _prepare_replay_request(request: RequestPayload) -> RequestPayload:
     clone = copy.deepcopy(request)
     clone.request_id = None
     return clone
-
-
-class UndoEntry(ABC):
-    """A single reversible operation within an undo batch.
-
-    Implementations issue ordinary engine requests to revert (undo) or re-apply (redo)
-    the operation, raising UndoEntryReplayError when replay fails.
-    """
-
-    @abstractmethod
-    def undo(self) -> None:
-        """Revert the recorded operation. Raises UndoEntryReplayError on failure."""
-
-    @abstractmethod
-    def redo(self) -> None:
-        """Re-apply the recorded operation. Raises UndoEntryReplayError on failure."""
-
-
-@dataclass
-class UndoBatch:
-    """One undoable user action, made up of one or more entries replayed together.
-
-    Attributes:
-        label: Human-readable description of the action (e.g. "Create node 'Agent_1'").
-        entries: Entries recorded in application order. Undo replays them in reverse.
-    """
-
-    label: str
-    entries: list[UndoEntry]
-
-
-@dataclass
-class RequestReplayUndoEntry(UndoEntry):
-    """Generic entry that reverts/re-applies an operation by replaying stored requests.
-
-    Produced by UndoManager.record_inverse: the undo direction replays the inverse request(s)
-    the handler supplied; the redo direction replays the original forward request(s).
-    """
-
-    undo_requests: list[RequestPayload]
-    redo_requests: list[RequestPayload]
-
-    def undo(self) -> None:
-        for request in self.undo_requests:
-            dispatch_expecting_success(request, f"undo via replaying {type(request).__name__}")
-
-    def redo(self) -> None:
-        for request in self.redo_requests:
-            dispatch_expecting_success(request, f"redo via replaying {type(request).__name__}")
-
-
-@dataclass
-class RecorderCapture:
-    """Outcome of a recorder's before-dispatch capture.
-
-    Attributes:
-        declined: True when the recorder cannot faithfully record this request (the manager
-            treats the request as an unrecordable mutation and invalidates history if it succeeds).
-        state: Opaque recorder-specific state handed back to create_batch after dispatch.
-    """
-
-    declined: bool = False
-    state: Any = None
-
-
-class UndoRecorder(ABC):
-    """Records the information needed to build an UndoBatch for one request type.
-
-    Recorders live in the domain that owns the request they reverse (e.g. node recorders live
-    beside NodeManager) and are registered via UndoManager.register_recorder. Use a recorder
-    (rather than record_inverse) when reversing an operation requires state captured *before* the
-    handler runs (e.g. serializing a node before it is deleted) or *after* it (e.g. the assigned
-    name of a freshly created node).
-    """
-
-    @abstractmethod
-    def capture_before(self, request: RequestPayload) -> RecorderCapture:
-        """Capture any 'before' state required to reverse the request. Runs before the handler."""
-
-    @abstractmethod
-    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:
-        """Build the undo batch after the handler succeeded. Returning None invalidates history."""
 
 
 @dataclass
@@ -212,21 +101,16 @@ class _RecordingFrame:
     invalidate: bool = False
 
 
-class UndoManager:
-    """Owns the undo/redo mechanism and policy; domains own the knowledge of how to reverse requests.
+class RecordingSession:
+    """Groups each user-initiated dispatch (and its cascade) into an UndoBatch.
 
-    Mechanism (here): the undo/redo stacks, the replay guard, grouping a dispatch (and its
-    cascade) into one batch, the user-initiated gate (request_id), transaction grouping, the
-    global history-clearing lifecycle events, and the Undo/Redo/GetState/Clear request handlers.
+    Owns the recorder registry and the framing state (active frame, dispatch stack, nesting depth).
+    A dispatch records when it is the outermost recordable dispatch in a frame -- opened by a
+    user-initiated request (has request_id) or, inside a transaction, by an engine-issued request --
+    but not when it is nested inside another recording dispatch (that ancestor owns the reversal).
 
-    Knowledge (elsewhere): how to reverse a specific request. Domains register a recorder via
-    register_recorder (for reversals needing pre/post-dispatch state) or call record_inverse from
-    their handler's success path (for reversals computed inline). Domains that intentionally do not
-    support undo for a mutating request declare it via register_non_undoable.
-
-    Safety invariant: a user-initiated mutation either (a) records an inverse, (b) is declared
-    non-undoable, or (c) invalidates history (the safe default). This lets coverage grow one domain
-    at a time without ever replaying against state the manager does not understand.
+    The session never touches the undo/redo stacks. It reports a completed batch via commit_batch,
+    a lost-trust condition via invalidate_history, and reads replay state via is_replaying.
     """
 
     # Request types that invalidate all undo history whenever they are dispatched, regardless of
@@ -250,10 +134,16 @@ class UndoManager:
         ClearUndoStateRequest,
     )
 
-    def __init__(self, event_manager: EventManager) -> None:
-        self._undo_stack: deque[UndoBatch] = deque(maxlen=MAX_UNDO_BATCHES)
-        self._redo_stack: list[UndoBatch] = []
-        self._is_replaying = False
+    def __init__(
+        self,
+        *,
+        is_replaying: Callable[[], bool],
+        commit_batch: Callable[[UndoBatch], None],
+        invalidate_history: Callable[[], None],
+    ) -> None:
+        self._is_replaying = is_replaying
+        self._commit_batch = commit_batch
+        self._invalidate_history = invalidate_history
         self._recorders: dict[type[RequestPayload], UndoRecorder] = {}
         self._non_undoable_types: set[type[RequestPayload]] = set()
         self._active_frame: _RecordingFrame | None = None
@@ -262,11 +152,6 @@ class UndoManager:
         # entry, so a nested cascade (depth > 0) is owned by its recording ancestor rather than
         # recorded separately.
         self._recording_depth = 0
-
-        event_manager.assign_manager_to_request_type(UndoRequest, self.on_undo_request)
-        event_manager.assign_manager_to_request_type(RedoRequest, self.on_redo_request)
-        event_manager.assign_manager_to_request_type(GetUndoStateRequest, self.on_get_undo_state_request)
-        event_manager.assign_manager_to_request_type(ClearUndoStateRequest, self.on_clear_undo_state_request)
 
     def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:
         """Register the recorder a domain uses to reverse one of its request types.
@@ -341,7 +226,7 @@ class UndoManager:
         A no-op passthrough during replay, or when a recording frame is already active (the active
         frame already groups that dispatch's work).
         """
-        if self._is_replaying or self._active_frame is not None:
+        if self._is_replaying() or self._active_frame is not None:
             yield
             return
 
@@ -351,7 +236,7 @@ class UndoManager:
             yield
         except Exception:
             self._active_frame = None
-            self.clear_history()
+            self._invalidate_history()
             raise
         self._active_frame = None
         self._finalize_frame(frame)
@@ -371,9 +256,9 @@ class UndoManager:
         if request_type in self._OWN_EVENT_TYPES:
             return None
         if isinstance(request, self._CLEAR_HISTORY_REQUEST_TYPES):
-            self.clear_history()
+            self._invalidate_history()
             return None
-        if self._is_replaying:
+        if self._is_replaying():
             return None
 
         # Nothing to track: no recording frame is open and this dispatch cannot open one (only a
@@ -446,94 +331,6 @@ class UndoManager:
             if capture.opened_frame:
                 self._active_frame = None
                 self._finalize_frame(frame)
-
-    def clear_history(self) -> None:
-        """Drop all undo and redo history."""
-        if self._undo_stack or self._redo_stack:
-            logger.debug("Cleared undo history (%d undo, %d redo).", len(self._undo_stack), len(self._redo_stack))
-        self._undo_stack.clear()
-        self._redo_stack.clear()
-
-    def on_undo_request(self, request: UndoRequest) -> ResultPayload:  # noqa: ARG002
-        if self._is_replaying:
-            details = "Attempted to undo. Failed because an undo or redo is already in progress."
-            return UndoResultFailure(result_details=details)
-        if GriptapeNodes.FlowManager().check_for_existing_running_flow():
-            details = "Attempted to undo. Failed because a flow is currently running."
-            return UndoResultFailure(result_details=details)
-        if not self._undo_stack:
-            details = "Attempted to undo. Failed because there is nothing to undo."
-            return UndoResultFailure(result_details=details)
-
-        batch = self._undo_stack.pop()
-        self._is_replaying = True
-        try:
-            for entry in reversed(batch.entries):
-                entry.undo()
-        except UndoEntryReplayError as err:
-            self.clear_history()
-            details = f"Attempted to undo '{batch.label}'. Failed because {err}. Undo history has been cleared."
-            return UndoResultFailure(result_details=details)
-        except Exception as err:
-            # An entry raised something other than UndoEntryReplayError (e.g. an un-deep-copyable
-            # redo request). The workflow is now partially reverted, so history can no longer be
-            # trusted; clear it and surface a typed failure rather than leaking the raw exception.
-            logger.exception("Unexpected error while undoing '%s'; clearing undo history.", batch.label)
-            self.clear_history()
-            details = f"Attempted to undo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
-            return UndoResultFailure(result_details=details)
-        finally:
-            self._is_replaying = False
-
-        self._redo_stack.append(batch)
-        return UndoResultSuccess(undone_label=batch.label, result_details=f"Undid '{batch.label}'.")
-
-    def on_redo_request(self, request: RedoRequest) -> ResultPayload:  # noqa: ARG002
-        if self._is_replaying:
-            details = "Attempted to redo. Failed because an undo or redo is already in progress."
-            return RedoResultFailure(result_details=details)
-        if GriptapeNodes.FlowManager().check_for_existing_running_flow():
-            details = "Attempted to redo. Failed because a flow is currently running."
-            return RedoResultFailure(result_details=details)
-        if not self._redo_stack:
-            details = "Attempted to redo. Failed because there is nothing to redo."
-            return RedoResultFailure(result_details=details)
-
-        batch = self._redo_stack.pop()
-        self._is_replaying = True
-        try:
-            for entry in batch.entries:
-                entry.redo()
-        except UndoEntryReplayError as err:
-            self.clear_history()
-            details = f"Attempted to redo '{batch.label}'. Failed because {err}. Undo history has been cleared."
-            return RedoResultFailure(result_details=details)
-        except Exception as err:
-            # An entry raised something other than UndoEntryReplayError. The workflow is now
-            # partially re-applied, so history can no longer be trusted; clear it and surface a
-            # typed failure rather than leaking the raw exception.
-            logger.exception("Unexpected error while redoing '%s'; clearing undo history.", batch.label)
-            self.clear_history()
-            details = f"Attempted to redo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
-            return RedoResultFailure(result_details=details)
-        finally:
-            self._is_replaying = False
-
-        self._undo_stack.append(batch)
-        return RedoResultSuccess(redone_label=batch.label, result_details=f"Redid '{batch.label}'.")
-
-    def on_get_undo_state_request(self, request: GetUndoStateRequest) -> ResultPayload:  # noqa: ARG002
-        undo_labels = [batch.label for batch in self._undo_stack]
-        redo_labels = [batch.label for batch in self._redo_stack]
-        return GetUndoStateResultSuccess(
-            undo_labels=undo_labels,
-            redo_labels=redo_labels,
-            result_details=f"Undo state retrieved ({len(undo_labels)} undo, {len(redo_labels)} redo).",
-        )
-
-    def on_clear_undo_state_request(self, request: ClearUndoStateRequest) -> ResultPayload:  # noqa: ARG002
-        self.clear_history()
-        return ClearUndoStateResultSuccess(result_details="Undo history cleared.")
 
     def _contribute_to_frame(
         self,
@@ -611,8 +408,7 @@ class UndoManager:
         if frame is None:
             return
         if frame.invalidate:
-            self.clear_history()
+            self._invalidate_history()
             return
         if frame.entries:
-            self._undo_stack.append(UndoBatch(label=frame.label or "Edit", entries=list(frame.entries)))
-            self._redo_stack.clear()
+            self._commit_batch(UndoBatch(label=frame.label or "Edit", entries=list(frame.entries)))
