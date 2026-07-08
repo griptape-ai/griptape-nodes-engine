@@ -1012,37 +1012,13 @@ class TestProvisioningPreviewMatchesActivation:
         assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == expected_libraries
         assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == expected_engine_version
 
-    def test_unset_libraries_fallback_live_matches_offline_global(
-        self, tmp_path: Path, isolate_user_config: Path
-    ) -> None:
-        """For an unset libraries_dir, live and offline both fall back to <global workspace>/libraries.
-
-        A self-contained project pins the active workspace to its own dir, but with no libraries_dir
-        override the live ConfigManager.resolved_libraries_root() and the offline preview both resolve
-        libraries_directory against configured_global_workspace_path(). This is the parity guard: the
-        two must compute the SAME path so the previewed SKIP/INSTALL/OVERWRITE plan matches activation.
-        """
-        from griptape_nodes.files.path_utils import resolve_workspace_path
-
-        global_ws = tmp_path / "global_ws"
-        global_ws.mkdir()
-        project_dir = tmp_path / "project"
-        project_dir.mkdir()
-        isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
-
-        with patch.dict(os.environ, {}, clear=True):
-            cm = ConfigManager()
-            # Self-contained project activated: workspace pinned to its own dir, no libraries override.
-            cm.set_workspace_override(project_dir)
-            cm.set_libraries_root_override(None)
-
-            live = cm.resolved_libraries_root()
-
-            # Offline preview fallback (library_manager): libraries_directory against the GLOBAL workspace.
-            libraries_directory = cm.get_config_value("libraries_directory", default="libraries")
-            offline = resolve_workspace_path(Path(libraries_directory), cm.configured_global_workspace_path())
-
-            assert live == offline == (global_ws / "libraries").resolve()
+    # Live-vs-offline parity for the unset-libraries fallback is covered by REAL-path tests, not a
+    # by-construction replica: the live side by
+    # TestConfigManager.test_resolved_libraries_root_fallback_ignores_active_workspace_override
+    # (resolved_libraries_root -> global, not the project override), and the offline side by
+    # test_library_manager.TestPreviewProjectProvisioning.test_probes_global_workspace_for_unset_libraries_fallback
+    # (drives the real on_preview_project_provisioning_request and fails if it stops probing the global
+    # workspace). Both now resolve against configured_global_workspace_path(), so they agree.
 
     def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
