@@ -38,6 +38,7 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import mcp_server_from_config, streamable_http_local
 from griptape_nodes.agents.pydantic_ai.runner import (
+    DEFAULT_SKILLS_DIRECTORY,
     PydanticAgentRunner,
     RunEvent,
     TextDelta,
@@ -231,6 +232,34 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
+
+# Written into the workspace skills directory the first time a runner is
+# built, so users discovering the folder know what belongs in it.
+_SKILLS_README = """\
+# Agent Skills
+
+Skills placed in this directory are loaded automatically by the Griptape Nodes
+agent. Each skill lives in its own subdirectory containing a `SKILL.md` file:
+
+    .agents/skills/
+        my-skill/
+            SKILL.md
+
+`SKILL.md` starts with YAML frontmatter declaring `name` (which must match the
+directory name) and `description`, followed by the skill's instructions:
+
+    ---
+    name: my-skill
+    description: When to use this skill and what it does.
+    ---
+
+    Step-by-step guidance for the agent goes here.
+
+The agent re-scans this directory before each run, so new or edited skills
+take effect without restarting the engine.
+
+Skills here follow the Agent Skills specification: https://agentskills.io
+"""
 
 
 @dataclass
@@ -717,6 +746,7 @@ class AgentManager:
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
+        self._ensure_skills_directory(workspace_root)
         mcp_servers: list[AbstractToolset[Any]] = [
             streamable_http_local(
                 f"http://localhost:{self._mcp_server_port}/mcp/",
@@ -748,6 +778,25 @@ class AgentManager:
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _ensure_skills_directory(self, workspace_root: Path) -> None:
+        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+
+        Called before every runner construction: the runner only attaches a
+        `SkillsCapability` when the directory exists at construction time, and
+        runners are cached, so creating the directory here guarantees skills
+        added mid-session are picked up on the next scan. Seeds a README the
+        first time so users discovering the folder know what belongs in it.
+        Failure to scaffold is logged but never blocks building the agent.
+        """
+        skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
+        try:
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            readme = skills_dir / "README.md"
+            if not readme.exists():
+                readme.write_text(_SKILLS_README, encoding="utf-8")
+        except OSError as e:
+            logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(

@@ -6,7 +6,10 @@ from unittest.mock import MagicMock, patch
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
-from griptape_nodes.retained_mode.events.variable_events import GetVariablesRequest, GetVariablesResultSuccess
+from griptape_nodes.retained_mode.events.variable_events import (
+    ResolveSubstitutionRequest,
+    ResolveSubstitutionResultSuccess,
+)
 
 from .mocks import MockNode
 
@@ -60,8 +63,8 @@ def _mock_gn(
     mock_gn = MagicMock()
     mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
     mock_gn.handle_request.side_effect = lambda req: (
-        GetVariablesResultSuccess(variables=variables, result_details="ok")
-        if isinstance(req, GetVariablesRequest)
+        ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
+        if isinstance(req, ResolveSubstitutionRequest)
         else MagicMock()
     )
 
@@ -102,8 +105,8 @@ def _run_tracked_set(
         mock_gn = MagicMock()
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
         mock_gn.handle_request.side_effect = lambda req: (
-            GetVariablesResultSuccess(variables=variables, result_details="ok")
-            if isinstance(req, GetVariablesRequest)
+            ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
+            if isinstance(req, ResolveSubstitutionRequest)
             else MagicMock()
         )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
@@ -581,3 +584,38 @@ class TestVariableSubstitutionDisableToggle:
             value = node.get_parameter_value("text")
 
         assert value == "sc001"
+
+
+class TestOptionalVariableSubstitution:
+    """{VAR?} tokens are omitted (empty string) when the variable is absent."""
+
+    def test_optional_var_omitted_when_missing(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", "Hello {title?} {name}"))
+        node.parameter_values["text"] = "Hello {title?} {name}"
+
+        with _mock_gn({"name": "Jason"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == "Hello  Jason"
+
+    def test_optional_var_substituted_when_present(self) -> None:
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", "Hello {title?} {name}"))
+        node.parameter_values["text"] = "Hello {title?} {name}"
+
+        with _mock_gn({"title": "Dr.", "name": "Jason"}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == "Hello Dr. Jason"
+
+    def test_required_var_leaves_token_when_missing(self) -> None:
+        """Required {VAR} tokens stay as-is when the variable is absent."""
+        node = MockNode(name="mock_node")
+        node.add_parameter(_make_str_param("text", "Hello {name}"))
+        node.parameter_values["text"] = "Hello {name}"
+
+        with _mock_gn({}), aprocess_scope():
+            value = node.get_parameter_value("text")
+
+        assert value == "Hello {name}"

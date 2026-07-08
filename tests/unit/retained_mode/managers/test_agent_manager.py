@@ -9,6 +9,7 @@ the real config system.
 import asyncio
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 import pytest
@@ -55,6 +56,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
+    _SKILLS_README,
     _VALID_PROVIDER_TYPES,
     AgentManager,
     _ActiveRun,
@@ -86,6 +88,33 @@ def providers_manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
     manager._image_model_name = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
     monkeypatch.setattr(manager, "_persist_providers", lambda: None)
     return manager
+
+
+class TestEnsureSkillsDirectory:
+    """`_ensure_skills_directory` scaffolds `.agents/skills` without ever raising."""
+
+    def test_creates_directory_and_readme(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        agent_manager._ensure_skills_directory(tmp_path)
+
+        skills_dir = tmp_path / ".agents/skills"
+        assert skills_dir.is_dir()
+        assert (skills_dir / "README.md").read_text(encoding="utf-8") == _SKILLS_README
+
+    def test_existing_readme_is_not_overwritten(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        skills_dir = tmp_path / ".agents/skills"
+        skills_dir.mkdir(parents=True)
+        readme = skills_dir / "README.md"
+        readme.write_text("user edits", encoding="utf-8")
+
+        agent_manager._ensure_skills_directory(tmp_path)
+
+        assert readme.read_text(encoding="utf-8") == "user edits"
+
+    def test_scaffold_failure_does_not_raise(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("", encoding="utf-8")
+
+        agent_manager._ensure_skills_directory(blocker)
 
 
 class TestComposeInstructions:
