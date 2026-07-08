@@ -2,14 +2,15 @@
 
 # ruff: noqa: PLR2004
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.machines.control_flow import ControlFlowMachine
 from griptape_nodes.machines.dag_builder import DagBuilder
-from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
+from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
@@ -385,3 +386,83 @@ class TestDagBuilderLifecycle:
             # Verify clear worked
             assert len(dag_builder.graphs) == 0
             assert dag_builder.node_to_reference == {}
+
+
+class TestCollectValuesFromUpstreamNodes:
+    """Test cases for value collection into nodes during DAG execution."""
+
+    @pytest.mark.asyncio
+    async def test_locked_node_skips_upstream_value_collection(self) -> None:
+        """A locked destination node halts propagation instead of erroring.
+
+        Pushing an upstream value into a locked node would be rejected by the
+        SetParameterValueRequest handler and escalated into a fatal error, making
+        the whole workflow un-runnable. Locking means "don't run this node", so
+        value collection into it must be a quiet no-op.
+        """
+        locked_node = MagicMock(spec=BaseNode)
+        locked_node.name = "locked_node"
+        locked_node.lock = True
+        # Guard against the method touching parameters before checking the lock.
+        locked_node.parameters = MagicMock(side_effect=AssertionError("parameters accessed on locked node"))
+
+        node_reference = MagicMock()
+        node_reference.node_reference = locked_node
+
+        with (
+            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
+            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.get_instance") as mock_get_instance,
+        ):
+            await ExecuteDagState.collect_values_from_upstream_nodes(node_reference)
+
+            # No connections were inspected and no set-parameter request was issued.
+            mock_flow_manager.return_value.get_connections.assert_not_called()
+            mock_get_instance.return_value.ahandle_request.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_unlocked_node_collects_upstream_value(self) -> None:
+        """An unlocked destination node still receives upstream values."""
+        upstream_node = MagicMock(spec=BaseNode)
+        upstream_node.name = "upstream_node"
+        upstream_node.parameter_output_values = {"out": "hello"}
+
+        upstream_parameter = MagicMock()
+        upstream_parameter.name = "out"
+        upstream_parameter.output_type = "str"
+
+        target_parameter = MagicMock()
+        target_parameter.name = "prompt"
+
+        target_node = MagicMock(spec=BaseNode)
+        target_node.name = "target_node"
+        target_node.lock = False
+        target_node.parameters = [target_parameter]
+
+        node_reference = MagicMock()
+        node_reference.node_reference = target_node
+
+        with (
+            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager,
+            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.get_instance") as mock_get_instance,
+        ):
+            mock_connections = MagicMock()
+            mock_connections.get_connected_node.return_value = (upstream_node, upstream_parameter)
+            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+
+            mock_instance = MagicMock()
+            ahandle_request = AsyncMock(return_value=MagicMock())
+            mock_instance.ahandle_request = ahandle_request
+            mock_get_instance.return_value = mock_instance
+
+            await ExecuteDagState.collect_values_from_upstream_nodes(node_reference)
+
+            mock_connections.get_connected_node.assert_called_once_with(
+                target_node, target_parameter, direction=Direction.UPSTREAM
+            )
+            ahandle_request.assert_awaited_once()
+            await_args = ahandle_request.await_args
+            assert await_args is not None
+            request = await_args.args[0]
+            assert request.node_name == "target_node"
+            assert request.parameter_name == "prompt"
+            assert request.value == "hello"
