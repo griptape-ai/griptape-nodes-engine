@@ -22,7 +22,11 @@ from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.node_events import (
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
+    DeleteNodeRequest,
+)
 from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
     GetParameterValueResultSuccess,
@@ -226,3 +230,43 @@ class TestSnapshotStrategy:
         assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
         assert not GriptapeNodes.ObjectManager().has_object_with_name("Pair1")
         assert not GriptapeNodes.ObjectManager().has_object_with_name("Pair2")
+
+    # ---------- Reconcile (surgical restore, not teardown/rebuild) ----------
+
+    def test_undo_value_edit_reconciles_survivors_in_place(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undoing a value edit updates only the changed node; survivors keep their instance identity."""
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        self._create_node(flow_name, node_name="ProbeB")
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeB", parameter_name="text", value="hello")
+        ).succeeded()
+
+        obj = GriptapeNodes.ObjectManager()
+        node_a_before = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        node_b_before = obj.attempt_get_object_by_name_as_type("ProbeB", BaseNode)
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+
+        # Neither node was deleted/recreated: the restore reconciled in place (no teardown blink).
+        assert obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode) is node_a_before
+        assert obj.attempt_get_object_by_name_as_type("ProbeB", BaseNode) is node_b_before
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeB", parameter_name="text"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value == ""
+
+    def test_undo_delete_recreates_only_changed_node(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undoing a delete recreates the removed node while leaving untouched survivors intact."""
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        self._create_node(flow_name, node_name="ProbeB")
+
+        obj = GriptapeNodes.ObjectManager()
+        node_a_before = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+
+        assert self._user_request(DeleteNodeRequest(node_name="ProbeB")).succeeded()
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+
+        # A was never touched (same instance); only B was recreated.
+        assert obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode) is node_a_before
+        assert obj.attempt_get_object_by_name_as_type("ProbeB", BaseNode) is not None

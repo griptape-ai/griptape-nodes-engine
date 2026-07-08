@@ -12,27 +12,36 @@ Scope and known limitations (prototype):
 
 - Single top-level flow (the common editor case). Multiple top-level flows or subflow-only state
   are not handled.
-- Restore rebuilds the entire flow: it deletes every node (cascading connections) and re-creates
-  everything from the snapshot. That is O(workflow size) per undo and emits a full teardown/rebuild
-  event stream -- the canvas "blink" and the loss of selection/viewport/execution state that are
-  exactly the tradeoffs this prototype exists to expose.
-- A snapshot is taken on every candidate edit, so serialization cost is paid per edit.
+- Restore reconciles the live flow against the snapshot: it deletes only removed nodes, creates only
+  added ones, and updates only changed values/positions/locks/connections on survivors. Nodes that
+  did not change are left untouched, so the canvas updates surgically (no teardown/rebuild blink) and
+  selection/viewport/execution state on unchanged nodes is preserved. Cost is O(changed) to apply,
+  though a snapshot is still captured on every candidate edit (O(workflow size) to capture).
+- Survivor parameter *structure* changes (a dynamic parameter added or removed by the undone action)
+  are not reconciled; values, positions, locks, connections, and whole-node add/delete are.
 
 Capture and restore timings are logged at INFO so the cost can be observed against inverse commands.
 """
 
 from __future__ import annotations
 
+import copy
 import logging
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.flow import ControlFlow
+from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.retained_mode.events.connection_events import (
+    CreateConnectionRequest,
+    DeleteConnectionRequest,
+    ListConnectionsForNodeRequest,
+    ListConnectionsForNodeResultSuccess,
+)
 from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextRequest
 from griptape_nodes.retained_mode.events.flow_events import (
-    DeserializeFlowFromCommandsRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
     ListNodesInFlowRequest,
@@ -40,8 +49,14 @@ from griptape_nodes.retained_mode.events.flow_events import (
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_events import DeleteNodeRequest
+from griptape_nodes.retained_mode.events.node_events import (
+    DeleteNodeRequest,
+    DeserializeNodeFromCommandsRequest,
+    SetLockNodeStateRequest,
+    SetNodeMetadataRequest,
+)
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.events.undo_events import (
     ClearUndoStateRequest,
     GetUndoStateRequest,
@@ -62,6 +77,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
+    from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
     from griptape_nodes.retained_mode.managers.undo.core import UndoRecorder
 
 logger = logging.getLogger("griptape_nodes")
@@ -100,10 +116,13 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
 
 
 def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
-    """Replace the flow's contents with the snapshot: delete every node, then deserialize.
+    """Reconcile the live flow to match the snapshot, emitting only the minimal set of mutations.
 
-    Raises UndoEntryReplayError on any failure so the manager can clear history and surface a typed
-    failure rather than leaving the workflow half-restored.
+    Nodes are matched by name (stable and unique). Removed nodes are deleted, added nodes are
+    created, and survivors have only their changed values/position/lock/connections updated. Nodes
+    that did not change are never touched, so the editor updates surgically instead of blinking
+    through a full teardown/rebuild. Raises UndoEntryReplayError on any failure so the manager can
+    clear history and surface a typed failure rather than leaving the workflow half-restored.
     """
     flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(snapshot.flow_name, ControlFlow)
     if flow is None:
@@ -111,39 +130,184 @@ def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
         raise UndoEntryReplayError(msg)
 
     started = time.perf_counter()
+    commands = snapshot.serialized_flow_commands
+
+    # Match nodes by name (the create command carries the node's stable name).
+    uuid_to_name: dict[str, str] = {}
+    name_to_node_commands: dict[str, SerializedNodeCommands] = {}
+    for node_commands in commands.serialized_node_commands:
+        node_name = node_commands.create_node_command.node_name
+        if node_name is None:
+            continue
+        uuid_to_name[node_commands.node_uuid] = node_name
+        name_to_node_commands[node_name] = node_commands
 
     list_result = GriptapeNodes.handle_request(ListNodesInFlowRequest(flow_name=snapshot.flow_name))
     if not isinstance(list_result, ListNodesInFlowResultSuccess):
         msg = f"snapshot restore could not list nodes in flow '{snapshot.flow_name}'"
         raise UndoEntryReplayError(msg)
 
-    for node_name in list_result.node_names:
-        # A node may already be gone if it was a child cleaned up by an earlier delete's cascade.
+    current_names = set(list_result.node_names)
+    target_names = set(name_to_node_commands)
+    to_delete = current_names - target_names
+    to_create = target_names - current_names
+
+    # 1. Delete removed nodes (each cascades its own connections away).
+    for node_name in to_delete:
         if not GriptapeNodes.ObjectManager().has_object_with_name(node_name):
             continue
-        delete_result = GriptapeNodes.handle_request(DeleteNodeRequest(node_name=node_name))
-        if delete_result.failed():
-            msg = f"snapshot restore failed deleting node '{node_name}': {delete_result.result_details}"
-            raise UndoEntryReplayError(msg)
-
-    with GriptapeNodes.ContextManager().flow(flow):
-        deserialize_result = GriptapeNodes.handle_request(
-            DeserializeFlowFromCommandsRequest(
-                serialized_flow_commands=snapshot.serialized_flow_commands,
-                pop_flow_context_after=False,
-            )
+        _require_success(
+            DeleteNodeRequest(node_name=node_name),
+            f"snapshot restore failed deleting node '{node_name}'",
         )
-    if deserialize_result.failed():
-        msg = f"snapshot restore failed rebuilding flow '{snapshot.flow_name}': {deserialize_result.result_details}"
-        raise UndoEntryReplayError(msg)
+
+    # 2. Create added nodes (create command + element modifications, including position metadata).
+    with GriptapeNodes.ContextManager().flow(flow):
+        for node_name in to_create:
+            _require_success(
+                DeserializeNodeFromCommandsRequest(serialized_node_commands=name_to_node_commands[node_name]),
+                f"snapshot restore failed creating node '{node_name}'",
+            )
+
+    # 3. Reconcile connections now that every endpoint exists.
+    _reconcile_connections(commands, uuid_to_name, target_names)
+
+    # 4. Reconcile per-node values / position / lock. Created nodes are forced (nothing to compare
+    #    against); survivors are diffed so unchanged state emits no events.
+    for node_name in target_names:
+        _reconcile_node_state(
+            node_name=node_name,
+            node_commands=name_to_node_commands[node_name],
+            commands=commands,
+            force=node_name in to_create,
+        )
 
     elapsed_ms = (time.perf_counter() - started) * 1000
     logger.info(
-        "Snapshot undo: restored flow '%s' (%d nodes) in %.1f ms.",
+        "Snapshot undo: reconciled flow '%s' in %.1f ms (+%d nodes, -%d nodes, %d survivors).",
         snapshot.flow_name,
-        len(list_result.node_names),
         elapsed_ms,
+        len(to_create),
+        len(to_delete),
+        len(target_names & current_names),
     )
+
+
+def _reconcile_connections(
+    commands: SerializedFlowCommands,
+    uuid_to_name: dict[str, str],
+    target_names: set[str],
+) -> None:
+    """Delete connections not in the snapshot and create those missing, touching only what differs."""
+    target_connections: set[tuple[str, str, str, str]] = set()
+    for connection in commands.serialized_connections:
+        source_name = uuid_to_name.get(connection.source_node_uuid)
+        target_name = uuid_to_name.get(connection.target_node_uuid)
+        if source_name is None or target_name is None:
+            continue
+        target_connections.add(
+            (source_name, connection.source_parameter_name, target_name, connection.target_parameter_name)
+        )
+
+    # Enumerate current connections once, via each node's outgoing edges (source side is unique).
+    current_connections: set[tuple[str, str, str, str]] = set()
+    for node_name in target_names:
+        list_result = GriptapeNodes.handle_request(ListConnectionsForNodeRequest(node_name=node_name))
+        if not isinstance(list_result, ListConnectionsForNodeResultSuccess):
+            continue
+        for outgoing in list_result.outgoing_connections:
+            current_connections.add(
+                (node_name, outgoing.source_parameter_name, outgoing.target_node_name, outgoing.target_parameter_name)
+            )
+
+    for source_name, source_param, target_name, target_param in current_connections - target_connections:
+        _require_success(
+            DeleteConnectionRequest(
+                source_node_name=source_name,
+                source_parameter_name=source_param,
+                target_node_name=target_name,
+                target_parameter_name=target_param,
+            ),
+            f"snapshot restore failed removing connection '{source_name}.{source_param}' -> '{target_name}.{target_param}'",
+        )
+    for source_name, source_param, target_name, target_param in target_connections - current_connections:
+        _require_success(
+            CreateConnectionRequest(
+                source_node_name=source_name,
+                source_parameter_name=source_param,
+                target_node_name=target_name,
+                target_parameter_name=target_param,
+            ),
+            f"snapshot restore failed creating connection '{source_name}.{source_param}' -> '{target_name}.{target_param}'",
+        )
+
+
+def _reconcile_node_state(
+    *,
+    node_name: str,
+    node_commands: SerializedNodeCommands,
+    commands: SerializedFlowCommands,
+    force: bool,
+) -> None:
+    """Restore a node's position, parameter values, and lock, setting only what differs (unless forced)."""
+    node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+    if node is None:
+        msg = f"snapshot restore could not find node '{node_name}' to reconcile"
+        raise UndoEntryReplayError(msg)
+
+    # Position / metadata. Created nodes already got it from their create command.
+    target_metadata = node_commands.create_node_command.metadata
+    if not force and target_metadata is not None and node.metadata != target_metadata:
+        _require_success(
+            SetNodeMetadataRequest(node_name=node_name, metadata=copy.deepcopy(target_metadata)),
+            f"snapshot restore failed setting metadata on node '{node_name}'",
+        )
+
+    # Parameter values.
+    for indirect_command in commands.set_parameter_value_commands.get(node_commands.node_uuid, []):
+        parameter_name = indirect_command.set_parameter_value_command.parameter_name
+        if indirect_command.unique_value_uuid not in commands.unique_parameter_uuid_to_values:
+            continue
+        target_value = commands.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
+        if not force and _values_equal(node.get_parameter_value(parameter_name), target_value):
+            continue
+        # Fresh request (do not mutate the snapshot's command; snapshots are reused across undo/redo).
+        # initial_setup bypasses the input+property connection guard and avoids unresolving the node,
+        # preserving execution state on nodes the restore did not otherwise change.
+        _require_success(
+            SetParameterValueRequest(
+                node_name=node_name,
+                parameter_name=parameter_name,
+                value=copy.deepcopy(target_value),
+                initial_setup=True,
+            ),
+            f"snapshot restore failed setting value '{node_name}.{parameter_name}'",
+        )
+
+    # Lock state.
+    lock_command = commands.set_lock_commands_per_node.get(node_commands.node_uuid)
+    target_lock = lock_command.lock if lock_command is not None else False
+    if node.lock != target_lock:
+        _require_success(
+            SetLockNodeStateRequest(node_name=node_name, lock=target_lock),
+            f"snapshot restore failed setting lock on node '{node_name}'",
+        )
+
+
+def _values_equal(current: Any, target: Any) -> bool:
+    """Best-effort value equality; treats an unorderable/ambiguous comparison as 'changed'."""
+    try:
+        return bool(current == target)
+    except Exception:
+        return False
+
+
+def _require_success(request: RequestPayload, failure_message: str) -> ResultPayload:
+    result = GriptapeNodes.handle_request(request)
+    if result.failed():
+        msg = f"{failure_message}: {result.result_details}"
+        raise UndoEntryReplayError(msg)
+    return result
 
 
 @dataclass
