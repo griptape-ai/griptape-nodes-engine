@@ -31,6 +31,7 @@ from griptape_nodes.retained_mode.events.artifact_events import (
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 from griptape_nodes.retained_mode.events.config_events import SetConfigValueResultSuccess
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_manager import ArtifactManager, PreviewMetadata
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     BaseArtifactProvider,
@@ -64,7 +65,6 @@ def mock_config_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     Any test that registers providers would otherwise pollute the real user config.
     """
     from griptape_nodes.retained_mode.events.config_events import SetConfigValueRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
     # Store the original handle_request method
     original_handle_request = GriptapeNodes.handle_request
@@ -413,13 +413,20 @@ class TestPermissionDispatch:
 
     _PROBE_FORMAT = "probe"
 
-    def _make_probe_provider_class(self, denial_for_write=None, denial_for_read=None):  # noqa: ANN001, ANN202
+    def _make_probe_provider_class(  # noqa: ANN202
+        self,
+        denial_for_write_from_bytes=None,  # noqa: ANN001
+        denial_for_write_from_path=None,  # noqa: ANN001
+        denial_for_read=None,  # noqa: ANN001
+        write_vetting_policy=None,  # noqa: ANN001
+    ):
         from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
             BaseArtifactMetadata,
             BaseArtifactProvider,
         )
 
         probe_format = self._PROBE_FORMAT
+        declared_policy = write_vetting_policy
 
         class _ProbeProvider(BaseArtifactProvider):
             calls: list[tuple[str, object]] = []  # noqa: RUF012
@@ -436,9 +443,17 @@ class TestPermissionDispatch:
             def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
                 return None
 
-            def check_write_permission(self, data, detected_format):  # noqa: ANN001, ANN202, ARG002
-                self.__class__.calls.append(("write", detected_format))
-                return denial_for_write
+            @staticmethod
+            def get_write_vetting_policy():  # noqa: ANN205
+                return declared_policy
+
+            def check_write_format_from_bytes(self, data, detected_format):  # noqa: ANN001, ANN202, ARG002
+                self.__class__.calls.append(("write_from_bytes", detected_format))
+                return denial_for_write_from_bytes
+
+            def check_write_format_from_path(self, source_path, detected_format):  # noqa: ANN001, ANN202, ARG002
+                self.__class__.calls.append(("write_from_path", detected_format))
+                return denial_for_write_from_path
 
             def check_read_permission(self, source_path):  # noqa: ANN001, ANN202
                 self.__class__.calls.append(("read", source_path))
@@ -452,25 +467,56 @@ class TestPermissionDispatch:
         )
         assert isinstance(result, RegisterArtifactProviderResultSuccess)
 
-    def test_check_write_permission_dispatches_to_provider_by_format(self) -> None:
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+    def test_get_write_vetting_policy_reflects_provider(self) -> None:
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 
-        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
-        probe_cls = self._make_probe_provider_class(denial_for_write=expected_denial)
+        probe_cls = self._make_probe_provider_class(write_vetting_policy=WriteVettingPolicy.FROM_PATH)
         manager = ArtifactManager()
         self._register(manager, probe_cls)
 
-        denial = manager.check_write_permission(b"any bytes", self._PROBE_FORMAT)
+        assert manager.get_write_vetting_policy(self._PROBE_FORMAT) is WriteVettingPolicy.FROM_PATH
+
+    def test_get_write_vetting_policy_none_when_no_provider(self) -> None:
+        manager = ArtifactManager()
+        assert manager.get_write_vetting_policy("unregistered") is None
+
+    def test_check_write_format_from_bytes_dispatches_to_provider_by_format(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
+        probe_cls = self._make_probe_provider_class(denial_for_write_from_bytes=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_write_format_from_bytes(b"any bytes", self._PROBE_FORMAT)
 
         assert denial is expected_denial
-        assert probe_cls.calls == [("write", self._PROBE_FORMAT)]
+        assert probe_cls.calls == [("write_from_bytes", self._PROBE_FORMAT)]
 
-    def test_check_write_permission_no_provider_falls_through(self) -> None:
+    def test_check_write_format_from_path_dispatches_to_provider_by_format(self) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="probe format is disallowed"),))
+        probe_cls = self._make_probe_provider_class(denial_for_write_from_path=expected_denial)
+        manager = ArtifactManager()
+        self._register(manager, probe_cls)
+
+        denial = manager.check_write_format_from_path("/tmp/staged.probe", self._PROBE_FORMAT)  # noqa: S108
+
+        assert denial is expected_denial
+        assert probe_cls.calls == [("write_from_path", self._PROBE_FORMAT)]
+
+    def test_check_write_format_from_bytes_no_provider_falls_through(self) -> None:
         # An unregistered format must not raise or reach any provider -- it's
         # not the ArtifactManager's job to know every possible extension.
         manager = ArtifactManager()
 
-        assert manager.check_write_permission(b"data", "unregistered") is None
+        assert manager.check_write_format_from_bytes(b"data", "unregistered") is None
+
+    def test_check_write_format_from_path_no_provider_falls_through(self) -> None:
+        manager = ArtifactManager()
+
+        assert manager.check_write_format_from_path("/tmp/nothing.dat", "unregistered") is None  # noqa: S108
 
     def test_check_read_permission_dispatches_by_extension(self) -> None:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
@@ -543,10 +589,7 @@ class TestCheckArtifactReadPermissionHandler:
             BaseArtifactMetadata,
             BaseArtifactProvider,
         )
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            CheckpointDenial,
-            CheckpointFailure,
-        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         expected_denial = CheckpointDenial(
             failures=(CheckpointFailure(detail="You are not licensed for probe reads."),)
@@ -599,7 +642,6 @@ class TestGeneratePreview:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
@@ -649,8 +691,6 @@ class TestGeneratePreview:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
@@ -918,7 +958,6 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         project_manager = GriptapeNodes.ProjectManager()
@@ -957,8 +996,6 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
@@ -1043,7 +1080,6 @@ class TestGetPreviewForArtifact:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
@@ -1089,8 +1125,6 @@ class TestGetPreviewForArtifact:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
@@ -1599,8 +1633,6 @@ class TestProviderRegistrationConfigLogLevels:
         manager = ArtifactManager()
         captured_requests: list[RequestPayload] = []
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         original = GriptapeNodes.handle_request
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
@@ -1627,8 +1659,6 @@ class TestProviderRegistrationConfigLogLevels:
 
         manager = ArtifactManager()
         captured_requests: list[RequestPayload] = []
-
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         original = GriptapeNodes.handle_request
 

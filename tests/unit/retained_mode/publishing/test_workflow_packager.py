@@ -1,5 +1,6 @@
 """Tests for WorkflowPackager transitive library dependency resolution."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
@@ -132,3 +133,53 @@ class TestCollectPipInstallFlagsTransitive:
 
         assert "--extra-index-url=https://a.example.com" in result
         assert "--extra-index-url=https://b.example.com" in result
+
+
+class TestCopyStaticFiles:
+    """copy_static_files handles the case where the destination resolves back onto the source."""
+
+    def test_skips_copy_when_source_and_dest_are_same_file(self, tmp_path: Path) -> None:
+        """A file whose destination resolves to itself is left in place instead of copied."""
+        packager = WorkflowPackager("test_workflow")
+        source = tmp_path / "inputs" / "images" / "img.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        relative = Path("inputs/images/img.jpg")
+
+        # destination is the project root itself, so dest == source.
+        with (
+            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                return_value=MagicMock(),
+            ),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "img.jpg")], tmp_path)
+
+        mock_copy_file.assert_not_called()
+        mock_copy_tree.assert_not_called()
+
+    def test_copies_when_source_and_dest_differ(self, tmp_path: Path) -> None:
+        """A file whose destination differs from the source is copied."""
+        packager = WorkflowPackager("test_workflow")
+        source = tmp_path / "inputs" / "images" / "img.jpg"
+        source.parent.mkdir(parents=True)
+        source.write_text("data")
+        relative = Path("inputs/images/img.jpg")
+        destination = tmp_path / "bundle"
+
+        with (
+            patch.object(packager, "_resolve_file_reference", return_value=(source, relative)),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                return_value=MagicMock(),
+            ),
+            patch.object(packager, "copy_file") as mock_copy_file,
+            patch.object(packager, "copy_tree") as mock_copy_tree,
+        ):
+            packager.copy_static_files([("node", "img.jpg")], destination)
+
+        mock_copy_file.assert_called_once_with(source, destination / relative)
+        mock_copy_tree.assert_not_called()

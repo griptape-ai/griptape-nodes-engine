@@ -53,6 +53,7 @@ from griptape_nodes.node_library.library_declarations import (
 )
 from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
+    CodecAccessDirection,
     CodecAccessVerdict,
     ModelAccessVerdict,
     QueryCodecAccessRequest,
@@ -162,14 +163,18 @@ class AccessManager:
         UI offers against the same policy that gates the actual read or write.
         """
         match request.direction:
-            case "read":
+            case CodecAccessDirection.READ:
                 action = CheckpointAction.READ_VIDEO_CODEC
-            case "write":
+            case CodecAccessDirection.WRITE:
                 action = CheckpointAction.WRITE_VIDEO_CODEC
             case _:
+                # Defense in depth for stray wire-side values. StrEnum catches
+                # Python-side typos; a request deserialized from the WS boundary
+                # can still carry any string.
+                valid = ", ".join(f"'{d.value}'" for d in CodecAccessDirection)
                 msg = (
                     f"Attempted to query codec access. Failed because direction "
-                    f"'{request.direction}' is not one of 'read' or 'write'."
+                    f"'{request.direction}' is not one of {valid}."
                 )
                 return QueryCodecAccessResultFailure(result_details=msg)
 

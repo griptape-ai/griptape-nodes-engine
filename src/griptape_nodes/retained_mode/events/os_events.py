@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import StrEnum
 
+from griptape_nodes.common.macro_parser import MacroVariables
 from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence, SequenceScanOptions
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -1131,6 +1132,76 @@ class MakeDirectoryResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
 
     Attributes:
         failure_reason: Classification of why the creation failed
+        result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason
+
+
+@dataclass
+@PayloadRegistry.register
+class WriteTempFileRequest(RequestPayload):
+    """Write a temp file at the project-scoped path resolved from ``SAVE_TEMP_FILE``.
+
+    Distinct from ``WriteFileRequest`` in that the caller does not choose the
+    destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. The
+    typical caller is an artifact provider that needs a real file on disk for
+    a one-shot inspection (e.g. running ffprobe on the bytes to extract a
+    codec) and will delete the file immediately afterward. Handled by
+    ``OSManager.on_write_temp_file_request``.
+
+    The SAVE_TEMP_FILE macro shipping in ``DEFAULT_PROJECT_TEMPLATE`` is
+    ``{temp}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}``.
+    Builtins like ``{temp}`` are injected automatically by ``ProjectManager``;
+    slots like ``{file_name_base}`` and ``{file_extension}`` come from
+    ``variables``. Callers are responsible for supplying enough variables to
+    fully resolve the macro (unresolved required slots produce a Failure).
+    Colliding filenames follow the situation's ``on_collision`` policy
+    (OVERWRITE by default), so callers who need uniqueness should include a
+    uuid or similar in ``file_name_base``.
+
+    Args:
+        content: The buffered write payload.
+        variables: Macro variable bindings passed through to
+            ``GetPathForMacroRequest``. Set ``file_name_base`` and
+            ``file_extension`` at minimum for the default macro. Some tools
+            that inspect the file rely on the suffix to pick the right
+            decoder (ffprobe's container heuristics, image libraries that
+            mimetype-by-extension, editors that key syntax highlighting off
+            the suffix), so pass the real extension when you know it. Empty
+            by default; the handler surfaces macro resolution errors verbatim.
+
+    Results: ``WriteTempFileResultSuccess`` (staged_path, bytes_written) |
+        ``WriteTempFileResultFailure`` (with FileIOFailureReason).
+    """
+
+    content: bytes
+    variables: MacroVariables = field(default_factory=dict)
+
+
+@dataclass
+@PayloadRegistry.register
+class WriteTempFileResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Bytes staged at a project-scoped temp path.
+
+    Attributes:
+        staged_path: Absolute path the bytes were written to. Callers are
+            responsible for deleting this path (via ``DeleteFileRequest``)
+            once they're done with it.
+        bytes_written: Number of bytes on disk at ``staged_path``.
+    """
+
+    staged_path: str
+    bytes_written: int
+
+
+@dataclass
+@PayloadRegistry.register
+class WriteTempFileResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Staging bytes to the project temp path failed.
+
+    Attributes:
+        failure_reason: Classification of why staging failed
         result_details: Human-readable error message (inherited from ResultPayloadFailure)
     """
 
