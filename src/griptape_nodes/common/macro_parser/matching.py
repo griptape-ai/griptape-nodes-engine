@@ -2,18 +2,14 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
-
 from griptape_nodes.common.macro_parser.exceptions import MacroParseFailureReason, MacroSyntaxError
+from griptape_nodes.common.macro_parser.formats import FormatSpec, LeadingSeparatorFormat, SeparatorFormat
 from griptape_nodes.common.macro_parser.segments import (
     ParsedSegment,
     ParsedStaticValue,
     ParsedVariable,
     VariableInfo,
 )
-
-if TYPE_CHECKING:
-    from griptape_nodes.common.macro_parser.formats import FormatSpec
 
 
 def extract_unknown_variables(
@@ -74,16 +70,63 @@ def extract_single_variable(
     Returns:
         Tuple of (extracted_value, new_position) or None if extraction fails.
     """
-    # Find next static segment to determine end position
-    next_static = find_next_static(remaining_segments)
-    if next_static:
-        end_pos = path.find(next_static.text, start_pos)
-        if end_pos == -1:
-            # Can't find next static - no match
+    # Two candidate boundaries for this variable's greedy extraction:
+    #
+    # 1. Next anchor — text emitted by a FOLLOWING segment: the next
+    #    `ParsedStaticValue` text, or the prefix of a following
+    #    `ParsedVariable`'s `LeadingSeparatorFormat`. Critical for
+    #    `{name}{###?:^_v}.png` where the following optional's `_v`
+    #    prefix marks where `{name}` ends (see #5025).
+    # 2. Self-anchor — this variable's OWN trailing `SeparatorFormat`. If it
+    #    emits `<value>_`, some `_` in the path bounds the value. Critical
+    #    for adjacent-variable layouts like `{a?:_}{b?:_}file.png` where
+    #    the next segment has no discoverable anchor of its own.
+    #
+    # When both are available, direction matters: if the immediate next
+    # segment is a static text (or a variable whose known-text anchor is
+    # right up against ours), take the LATEST self-anchor before that text
+    # (tightest split). Otherwise — the next segment is another variable
+    # with its own separator to fill — take the FIRST self-anchor (leaves
+    # room for the following variable to consume its share).
+    self_separator = _trailing_separator(variable)
+    next_anchor_text = find_next_anchor(remaining_segments)
+    next_is_static = bool(remaining_segments) and isinstance(remaining_segments[0], ParsedStaticValue)
+
+    next_end_pos: int | None = None
+    if next_anchor_text is not None:
+        anchor_pos = path.find(next_anchor_text, start_pos)
+        if anchor_pos == -1:
             return None
-    else:
-        # No more static segments - consume to end
+        next_end_pos = anchor_pos
+
+    self_end_pos: int | None = None
+    if self_separator is not None:
+        search_limit = next_end_pos if next_end_pos is not None else len(path)
+        # Direction of the self-anchor search:
+        # - If the NEXT segment is a static, we want the tightest split against
+        #   that static: LATEST self-anchor before it. That's the
+        #   `{workflow_name?:_}photo.jpg` case.
+        # - Otherwise (next segment is a variable — adjacent-optional layout),
+        #   pick the FIRST self-anchor. That leaves the maximum tail for the
+        #   following variables to consume: `{a?:_}{b?:_}file.png` on
+        #   `first_second_file.png` → a=first, b=second.
+        if next_is_static:
+            sep_pos = path.rfind(self_separator, start_pos, search_limit)
+        else:
+            sep_pos = path.find(self_separator, start_pos, search_limit)
+        if sep_pos != -1:
+            self_end_pos = sep_pos + len(self_separator)
+
+    if self_end_pos is not None:
+        end_pos = self_end_pos
+    elif next_end_pos is not None:
+        end_pos = next_end_pos
+    elif self_separator is None and next_anchor_text is None:
+        # No more anchors - consume to end
         end_pos = len(path)
+    else:
+        # An anchor was expected but not found - no match
+        return None
 
     # Extract raw value
     raw_value = path[start_pos:end_pos]
@@ -97,19 +140,60 @@ def extract_single_variable(
     return (reversed_value, end_pos)
 
 
-def find_next_static(segments: list[ParsedSegment]) -> ParsedStaticValue | None:
-    """Find next static segment in list.
+def find_next_anchor(segments: list[ParsedSegment]) -> str | None:
+    """Find the next fixed text that bounds a preceding variable's extraction.
+
+    An anchor is either:
+    - The text of the next `ParsedStaticValue` segment, or
+    - The `prefix` of a `LeadingSeparatorFormat` on the next `ParsedVariable`
+      (e.g. `_v` inside `{###?:^_v}`), which is fixed text emitted iff the
+      variable emits.
+
+    The former is authoritative — a static segment ALWAYS appears in the path.
+    The latter is fixed text only when the following variable emits; if it
+    doesn't emit, callers may over-shrink the extraction range. That is
+    acceptable here because the reverse-match orchestrator
+    (`find_matches_detailed`) runs each of 2**k emitted/omitted combinations
+    and validates via forward round-trip — an over-shrunk range simply fails
+    to round-trip and the next mask is tried.
+
+    Whichever comes FIRST in `segments` wins — the caller wants the
+    tightest boundary.
 
     Args:
         segments: List of segments to search
 
     Returns:
-        First ParsedStaticValue found, or None if no static segments.
+        Anchor text, or None if no anchor is available.
     """
     for seg in segments:
         if isinstance(seg, ParsedStaticValue):
-            return seg
-    # No static segment found
+            return seg.text
+        if isinstance(seg, ParsedVariable):
+            leading_prefix = _leading_separator_prefix(seg)
+            if leading_prefix is not None:
+                return leading_prefix
+    return None
+
+
+def _leading_separator_prefix(variable: ParsedVariable) -> str | None:
+    """Return the `LeadingSeparatorFormat.prefix` on ``variable`` if present."""
+    for spec in variable.format_specs:
+        if isinstance(spec, LeadingSeparatorFormat):
+            return spec.prefix
+    return None
+
+
+def _trailing_separator(variable: ParsedVariable) -> str | None:
+    """Return the ``SeparatorFormat.separator`` on ``variable`` if present.
+
+    ``SeparatorFormat`` is a trailing separator — it renders as
+    ``<value><sep>``. On the reverse path it's a self-anchor: the first
+    occurrence of the separator in the path bounds this variable's extraction.
+    """
+    for spec in variable.format_specs:
+        if isinstance(spec, SeparatorFormat):
+            return spec.separator
     return None
 
 

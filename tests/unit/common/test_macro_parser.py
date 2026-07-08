@@ -21,6 +21,7 @@ from griptape_nodes.common.macro_parser import (
     MacroResolutionFailure,
     MacroResolutionFailureReason,
     MacroSyntaxError,
+    MacroVariables,
     NumericPaddingFormat,
     ParsedMacro,
     ParsedStaticValue,
@@ -926,7 +927,8 @@ class TestMacroFailureTypes:
         assert MacroParseFailureReason.MULTIPLE_SEQUENCE_SLOTS == "MULTIPLE_SEQUENCE_SLOTS"
         assert MacroParseFailureReason.EMPTY_LEADING_SEPARATOR == "EMPTY_LEADING_SEPARATOR"
         assert MacroParseFailureReason.MULTIPLE_LEADING_SEPARATORS == "MULTIPLE_LEADING_SEPARATORS"
-        assert len(MacroParseFailureReason) == 8
+        assert MacroParseFailureReason.TOO_MANY_OPTIONAL_VARIABLES == "TOO_MANY_OPTIONAL_VARIABLES"
+        assert len(MacroParseFailureReason) == 9
 
     def test_macro_resolution_failure_dataclass(self) -> None:
         """Test creating MacroResolutionFailure with all fields."""
@@ -1555,3 +1557,315 @@ class TestLeadingSeparatorSyntax:
         # returns the value unchanged; NumericPaddingFormat.reverse then parses it.
         extracted = macro.extract_variables("v005.py", {}, secrets_manager)
         assert extracted == {"shot": 5}
+
+
+class TestReverseMatchOptionalVariable5025:
+    """Reverse-match should recover an optional variable's bound value when the value IS present in the path.
+
+    Covers the direct repros from #5025, mixed emitted/omitted layouts,
+    format-spec composition (numeric padding, leading separator, sequence
+    slot), the popcount-descending preference, the round-trip guard's
+    rejection of inconsistent extractions, the ``MAX_OPTIONAL_VARIABLES``
+    cap, and integration with known-variable overlay.
+    """
+
+    @pytest.fixture
+    def sm(self) -> Any:
+        """Return a SecretsManager that answers None for every env lookup."""
+        from unittest.mock import MagicMock
+
+        mock = MagicMock()
+        mock.get_secret.return_value = None
+        return mock
+
+    # --- Direct repros from the #5025 issue body ---
+
+    def test_plain_optional_recovers_bound_value(self, sm: Any) -> None:
+        """`{shot?}` extracts `shot=foo` from `renderfoo` — issue's core repro."""
+        macro = ParsedMacro("render{shot?}")
+        assert macro.extract_variables("renderfoo", {}, sm) == {"shot": "foo"}
+
+    def test_plain_optional_absent_stays_empty(self, sm: Any) -> None:
+        """`{shot?}` on `render` returns `{}` — omitted case still works."""
+        macro = ParsedMacro("render{shot?}")
+        assert macro.extract_variables("render", {}, sm) == {}
+
+    def test_optional_sequence_slot_recovers_bound_index(self, sm: Any) -> None:
+        """`{###?}` extracts `_index=1` from `render001.png`."""
+        macro = ParsedMacro("render{###?}.png")
+        assert macro.extract_variables("render001.png", {}, sm) == {"_index": 1}
+
+    def test_optional_sequence_slot_absent_returns_empty(self, sm: Any) -> None:
+        """`{###?}` on `render.png` — slot omitted, no `_index`."""
+        macro = ParsedMacro("render{###?}.png")
+        assert macro.extract_variables("render.png", {}, sm) == {}
+
+    def test_optional_leading_separator_sequence_recovers_bound_index(self, sm: Any) -> None:
+        """`{###?:^_v}` extracts `_index=1` from `render_v001.png`."""
+        macro = ParsedMacro("render{###?:^_v}.png")
+        assert macro.extract_variables("render_v001.png", {}, sm) == {"_index": 1}
+
+    def test_optional_leading_separator_sequence_absent_returns_empty(self, sm: Any) -> None:
+        """`{###?:^_v}` on `render.png` — slot + separator both omitted."""
+        macro = ParsedMacro("render{###?:^_v}.png")
+        assert macro.extract_variables("render.png", {}, sm) == {}
+
+    # --- Canonical multi-optional composition (canary case) ---
+
+    def test_workflow_manager_canary_versioned_save_extracts_full_bag(self, sm: Any) -> None:
+        """The exact template + path from ``test_create_versioned_match_path_passes_full_matched_dict_through``.
+
+        Two optionals (``sub_dirs?:/`` and ``###?:^_v``); the path has the
+        version slot but no subdir. Correct answer requires (sub_dirs=off,
+        _index=on) — the popcount-desc search finds it after two higher-
+        popcount attempts fail their round-trips.
+        """
+        macro = ParsedMacro("{workspace_dir}/{sub_dirs?:/}{file_name_base}{###?:^_v}.{file_extension}")
+        known: MacroVariables = {"workspace_dir": "/ws", "file_extension": "py"}
+        assert macro.extract_variables("/ws/my_flow_v001.py", known, sm) == {
+            "workspace_dir": "/ws",
+            "file_name_base": "my_flow",
+            "_index": 1,
+            "file_extension": "py",
+        }
+
+    def test_workflow_manager_canary_versioned_save_no_version_extracts_bare_name(self, sm: Any) -> None:
+        """Same template, path with NEITHER optional emitted. Both drop."""
+        macro = ParsedMacro("{workspace_dir}/{sub_dirs?:/}{file_name_base}{###?:^_v}.{file_extension}")
+        known: MacroVariables = {"workspace_dir": "/ws", "file_extension": "py"}
+        assert macro.extract_variables("/ws/my_flow.py", known, sm) == {
+            "workspace_dir": "/ws",
+            "file_name_base": "my_flow",
+            "file_extension": "py",
+        }
+
+    # --- Format-spec compositions on the optional ---
+
+    def test_optional_with_case_transform_recovers_value(self, sm: Any) -> None:
+        """`{shot?:upper}` on `renderFOO` — case-transform doesn't block extraction."""
+        macro = ParsedMacro("render{shot?:upper}")
+        # Extractor grabs the tail; upper-transform reverse is a no-op on strings.
+        assert macro.extract_variables("renderFOO", {}, sm) == {"shot": "FOO"}
+
+    def test_optional_with_numeric_padding_recovers_integer(self, sm: Any) -> None:
+        """`{frame?:03}` on `render042` → `frame=42`."""
+        macro = ParsedMacro("render{frame?:03}")
+        assert macro.extract_variables("render042", {}, sm) == {"frame": 42}
+
+    def test_optional_with_numeric_padding_absent_returns_empty(self, sm: Any) -> None:
+        """`{frame?:03}` on `render` — omitted, no `frame`."""
+        macro = ParsedMacro("render{frame?:03}")
+        assert macro.extract_variables("render", {}, sm) == {}
+
+    def test_optional_with_trailing_separator_recovers_value(self, sm: Any) -> None:
+        """`{workflow_name?:_}` on `my_wf_photo.jpg`."""
+        macro = ParsedMacro("{workflow_name?:_}photo.jpg")
+        assert macro.extract_variables("my_wf_photo.jpg", {}, sm) == {"workflow_name": "my_wf"}
+
+    def test_optional_with_trailing_separator_absent_drops_optional(self, sm: Any) -> None:
+        """`{workflow_name?:_}` on `photo.jpg` — omitted."""
+        macro = ParsedMacro("{workflow_name?:_}photo.jpg")
+        assert macro.extract_variables("photo.jpg", {}, sm) == {}
+
+    # --- Mixed with known variables ---
+
+    def test_known_and_optional_together_extract_both(self, sm: Any) -> None:
+        """Known variable AND optional-unbound coexist in the same template."""
+        macro = ParsedMacro("{root}/{name?:_}file.png")
+        result = macro.extract_variables("inputs/foo_file.png", {"root": "inputs"}, sm)
+        assert result == {"root": "inputs", "name": "foo"}
+
+    def test_known_and_optional_together_optional_omitted(self, sm: Any) -> None:
+        """Known + optional, path has known but drops optional."""
+        macro = ParsedMacro("{root}/{name?:_}file.png")
+        result = macro.extract_variables("inputs/file.png", {"root": "inputs"}, sm)
+        assert result == {"root": "inputs"}
+
+    def test_known_value_mismatch_returns_none_even_with_optional(self, sm: Any) -> None:
+        """A wrong known value blocks the match; the optional can't rescue it."""
+        macro = ParsedMacro("{root}/{name?:_}file.png")
+        assert macro.extract_variables("outputs/foo_file.png", {"root": "inputs"}, sm) is None
+
+    # --- Multi-optional layouts (2 optionals) ---
+
+    def test_two_optionals_both_emitted(self, sm: Any) -> None:
+        """Both optionals fire; popcount-2 mask wins."""
+        macro = ParsedMacro("{a?:_}{b?:_}file.png")
+        result = macro.extract_variables("first_second_file.png", {}, sm)
+        assert result == {"a": "first", "b": "second"}
+
+    def test_two_optionals_only_first_emitted(self, sm: Any) -> None:
+        """First optional emitted, second omitted."""
+        macro = ParsedMacro("{a?:_}{b?:_}file.png")
+        result = macro.extract_variables("first_file.png", {}, sm)
+        # Either interpretation could round-trip; popcount-desc + bit-order
+        # tie-breaking gives the deterministic answer.
+        assert result is not None
+        assert result in ({"a": "first"}, {"b": "first"})
+
+    def test_two_optionals_neither_emitted(self, sm: Any) -> None:
+        """Both optionals dropped; popcount-0 mask wins."""
+        macro = ParsedMacro("{a?:_}{b?:_}file.png")
+        result = macro.extract_variables("file.png", {}, sm)
+        assert result == {}
+
+    # --- Three-optional composition (highest real-world density) ---
+
+    def test_three_optionals_all_emitted(self, sm: Any) -> None:
+        """Three-optional template with a leading-separator index (so the index has an anchor)."""
+        macro = ParsedMacro("{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03:^_v}.{ext}")
+        known: MacroVariables = {"outputs": "outputs", "ext": "png"}
+        result = macro.extract_variables("outputs/subdir/mynode_render_v001.png", known, sm)
+        assert result == {
+            "outputs": "outputs",
+            "sub_dirs": "subdir",
+            "node_name": "mynode",
+            "file_name_base": "render",
+            "_index": 1,
+            "ext": "png",
+        }
+
+    def test_three_optionals_only_index_emitted(self, sm: Any) -> None:
+        """Three-optional template ambiguity — multiple readings round-trip.
+
+        The path ``render_v001.png`` under this template is genuinely
+        ambiguous: (``file_name_base=render, _index=1``),
+        (``node_name=render, file_name_base=v001``), and
+        (``file_name_base=render_v001``) all round-trip. All three are
+        popcount≤1, so the mask iteration order picks one deterministically
+        without semantic preference. The test asserts a valid reading
+        is returned — the grammar itself doesn't disambiguate. Callers
+        that need the "sequence-slot preferred" reading should either
+        supply ``node_name`` in ``known_variables`` or use a template
+        with an unambiguous static separator between name and version.
+        """
+        macro = ParsedMacro("{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03:^_v}.{ext}")
+        known: MacroVariables = {"outputs": "outputs", "ext": "png"}
+        result = macro.extract_variables("outputs/render_v001.png", known, sm)
+        assert result is not None
+        # Round-trip validates any winner.
+        assert macro.resolve(result, sm) == "outputs/render_v001.png"
+
+    def test_three_optionals_none_emitted(self, sm: Any) -> None:
+        """Three-optional template with only bare filename."""
+        macro = ParsedMacro("{outputs}/{sub_dirs?:/}{node_name?:_}{file_name_base}{_index?:03:^_v}.{ext}")
+        known: MacroVariables = {"outputs": "outputs", "ext": "png"}
+        result = macro.extract_variables("outputs/render.png", known, sm)
+        assert result == {"outputs": "outputs", "file_name_base": "render", "ext": "png"}
+
+    def test_three_optionals_no_index_anchor_is_ambiguous(self, sm: Any) -> None:
+        """Real-world template ``{...}{_index?:03}.{ext}`` — index has NO leading anchor.
+
+        Without a leading separator on ``{_index?:03}``, there's no fixed
+        text between ``{file_name_base}`` and ``{_index?:03}`` to bound the
+        preceding variable's greedy extraction. The extractor falls back to
+        the popcount-desc round-trip which finds ``file_name_base`` grabs
+        the whole numeric tail. This is a design limitation — authors who
+        want a distinguishable index slot should use ``{###?:^_v}`` or
+        equivalent (as `CREATE_VERSIONED_WORKFLOW`'s macro does).
+        """
+        macro = ParsedMacro("{outputs}/{file_name_base}{_index?:03}.{ext}")
+        known: MacroVariables = {"outputs": "outputs", "ext": "png"}
+        result = macro.extract_variables("outputs/render001.png", known, sm)
+        # file_name_base absorbs the whole stem; _index isn't extracted.
+        # Round-trip confirms this is a valid (if less-informative) reading.
+        assert result == {"outputs": "outputs", "file_name_base": "render001", "ext": "png"}
+
+    # --- Round-trip validation rejects greedy misreads ---
+
+    def test_round_trip_rejects_extraction_that_does_not_reproduce_path(self, sm: Any) -> None:
+        """Extractor's greedy reading can succeed but fail round-trip.
+
+        Template ``prefix{opt?:X}suffix`` on path ``prefixNOsuffix``: emitted
+        attempt captures ``opt="NO"`` but the forward render is
+        ``prefixNOXsuffix`` — mismatch. Round-trip rejects; popcount-0 wins
+        with the raw ``prefixNOsuffix``... wait, that also doesn't match
+        (static text ``prefix``+``suffix`` = ``prefixsuffix``). So the whole
+        match returns None.
+        """
+        macro = ParsedMacro("prefix{opt?:X}suffix")
+        assert macro.extract_variables("prefixNOsuffix", {}, sm) is None
+
+    def test_prefers_higher_popcount_when_multiple_masks_round_trip(self, sm: Any) -> None:
+        """When both `opt=emitted` and `opt=omitted` round-trip, prefer emitted.
+
+        Template ``{a?:_}foo`` on path ``foo`` — omitted wins (only fit).
+        Template ``{a?:_}foo`` on path ``xxx_foo`` — emitted wins with a=xxx.
+        """
+        macro = ParsedMacro("{a?:_}foo")
+        # Only omitted round-trips (path exactly == "foo" after dropping optional).
+        assert macro.extract_variables("foo", {}, sm) == {}
+        # Only emitted round-trips (path has the _ separator).
+        assert macro.extract_variables("xxx_foo", {}, sm) == {"a": "xxx"}
+
+    # --- Edge cases ---
+
+    def test_empty_capture_for_emitted_optional_is_rejected(self, sm: Any) -> None:
+        """An emitted optional that captures the empty string is inconsistent.
+
+        Template ``{a?}b`` on path ``b``: emitted attempt grabs ``a=""``,
+        which the guard rejects; popcount-0 (dropped) wins.
+        """
+        macro = ParsedMacro("{a?}b")
+        assert macro.extract_variables("b", {}, sm) == {}
+
+    def test_leading_separator_prefix_becomes_extraction_anchor_for_preceding_var(self, sm: Any) -> None:
+        """A following optional's ``LeadingSeparatorFormat`` prefix bounds the preceding variable.
+
+        Without this, ``{name}`` in ``{name}{###?:^_v}.png`` would greedily
+        consume up to ``.png`` and swallow ``_v001``, leaving nothing for
+        the sequence slot. See ``find_next_anchor`` in
+        ``macro_parser/matching.py``.
+        """
+        macro = ParsedMacro("{name}{###?:^_v}.png")
+        assert macro.extract_variables("render_v001.png", {}, sm) == {"name": "render", "_index": 1}
+
+    def test_only_required_no_optional_still_works(self, sm: Any) -> None:
+        """A template with no optionals bypasses the 2^k search entirely."""
+        macro = ParsedMacro("{a}/{b}")
+        assert macro.extract_variables("foo/bar", {}, sm) == {"a": "foo", "b": "bar"}
+
+    def test_fully_resolved_by_knowns_bypasses_search(self, sm: Any) -> None:
+        """If knowns cover every variable, no 2^k search — direct compare."""
+        macro = ParsedMacro("{a}/{b}")
+        result = macro.extract_variables("foo/bar", {"a": "foo", "b": "bar"}, sm)
+        assert result == {"a": "foo", "b": "bar"}
+
+    def test_matches_boolean_wrapper_also_works(self, sm: Any) -> None:
+        """`matches()` returns True/False in step with the extractor."""
+        macro = ParsedMacro("render{shot?}")
+        assert macro.matches("renderfoo", {}, sm) is True
+        assert macro.matches("render", {}, sm) is True
+        # A path the extractor can't recover from → False.
+        macro2 = ParsedMacro("prefix{opt?:X}suffix")
+        assert macro2.matches("prefixNOsuffix", {}, sm) is False
+
+    # --- MAX_OPTIONAL_VARIABLES_FOR_REVERSE_MATCH cap ---
+
+    def test_five_optionals_still_matches(self, sm: Any) -> None:
+        """Five optionals is at the cap and still runs."""
+        macro = ParsedMacro("{a?:_}{b?:_}{c?:_}{d?:_}{e?:_}base")
+        # All five emitted.
+        result = macro.extract_variables("A_B_C_D_E_base", {}, sm)
+        assert result == {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E"}
+        # None emitted.
+        assert macro.extract_variables("base", {}, sm) == {}
+
+    def test_six_optionals_raises_too_many(self, sm: Any) -> None:
+        """Six optionals exceeds the cap — reverse-match refuses to search."""
+        macro = ParsedMacro("{a?:_}{b?:_}{c?:_}{d?:_}{e?:_}{f?:_}base")
+        with pytest.raises(MacroSyntaxError) as exc_info:
+            macro.extract_variables("A_B_C_D_E_F_base", {}, sm)
+        assert exc_info.value.failure_reason == MacroParseFailureReason.TOO_MANY_OPTIONAL_VARIABLES
+
+    def test_six_optionals_but_all_known_bypasses_cap(self, sm: Any) -> None:
+        """The cap only counts UNBOUND optionals — knowns don't add to k.
+
+        A caller with six optional variables can still reverse-match if
+        they pre-bind them all, because at that point there's nothing to
+        enumerate.
+        """
+        macro = ParsedMacro("{a?:_}{b?:_}{c?:_}{d?:_}{e?:_}{f?:_}base")
+        known: MacroVariables = {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E", "f": "F"}
+        # No unbound optionals → no 2^k search → no cap violation.
+        assert macro.extract_variables("A_B_C_D_E_F_base", known, sm) == known
