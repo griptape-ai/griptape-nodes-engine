@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from contextvars import ContextVar
 from typing import Any, ClassVar
@@ -7,6 +8,8 @@ from typing import Any, ClassVar
 from griptape_nodes.common.macro_parser.core import ParsedMacro
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError, MacroSyntaxError
 from griptape_nodes.common.macro_parser.segments import ParsedVariable
+
+logger = logging.getLogger("griptape_nodes")
 
 # Sentinel meaning "the flow lookup was attempted but the node is not in any flow."
 _NO_FLOW: object = object()
@@ -42,7 +45,7 @@ class VariableResolver:
         return False
 
     @staticmethod
-    def resolve_macro_token(token: str, variables: dict[str, str | int]) -> str:
+    def resolve_macro_token(token: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Try to resolve a single {VAR} or {VAR:spec} token against the variable dict.
 
         Returns the resolved string on success, or the original token if the variable
@@ -63,8 +66,21 @@ class VariableResolver:
         # one ParsedVariable segment. Iterate segments directly (not get_variables()) to retain
         # format_specs, which are stripped by get_variables().
         parsed_var = next((seg for seg in parsed.segments if isinstance(seg, ParsedVariable)), None)
-        if parsed_var is None or parsed_var.info.name not in variables:
+        if parsed_var is None:
             return token
+        if parsed_var.info.name not in variables:
+            if parsed_var.info.is_required:
+                # DEBUG intentionally — unresolved tokens are common during partial setup and shouldn't flood the UI.
+                if node_name:
+                    logger.debug(
+                        "Node %r: variable %r not found; leaving token %r unresolved",
+                        node_name,
+                        parsed_var.info.name,
+                        token,
+                    )
+                else:
+                    logger.debug("Variable %r not found; leaving token %r unresolved", parsed_var.info.name, token)
+            return "" if not parsed_var.info.is_required else token
         value: str | int = variables[parsed_var.info.name]
         try:
             for format_spec in parsed_var.format_specs:
@@ -74,24 +90,24 @@ class VariableResolver:
         return str(value)
 
     @staticmethod
-    def resolve_string(text: str, variables: dict[str, str | int]) -> str:
+    def resolve_string(text: str, variables: dict[str, str | int], node_name: str | None = None) -> str:
         """Substitute all {VAR} tokens in text using the provided variable dict."""
         return VariableResolver._MACRO_TOKEN.sub(
-            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables),
+            lambda m: VariableResolver.resolve_macro_token(m.group(0), variables, node_name),
             text,
         )
 
     @staticmethod
-    def resolve_value(value: Any, variables: dict[str, str | int]) -> Any:
+    def resolve_value(value: Any, variables: dict[str, str | int], node_name: str | None = None) -> Any:
         """Recursively substitute {VAR} references in any str/dict/list value."""
         if isinstance(value, str):
             if VariableResolver._HAS_VARIABLE_MACRO.search(value):
-                return VariableResolver.resolve_string(value, variables)
+                return VariableResolver.resolve_string(value, variables, node_name)
             return value
         if isinstance(value, dict):
-            return {k: VariableResolver.resolve_value(v, variables) for k, v in value.items()}
+            return {k: VariableResolver.resolve_value(v, variables, node_name) for k, v in value.items()}
         if isinstance(value, list):
-            return [VariableResolver.resolve_value(item, variables) for item in value]
+            return [VariableResolver.resolve_value(item, variables, node_name) for item in value]
         return value
 
     @staticmethod
@@ -144,8 +160,8 @@ class VariableResolver:
             return cached  # type: ignore[return-value]
 
         from griptape_nodes.retained_mode.events.variable_events import (
-            GetVariablesRequest,
-            GetVariablesResultSuccess,
+            ResolveSubstitutionRequest,
+            ResolveSubstitutionResultSuccess,
         )
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -155,9 +171,10 @@ class VariableResolver:
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
         result = GriptapeNodes.handle_request(
-            GetVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(result, GetVariablesResultSuccess):
+        if not isinstance(result, ResolveSubstitutionResultSuccess):
+            logger.debug("Variable substitution skipped for node %s: %s", node_name, result.result_details)
             _aprocess_variable_cache.set(_NO_FLOW)
             return None
         resolved = VariableResolver._filter_for_substitution(result.variables)
