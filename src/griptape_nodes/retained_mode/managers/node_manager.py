@@ -2618,7 +2618,16 @@ class NodeManager:
         # (incoming_node_set), which are reproduced when the originating edit is undone rather than
         # reverted individually.
         is_user_property_edit = not request.initial_setup and not request.is_output and not incoming_node_set
-        old_value_for_undo = node.get_parameter_value(request.parameter_name) if is_user_property_edit else None
+        old_value_for_undo = None
+        if is_user_property_edit:
+            # Deep-copy now, before the set mutates node state. Hooks (before/after_value_set) or
+            # container parameters can mutate the previous value object in place, so snapshotting a
+            # bare reference here and copying it later (after the mutation) could record the new
+            # value as the "old" one. A value that cannot be deep-copied simply will not be undoable.
+            try:
+                old_value_for_undo = copy.deepcopy(node.get_parameter_value(request.parameter_name))
+            except Exception:
+                is_user_property_edit = False
 
         try:
             finalized_value, modified = self._set_and_pass_through_values(request, node)
