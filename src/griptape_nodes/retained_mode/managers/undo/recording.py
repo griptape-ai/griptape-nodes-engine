@@ -380,7 +380,9 @@ class RecordingSession:
             frame.invalidate = True
             return
         frame.entries.extend(batch.entries)
-        if frame.label is None:
+        # An empty batch is a deliberate no-op (e.g. an unchanged value); it neither records nor
+        # names the frame.
+        if batch.entries and frame.label is None:
             frame.label = batch.label
 
     def _contribute_without_recorder(

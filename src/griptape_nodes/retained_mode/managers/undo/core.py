@@ -126,4 +126,10 @@ class UndoRecorder(ABC):
 
     @abstractmethod
     def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:
-        """Build the undo batch after the handler succeeded. Returning None invalidates history."""
+        """Build the undo batch after the handler succeeded.
+
+        Return a batch with one or more entries to record the reversal. Return an empty batch (no
+        entries) to record nothing without invalidating history -- e.g. a no-op edit, or a variant
+        of the request the recorder deliberately does not reverse. Return None to invalidate history
+        (the recorder cannot faithfully reverse a mutation that did happen).
+        """

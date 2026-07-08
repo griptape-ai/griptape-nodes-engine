@@ -669,6 +669,9 @@ class TestUndoManager:
         undo_manager = griptape_nodes.UndoManager()
         assert CreateNodeRequest in undo_manager._recording._recorders
         assert DeleteNodeRequest in undo_manager._recording._recorders
+        assert SetParameterValueRequest in undo_manager._recording._recorders
+        assert CreateConnectionRequest in undo_manager._recording._recorders
+        assert DeleteConnectionRequest in undo_manager._recording._recorders
 
     def test_register_recorder_rejects_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
         """A second recorder for the same request type is a registration error, mirroring handlers."""

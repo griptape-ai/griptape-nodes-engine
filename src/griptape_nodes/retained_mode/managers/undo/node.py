@@ -35,9 +35,14 @@ from griptape_nodes.retained_mode.events.node_events import (
     SerializeNodeToCommandsResultSuccess,
     SetLockNodeStateRequest,
 )
+from griptape_nodes.retained_mode.events.parameter_events import (
+    SetParameterValueRequest,
+    SetParameterValueResultSuccess,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.undo import (
     RecorderCapture,
+    RequestReplayUndoEntry,
     UndoBatch,
     UndoEntry,
     UndoEntryReplayError,
@@ -267,3 +272,92 @@ class DeleteNodeRecorder(UndoRecorder):
     def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:  # noqa: ARG002
         entry: DeleteNodeUndoEntry = state
         return UndoBatch(label=f"Delete node '{entry.node_name}'", entries=[entry])
+
+
+@dataclass
+class _ParameterEditCapture:
+    """Pre-set snapshot of a property edit: the values needed to reverse and re-apply it."""
+
+    node_name: str
+    parameter_name: str
+    data_type: str
+    old_value: Any
+
+
+class SetParameterValueRecorder(UndoRecorder):
+    """Records a user property edit so undo restores the previous value and redo re-applies the new one.
+
+    Only genuine user property edits are reversible. Internal writes -- workflow load
+    (initial_setup), output-value writes, and downstream propagation (an incoming connection
+    source) -- are folded into the originating action instead, so they are treated as no-ops here.
+    A set that does not change the value is likewise a no-op.
+    """
+
+    def capture_before(self, request: RequestPayload) -> RecorderCapture:  # noqa: PLR0911
+        if not isinstance(request, SetParameterValueRequest):
+            return RecorderCapture(declined=True)
+        # Not a user property edit: fold into the originating action rather than record it here.
+        incoming_node_set = request.incoming_connection_source_node_name is not None
+        if request.initial_setup or request.is_output or incoming_node_set:
+            return RecorderCapture(state=None)
+
+        node_name = request.node_name
+        node = None
+        if node_name is None:
+            context_manager = GriptapeNodes.ContextManager()
+            if not context_manager.has_current_node():
+                # The set itself will fail; nothing to record.
+                return RecorderCapture(state=None)
+            node = context_manager.get_current_node()
+            node_name = node.name
+        if node is None:
+            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        if node is None:
+            return RecorderCapture(state=None)
+
+        parameter = node.get_parameter_by_name(request.parameter_name)
+        if parameter is None:
+            return RecorderCapture(state=None)
+
+        try:
+            # Snapshot before the mutation so an in-place change during the set cannot corrupt it.
+            old_value = copy.deepcopy(node.get_parameter_value(request.parameter_name))
+        except Exception:
+            # A value that cannot be deep-copied simply will not be undoable.
+            return RecorderCapture(state=None)
+
+        return RecorderCapture(
+            state=_ParameterEditCapture(
+                node_name=node_name,
+                parameter_name=request.parameter_name,
+                data_type=parameter.type,
+                old_value=old_value,
+            )
+        )
+
+    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:  # noqa: ARG002
+        # No captured state (internal write, missing node/parameter) or an unexpected result type:
+        # record nothing without invalidating history.
+        if state is None or not isinstance(result, SetParameterValueResultSuccess):
+            return UndoBatch(label="", entries=[])
+        capture: _ParameterEditCapture = state
+        # A set that did not change the value is a no-op.
+        if capture.old_value == result.finalized_value:
+            return UndoBatch(label="", entries=[])
+
+        undo_request = SetParameterValueRequest(
+            node_name=capture.node_name,
+            parameter_name=capture.parameter_name,
+            value=copy.deepcopy(capture.old_value),
+            data_type=capture.data_type,
+        )
+        redo_request = SetParameterValueRequest(
+            node_name=capture.node_name,
+            parameter_name=capture.parameter_name,
+            value=copy.deepcopy(result.finalized_value),
+            data_type=capture.data_type,
+        )
+        return UndoBatch(
+            label=f"Set '{capture.node_name}.{capture.parameter_name}'",
+            entries=[RequestReplayUndoEntry(undo_requests=[undo_request], redo_requests=[redo_request])],
+        )

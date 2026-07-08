@@ -237,7 +237,11 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.undo.node import CreateNodeRecorder, DeleteNodeRecorder
+from griptape_nodes.retained_mode.managers.undo.node import (
+    CreateNodeRecorder,
+    DeleteNodeRecorder,
+    SetParameterValueRecorder,
+)
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -415,13 +419,11 @@ class NodeManager:
         if undo_manager is not None:
             undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
             undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
+            undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
             # Node mutations declared non-undoable act as the floor for the undo system: a user
-            # mutation of one of these neither records nor invalidates history. SetParameterValueRequest
-            # is recorded inline via record_inverse when the value actually changes (see the handler);
-            # it stays listed here so no-op sets (unchanged value) do not invalidate history. The
-            # others are not yet undoable and become recorders as coverage grows.
+            # mutation of one of these neither records nor invalidates history. These are not yet
+            # undoable and become recorders as coverage grows.
             undo_manager.register_non_undoable(
-                SetParameterValueRequest,
                 SetNodeMetadataRequest,
                 BatchSetNodeMetadataRequest,
                 SetLockNodeStateRequest,
@@ -2613,22 +2615,6 @@ class NodeManager:
         should_check_output_side_effects = not request.initial_setup and not request.is_output
         output_snapshot = dict(node.parameter_output_values) if should_check_output_side_effects else None
 
-        # Capture the pre-set value so a user property edit can be reversed by undo. Skip internal
-        # writes: workflow load (initial_setup), output-value writes, and downstream propagation
-        # (incoming_node_set), which are reproduced when the originating edit is undone rather than
-        # reverted individually.
-        is_user_property_edit = not request.initial_setup and not request.is_output and not incoming_node_set
-        old_value_for_undo = None
-        if is_user_property_edit:
-            # Deep-copy now, before the set mutates node state. Hooks (before/after_value_set) or
-            # container parameters can mutate the previous value object in place, so snapshotting a
-            # bare reference here and copying it later (after the mutation) could record the new
-            # value as the "old" one. A value that cannot be deep-copied simply will not be undoable.
-            try:
-                old_value_for_undo = copy.deepcopy(node.get_parameter_value(request.parameter_name))
-            except Exception:
-                is_user_property_edit = False
-
         try:
             finalized_value, modified = self._set_and_pass_through_values(request, node)
         except Exception as err:
@@ -2702,20 +2688,6 @@ class NodeManager:
                     )
 
         # Cool.
-        # Record how to reverse this edit for undo. Only genuine user property edits that actually
-        # changed the value are recorded; a no-op set (unchanged value) records nothing and, because
-        # SetParameterValueRequest is declared non-undoable, does not invalidate history either.
-        if is_user_property_edit and modified:
-            GriptapeNodes.UndoManager().record_inverse(
-                SetParameterValueRequest(
-                    node_name=node_name,
-                    parameter_name=request.parameter_name,
-                    value=old_value_for_undo,
-                    data_type=parameter.type,
-                ),
-                label=f"Set '{node_name}.{request.parameter_name}'",
-            )
-
         details = f"Successfully set value on Node '{node_name}' Parameter '{request.parameter_name}'."
         result = SetParameterValueResultSuccess(
             finalized_value=finalized_value, data_type=parameter.type, result_details=details
