@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
@@ -236,6 +237,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
+from griptape_nodes.retained_mode.managers.node_manager_undo import CreateNodeRecorder, DeleteNodeRecorder
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -307,7 +309,7 @@ class _NodeInstantiationDeniedError(Exception):
 class NodeManager:
     _name_to_parent_flow_name: dict[str, str]
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, undo_manager: UndoManager | None = None) -> None:
         self._name_to_parent_flow_name = {}
 
         # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
@@ -406,6 +408,23 @@ class NodeManager:
         )
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
+
+        # Register how node requests are reversed for undo/redo. The UndoManager owns the
+        # mechanism; the node domain owns the knowledge of how to reverse its own requests.
+        # undo_manager is None in isolated unit tests that construct NodeManager directly.
+        if undo_manager is not None:
+            undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
+            undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
+            # Node mutations that alter workflow state but are not yet undoable. Declaring them keeps
+            # them from invalidating history. Each becomes a recorder as undo coverage grows.
+            undo_manager.register_non_undoable(
+                SetParameterValueRequest,
+                SetNodeMetadataRequest,
+                BatchSetNodeMetadataRequest,
+                SetLockNodeStateRequest,
+                ResolveNodeRequest,
+                UnresolveNodeRequest,
+            )
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself
