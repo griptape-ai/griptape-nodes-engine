@@ -10,6 +10,65 @@ plugins:
           options:
             show_if_no_docstring: true
             heading_level: 3
+  - redirects:
+      redirect_maps:
+        configuration.md: guides/configuration.md
+        configuration_reference.md: reference/configuration_reference.md
+        libraries.md: guides/libraries.md
+        command_line_interface.md: reference/command_line_interface.md
+        retained_mode.md: development/retained_mode.md
+        publishing/index.md: guides/publishing.md
+        ftue/FTUE.md: tutorials/index.md
+        ftue/00_tour/FTUE_00_tour.md: tutorials/00_tour/index.md
+        ftue/01_prompt_an_image/FTUE_01_prompt_an_image.md: tutorials/01_prompt_an_image/index.md
+        ftue/02_coordinating_agents/FTUE_02_coordinating_agents.md: tutorials/02_coordinating_agents/index.md
+        ftue/03_compare_prompts/FTUE_03_compare_prompts.md: tutorials/03_compare_prompts/index.md
+        ftue/04_photography_team/FTUE_04_photography_team.md: tutorials/04_photography_team/index.md
+        how_to/making_custom_nodes.md: development/custom_nodes/index.md
+        how_to/making_custom_scripts.md: development/retained_mode.md
+        how_to/keys/openai.md: guides/integrations/openai.md
+        how_to/keys/grok.md: guides/integrations/grok.md
+        how_to/installs/hugging_face.md: guides/integrations/hugging_face.md
+        how_to/mcp/index.md: guides/mcp/index.md
+        how_to/mcp/getting_started.md: guides/mcp/getting_started.md
+        how_to/mcp/mcp_task_agents.md: guides/mcp/mcp_task_agents.md
+        how_to/mcp/advanced_local_models.md: guides/mcp/advanced_local_models.md
+        how_to/mcp/external_clients.md: guides/mcp/external_clients.md
+        how_to/mcp/rules.md: guides/mcp/rules.md
+        how_to/mcp/connection_types/stdio.md: guides/mcp/connection_types/stdio.md
+        how_to/mcp/connection_types/sse.md: guides/mcp/connection_types/sse.md
+        how_to/mcp/connection_types/streamable_http.md: guides/mcp/connection_types/streamable_http.md
+        how_to/mcp/connection_types/websocket.md: guides/mcp/connection_types/websocket.md
+        how_to/mcp/servers/index.md: guides/mcp/servers/index.md
+        how_to/mcp/servers/blender.md: guides/mcp/servers/blender.md
+        how_to/mcp/servers/maya.md: guides/mcp/servers/maya.md
+        how_to/mcp/servers/exa.md: guides/mcp/servers/exa.md
+        how_to/mcp/servers/fetch.md: guides/mcp/servers/fetch.md
+        how_to/mcp/servers/filesystem.md: guides/mcp/servers/filesystem.md
+        how_to/mcp/servers/time.md: guides/mcp/servers/time.md
+        how_to/agent_sidebar.md: guides/agent_sidebar.md
+        how_to/ai_providers/index.md: guides/ai_providers/index.md
+        how_to/ai_providers/griptape_cloud.md: guides/ai_providers/griptape_cloud.md
+        how_to/ai_providers/ollama.md: guides/ai_providers/ollama.md
+        how_to/ai_providers/lm_studio.md: guides/ai_providers/lm_studio.md
+        how_to/ai_providers/custom.md: guides/ai_providers/custom.md
+        developing_nodes/index.md: development/custom_nodes/index.md
+        developing_nodes/getting_started.md: development/custom_nodes/getting_started.md
+        developing_nodes/comprehensive_guide.md: development/custom_nodes/comprehensive_guide.md
+        developing_nodes/node_isolation_with_workers.md: development/custom_nodes/node_isolation_with_workers.md
+        developing_nodes/strict_mode.md: development/custom_nodes/strict_mode.md
+        projects/index.md: guides/projects/index.md
+        projects/gui_guide.md: guides/projects/gui_guide.md
+        projects/workspace.md: guides/projects/workspace.md
+        projects/projects.md: guides/projects/projects.md
+        projects/version_pinning.md: guides/projects/version_pinning.md
+        projects/macros.md: guides/projects/macros.md
+        projects/directories.md: guides/projects/directories.md
+        projects/situations.md: guides/projects/situations.md
+        projects/environment.md: guides/projects/environment.md
+        projects/file_extension_directories.md: guides/projects/file_extension_directories.md
+        projects/sequences.md: guides/projects/sequences.md
+        projects/customization.md: guides/projects/customization.md
   - llmstxt:
       full_output: llms-full.txt
       markdown_description: |
@@ -19,69 +78,80 @@ plugins:
         agent in the engine's actual API rather than scraping rendered HTML or
         fetching unrenderered raw markdown from `main`.
       sections:
-        Overview:
+        Get started:
           - index.md: Top-level introduction to Griptape Nodes
-          - for_agents.md: Hosted machine-readable docs surface (this page)
+          - installation.md: Install the engine
           - faq.md: Frequently asked questions
           - glossary.md: Terms and definitions used throughout the docs
-          - installation.md: Install the engine
-        Configuration and CLI:
-          - configuration.md: Engine configuration (workspace, secrets, libraries)
-          - libraries.md: Installing and managing node libraries
-          - command_line_interface.md: gtn CLI reference
-        Scripting (retained mode):
-          - retained_mode.md: Engine scripting API for building and running workflows
+          - for_agents.md: Hosted machine-readable docs surface (this page)
+        Tutorials:
+          - tutorials/index.md: Tutorial overview
+          - tutorials/00_tour/index.md
+          - tutorials/01_prompt_an_image/index.md
+          - tutorials/02_coordinating_agents/index.md
+          - tutorials/03_compare_prompts/index.md
+          - tutorials/04_photography_team/index.md
+        Agent sidebar:
+          - guides/agent_sidebar.md: Built-in chat interface with direct workflow access via the Griptape MCP server
+        AI providers:
+          - guides/ai_providers/index.md: Overview of supported AI providers
+          - guides/ai_providers/griptape_cloud.md: Griptape Cloud (default hosted provider)
+          - guides/ai_providers/ollama.md: Ollama local provider setup
+          - guides/ai_providers/lm_studio.md: LM Studio local provider setup
+          - guides/ai_providers/custom.md: Custom OpenAI-compatible endpoint setup
+        Configuration and libraries:
+          - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
+          - guides/libraries.md: Installing and managing node libraries
         Project system:
-          - projects/index.md: Project system overview
-          - projects/workspace.md: Workspace concepts
-          - projects/projects.md: Projects
-          - projects/version_pinning.md: Pinning engine and library versions
-          - projects/macros.md: Macros
-          - projects/directories.md: Directories
-          - projects/situations.md: Situations
-          - projects/environment.md: Environment and built-in variables
-          - projects/file_extension_directories.md: File extension directories
-          - projects/customization.md: Customization guide
-        Custom nodes and scripts:
-          - developing_nodes/index.md: Developing custom nodes overview
-          - developing_nodes/getting_started.md: Beginner-friendly intro to node development
-          - developing_nodes/comprehensive_guide.md: Exhaustive node development reference
-          - developing_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
-          - developing_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
-          - how_to/making_custom_nodes.md: Quick start template for building a custom node
-          - how_to/making_custom_scripts.md: Build custom node execution scripts
-        Beginner tutorial (FTUE):
-          - ftue/FTUE.md: Tutorial overview
-          - ftue/00_tour/FTUE_00_tour.md
-          - ftue/01_prompt_an_image/FTUE_01_prompt_an_image.md
-          - ftue/02_coordinating_agents/FTUE_02_coordinating_agents.md
-          - ftue/03_compare_prompts/FTUE_03_compare_prompts.md
-          - ftue/04_photography_team/FTUE_04_photography_team.md
-        External services:
-          - how_to/keys/openai.md
-          - how_to/keys/grok.md
-          - how_to/installs/hugging_face.md
+          - guides/projects/index.md: Project system overview
+          - guides/projects/gui_guide.md: Managing projects from the GUI
+          - guides/projects/workspace.md: Workspace concepts
+          - guides/projects/projects.md: Projects
+          - guides/projects/directories.md: Directories
+          - guides/projects/macros.md: Macros
+          - guides/projects/situations.md: Situations
+          - guides/projects/environment.md: Environment and built-in variables
+          - guides/projects/file_extension_directories.md: File extension directories
+          - guides/projects/sequences.md: Numbered file sequences (patterns and policies)
+          - guides/projects/version_pinning.md: Pinning engine and library versions
+          - guides/projects/customization.md: Customization guide
+        Publishing:
+          - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
-          - how_to/mcp/index.md: MCP integration overview
-          - how_to/mcp/getting_started.md
-          - how_to/mcp/mcp_task_agents.md
-          - how_to/mcp/advanced_local_models.md
-          - how_to/mcp/connection_types/stdio.md
-          - how_to/mcp/connection_types/sse.md
-          - how_to/mcp/connection_types/streamable_http.md
-          - how_to/mcp/connection_types/websocket.md
-          - how_to/mcp/rules.md
-          - how_to/mcp/servers/index.md
-          - how_to/mcp/servers/blender.md
-          - how_to/mcp/servers/maya.md
-          - how_to/mcp/servers/exa.md
-          - how_to/mcp/servers/fetch.md
-          - how_to/mcp/servers/filesystem.md
-          - how_to/mcp/servers/time.md
+          - guides/mcp/index.md: MCP integration overview
+          - guides/mcp/getting_started.md
+          - guides/mcp/connection_types/stdio.md
+          - guides/mcp/connection_types/sse.md
+          - guides/mcp/connection_types/streamable_http.md
+          - guides/mcp/connection_types/websocket.md
+          - guides/mcp/mcp_task_agents.md
+          - guides/mcp/advanced_local_models.md
+          - guides/mcp/external_clients.md
+          - guides/mcp/rules.md
+          - guides/mcp/servers/index.md
+          - guides/mcp/servers/blender.md
+          - guides/mcp/servers/exa.md
+          - guides/mcp/servers/fetch.md
+          - guides/mcp/servers/filesystem.md
+          - guides/mcp/servers/maya.md
+          - guides/mcp/servers/time.md
+        External services:
+          - guides/integrations/openai.md
+          - guides/integrations/grok.md
+          - guides/integrations/hugging_face.md
+        Scripting (retained mode):
+          - development/retained_mode.md: Engine scripting API for building and running workflows
+        Custom nodes:
+          - development/custom_nodes/index.md: Developing custom nodes overview
+          - development/custom_nodes/getting_started.md: Beginner-friendly intro to node development
+          - development/custom_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
+          - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
+        Reference:
+          - reference/command_line_interface.md: gtn CLI reference
+          - reference/configuration_reference.md: Every engine setting with type, default, and env var
         Enterprise:
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
-        Publishing:
-          - publishing/index.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -144,232 +214,225 @@ markdown_extensions:
       toc_depth: 3
 
 nav:
-  - Home:
+  - Get Started:
       - Overview: index.md
-      - Getting Started:
-          - Installation: installation.md
-          - Beginner's Guide:
-              - Tutorial Overview: ftue/FTUE.md
-              - 1. Getting Started: ftue/00_tour/FTUE_00_tour.md
-              - 2. Prompt an Image: ftue/01_prompt_an_image/FTUE_01_prompt_an_image.md
-              - 3. Coordinating Agents: ftue/02_coordinating_agents/FTUE_02_coordinating_agents.md
-              - 4. Compare Prompts: ftue/03_compare_prompts/FTUE_03_compare_prompts.md
-              - 5. Build a Photography Team: ftue/04_photography_team/FTUE_04_photography_team.md
-      - Engine Configuration: configuration.md
-      - Configuration Reference: configuration_reference.md
-      - Libraries: libraries.md
-      - Command Line Interface: command_line_interface.md
-      - Scripting: retained_mode.md
-      - Project System:
-          - Overview: projects/index.md
-          - Managing Projects (GUI): projects/gui_guide.md
-          - Workspace: projects/workspace.md
-          - Projects: projects/projects.md
-          - Version Pinning: projects/version_pinning.md
-          - Macros: projects/macros.md
-          - Directories: projects/directories.md
-          - Situations: projects/situations.md
-          - Environment & Builtin Variables: projects/environment.md
-          - File Extension Directories: projects/file_extension_directories.md
-          - Customization Guide: projects/customization.md
-  - How-To:
-      - Agent Sidebar: how_to/agent_sidebar.md
-      - Making Custom Nodes: how_to/making_custom_nodes.md
-      - Making Custom Scripts: how_to/making_custom_scripts.md
+      - Installation: installation.md
+      - Tutorials:
+          - Overview: tutorials/index.md
+          - 1. A Tour of the Editor: tutorials/00_tour/index.md
+          - 2. Prompt an Image: tutorials/01_prompt_an_image/index.md
+          - 3. Coordinating Agents: tutorials/02_coordinating_agents/index.md
+          - 4. Compare Prompts: tutorials/03_compare_prompts/index.md
+          - 5. Build a Photography Team: tutorials/04_photography_team/index.md
+      - FAQ: faq.md
+      - Glossary: glossary.md
+  - Guides:
+      - Agent Sidebar: guides/agent_sidebar.md
+      - AI Providers:
+          - Overview: guides/ai_providers/index.md
+          - Griptape Cloud: guides/ai_providers/griptape_cloud.md
+          - Ollama: guides/ai_providers/ollama.md
+          - LM Studio: guides/ai_providers/lm_studio.md
+          - Custom (OpenAI-compatible): guides/ai_providers/custom.md
+      - Configuration: guides/configuration.md
+      - Libraries: guides/libraries.md
+      - Projects:
+          - Overview: guides/projects/index.md
+          - Managing Projects in the GUI: guides/projects/gui_guide.md
+          - Workspace: guides/projects/workspace.md
+          - Projects: guides/projects/projects.md
+          - Directories: guides/projects/directories.md
+          - Macros: guides/projects/macros.md
+          - Situations: guides/projects/situations.md
+          - Environment & Builtin Variables: guides/projects/environment.md
+          - File Extension Directories: guides/projects/file_extension_directories.md
+          - Sequences: guides/projects/sequences.md
+          - Version Pinning: guides/projects/version_pinning.md
+          - Customization Guide: guides/projects/customization.md
+      - Publishing Workflows: guides/publishing.md
+      - MCP:
+          - Overview: guides/mcp/index.md
+          - Getting Started: guides/mcp/getting_started.md
+          - Connection Types:
+              - Local Process (stdio): guides/mcp/connection_types/stdio.md
+              - Server-Sent Events (SSE): guides/mcp/connection_types/sse.md
+              - Streamable HTTP: guides/mcp/connection_types/streamable_http.md
+              - WebSocket: guides/mcp/connection_types/websocket.md
+          - Using MCPTask with Agents: guides/mcp/mcp_task_agents.md
+          - Local Models with Agents: guides/mcp/advanced_local_models.md
+          - Connect External MCP Clients: guides/mcp/external_clients.md
+          - MCP Server Rules: guides/mcp/rules.md
+          - Example MCP Servers:
+              - Overview: guides/mcp/servers/index.md
+              - Blender: guides/mcp/servers/blender.md
+              - Exa: guides/mcp/servers/exa.md
+              - Fetch: guides/mcp/servers/fetch.md
+              - Filesystem: guides/mcp/servers/filesystem.md
+              - Maya: guides/mcp/servers/maya.md
+              - Time: guides/mcp/servers/time.md
+      - Integrations:
+          - OpenAI API Keys: guides/integrations/openai.md
+          - Grok API Keys: guides/integrations/grok.md
+          - Hugging Face Models: guides/integrations/hugging_face.md
+  - Development:
+      - Scripting: development/retained_mode.md
+      - Custom Nodes:
+          - Overview: development/custom_nodes/index.md
+          - Getting Started: development/custom_nodes/getting_started.md
+          - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
+          - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
+          - Strict Mode Reference: development/custom_nodes/strict_mode.md
+          - Example Control Node: development/custom_nodes/example_control_node.py
       - For Agents: for_agents.md
-      - External Resources:
-          - AI Providers:
-              - Overview: how_to/ai_providers/index.md
-              - Griptape Cloud: how_to/ai_providers/griptape_cloud.md
-              - Ollama: how_to/ai_providers/ollama.md
-              - LM Studio: how_to/ai_providers/lm_studio.md
-              - Custom (OpenAI-compatible): how_to/ai_providers/custom.md
-          - Keys:
-              - OpenAI: how_to/keys/openai.md
-              - Grok: how_to/keys/grok.md
-          - Installs:
-              - Hugging Face: how_to/installs/hugging_face.md
-          - MCP Integration:
-              - Overview: how_to/mcp/index.md
-              - Getting Started: how_to/mcp/getting_started.md
-              - Using MCPTask with Agents: how_to/mcp/mcp_task_agents.md
-              - "Local Models with Agents": how_to/mcp/advanced_local_models.md
-              - Connect External MCP Clients: how_to/mcp/external_clients.md
-              - Connection Types:
-                  - Local Process (stdio): how_to/mcp/connection_types/stdio.md
-                  - Server-Sent Events (SSE): how_to/mcp/connection_types/sse.md
-                  - Streamable HTTP: how_to/mcp/connection_types/streamable_http.md
-                  - WebSocket: how_to/mcp/connection_types/websocket.md
-              - MCP Server Rules: how_to/mcp/rules.md
-              - Example MCP Servers:
-                  - Overview: how_to/mcp/servers/index.md
-                  - Blender: how_to/mcp/servers/blender.md
-                  - Maya: how_to/mcp/servers/maya.md
-                  - Exa: how_to/mcp/servers/exa.md
-                  - Fetch: how_to/mcp/servers/fetch.md
-                  - Filesystem: how_to/mcp/servers/filesystem.md
-                  - Time: how_to/mcp/servers/time.md
-  - Enterprise:
-      - Admin Server: enterprise/admin_server.md
-  - Publishing:
-      - Overview: publishing/index.md
-  - FAQ: faq.md
-  - Nodes Reference:
-      - Overview: nodes/overview.md
-      - Misc:
-          - Note: nodes/utils/note.md
-      - Execution:
-          - Reroute: nodes/execution/reroute.md
-      - Agents:
-          - Agent: nodes/agents/create_agent.md
-      - Audio:
-          - Load Audio: nodes/audio/load_audio.md
-          - Microphone: nodes/audio/microphone.md
-          - Transcribe Audio: nodes/audio/transcribe_audio.md
-      - Configs:
-          - Anthropic Prompt: nodes/config/anthropic_prompt_driver.md
-          - Cohere Prompt: nodes/config/cohere_prompt_driver.md
-          - Griptape Cloud Image: nodes/config/griptape_cloud_image_driver.md
-          - Griptape Cloud Prompt: nodes/config/griptape_cloud_prompt_driver.md
-          - Grok Image: nodes/config/grok_image_driver.md
-          - Grok Prompt: nodes/config/grok_prompt_driver.md
-          - Groq Prompt: nodes/config/groq_prompt_driver.md
-          - OpenAI Image: nodes/config/openai_image_driver.md
-          - OpenAI Prompt: nodes/config/openai_prompt_driver.md
-      - Dict:
-          - Dict: nodes/dict/create_dict.md
-          - Display Dict: nodes/dict/display_dict.md
-          - Key Value Pair: nodes/dict/key_value_pair.md
-          - Merge Key Value Pairs: nodes/dict/merge_key_value_pair.md
-      - JSON:
-          - JSON Input: nodes/json/json_input.md
-          - JSON Extract Value: nodes/json/json_extract_value.md
-          - JSON Find: nodes/json/json_find.md
-          - JSON Replace: nodes/json/json_replace.md
-          - Display JSON: nodes/json/display_json.md
-      - Convert:
-          - To JSON: nodes/convert/to_json.md
-      - Image:
-          - Load Image: nodes/image/load_image.md
-          - Generate Image: nodes/image/create_image.md
-          - Describe Image: nodes/image/describe_image.md
-          - Display Image: nodes/image/display_image.md
-          - Display Channel: nodes/image/display_channel.md
-          - Extract Key Colors: nodes/image/extract_key_colors.md
-          - Invert Image: nodes/image/invert_image.md
-          - Flip Image: nodes/image/flip_image.md
-          - Display Mask: nodes/image/display_mask.md
-          - Paint Mask: nodes/image/paint_mask.md
-          - Invert Mask: nodes/image/invert_mask.md
-          - Apply Mask: nodes/image/apply_mask.md
-          - Combine Masks: nodes/image/combine_masks.md
-          - Add Text to Existing Image: nodes/image/add_text_to_existing_image.md
-          - Add Bounding Boxes: nodes/image/add_bounding_boxes.md
-          - Adjust Image EQ: nodes/image/adjust_image_eq.md
-          - Adjust Image Levels: nodes/image/adjust_image_levels.md
-          - Bloom Effect: nodes/image/bloom_effect.md
-          - Gaussian Edge Fade: nodes/image/gaussian_edge_fade.md
-          - Crop Image: nodes/image/crop_image.md
-          - Image Blend Compositor: nodes/image/image_blend_compositor.md
-          - Color Match: nodes/image/color_match.md
-          - Image Bash: nodes/image/image_bash.md
-          - Rescale Image: nodes/image/rescale_image.md
-          - Compare Images: nodes/image/compare_images.md
-          - Create Color Bars: nodes/image/create_color_bars.md
-          - Display Image Grid: nodes/image/display_image_grid.md
-          - Image Grid Splitter: nodes/image/image_grid_splitter.md
-          - Extend Canvas: nodes/image/extend_canvas.md
-          - Merge Images: nodes/image/merge_images.md
-          - Save Image: nodes/image/save_image.md
-          - Webcam: nodes/image/webcam.md
-      - Lists:
-          - Create List: nodes/lists/create_list.md
-          - Add To List: nodes/lists/add_to_list.md
-          - Remove From List: nodes/lists/remove_from_list.md
-          - Get From List: nodes/lists/get_from_list.md
-          - Get List Length: nodes/lists/get_list_length.md
-          - Get List Is Empty: nodes/lists/get_list_is_empty.md
-          - Get List Contains Item: nodes/lists/get_list_contains_item.md
-          - Get Index Of Item: nodes/lists/get_index_of_item.md
-          - Display List: nodes/lists/display_list.md
-          - Replace In List: nodes/lists/replace_in_list.md
-          - Split List: nodes/lists/split_list.md
-          - Combine Lists: nodes/lists/combine_lists.md
-          - Create Float List: nodes/lists/create_float_list.md
-          - Create Int List: nodes/lists/create_int_list.md
-          - Create Bool List: nodes/lists/create_bool_list.md
-          - Create Text List: nodes/lists/create_text_list.md
-          - Select From List: nodes/lists/select_from_list.md
-      - Number:
-          - Input Nodes:
-              - Float Input: nodes/number/create_float.md
-              - Int Input: nodes/number/create_int.md
+  - Reference:
+      - Nodes:
+          - Overview: nodes/overview.md
+          - 3D:
+              - Load 3D: nodes/three_d/load_gltf.md
+          - Advanced Media Library:
+              - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
+              - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
+          - Agents:
+              - Agent: nodes/agents/create_agent.md
+          - Audio:
+              - Load Audio: nodes/audio/load_audio.md
+              - Microphone: nodes/audio/microphone.md
+              - Transcribe Audio: nodes/audio/transcribe_audio.md
+          - Configs:
+              - Anthropic Prompt: nodes/config/anthropic_prompt_driver.md
+              - Cohere Prompt: nodes/config/cohere_prompt_driver.md
+              - Griptape Cloud Image: nodes/config/griptape_cloud_image_driver.md
+              - Griptape Cloud Prompt: nodes/config/griptape_cloud_prompt_driver.md
+              - Grok Image: nodes/config/grok_image_driver.md
+              - Grok Prompt: nodes/config/grok_prompt_driver.md
+              - Groq Prompt: nodes/config/groq_prompt_driver.md
+              - OpenAI Image: nodes/config/openai_image_driver.md
+              - OpenAI Prompt: nodes/config/openai_prompt_driver.md
+          - Convert:
+              - To JSON: nodes/convert/to_json.md
+          - Dict:
+              - Dict: nodes/dict/create_dict.md
+              - Display Dict: nodes/dict/display_dict.md
+              - Key Value Pair: nodes/dict/key_value_pair.md
+              - Merge Key Value Pairs: nodes/dict/merge_key_value_pair.md
+          - Execution:
+              - End Flow: nodes/execution/end_flow.md
+              - Reroute: nodes/execution/reroute.md
+              - Start Flow: nodes/execution/start_flow.md
+          - Image:
+              - Add Bounding Boxes: nodes/image/add_bounding_boxes.md
+              - Add Text to Existing Image: nodes/image/add_text_to_existing_image.md
+              - Adjust Image EQ: nodes/image/adjust_image_eq.md
+              - Adjust Image Levels: nodes/image/adjust_image_levels.md
+              - Apply Mask: nodes/image/apply_mask.md
+              - Bloom Effect: nodes/image/bloom_effect.md
+              - Color Match: nodes/image/color_match.md
+              - Combine Masks: nodes/image/combine_masks.md
+              - Compare Images: nodes/image/compare_images.md
+              - Create Color Bars: nodes/image/create_color_bars.md
+              - Crop Image: nodes/image/crop_image.md
+              - Describe Image: nodes/image/describe_image.md
+              - Display Channel: nodes/image/display_channel.md
+              - Display Image: nodes/image/display_image.md
+              - Display Image Grid: nodes/image/display_image_grid.md
+              - Display Mask: nodes/image/display_mask.md
+              - Extend Canvas: nodes/image/extend_canvas.md
+              - Extract Key Colors: nodes/image/extract_key_colors.md
+              - Flip Image: nodes/image/flip_image.md
+              - Gaussian Edge Fade: nodes/image/gaussian_edge_fade.md
+              - Generate Image: nodes/image/create_image.md
+              - Image Bash: nodes/image/image_bash.md
+              - Image Blend Compositor: nodes/image/image_blend_compositor.md
+              - Image Grid Splitter: nodes/image/image_grid_splitter.md
+              - Invert Image: nodes/image/invert_image.md
+              - Invert Mask: nodes/image/invert_mask.md
+              - Load Image: nodes/image/load_image.md
+              - Merge Images: nodes/image/merge_images.md
+              - Paint Mask: nodes/image/paint_mask.md
+              - Rescale Image: nodes/image/rescale_image.md
+              - Save Image: nodes/image/save_image.md
+              - Webcam: nodes/image/webcam.md
+          - JSON:
+              - Display JSON: nodes/json/display_json.md
+              - JSON Extract Value: nodes/json/json_extract_value.md
+              - JSON Find: nodes/json/json_find.md
+              - JSON Input: nodes/json/json_input.md
+              - JSON Replace: nodes/json/json_replace.md
+          - Lists:
+              - Add To List: nodes/lists/add_to_list.md
+              - Combine Lists: nodes/lists/combine_lists.md
+              - Create Bool List: nodes/lists/create_bool_list.md
+              - Create Float List: nodes/lists/create_float_list.md
+              - Create Int List: nodes/lists/create_int_list.md
+              - Create List: nodes/lists/create_list.md
+              - Create Text List: nodes/lists/create_text_list.md
+              - Display List: nodes/lists/display_list.md
+              - Get From List: nodes/lists/get_from_list.md
+              - Get Index Of Item: nodes/lists/get_index_of_item.md
+              - Get List Contains Item: nodes/lists/get_list_contains_item.md
+              - Get List Is Empty: nodes/lists/get_list_is_empty.md
+              - Get List Length: nodes/lists/get_list_length.md
+              - Remove From List: nodes/lists/remove_from_list.md
+              - Replace In List: nodes/lists/replace_in_list.md
+              - Select From List: nodes/lists/select_from_list.md
+              - Split List: nodes/lists/split_list.md
+          - Number:
+              - Askulator: nodes/number/askulator.md
               - Bool Input: nodes/number/create_bool.md
-          - Display Nodes:
               - Display Float: nodes/number/display_float.md
               - Display Int: nodes/number/display_int.md
-          - Math Nodes:
+              - Float Input: nodes/number/create_float.md
+              - Int Input: nodes/number/create_int.md
               - Math Operations: nodes/number/math.md
-              - Askulator: nodes/number/askulator.md
-      - Rules:
-          - Ruleset: nodes/rules/create_ruleset.md
-          - Ruleset List: nodes/rules/ruleset_list.md
-      - Text:
-          - Date and Time: nodes/text/date_and_time.md
-          - Display Text: nodes/text/display_text.md
-          - Evaluate Text Result: nodes/text/evaluate_text_result.md
-          - Load Text: nodes/text/load_text.md
-          - Merge Texts: nodes/text/merge_texts.md
-          - Random Text: nodes/text/random_text.md
-          - Save Text: nodes/text/save_text.md
-          - Scrape Web: nodes/text/scrape_web.md
-          - Search Replace Text: nodes/text/search_replace_text.md
-          - Search Web: nodes/text/search_web.md
-          - Summarize Text: nodes/text/summarize_text.md
-          - Text Input: nodes/text/create_multiline_text.md
-      - Video:
-          - Load Video: nodes/video/load_video.md
-          - Display Video: nodes/video/display_video.md
-          - Save Video: nodes/video/save_video.md
-          - Resize Video: nodes/video/resize_video.md
-          - Change Speed: nodes/video/change_speed.md
-          - Flip Video: nodes/video/flip_video.md
-          - Reverse Video: nodes/video/reverse_video.md
-          - Split Video: nodes/video/split_video.md
-          - Concatenate Videos: nodes/video/concatenate_videos.md
-          - Extract Last Frame: nodes/video/extract_last_frame.md
-          - Extract Audio: nodes/video/extract_audio.md
-          - Hold Video Frames: nodes/video/hold_video_frames.md
-          - Adjust Video EQ: nodes/video/adjust_video_eq.md
-          - Add Color Curves: nodes/video/add_color_curves.md
-          - Add Film Grain: nodes/video/add_film_grain.md
-          - Add Overlay: nodes/video/add_overlay.md
-          - Add RGB Shift: nodes/video/add_rgb_shift.md
-          - Add Vignette: nodes/video/add_vignette.md
-          - Adjust Mask Size: nodes/video/adjust_mask_size.md
-          - Combine Masks Video: nodes/video/combine_masks_video.md
-          - Video Color Match: nodes/video/video_color_match.md
-      - Tools:
-          - Calculator: nodes/tools/calculator_tool.md
-          - Date Time: nodes/tools/date_time_tool.md
-          - File Manager: nodes/tools/file_manager_tool.md
-          - Info Retriever: nodes/tools/rag_tool.md
-          - Tool List: nodes/tools/tool_list.md
-          - Web Scraper: nodes/tools/web_scraper_tool.md
-          - Web Search: nodes/tools/web_search_tool.md
-      - Advanced Media Library:
-          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
-          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
-      - Workflows:
-          - Start Flow: nodes/execution/start_flow.md
-          - End Flow: nodes/execution/end_flow.md
-      - 3D:
-          - Load 3D: nodes/three_d/load_gltf.md
-  - Developing Custom Nodes:
-      - Overview: developing_nodes/index.md
-      - Getting Started: developing_nodes/getting_started.md
-      - Comprehensive Guide: developing_nodes/comprehensive_guide.md
-      - Node Isolation with Workers: developing_nodes/node_isolation_with_workers.md
-      - Strict Mode Reference: developing_nodes/strict_mode.md
-      - Example Control Node: developing_nodes/example_control_node.py
-  - Glossary: glossary.md
+          - Rules:
+              - Ruleset: nodes/rules/create_ruleset.md
+              - Ruleset List: nodes/rules/ruleset_list.md
+          - Text:
+              - Date and Time: nodes/text/date_and_time.md
+              - Display Text: nodes/text/display_text.md
+              - Evaluate Text Result: nodes/text/evaluate_text_result.md
+              - Load Text: nodes/text/load_text.md
+              - Merge Texts: nodes/text/merge_texts.md
+              - Random Text: nodes/text/random_text.md
+              - Save Text: nodes/text/save_text.md
+              - Scrape Web: nodes/text/scrape_web.md
+              - Search Replace Text: nodes/text/search_replace_text.md
+              - Search Web: nodes/text/search_web.md
+              - Summarize Text: nodes/text/summarize_text.md
+              - Text Input: nodes/text/create_multiline_text.md
+          - Tools:
+              - Calculator: nodes/tools/calculator_tool.md
+              - Date Time: nodes/tools/date_time_tool.md
+              - File Manager: nodes/tools/file_manager_tool.md
+              - Info Retriever: nodes/tools/rag_tool.md
+              - Tool List: nodes/tools/tool_list.md
+              - Web Scraper: nodes/tools/web_scraper_tool.md
+              - Web Search: nodes/tools/web_search_tool.md
+          - Utility:
+              - Note: nodes/utils/note.md
+          - Video:
+              - Add Color Curves: nodes/video/add_color_curves.md
+              - Add Film Grain: nodes/video/add_film_grain.md
+              - Add Overlay: nodes/video/add_overlay.md
+              - Add RGB Shift: nodes/video/add_rgb_shift.md
+              - Add Vignette: nodes/video/add_vignette.md
+              - Adjust Mask Size: nodes/video/adjust_mask_size.md
+              - Adjust Video EQ: nodes/video/adjust_video_eq.md
+              - Change Speed: nodes/video/change_speed.md
+              - Combine Masks Video: nodes/video/combine_masks_video.md
+              - Concatenate Videos: nodes/video/concatenate_videos.md
+              - Display Video: nodes/video/display_video.md
+              - Extract Audio: nodes/video/extract_audio.md
+              - Extract Last Frame: nodes/video/extract_last_frame.md
+              - Flip Video: nodes/video/flip_video.md
+              - Hold Video Frames: nodes/video/hold_video_frames.md
+              - Load Video: nodes/video/load_video.md
+              - Resize Video: nodes/video/resize_video.md
+              - Reverse Video: nodes/video/reverse_video.md
+              - Save Video: nodes/video/save_video.md
+              - Split Video: nodes/video/split_video.md
+              - Video Color Match: nodes/video/video_color_match.md
+      - Command Line Interface: reference/command_line_interface.md
+      - Configuration Reference: reference/configuration_reference.md
+  - Enterprise:
+      - Admin Server: enterprise/admin_server.md

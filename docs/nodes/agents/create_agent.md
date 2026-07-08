@@ -23,7 +23,7 @@ Use this node when you want to:
 ### Parameters
 
 - **agent**: An existing Agent configuration (optional). If specified, it will use the existing Agent when prompting.
-- **provider**: The AI provider to use (e.g., Griptape Cloud, Ollama, LM Studio, or a custom endpoint). See [AI Providers](../../how_to/ai_providers/index.md) for setup instructions.
+- **provider**: The AI provider to use (e.g., Griptape Cloud, Ollama, LM Studio, or a custom endpoint). See [AI Providers](../../guides/ai_providers/index.md) for setup instructions.
 - **prompt model**: The specific model from the selected provider.
 - **prompt**: The instructions or question you want to ask the Agent.
 - **additional_context**: String or key-value pairs providing additional context to the Agent.
@@ -127,7 +127,7 @@ Let's say you want to extract information about a restaurant from a review:
 - The node supports both streaming and non-streaming prompt drivers
 - Tools and rulesets can be provided as individual items or as lists
 - The additional_context parameter allows you to provide additional_context to the agent as a string or dictionary of key/value pairs
-- By default the node uses Griptape Cloud, which requires a valid `GT_CLOUD_API_KEY`. You can switch to a local or custom provider using the **provider** parameter — see [AI Providers](../../how_to/ai_providers/index.md).
+- By default the node uses Griptape Cloud, which requires a valid `GT_CLOUD_API_KEY`. You can switch to a local or custom provider using the **provider** parameter — see [AI Providers](../../guides/ai_providers/index.md).
 - When you pass an Agent from one node to another using the agent input/output pins, the conversation memory is maintained, which means:
     - The Agent "remembers" previous interactions in the same flow
     - Context from previous prompts influences how the Agent interprets new prompts
@@ -141,9 +141,9 @@ To shape how an Agent behaves in a workflow, use **Rulesets** (or a plain **Text
 
 !!! note "Skills are not supported in the Agent node"
 
-    The `.agents/skills` folder used by the [chat sidebar](../../how_to/agent_sidebar.md#skills) does not apply to Agent nodes in workflows. Use a **Ruleset node** or a **TextInput** connected to the Agent's `Behaviors (Rulesets)` input to control agentic behavior instead.
+    The `.agents/skills` folder used by the [chat sidebar](../../guides/agent_sidebar.md#skills) does not apply to Agent nodes in workflows. Use a **Ruleset node** or a **TextInput** connected to the Agent's `Behaviors (Rulesets)` input to control agentic behavior instead.
 
 ## Common Issues
 
-- **No provider configured**: If no provider is set, the node uses Griptape Cloud by default, which requires a valid `GT_CLOUD_API_KEY`. See [AI Providers](../../how_to/ai_providers/index.md) to add Ollama, LM Studio, or a custom endpoint.
+- **No provider configured**: If no provider is set, the node uses Griptape Cloud by default, which requires a valid `GT_CLOUD_API_KEY`. See [AI Providers](../../guides/ai_providers/index.md) to add Ollama, LM Studio, or a custom endpoint.
 - **Streaming Issues**: If using a streaming prompt driver, ensure your flow supports handling streamed outputs.
