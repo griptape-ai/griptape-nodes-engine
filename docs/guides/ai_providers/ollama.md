@@ -26,7 +26,7 @@
 1. Click **+ Add Provider**
 1. Select **Ollama (local)**
 
-<!-- TODO: screenshot of the "Add Provider — Configure Ollama (local)" step -->
+<!-- TODO(#5095): screenshot of the "Add Provider — Configure Ollama (local)" step -->
 
 Fill in the configuration:
 
@@ -41,7 +41,7 @@ Click **Create Provider**.
 
 After creation the wizard shows a confirmation screen. Select a model, type a test message, and verify you get a response before clicking **Done**.
 
-<!-- TODO: screenshot of the "Provider Added" step with a successful test response -->
+<!-- TODO(#5095): screenshot of the "Provider Added" step with a successful test response -->
 
 ## Choosing Models
 

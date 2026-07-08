@@ -2,7 +2,7 @@
 
 Griptape Cloud is the default AI provider in Griptape Nodes. It routes requests through Griptape's hosted proxy, giving you access to a wide catalog of models under a single Griptape API key — no per-provider accounts or keys needed.
 
-<!-- TODO: screenshot of the Griptape Cloud entry in the AI Providers list (locked, always enabled) -->
+<!-- TODO(#5095): screenshot of the Griptape Cloud entry in the AI Providers list (locked, always enabled) -->
 
 ## Setup
 

@@ -16,7 +16,7 @@ You'll need:
 1. Click **+ Add Provider**
 1. Select **Custom (OpenAI-compatible)**
 
-<!-- TODO: screenshot of the "Add Provider — Configure Custom (OpenAI-compatible)" step -->
+<!-- TODO(#5095): screenshot of the "Add Provider — Configure Custom (OpenAI-compatible)" step -->
 
 Fill in the configuration:
 
@@ -28,7 +28,7 @@ Fill in the configuration:
 
 - **API Key Secret** — select an existing secret, or click **+** to create one:
 
-    <!-- TODO: screenshot of the "Create Secret" modal -->
+    <!-- TODO(#5095): screenshot of the "Create Secret" modal -->
 
     - **Secret Name** — the environment variable name (e.g., `OPENAI_API_KEY`)
     - **Value** — the actual key value
@@ -43,7 +43,7 @@ Click **Create Provider**.
 
 After creation the wizard shows a confirmation screen. Verify you get a response before clicking **Done**.
 
-<!-- TODO: screenshot of the "Provider Added" confirmation step -->
+<!-- TODO(#5095): screenshot of the "Provider Added" confirmation step -->
 
 ## Related
 

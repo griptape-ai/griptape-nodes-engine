@@ -10,7 +10,7 @@
 
 1. Start the **Local Server** inside LM Studio — Griptape Nodes connects to this server, so it must be running whenever you want to use LM Studio as a provider
 
-<!-- TODO: screenshot of LM Studio showing the Local Server running -->
+<!-- TODO(#5095): screenshot of LM Studio showing the Local Server running -->
 
 ## Add the Provider
 
@@ -18,7 +18,7 @@
 1. Click **+ Add Provider**
 1. Select **LM Studio (local)**
 
-<!-- TODO: screenshot of the "Add Provider — Configure LM Studio (local)" step -->
+<!-- TODO(#5095): screenshot of the "Add Provider — Configure LM Studio (local)" step -->
 
 Fill in the configuration:
 
@@ -33,7 +33,7 @@ Click **Create Provider**.
 
 After creation the wizard shows a confirmation screen. Select a model, type a test message, and verify you get a response before clicking **Done**.
 
-<!-- TODO: screenshot of the "Provider Added" step with a successful test response -->
+<!-- TODO(#5095): screenshot of the "Provider Added" step with a successful test response -->
 
 ## Choosing Models
 

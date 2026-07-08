@@ -2,7 +2,7 @@
 
 The Agent Sidebar is a built-in chat interface that gives you a direct line to an AI assistant — one that already knows your workflow. Ask it questions, have it build nodes for you, inspect what's on the canvas, or run your workflow, all in plain conversation.
 
-<!-- TODO: screenshot of the full sidebar showing the chat tab active, the model dropdown, and a sample conversation -->
+<!-- TODO(#5095): screenshot of the full sidebar showing the chat tab active, the model dropdown, and a sample conversation -->
 
 ## What it can do
 
@@ -20,7 +20,7 @@ This is powered by Griptape's built-in MCP server, which runs alongside the engi
 
 The sidebar lives on the right side of the Griptape Nodes canvas. Click the **chat bubble** tab (the first icon in the Sidebar Panels header) to open it.
 
-<!-- TODO: screenshot highlighting the Sidebar Panels tabs, with the chat tab indicated -->
+<!-- TODO(#5095): screenshot highlighting the Sidebar Panels tabs, with the chat tab indicated -->
 
 ## Threads
 
@@ -29,7 +29,7 @@ Each conversation is a **thread**. Threads are named automatically with the date
 - Click **+ New** to start a fresh conversation
 - Previous threads are listed above the message input
 
-<!-- TODO: screenshot of the thread header showing the timestamp name and "+ New" button -->
+<!-- TODO(#5095): screenshot of the thread header showing the timestamp name and "+ New" button -->
 
 ### Where threads are stored
 
@@ -56,7 +56,7 @@ At the top of the chat panel there are two dropdowns: **Model** and **MCP server
 
 Click the **Model** dropdown to see all available models, grouped by provider:
 
-<!-- TODO: screenshot of the model dropdown open, showing Griptape Cloud models at top and an Ollama section below -->
+<!-- TODO(#5095): screenshot of the model dropdown open, showing Griptape Cloud models at top and an Ollama section below -->
 
 - The top group contains **Griptape Cloud** models (Claude, GPT, Gemini, DeepSeek, Llama, and more)
 - Any additional providers you've configured appear as their own labeled sections below
@@ -71,7 +71,7 @@ The **MCP servers** dropdown lets you attach one or more MCP servers to the side
 
 See [MCP Integration](./mcp/index.md) for how to set up MCP servers.
 
-<!-- TODO: screenshot of the MCP servers dropdown -->
+<!-- TODO(#5095): screenshot of the MCP servers dropdown -->
 
 ## Sending Messages
 
@@ -79,13 +79,13 @@ Type in the **Write a message...** input at the bottom and press Enter or click 
 
 The agent streams its response back in real time. If it uses a tool (e.g., reads a file via an MCP server), you'll see tool call and result events inline in the conversation.
 
-<!-- TODO: screenshot of an in-progress response with a tool call visible -->
+<!-- TODO(#5095): screenshot of an in-progress response with a tool call visible -->
 
 ## Personalization
 
 You can customize how the agent talks to you and what context it has. Open **Settings → Agent Settings** and scroll down to the **Personalization** section.
 
-<!-- TODO: screenshot of the full Personalization section -->
+<!-- TODO(#5095): screenshot of the full Personalization section -->
 
 | Field                       | What it does                                                                                                                 |
 | --------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
