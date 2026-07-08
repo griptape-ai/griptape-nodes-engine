@@ -652,6 +652,52 @@ class TestSidecarMetadata:
         data = _json.loads(sidecar_path.read_text())
         assert data["schema_version"] == "0.1.0"
 
+    def test_sidecar_file_extension_unchanged_for_alias_extensions(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.
+
+        Regression for the alias-extension case (jpg/jpeg, tif/tiff, m4v/mp4):
+        the image provider sniffs JPEG bytes as ``"jpg"``, but writing to
+        ``output.jpeg`` leaves the file at ``.jpeg`` on disk (no swap:
+        ``canonical_extension("jpg") == canonical_extension("jpeg")``). The
+        sidecar's ``file_extension`` variable must therefore stay at what the
+        caller supplied (``"jpeg"``), not get rewritten to the raw sniff
+        (``"jpg"``).
+        """
+        import json as _json
+
+        os_manager = griptape_nodes.OSManager()
+        file_path = temp_dir / "photo.jpeg"
+        # Bind file_extension in the sidecar's situation variables so the
+        # sidecar update path has something to (potentially) overwrite.
+        file_metadata = SidecarContent(
+            situation=SituationMetadata(
+                name="save_node_output",
+                macro="{outputs}/{file_name_base}.{file_extension}",
+                variables={"file_name_base": "photo", "file_extension": "jpeg"},
+            ),
+        )
+
+        request = WriteFileRequest(
+            file_path=str(file_path),
+            content=_jpeg_bytes(),
+            file_metadata=file_metadata,
+        )
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # File landed at the caller's requested suffix (alias -> no swap).
+        assert Path(result.final_file_path) == file_path
+        assert file_path.exists()
+
+        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "photo.jpeg.json"
+        assert sidecar_path.exists()
+        data = _json.loads(sidecar_path.read_text())
+        # The critical assertion: sidecar variable stayed at "jpeg" (the caller's
+        # value), not "jpg" (the raw sniff). Before the fix this returned "jpg".
+        assert data["situation"]["variables"]["file_extension"] == "jpeg"
+
 
 def _png_bytes() -> bytes:
     buf = BytesIO()
@@ -829,11 +875,7 @@ class TestOSWritePermissionVet:
         self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A provider that denies must abort the write before any bytes hit disk."""
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-            CheckpointFailure,
-        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
@@ -852,20 +894,10 @@ class TestOSWritePermissionVet:
             lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
-        # Register a sentinel hook so the has_authorization_hooks() short-circuit
-        # doesn't skip the vet. The hook isn't consulted (the provider returns
-        # the denial before the checkpoint would fire) -- it just gates the vet.
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            os_manager = griptape_nodes.OSManager()
-            requested_path = temp_dir / "image.png"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            result = os_manager.on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
@@ -925,11 +957,7 @@ class TestOSWritePermissionVet:
         lives in ``on_write_file_request`` and runs BEFORE coercion, so an
         extensionless destination is protected.
         """
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-            CheckpointFailure,
-        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
@@ -945,20 +973,13 @@ class TestOSWritePermissionVet:
             lambda data, detected_format: expected_denial,  # noqa: ARG005
         )
 
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            os_manager = griptape_nodes.OSManager()
-            # Destination has NO extension. Sniff on bytes classifies as PNG,
-            # provider denies, OSManager must refuse the write. Before finding 1
-            # this would return Success and leave the file on disk.
-            requested_path = temp_dir / "movie"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            result = os_manager.on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        os_manager = griptape_nodes.OSManager()
+        # Destination has NO extension. Sniff on bytes classifies as PNG,
+        # provider denies, OSManager must refuse the write. Before the fix
+        # this would return Success and leave the file on disk.
+        requested_path = temp_dir / "movie"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
@@ -986,36 +1007,6 @@ class TestOSWritePermissionVet:
 
         assert called == []
 
-    def test_vet_skipped_when_no_authorization_hook_registered(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Perf short-circuit: with no auth hook, the vet dispatch is never invoked.
-
-        The dispatcher call is expensive for video (spools bytes to project
-        temp + shells out to ffprobe). When no policy is installed the vet's
-        outcome is guaranteed to be None anyway, so skipping saves the work.
-        """
-        called: list[bool] = []
-
-        def spy_policy(fmt: str) -> None:  # noqa: ARG001
-            called.append(True)
-
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
-
-        # Baseline: no hook registered. EventManager fixture starts clean.
-        assert griptape_nodes.EventManager().has_authorization_hooks() is False
-
-        os_manager = griptape_nodes.OSManager()
-        requested_path = temp_dir / "image.png"
-
-        # Recognized PNG bytes (sniff would return "png") but no auth hook, so
-        # the entire vet block short-circuits before dispatching to the provider.
-        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-        result = os_manager.on_write_file_request(request)
-
-        assert isinstance(result, WriteFileResultSuccess)
-        assert called == [], "vet policy lookup must not happen when no hook is registered"
-
     def test_unrecognized_policy_variant_raises_loudly(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1025,29 +1016,17 @@ class TestOSWritePermissionVet:
         write that reached it. Simulate the future variant by returning a
         sentinel string the switch doesn't recognize.
         """
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-        )
-
         monkeypatch.setattr(
             griptape_nodes.ArtifactManager(),
             "get_write_vetting_policy",
             lambda fmt: "future_variant",  # noqa: ARG005
         )
 
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            os_manager = griptape_nodes.OSManager()
-            requested_path = temp_dir / "image.png"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            with pytest.raises(RuntimeError, match="Unrecognized WriteVettingPolicy"):
-                os_manager.on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        with pytest.raises(RuntimeError, match="Unrecognized WriteVettingPolicy"):
+            os_manager.on_write_file_request(request)
 
         assert not requested_path.exists()
 
@@ -1060,11 +1039,6 @@ class TestOSWritePermissionVet:
         time, (b) never see the raw bytes, (c) never re-enter ``handle_request``
         for cleanup: OSManager owns the whole staged-file lifecycle.
         """
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-        )
-
         seen_paths: list[str] = []
 
         def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
@@ -1081,17 +1055,10 @@ class TestOSWritePermissionVet:
         )
         monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
 
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            os_manager = griptape_nodes.OSManager()
-            requested_path = temp_dir / "image.png"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            result = os_manager.on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
 
         # Allowed: the write proceeds to the real destination.
         assert isinstance(result, WriteFileResultSuccess)
@@ -1108,11 +1075,6 @@ class TestOSWritePermissionVet:
         An unstageable vet cannot verify the write is compliant -- fail closed
         rather than silently blessing bytes because we couldn't run the check.
         """
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-        )
-
         provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
         assert provider_classes
         provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
@@ -1137,16 +1099,9 @@ class TestOSWritePermissionVet:
 
         monkeypatch.setattr(os_manager, "_stage_bytes_at_temp", raise_staging)
 
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            requested_path = temp_dir / "image.png"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            result = os_manager.on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
@@ -1171,10 +1126,6 @@ class TestOSWritePermissionVet:
             DeleteFileResultSuccess,
             DeletionBehavior,
             DeletionOutcome,
-        )
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
         )
 
         provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
@@ -1213,16 +1164,9 @@ class TestOSWritePermissionVet:
         registry = event_manager._request_type_to_manager
         monkeypatch.setitem(registry, DeleteFileRequest, spy_delete_handler)
 
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            requested_path = temp_dir / "image.png"
-            request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-            result = griptape_nodes.OSManager().on_write_file_request(request)
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = griptape_nodes.OSManager().on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultSuccess)
         # Exactly one DeleteFileRequest for the staged temp; not more (would

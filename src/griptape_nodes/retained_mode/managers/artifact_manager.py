@@ -346,10 +346,11 @@ class ArtifactManager:
         """Resolve the registered provider that handles ``fmt`` (empty → None).
 
         Centralizes the "which class wins when multiple providers claim the
-        same format" decision so ``check_write_permission``,
-        ``check_read_permission``, and (eventually) ``prepare_content_for_write``
-        don't drift on it. Currently just "first registered class wins" per the
-        provider registry order; ambiguity handling is tracked at
+        same format" decision so ``check_write_format_from_bytes``,
+        ``check_write_format_from_path``, ``check_read_permission``, and
+        (eventually) ``prepare_content_for_write`` don't drift on it.
+        Currently just "first registered class wins" per the provider
+        registry order; ambiguity handling is tracked at
         https://github.com/griptape-ai/griptape-nodes/issues/4027.
         """
         if not fmt:
@@ -912,20 +913,13 @@ class ArtifactManager:
     ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
         """Handle a read-permission check request by dispatching to the provider.
 
-        Short-circuits when no authorization hook is registered: with no hook,
-        the provider's checkpoint call deterministically returns None (allow),
-        so probing the file (ffprobe subprocess) would be wasted work. Saves
-        the subprocess on every video-read gate call in engines that have no
-        policy installed.
+        Whether the provider actually does any work is the provider's call:
+        the base ``check_read_permission`` returns ``None`` (allow), so
+        providers that don't opt in pay nothing.
         """
         if not request.source_path:
             return CheckArtifactReadPermissionResultFailure(
                 result_details="Attempted to check read permission. Failed because no source path was provided."
-            )
-        if not GriptapeNodes.EventManager().has_authorization_hooks():
-            return CheckArtifactReadPermissionResultSuccess(
-                denial=None,
-                result_details=f"Read allowed for '{request.source_path}' (no authorization hook registered).",
             )
         denial = self.check_read_permission(request.source_path)
         if denial is None:

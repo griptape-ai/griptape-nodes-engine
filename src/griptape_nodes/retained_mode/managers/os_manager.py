@@ -2431,23 +2431,14 @@ class OSManager:
             else None
         )
 
-        # Codec-permission vet. Runs BEFORE extension coercion so an
-        # extension-less destination (e.g. "movie") does not silently bypass
-        # the gate -- sniff on bytes is independent of the destination suffix.
-        # Appends skip the vet: the tail alone has no container header to
-        # classify.
-        #
-        # Short-circuit when no authorization hook is installed: with no hook,
-        # ``evaluate_authorization_checkpoint`` deterministically returns None
-        # (allow), so the vet would spool bytes to disk and shell out to
-        # ffprobe purely to arrive at a foregone conclusion. Skipping saves
-        # the ffprobe subprocess + temp-file IO on every video write when the
-        # host has no policy installed (the common case for individual-tier
-        # users). Hooks are typically registered at engine startup and stable
-        # thereafter; a hook registered mid-write races with this check, but
-        # that's acceptable -- the alternative is running an expensive vet on
-        # every write forever.
-        if sniffed_ext is not None and not request.append and GriptapeNodes.EventManager().has_authorization_hooks():
+        # Write vet. Runs BEFORE extension coercion so an extension-less
+        # destination (e.g. "movie") does not silently bypass the gate --
+        # sniff on bytes is independent of the destination suffix. Appends
+        # skip the vet: the tail alone has no container header to classify.
+        # Whether the vet actually does any work is the provider's call:
+        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
+        # short-circuited inside ``_run_write_vet``.
+        if sniffed_ext is not None and not request.append:
             vet_failure = self._run_write_vet(
                 content=request.content,  # type: ignore[arg-type]
                 sniffed_ext=sniffed_ext,
@@ -2469,6 +2460,14 @@ class OSManager:
         if isinstance(alignment, WriteFileResultFailure):
             return alignment
         file_path = alignment.aligned_path
+        # ``alignment.sniffed_ext`` is the *swap-only* signal: non-None only
+        # when the on-disk suffix was actually rewritten. Do NOT reuse the raw
+        # ``sniffed_ext`` local for on-disk-name-sensitive downstream code
+        # (indexed-fallback walk, sidecar update). The raw sniff is truthy
+        # for alias pairs too (jpg/jpeg, tif/tiff, m4v/mp4), where the file
+        # lands at the caller's requested suffix and downstream consumers
+        # would otherwise disagree with the on-disk name.
+        swapped_ext = alignment.sniffed_ext
 
         # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
@@ -2680,9 +2679,13 @@ class OSManager:
                         # try-first attempt. The synthesized-macro path inherits this
                         # because its template comes from the already-swapped file_path;
                         # the walking-original path uses the user's original suffix and
-                        # needs this swap every iteration.
-                        if sniffed_ext is not None:
-                            candidate_path = candidate_path.with_suffix(f".{sniffed_ext}")
+                        # needs this swap every iteration. Use ``swapped_ext`` (non-None
+                        # only when a genuine swap happened) rather than the raw sniff:
+                        # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk
+                        # suffix at the caller's request, and the walked candidate must
+                        # follow suit.
+                        if swapped_ext is not None:
+                            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
 
                         # Ensure parent directory for this candidate
                         parent_failure_reason = self._ensure_parent_directory_ready(
@@ -2734,15 +2737,19 @@ class OSManager:
         # Sidecar provenance must reflect the on-disk extension, not the requested one.
         # The actual reconciliation already happened at the top of the handler via
         # the sniff-and-swap; this just keeps the sidecar's file_extension variable
-        # (when present) consistent with what the bytes turned out to be.
+        # (when present) consistent with what the bytes turned out to be. Use
+        # ``swapped_ext`` (non-None only when a genuine swap happened) rather
+        # than the raw sniff: for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the
+        # file lands at the caller's requested suffix, and the sidecar's
+        # ``file_extension`` should stay whatever the caller supplied.
         if (
-            sniffed_ext is not None
+            swapped_ext is not None
             and request.file_metadata is not None
             and request.file_metadata.situation is not None
         ):
             sidecar_variables = request.file_metadata.situation.variables
             if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = sniffed_ext
+                sidecar_variables["file_extension"] = swapped_ext
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:

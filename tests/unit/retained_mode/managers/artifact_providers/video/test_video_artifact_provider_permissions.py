@@ -140,7 +140,11 @@ class TestVideoCheckWriteFormatFromPath:
         assert denial is not None
         # The denial detail is generic -- OSManager wraps it with the caller's
         # destination filename. The provider is intentionally file-name-agnostic.
+        # Denial detail carries the "probe unavailable or failed -- see server logs"
+        # hint so support/operators can distinguish this from a policy denial.
         assert "video codec could not be verified" in denial.reason().lower()
+        assert "probe unavailable or failed" in denial.reason().lower()
+        assert "server logs" in denial.reason().lower()
         # Policy hook must NOT fire when we couldn't identify the codec --
         # we short-circuited to a synthetic denial before evaluation.
         assert hook_fired == []
@@ -176,8 +180,64 @@ class TestVideoCheckWriteFormatFromPath:
             griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
 
         assert denial is not None
+        # Denial detail carries the "probe unavailable or failed -- see server logs"
+        # hint so support/operators can distinguish this from a policy denial.
         assert "video codec could not be verified" in denial.reason().lower()
+        assert "probe unavailable or failed" in denial.reason().lower()
+        assert "server logs" in denial.reason().lower()
         assert hook_fired == []
+
+    def test_denies_when_disallowed_codec_is_on_a_non_first_video_stream(
+        self,
+        griptape_nodes: GriptapeNodes,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Multi-stream containers must have every video stream vetted, not just stream 0.
+
+        Common containers (mp4, mov, mkv) can carry more than one video
+        stream. If the vet only inspected stream 0, a caller could smuggle
+        a disallowed codec through by placing it on stream 1 (or later).
+        This test verifies that a container with an allowed codec on
+        stream 0 and a disallowed codec on stream 1 still denies.
+        """
+        multi_stream_probe: dict[str, Any] = {
+            "streams": [
+                {"codec_type": "video", "codec_name": "h264"},
+                {"codec_type": "video", "codec_name": "hevc"},
+            ],
+        }
+        monkeypatch.setattr(
+            VideoArtifactProvider,
+            "_run_ffprobe",
+            classmethod(lambda cls, source_path: multi_stream_probe),  # noqa: ARG005
+        )
+
+        seen_codecs: list[str] = []
+
+        def deny_hevc(checkpoint: object) -> CheckpointDenial | None:
+            codec = checkpoint.attributes.get("id")  # type: ignore[attr-defined]
+            if isinstance(codec, str):
+                seen_codecs.append(codec)
+            if codec == "hevc":
+                return CheckpointDenial(failures=(CheckpointFailure(detail="hevc is not licensed."),))
+            return None
+
+        staged = tmp_path / "staged.mp4"
+        staged.write_bytes(b"stand-in; ffprobe is mocked")
+
+        provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
+        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        try:
+            denial = provider.check_write_format_from_path(str(staged), "mp4")
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+
+        assert denial is not None
+        # Both codecs must have been offered to the hook, in stream order.
+        # An implementation that stops after stream 0 would show only ``["h264"]``
+        # and never surface the hevc denial.
+        assert seen_codecs == ["h264", "hevc"]
 
 
 class TestVideoReadPermission:
@@ -271,5 +331,9 @@ class TestVideoReadPermission:
             griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
 
         assert denial is not None
+        # Denial detail carries the "probe unavailable or failed -- see server logs"
+        # hint so support/operators can distinguish this from a policy denial.
         assert "video codec could not be verified" in denial.reason().lower()
+        assert "probe unavailable or failed" in denial.reason().lower()
+        assert "server logs" in denial.reason().lower()
         assert hook_fired == []

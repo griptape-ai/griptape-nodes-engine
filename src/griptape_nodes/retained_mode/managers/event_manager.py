@@ -358,22 +358,6 @@ class EventManager:
             except ValueError:
                 return
 
-    def has_authorization_hooks(self) -> bool:
-        """Return True when at least one authorization hook is registered.
-
-        Callers use this to short-circuit expensive checkpoint construction
-        (e.g. the codec-permission vet that spools bytes to disk and shells
-        out to ffprobe) when no policy is installed. Without a hook,
-        ``evaluate_authorization_checkpoint`` deterministically returns
-        ``None`` (allow), so the work would produce no permission decision.
-
-        Not a substitute for the checkpoint call itself in code paths that
-        genuinely need the checkpoint's semantics -- it only lets a caller
-        skip the work leading UP to the call.
-        """
-        with self._authorization_hooks_lock:
-            return bool(self._authorization_hooks)
-
     def evaluate_authorization_checkpoint(self, checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
         """Ask registered hooks whether a resolved operation is permitted.
 

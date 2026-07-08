@@ -183,39 +183,70 @@ class VideoArtifactProvider(BaseArtifactProvider):
         action: CheckpointAction,
         container_format: str,
     ) -> CheckpointDenial | None:
-        """Probe ``source_path`` for its video codec and evaluate ``action``.
+        """Probe ``source_path`` for its video codecs and evaluate ``action``.
 
-        Fail-closed on unverifiable codecs: if ffprobe cannot identify a
-        video stream, return a synthetic denial rather than allow the
-        operation. For a gate that exists to protect against
-        legally-encumbered codecs, defaulting to permit would silently
-        bless disallowed operations whenever ffprobe hiccups. Denial detail
-        is generic ("The video codec could not be verified."); the caller
-        (OSManager on the write side, library code on the read side) is
-        expected to wrap it with any file-name framing.
+        Evaluates every video stream in the container. Common containers
+        (mp4, mov, mkv) can carry more than one video stream -- a main
+        video plus an alpha channel, a HEIF-style file with a thumbnail
+        stream in a different codec, an editorial file with multiple
+        angles. Refusing on stream 0 alone would let a disallowed codec
+        slip through by riding along on a later stream.
+
+        The checkpoint contract stays "one codec per call", so we
+        evaluate each stream's codec independently and return the first
+        denial (or ``None`` if every stream is allowed). Hooks don't
+        need to know a file might have several.
+
+        Fail-closed on unverifiable codecs: if ffprobe cannot identify any
+        video stream at all, return a synthetic denial rather than allow the
+        operation. The denial detail names "probe unavailable or failed --
+        see server logs" so an artist's bug report can be triaged apart
+        from an actual codec denial (``_run_ffprobe`` logs the underlying
+        cause at ERROR). The caller (OSManager on the write side, library
+        code on the read side) is expected to wrap this detail with any
+        file-name framing.
         """
         probe_data = cls._run_ffprobe(source_path)
-        codec = cls._codec_from_probe_data(probe_data)
-        if codec is None:
-            return CheckpointDenial(failures=(CheckpointFailure(detail="The video codec could not be verified."),))
+        codecs = cls._codecs_from_probe_data(probe_data)
+        if not codecs:
+            return CheckpointDenial(
+                failures=(
+                    CheckpointFailure(
+                        detail="The video codec could not be verified (probe unavailable or failed -- see server logs)."
+                    ),
+                )
+            )
 
-        return cls._evaluate_codec_checkpoint(
-            action=action,
-            codec=codec,
-            container_format=container_format,
-        )
+        for codec in codecs:
+            denial = cls._evaluate_codec_checkpoint(
+                action=action,
+                codec=codec,
+                container_format=container_format,
+            )
+            if denial is not None:
+                return denial
+        return None
 
     @staticmethod
-    def _codec_from_probe_data(probe_data: dict | None) -> str | None:
-        """Pull the first video stream's codec_name from an ffprobe payload."""
+    def _codecs_from_probe_data(probe_data: dict | None) -> list[str]:
+        """Pull every video stream's codec_name from an ffprobe payload, in stream order.
+
+        Returns an empty list when ``probe_data`` is None (probe failed) or
+        when the container has no video streams. Duplicate codec names are
+        preserved: the checkpoint evaluation is idempotent and a
+        two-stream ``[h264, h264]`` file should not silently be treated
+        as a single-stream file.
+        """
         if probe_data is None:
-            return None
+            return []
+        codecs: list[str] = []
         for stream in probe_data.get("streams", []):
-            if stream.get("codec_type") == "video":
-                codec = stream.get("codec_name")
-                if isinstance(codec, str) and codec:
-                    return codec
-        return None
+            if stream.get("codec_type") != "video":
+                continue
+            codec = stream.get("codec_name")
+            if isinstance(codec, str) and codec:
+                codecs.append(codec)
+        return codecs
 
     @staticmethod
     def _evaluate_codec_checkpoint(
@@ -243,11 +274,23 @@ class VideoArtifactProvider(BaseArtifactProvider):
 
     @classmethod
     def _run_ffprobe(cls, source_path: str) -> dict | None:
-        """Run ffprobe on a video file and return parsed JSON output."""
+        """Run ffprobe on a video file and return parsed JSON output.
+
+        Every failure surface below logs at ERROR because these are the
+        situations where the codec-vet fails closed and the user sees a
+        video I/O denial: operators need to distinguish "policy denied
+        this codec" (no log) from "ffprobe couldn't run" (this log).
+        Bumping to ERROR keeps these visible in log tailers that filter
+        to ERROR+.
+        """
         try:
             _ffmpeg_path, ffprobe_path = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
-        except Exception:
-            logger.warning("Attempted to get ffprobe binary via static-ffmpeg. Failed to fetch platform executables.")
+        except Exception as exc:
+            logger.error(
+                "Attempted to get ffprobe binary via static-ffmpeg for '%s'. Failed to fetch platform executables: %s",
+                source_path,
+                exc,
+            )
             return None
 
         try:
@@ -261,33 +304,41 @@ class VideoArtifactProvider(BaseArtifactProvider):
                     "-print_format",
                     "json",
                     # Include per-stream info (codec, dimensions, frame rate, etc.)
+                    # for EVERY stream in the container. Do NOT filter with
+                    # ``-select_streams v:0`` -- containers can carry multiple
+                    # video streams (main + alpha, main + thumbnail,
+                    # multi-angle editorial) and codec policy has to see
+                    # them all, not just stream 0.
                     "-show_streams",
-                    # Only the first video stream
-                    "-select_streams",
-                    "v:0",
                     # Include container-level info (duration, size, etc.)
                     "-show_format",
                     source_path,
                 ],
                 capture_output=True,
                 text=True,
-                timeout=120,
+                # Runaway-probe backstop, not a work budget. ffprobe reads
+                # only container headers (not the full file), so it should
+                # complete well under a second on local disk regardless of
+                # file size. A wedge past this ceiling (malformed header,
+                # hung fuse mount, pathological box structure) fails closed
+                # -- the right outcome for a security gate.
+                timeout=30,
                 check=True,
             )
         except subprocess.TimeoutExpired:
-            logger.warning("Attempted to probe video metadata for '%s'. ffprobe timed out.", source_path)
+            logger.error("Attempted to probe video metadata for '%s'. ffprobe timed out.", source_path)
             return None
         except subprocess.CalledProcessError as e:
-            logger.warning("Attempted to probe video metadata for '%s'. ffprobe failed: %s", source_path, e.stderr)
+            logger.error("Attempted to probe video metadata for '%s'. ffprobe failed: %s", source_path, e.stderr)
             return None
         except OSError as e:
-            logger.warning("Attempted to run ffprobe for '%s'. Failed because: %s", source_path, e)
+            logger.error("Attempted to run ffprobe for '%s'. Failed because: %s", source_path, e)
             return None
 
         try:
             return json.loads(result.stdout)
         except json.JSONDecodeError:
-            logger.warning("Attempted to parse ffprobe output for '%s'. Failed to decode JSON.", source_path)
+            logger.error("Attempted to parse ffprobe output for '%s'. Failed to decode JSON.", source_path)
             return None
 
     @classmethod

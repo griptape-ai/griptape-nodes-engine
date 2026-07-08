@@ -65,7 +65,6 @@ def mock_config_writes(monkeypatch: pytest.MonkeyPatch) -> None:
     Any test that registers providers would otherwise pollute the real user config.
     """
     from griptape_nodes.retained_mode.events.config_events import SetConfigValueRequest
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
     # Store the original handle_request method
     original_handle_request = GriptapeNodes.handle_request
@@ -581,7 +580,7 @@ class TestCheckArtifactReadPermissionHandler:
         assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
         assert result.denial is None
 
-    def test_denial_is_threaded_through_success_payload(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_denial_is_threaded_through_success_payload(self) -> None:
         from griptape_nodes.retained_mode.events.artifact_events import (
             CheckArtifactReadPermissionRequest,
             CheckArtifactReadPermissionResultSuccess,
@@ -590,11 +589,7 @@ class TestCheckArtifactReadPermissionHandler:
             BaseArtifactMetadata,
             BaseArtifactProvider,
         )
-        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
-            AuthorizationCheckpoint,
-            CheckpointDenial,
-            CheckpointFailure,
-        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
         expected_denial = CheckpointDenial(
             failures=(CheckpointFailure(detail="You are not licensed for probe reads."),)
@@ -622,76 +617,15 @@ class TestCheckArtifactReadPermissionHandler:
         )
         assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
 
-        # Register a sentinel hook so the short-circuit doesn't skip the vet.
-        # The hook itself isn't consulted here (the provider returns its own
-        # denial before the checkpoint would fire) -- it just satisfies
-        # ``has_authorization_hooks()``.
-        def sentinel_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
-            return None
-
-        griptape_nodes.EventManager().add_authorization_hook(sentinel_hook)
-        try:
-            result = manager.on_check_artifact_read_permission_request(
-                CheckArtifactReadPermissionRequest(source_path="/x/y.deny")
-            )
-        finally:
-            griptape_nodes.EventManager().remove_authorization_hook(sentinel_hook)
+        result = manager.on_check_artifact_read_permission_request(
+            CheckArtifactReadPermissionRequest(source_path="/x/y.deny")
+        )
 
         assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
         assert result.denial is expected_denial
         # The result_details includes the denial's reason so callers logging
         # the result get useful text without inspecting the payload.
         assert "probe reads" in str(result.result_details)
-
-    def test_vet_skipped_when_no_authorization_hook_registered(self, griptape_nodes: GriptapeNodes) -> None:
-        """Perf short-circuit: with no auth hook registered, the provider's check_read_permission is not called.
-
-        The read-side gate has the same short-circuit as the write-side vet.
-        Without a hook the provider's read check (ffprobe subprocess) is
-        skipped -- outcome is guaranteed to be None anyway.
-        """
-        from griptape_nodes.retained_mode.events.artifact_events import (
-            CheckArtifactReadPermissionRequest,
-            CheckArtifactReadPermissionResultSuccess,
-        )
-        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
-            BaseArtifactMetadata,
-            BaseArtifactProvider,
-        )
-
-        called: list[bool] = []
-
-        class _SpyProvider(BaseArtifactProvider):
-            @classmethod
-            def get_friendly_name(cls) -> str:
-                return "Spy"
-
-            @classmethod
-            def get_supported_formats(cls) -> set[str]:
-                return {"spy"}
-
-            @classmethod
-            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
-                return None
-
-            def check_read_permission(self, source_path):  # noqa: ANN001, ANN202, ARG002
-                called.append(True)
-
-        manager = ArtifactManager()
-        manager.on_handle_register_artifact_provider_request(
-            RegisterArtifactProviderRequest(provider_class=_SpyProvider)
-        )
-
-        # Baseline: no hook registered.
-        assert griptape_nodes.EventManager().has_authorization_hooks() is False
-
-        result = manager.on_check_artifact_read_permission_request(
-            CheckArtifactReadPermissionRequest(source_path="/x/y.spy")
-        )
-
-        assert isinstance(result, CheckArtifactReadPermissionResultSuccess)
-        assert result.denial is None
-        assert called == [], "check_read_permission must not be called when no hook is registered"
 
 
 class TestGeneratePreview:
@@ -708,7 +642,6 @@ class TestGeneratePreview:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
@@ -758,8 +691,6 @@ class TestGeneratePreview:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
@@ -1027,7 +958,6 @@ class TestPreviewMetadataDoesNotCreateSidecar:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         project_manager = GriptapeNodes.ProjectManager()
@@ -1066,8 +996,6 @@ class TestPreviewMetadataDoesNotCreateSidecar:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager instance with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
         manager.on_handle_register_artifact_provider_request(request)
@@ -1152,7 +1080,6 @@ class TestGetPreviewForArtifact:
         """Set up a real project in ProjectManager with temp_dir as workspace."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         # Get ProjectManager singleton
@@ -1198,8 +1125,6 @@ class TestGetPreviewForArtifact:
     @pytest.fixture
     def artifact_manager(self, mock_project: None, temp_dir: Path) -> ArtifactManager:  # noqa: ARG002
         """Create ArtifactManager with ImageArtifactProvider registered."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         manager = ArtifactManager()
         # Register ImageArtifactProvider (no longer auto-registered)
         request = RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
@@ -1708,8 +1633,6 @@ class TestProviderRegistrationConfigLogLevels:
         manager = ArtifactManager()
         captured_requests: list[RequestPayload] = []
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         original = GriptapeNodes.handle_request
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
@@ -1736,8 +1659,6 @@ class TestProviderRegistrationConfigLogLevels:
 
         manager = ArtifactManager()
         captured_requests: list[RequestPayload] = []
-
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         original = GriptapeNodes.handle_request
 
