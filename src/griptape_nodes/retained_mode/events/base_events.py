@@ -168,7 +168,9 @@ class RequestPayload(Payload, ABC):
                     listed, the full ``workflows`` value is kept.
                   - ``"*"`` wildcard — for ``dict[str, SomeObject]`` where keys are
                     arbitrary (e.g. file paths). ``"workflows.*.name"`` plucks ``name``
-                    from each value without knowing the keys in advance.
+                    from each value without knowing the keys in advance. Prefer ``"*"``
+                    over a concrete key for such maps: naming a specific key warns
+                    "not found" whenever that key is legitimately absent.
 
                 Framework fields (result_details, altered_workflow_state) are always
                 included regardless of what fields specifies. Filtering is skipped
@@ -350,7 +352,6 @@ class BaseEvent(BaseModel, ABC):
 
     def json(self, **kwargs) -> str:
         """Serialize to JSON string."""
-        logger = logging.getLogger(__name__)
 
         def _default(obj: Any) -> str:
             logger.debug(

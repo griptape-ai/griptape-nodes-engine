@@ -5,6 +5,8 @@ import logging
 import pytest
 
 from griptape_nodes.retained_mode.events.base_events import (
+    EventResultFailure,
+    EventResultSuccess,
     RequestPayload,
     ResultDetail,
     ResultDetails,
@@ -13,6 +15,11 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
 from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
+from griptape_nodes.retained_mode.events.project_events import (
+    GetAllSituationsForProjectRequest,
+    GetAllSituationsForProjectResultFailure,
+    GetAllSituationsForProjectResultSuccess,
+)
 
 
 class TestBroadcastResultDefaults:
@@ -188,3 +195,64 @@ class TestApplyPathTree:
             apply_path_tree(data, {"*": {"x": {}}, "meta": {}})
         assert "named keys" in caplog.text
         assert "meta" in caplog.text
+
+
+class TestApplyPathTreeWarningDedup:
+    def test_wildcard_typo_warns_once_with_star_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        # One typo under a wildcard across many values must dedupe to a single warning
+        # reported with the "*" spelling, not one warning per resolved key.
+        data = {"workflows": {f"/path/{i}": {"name": str(i)} for i in range(50)}}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, build_path_tree(["workflows.*.nme"]))
+        matching = [r for r in caplog.records if "not found" in r.message]
+        assert len(matching) == 1
+        assert "workflows.*.nme" in matching[0].message
+
+    def test_list_typo_warns_once(self, caplog: pytest.LogCaptureFixture) -> None:
+        data = {"items": [{"name": "x"}, {"name": "y"}, {"name": "z"}]}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, build_path_tree(["items.nme"]))
+        matching = [r for r in caplog.records if "not found" in r.message]
+        assert len(matching) == 1
+        assert "items.nme" in matching[0].message
+
+
+class TestEventResultDictFiltering:
+    """Integration coverage for EventResult.dict()'s fields filtering.
+
+    The path-projection helpers are unit-tested above; these exercise the wire logic
+    that wraps them: the succeeded() gate, framework-field re-add, and [] vs None.
+    """
+
+    def _success(self, fields: list[str] | None) -> dict:
+        request = GetAllSituationsForProjectRequest(fields=fields)
+        result = GetAllSituationsForProjectResultSuccess(
+            situations={"a": "macro"}, descriptions={"a": "desc"}, result_details="ok"
+        )
+        return EventResultSuccess(request=request, result=result).dict()["result"]
+
+    def test_none_returns_all_fields(self) -> None:
+        keys = self._success(fields=None)
+        assert set(keys) == {"situations", "descriptions", "result_details", "altered_workflow_state"}
+
+    def test_empty_list_returns_only_framework_fields(self) -> None:
+        keys = self._success(fields=[])
+        assert set(keys) == {"result_details", "altered_workflow_state"}
+
+    def test_selected_field_plus_framework_fields(self) -> None:
+        result = self._success(fields=["situations"])
+        assert set(result) == {"situations", "result_details", "altered_workflow_state"}
+        assert result["situations"] == {"a": "macro"}
+
+    def test_failure_result_is_never_filtered(self) -> None:
+        # A success-shaped fields filter on a failed request must not strip the exception.
+        request = GetAllSituationsForProjectRequest(fields=["situations"])
+        result = GetAllSituationsForProjectResultFailure(result_details="boom", exception=ValueError("kaboom"))
+        payload = EventResultFailure(request=request, result=result).dict()["result"]
+        assert payload["exception"]["message"] == "kaboom"
+        assert "result_details" in payload
+
+    def test_bogus_top_level_path_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            self._success(fields=["situatons"])  # typo
+        assert any("situatons" in r.message and "not found" in r.message for r in caplog.records)
