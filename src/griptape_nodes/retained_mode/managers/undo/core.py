@@ -8,6 +8,7 @@ recorders (knowledge) both build on these types.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -89,11 +90,14 @@ class RequestReplayUndoEntry(UndoEntry):
 
     def undo(self) -> None:
         for request in self.undo_requests:
-            dispatch_expecting_success(request, f"undo via replaying {type(request).__name__}")
+            # Deep-copy before dispatch so a handler that writes back to its request (e.g.
+            # SetParameterValue normalizing value/data_type) cannot mutate the stored inverse and
+            # let it drift across repeated undo/redo cycles.
+            dispatch_expecting_success(deepcopy(request), f"undo via replaying {type(request).__name__}")
 
     def redo(self) -> None:
         for request in self.redo_requests:
-            dispatch_expecting_success(request, f"redo via replaying {type(request).__name__}")
+            dispatch_expecting_success(deepcopy(request), f"redo via replaying {type(request).__name__}")
 
 
 @dataclass
