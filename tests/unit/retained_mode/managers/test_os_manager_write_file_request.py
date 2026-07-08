@@ -46,9 +46,11 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationPolicy,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
     ImageArtifactProvider,
 )
+from griptape_nodes.retained_mode.managers.os_manager import StagingFailedError
 
 # Mirrors the constant in tests/unit/retained_mode/managers/test_os_manager.py.
 # Used by the long-path stress test below so the magic 260 doesn't bare-appear.
@@ -650,6 +652,52 @@ class TestSidecarMetadata:
         data = _json.loads(sidecar_path.read_text())
         assert data["schema_version"] == "0.1.0"
 
+    def test_sidecar_file_extension_unchanged_for_alias_extensions(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Sidecar's ``file_extension`` variable must reflect the on-disk name, not the raw sniff.
+
+        Regression for the alias-extension case (jpg/jpeg, tif/tiff, m4v/mp4):
+        the image provider sniffs JPEG bytes as ``"jpg"``, but writing to
+        ``output.jpeg`` leaves the file at ``.jpeg`` on disk (no swap:
+        ``canonical_extension("jpg") == canonical_extension("jpeg")``). The
+        sidecar's ``file_extension`` variable must therefore stay at what the
+        caller supplied (``"jpeg"``), not get rewritten to the raw sniff
+        (``"jpg"``).
+        """
+        import json as _json
+
+        os_manager = griptape_nodes.OSManager()
+        file_path = temp_dir / "photo.jpeg"
+        # Bind file_extension in the sidecar's situation variables so the
+        # sidecar update path has something to (potentially) overwrite.
+        file_metadata = SidecarContent(
+            situation=SituationMetadata(
+                name="save_node_output",
+                macro="{outputs}/{file_name_base}.{file_extension}",
+                variables={"file_name_base": "photo", "file_extension": "jpeg"},
+            ),
+        )
+
+        request = WriteFileRequest(
+            file_path=str(file_path),
+            content=_jpeg_bytes(),
+            file_metadata=file_metadata,
+        )
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # File landed at the caller's requested suffix (alias -> no swap).
+        assert Path(result.final_file_path) == file_path
+        assert file_path.exists()
+
+        sidecar_path = temp_dir / ".griptape-nodes-metadata" / "photo.jpeg.json"
+        assert sidecar_path.exists()
+        data = _json.loads(sidecar_path.read_text())
+        # The critical assertion: sidecar variable stayed at "jpeg" (the caller's
+        # value), not "jpg" (the raw sniff). Before the fix this returned "jpg".
+        assert data["situation"]["variables"]["file_extension"] == "jpeg"
+
 
 def _png_bytes() -> bytes:
     buf = BytesIO()
@@ -831,18 +879,24 @@ class TestOSWritePermissionVet:
 
         expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
 
-        # Force the ImageArtifactProvider instance's check_write_permission to
-        # deny. We patch on the instance retrieved through the same lookup path
-        # the manager uses so we intercept the exact object it will call.
+        # Image provider defaults to ``None`` policy (no vet). Override its
+        # policy to ``FROM_BYTES`` and its from-bytes hook to deny -- keeps the
+        # test focused on the vet dispatch without dragging in disk staging.
         provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
         assert provider_classes, "PNG must resolve to the registered image provider"
         provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
-        monkeypatch.setattr(provider, "check_write_permission", lambda data, detected_format: expected_denial)  # noqa: ARG005
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
+        )
 
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "image.png"
         request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
-
         result = os_manager.on_write_file_request(request)
 
         assert isinstance(result, WriteFileResultFailure)
@@ -850,11 +904,14 @@ class TestOSWritePermissionVet:
         # The user-facing message must include the denial's own reason string
         # (owned by the policy) so an artist sees plain English, not "sniffed".
         assert "This codec is not licensed." in str(result.result_details)
+        # And OSManager owns the "Cannot save '...'" framing -- the provider
+        # denial detail is generic; the file-name wrapping happens here.
+        assert "image.png" in str(result.result_details)
         assert "sniffed" not in str(result.result_details).lower()
         assert not requested_path.exists()
 
     def test_allow_writes_normally(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
-        """The default BaseArtifactProvider.check_write_permission returns None -> allow."""
+        """The default ``None`` policy skips the vet entirely -> allow."""
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "image.png"
 
@@ -871,13 +928,13 @@ class TestOSWritePermissionVet:
         """If sniff returns None (no provider claims the bytes), the vet is never invoked."""
         called: list[bool] = []
 
-        def spy(data: bytes, detected_format: str) -> None:  # noqa: ARG001
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
             called.append(True)
 
-        # Attach the spy to any provider instance we might reach; if the vet
-        # were ever invoked for unrecognized bytes we'd catch it here. Simpler:
-        # spy on ArtifactManager.check_write_permission at the dispatch layer.
-        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "check_write_permission", spy)
+        # Spy on ArtifactManager.get_write_vetting_policy: if OSManager ever
+        # asks about an unrecognized format, we'd see it here. sniff on the
+        # blob returns None, so the vet block never even reads the policy.
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
 
         os_manager = griptape_nodes.OSManager()
         requested_path = temp_dir / "blob.dat"
@@ -888,6 +945,238 @@ class TestOSWritePermissionVet:
         assert isinstance(result, WriteFileResultSuccess)
         assert called == []
         assert requested_path.exists()
+
+    def test_deny_returns_codec_not_permitted_and_no_file_for_extensionless_destination(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Regression: extension-less destinations must not bypass the codec vet.
+
+        Before the fix, ``_apply_extension_coercion`` returned early when the
+        destination had no suffix and the vet inside it never fired, letting
+        gated bytes reach disk simply by omitting the extension. The vet now
+        lives in ``on_write_file_request`` and runs BEFORE coercion, so an
+        extensionless destination is protected.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        expected_denial = CheckpointDenial(failures=(CheckpointFailure(detail="This codec is not licensed."),))
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes, "PNG must resolve to the registered image provider"
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_BYTES)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_bytes",
+            lambda data, detected_format: expected_denial,  # noqa: ARG005
+        )
+
+        os_manager = griptape_nodes.OSManager()
+        # Destination has NO extension. Sniff on bytes classifies as PNG,
+        # provider denies, OSManager must refuse the write. Before the fix
+        # this would return Success and leave the file on disk.
+        requested_path = temp_dir / "movie"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "This codec is not licensed." in str(result.result_details)
+        assert not requested_path.exists()
+
+    def test_append_writes_are_not_vetted(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Appends skip the codec vet: the tail alone has no container header to classify."""
+        called: list[bool] = []
+
+        def spy_policy(fmt: str) -> None:  # noqa: ARG001
+            called.append(True)
+
+        monkeypatch.setattr(griptape_nodes.ArtifactManager(), "get_write_vetting_policy", spy_policy)
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        # Seed the file so append has something to append to.
+        requested_path.write_bytes(_png_bytes())
+
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes(), append=True)
+        os_manager.on_write_file_request(request)
+
+        assert called == []
+
+    def test_unrecognized_policy_variant_raises_loudly(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A future ``WriteVettingPolicy`` variant OSManager doesn't know how to dispatch must fail loud.
+
+        Silently falling through would let an unrecognized policy bless every
+        write that reached it. Simulate the future variant by returning a
+        sentinel string the switch doesn't recognize.
+        """
+        monkeypatch.setattr(
+            griptape_nodes.ArtifactManager(),
+            "get_write_vetting_policy",
+            lambda fmt: "future_variant",  # noqa: ARG005
+        )
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        with pytest.raises(RuntimeError, match="Unrecognized WriteVettingPolicy"):
+            os_manager.on_write_file_request(request)
+
+        assert not requested_path.exists()
+
+    def test_from_path_policy_stages_bytes_and_provides_path_to_provider(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When a provider declares ``FROM_PATH`` OSManager stages bytes, hands the provider a path, and truncates + deletes after.
+
+        The provider must (a) receive a filesystem path that exists at call
+        time, (b) never see the raw bytes, (c) never re-enter ``handle_request``
+        for cleanup: OSManager owns the whole staged-file lifecycle.
+        """
+        seen_paths: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            # Path must exist at hook-call time.
+            assert Path(source_path).exists()
+            assert Path(source_path).read_bytes() == _png_bytes()
+            seen_paths.append(source_path)
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        os_manager = griptape_nodes.OSManager()
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
+
+        # Allowed: the write proceeds to the real destination.
+        assert isinstance(result, WriteFileResultSuccess)
+        assert requested_path.exists()
+        # The staged temp path must have been truncated + deleted after the vet.
+        assert len(seen_paths) == 1
+        assert not Path(seen_paths[0]).exists(), "staged codec-vet temp must be cleaned up"
+
+    def test_from_path_policy_staging_failure_fails_closed(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """If staging the vet's temp file blows up, the write must be refused, not permitted.
+
+        An unstageable vet cannot verify the write is compliant -- fail closed
+        rather than silently blessing bytes because we couldn't run the check.
+        """
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+
+        provider_hook_calls: list[str] = []
+
+        def from_path_hook(source_path: str, detected_format: str) -> None:  # noqa: ARG001
+            provider_hook_calls.append(source_path)
+
+        monkeypatch.setattr(provider, "check_write_format_from_path", from_path_hook)
+
+        # Break the staging step by making the SAVE_TEMP_FILE macro resolve fail.
+        # Easiest: monkeypatch _stage_bytes_at_temp on the manager to raise.
+        os_manager = griptape_nodes.OSManager()
+
+        def raise_staging(*_args, **_kwargs):  # type: ignore[no-untyped-def]  # noqa: ANN202
+            msg = "simulated staging outage"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        monkeypatch.setattr(os_manager, "_stage_bytes_at_temp", raise_staging)
+
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = os_manager.on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.CODEC_NOT_PERMITTED
+        assert "staging for verification failed" in str(result.result_details)
+        assert not requested_path.exists()
+        # Provider hook must not have been called if we couldn't stage.
+        assert provider_hook_calls == []
+
+    def test_from_path_policy_cleanup_dispatches_delete_file_request(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Cleanup must go through ``DeleteFileRequest``, not raw ``Path.unlink``.
+
+        Routing the delete through the request handler is what gets us the
+        workspace containment, permanent-vs-trash policy, and audit logging
+        that ``on_delete_file_request`` enforces. If a future change swapped
+        the dispatch for a raw ``unlink``, codec-vet cleanups would silently
+        opt out of that policy -- this test catches that regression.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            DeleteFileRequest,
+            DeleteFileResultSuccess,
+            DeletionBehavior,
+            DeletionOutcome,
+        )
+
+        provider_classes = griptape_nodes.ArtifactManager()._registry.get_provider_classes_by_format("png")
+        assert provider_classes
+        provider = griptape_nodes.ArtifactManager()._registry.get_or_create_provider_instance(provider_classes[0])
+        monkeypatch.setattr(
+            provider.__class__, "get_write_vetting_policy", staticmethod(lambda: WriteVettingPolicy.FROM_PATH)
+        )
+        monkeypatch.setattr(
+            provider,
+            "check_write_format_from_path",
+            lambda source_path, detected_format: None,  # noqa: ARG005
+        )
+
+        # Intercept DeleteFileRequest at the event dispatcher and record every
+        # call. Handler returns Success so the vet's cleanup logs no error.
+        seen_deletes: list[DeleteFileRequest] = []
+
+        def spy_delete_handler(request: DeleteFileRequest) -> DeleteFileResultSuccess:
+            seen_deletes.append(request)
+            # OSManager always passes ``path`` (not the file_entry alternative)
+            # for codec-vet cleanup -- narrow the type for the rest of this handler.
+            assert request.path is not None
+            # Real unlink so the file is actually gone -- keeps the "staged
+            # file must be cleaned up" invariant from the sibling test intact.
+            Path(request.path).unlink(missing_ok=True)
+            return DeleteFileResultSuccess(
+                deleted_path=request.path,
+                was_directory=False,
+                deleted_paths=[request.path],
+                outcome=DeletionOutcome.PERMANENTLY_DELETED,
+                result_details="delete recorded by spy",
+            )
+
+        event_manager = griptape_nodes.EventManager()
+        registry = event_manager._request_type_to_manager
+        monkeypatch.setitem(registry, DeleteFileRequest, spy_delete_handler)
+
+        requested_path = temp_dir / "image.png"
+        request = WriteFileRequest(file_path=str(requested_path), content=_png_bytes())
+        result = griptape_nodes.OSManager().on_write_file_request(request)
+
+        assert isinstance(result, WriteFileResultSuccess)
+        # Exactly one DeleteFileRequest for the staged temp; not more (would
+        # indicate double-cleanup) and not zero (would indicate unlink bypass).
+        assert len(seen_deletes) == 1
+        # PERMANENTLY_DELETE -- codec-vet temps should never land in the trash
+        # where an artist could recover legally-encumbered bytes.
+        assert seen_deletes[0].deletion_behavior == DeletionBehavior.PERMANENTLY_DELETE
+        # The staged path (not the destination) is what's being deleted.
+        assert seen_deletes[0].path != str(requested_path)
 
 
 class TestExtensionCoercionDoesNotClobberPriorSave:
@@ -1595,3 +1884,172 @@ class TestCreateNewMacroIndexSeedWindowsPaths:
         assert (outputs_dir / "render_v003.png").read_bytes() == b"new"
         # Negative assertion: the convert-on-collision unpadded fallback must NOT have fired.
         assert not (outputs_dir / "render_v001_1.png").exists()
+
+
+class TestWriteTempFileRequest:
+    """``WriteTempFileRequest`` stages bytes at the project's SAVE_TEMP_FILE macro path.
+
+    Distinct from ``WriteFileRequest``: caller does not pick the destination,
+    the situation's macro does. Used by artifact providers that need bytes
+    on disk for one-shot inspection (e.g. ffprobe for codec extraction).
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_workspace(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        """Load the default project template so SAVE_TEMP_FILE resolves."""
+        config_manager = griptape_nodes.ConfigManager()
+        original_workspace = config_manager.workspace_path
+        config_manager.set_config_value("workspace_directory", str(temp_dir))
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        yield
+
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        config_manager.set_config_value("workspace_directory", str(original_workspace))
+
+    def test_stages_bytes_at_project_temp_path(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = griptape_nodes.OSManager()
+        payload = b"probe target bytes"
+
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(
+                content=payload,
+                variables={"file_name_base": "probe", "file_extension": "mp4"},
+            )
+        )
+
+        assert isinstance(result, WriteTempFileResultSuccess)
+        staged = Path(result.staged_path)
+        # File must exist and carry the caller's bytes verbatim.
+        assert staged.exists()
+        assert staged.read_bytes() == payload
+        assert result.bytes_written == len(payload)
+        # Suffix must reflect ``file_extension`` so ffprobe & tools recognize
+        # the type from the filename.
+        assert staged.suffix == ".mp4"
+        assert "probe" in staged.stem
+
+    def test_caller_controls_uniqueness_via_variables(self, griptape_nodes: GriptapeNodes) -> None:
+        """The handler does not inject uuids -- callers who want uniqueness supply their own.
+
+        SAVE_TEMP_FILE's on-collision policy is OVERWRITE, so two callers passing
+        the same ``file_name_base`` land at the same path and the second wins.
+        Callers who need collision safety (e.g. the codec vet racing across
+        multiple provider instances) must include a uuid in ``file_name_base``.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = griptape_nodes.OSManager()
+
+        result_a = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"a", variables={"file_name_base": "unique-a", "file_extension": "mp4"})
+        )
+        result_b = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"b", variables={"file_name_base": "unique-b", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result_a, WriteTempFileResultSuccess)
+        assert isinstance(result_b, WriteTempFileResultSuccess)
+        assert result_a.staged_path != result_b.staged_path
+        assert Path(result_a.staged_path).read_bytes() == b"a"
+        assert Path(result_b.staged_path).read_bytes() == b"b"
+
+    def test_lands_under_project_temp_directory(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """The staged path is under the project's ``{temp}`` directory, not the OS temp dir.
+
+        Confirms we're using the SAVE_TEMP_FILE situation's project-scoped
+        macro rather than a system-wide tempfile, which is the whole point of
+        the request type (avoid exhausting a small OS temp partition when
+        staging multi-GB video bytes).
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            WriteTempFileRequest,
+            WriteTempFileResultSuccess,
+        )
+
+        os_manager = griptape_nodes.OSManager()
+
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result, WriteTempFileResultSuccess)
+        staged = Path(result.staged_path).resolve()
+        # Staged path must live under the workspace root, not /tmp or the
+        # system temp dir. Using ``resolve()`` on both sides handles symlink
+        # differences (e.g. macOS ``/var`` vs ``/private/var``).
+        assert temp_dir.resolve() in staged.parents
+
+    def test_returns_failure_when_variables_do_not_resolve_macro(self, griptape_nodes: GriptapeNodes) -> None:
+        """Caller omitting a required macro variable surfaces as a Failure.
+
+        The SAVE_TEMP_FILE macro references ``{file_name_base}`` and
+        ``{file_extension}``. Passing an empty ``variables`` dict leaves those
+        slots unresolved; the handler surfaces the ``GetPathForMacroRequest``
+        failure verbatim as ``INVALID_PATH``.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            WriteTempFileRequest,
+            WriteTempFileResultFailure,
+        )
+
+        os_manager = griptape_nodes.OSManager()
+        result = os_manager.on_write_temp_file_request(WriteTempFileRequest(content=b"payload", variables={}))
+
+        assert isinstance(result, WriteTempFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_returns_failure_when_situation_registry_missing_save_temp_file(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """SAVE_TEMP_FILE absent from the situation registry -> Failure result.
+
+        SAVE_TEMP_FILE ships in DEFAULT_PROJECT_TEMPLATE so this failure
+        branch is unreachable in normal operation. Test it by monkeypatching
+        the GetSituationRequest handler to return Failure, simulating a
+        project template that removed the situation.
+        """
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            WriteTempFileRequest,
+            WriteTempFileResultFailure,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetSituationRequest,
+            GetSituationResultFailure,
+        )
+
+        def situation_missing_handler(request: GetSituationRequest) -> GetSituationResultFailure:  # noqa: ARG001
+            return GetSituationResultFailure(result_details="situation missing (test)")
+
+        event_manager = griptape_nodes.EventManager()
+        registry = event_manager._request_type_to_manager
+        monkeypatch.setitem(registry, GetSituationRequest, situation_missing_handler)
+
+        os_manager = griptape_nodes.OSManager()
+        result = os_manager.on_write_temp_file_request(
+            WriteTempFileRequest(content=b"payload", variables={"file_name_base": "probe", "file_extension": "mp4"})
+        )
+
+        assert isinstance(result, WriteTempFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+        assert "save_temp_file" in str(result.result_details).lower()
