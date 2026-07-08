@@ -255,10 +255,12 @@ class RecordingSession:
         request_type = type(request)
         if request_type in self._OWN_EVENT_TYPES:
             return None
+        # Isolate replay first: an inverse dispatched during undo/redo must never clear history or
+        # be recorded, even if it is (or cascades into) a history-clearing lifecycle type.
+        if self._is_replaying():
+            return None
         if isinstance(request, self._CLEAR_HISTORY_REQUEST_TYPES):
             self._invalidate_history()
-            return None
-        if self._is_replaying():
             return None
 
         # Nothing to track: no recording frame is open and this dispatch cannot open one (only a

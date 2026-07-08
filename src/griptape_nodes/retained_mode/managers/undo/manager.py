@@ -116,24 +116,9 @@ class UndoManager:
             return UndoResultFailure(result_details=details)
 
         batch = self._undo_stack.pop()
-        self._is_replaying = True
-        try:
-            for entry in reversed(batch.entries):
-                entry.undo()
-        except UndoEntryReplayError as err:
-            self.clear_history()
-            details = f"Attempted to undo '{batch.label}'. Failed because {err}. Undo history has been cleared."
-            return UndoResultFailure(result_details=details)
-        except Exception as err:
-            # An entry raised something other than UndoEntryReplayError (e.g. an un-deep-copyable
-            # redo request). The workflow is now partially reverted, so history can no longer be
-            # trusted; clear it and surface a typed failure rather than leaking the raw exception.
-            logger.exception("Unexpected error while undoing '%s'; clearing undo history.", batch.label)
-            self.clear_history()
-            details = f"Attempted to undo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
-            return UndoResultFailure(result_details=details)
-        finally:
-            self._is_replaying = False
+        error_details = self._replay_batch(batch, undo=True)
+        if error_details is not None:
+            return UndoResultFailure(result_details=error_details)
 
         self._redo_stack.append(batch)
         return UndoResultSuccess(undone_label=batch.label, result_details=f"Undid '{batch.label}'.")
@@ -150,24 +135,9 @@ class UndoManager:
             return RedoResultFailure(result_details=details)
 
         batch = self._redo_stack.pop()
-        self._is_replaying = True
-        try:
-            for entry in batch.entries:
-                entry.redo()
-        except UndoEntryReplayError as err:
-            self.clear_history()
-            details = f"Attempted to redo '{batch.label}'. Failed because {err}. Undo history has been cleared."
-            return RedoResultFailure(result_details=details)
-        except Exception as err:
-            # An entry raised something other than UndoEntryReplayError. The workflow is now
-            # partially re-applied, so history can no longer be trusted; clear it and surface a
-            # typed failure rather than leaking the raw exception.
-            logger.exception("Unexpected error while redoing '%s'; clearing undo history.", batch.label)
-            self.clear_history()
-            details = f"Attempted to redo '{batch.label}'. Failed with unexpected error: {err}. Undo history has been cleared."
-            return RedoResultFailure(result_details=details)
-        finally:
-            self._is_replaying = False
+        error_details = self._replay_batch(batch, undo=False)
+        if error_details is not None:
+            return RedoResultFailure(result_details=error_details)
 
         self._undo_stack.append(batch)
         return RedoResultSuccess(redone_label=batch.label, result_details=f"Redid '{batch.label}'.")
@@ -189,3 +159,44 @@ class UndoManager:
         """Push a completed batch onto the undo stack, invalidating the redo stack."""
         self._undo_stack.append(batch)
         self._redo_stack.clear()
+
+    def _replay_batch(self, batch: UndoBatch, *, undo: bool) -> str | None:
+        """Replay one batch under the replay guard; return a failure detail string, or None on success.
+
+        Undo replays the batch's entries in reverse via entry.undo(); redo replays them in order via
+        entry.redo(). Any replay failure leaves the workflow partially reverted or re-applied, so the
+        whole history can no longer be trusted: it is cleared and a detail string is returned for the
+        caller to wrap in its typed failure.
+        """
+        if undo:
+            action_noun = "undo"
+            entries = list(reversed(batch.entries))
+        else:
+            action_noun = "redo"
+            entries = list(batch.entries)
+
+        self._is_replaying = True
+        try:
+            for entry in entries:
+                if undo:
+                    entry.undo()
+                else:
+                    entry.redo()
+        except UndoEntryReplayError as err:
+            self.clear_history()
+            return f"Attempted to {action_noun} '{batch.label}'. Failed because {err}. Undo history has been cleared."
+        except Exception as err:
+            # An entry raised something other than UndoEntryReplayError (e.g. an un-deep-copyable
+            # request). The workflow is now partially changed, so history can no longer be trusted;
+            # clear it and surface a typed failure rather than leaking the raw exception.
+            logger.exception(
+                "Unexpected error while replaying %s of '%s'; clearing undo history.", action_noun, batch.label
+            )
+            self.clear_history()
+            return (
+                f"Attempted to {action_noun} '{batch.label}'. Failed with unexpected error: {err}. "
+                "Undo history has been cleared."
+            )
+        finally:
+            self._is_replaying = False
+        return None

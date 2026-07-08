@@ -50,8 +50,8 @@ class _ConnectionEndpoints:
     target_node_name: str
     target_parameter_name: str
     target_data_type: str | None = None
-    had_prior_target_value: bool = False
-    prior_target_value: Any = None
+    restore_target_value: bool = False
+    target_restore_value: Any = None
 
 
 def _resolve_node(node_name: str | None) -> BaseNodeType | None:
@@ -110,14 +110,14 @@ class CreateConnectionRecorder(UndoRecorder):
                 target_parameter_name=endpoints.target_parameter_name,
             )
         ]
-        if endpoints.had_prior_target_value:
+        if endpoints.restore_target_value:
             # Restore the property value the connection overwrote, after the edge is removed so the
             # INPUT+PROPERTY "connected, cannot set as property" guard no longer blocks the set.
             undo_requests.append(
                 SetParameterValueRequest(
                     node_name=endpoints.target_node_name,
                     parameter_name=endpoints.target_parameter_name,
-                    value=endpoints.prior_target_value,
+                    value=endpoints.target_restore_value,
                     data_type=endpoints.target_data_type,
                 )
             )
@@ -167,6 +167,11 @@ class CreateConnectionRecorder(UndoRecorder):
         Mirrors the handler's value-passing gate: a control-parameter source, a locked target, or
         initial setup passes no value, so there is nothing to restore. Non-PROPERTY targets are
         wiped on disconnect, which already matches their pre-connection state.
+
+        A PROPERTY target keeps whatever the connection propagated into it even after the edge is
+        removed (disconnect only wipes non-PROPERTY targets), so undo must set it back explicitly.
+        Snapshot the observable value even when the target had no explicit entry: that value is the
+        parameter's default, which is exactly what removing the propagated value restores it to.
         """
         is_control_parameter = (
             ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
@@ -175,13 +180,11 @@ class CreateConnectionRecorder(UndoRecorder):
             return
         if ParameterMode.PROPERTY not in target_param.allowed_modes:
             return
-        if target_param.name not in target_node.parameter_values:
-            return
         try:
-            endpoints.prior_target_value = copy.deepcopy(target_node.get_parameter_value(target_param.name))
-            endpoints.had_prior_target_value = True
+            endpoints.target_restore_value = copy.deepcopy(target_node.get_parameter_value(target_param.name))
+            endpoints.restore_target_value = True
         except Exception:
-            endpoints.had_prior_target_value = False
+            endpoints.restore_target_value = False
 
 
 class DeleteConnectionRecorder(UndoRecorder):
