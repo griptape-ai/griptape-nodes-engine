@@ -237,6 +237,10 @@ _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 # external attachment warrants.
 _REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS = 5.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
+# Stands in for a replayed user turn whose only content was image attachments
+# that all failed to re-download, so the turn is never sent to the model as an
+# empty message (which some providers reject).
+_UNAVAILABLE_IMAGE_PLACEHOLDER = "[An image attached to this earlier message is no longer available.]"
 
 # Written into the workspace skills directory the first time a runner is
 # built, so users discovering the folder know what belongs in it.
@@ -547,6 +551,11 @@ class AgentManager:
                 if content is not None:
                     succeeded += 1
                     rehydrated.append(content)
+            # An image-only turn whose every image failed to re-download would
+            # otherwise become empty content, which some providers reject. Keep
+            # the turn present with a placeholder so replay still works.
+            if images and not rehydrated:
+                rehydrated.append(_UNAVAILABLE_IMAGE_PLACEHOLDER)
             new_parts.append(replace(part, content=rehydrated))
         return _RehydratedMessage(message=replace(message, parts=new_parts), attempted=attempted, succeeded=succeeded)
 

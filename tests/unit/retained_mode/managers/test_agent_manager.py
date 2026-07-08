@@ -57,6 +57,7 @@ from griptape_nodes.retained_mode.events.agent_events import (
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
     _SKILLS_README,
+    _UNAVAILABLE_IMAGE_PLACEHOLDER,
     _VALID_PROVIDER_TYPES,
     AgentManager,
     ComposedPrompt,
@@ -407,6 +408,38 @@ class TestRehydrateHistory:
         part = result[0].parts[0]
         assert isinstance(part, UserPromptPart)
         assert part.content == ["look"]
+
+    @pytest.mark.asyncio
+    async def test_image_only_turn_all_failing_gets_placeholder_text(
+        self, agent_manager: AgentManager, patch_get: _GetRecorder
+    ) -> None:
+        # An image-only turn whose every image fails must not become empty
+        # content (some providers reject an empty user message on replay).
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=[ImageUrl(url=url)])])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == [_UNAVAILABLE_IMAGE_PLACEHOLDER]
+
+    @pytest.mark.asyncio
+    async def test_failed_image_with_text_keeps_text_without_placeholder(
+        self, agent_manager: AgentManager, patch_get: _GetRecorder
+    ) -> None:
+        # When the turn still has text after a failed download, the text carries
+        # the turn: no placeholder is added.
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["hi", ImageUrl(url=url)])])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == ["hi"]
 
     @pytest.mark.asyncio
     async def test_multiple_images_preserve_order_with_partial_failure(
