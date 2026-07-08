@@ -4,7 +4,7 @@ import copy
 import logging
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
@@ -19,6 +19,25 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
 
 logger = logging.getLogger("griptape_nodes")
+
+
+class DagNodeCategories(NamedTuple):
+    """Nodes bucketed by their role when seeding a DAG.
+
+    Produced by classifying a scope of nodes (a whole flow or a single subflow) and consumed
+    by the DAG-seeding routine. Keeping this scope-agnostic lets top-level flows and isolated
+    subflows share one classification + seeding implementation.
+
+    Attributes:
+        start_nodes: StartNode instances (workflow entry points).
+        control_nodes: Control-flow entry nodes that have no external incoming control connection.
+        data_sink_nodes: Data nodes with no external outgoing connection (terminal/leaf nodes);
+            seeding these resolves their dependencies backward.
+    """
+
+    start_nodes: list[BaseNode]
+    control_nodes: list[BaseNode]
+    data_sink_nodes: list[BaseNode]
 
 
 class NodeState(StrEnum):

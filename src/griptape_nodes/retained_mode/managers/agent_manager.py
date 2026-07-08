@@ -38,6 +38,7 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import mcp_server_from_config, streamable_http_local
 from griptape_nodes.agents.pydantic_ai.runner import (
+    DEFAULT_SKILLS_DIRECTORY,
     PydanticAgentRunner,
     RunEvent,
     TextDelta,
@@ -183,6 +184,43 @@ def _build_agent_instructions(*, include_image_tool: bool) -> str:
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
 
 
+def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | None:
+    """Return a user-facing message when listing a provider's models fails.
+
+    Scoped to the model-listing path only: that request's whole job is "reach
+    this one endpoint and list its models", so a connection-class failure here
+    unambiguously means *that* provider is unreachable. A custom/local provider
+    (LMStudio, Ollama, any OpenAI-compatible endpoint) is commonly offline — the
+    app is closed, the machine slept, the port changed — and the raw transport
+    error ("All connection attempts failed") means nothing to the person who
+    configured it. Map connection-class failures to plain language that names
+    the endpoint and points at the likely cause.
+
+    Returns ``None`` when the error isn't a recognizable connection failure, so
+    the caller falls back to its existing (raw) message for other error classes
+    (e.g. an HTTP status error or a bad JSON body — those aren't "server down").
+    """
+    where = f" at '{base_url}'" if base_url else ""
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return (
+            f"Couldn't reach the model provider{where}. Is the local server "
+            "(e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    if isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout)):
+        return (
+            f"The model provider{where} didn't respond in time. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    # Other httpx.RequestError subclasses (DNS failures, connection drops, etc.)
+    # are still connection-shaped from the user's perspective.
+    if isinstance(exc, httpx.RequestError):
+        return (
+            f"Couldn't connect to the model provider{where}. Is the local "
+            "server (e.g. LMStudio or Ollama) running and reachable at that address?"
+        )
+    return None
+
+
 # Cap each chat-sidebar turn so a runaway loop can't burn through credits or
 # wedge the conversation. The numbers are deliberately generous: 60 model
 # requests is enough for a complex multi-tool task while still protecting the
@@ -194,6 +232,34 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
+
+# Written into the workspace skills directory the first time a runner is
+# built, so users discovering the folder know what belongs in it.
+_SKILLS_README = """\
+# Agent Skills
+
+Skills placed in this directory are loaded automatically by the Griptape Nodes
+agent. Each skill lives in its own subdirectory containing a `SKILL.md` file:
+
+    .agents/skills/
+        my-skill/
+            SKILL.md
+
+`SKILL.md` starts with YAML frontmatter declaring `name` (which must match the
+directory name) and `description`, followed by the skill's instructions:
+
+    ---
+    name: my-skill
+    description: When to use this skill and what it does.
+    ---
+
+    Step-by-step guidance for the agent goes here.
+
+The agent re-scans this directory before each run, so new or edited skills
+take effect without restarting the engine.
+
+Skills here follow the Agent Skills specification: https://agentskills.io
+"""
 
 
 @dataclass
@@ -614,8 +680,11 @@ class AgentManager:
                 result_details=f"Retrieved {len(models)} models from {base_url}.",
             )
         except (httpx.HTTPStatusError, httpx.RequestError, ValueError) as e:
-            details = f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
-            logger.warning(details)
+            # Keep the raw exception in the logs for debugging, but surface a
+            # message the user can act on when the provider is simply offline.
+            logger.warning("Attempted to list models from '%s'. Failed with: %s", request.base_url, e)
+            friendly = _friendly_list_models_error(e, request.base_url)
+            details = friendly or f"Attempted to list models from '{request.base_url}'. Failed with: {e}"
             return ListProviderModelsResultFailure(result_details=details)
 
     def on_handle_get_conversation_memory_request(self, request: GetConversationMemoryRequest) -> ResultPayload:
@@ -677,6 +746,7 @@ class AgentManager:
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
+        self._ensure_skills_directory(workspace_root)
         mcp_servers: list[AbstractToolset[Any]] = [
             streamable_http_local(
                 f"http://localhost:{self._mcp_server_port}/mcp/",
@@ -708,6 +778,25 @@ class AgentManager:
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _ensure_skills_directory(self, workspace_root: Path) -> None:
+        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+
+        Called before every runner construction: the runner only attaches a
+        `SkillsCapability` when the directory exists at construction time, and
+        runners are cached, so creating the directory here guarantees skills
+        added mid-session are picked up on the next scan. Seeds a README the
+        first time so users discovering the folder know what belongs in it.
+        Failure to scaffold is logged but never blocks building the agent.
+        """
+        skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
+        try:
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            readme = skills_dir / "README.md"
+            if not readme.exists():
+                readme.write_text(_SKILLS_README, encoding="utf-8")
+        except OSError as e:
+            logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
@@ -741,6 +830,8 @@ class AgentManager:
             model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
             base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
+            enabled=pd.enabled,
+            icon=pd.icon or None,
         )
         self._providers.append(provider)
         self._persist_providers()
@@ -758,6 +849,10 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
+        if pd.enabled is False and request.name == _PROTECTED_PROVIDER_NAME:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because it is a protected provider and cannot be disabled."
+            )
         if pd.type is not None:
             existing.type = pd.type
         if pd.model is not None:
@@ -767,6 +862,10 @@ class AgentManager:
         if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):
             raw = pd.api_key_secret_name or ""
             existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
+        if pd.enabled is not None:
+            existing.enabled = pd.enabled
+        if "icon" in pd.model_fields_set:
+            existing.icon = pd.icon or None
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")

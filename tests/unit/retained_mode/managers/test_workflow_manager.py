@@ -1793,7 +1793,7 @@ class TestWorkflowVariablePersistence:
 
         if context_manager.has_current_workflow():
             GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         context_manager.push_workflow(workflow_name="round_trip_workflow")
 
@@ -2044,7 +2044,7 @@ class TestWorkflowVariablePersistence:
 
         # Clear everything, then exec the script and confirm the variable is rebuilt.
         GriptapeNodes.clear_current_workflow_data()
-        variables_manager.on_clear_object_state()
+        variables_manager.clear_object_state()
 
         exec_globals: dict[str, object] = {"__file__": "test_workflow.py"}
         exec(compile(script_source, "<round_trip_test>", "exec"), exec_globals)  # noqa: S102
@@ -2760,10 +2760,12 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             # The destination carries the create_versioned_workflow macro (unresolved
-            # `{_index:03}`), so OSManager's seed walks past existing v001 and lands
-            # at v002 on write.
+            # sequence-slot marker — `{_index:NN}` in legacy templates or `{###}` /
+            # `{###?}` in the modern default), so OSManager's seed walks past existing
+            # v001 and lands at v002 on write.
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            macro = target.destination._file.location
+            assert "_index" in macro or "#" in macro
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
@@ -2986,8 +2988,9 @@ class TestCreateVersionedWorkflow:
         situation = DEFAULT_PROJECT_TEMPLATE.situations.get(BuiltInSituation.CREATE_VERSIONED_WORKFLOW)
         assert situation is not None, "create_versioned_workflow missing from DEFAULT_PROJECT_TEMPLATE"
         assert situation.policy.on_collision == SituationFilePolicy.CREATE_NEW
-        # Padded `{_index:NN}` slot is what makes the seed-and-retry produce v001/v002/...
-        assert "_index" in situation.macro
+        # A sequence-slot marker (legacy `{_index:NN}` or modern `{###}` / `{###?}`)
+        # is what makes the seed-and-retry produce v001/v002/...
+        assert "_index" in situation.macro or "#" in situation.macro
 
     def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: GriptapeNodes) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
@@ -3001,7 +3004,10 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             assert target.destination is not None
-            assert "_index" in target.destination._file.location
+            # Destination carries the create_versioned_workflow macro with an
+            # unresolved sequence-slot marker (`{_index:NN}` legacy or `{###}` modern).
+            macro = target.destination._file.location
+            assert "_index" in macro or "#" in macro
             # Base name comes from the explicit request; relative_file_path reflects
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"
@@ -3513,3 +3519,160 @@ class TestSaveWorkflowDisplayNameFallback:
             # isn't in the registry under the resolved key yet), no
             # request.file_name → fall-through to None.
             assert captured is None
+
+
+class TestScrubForAstConstant:
+    """Regression coverage for griptape-nodes-engine#5013.
+
+    A Button trait object placed inside a parameter's ``ui_options`` dict (instead of
+    attached via ``traits=``) survives serialization and, when emitted by codegen via
+    ``ast.Constant``, is rendered as its ``repr()`` (``<function ... at 0x...>``), which
+    is invalid Python and prevents the saved workflow from reopening.
+    """
+
+    def test_primitive_values_are_safe(self) -> None:
+        for value in ["s", b"b", True, 1, 1.5, None]:
+            assert WorkflowManager._is_ast_constant_safe(value) is True
+
+    def test_nested_container_of_primitives_is_safe(self) -> None:
+        value = {"a": [1, 2, {"b": ("x", None)}], "c": {1, 2}}
+        assert WorkflowManager._is_ast_constant_safe(value) is True
+
+    def test_callable_leaf_is_unsafe(self) -> None:
+        assert WorkflowManager._is_ast_constant_safe(lambda: None) is False
+
+    def test_scrub_leaves_safe_value_untouched(self) -> None:
+        value = {"display_name": "X", "hide": True, "nums": [1, 2]}
+        result = WorkflowManager._scrub_for_ast_constant(value)
+        assert result.dropped is False
+        assert result.value == value
+
+    def test_scrub_drops_button_in_ui_options_traits(self) -> None:
+        from griptape_nodes.traits.button import Button
+
+        button = Button(size="icon", icon="audio-lines", tooltip="Search", button_link="https://example.com")
+        ui_options = {
+            "display_name": "Custom Voice ID",
+            "hide": True,
+            "placeholder_text": "e.g., 21m00Tcm4TlvDq8ikWAM",
+            "traits": [button],
+        }
+
+        result = WorkflowManager._scrub_for_ast_constant(ui_options)
+
+        assert result.dropped is True
+        # Safe keys are preserved; the unsafe Button is removed, leaving an empty traits list.
+        assert result.value == {
+            "display_name": "Custom Voice ID",
+            "hide": True,
+            "placeholder_text": "e.g., 21m00Tcm4TlvDq8ikWAM",
+            "traits": [],
+        }
+
+    def test_keyword_from_field_value_emits_valid_python(self) -> None:
+        from griptape_nodes.traits.button import Button
+
+        button = Button(icon="key", tooltip="Open", button_link="https://example.com")
+        ui_options = {"display_name": "X", "traits": [button]}
+
+        keyword = WorkflowManager._keyword_from_field_value("ui_options", ui_options, object())
+        call_node = ast.Call(
+            func=ast.Name(id="Req", ctx=ast.Load()),
+            args=[],
+            keywords=[keyword],
+        )
+        source = ast.unparse(ast.fix_missing_locations(call_node))
+
+        # The rendered source must be free of the invalid function repr and must parse.
+        assert "0x" not in source
+        assert "<function" not in source
+        assert "Button(" not in source
+        ast.parse(source)
+
+    def test_scrub_namedtuple_with_unsafe_leaf_does_not_crash(self) -> None:
+        """A namedtuple (tuple subclass) containing an unsafe leaf must not raise.
+
+        ``type(value)(scrubbed_items)`` would call the namedtuple's positional
+        ``__new__`` with a single list arg and raise TypeError, turning graceful
+        degradation into a hard crash of the whole save. It must degrade to a plain
+        tuple instead.
+        """
+
+        class Point(NamedTuple):
+            x: int
+            handler: object
+
+        value = Point(1, lambda: None)
+        result = WorkflowManager._scrub_for_ast_constant(value)
+
+        assert result.dropped is True
+        # Reconstructed as a plain tuple with the unsafe leaf removed.
+        assert result.value == (1,)
+        assert type(result.value) is tuple
+
+    def test_generate_workflow_file_content_scrubs_button_in_ui_options(self, griptape_nodes: GriptapeNodes) -> None:
+        """End-to-end regression for #5013: a Button in ui_options must not break the saved file.
+
+        Drives the real generator (``_generate_workflow_file_content``) with a node whose
+        AlterParameterDetailsRequest carries a Button inside ``ui_options`` (the exact shape
+        the standalone ElevenLabs library produced). The emitted module must be valid,
+        reopenable Python with no function repr leaking through.
+        """
+        from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, SerializedNodeCommands
+        from griptape_nodes.retained_mode.events.parameter_events import AlterParameterDetailsRequest
+        from griptape_nodes.traits.button import Button
+
+        button = Button(size="icon", icon="audio-lines", tooltip="Search", button_link="https://example.com")
+        alter_request = AlterParameterDetailsRequest(
+            parameter_name="custom_voice_id",
+            ui_options={
+                "display_name": "Custom Voice ID",
+                "hide": False,
+                "traits": [button],
+            },
+            initial_setup=True,
+        )
+        node_command = SerializedNodeCommands(
+            create_node_command=CreateNodeRequest(
+                node_type="SomeNode",
+                specific_library_name="Some Library",
+                node_name="Node_1",
+            ),
+            element_modification_commands=[alter_request],
+            node_dependencies=NodeDependencies(),
+        )
+        flow_commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[node_command],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=NodeDependencies(
+                libraries={LibraryNameAndVersion(library_name="Some Library", library_version="0.1.0")}
+            ),
+            node_types_used=set(),
+        )
+
+        metadata = WorkflowMetadata(
+            name="test_workflow",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="1.0.0",
+            node_libraries_referenced=[],
+            workflow_shape=None,
+        )
+        content = griptape_nodes.WorkflowManager()._generate_workflow_file_content(
+            serialized_flow_commands=flow_commands,
+            workflow_metadata=metadata,
+        )
+
+        # The generated file must be valid, reopenable Python with no leaked function repr,
+        # and the surviving ui_options must keep its safe keys with an emptied traits list.
+        assert "<function" not in content
+        assert "at 0x" not in content
+        assert "_create_button_link_handler" not in content
+        ast.parse(content)
+        assert "'traits': []" in content
+        assert "'display_name': 'Custom Voice ID'" in content

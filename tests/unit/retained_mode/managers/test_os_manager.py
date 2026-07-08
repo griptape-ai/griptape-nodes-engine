@@ -1247,12 +1247,19 @@ class TestWindowsLongPathHandling:
         return Path(*path_parts)
 
     def test_normalize_path_short_path(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:  # noqa: ARG002
-        """Test that short paths are not modified."""
+        r"""Short paths get the \\?\ prefix on Windows, none elsewhere.
+
+        The prefix is applied unconditionally on Windows (not gated on length):
+        prefixing a short root is what lets a recursive copy carry the prefix
+        down to deep leaf paths that individually exceed MAX_PATH.
+        """
         short_path = temp_dir / "short.txt"
         result = normalize_path_for_platform(short_path)
 
-        # Should return string without \\?\ prefix
-        assert not result.startswith("\\\\?\\")
+        if platform.system() == "Windows":
+            assert result.startswith("\\\\?\\")
+        else:
+            assert not result.startswith("\\\\?\\")
 
     @pytest.mark.skipif(platform.system() != "Windows", reason="Windows-specific test")
     def test_normalize_path_long_path_windows(self, griptape_nodes: GriptapeNodes, long_path: Path) -> None:  # noqa: ARG002
@@ -1978,6 +1985,32 @@ class TestGetNextUnusedFilenameRequest:
         assert isinstance(result, GetNextUnusedFilenameResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
 
+    def test_sequence_format_glob_uses_permissive_wildcard(self, griptape_nodes: GriptapeNodes) -> None:
+        """The glob builder emits ``*`` for ``SequenceFormat`` slots, not fixed-width ``?`` chars.
+
+        Pins the new branch added for #4902: ``SequenceFormat`` means
+        *minimum* width N, so the scan must use a permissive wildcard that
+        also matches values whose digit count overflows N. Contrast with
+        the legacy ``NumericPaddingFormat`` glob (fixed-width via N copies
+        of ``?``), which is unchanged.
+        """
+        from griptape_nodes.common.macro_parser.resolution import partial_resolve
+
+        os_manager = griptape_nodes.OSManager()
+        secrets_manager = GriptapeNodes.SecretsManager()
+
+        # `SequenceFormat` (new): permissive `*` wildcard, accepts any digit count.
+        sequence_macro = ParsedMacro("/anywhere/render_v{###}.png")
+        sequence_partial = partial_resolve(sequence_macro.template, sequence_macro.segments, {}, secrets_manager)
+        sequence_glob = os_manager._build_glob_pattern_from_partially_resolved(sequence_partial.segments, "_index")
+        assert sequence_glob == "/anywhere/render_v*.png"
+
+        # `NumericPaddingFormat` (legacy): fixed-width `???` (one `?` per digit).
+        legacy_macro = ParsedMacro("/anywhere/render_v{_index:03}.png")
+        legacy_partial = partial_resolve(legacy_macro.template, legacy_macro.segments, {}, secrets_manager)
+        legacy_glob = os_manager._build_glob_pattern_from_partially_resolved(legacy_partial.segments, "_index")
+        assert legacy_glob == "/anywhere/render_v???.png"
+
 
 class TestGetNextVersionIndexRequest:
     """Test GetNextVersionIndexRequest index-preview behavior."""
@@ -2038,6 +2071,32 @@ class TestGetNextVersionIndexRequest:
 
         assert isinstance(result, GetNextVersionIndexResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
+
+    def test_sequence_slot_scan_skips_non_numeric_siblings(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Regression: scanning a `{###}` macro with a non-numeric sibling must not crash.
+
+        `SequenceFormat` slots use a permissive `*` glob, so `render_vfinal.png`
+        matches the shell glob against `render_v{###}.png`. Before the fix,
+        reverse-matching that name routed through `SequenceFormat.reverse("final")`,
+        raising `MacroResolutionError` all the way out to the request handler.
+        The scan now catches that error and treats non-parseable matches as
+        non-matches, so the numeric siblings still drive the next-index result.
+        """
+        (temp_dir / "render_v001.png").touch()
+        (temp_dir / "render_v002.png").touch()
+        (temp_dir / "render_vfinal.png").touch()  # non-numeric sibling — the crash trigger
+
+        os_manager = griptape_nodes.OSManager()
+        request = GetNextVersionIndexRequest(
+            macro_path=MacroPath(
+                parsed_macro=ParsedMacro("{outputs}/render_v{###}.png"),
+                variables={"outputs": str(temp_dir)},
+            )
+        )
+        result = os_manager.on_get_next_version_index_request(request)
+
+        assert isinstance(result, GetNextVersionIndexResultSuccess)
+        assert result.index == 3  # noqa: PLR2004
 
 
 class TestMakeDirectoryRequest:

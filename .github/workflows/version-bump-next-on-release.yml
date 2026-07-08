@@ -1,0 +1,140 @@
+name: Bump Main to Next Version
+
+# When a minor or major release publishes (a tag ending in .0), open a PR that
+# advances main's version to the next minor (X.Y.0 -> X.(Y+1).0). This keeps main
+# ahead of the last release so ongoing development reflects the upcoming version
+# instead of the shipped one.
+#
+# Patch releases (X.Y.Z where Z > 0) are skipped: those ship maintenance fixes
+# from a release/** branch and main is already ahead of them.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Released tag to bump past (e.g. v0.89.0)'
+        required: true
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  bump-next:
+    # Skip prereleases (the nightly "latest" release), non-version tags, and
+    # patch releases (only tags ending in .0 advance main). workflow_dispatch is
+    # allowed through and re-validated in the shell so a patch tag is a no-op.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.release.prerelease == false &&
+       startsWith(github.event.release.tag_name, 'v') &&
+       endsWith(github.event.release.tag_name, '.0'))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Compute next version
+        id: compute
+        run: |
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          RELEASED="${TAG#v}"
+
+          # Only minor/major releases (X.Y.0) advance main. Patch releases ship
+          # from a release/** branch and main is already ahead of them.
+          if [ "${RELEASED##*.}" != "0" ]; then
+            echo "$RELEASED is a patch release; main is already ahead, nothing to bump."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          CURRENT=$(uv version --short)
+
+          # Anchor the bump to the released tag so a stale or behind main can't
+          # produce a version that collides with what was just shipped.
+          uv version "$RELEASED" >/dev/null
+          NEXT=$(uv version --bump minor --short)
+
+          echo "Released: $RELEASED | main currently: $CURRENT | computed next: $NEXT"
+
+          # Never move main backwards: only proceed if NEXT is strictly greater
+          # than main's current version.
+          HIGHEST=$(printf '%s\n%s\n' "$CURRENT" "$NEXT" | sort -V | tail -n1)
+          if [ "$NEXT" = "$CURRENT" ] || [ "$HIGHEST" != "$NEXT" ]; then
+            echo "main ($CURRENT) is already at or ahead of the next version ($NEXT); nothing to do."
+            git checkout -- pyproject.toml
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "next=$NEXT" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update lockfile
+        if: steps.compute.outputs.skip == 'false'
+        run: uv lock
+
+      - name: Create bump branch and commit
+        if: steps.compute.outputs.skip == 'false'
+        id: branch
+        run: |
+          NEXT="${{ steps.compute.outputs.next }}"
+          BRANCH="chore/bump-next-v${NEXT}"
+          git checkout -b "$BRANCH"
+          git add pyproject.toml uv.lock
+          git commit -m "chore: bump v${NEXT}"
+          git push origin "$BRANCH" --force
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Check if PR already exists
+        if: steps.compute.outputs.skip == 'false'
+        id: check-pr
+        run: |
+          PR_EXISTS=$(gh pr list --base main --head "${{ steps.branch.outputs.branch }}" --json number --jq length)
+          echo "exists=$PR_EXISTS" >> "$GITHUB_OUTPUT"
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
+      - name: Create pull request into main
+        if: steps.compute.outputs.skip == 'false' && steps.check-pr.outputs.exists == '0'
+        id: create-pr
+        run: |
+          NEXT="${{ steps.compute.outputs.next }}"
+          TAG="${{ github.event.inputs.tag || github.event.release.tag_name }}"
+          gh pr create \
+            --base main \
+            --head "${{ steps.branch.outputs.branch }}" \
+            --title "chore: bump v${NEXT}" \
+            --body "Advances \`main\` to the next version (\`${NEXT}\`) following the \`${TAG}\` release.
+
+          Generated automatically by the \`Bump Main to Next Version\` workflow."
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+
+      - name: Enable auto-merge
+        if: steps.compute.outputs.skip == 'false' && steps.check-pr.outputs.exists == '0'
+        continue-on-error: true
+        run: gh pr merge --auto --squash "${{ steps.branch.outputs.branch }}"
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}

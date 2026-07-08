@@ -9,7 +9,7 @@ from griptape_nodes.exe_types.node_types import (
     BaseNode,
     NodeResolutionState,
 )
-from griptape_nodes.machines.dag_builder import DagBuilder
+from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
@@ -25,6 +25,7 @@ from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 
 
 @dataclass
@@ -253,14 +254,20 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         ):
             await self.update()
 
-    async def _process_nodes_for_dag(self, start_node: BaseNode) -> list[BaseNode]:  # noqa: C901, PLR0912
-        """Process data_nodes from the global queue to build unified DAG.
+    async def _process_nodes_for_dag(self, start_node: BaseNode) -> list[BaseNode]:
+        """Seed the DAG for this run and return the entry (control) nodes.
 
-        This method identifies data_nodes in the execution queue and processes
-        their dependencies into the DAG resolution machine.
-
-        For isolated subflows, this skips the global queue entirely and just
-        processes the start node, as subflows are self-contained.
+        Top-level runs and isolated subflows share one classifier and one seeding routine; they
+        differ only in scope. A top-level run draws its categorized nodes from the global queue
+        (already scoped by get_start_node_queue to exclude referenced subflows and group
+        children). An isolated subflow classifies its own direct nodes and, unlike the top-level
+        run, does NOT drop group children: a node carries a parent_group only when it belongs to
+        the group that owns this very subflow (members are moved into their group's subflow), so
+        those children are exactly the nodes this run must resolve. A nested group appears as its
+        proxy node, which resolves here and executes its own subflow in turn, so nothing is
+        double-executed. Either way the same seeding logic runs, so a data-only subflow (or a
+        group of independent nodes) resolves all its leaf nodes in parallel instead of stopping
+        at the start node.
         """
         # Use the DagBuilder from the resolution machine context (may be isolated or global)
         dag_builder = self._context.resolution_machine.context.dag_builder
@@ -271,68 +278,94 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         # Build with the first node (it should already be the proxy if it's part of a group)
         dag_builder.add_node_with_dependencies(start_node, start_node.name)
 
-        # Check if we're using an isolated DagBuilder (for subflows)
         flow_manager = GriptapeNodes.FlowManager()
         node_manager = GriptapeNodes.NodeManager()
         is_isolated = dag_builder is not flow_manager.global_dag_builder
 
         if is_isolated:
-            # For isolated subflows, we don't process the global queue
-            # Just return the start node - the subflow is self-contained
-            logger.debug(
-                "Using isolated DagBuilder for flow '%s' - skipping global queue processing", self._context.flow_name
-            )
-            return [start_node]
+            subflow = flow_manager.get_flow_by_name(self._context.flow_name)
+            # Scope is this subflow's own direct nodes. Do NOT apply exclude_subflow_group_children
+            # here (unlike get_start_node_queue): a node carries a parent_group only when it belongs
+            # to the group that owns this exact subflow, so its "group children" are precisely the
+            # nodes this run must resolve. A nested group is represented by its proxy node, whose
+            # own members live in the nested group's subflow, so excluding here would strand this
+            # group's independent nodes and let only the start node run.
+            scope_nodes = list(subflow.nodes.values())
+            categories = flow_manager.classify_nodes_for_dag(scope_nodes)
+            logger.debug("Seeding isolated subflow '%s' DAG from its own nodes", self._context.flow_name)
+        else:
+            categories = self._drain_global_flow_queue(flow_manager)
 
-        # For main flows using the global DagBuilder, process the global queue
-        start_nodes = [start_node]
+        return self._seed_dag_from_categories(start_node, categories, dag_builder, flow_manager, node_manager)
+
+    @staticmethod
+    def _drain_global_flow_queue(flow_manager: FlowManager) -> DagNodeCategories:
+        """Consume the global flow queue into categorized node lists for seeding.
+
+        The queue is populated (and scoped) by get_start_node_queue before a top-level run. Draining
+        it here preserves the existing contract that the queue is emptied during DAG construction.
+        """
+        # Local import: flow_manager imports control_flow (CompleteState, ControlFlowMachine) at
+        # module scope, so importing DagExecutionType at the top would be a circular import.
         from griptape_nodes.retained_mode.managers.flow_manager import DagExecutionType
 
-        # PASS 1: Process all control/start nodes first to build control flow graphs
-        queue_items = list(flow_manager.global_flow_queue.queue)
-        for item in queue_items:
-            if item.dag_execution_type in (DagExecutionType.CONTROL_NODE, DagExecutionType.START_NODE):
-                node = item.node
-                node.state = NodeResolutionState.UNRESOLVED
-                # Use proxy node if this node is part of a group, otherwise use original node
-                node_to_add = node
+        start_nodes: list[BaseNode] = []
+        control_nodes: list[BaseNode] = []
+        data_sink_nodes: list[BaseNode] = []
+        for item in list(flow_manager.global_flow_queue.queue):
+            if item.dag_execution_type == DagExecutionType.START_NODE:
+                start_nodes.append(item.node)
+            elif item.dag_execution_type == DagExecutionType.CONTROL_NODE:
+                control_nodes.append(item.node)
+            elif item.dag_execution_type == DagExecutionType.DATA_NODE:
+                data_sink_nodes.append(item.node)
+            flow_manager.global_flow_queue.queue.remove(item)
+        return DagNodeCategories(start_nodes=start_nodes, control_nodes=control_nodes, data_sink_nodes=data_sink_nodes)
 
-                # Only add if not already added (proxy might already be in DAG)
-                if node_to_add.name not in dag_builder.node_to_reference:
-                    dag_builder.add_node_with_dependencies(node_to_add, node_to_add.name)
-                    if node_to_add not in start_nodes:
-                        start_nodes.append(node_to_add)
-                flow_manager.global_flow_queue.queue.remove(item)
+    @staticmethod
+    def _seed_dag_from_categories(
+        start_node: BaseNode,
+        categories: DagNodeCategories,
+        dag_builder: DagBuilder,
+        flow_manager: FlowManager,
+        node_manager: NodeManager,
+    ) -> list[BaseNode]:
+        """Seed the DAG from categorized nodes and return the entry (control) nodes.
 
-        # PASS 2: Process all data nodes after control graphs are built
-        queue_items = list(flow_manager.global_flow_queue.queue)
-        for item in queue_items:
-            if item.dag_execution_type == DagExecutionType.DATA_NODE:
-                node = item.node
-                node.state = NodeResolutionState.UNRESOLVED
-                # Use proxy node if this node is part of a group, otherwise use original node
-                node_to_add = node
-                # Only add if not already added (proxy might already be in DAG)
-                disconnected = True
-                if node_to_add.name not in dag_builder.node_to_reference:
-                    # Now, we need to create the DAG, but it can't be queued or used until it's dependencies have been resolved.
-                    # Figure out which graph the data node belongs to, if it belongs to a graph.
-                    for graph_start_node_name in dag_builder.graphs:
-                        graph_start_node = node_manager.get_node_by_name(graph_start_node_name)
-                        # Get boundary nodes (empty list if not connected)
-                        boundary_nodes = flow_manager.is_node_connected(graph_start_node, node)
-                        # This means this node is in the downstream connection of one of this graph.
-                        if boundary_nodes:
-                            # Is the node connected to a graph?
-                            disconnected = False
-                            if node.name not in dag_builder.start_node_candidates:
-                                dag_builder.start_node_candidates[node.name] = {}
-                            dag_builder.start_node_candidates[node.name][graph_start_node_name] = set(boundary_nodes)
-                    if disconnected:
-                        # If the node is not connected to any graph, we can add it as it's own graph here.
-                        # It will not cause any overlapping confusion with existing graphs.
-                        dag_builder.add_node_with_dependencies(node_to_add, node_to_add.name)
-                flow_manager.global_flow_queue.queue.remove(item)
+        PASS 1 adds start/control entry nodes so control-flow graphs exist. PASS 2 adds data
+        sink (terminal/leaf) nodes. A sink that is only data-connected gets its own graph so its
+        dependencies resolve unconditionally; a sink reachable from a graph's forward control
+        path is instead registered as a control-gated candidate so branches stay gated. The
+        current classifier only routes control-disconnected nodes into data_sink_nodes, so the
+        gated branch is a defensive fallback and the data-connected case is what runs in practice.
+        """
+        start_nodes = [start_node]
+
+        # PASS 1: control/start entries build the control-flow graphs.
+        for node in (*categories.start_nodes, *categories.control_nodes):
+            node.state = NodeResolutionState.UNRESOLVED
+            if node.name not in dag_builder.node_to_reference:
+                dag_builder.add_node_with_dependencies(node, node.name)
+                if node not in start_nodes:
+                    start_nodes.append(node)
+
+        # PASS 2: data sinks, after the control graphs exist.
+        for node in categories.data_sink_nodes:
+            node.state = NodeResolutionState.UNRESOLVED
+            if node.name in dag_builder.node_to_reference:
+                continue
+            disconnected = True
+            for graph_start_node_name in list(dag_builder.graphs):
+                graph_start_node = node_manager.get_node_by_name(graph_start_node_name)
+                boundary_nodes = flow_manager.is_node_connected(graph_start_node, node)
+                if boundary_nodes:
+                    disconnected = False
+                    if node.name not in dag_builder.start_node_candidates:
+                        dag_builder.start_node_candidates[node.name] = {}
+                    dag_builder.start_node_candidates[node.name][graph_start_node_name] = set(boundary_nodes)
+            if disconnected:
+                # Not gated by any control graph - resolve it (and its dependencies) on its own.
+                dag_builder.add_node_with_dependencies(node, node.name)
 
         return start_nodes
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -13,13 +14,18 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 from pydantic import ValidationError
 
 from griptape_nodes.common.macro_parser import (
+    SEQUENCE_VARIABLE_NAME,
     MacroMatchFailure,
     MacroMatchFailureReason,
     MacroResolutionError,
     MacroResolutionFailureReason,
     MacroVariables,
     ParsedMacro,
+    ParsedStaticValue,
+    ParsedVariable,
+    SequenceFormat,
 )
+from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.project_templates import (
     DEFAULT_PROJECT_TEMPLATE,
     DirectoryDefinition,
@@ -30,7 +36,9 @@ from griptape_nodes.common.project_templates import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
     SituationTemplate,
+    default_template_for_version,
     load_partial_project_template,
+    schema_major_or_none,
     select_project_path,
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
@@ -39,7 +47,6 @@ from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     resolve_file_path,
     resolve_path_safely,
-    resolve_workspace_path,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
@@ -104,6 +111,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     UnregisterProjectTemplateRequest,
     UnregisterProjectTemplateResultFailure,
     UnregisterProjectTemplateResultSuccess,
+    UnresolvedSequenceSlotBehavior,
+    UpgradeProjectSchemaRequest,
+    UpgradeProjectSchemaResultFailure,
+    UpgradeProjectSchemaResultSuccess,
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
@@ -133,6 +144,7 @@ from griptape_nodes.utils.version_utils import engine_version, engine_version_fa
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
 
+    from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -428,6 +440,31 @@ class _ManifestValidation(NamedTuple):
     failure_reason: str | None
 
 
+def _find_unresolved_sequence_segment(
+    segments: list[ParsedSegment], resolution_bag: MacroVariables
+) -> ParsedVariable | None:
+    """Return the REQUIRED sequence-slot ``ParsedVariable`` if the macro has one that isn't bound.
+
+    A "sequence slot" is any variable carrying a ``SequenceFormat`` in its
+    format specs — emitted by ``{###}`` / ``{###?}`` shorthand. Parsing already
+    enforces at most one sequence slot per macro. Optional slots (``{###?}``)
+    are intentionally skipped: the standard resolver already omits them when
+    unbound, so ``UnresolvedSequenceSlotBehavior`` only fires on required
+    slots. Returns ``None`` when the macro has no required sequence slot or
+    the slot's value is already bound.
+    """
+    for segment in segments:
+        if not isinstance(segment, ParsedVariable):
+            continue
+        if not segment.info.is_required:
+            continue
+        if segment.info.name in resolution_bag:
+            continue
+        if any(isinstance(spec, SequenceFormat) for spec in segment.format_specs):
+            return segment
+    return None
+
+
 class ProjectManager:
     """Manages project templates, validation, and file path resolution.
 
@@ -502,6 +539,9 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(SetCurrentProjectRequest, self.on_set_current_project_request)
         event_manager.assign_manager_to_request_type(GetCurrentProjectRequest, self.on_get_current_project_request)
         event_manager.assign_manager_to_request_type(SaveProjectTemplateRequest, self.on_save_project_template_request)
+        event_manager.assign_manager_to_request_type(
+            UpgradeProjectSchemaRequest, self.on_upgrade_project_schema_request
+        )
         event_manager.assign_manager_to_request_type(
             AttemptMatchPathAgainstMacroRequest, self.on_match_path_against_macro_request
         )
@@ -835,14 +875,14 @@ class ProjectManager:
                     "treating as no parent on this OS",
                     overlay.parent_project_path,
                 )
-                return DEFAULT_PROJECT_TEMPLATE
+                return default_template_for_version(overlay.project_template_schema_version)
             parent_label = selected_parent
             parent_path_raw = Path(selected_parent)
             if not parent_path_raw.is_absolute():
                 parent_path_raw = project_file_path.parent / parent_path_raw
             parent_file_path = canonicalize_for_identity(parent_path_raw)
         else:
-            return DEFAULT_PROJECT_TEMPLATE
+            return default_template_for_version(overlay.project_template_schema_version)
 
         if parent_file_path in visited:
             cycle = " -> ".join(str(p) for p in [*sorted(visited, key=str), parent_file_path])
@@ -1236,8 +1276,51 @@ class ProjectManager:
             if shell_value is not None:
                 resolution_bag[var_name] = shell_value
 
+        # Apply the caller's unresolved-sequence-slot behavior BEFORE the
+        # required-vars check, since START_AT_ZERO / START_AT_ONE / RENDER_SEQUENCE_PATTERN
+        # all satisfy an otherwise-missing required `{###}` slot. The write path
+        # (default FAIL) is untouched — a missing sequence slot falls through
+        # to MISSING_REQUIRED_VARIABLES so `on_write_file_request`'s seed step
+        # can auto-allocate the first index.
+        sequence_segment = _find_unresolved_sequence_segment(request.parsed_macro.segments, resolution_bag)
+        rewritten_segments: list[ParsedSegment] | None = None
+        if sequence_segment is not None:
+            match request.unresolved_sequence_slot_behavior:
+                case UnresolvedSequenceSlotBehavior.FAIL:
+                    # Default write-path contract — fall through to MISSING_REQUIRED_VARIABLES
+                    # below so on_write_file_request's seed step can auto-allocate the first index.
+                    pass
+                case UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN:
+                    # Substitute a static pattern segment so SequenceFormat.apply
+                    # never runs on the sentinel. Presentation-only output.
+                    sequence_format = next(
+                        (spec for spec in sequence_segment.format_specs if isinstance(spec, SequenceFormat)),
+                        None,
+                    )
+                    if sequence_format is not None:
+                        pattern = sequence_format.render_pattern()
+                        rewritten_segments = [
+                            ParsedStaticValue(text=pattern) if seg is sequence_segment else seg
+                            for seg in request.parsed_macro.segments
+                        ]
+                case UnresolvedSequenceSlotBehavior.START_AT_ZERO:
+                    resolution_bag[SEQUENCE_VARIABLE_NAME] = 0
+                case UnresolvedSequenceSlotBehavior.START_AT_ONE:
+                    resolution_bag[SEQUENCE_VARIABLE_NAME] = 1
+                case _:
+                    msg = (
+                        f"Attempted to resolve macro path. Failed because unresolved_sequence_slot_behavior "
+                        f"{request.unresolved_sequence_slot_behavior!r} is not a recognized "
+                        f"UnresolvedSequenceSlotBehavior value; add a case for it above when introducing a new one."
+                    )
+                    raise ValueError(msg)
+
         required_vars = {v.name for v in variable_infos if v.is_required}
         provided_vars = set(resolution_bag.keys())
+        if rewritten_segments is not None:
+            # Segment-level substitution satisfies the sequence slot without
+            # touching the resolution bag, so exempt it from the missing check.
+            provided_vars = provided_vars | {SEQUENCE_VARIABLE_NAME}
         missing = required_vars - provided_vars
 
         if missing:
@@ -1248,7 +1331,21 @@ class ProjectManager:
             )
 
         try:
-            resolved_string = request.parsed_macro.resolve(resolution_bag, self._secrets_manager)
+            # RENDER_SEQUENCE_PATTERN rewrote the sequence-slot segment to a static ``###`` string.
+            # We can't route that through ParsedMacro.resolve because the resolver would still run
+            # SequenceFormat.apply on the slot's variable — apply() only accepts digits and would raise
+            # on ``###``. Instead, feed the rewritten segment list directly to partial_resolve, which
+            # walks segments without re-applying format specs to already-substituted static values.
+            if rewritten_segments is not None:
+                partial = partial_resolve(
+                    request.parsed_macro.template,
+                    rewritten_segments,
+                    resolution_bag,
+                    self._secrets_manager,
+                )
+                resolved_string = partial.to_string()
+            else:
+                resolved_string = request.parsed_macro.resolve(resolution_bag, self._secrets_manager)
         except MacroResolutionError as e:
             if e.failure_reason == MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES:
                 path_failure_reason = PathResolutionFailureReason.MISSING_REQUIRED_VARIABLES
@@ -1482,54 +1579,37 @@ class ProjectManager:
     ) -> str | None:
         """Offline analogue of _inherit_workspace_from_parents: walk the parent chain from disk.
 
-        Resolves parent links by reading each node's overlay from disk rather than its loaded
-        template, so resolving an ancestor's workspace never forces that ancestor to be
-        loaded/enabled. Each hop reduces the node's parent link to an
-        id via the shared _reduce_parent_link_to_id (which reads only the parent_project_id /
-        parent_project_path fields, present on ProjectOverlayData as well as ProjectTemplate), then
-        maps that id back to a file path: through `id_index` for a parent_project_id (or a legacy
-        path already in the index), or by following the reduced canonical path directly from disk for
-        an unregistered legacy parent_project_path. A parent_project_id with no index entry and no
-        readable file fails closed (returns None). The per-node workspace test is the shared
-        _resolve_node_explicit_workspace primitive. The walk begins at the parent: the starting
-        project's own explicit sources are handled by _decide_workspace_pre_inheritance. A visited
-        id-set guards against a cyclic parent chain.
+        Resolves an ancestor's workspace without forcing that ancestor to be loaded/enabled. The
+        chain traversal, cycle guard, and single per-node overlay read live in the shared
+        _nearest_ancestor_value_offline; only the per-node probe is supplied here. Each ancestor is
+        probed the same way (and in the same precedence) as the live walk: its workspace_dir template
+        field first (from the overlay, resolved against the ancestor's dir), then its
+        project_workspaces override, then its adjacent config. The walk begins at the parent: the
+        starting project's own explicit sources are handled by _decide_workspace_pre_inheritance.
+
+        Because the shared walker requires each node's overlay to be readable to stay on the chain, an
+        ancestor whose project YAML is unreadable is skipped even if it declares a workspace via a
+        project_workspaces override or adjacent config. This fails closed (the walk returns None and
+        the resolver falls back to the global default), matching the live walk and the offline
+        libraries walk, which already treat an unreadable/unloadable ancestor as a broken chain link.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
             config_source="user_config",
             default={},
         )
-        file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
 
-        # Seed the cycle guard with the start project's id (when it has one in the index) so a chain
-        # that loops back to the start is detected on the hop into it, mirroring the live walk. A
-        # legacy start reachable only by path has no index id; it is left unseeded.
-        start_id = file_path_to_id.get(project_file_path)
-        visited: set[ProjectID] = {start_id} if start_id is not None else set()
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+            # The ancestor's workspace_dir template field (branch 0) wins, mirroring how the ancestor
+            # would resolve its own workspace as the active project; the overlay was already read by
+            # the walker to follow the parent link, so the field is free to read here. Falls through
+            # to the ancestor's project_workspaces override / adjacent config when the field is unset.
+            template_workspace = self._resolve_template_workspace_dir(overlay.workspace_dir, node_path)
+            if template_workspace is not None:
+                return template_workspace
+            return self._resolve_node_explicit_workspace(node_path, project_workspaces)
 
-        current_path: Path | None = project_file_path
-        while current_path is not None:
-            read_load = await self._read_overlay(current_path, record_status=False)
-            if isinstance(read_load, LoadProjectTemplateResultFailure):
-                return None
-            _, overlay = read_load
-
-            parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
-            if parent_id is None:
-                return None
-            if parent_id in visited:
-                return None
-            visited.add(parent_id)
-
-            parent_path = self._resolve_parent_id_to_path(parent_id, id_index)
-            if parent_path is None:
-                return None
-            node_workspace = self._resolve_node_explicit_workspace(parent_path, project_workspaces)
-            if node_workspace is not None:
-                return node_workspace
-            current_path = parent_path
-        return None
+        return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
 
     def _resolve_parent_id_to_path(self, parent_id: ProjectID, id_index: dict[str, Path]) -> Path | None:
         """Map a reduced parent id to a project file path for the offline walk, or None if unresolvable.
@@ -1547,6 +1627,106 @@ class ProjectManager:
         if not parent_path_candidate.is_file():
             return None
         return parent_path_candidate
+
+    async def resolve_libraries_root_for_project_id(self, project_id: str) -> Path | None:
+        """Resolve the libraries root a project would use WITHOUT loading it, or None for the default.
+
+        Offline analogue of decide_libraries_root, used by the provisioning preview so the previewed
+        SKIP/INSTALL/OVERWRITE plan matches what activation reconciles. The id is resolved to a file
+        path the same way resolve_workspace_dir_for_project_id does. Branch 0 reads this project's own
+        libraries_dir from its on-disk overlay; branch 1 walks the parent chain offline. Returns None
+        when no libraries_dir is declared anywhere in the chain, so the caller falls back to the
+        workspace-relative libraries directory.
+        """
+        id_index = await self._build_unloaded_id_index()
+        project_file_path = id_index.get(project_id)
+        if project_file_path is None:
+            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
+            if not legacy_path_candidate.is_file():
+                return None
+            project_file_path = legacy_path_candidate
+
+        own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
+        if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
+            _, own_overlay = own_overlay_load
+            template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
+            if template_libraries_dir is not None:
+                return Path(template_libraries_dir)
+
+        inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
+        if inherited is not None:
+            return Path(inherited)
+        return None
+
+    async def _inherit_libraries_dir_from_parents_offline(
+        self, project_file_path: Path, id_index: dict[str, Path]
+    ) -> str | None:
+        """Offline analogue of _inherit_libraries_dir_from_parents: walk the parent chain from disk.
+
+        Resolves an ancestor's libraries_dir without forcing that ancestor to be loaded/enabled. The
+        chain traversal, cycle guard, and single per-node overlay read live in the shared
+        _nearest_ancestor_value_offline; only the per-node probe (an ancestor's template libraries_dir,
+        read from the overlay the walker already loaded) is supplied here. The walk begins at the
+        parent: the starting project's own libraries_dir is handled by branch 0 of the caller.
+        """
+
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+            return self._resolve_template_libraries_dir(overlay.libraries_dir, node_path)
+
+        return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
+
+    async def _nearest_ancestor_value_offline(
+        self,
+        project_file_path: Path,
+        id_index: dict[str, Path],
+        probe: Callable[[Path, ProjectOverlayData], str | None],
+    ) -> str | None:
+        """Walk the explicit parent chain from disk and return the first probe hit, or None.
+
+        Shared skeleton for the offline workspace and libraries inheritance walks, used when a target
+        project may not be loaded (e.g. the provisioning preview). Reads each node's overlay from disk
+        exactly ONCE, at the top of the loop, and uses it both to reduce the parent link (via the
+        shared _reduce_parent_link_to_id) and to probe that node. Each reduced id maps back to a file
+        path through `id_index` for a parent_project_id (or a legacy path already indexed), else the
+        reduced canonical path is followed directly from disk for an unregistered legacy
+        parent_project_path; an id with no index entry and no readable file fails closed (None).
+
+        The start project is NOT probed: its own value is handled by the caller's branch 0 / the
+        earlier decide_workspace branches, so the walk begins at the parent. A node whose overlay
+        cannot be read returns None (fail-closed) -- an unreadable project YAML is not a valid chain
+        link. A visited id-set guards against a cyclic parent chain.
+        """
+        file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
+
+        # Seed the cycle guard with the start project's id (when it has one in the index) so a chain
+        # that loops back to the start is detected on the hop into it, mirroring the live walk. A
+        # legacy start reachable only by path has no index id; it is left unseeded.
+        start_id = file_path_to_id.get(project_file_path)
+        visited: set[ProjectID] = {start_id} if start_id is not None else set()
+
+        current_path: Path | None = project_file_path
+        is_start = True
+        while current_path is not None:
+            read_load = await self._read_overlay(current_path, record_status=False)
+            if isinstance(read_load, LoadProjectTemplateResultFailure):
+                return None
+            _, overlay = read_load
+
+            if not is_start:
+                node_value = probe(current_path, overlay)
+                if node_value is not None:
+                    return node_value
+            is_start = False
+
+            parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
+            if parent_id is None:
+                return None
+            if parent_id in visited:
+                return None
+            visited.add(parent_id)
+
+            current_path = self._resolve_parent_id_to_path(parent_id, id_index)
+        return None
 
     def decide_workspace(
         self,
@@ -1736,19 +1916,110 @@ class ProjectManager:
     def _inherit_workspace_from_parents(self, project_file_path: Path) -> str | None:
         """Walk the explicit parent-project chain for the nearest ancestor's workspace.
 
-        Returns the workspace_directory the nearest ancestor would resolve to (its
-        project_workspaces override, else its adjacent griptape_nodes_config.json),
-        or None when no ancestor in the chain defines one. The walk is conducted in
-        id-space through the registry (no disk template loads); each ancestor's
-        adjacent config is read read-only. A visited id-set guards against a cyclic
-        parent chain. The starting project's OWN explicit sources are handled by the
-        earlier branches of decide_workspace, so the walk begins at the parent.
+        Returns the workspace the nearest ancestor would resolve to, or None when no ancestor in the
+        chain defines one. Each ancestor is probed the SAME way it resolves its own workspace when it
+        is the active project: its workspace_dir template field first (resolved against that
+        ancestor's dir, so a relative "./" means the ancestor's own folder -- not the child's), then
+        its project_workspaces override, then its adjacent griptape_nodes_config.json. Consulting the
+        template field here is what lets a parent that declares only workspace_dir be inherited (it is
+        the common self-contained case). The starting project's OWN explicit sources are handled by
+        the earlier branches of decide_workspace, so the walk begins at the parent. The chain
+        traversal and cycle guard live in the shared _nearest_ancestor_value_live; only the per-node
+        probe is supplied here.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
             config_source="user_config",
             default={},
         )
+
+        def probe(info: ProjectInfo) -> str | None:
+            if info.project_file_path is None:
+                return None
+            template_workspace = self._resolve_template_workspace_dir(
+                info.template.workspace_dir, info.project_file_path
+            )
+            if template_workspace is not None:
+                return template_workspace
+            return self._resolve_node_explicit_workspace(info.project_file_path, project_workspaces)
+
+        return self._nearest_ancestor_value_live(project_file_path, probe)
+
+    def decide_libraries_root(self, project_file_path: Path, template_libraries_dir: str | None) -> Path | None:
+        """Decide where a project's libraries install/resolve, or None for the legacy default.
+
+        Priority, highest first:
+
+        0. the project's OWN libraries_dir field (passed in already resolved to an absolute path via
+           _resolve_template_libraries_dir) -> that dir
+        1. the nearest ancestor with a libraries_dir, walking the explicit parent-project chain,
+           resolved against THAT ancestor's project dir -> the ancestor's dir
+        2. None -> no explicit libraries root; the caller (ConfigManager.resolved_libraries_root)
+           falls back to the workspace-relative libraries_directory, preserving legacy behavior.
+
+        Unlike decide_workspace, this consults ONLY the project-template libraries_dir field (no
+        project_workspaces mapping, no adjacent config, no env): library sharing is a portable,
+        version-controlled, template-side concept. Branch 1 resolving the inherited value against the
+        ancestor's own dir is what makes every child point at the same parent libraries/ tree, so a
+        library declared on the parent is downloaded once and reused via SKIP. See
+        _inherit_libraries_dir_from_parents.
+        """
+        if template_libraries_dir is not None:
+            return Path(template_libraries_dir)
+        inherited = self._inherit_libraries_dir_from_parents(project_file_path)
+        if inherited is not None:
+            return Path(inherited)
+        return None
+
+    def _resolve_template_libraries_dir(
+        self, raw: str | PerPlatformProjectPath | None, project_file_path: Path
+    ) -> str | None:
+        """Resolve a template's raw libraries_dir field to an absolute path string, or None.
+
+        Mirrors _resolve_template_workspace_dir: reduces a per-platform mapping to the active
+        platform's value, resolves a relative path against the project YAML's directory, and
+        canonicalizes the result. Returns None when the field is unset or has no value for the active
+        platform. This doubles as the per-node leaf primitive for the parent-chain walks, so an
+        inherited value resolves against the DECLARING node's directory.
+        """
+        selected = select_project_path(raw)
+        if selected is None:
+            return None
+        candidate = Path(selected)
+        if not candidate.is_absolute():
+            candidate = project_file_path.parent / candidate
+        return str(canonicalize_for_identity(candidate))
+
+    def _inherit_libraries_dir_from_parents(self, project_file_path: Path) -> str | None:
+        """Walk the explicit parent-project chain for the nearest ancestor's libraries_dir.
+
+        Returns the resolved absolute libraries_dir the nearest ancestor declares (against that
+        ancestor's own project dir), or None when no ancestor in the chain defines one. The starting
+        project's OWN libraries_dir is handled by branch 0 of decide_libraries_root, so the walk
+        begins at the parent. The chain traversal and cycle guard live in the shared
+        _nearest_ancestor_value_live; only the per-node probe (an ancestor's template libraries_dir)
+        is supplied here.
+        """
+
+        def probe(info: ProjectInfo) -> str | None:
+            if info.project_file_path is None:
+                return None
+            return self._resolve_template_libraries_dir(info.template.libraries_dir, info.project_file_path)
+
+        return self._nearest_ancestor_value_live(project_file_path, probe)
+
+    def _nearest_ancestor_value_live(
+        self, project_file_path: Path, probe: Callable[[ProjectInfo], str | None]
+    ) -> str | None:
+        """Walk the explicit parent chain (loaded registry) and return the first probe hit, or None.
+
+        Shared skeleton for the live workspace and libraries inheritance walks. Traverses in id-space
+        through _successfully_loaded_project_templates (no disk loads): find the start project's id,
+        then hop parent to parent via _reduce_parent_link_to_id, guarding against a cyclic chain with
+        a visited id-set. The walk begins at the parent (the starting project's own value is handled
+        by the caller's branch 0 / earlier decide_workspace branches). `probe` is applied to each
+        ancestor ProjectInfo; the first non-None result wins.
+        """
         file_path_to_id: dict[Path, ProjectID] = {
             info.project_file_path: pid
             for pid, info in self._successfully_loaded_project_templates.items()
@@ -1784,12 +2055,9 @@ class ProjectManager:
             parent_info = self._successfully_loaded_project_templates.get(parent_id)
             if parent_info is None:
                 return None
-            if parent_info.project_file_path is not None:
-                node_workspace = self._resolve_node_explicit_workspace(
-                    parent_info.project_file_path, project_workspaces
-                )
-                if node_workspace is not None:
-                    return node_workspace
+            node_value = probe(parent_info)
+            if node_value is not None:
+                return node_value
             current_info = parent_info
         return None
 
@@ -1821,10 +2089,11 @@ class ProjectManager:
         catches a workspace-only switch: `libraries_directory` is workspace-relative
         by default, so two projects with identical config strings but different
         workspaces resolve to different on-disk `libraries/` trees and must still
-        reload, even though the three values above are unchanged.
+        reload, even though the three values above are unchanged. The resolved dir
+        also reflects a project's own/inherited `libraries_dir` override, so a switch
+        between a sharing child and a non-sharing project trips the reload too.
         """
-        libraries_dir = self._config_manager.get_config_value("libraries_directory", default="")
-        resolved_libraries_dir = str(resolve_workspace_path(Path(libraries_dir), self._config_manager.workspace_path))
+        resolved_libraries_dir = str(self._config_manager.resolved_libraries_root())
         snapshot = {
             LIBRARIES_TO_REGISTER_KEY: self._config_manager.get_config_value(LIBRARIES_TO_REGISTER_KEY, default=[]),
             LIBRARIES_TO_DOWNLOAD_KEY: self._config_manager.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[]),
@@ -2014,6 +2283,18 @@ class ProjectManager:
             if decision.apply_override:
                 self._config_manager.set_workspace_override(decision.workspace_dir)
 
+            # Decide the libraries root independently of the workspace (a project may point
+            # workspace_dir away from its own dir yet still share a parent's libraries). None
+            # means no explicit libraries_dir anywhere in the chain, so the override stays
+            # cleared and resolved_libraries_root() falls back to the workspace-relative
+            # default. Set before the post-change snapshot below so a sharing-vs-not switch
+            # is reflected in library_config_changed.
+            template_libraries_dir = self._resolve_template_libraries_dir(
+                project_info.template.libraries_dir, project_file_path
+            )
+            libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
+            self._config_manager.set_libraries_root_override(libraries_root)
+
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
         elif project_info is not None and project_info.project_file_path is None:
@@ -2150,7 +2431,7 @@ class ProjectManager:
         # mappings are reduced to the active platform's value first; a mapping
         # with no matching key and no `default` falls back to system defaults
         # (no parent on this OS).
-        base_template: ProjectTemplate = DEFAULT_PROJECT_TEMPLATE
+        base_template: ProjectTemplate = default_template_for_version(template.project_template_schema_version)
         if template.parent_project_id is not None:
             parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
             if parent_info is None:
@@ -2215,6 +2496,140 @@ class ProjectManager:
 
         return SaveProjectTemplateResultSuccess(
             result_details=f"Successfully saved project template to '{request.project_path}'",
+        )
+
+    async def on_upgrade_project_schema_request(  # noqa: PLR0911
+        self, request: UpgradeProjectSchemaRequest
+    ) -> UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure:
+        """Electively upgrade a loaded project to the latest schema major and re-save.
+
+        A within-major advance happens automatically on save; this performs the explicit,
+        opt-in crossing of a major boundary so the project ADOPTS the new major's defaults.
+
+        It re-reads the project's own on-disk OVERLAY (its explicit customizations only -- NOT
+        the merged template, whose inherited fields were materialized to the old-major values at
+        load), restamps that overlay to the latest version, and re-merges it onto the new-major
+        base. Re-saving that merged template diffs it back against the same new-major base, so a
+        field the user never overrode is omitted and falls through to the NEW default, while
+        genuine user overrides survive. BREAKING: a project's effective workspace/library/file
+        layout can change, which is exactly the point of crossing a major.
+
+        Only a parentless project can adopt the new defaults this way: its merge base is the
+        latest-major default template. A child's merge base is its parent's resolved template, which
+        each ancestor resolves against ITS OWN major, so a child cannot adopt new-major defaults while
+        its parent is still on the old major. Such a child is refused (upgrade the parent first) rather
+        than re-stamped to a version label its inherited layout does not match.
+
+        Failure cases (evaluated first): not loaded, no backing file, already at/ahead of the
+        latest major (or an unparsable version), the overlay can't be re-read, the parent chain is
+        still on an older major, or the re-save fails. Only then is the upgrade performed.
+        """
+        project_info = self._successfully_loaded_project_templates.get(request.project_id)
+        if project_info is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. Failed because it is not loaded."
+                ),
+            )
+        if project_info.project_file_path is None:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because it has no backing file (e.g. system defaults)."
+                ),
+            )
+
+        previous_version = project_info.template.project_template_schema_version
+        latest_version = ProjectTemplate.LATEST_SCHEMA_VERSION
+        # Only upgrade STRICTLY older majors. A project already at -- or somehow ahead of (a
+        # future major opened on an older engine, which the load path accepts forward-compat)
+        # -- the latest major must not be touched: restamping it down to latest would be a
+        # silent schema DOWNGRADE re-saved against an older baseline, contradicting the
+        # never-downgrade contract in _version_to_write. schema_major_or_none keeps this from
+        # raising on a malformed version (the load path tolerates one, so this must too).
+        previous_major = schema_major_or_none(previous_version)
+        latest_major = schema_major_or_none(latest_version)
+        if previous_major is None or latest_major is None or previous_major >= latest_major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its schema version '{previous_version}' is not an older major "
+                    f"than the latest '{latest_version}' (or is unparsable)."
+                ),
+            )
+
+        # Re-read the project's OWN overlay (explicit fields only) so inherited values are NOT
+        # carried over as old-major pins. Restamp it to the latest version, then re-merge onto
+        # the base for that version + the project's parent chain (the same base the save path
+        # re-diffs against), so un-overridden fields adopt the new-major defaults.
+        project_file_path = project_info.project_file_path
+        overlay_load = await self._read_overlay(project_file_path, record_status=False)
+        if isinstance(overlay_load, LoadProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its project file could not be re-read: {overlay_load.result_details}"
+                ),
+            )
+        _, overlay = overlay_load
+        upgraded_overlay = overlay._replace(project_template_schema_version=latest_version)
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        base_template = await self._resolve_parent_chain(
+            upgraded_overlay, project_file_path, validation, visited={canonicalize_for_identity(project_file_path)}
+        )
+        if base_template is None or not validation.is_usable():
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the upgraded template could not be resolved against the latest base."
+                ),
+            )
+
+        # Refuse to upgrade a child whose parent chain is still on an older major. The merge base is
+        # the parent's fully-resolved template, and each ancestor resolves against ITS OWN declared
+        # major (see _resolve_parent_chain), so a child re-stamped to the latest major but merged onto
+        # a v0-derived base would keep the old-major defaults for every field it never overrode --
+        # reporting a successful major upgrade while its effective layout does not change. Only a
+        # parentless project (whose base is the latest-major default template) can actually adopt the
+        # new defaults here. A parented child must upgrade the top of its chain first. schema_major_or_none
+        # tolerates a malformed base version the same way the guards above tolerate the project's own.
+        base_major = schema_major_or_none(base_template.project_template_schema_version)
+        if base_major is None or base_major < latest_major:
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because its parent project is still on an older schema major "
+                    f"('{base_template.project_template_schema_version}'); a child inherits its parent's "
+                    f"defaults, so upgrade the parent (the top of the chain) to '{latest_version}' first."
+                ),
+            )
+
+        upgraded_template = ProjectTemplate.merge(base_template, upgraded_overlay, validation)
+
+        save_result = self.on_save_project_template_request(
+            SaveProjectTemplateRequest(
+                project_path=project_file_path,
+                template_data=upgraded_template.model_dump(mode="json"),
+            )
+        )
+        if isinstance(save_result, SaveProjectTemplateResultFailure):
+            return UpgradeProjectSchemaResultFailure(
+                result_details=(
+                    f"Attempted to upgrade project '{request.project_id}'. "
+                    f"Failed because the re-save failed: {save_result.result_details}"
+                ),
+            )
+
+        return UpgradeProjectSchemaResultSuccess(
+            project_id=request.project_id,
+            previous_schema_version=previous_version,
+            new_schema_version=latest_version,
+            result_details=(
+                f"Upgraded project '{request.project_id}' from schema '{previous_version}' "
+                f"to '{latest_version}'. The project now adopts the new-major defaults; its "
+                f"effective workspace/library/file layout may have changed."
+            ),
         )
 
     def on_validate_project_template_request(
@@ -2989,6 +3404,26 @@ class ProjectManager:
             result_details=f"Successfully mapped absolute path to '{mapped_path}'",
         )
 
+    def get_project_substitution_variables(self, project_info: ProjectInfo) -> dict[str, str | int]:
+        """Return all project-level variables available for {VAR} substitution.
+
+        Collects builtin variables (workspace_dir, workflow_name, etc.) and
+        project template directories (inputs, outputs, etc.). Variables that
+        cannot be resolved in the current context (e.g. workflow_dir before a
+        workflow is saved) are silently omitted.
+        """
+        resolver = self._build_variable_resolver(project_info.template, project_info)
+        variables: dict[str, str | int] = {}
+        for name in BUILTIN_VARIABLES:
+            with contextlib.suppress(RuntimeError, NotImplementedError):
+                variables[name] = resolver._get_builtin(name)
+        for name in project_info.template.directories:
+            try:
+                variables[name] = resolver.resolve_directory(name)
+            except (RuntimeError, NotImplementedError) as e:
+                logger.debug("Skipping directory variable %r: %s", name, e)
+        return variables
+
     # Helper methods (private)
 
     @staticmethod
@@ -3397,7 +3832,9 @@ class ProjectManager:
             )
             return f"its id '{project_id}' is already used by a different project at '{existing.project_file_path}'"
 
-        template = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
+        template = ProjectTemplate.merge(
+            default_template_for_version(overlay.project_template_schema_version), overlay, validation
+        )
 
         if not validation.is_usable():
             problem_details = "; ".join(

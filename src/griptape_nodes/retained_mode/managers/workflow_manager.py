@@ -173,6 +173,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     SaveWorkflowRequest,
     SaveWorkflowResultFailure,
     SaveWorkflowResultSuccess,
+    SetVariableSubstitutionEnabledRequest,
+    SetVariableSubstitutionEnabledResultFailure,
+    SetVariableSubstitutionEnabledResultNotAlteredSuccess,
+    SetVariableSubstitutionEnabledResultSuccess,
     SetWorkflowMetadataRequest,
     SetWorkflowMetadataResultFailure,
     SetWorkflowMetadataResultSuccess,
@@ -352,6 +356,11 @@ class WorkflowManager:
         # unwind. refresh_workflow_registry clears this while it mutates the registry.
         self._workflows_loading_complete = asyncio.Event()
         self._workflows_loading_complete.set()
+        # Maps workflow registry key → whether variable substitution is enabled.
+        # Set via SetVariableSubstitutionEnabledRequest; defaults to True (substitution on).
+        # Stored here rather than in WorkflowMetadata so it is set by executable code inside
+        # build_workflow() and therefore survives both editor loads and direct script execution.
+        self._variable_substitution_enabled: dict[str, bool] = {}
 
         event_manager.assign_manager_to_request_type(
             RunWorkflowFromScratchRequest, self.on_run_workflow_from_scratch_request
@@ -413,6 +422,10 @@ class WorkflowManager:
         event_manager.assign_manager_to_request_type(
             SetWorkflowMetadataRequest,
             self.on_set_workflow_metadata_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            SetVariableSubstitutionEnabledRequest,
+            self.on_set_variable_substitution_enabled_request,
         )
         event_manager.assign_manager_to_request_type(
             GetWorkflowInfoRequest,
@@ -478,6 +491,61 @@ class WorkflowManager:
             IndexError: If no referenced workflow context is active.
         """
         return self._referenced_workflow_stack[-1]
+
+    def _drop_substitution_flag(self, workflow_key: str) -> None:
+        """Remove the substitution flag when a workflow is permanently deleted."""
+        self._variable_substitution_enabled.pop(workflow_key, None)
+
+    def _rekey_substitution_flag(self, old_key: str, new_key: str) -> None:
+        """Transfer the substitution flag when a workflow registry key changes.
+
+        Only moves the entry when a flag was explicitly set; workflows that defaulted
+        to True (no dict entry) stay that way under the new key without polluting the dict.
+        """
+        if old_key in self._variable_substitution_enabled:
+            self._variable_substitution_enabled[new_key] = self._variable_substitution_enabled.pop(old_key)
+
+    def is_variable_substitution_enabled(self) -> bool:
+        """Return whether variable substitution is enabled for the current workflow.
+
+        Reads from the in-memory dict populated by SetVariableSubstitutionEnabledRequest.
+        Defaults to True so existing workflows that have never set the flag get
+        substitution without any migration.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return True
+        workflow_name = context_manager.get_current_workflow_name()
+        # Return the stored value, or True if this workflow has never set the flag.
+        return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_set_variable_substitution_enabled_request(
+        self, request: SetVariableSubstitutionEnabledRequest
+    ) -> ResultPayload:
+        """Enable or disable variable substitution for the current workflow.
+
+        Stores the flag in memory keyed by the current workflow name. When the
+        workflow is saved, the code generator bakes a SetVariableSubstitutionEnabledRequest
+        call into build_workflow() so the flag is restored on every subsequent load,
+        including direct script execution.
+        """
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return SetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to set variable substitution enabled. Failed because no workflow is active."
+            )
+        workflow_name = context_manager.get_current_workflow_name()
+        self._variable_substitution_enabled[workflow_name] = request.enabled
+        details = (
+            f"Variable substitution {'enabled' if request.enabled else 'disabled'} for workflow '{workflow_name}'."
+        )
+        if request.initial_setup:
+            return SetVariableSubstitutionEnabledResultNotAlteredSuccess(result_details=details)
+        return SetVariableSubstitutionEnabledResultSuccess(result_details=details)
 
     async def refresh_workflow_registry(self, workflows_to_register: list[str] | None = None) -> None:
         # All of the libraries have loaded, and any workflows they came with have been registered.
@@ -683,6 +751,10 @@ class WorkflowManager:
 
     def should_squelch_workflow_altered(self) -> bool:
         return self._squelch_workflow_altered_count > 0
+
+    def clear_object_state(self) -> None:
+        """Clear per-workflow state when the engine is reset."""
+        self._variable_substitution_enabled.clear()
 
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""
@@ -1073,6 +1145,7 @@ class WorkflowManager:
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
+        self._drop_substitution_flag(request.name)
         return DeleteWorkflowResultSuccess(
             result_details=ResultDetails(message=f"Successfully deleted workflow: {request.name}", level=logging.INFO)
         )
@@ -1107,6 +1180,10 @@ class WorkflowManager:
             return RenameWorkflowResultFailure(result_details=details)
 
         new_workflow_name = save_workflow_request.workflow_name
+
+        # Transfer the substitution flag to the new name before the delete call removes the old entry.
+        if new_workflow_name != request.workflow_name:
+            self._rekey_substitution_flag(request.workflow_name, new_workflow_name)
 
         # If the renamed file landed outside the workspace, keep it registered at its new path
         # (the old path's registration is stripped by the delete below).
@@ -1569,6 +1646,7 @@ class WorkflowManager:
             # Update registry key if directory changed
             if old_registry_key != new_registry_key:
                 WorkflowRegistry.rekey_workflow(old_registry_key, new_registry_key)
+                self._rekey_substitution_flag(old_registry_key, new_registry_key)
                 context_manager = GriptapeNodes.ContextManager()
                 if (
                     context_manager.has_current_workflow()
@@ -2287,8 +2365,10 @@ class WorkflowManager:
             # dropping the unsaved entry and updating the existing saved entry below.
             if registry_key in registered_workflows:
                 WorkflowRegistry.delete_workflow_by_name(unsaved_source_key)
+                self._drop_substitution_flag(unsaved_source_key)
             else:
                 WorkflowRegistry.rekey_workflow(old_key=unsaved_source_key, new_key=registry_key)
+                self._rekey_substitution_flag(unsaved_source_key, registry_key)
                 rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
             for workflow_context_state in GriptapeNodes.ContextManager()._workflow_stack:
@@ -3017,8 +3097,13 @@ class WorkflowManager:
 
         main_body: list[ast.stmt] = []
 
+        # Snapshot the flag now (at save time) so it's baked into build_workflow().
+        variable_substitution_enabled = self.is_variable_substitution_enabled()
+
         prereq_code = self._generate_workflow_run_prerequisite_code(
-            import_recorder=import_recorder, library_names=library_names
+            import_recorder=import_recorder,
+            library_names=library_names,
+            variable_substitution_enabled=variable_substitution_enabled,
         )
         main_body.extend(cast("ast.stmt", node) for node in prereq_code)
 
@@ -3633,6 +3718,12 @@ class WorkflowManager:
                         # Create CLI argument name: --{param_name}
                         arg_name = f"--{param_name}".lower()
 
+                        # Derive an explicit, identifier-safe dest. Without this, argparse
+                        # derives the dest from the flag name, which can contain characters
+                        # (e.g. parentheses from a node name) that are not valid in a Python
+                        # identifier, making the emitted `args.<dest>` access invalid Python.
+                        arg_dest = self._safe_arg_dest(param_name)
+
                         # Get help text from parameter info
                         help_text = param_info.get("tooltip", f"Parameter {param_name} for node {node_name}")
 
@@ -3646,6 +3737,7 @@ class WorkflowManager:
                                     ),
                                     args=[ast.Constant(arg_name)],
                                     keywords=[
+                                        ast.keyword(arg="dest", value=ast.Constant(arg_dest)),
                                         ast.keyword(arg="default", value=ast.Constant(None)),
                                         ast.keyword(arg="help", value=ast.Constant(help_text)),
                                     ],
@@ -3743,7 +3835,7 @@ class WorkflowManager:
                     test=ast.Compare(
                         left=ast.Attribute(
                             value=ast.Name(id="args", ctx=ast.Load()),
-                            attr=param_name.lower(),
+                            attr=self._safe_arg_dest(param_name),
                             ctx=ast.Load(),
                         ),
                         ops=[ast.IsNot()],
@@ -3764,7 +3856,7 @@ class WorkflowManager:
                             ],
                             value=ast.Attribute(
                                 value=ast.Name(id="args", ctx=ast.Load()),
-                                attr=param_name.lower(),
+                                attr=self._safe_arg_dest(param_name),
                                 ctx=ast.Load(),
                             ),
                         )
@@ -4086,6 +4178,8 @@ class WorkflowManager:
         self,
         import_recorder: ImportRecorder,
         library_names: list[str],
+        *,
+        variable_substitution_enabled: bool = True,
     ) -> list[ast.AST]:
         code_blocks: list[ast.AST] = []
 
@@ -4173,7 +4267,173 @@ class WorkflowManager:
         )
         ast.fix_missing_locations(if_stmt)
         code_blocks.append(if_stmt)
+
+        # When variable substitution is disabled, bake a request call into build_workflow()
+        # so the setting is restored on every load — including running the file as a script.
+        # We only emit the call when disabled (False) because True is the default; omitting
+        # the call for enabled workflows keeps the generated code clean.
+        if not variable_substitution_enabled:
+            import_recorder.add_from_import(
+                "griptape_nodes.retained_mode.events.workflow_events",
+                "SetVariableSubstitutionEnabledRequest",
+            )
+            disable_substitution_call = ast.Expr(
+                value=ast.Await(
+                    value=ast.Call(
+                        func=ast.Attribute(
+                            value=ast.Name(id="GriptapeNodes", ctx=ast.Load()),
+                            attr="ahandle_request",
+                            ctx=ast.Load(),
+                        ),
+                        args=[
+                            ast.Call(
+                                func=ast.Name(id="SetVariableSubstitutionEnabledRequest", ctx=ast.Load()),
+                                args=[],
+                                keywords=[
+                                    ast.keyword(arg="enabled", value=ast.Constant(value=False)),
+                                    ast.keyword(arg="initial_setup", value=ast.Constant(value=True)),
+                                ],
+                            )
+                        ],
+                        keywords=[],
+                    )
+                )
+            )
+            ast.fix_missing_locations(disable_substitution_call)
+            code_blocks.append(disable_substitution_call)
+
         return code_blocks
+
+    class _ScrubResult(NamedTuple):
+        """Result of scrubbing a value for inline AST emission."""
+
+        value: Any
+        dropped: bool
+
+    @staticmethod
+    def _is_ast_constant_safe(value: Any) -> bool:
+        """True if value is composed only of literals ``ast.unparse`` can round-trip.
+
+        Anything else (e.g. a Button trait object mistakenly placed in ``ui_options``)
+        would be rendered by ``ast.Constant`` via its ``repr()``, which is not valid
+        Python and breaks reopening the saved workflow.
+        """
+        primitives = (str, bytes, bool, int, float, complex, type(None))
+        if isinstance(value, primitives):
+            return True
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return all(WorkflowManager._is_ast_constant_safe(item) for item in value)
+        if isinstance(value, dict):
+            return all(
+                WorkflowManager._is_ast_constant_safe(key) and WorkflowManager._is_ast_constant_safe(item)
+                for key, item in value.items()
+            )
+        return False
+
+    @staticmethod
+    def _scrub_for_ast_constant(value: Any) -> WorkflowManager._ScrubResult:
+        """Return a copy of value with any non-literal leaves removed.
+
+        Recurses through dict/list/tuple/set, dropping keys (for dicts) or elements
+        (for sequences) whose values cannot be emitted as an ``ast.Constant``. The
+        boolean flags whether anything was dropped so callers can warn.
+
+        A bare unsafe scalar with no surrounding container is replaced with ``None``.
+        """
+        if WorkflowManager._is_ast_constant_safe(value):
+            return WorkflowManager._ScrubResult(value=value, dropped=False)
+
+        if isinstance(value, dict):
+            return WorkflowManager._scrub_dict(value)
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return WorkflowManager._scrub_sequence(value)
+
+        # A bare unsafe scalar (e.g. a callable or trait object) with no container to
+        # prune: signal that it was dropped and return None as a safe placeholder.
+        return WorkflowManager._ScrubResult(value=None, dropped=True)
+
+    @staticmethod
+    def _scrub_dict(value: dict) -> WorkflowManager._ScrubResult:
+        """Scrub a dict, dropping entries whose key or (non-container) value is unsafe."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_dict = {}
+        dropped = False
+        for key, item in value.items():
+            # An unsafe key or an unsafe non-container value means we drop the entry entirely.
+            if not WorkflowManager._is_ast_constant_safe(key) or (
+                not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item)
+            ):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_dict[key] = item_result.value
+            dropped = dropped or item_result.dropped
+        return WorkflowManager._ScrubResult(value=scrubbed_dict, dropped=dropped)
+
+    @staticmethod
+    def _scrub_sequence(value: list | tuple | set | frozenset) -> WorkflowManager._ScrubResult:
+        """Scrub a sequence, dropping unsafe non-container elements and recursing into containers."""
+        containers = (dict, list, tuple, set, frozenset)
+        scrubbed_items = []
+        dropped = False
+        for item in value:
+            # An unsafe non-container element is dropped; containers are recursed into.
+            if not isinstance(item, containers) and not WorkflowManager._is_ast_constant_safe(item):
+                dropped = True
+                continue
+            item_result = WorkflowManager._scrub_for_ast_constant(item)
+            scrubbed_items.append(item_result.value)
+            dropped = dropped or item_result.dropped
+        # Rebuild using the nearest builtin constructor rather than type(value)(...),
+        # so a tuple subclass like a namedtuple (whose __new__ takes positional fields,
+        # not an iterable) becomes a plain tuple instead of raising TypeError.
+        if isinstance(value, list):
+            rebuilt: Any = scrubbed_items
+        elif isinstance(value, tuple):
+            rebuilt = tuple(scrubbed_items)
+        elif isinstance(value, frozenset):
+            rebuilt = frozenset(scrubbed_items)
+        else:
+            rebuilt = set(scrubbed_items)
+        return WorkflowManager._ScrubResult(value=rebuilt, dropped=dropped)
+
+    @staticmethod
+    def _safe_arg_dest(param_name: str) -> str:
+        """Derive a Python-identifier-safe argparse ``dest`` from a parameter name.
+
+        Workflow-input parameter names can contain characters that are invalid in a
+        Python identifier (e.g. ``(``, ``)``, ``.``, ``-``) — this happens when a node
+        name contains them (e.g. ``Generate Media (Diffusion Pipeline)``). argparse
+        would otherwise store the parsed value under an attribute that cannot be read
+        back as ``args.<name>``, and the ``ast.Attribute`` access emitted into the
+        generated workflow is not valid Python, so the file fails to import with
+        ``SyntaxError``. Non-word characters are collapsed to underscores, and a
+        leading digit is prefixed so the result is always a valid identifier.
+        """
+        dest = re.sub(r"\W+", "_", param_name.lower())
+        if dest and dest[0].isdigit():
+            dest = f"_{dest}"
+        return dest
+
+    @staticmethod
+    def _keyword_from_field_value(arg_name: str, field_value: Any, command: Any) -> ast.keyword:
+        """Build an ``ast.keyword`` for a command field, scrubbing unsafe content.
+
+        Non-serializable content (e.g. a Button trait object mistakenly placed in
+        ``ui_options`` instead of attached via ``traits=``) is dropped so the saved
+        workflow stays valid Python and can be reopened.
+        """
+        scrub_result = WorkflowManager._scrub_for_ast_constant(field_value)
+        if scrub_result.dropped:
+            logger.warning(
+                "Omitting non-serializable content from field '%s' of %s while saving the workflow. "
+                "This usually means a UI object (e.g. a Button) was placed in ui_options instead of "
+                "being attached as a trait.",
+                arg_name,
+                type(command).__name__,
+            )
+        return ast.keyword(arg=arg_name, value=ast.Constant(value=scrub_result.value, lineno=1, col_offset=0))
 
     def _generate_unique_values_code(
         self,
@@ -4316,7 +4576,7 @@ class WorkflowManager:
                         )
                     else:
                         create_flow_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_flow_command)
                         )
 
         # Create a comment explaining the behavior
@@ -4409,7 +4669,7 @@ class WorkflowManager:
                 field_value = getattr(import_workflow_command, field.name)
                 if field_value != field.default:
                     import_workflow_request_args.append(
-                        ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                        self._keyword_from_field_value(field.name, field_value, import_workflow_command)
                     )
 
         # Construct the AST for importing the workflow
@@ -4637,7 +4897,7 @@ class WorkflowManager:
                             )
                     else:
                         create_node_request_args.append(
-                            ast.keyword(arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0))
+                            self._keyword_from_field_value(field.name, field_value, create_node_request)
                         )
 
         # After processing all fields, handle subflow_name from metadata
@@ -4744,9 +5004,7 @@ class WorkflowManager:
                         field_value = getattr(element_command, field.name)
                         if field_value != field.default:
                             element_command_args.append(
-                                ast.keyword(
-                                    arg=field.name, value=ast.Constant(value=field_value, lineno=1, col_offset=0)
-                                )
+                                self._keyword_from_field_value(field.name, field_value, element_command)
                             )
 
                 # Create the await ahandle_request call
@@ -5767,6 +6025,7 @@ class WorkflowManager:
             result_messages = []
             try:
                 WorkflowRegistry.delete_workflow_by_name(request.workflow_name)
+                self._drop_substitution_flag(request.workflow_name)
                 # TODO: Replace with DeleteFileRequest https://github.com/griptape-ai/griptape-nodes/issues/3765
                 Path(branch_content_file_path).unlink()
                 cleanup_message = f"Deleted branch workflow file and registry entry for '{request.workflow_name}'"

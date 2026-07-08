@@ -46,6 +46,9 @@ from griptape_nodes.retained_mode.events.library_events import (
     LoadLibraryMetadataFromFileResultSuccess,
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultFailure,
+    RegisterLibraryFromFileResultSuccess,
+    UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
@@ -1995,8 +1998,7 @@ class TestInstalledLibraryVersion:
     @staticmethod
     def _config_manager_for(libraries_dir: Path) -> MagicMock:
         config_manager = MagicMock()
-        config_manager.get_config_value.return_value = str(libraries_dir)
-        config_manager.workspace_path = str(libraries_dir.parent)
+        config_manager.resolved_libraries_root.return_value = libraries_dir
         return config_manager
 
     @pytest.mark.asyncio
@@ -2018,12 +2020,10 @@ class TestInstalledLibraryVersion:
             assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = self._config_manager_for(tmp_path / "empty-libraries")
             assert await library_manager._installed_library_version("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
@@ -2066,12 +2066,12 @@ class TestInstalledLibraryManifestPath:
             assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
+                tmp_path / "empty-libraries"
+            )
             assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
 
@@ -2121,13 +2121,13 @@ class TestInstalledDownloadVersion:
             assert await library_manager._installed_download_version(download) == "0.9.0"
 
     @pytest.mark.asyncio
-    async def test_returns_none_when_libraries_directory_unconfigured(self, griptape_nodes: GriptapeNodes) -> None:
+    async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        config_manager = MagicMock()
-        config_manager.get_config_value.return_value = None
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = config_manager
+            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
+                tmp_path / "empty-libraries"
+            )
             assert await library_manager._installed_download_version(download) is None
 
     @pytest.mark.asyncio
@@ -2331,9 +2331,16 @@ class TestPreviewProjectProvisioning:
         }
 
     @staticmethod
-    def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object) -> None:
-        """Wire the mocked ProjectManager/ConfigManager the new handler calls."""
+    def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object, libraries_root: object = None) -> None:
+        """Wire the mocked ProjectManager/ConfigManager the new handler calls.
+
+        `libraries_root` is what resolve_libraries_root_for_project_id returns: None (the default)
+        makes the preview fall back to the merged config's workspace-relative libraries dir.
+        """
         mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = dirs
+        mock_gn.ProjectManager.return_value.resolve_libraries_root_for_project_id = AsyncMock(
+            return_value=libraries_root
+        )
         mock_gn.ConfigManager.return_value.compute_project_provisioning_config.return_value = merged
 
     @staticmethod
@@ -2498,6 +2505,45 @@ class TestPreviewProjectProvisioning:
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
+            result = await library_manager.on_preview_project_provisioning_request(
+                PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
+            )
+
+        assert isinstance(result, PreviewProjectProvisioningResultSuccess)
+        assert [a.kind for a in result.actions] == [LibraryProvisioningActionKind.OVERWRITE]
+        assert result.actions[0].destructive is True
+        assert result.actions[0].installed_version == "1.0.0"
+
+    @pytest.mark.asyncio
+    async def test_probes_offline_resolved_libraries_root_over_workspace_default(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A non-None libraries_root from the offline resolver overrides the workspace-relative default.
+
+        Exercises the branch that consumes resolve_libraries_root_for_project_id: when the target
+        project's own/inherited libraries_dir relocates the sink (e.g. a child sharing its parent's
+        libraries tree), the probe must read THAT dir, not merged workspace/libraries_directory. Here
+        the unsatisfying version lives only in the resolved root; if the preview probed the merged
+        workspace default instead, the plan would wrongly be a non-destructive INSTALL.
+        """
+        from griptape_nodes.retained_mode.events.library_events import (
+            LibraryProvisioningActionKind,
+            PreviewProjectProvisioningRequest,
+            PreviewProjectProvisioningResultSuccess,
+        )
+
+        library_manager = griptape_nodes.LibraryManager()
+        resolved_root = tmp_path / "shared-libs"
+        TestInstalledLibraryVersion._write_manifest(resolved_root / "git-lib", "git-lib", "1.0.0")
+        # The merged workspace-relative default points at an empty dir; probing it would miss the
+        # stale version and under-report the plan as INSTALL.
+        merged = self._merged_config(
+            [{"git_url": "griptape-ai/git-lib@v2.0", "version": ">=2.0"}],
+            workspace_directory=str(tmp_path / "ws"),
+            libraries_directory="libraries",
+        )
+        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
+            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged, libraries_root=resolved_root)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -3230,6 +3276,57 @@ class TestLibraryManagerMetadataLoadFailureSurfacing:
         assert stored.problems
 
 
+class TestCollectLibraryLoadStatuses:
+    """_collect_library_load_statuses turns LibraryInfo into serializable status data."""
+
+    def test_maps_fields_and_disabled_state(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+        library_manager = griptape_nodes.LibraryManager()
+
+        good = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.LOADED,
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            library_path="/libs/good.json",
+            is_sandbox=False,
+            library_name="Good Library",
+            library_version="1.2.3",
+        )
+        disabled = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISABLED,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            library_path="/libs/off.json",
+            is_sandbox=False,
+            library_name="Disabled Library",
+            library_version=None,
+        )
+        library_manager._library_file_path_to_info = {
+            "/libs/good.json": good,
+            "/libs/off.json": disabled,
+        }
+
+        statuses = library_manager._collect_library_load_statuses()
+
+        # Unpacking enforces exactly two statuses were produced.
+        good_status, disabled_status = statuses
+
+        assert good_status.library_name == "Good Library"
+        assert good_status.library_version == "1.2.3"
+        assert good_status.library_path == "/libs/good.json"
+        assert good_status.fitness == "GOOD"
+        assert good_status.disabled is False
+        assert good_status.problems is None
+
+        assert disabled_status.disabled is True
+        assert disabled_status.library_version is None
+
+    def test_empty_when_no_libraries(self, griptape_nodes: GriptapeNodes) -> None:
+        library_manager = griptape_nodes.LibraryManager()
+        library_manager._library_file_path_to_info = {}
+
+        assert library_manager._collect_library_load_statuses() == []
+
+
 class TestLibraryFitnessAuthorizationCheckpoint:
     """The license-policy checkpoint wired into library fitness evaluation."""
 
@@ -3358,3 +3455,166 @@ class TestLibraryFitnessAuthorizationCheckpoint:
         assert len(problems) == 1
         assert problems[0].node_type == "LabsNode"
         assert "Ask your admin to enable Labs nodes." in problems[0].collate_problems_for_display(problems)
+
+
+class TestLibraryManagerDuplicateEntryHygiene:
+    """Regression tests for issue #5039.
+
+    A library that ends up with more than one entry in `_library_file_path_to_info` (a duplicate
+    install, or a filename variation left behind by a git operation) desynchronizes the update and
+    update-check paths, producing a permanent "update available" loop. The fix keeps the dict free
+    of duplicates and routes both paths through the same resolver.
+    """
+
+    def _lib_info(
+        self,
+        library_manager: _LibraryManager,
+        path: str,
+        name: str,
+        lifecycle_state: _LibraryManager.LibraryLifecycleState = _LibraryManager.LibraryLifecycleState.LOADED,
+    ) -> _LibraryManager.LibraryInfo:
+        return library_manager.LibraryInfo(
+            lifecycle_state=lifecycle_state,
+            library_path=path,
+            is_sandbox=False,
+            library_name=name,
+            library_version="0.81.0",
+            fitness=_LibraryManager.LibraryFitness.GOOD,
+            problems=[],
+        )
+
+    def test_unload_removes_all_entries_for_library_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """Unload must drop every entry for the name, not just the first, so no stale copy lingers."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        # Two on-disk copies registered under one name: one on `main`, one on `stable`. Both
+        # report the same version but live at different paths (the #5039 scenario).
+        entries = {
+            "/libs/copyA/griptape_nodes_library.json": self._lib_info(
+                library_manager, "/libs/copyA/griptape_nodes_library.json", "MyLib"
+            ),
+            "/libs/copyB/griptape-nodes-library.json": self._lib_info(
+                library_manager, "/libs/copyB/griptape-nodes-library.json", "MyLib"
+            ),
+        }
+
+        with (
+            patch.object(library_manager, "_library_file_path_to_info", entries),
+            patch.object(LibraryRegistry, "unregister_library"),
+            patch.object(library_manager, "_unregister_all_stable_module_aliases_for_library"),
+        ):
+            result = library_manager.unload_library_from_registry_request(
+                UnloadLibraryFromRegistryRequest(library_name="MyLib")
+            )
+
+        assert isinstance(result, UnloadLibraryFromRegistryResultSuccess)
+        # No entry for MyLib should survive the unload.
+        remaining = [info for info in entries.values() if info.library_name == "MyLib"]
+        assert remaining == []
+        assert entries == {}
+
+    def test_reload_collapses_duplicate_entries_to_one(self, griptape_nodes: GriptapeNodes) -> None:
+        """Reload must collapse duplicate entries to one.
+
+        It must not leave a pre-operation entry alongside the reloaded one when the git operation
+        resolves the JSON under a different filename.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+
+        # Pre-operation entry keyed under the dashed filename.
+        old_path = "/libs/copy/griptape-nodes-library.json"
+        # The git operation resolves the underscore filename on disk.
+        new_path = "/libs/copy/griptape_nodes_library.json"
+        entries = {old_path: self._lib_info(library_manager, old_path, "MyLib")}
+
+        mock_library = MagicMock()
+        mock_library.get_metadata.return_value = MagicMock(library_version="0.81.0")
+
+        with (
+            patch.object(library_manager, "_library_file_path_to_info", entries),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.handle_request",
+                return_value=UnloadLibraryFromRegistryResultSuccess(result_details="ok"),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.find_file_in_directory",
+                return_value=Path(new_path),
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ahandle_request",
+                AsyncMock(return_value=RegisterLibraryFromFileResultSuccess(library_name="MyLib", result_details="ok")),
+            ),
+            patch.object(LibraryRegistry, "get_library", return_value=mock_library),
+        ):
+            result = asyncio.run(
+                library_manager._reload_library_after_git_operation(
+                    library_name="MyLib",
+                    library_file_path=old_path,
+                    failure_result_class=RegisterLibraryFromFileResultFailure,
+                )
+            )
+
+        assert result == "0.81.0"
+        # Exactly one entry for MyLib, keyed under the reloaded filename. The reload stores
+        # str(Path(...)), so normalize the expected key the same way for cross-platform parity
+        # (Windows renders the separators as backslashes).
+        mylib_paths = [path for path, info in entries.items() if info.library_name == "MyLib"]
+        assert mylib_paths == [str(Path(new_path))]
+
+    def test_resolver_prefers_loaded_copy_over_failed_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
+        """The resolver must return the LOADED copy, not a dead duplicate.
+
+        A duplicate install keeps a second entry marked FAILURE (DuplicateLibraryProblem) in the
+        dict, inserted BEFORE the loaded copy in some orderings. First-match would resolve the
+        dead copy whose on-disk state the update path can never make agree with the loaded copy's
+        version, producing a permanent "update available" loop (issue #5039). Preferring the LOADED
+        entry keeps path resolution consistent with the copy whose version the check reads.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+
+        # The FAILURE duplicate is inserted first, so first-match would pick it.
+        entries = {
+            "/libs/dead/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/dead/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.FAILURE,
+            ),
+            "/libs/loaded/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/loaded/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.LOADED,
+            ),
+        }
+
+        with patch.object(library_manager, "_library_file_path_to_info", entries):
+            info = library_manager.get_library_info_by_library_name("MyLib")
+
+        assert info is not None
+        assert info.library_path == "/libs/loaded/griptape_nodes_library.json"
+
+    def test_resolver_falls_back_to_first_match_when_none_loaded(self, griptape_nodes: GriptapeNodes) -> None:
+        """With no LOADED copy (e.g. discovery / worker-pending), the resolver keeps first-match."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        entries = {
+            "/libs/copyA/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/copyA/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.WORKER_PENDING,
+            ),
+            "/libs/copyB/griptape_nodes_library.json": self._lib_info(
+                library_manager,
+                "/libs/copyB/griptape_nodes_library.json",
+                "MyLib",
+                lifecycle_state=_LibraryManager.LibraryLifecycleState.DISCOVERED,
+            ),
+        }
+
+        with patch.object(library_manager, "_library_file_path_to_info", entries):
+            info = library_manager.get_library_info_by_library_name("MyLib")
+
+        assert info is not None
+        assert info.library_path == "/libs/copyA/griptape_nodes_library.json"

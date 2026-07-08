@@ -16,17 +16,20 @@ from griptape_nodes.common.macro_parser.formats import (
     CamelCaseFormat,
     DateFormat,
     DotCaseFormat,
+    LeadingSeparatorFormat,
     LowerCaseFormat,
     NumericPaddingFormat,
     PascalCaseFormat,
     ScreamingSnakeCaseFormat,
     SeparatorFormat,
+    SequenceFormat,
     SlugFormat,
     SnakeCaseFormat,
     TitleCaseFormat,
     TrimFormat,
     UpperCaseFormat,
 )
+from griptape_nodes.common.macro_parser.parsing import SEQUENCE_VARIABLE_NAME
 from griptape_nodes.common.macro_parser.segments import (
     MacroVariables,
     ParsedStaticValue,
@@ -35,10 +38,12 @@ from griptape_nodes.common.macro_parser.segments import (
 )
 
 __all__ = [
+    "SEQUENCE_VARIABLE_NAME",
     "AbbrevFormat",
     "CamelCaseFormat",
     "DateFormat",
     "DotCaseFormat",
+    "LeadingSeparatorFormat",
     "LowerCaseFormat",
     "MacroMatchFailure",
     "MacroMatchFailureReason",
@@ -56,6 +61,7 @@ __all__ = [
     "PascalCaseFormat",
     "ScreamingSnakeCaseFormat",
     "SeparatorFormat",
+    "SequenceFormat",
     "SlugFormat",
     "SnakeCaseFormat",
     "TitleCaseFormat",

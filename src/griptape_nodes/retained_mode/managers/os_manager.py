@@ -27,7 +27,7 @@ from griptape_nodes.common.macro_parser import (
     ParsedMacro,
 )
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailureReason
-from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat
+from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
 from griptape_nodes.common.sequences import (
@@ -43,6 +43,7 @@ from griptape_nodes.common.sequences.scan import (
     scan_sequences,
     scan_sequences_from_filenames,
 )
+from griptape_nodes.files import os_utils
 from griptape_nodes.files.drivers.base64_file_driver import Base64FileDriver
 from griptape_nodes.files.drivers.data_uri_file_driver import DataUriFileDriver
 from griptape_nodes.files.drivers.griptape_cloud_file_driver import GriptapeCloudFileDriver
@@ -53,6 +54,7 @@ from griptape_nodes.files.file import File, FileLoadError, canonical_extension
 from griptape_nodes.files.file_driver import FileDriverNotFoundError, FileDriverRegistry
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
+    canonicalize_to_posix,
     normalize_path_for_platform,
     path_needs_expansion,
     resolve_path_safely,
@@ -542,7 +544,9 @@ class OSManager:
             # Re-raise the exception for non-workspace mode
             raise
 
-    def _resolve_macro_path_to_string(self, macro_path: MacroPath) -> str | MacroResolutionFailure:
+    def _resolve_macro_path_to_string(
+        self, macro_path: MacroPath, *, failure_log_level: int = logging.ERROR
+    ) -> str | MacroResolutionFailure:
         """Resolve MacroPath to absolute string via ProjectManager.
 
         Pure resolver: routes through ``GetPathForMacroRequest`` so project
@@ -553,6 +557,14 @@ class OSManager:
 
         Args:
             macro_path: MacroPath containing parsed macro and variables
+            failure_log_level: Log level for the failure result's
+                ``result_details``. Defaults to ``logging.ERROR`` — the
+                natural level for a failed resolve. Callers that treat a
+                resolution failure as an expected signal (e.g. the
+                ``on_write_file_request`` seed-and-retry path, whose first
+                attempt is intentionally probing for a missing sequence slot)
+                should pass ``logging.DEBUG`` so the noise doesn't surface as
+                a user-facing ERROR when the fallback succeeds.
 
         Returns:
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
@@ -562,6 +574,7 @@ class OSManager:
             GetPathForMacroRequest(
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
+                failure_log_level=failure_log_level,
             )
         )
         if not isinstance(result, GetPathForMacroResultSuccess):
@@ -907,17 +920,31 @@ class OSManager:
                 pattern_parts.append(segment.text)
             elif isinstance(segment, ParsedVariable):
                 if segment.info.name == index_var_name:
-                    # Replace index variable with wildcards based on padding
-                    has_padding = False
+                    # Pick the glob width based on the slot's format spec:
+                    #  - NumericPaddingFormat (legacy `{x:NN}`): exact width via
+                    #    fixed-count `?` wildcards. Matches the original semantics
+                    #    where `:03` means "exactly 3 digits."
+                    #  - SequenceFormat (new `###` shorthand): minimum width, so
+                    #    overflow values like `_v1000` against `###` are valid
+                    #    matches. Use the permissive `*` glob. The `*` may match
+                    #    non-numeric siblings (e.g. `foo_vfinal.py`); those are
+                    #    skipped downstream when `_extract_index_from_filename`
+                    #    catches the MacroResolutionError raised by
+                    #    `SequenceFormat.reverse("final")`.
+                    #  - Neither (no padding info): also `*`; same skip behavior.
+                    matched_spec = False
                     for format_spec in segment.format_specs:
                         if isinstance(format_spec, NumericPaddingFormat):
-                            # Use exact number of wildcards for padding width
                             pattern_parts.append("?" * format_spec.width)
-                            has_padding = True
+                            matched_spec = True
+                            break
+                        if isinstance(format_spec, SequenceFormat):
+                            pattern_parts.append("*")
+                            matched_spec = True
                             break
 
-                    if not has_padding:
-                        # No padding format - match any number of digits
+                    if not matched_spec:
+                        # No padding-style format - match any number of digits
                         pattern_parts.append("*")
                 else:
                     # This shouldn't happen - all non-index variables should be resolved
@@ -954,8 +981,33 @@ class OSManager:
         """
         secrets_manager = GriptapeNodes.SecretsManager()
 
-        # Use macro's extract_variables to reverse-match
-        extracted = parsed_macro.extract_variables(filename, variables, secrets_manager)
+        # Normalize path separators to POSIX form before reverse-matching. The
+        # macro template uses `/` by convention, but the filename comes from
+        # `Path.glob()` on the host filesystem (backslashes on Windows), and
+        # directory-shaped `variables` values (e.g. `{outputs}` bound to
+        # `str(temp_dir)`) may likewise carry `\`. A single-char separator
+        # mismatch causes the reverse-matcher to fail static-text alignment
+        # and return no matches, which manifested as the sequence-slot scan
+        # finding zero existing files on Windows CI.
+        # `canonicalize_to_posix` correctly handles UNC, long-path
+        # prefix (`\\?\`), long-UNC prefix, drive-letter, and mixed-separator
+        # cases — see its docstring for the full contract.
+        normalized_filename = canonicalize_to_posix(filename)
+        normalized_variables: MacroVariables = {
+            key: canonicalize_to_posix(value) if isinstance(value, str) else value for key, value in variables.items()
+        }
+
+        # Use macro's extract_variables to reverse-match. Non-numeric siblings caught
+        # by the permissive `*` glob (e.g. `workflow_vfinal.py` scanning against
+        # `workflow_v{###}.py`) reach `SequenceFormat.reverse()` and raise
+        # MacroResolutionError from int("final"). Treat that as "this file doesn't
+        # match" — same contract as extract_variables returning None. Anything else
+        # matched the glob but isn't a valid sequence entry, so it should be skipped,
+        # not crash the scan.
+        try:
+            extracted = parsed_macro.extract_variables(normalized_filename, normalized_variables, secrets_manager)
+        except MacroResolutionError:
+            return None
 
         if extracted is None:
             # Filename doesn't match template
@@ -1067,16 +1119,39 @@ class OSManager:
         return MacroPath(parsed_macro=parsed_macro, variables={})
 
     @staticmethod
+    def _has_sequence_slot_marker(variable: ParsedVariable) -> bool:
+        """Return True when this variable should be treated as a sequence-allocated slot.
+
+        Two paths qualify, ORed together:
+
+        1. **Explicit ``SequenceFormat`` marker** — emitted by ``###`` shorthand in
+           the macro template (issue #4902). Unambiguously says "this slot is
+           system-allocated; OSManager fills it with a sequence number."
+        2. **Legacy ``NumericPaddingFormat`` heuristic** — a ``{x:NN}`` slot that
+           the macro author intended to bind, but which CREATE_NEW has historically
+           treated as auto-indexable when it's the lone unresolved required variable.
+           Kept for backward compatibility with shipping project templates and the
+           documented behavior in [macros.md], [situations.md], and the default
+           situation macros. The OR is the load-bearing piece of #4902's
+           "introduce explicit syntax without breaking existing macros" strategy.
+
+        A follow-up cleanup will retire the heuristic path once project templates
+        and docs migrate to ``###``; until then both routes are equivalent.
+        """
+        return any(isinstance(spec, (SequenceFormat, NumericPaddingFormat)) for spec in variable.format_specs)
+
+    @staticmethod
     def _find_padded_unresolved_required(
         parsed_macro: ParsedMacro, missing_required: set[str]
     ) -> ParsedVariable | None:
         """Find the single missing required variable that opts into auto-index seeding.
 
-        A macro author opts in by writing a single unresolved required variable with a
-        ``NumericPaddingFormat`` (``{x:NN}``). The padding spec is the safety contract:
-        without it, an unresolved ``{shot}`` could just as plausibly be a variable the
-        user forgot to bind, and silently filling it with ``1`` would write data under
-        a name the user never intended.
+        A macro author opts in by writing either ``###`` shorthand (parsed as a
+        sequence slot — see :class:`SequenceFormat`) or a single unresolved required
+        variable with a ``NumericPaddingFormat`` (``{x:NN}`` — legacy heuristic).
+        Either marker is the safety contract: without it, an unresolved ``{shot}``
+        could just as plausibly be a variable the user forgot to bind, and silently
+        filling it with ``1`` would write data under a name the user never intended.
 
         Used by the seed step in ``on_write_file_request`` (CREATE_NEW only) — after a
         first-attempt resolve fails with MISSING_REQUIRED_VARIABLES, this picks the slot
@@ -1107,9 +1182,10 @@ class OSManager:
             return None
         candidate = matching[0]
 
-        # Gate 3: padding (`:NN`) is the safety contract. Without it the macro author
-        # didn't opt in.
-        if not any(isinstance(spec, NumericPaddingFormat) for spec in candidate.format_specs):
+        # Gate 3: the slot must carry a sequence-allocation marker — either the
+        # explicit ``SequenceFormat`` (from ``###`` shorthand) or the legacy
+        # ``NumericPaddingFormat`` heuristic. Without it the macro author didn't opt in.
+        if not OSManager._has_sequence_slot_marker(candidate):
             return None
 
         return candidate
@@ -1123,11 +1199,13 @@ class OSManager:
         None, the caller walks *its* slot (using ProjectManager so unresolved project
         directories like ``{outputs}`` get substituted each iteration).
 
-        When the caller passed a MacroPath whose macro has a ``NumericPaddingFormat``
-        slot — required ``{x:NN}`` OR optional ``{x?:NN}``, AND regardless of whether
-        the caller pre-bound that slot — we walk that slot against the user's ORIGINAL
-        macro. Incrementing it produces consistent zero-padded width across the
-        sequence (``v001 → v002 → v003``).
+        When the caller passed a MacroPath whose macro carries a sequence-slot marker
+        (``SequenceFormat`` from ``{###}`` shorthand, or legacy ``NumericPaddingFormat``
+        from ``{x:NN}`` / ``{x?:NN}``), AND regardless of whether the caller pre-bound
+        that slot, we walk that slot against the user's ORIGINAL macro. Incrementing it
+        produces consistent zero-padded width across the sequence
+        (``v001 → v002 → v003``). Discrimination goes through ``_has_sequence_slot_marker``
+        so both marker types are recognized uniformly.
 
         The bound/unbound distinction matters for *starting* the walk (see the
         start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
@@ -1146,9 +1224,13 @@ class OSManager:
         """
         if isinstance(request.file_path, MacroPath):
             for segment in request.file_path.parsed_macro.segments:
-                if isinstance(segment, ParsedVariable) and any(
-                    isinstance(spec, NumericPaddingFormat) for spec in segment.format_specs
-                ):
+                # `_has_sequence_slot_marker` recognizes both `SequenceFormat` (from
+                # `{###}` shorthand) and legacy `NumericPaddingFormat` (from `{x:NN}`)
+                # as sequence-slot markers. We do NOT gate on "not already bound" —
+                # the reverse-match flow (#4956) intentionally binds `_index` in the
+                # variables dict before landing here, and we still want that slot to
+                # be the one we walk forward on collision.
+                if isinstance(segment, ParsedVariable) and OSManager._has_sequence_slot_marker(segment):
                     return request.file_path, segment
         return self._convert_str_path_to_macro_with_index(str(file_path)), None
 
@@ -1239,18 +1321,17 @@ class OSManager:
     def platform() -> str:
         return sys.platform
 
-    # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4418
     @staticmethod
     def is_windows() -> bool:
-        return sys.platform.startswith("win")
+        return os_utils.is_windows()
 
     @staticmethod
     def is_mac() -> bool:
-        return sys.platform.startswith("darwin")
+        return os_utils.is_mac()
 
     @staticmethod
     def is_linux() -> bool:
-        return sys.platform.startswith("linux")
+        return os_utils.is_linux()
 
     def replace_process(self, args: list[Any]) -> None:
         """Replace the current process with a new one.
@@ -1323,7 +1404,13 @@ class OSManager:
             if self.is_windows():
                 # Linter complains but this is the recommended way on Windows
                 # We can ignore this warning as we've validated the path
-                os.startfile(normalize_path_for_platform(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
+                #
+                # NOTE: do NOT pass normalize_path_for_platform(path) here. os.startfile is
+                # backed by ShellExecute, which does not understand the \\?\ extended-length
+                # prefix that normalize_path_for_platform now applies unconditionally on
+                # Windows -- a prefixed path makes ShellExecute fail to open the file. The
+                # path is already validated to exist above, so hand it over unprefixed.
+                os.startfile(os.fspath(path))  # noqa: S606 # pyright: ignore[reportAttributeAccessIssue]
                 logger.info("Opened path on Windows: %s", path)
             elif self.is_mac():
                 # On macOS, open should be in a standard location
@@ -2222,7 +2309,17 @@ class OSManager:
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
             path_display = f"{macro_path.parsed_macro}"
-            resolution_result = self._resolve_macro_path_to_string(macro_path)
+            # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
+            # the failure is the signal the seed-and-retry logic below uses to pick which
+            # slot to auto-allocate. Demote the log level so the probing miss doesn't
+            # surface as a user-facing ERROR when the retry succeeds. For any other
+            # policy the failure IS terminal, so it keeps the default ERROR level.
+            first_attempt_log_level = (
+                logging.DEBUG if request.existing_file_policy is ExistingFilePolicy.CREATE_NEW else logging.ERROR
+            )
+            resolution_result = self._resolve_macro_path_to_string(
+                macro_path, failure_log_level=first_attempt_log_level
+            )
 
             # Seed-and-retry: ONLY for CREATE_NEW + a single padded missing-required
             # slot. Anything else (other policies, multiple missing, no padding) falls
@@ -2239,6 +2336,8 @@ class OSManager:
                 if candidate is not None:
                     seeded_vars = {**macro_path.variables, candidate.info.name: 1}
                     seeded_macro = MacroPath(parsed_macro=macro_path.parsed_macro, variables=seeded_vars)
+                    # Second-attempt resolve: if seeding didn't fix it, that's genuinely
+                    # broken — keep the ERROR default so the user sees what went wrong.
                     resolution_result = self._resolve_macro_path_to_string(seeded_macro)
 
             if isinstance(resolution_result, MacroResolutionFailure):
@@ -2608,7 +2707,7 @@ class OSManager:
             result_details=result_details,
         )
 
-    def _apply_extension_coercion(
+    def _apply_extension_coercion(  # noqa: PLR0911
         self,
         request: WriteFileRequest,
         file_path: Path,
@@ -2648,6 +2747,14 @@ class OSManager:
                 destination_suffix,
             )
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
+
+        denial = GriptapeNodes.ArtifactManager().check_write_permission(content, sniffed)
+        if denial is not None:
+            msg = f"Cannot save '{file_path.name}': {denial.reason()}"
+            return WriteFileResultFailure(
+                failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                result_details=msg,
+            )
 
         if canonical_extension(destination_suffix) == canonical_extension(sniffed):
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)

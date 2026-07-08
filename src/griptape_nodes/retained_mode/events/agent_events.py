@@ -22,6 +22,8 @@ class ProviderConfig(BaseModel):
     model: str
     base_url: str | None = None
     api_key_secret_name: str | None = None
+    enabled: bool = True
+    icon: str | None = None
 
 
 class PromptDriverConfig(BaseModel):
@@ -40,6 +42,8 @@ class CreateProviderPayload(BaseModel):
     model: str = ""
     base_url: str | None = None
     api_key_secret_name: str | None = None
+    enabled: bool = True
+    icon: str | None = None
 
 
 class UpdateProviderPayload(BaseModel):
@@ -49,6 +53,8 @@ class UpdateProviderPayload(BaseModel):
     model: str | None = None
     base_url: str | None = None
     api_key_secret_name: str | None = None
+    enabled: bool | None = None
+    icon: str | None = None
 
     @field_validator("type", "model")
     @classmethod

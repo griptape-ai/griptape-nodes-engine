@@ -482,6 +482,7 @@ class GetFlowDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
 
     referenced_workflow_name: str | None
     parent_flow_name: str | None
+    flow_type: str | None
 
 
 @dataclass

@@ -24,12 +24,6 @@ from packaging.specifiers import InvalidSpecifier, SpecifierSet
 from packaging.version import InvalidVersion
 from packaging.version import Version as PackagingVersion
 from pydantic import ValidationError
-from rich.align import Align
-from rich.box import HEAVY_EDGE
-from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich.text import Text
 from semver import Version
 from xdg_base_dirs import xdg_data_home
 
@@ -68,11 +62,13 @@ from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     AppSessionStartedEvent,
     EngineInitializationProgress,
+    EngineReadyEvent,
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
     InitializationPhase,
     InitializationStatus,
     LibraryLoadedNotification,
+    LibraryLoadStatus,
     WorkerNodeSchema,
     WorkerParameterSchema,
 )
@@ -126,6 +122,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     InstallLibraryDependenciesRequest,
     InstallLibraryDependenciesResultFailure,
     InstallLibraryDependenciesResultSuccess,
+    LibraryEventHandlerDetails,
     LibraryProvisioningAction,
     LibraryProvisioningActionKind,
     ListCapableLibraryEventHandlersRequest,
@@ -245,6 +242,7 @@ from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normaliz
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
+    GitError,
     GitPullError,
     GitRefError,
     GitRemoteError,
@@ -256,6 +254,7 @@ from griptape_nodes.utils.git_utils import (
     get_git_remote,
     get_local_commit_sha,
     is_git_url,
+    is_on_tag,
     normalize_github_url,
     parse_git_url_with_ref,
     remote_ref_exists,
@@ -275,7 +274,6 @@ from griptape_nodes.utils.library_utils import (
 from griptape_nodes.utils.uv_utils import find_uv_bin, is_venv_functional, venv_python_path
 from griptape_nodes.utils.version_utils import (
     engine_version_failure_detail,
-    get_complete_version_string,
 )
 
 if TYPE_CHECKING:
@@ -288,7 +286,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
 
 logger = logging.getLogger("griptape_nodes")
-console = Console()
 
 # Directories to exclude when scanning for Python source files (in addition to any directory starting with '.')
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
@@ -709,82 +706,26 @@ class LibraryManager:
                 library_name,
             )
 
-    def print_library_load_status(self) -> None:
-        library_file_paths = self.get_libraries_attempted_to_load()
-        library_infos = []
-        for library_file_path in library_file_paths:
-            library_info = self.get_library_info_for_attempted_load(library_file_path)
-            library_infos.append(library_info)
+    def _collect_library_load_statuses(self) -> list[LibraryLoadStatus]:
+        """Gather the load outcome for every attempted library as serializable data.
 
-        console = Console()
-
-        # Check if the list is empty
-        if not library_infos:
-            # Display a message indicating no libraries are available
-            empty_message = Text("No library information available", style="italic")
-            panel = Panel(empty_message, title="Library Information", border_style="blue")
-            console.print(panel)
-            return
-
-        # Create a table with two columns and row dividers
-        table = Table(show_header=True, box=HEAVY_EDGE, show_lines=True, expand=True)
-        table.add_column("Library", style="green", ratio=1)
-        table.add_column("Problems", style="yellow", ratio=1)
-
-        # Status emojis mapping
-        status_emoji = {
-            LibraryManager.LibraryFitness.GOOD: "[green]OK[/green]",
-            LibraryManager.LibraryFitness.FLAWED: "[yellow]![/yellow]",
-            LibraryManager.LibraryFitness.UNUSABLE: "[red]X[/red]",
-            LibraryManager.LibraryFitness.MISSING: "[red]?[/red]",
-            LibraryManager.LibraryFitness.NOT_EVALUATED: "[cyan]...[/cyan]",
-        }
-
-        # Status text mapping (colored)
-        status_text = {
-            LibraryManager.LibraryFitness.GOOD: "[green](GOOD)[/green]",
-            LibraryManager.LibraryFitness.FLAWED: "[yellow](FLAWED)[/yellow]",
-            LibraryManager.LibraryFitness.UNUSABLE: "[red](UNUSABLE)[/red]",
-            LibraryManager.LibraryFitness.MISSING: "[red](MISSING)[/red]",
-            LibraryManager.LibraryFitness.NOT_EVALUATED: "[cyan](PENDING)[/cyan]",
-        }
-
-        # Add rows for each library info
-        for lib_info in library_infos:
-            # Library column with emoji, name, version, colored status, and file path underneath
-            is_disabled = lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.DISABLED
-            if is_disabled:
-                emoji = "[dim]-[/dim]"
-                colored_status = "[dim](DISABLED)[/dim]"
-            else:
-                emoji = status_emoji.get(lib_info.fitness, "ERROR: Unknown/Unexpected Library Status")
-                colored_status = status_text.get(lib_info.fitness, "(UNKNOWN)")
-            name = lib_info.library_name or "*UNKNOWN*"
-
-            library_version = lib_info.library_version
-            if library_version:
-                version_str = str(library_version)
-            else:
-                version_str = "*UNKNOWN*"
-
-            file_path = lib_info.library_path
-            library_name_with_details = Text.from_markup(
-                f"{emoji} - {name} v{version_str} {colored_status}\n[cyan dim]{file_path}[/cyan dim]"
+        Presentation (icons, colors, table layout) is owned by the application
+        layer; this returns raw data for it to render.
+        """
+        statuses: list[LibraryLoadStatus] = []
+        for library_file_path in self.get_libraries_attempted_to_load():
+            lib_info = self.get_library_info_for_attempted_load(library_file_path)
+            statuses.append(
+                LibraryLoadStatus(
+                    library_name=lib_info.library_name,
+                    library_version=str(lib_info.library_version) if lib_info.library_version else None,
+                    library_path=lib_info.library_path,
+                    fitness=lib_info.fitness.value,
+                    disabled=lib_info.lifecycle_state == LibraryManager.LibraryLifecycleState.DISABLED,
+                    problems=self.collate_problems_for_lib_info(lib_info),
+                )
             )
-            library_name_with_details.overflow = "fold"
-
-            # Problems column - collate by type then format
-            collated = self.collate_problems_for_lib_info(lib_info)
-            problems = collated if collated is not None else "No problems detected."
-
-            # Add the row to the table
-            table.add_row(library_name_with_details, problems)
-
-        # Create a panel containing the table
-        panel = Panel(table, title="Library Information", border_style="blue")
-
-        # Display the panel
-        console.print(panel)
+        return statuses
 
     def get_libraries_attempted_to_load(self) -> list[str]:
         return list(self._library_file_path_to_info.keys())
@@ -793,10 +734,21 @@ class LibraryManager:
         return self._library_file_path_to_info[library_file_path]
 
     def get_library_info_by_library_name(self, library_name: str) -> LibraryInfo | None:
-        for library_info in self._library_file_path_to_info.values():
-            if library_info.library_name == library_name:
+        # A library name can have more than one entry: a duplicate install registers a second
+        # copy that fails with DuplicateLibraryProblem but is deliberately kept in the dict
+        # (marked FAILURE) so the GUI can surface it, and filename variations / download +
+        # discovery collisions can key the same name under two paths. Prefer the copy that is
+        # actually LOADED (the one in LibraryRegistry, whose version the update-check reads) so
+        # every caller resolves the live copy rather than a dead duplicate. This keeps the
+        # update path, the update-check path, and the on-disk copy consistent (issue #5039).
+        # Fall back to first-match when nothing is loaded yet (e.g. discovery / worker-pending).
+        matches = [info for info in self._library_file_path_to_info.values() if info.library_name == library_name]
+        if not matches:
+            return None
+        for library_info in matches:
+            if library_info.lifecycle_state == LibraryManager.LibraryLifecycleState.LOADED:
                 return library_info
-        return None
+        return matches[0]
 
     def resolve_transitive_library_deps(
         self,
@@ -914,8 +866,23 @@ class LibraryManager:
             details = f"Request type '{request.request_type}' is not registered in the PayloadRegistry."
             return ListCapableLibraryEventHandlersResultFailure(exception=KeyError(details), result_details=details)
         handler_mappings = self.get_registered_event_handlers(request_type)
+        # Surface any presentation metadata a library registered alongside its handler
+        # (currently PublishWorkflowRegisteredEventData's display_name/description/icon)
+        # so a frontend can render richer menu entries. Read the fields defensively:
+        # event_data may be None or a type without these attributes, in which case the
+        # handler still gets an entry keyed only by its library name.
+        handler_details = [
+            LibraryEventHandlerDetails(
+                library_name=library_name,
+                display_name=getattr(registered.event_data, "display_name", None),
+                description=getattr(registered.event_data, "description", None),
+                icon=getattr(registered.event_data, "icon", None),
+            )
+            for library_name, registered in handler_mappings.items()
+        ]
         return ListCapableLibraryEventHandlersResultSuccess(
             handlers=list(handler_mappings.keys()),
+            handler_details=handler_details,
             result_details=f"Successfully listed {len(handler_mappings)} capable library event handlers",
         )
 
@@ -1655,9 +1622,12 @@ class LibraryManager:
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
         if not file_path.is_file():
+            # Display file_identity, not file_path: on Windows the latter now carries the
+            # \\?\ long-path prefix (canonicalize_for_io applies it unconditionally), which
+            # is confusing in a user-facing message. file_identity is the un-prefixed form.
             details = (
                 f"Attempted to register a sandbox node with file_path={request.file_path!r}. "
-                f"Failed because no file exists at the resolved path '{file_path}'. Write "
+                f"Failed because no file exists at the resolved path '{file_identity}'. Write "
                 "the source file into the sandbox directory before calling this request."
             )
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
@@ -1668,7 +1638,8 @@ class LibraryManager:
         try:
             module = self._load_module_from_file(file_path, LibraryManager.SANDBOX_LIBRARY_NAME)
         except ImportError as err:
-            details = f"Attempted to register a sandbox node from '{file_path}'. Failed at import time: {err}"
+            # Display file_identity (un-prefixed); file_path may carry the \\?\ prefix on Windows.
+            details = f"Attempted to register a sandbox node from '{file_identity}'. Failed at import time: {err}"
             return RegisterSandboxNodeFromSourceResultFailure(result_details=details)
 
         # The Sandbox Library must already be registered. It is created as part of normal
@@ -2795,10 +2766,17 @@ class LibraryManager:
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
         # Remove the library from our library info list. This prevents it from still showing
-        # up in the table of attempted library loads.
-        lib_info = self.get_library_info_by_library_name(request.library_name)
-        if lib_info:
-            del self._library_file_path_to_info[lib_info.library_path]
+        # up in the table of attempted library loads. Remove ALL entries for this name, not
+        # just the first: a duplicately-registered library (e.g. two on-disk copies, or a
+        # filename variation left behind by a git operation) would otherwise keep a stale
+        # entry alive, which desynchronizes the update and update-check paths.
+        stale_paths = [
+            file_path
+            for file_path, library_info in self._library_file_path_to_info.items()
+            if library_info.library_name == request.library_name
+        ]
+        for file_path in stale_paths:
+            del self._library_file_path_to_info[file_path]
         details = f"Successfully unloaded (and unregistered) library '{request.library_name}'."
         return UnloadLibraryFromRegistryResultSuccess(result_details=details)
 
@@ -3428,11 +3406,21 @@ class LibraryManager:
 
         # Probe the installed versions against the TARGET project's libraries dir, not the
         # live one, so the plan matches what activation would reconcile in that workspace.
+        # A project's own/inherited libraries_dir (resolved offline so an unloaded target is
+        # honored) takes precedence; otherwise fall back to the workspace-relative default.
         # Both keys come from Settings defaults, so they are always present in `merged`.
-        libraries_path = resolve_workspace_path(
-            Path(get_dot_value(merged, "libraries_directory")),
-            Path(get_dot_value(merged, "workspace_directory")),
-        )
+        libraries_root = None
+        if request.project_id != SYSTEM_DEFAULTS_KEY:
+            libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
+                request.project_id
+            )
+        if libraries_root is not None:
+            libraries_path = libraries_root
+        else:
+            libraries_path = resolve_workspace_path(
+                Path(get_dot_value(merged, "libraries_directory")),
+                Path(get_dot_value(merged, "workspace_directory")),
+            )
 
         actions = await asyncio.gather(
             *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
@@ -3638,11 +3626,7 @@ class LibraryManager:
         about is exactly the file overwrite targets.
         """
         if libraries_path is None:
-            config_mgr = GriptapeNodes.ConfigManager()
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                return None
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
 
         for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
@@ -3688,11 +3672,7 @@ class LibraryManager:
             return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
 
         if libraries_path is None:
-            config_mgr = GriptapeNodes.ConfigManager()
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                return None
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
 
         repo_name = extract_repo_name_from_url(download.git_url)
         repo_directory = libraries_path / repo_name
@@ -3811,13 +3791,7 @@ class LibraryManager:
             }
         """
         config_mgr = GriptapeNodes.ConfigManager()
-        libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-
-        if not libraries_dir_setting:
-            logger.warning("Cannot download libraries: libraries_directory not configured")
-            return {}
-
-        libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+        libraries_path = config_mgr.resolved_libraries_root()
 
         async def download_one(git_url_with_ref: str) -> tuple[str, dict[str, Any]]:
             """Download a single library if not already present."""
@@ -3924,11 +3898,6 @@ class LibraryManager:
         if GriptapeNodes.get_session_id():
             await self._await_pending_workers()
 
-        # Print library status after workers have had a chance to report back so worker
-        # libraries show their real fitness rather than NOT_EVALUATED.
-        if not self._is_worker:
-            self.print_library_load_status()
-
         # Register all secrets now that libraries are loaded and settings are merged
         GriptapeNodes.SecretsManager().register_all_secrets()
 
@@ -3941,8 +3910,21 @@ class LibraryManager:
         # Go tell the Workflow Manager that it's turn is now.
         await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
 
-        # Only print the engine ready banner for the orchestrator — not for dedicated library workers.
-        self._maybe_print_engine_ready_banner(is_worker=self._is_worker)
+        # Signal readiness so the application layer can render its library status
+        # table and "engine ready" banner, and other consumers (the GUI, the
+        # desktop app) can react to the same event. Only the orchestrator
+        # announces readiness; dedicated library workers do not. Presentation is
+        # owned by the app, not the engine. The library statuses reflect real
+        # fitness because workers have already reported back above.
+        if not self._is_worker:
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=True,
+                    )
+                )
+            )
 
     async def _collect_library_workflow_files(self) -> list[str]:
         """Collect workflow file paths declared by all registered libraries.
@@ -4144,37 +4126,6 @@ class LibraryManager:
             pass
 
         return type(class_name, (BaseNode,), {"__init__": stub_init, "process": stub_process})
-
-    def _maybe_print_engine_ready_banner(self, *, is_worker: bool) -> None:
-        if is_worker:
-            return
-
-        engine_version = get_complete_version_string()
-
-        # Get current session ID
-        session_id = GriptapeNodes.get_session_id()
-        session_info = f" | Session: {session_id[:8]}..." if session_id else " | No Session"
-
-        # Get user and organization
-        user = GriptapeNodes.UserManager().user
-        user_info = f" | User: {user.email if user else 'Not available'}"
-
-        user_organization = GriptapeNodes.UserManager().user_organization
-        org_info = f" | Org: {user_organization.name if user_organization else 'Not available'}"
-
-        nodes_app_url = os.getenv("GRIPTAPE_NODES_UI_BASE_URL", "https://nodes.griptape.ai")
-        message = Panel(
-            Align.center(
-                f"[bold green]Engine is ready to receive events[/bold green]\n"
-                f"[bold blue]Return to: [link={nodes_app_url}]{nodes_app_url}[/link] to access the Workflow Editor[/bold blue]",
-                vertical="middle",
-            ),
-            title="Griptape Nodes Engine Started",
-            subtitle=f"[green]Version: {engine_version}{session_info}{user_info}{org_info}[/green]",
-            border_style="green",
-            padding=(1, 4),
-        )
-        console.print(message)
 
     def _load_advanced_library_module(
         self,
@@ -4928,8 +4879,18 @@ class LibraryManager:
         # must be registered before we respond.
         await self._await_pending_workers()
 
-        # Print after workers have reported back so their real fitness is shown.
-        self.print_library_load_status()
+        # Signal readiness again so the app re-renders the library status table with real
+        # fitness now that workers have reported back. is_initial_start=False so the app
+        # refreshes the table without re-showing the startup banner. Orchestrator only.
+        if not self._is_worker:
+            GriptapeNodes.EventManager().put_event(
+                AppEvent(
+                    payload=EngineReadyEvent(
+                        libraries=self._collect_library_load_statuses(),
+                        is_initial_start=False,
+                    )
+                )
+            )
 
         # Hard activation: a reload is interactive (project switch / explicit reload), so a
         # reconcile failure (bad engine_version gate or a sourced library that could not be
@@ -5396,16 +5357,14 @@ class LibraryManager:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no Library with that name was registered."
             return CheckLibraryUpdateResultFailure(result_details=details)
 
-        # Find the library file path
-        library_file_path = None
-        for file_path, library_info in self._library_file_path_to_info.items():
-            if library_info.library_name == library_name:
-                library_file_path = file_path
-                break
-
-        if library_file_path is None:
+        # Find the library file path. Route through the shared resolver so the update path
+        # (_validate_and_prepare_library_for_git_operation) and this check path can never
+        # disagree about which on-disk copy a duplicately-registered library maps to.
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
             details = f"Attempted to check for updates for Library '{library_name}'. Failed because no file path could be found for this library."
             return CheckLibraryUpdateResultFailure(result_details=details)
+        library_file_path = library_info.library_path
 
         # Get the library directory (parent of the JSON file)
         library_dir = Path(library_file_path).parent.absolute()
@@ -5578,16 +5537,14 @@ class LibraryManager:
             details = f"Library '{library_name}' has no version information."
             return failure_result_class(result_details=details)
 
-        # Find the library file path
-        library_file_path = None
-        for file_path, library_info in self._library_file_path_to_info.items():
-            if library_info.library_name == library_name:
-                library_file_path = file_path
-                break
-
-        if library_file_path is None:
+        # Find the library file path. Route through the shared resolver so this update path
+        # and check_library_update_request can never disagree about which on-disk copy a
+        # duplicately-registered library maps to.
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
             details = f"Attempted to {operation_description} Library '{library_name}'. Failed because no file path could be found for this library."
             return failure_result_class(result_details=details)
+        library_file_path = library_info.library_path
 
         # Get the library directory (parent of the JSON file)
         library_dir = Path(library_file_path).parent.absolute()
@@ -5636,6 +5593,20 @@ class LibraryManager:
 
         # Use the found file path for reloading
         actual_library_file_path = str(actual_library_file)
+
+        # Drop any lingering entries for this library before reinserting. The git operation may
+        # resolve the JSON under a different filename (griptape_nodes_library.json vs
+        # griptape-nodes-library.json), which would otherwise leave the pre-operation entry keyed
+        # under the old filename alongside the new one. Two live entries for one name let the
+        # update and update-check paths resolve different on-disk copies, producing a permanent
+        # "update available" loop.
+        stale_paths = [
+            file_path
+            for file_path, existing_info in self._library_file_path_to_info.items()
+            if existing_info.library_name == library_name
+        ]
+        for file_path in stale_paths:
+            del self._library_file_path_to_info[file_path]
 
         # Create LibraryInfo for tracking this library reload
         lib_info = LibraryManager.LibraryInfo(
@@ -5714,6 +5685,31 @@ class LibraryManager:
                 retryable=retryable,
                 existing_path=str(library_dir) if retryable else None,
             )
+
+        # After a moving-tag update, the local HEAD should match the commit the remote tag
+        # resolves to. If it does not, the next update check will report "update available"
+        # forever (the loop from issue #5039). Surface it loudly rather than looping silently.
+        # This is diagnostic only and never fails the update. Restricted to tag-based (detached
+        # HEAD) libraries: a branch update does `git reset --hard` to remote HEAD, so it always
+        # converges and would only pay for an extra remote clone with nothing to report.
+        try:
+            if await asyncio.to_thread(is_on_tag, library_dir):
+                local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+                git_remote = await asyncio.to_thread(get_git_remote, library_dir)
+                git_ref = await asyncio.to_thread(get_current_ref, library_dir)
+                if local_commit is not None and git_remote is not None:
+                    version_info = await asyncio.to_thread(clone_and_get_library_version, git_remote, git_ref or "HEAD")
+                    if local_commit != version_info.commit_sha:
+                        logger.warning(
+                            "After updating Library '%s' on ref '%s', local commit %s does not match "
+                            "remote commit %s. Update checks may keep reporting an available update.",
+                            library_name,
+                            git_ref,
+                            local_commit,
+                            version_info.commit_sha,
+                        )
+        except GitError as e:
+            logger.debug("Skipped post-update commit verification for Library '%s': %s", library_name, e)
 
         # Reload library
         reload_result = await self._reload_library_after_git_operation(
@@ -5810,12 +5806,9 @@ class LibraryManager:
             # Use custom download directory if provided
             libraries_path = Path(download_directory)
         else:
-            # Use default from config
-            libraries_dir_setting = config_mgr.get_config_value("libraries_directory")
-            if not libraries_dir_setting:
-                details = "Cannot download library: libraries_directory setting is not configured."
-                return DownloadLibraryResultFailure(result_details=details)
-            libraries_path = resolve_workspace_path(Path(libraries_dir_setting), config_mgr.workspace_path)
+            # Resolve the libraries root (a project's own/inherited libraries_dir override, else the
+            # workspace-relative libraries_directory).
+            libraries_path = config_mgr.resolved_libraries_root()
 
         # Ensure parent directory exists
         await anyio.Path(libraries_path).mkdir(parents=True, exist_ok=True)
