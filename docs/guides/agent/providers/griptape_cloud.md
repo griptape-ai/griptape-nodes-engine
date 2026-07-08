@@ -18,9 +18,9 @@ Griptape Cloud exposes models from multiple providers:
 - **Meta** — Llama models
 - **DeepSeek** — DeepSeek V3 and R1
 
-The full list is visible in the **Model** dropdown in the [chat sidebar](../agent_sidebar.md).
+The full list is visible in the **Model** dropdown in the [Agent](../index.md).
 
 ## Related
 
 - [AI Providers overview](./index.md)
-- [Agent Sidebar](../agent_sidebar.md)
+- [Agent Sidebar](../index.md)

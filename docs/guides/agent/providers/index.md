@@ -1,6 +1,6 @@
 # AI Providers
 
-Griptape Nodes supports multiple AI providers for the [chat sidebar](../agent_sidebar.md) and the **Agent node** in workflows. Griptape Cloud is provided by default. You can add local providers or any OpenAI-compatible endpoint as additional options.
+Griptape Nodes supports multiple AI providers for the [Agent](../index.md) and the **Agent node** in workflows. Griptape Cloud is provided by default. You can add local providers or any OpenAI-compatible endpoint as additional options.
 
 <!-- TODO(#5095): screenshot of Agent Settings → AI Providers section showing the provider list and "+ Add Provider" button -->
 
@@ -35,9 +35,9 @@ Each provider (other than Griptape Cloud) has three controls:
 
 ## Using a Provider in the Chat Sidebar
 
-Once a provider is enabled, its models appear in the **Model** dropdown in the chat sidebar, grouped by provider name. Click any model to switch to it immediately.
+Once a provider is enabled, its models appear in the **Model** dropdown in the Agent, grouped by provider name. Click any model to switch to it immediately.
 
-See [Agent Sidebar](../agent_sidebar.md) for more on the chat interface.
+See [Agent Sidebar](../index.md) for more on the chat interface.
 
 ## Using a Provider in a Workflow
 

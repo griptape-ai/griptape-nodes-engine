@@ -47,7 +47,7 @@ After creation the wizard shows a confirmation screen. Select a model, type a te
 
 Models you've pulled with `ollama pull` appear automatically in:
 
-- The **Model** dropdown in the [chat sidebar](../agent_sidebar.md), grouped under the Ollama provider name
+- The **Model** dropdown in the [Agent](../index.md), grouped under the Ollama provider name
 - The `prompt model` parameter on the **Agent node** when `provider` is set to Ollama
 
 To add more models, run `ollama pull <model-name>` in a terminal and they'll appear immediately.

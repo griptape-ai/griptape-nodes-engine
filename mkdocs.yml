@@ -46,12 +46,18 @@ plugins:
         how_to/mcp/servers/fetch.md: guides/mcp/servers/fetch.md
         how_to/mcp/servers/filesystem.md: guides/mcp/servers/filesystem.md
         how_to/mcp/servers/time.md: guides/mcp/servers/time.md
-        how_to/agent_sidebar.md: guides/agent_sidebar.md
-        how_to/ai_providers/index.md: guides/ai_providers/index.md
-        how_to/ai_providers/griptape_cloud.md: guides/ai_providers/griptape_cloud.md
-        how_to/ai_providers/ollama.md: guides/ai_providers/ollama.md
-        how_to/ai_providers/lm_studio.md: guides/ai_providers/lm_studio.md
-        how_to/ai_providers/custom.md: guides/ai_providers/custom.md
+        how_to/agent_sidebar.md: guides/agent/index.md
+        guides/agent_sidebar.md: guides/agent/index.md
+        how_to/ai_providers/index.md: guides/agent/providers/index.md
+        how_to/ai_providers/griptape_cloud.md: guides/agent/providers/griptape_cloud.md
+        how_to/ai_providers/ollama.md: guides/agent/providers/ollama.md
+        how_to/ai_providers/lm_studio.md: guides/agent/providers/lm_studio.md
+        how_to/ai_providers/custom.md: guides/agent/providers/custom.md
+        guides/ai_providers/index.md: guides/agent/providers/index.md
+        guides/ai_providers/griptape_cloud.md: guides/agent/providers/griptape_cloud.md
+        guides/ai_providers/ollama.md: guides/agent/providers/ollama.md
+        guides/ai_providers/lm_studio.md: guides/agent/providers/lm_studio.md
+        guides/ai_providers/custom.md: guides/agent/providers/custom.md
         developing_nodes/index.md: development/custom_nodes/index.md
         developing_nodes/getting_started.md: development/custom_nodes/getting_started.md
         developing_nodes/comprehensive_guide.md: development/custom_nodes/comprehensive_guide.md
@@ -91,14 +97,19 @@ plugins:
           - tutorials/02_coordinating_agents/index.md
           - tutorials/03_compare_prompts/index.md
           - tutorials/04_photography_team/index.md
-        Agent sidebar:
-          - guides/agent_sidebar.md: Built-in chat interface with direct workflow access via the Griptape MCP server
-        AI providers:
-          - guides/ai_providers/index.md: Overview of supported AI providers
-          - guides/ai_providers/griptape_cloud.md: Griptape Cloud (default hosted provider)
-          - guides/ai_providers/ollama.md: Ollama local provider setup
-          - guides/ai_providers/lm_studio.md: LM Studio local provider setup
-          - guides/ai_providers/custom.md: Custom OpenAI-compatible endpoint setup
+        Agent:
+          - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
+          - guides/agent/choosing_a_model.md: Selecting an AI model for the agent
+          - guides/agent/sending_messages.md: Sending messages and attaching files
+          - guides/agent/personalization.md: Customizing agent tone, role, and system prompt
+          - guides/agent/skills.md: Extending the agent with custom skill files
+          - guides/agent/threads.md: Conversation threads and local storage locations
+          - guides/agent/mcp_servers.md: Attaching MCP servers to an agent conversation
+          - guides/agent/providers/index.md: Overview of supported AI providers
+          - guides/agent/providers/griptape_cloud.md: Griptape Cloud (default hosted provider)
+          - guides/agent/providers/ollama.md: Ollama local provider setup
+          - guides/agent/providers/lm_studio.md: LM Studio local provider setup
+          - guides/agent/providers/custom.md: Custom OpenAI-compatible endpoint setup
         Configuration and libraries:
           - guides/configuration.md: Engine configuration (workspace, secrets, libraries)
           - guides/libraries.md: Installing and managing node libraries
@@ -227,13 +238,20 @@ nav:
       - FAQ: faq.md
       - Glossary: glossary.md
   - Guides:
-      - Agent Sidebar: guides/agent_sidebar.md
-      - AI Providers:
-          - Overview: guides/ai_providers/index.md
-          - Griptape Cloud: guides/ai_providers/griptape_cloud.md
-          - Ollama: guides/ai_providers/ollama.md
-          - LM Studio: guides/ai_providers/lm_studio.md
-          - Custom (OpenAI-compatible): guides/ai_providers/custom.md
+      - Agent:
+          - Overview: guides/agent/index.md
+          - Choosing a Model: guides/agent/choosing_a_model.md
+          - Sending Messages: guides/agent/sending_messages.md
+          - Personalization: guides/agent/personalization.md
+          - Skills: guides/agent/skills.md
+          - Threads: guides/agent/threads.md
+          - MCP Servers: guides/agent/mcp_servers.md
+          - Providers:
+              - Overview: guides/agent/providers/index.md
+              - Griptape Cloud: guides/agent/providers/griptape_cloud.md
+              - Ollama: guides/agent/providers/ollama.md
+              - LM Studio: guides/agent/providers/lm_studio.md
+              - Custom (OpenAI-compatible): guides/agent/providers/custom.md
       - Configuration: guides/configuration.md
       - Libraries: guides/libraries.md
       - Projects:
