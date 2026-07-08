@@ -1244,13 +1244,20 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> LibraryJsonCheck
             )
             commit_sha = rev_parse_result.stdout.strip()
 
-            # Get the committer date of the checked-out commit (strict ISO 8601)
-            commit_date_result = _run_git_command(
-                ["git", "log", "-1", "--format=%cI", "HEAD"],
-                temp_dir,
-                "Git log failed",
-            )
-            commit_datetime = parse_commit_datetime(commit_date_result.stdout.strip())
+            # Get the committer date of the checked-out commit (strict ISO 8601). This is a
+            # best-effort field for the update age gate; a failure here must not fail the whole
+            # checkout, which backs the core version-check path, so degrade to None on error
+            # (mirroring the pygit2 path below).
+            commit_datetime = None
+            try:
+                commit_date_result = _run_git_command(
+                    ["git", "log", "-1", "--format=%cI", "HEAD"],
+                    temp_dir,
+                    "Git log failed",
+                )
+                commit_datetime = parse_commit_datetime(commit_date_result.stdout.strip())
+            except GitCloneError as e:
+                logger.debug("Failed to read commit datetime from sparse checkout of %s: %s", remote_url, e)
 
             # Read the JSON data before temp directory is deleted
             try:
@@ -1336,12 +1343,14 @@ def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> LibraryJsonCheckout
             # Get commit SHA
             commit_sha = str(repo.head.target)
 
-            # Get the committer date of the checked-out commit
+            # Get the committer date of the checked-out commit. Peel to a commit first: for an
+            # annotated tag repo.head.target is the tag OID, and indexing it yields a pygit2.Tag
+            # (no commit_time). This is a best-effort field, so any failure degrades to None.
             commit_datetime = None
             try:
-                commit_obj = cast("pygit2.Commit", repo[repo.head.target])
+                commit_obj = cast("pygit2.Commit", repo[repo.head.target].peel(pygit2.Commit))
                 commit_datetime = datetime.fromtimestamp(commit_obj.commit_time, tz=UTC)
-            except (pygit2.GitError, KeyError, ValueError, OverflowError, OSError) as e:
+            except (pygit2.GitError, KeyError, AttributeError, ValueError, OverflowError, OSError) as e:
                 logger.debug("Failed to read commit datetime from clone of %s: %s", remote_url, e)
 
             # Read the JSON data before temp directory is deleted

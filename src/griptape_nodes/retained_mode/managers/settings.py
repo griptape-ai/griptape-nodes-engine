@@ -305,14 +305,19 @@ class LibrarySettings(BaseModel):
             "When True, a library update is withheld until the commit it would update to is at least "
             "`update_min_age_hours` old (a soak period). This guards against automatically adopting a "
             "freshly-pushed release before there is time to catch and yank a bad one. When False (default), "
-            "updates apply as soon as they are available."
+            "updates apply as soon as they are available. If the target commit's age cannot be determined "
+            "(e.g. the remote timestamp is unreadable), the update is allowed (fail-open) and a warning is "
+            "logged, so a metadata hiccup never permanently blocks updates."
         ),
     )
     update_min_age_hours: float = Field(
         default=24.0,
         description=(
             "Minimum age, in hours, of the target commit before an update may be applied. Only enforced when "
-            "`update_age_gating_enabled` is True. Age is measured from the target commit's git timestamp."
+            "`update_age_gating_enabled` is True. Age is measured from the target commit's git committer "
+            "timestamp, which is not necessarily when the release was published: rebased, cherry-picked, "
+            "backdated (GIT_COMMITTER_DATE), or force-moved tags can report an age that differs from the "
+            "actual publish time."
         ),
     )
 

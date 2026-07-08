@@ -18,7 +18,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.library_manager import LibraryGitOperationContext
+from griptape_nodes.retained_mode.managers.library_manager import AgeGateConfig, LibraryGitOperationContext
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY,
     LIBRARY_UPDATE_MIN_AGE_HOURS_KEY,
@@ -110,6 +110,67 @@ class TestEvaluateUpdateAgeGate:
             decision = library_manager._evaluate_update_age_gate(naive_young_commit)
 
         assert decision.gated is True
+
+    def test_enabled_unknown_timestamp_logs_fail_open_warning(
+        self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        library_manager = griptape_nodes.LibraryManager()
+
+        with (
+            patch.object(
+                GriptapeNodes, "ConfigManager", return_value=_config_manager(enabled=True, min_age_hours=MIN_AGE_HOURS)
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            decision = library_manager._evaluate_update_age_gate(None)
+
+        assert decision.gated is False
+        assert any("could not be determined" in message for message in caplog.messages)
+
+    def test_disabled_unknown_timestamp_does_not_warn(
+        self, griptape_nodes: GriptapeNodes, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        library_manager = griptape_nodes.LibraryManager()
+
+        with (
+            patch.object(
+                GriptapeNodes, "ConfigManager", return_value=_config_manager(enabled=False, min_age_hours=MIN_AGE_HOURS)
+            ),
+            caplog.at_level("WARNING"),
+        ):
+            decision = library_manager._evaluate_update_age_gate(None)
+
+        assert decision.enabled is False
+        assert not any("could not be determined" in message for message in caplog.messages)
+
+    def test_explicit_config_is_not_re_read_from_config_manager(self, griptape_nodes: GriptapeNodes) -> None:
+        """Passing a pre-read config skips the ConfigManager lookup entirely."""
+        library_manager = griptape_nodes.LibraryManager()
+        config_mgr = _config_manager(enabled=True, min_age_hours=MIN_AGE_HOURS)
+        old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
+
+        with patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr):
+            decision = library_manager._evaluate_update_age_gate(
+                old_commit, config=AgeGateConfig(enabled=True, min_age_hours=MIN_AGE_HOURS)
+            )
+
+        assert decision.enabled is True
+        assert decision.gated is False
+        config_mgr.get_config_value.assert_not_called()
+
+
+class TestReadAgeGateConfig:
+    """Test the config-reading helper that both the check and update paths share."""
+
+    def test_reads_both_keys(self, griptape_nodes: GriptapeNodes) -> None:
+        library_manager = griptape_nodes.LibraryManager()
+
+        with patch.object(
+            GriptapeNodes, "ConfigManager", return_value=_config_manager(enabled=True, min_age_hours=12.0)
+        ):
+            config = library_manager._read_age_gate_config()
+
+        assert config == AgeGateConfig(enabled=True, min_age_hours=12.0)
 
 
 class TestUpdateLibraryRequestAgeGate:

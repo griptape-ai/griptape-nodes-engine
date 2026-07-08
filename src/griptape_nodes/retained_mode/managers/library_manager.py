@@ -336,6 +336,13 @@ class UpdateAgeGateDecision(NamedTuple):
     min_age_hours: float
 
 
+class AgeGateConfig(NamedTuple):
+    """The library update age-gate config, read once so callers avoid duplicate config lookups."""
+
+    enabled: bool
+    min_age_hours: float
+
+
 class LibraryManager:
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
@@ -5363,21 +5370,8 @@ class LibraryManager:
             return None
         return LibraryManager.ResolvedDiscoveryPath(path=library_path, registered_path=entry.path)
 
-    def _evaluate_update_age_gate(self, commit_datetime: datetime | None) -> UpdateAgeGateDecision:
-        """Decide whether an update to a commit is withheld by the update age gate.
-
-        Reads library.update_age_gating_enabled and library.update_min_age_hours from config. When
-        gating is disabled the update is never gated. When enabled but the commit timestamp is
-        unknown, the update is allowed (age cannot be verified) and a warning is logged rather than
-        wedging updates permanently.
-
-        Args:
-            commit_datetime: The timezone-aware timestamp of the commit the update would move to.
-
-        Returns:
-            UpdateAgeGateDecision describing whether gating is enabled, whether this update is gated,
-            the commit's age in hours, and the configured minimum age.
-        """
+    def _read_age_gate_config(self) -> AgeGateConfig:
+        """Read the age-gate config keys once. Centralizes the key literals and default handling."""
         config_mgr = GriptapeNodes.ConfigManager()
         enabled = bool(
             config_mgr.get_config_value(LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY, default=False, cast_type=bool)
@@ -5385,6 +5379,31 @@ class LibraryManager:
         min_age_hours = float(
             config_mgr.get_config_value(LIBRARY_UPDATE_MIN_AGE_HOURS_KEY, default=24.0, cast_type=float)
         )
+        return AgeGateConfig(enabled=enabled, min_age_hours=min_age_hours)
+
+    def _evaluate_update_age_gate(
+        self, commit_datetime: datetime | None, config: AgeGateConfig | None = None
+    ) -> UpdateAgeGateDecision:
+        """Decide whether an update to a commit is withheld by the update age gate.
+
+        When gating is disabled the update is never gated. When enabled but the commit timestamp is
+        unknown, the update is allowed (age cannot be verified) and a warning is logged rather than
+        wedging updates permanently.
+
+        Args:
+            commit_datetime: The timezone-aware timestamp of the commit the update would move to.
+            config: Pre-read age-gate config. When None, it is read from config. Callers that must
+                inspect ``enabled`` before deciding whether to fetch the commit datetime should read
+                it once via _read_age_gate_config and pass it here to avoid a duplicate lookup.
+
+        Returns:
+            UpdateAgeGateDecision describing whether gating is enabled, whether this update is gated,
+            the commit's age in hours, and the configured minimum age.
+        """
+        if config is None:
+            config = self._read_age_gate_config()
+        enabled = config.enabled
+        min_age_hours = config.min_age_hours
 
         if not enabled:
             return UpdateAgeGateDecision(enabled=False, gated=False, age_hours=None, min_age_hours=min_age_hours)
@@ -5569,16 +5588,25 @@ class LibraryManager:
             )
             return CheckLibraryUpdateResultFailure(result_details=details)
 
-        # When an update exists, evaluate the age gate so callers can surface a "pending soak"
-        # state. version_info.commit_datetime is the timestamp of the commit this update targets.
-        age_gate = self._evaluate_update_age_gate(version_info.commit_datetime if has_update else None)
-        update_gated_by_age = has_update and age_gate.gated
+        # Evaluate the age gate only when an update actually exists, so callers can surface a
+        # "pending soak" state. Skipping the evaluation when up to date avoids a spurious
+        # "timestamp could not be determined" warning (there is simply nothing to gate) and the
+        # cost of the decision on the common no-update path.
+        if has_update:
+            age_gate = self._evaluate_update_age_gate(version_info.commit_datetime)
+            update_gated_by_age = age_gate.gated
+            target_commit_age_hours = age_gate.age_hours
+            update_min_age_hours = age_gate.min_age_hours if age_gate.enabled else None
+        else:
+            update_gated_by_age = False
+            target_commit_age_hours = None
+            update_min_age_hours = None
 
         if update_gated_by_age:
             details = (
                 f"Update available for Library '{library_name}' ({current_version} -> {latest_version}), but the "
-                f"target commit is {age_gate.age_hours:.1f}h old, younger than the required "
-                f"{age_gate.min_age_hours:.1f}h soak period. Update will be available once the target commit ages."
+                f"target commit is {target_commit_age_hours:.1f}h old, younger than the required "
+                f"{update_min_age_hours:.1f}h soak period. Update will be available once the target commit ages."
             )
             logger.info(details)
         else:
@@ -5594,8 +5622,8 @@ class LibraryManager:
             local_commit=local_commit,
             remote_commit=remote_commit,
             update_gated_by_age=update_gated_by_age,
-            target_commit_age_hours=age_gate.age_hours if has_update else None,
-            update_min_age_hours=age_gate.min_age_hours if age_gate.enabled else None,
+            target_commit_age_hours=target_commit_age_hours,
+            update_min_age_hours=update_min_age_hours,
             result_details=details,
         )
 
@@ -5760,13 +5788,10 @@ class LibraryManager:
 
         # Enforce the update age gate (soak period) before mutating the working tree. Only pay the
         # remote round-trip when gating is actually enabled, so the common (disabled) path is free.
-        config_mgr = GriptapeNodes.ConfigManager()
-        age_gating_enabled = bool(
-            config_mgr.get_config_value(LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY, default=False, cast_type=bool)
-        )
-        if age_gating_enabled:
+        age_gate_config = self._read_age_gate_config()
+        if age_gate_config.enabled:
             target_commit_datetime = await self._get_remote_target_commit_datetime(library_dir)
-            age_gate = self._evaluate_update_age_gate(target_commit_datetime)
+            age_gate = self._evaluate_update_age_gate(target_commit_datetime, config=age_gate_config)
             if age_gate.gated:
                 details = (
                     f"Cannot update Library '{library_name}' yet: the target commit is "
