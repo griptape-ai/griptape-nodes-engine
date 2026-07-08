@@ -1182,6 +1182,9 @@ class FlowManager:
         if target_had_prior_value_for_undo:
             # Restore the property value the connection overwrote, after the edge is removed so the
             # INPUT+PROPERTY "connected, cannot set as property" guard no longer blocks the set.
+            # If the target is locked between this connect and the undo, the detach still succeeds but
+            # this restore fails and history is cleared (the safe default); the edge is gone but the
+            # value is not restored. That narrow case is accepted rather than reversed here.
             undo_requests.append(
                 SetParameterValueRequest(
                     node_name=target_node_name,
