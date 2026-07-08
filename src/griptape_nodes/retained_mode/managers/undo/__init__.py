@@ -6,8 +6,8 @@ Public surface:
       `RequestReplayUndoEntry`, `UndoRecorder`, `RecorderCapture`, `UndoEntryReplayError`, and the
       `dispatch_expecting` / `dispatch_expecting_success` replay helpers.
 
-Per-domain reversal knowledge lives in sibling modules (e.g. `undo.node`) and is registered with
-the manager by the owning domain manager.
+Per-domain reversal knowledge lives in the `undo.recorders` subpackage (e.g. `recorders.node`) and
+is registered with the manager by the owning domain manager.
 """
 
 from griptape_nodes.retained_mode.managers.undo.core import (

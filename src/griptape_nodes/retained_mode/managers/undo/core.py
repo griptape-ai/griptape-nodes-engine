@@ -114,8 +114,8 @@ class UndoRecorder(ABC):
     """Records the information needed to build an UndoBatch for one request type.
 
     A recorder lives in the module that owns the reversal knowledge for its domain (e.g. node
-    recorders live in undo.node) and is registered via UndoManager.register_recorder by the
-    owning manager. Use a recorder (rather than record_inverse) when reversing an operation
+    recorders live in undo.recorders.node) and is registered via UndoManager.register_recorder by
+    the owning manager. Use a recorder (rather than record_inverse) when reversing an operation
     requires state captured *before* the handler runs (e.g. serializing a node before it is
     deleted) or *after* it (e.g. the assigned name of a freshly created node).
     """

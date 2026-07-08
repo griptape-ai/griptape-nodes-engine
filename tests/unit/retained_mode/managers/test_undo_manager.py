@@ -675,7 +675,7 @@ class TestUndoManager:
 
     def test_register_recorder_rejects_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
         """A second recorder for the same request type is a registration error, mirroring handlers."""
-        from griptape_nodes.retained_mode.managers.undo.node import CreateNodeRecorder
+        from griptape_nodes.retained_mode.managers.undo.recorders.node import CreateNodeRecorder
 
         undo_manager = griptape_nodes.UndoManager()
         with pytest.raises(ValueError, match="already registered"):

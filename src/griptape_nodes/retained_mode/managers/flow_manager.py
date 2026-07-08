@@ -174,7 +174,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
-from griptape_nodes.retained_mode.managers.undo.flow import CreateConnectionRecorder, DeleteConnectionRecorder
+from griptape_nodes.retained_mode.managers.undo.recorders.flow import (
+    CreateConnectionRecorder,
+    DeleteConnectionRecorder,
+)
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
