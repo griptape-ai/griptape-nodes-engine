@@ -200,6 +200,10 @@ class DeleteConnectionRecorder(UndoRecorder):
             # The delete itself will fail; nothing to record.
             return RecorderCapture(state=None)
 
+        # No proxy-remap skip is needed here (unlike CreateConnectionRecorder): the delete handler
+        # has no proxy-remap path and validates the raw endpoints via _has_connection, so a
+        # raw-endpoint delete of a subflow-proxied connection fails. create_batch only records on
+        # DeleteConnectionResultSuccess, so a failed proxy delete records no (wrong) inverse.
         return RecorderCapture(
             state=_ConnectionEndpoints(
                 source_node_name=source_node.name,
