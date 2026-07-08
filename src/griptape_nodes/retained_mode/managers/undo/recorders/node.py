@@ -131,8 +131,12 @@ class DeleteNodeUndoEntry(UndoEntry):
             )
             raise UndoEntryReplayError(msg)
 
-        self._restore_connections()
+        # Restore values before connections: a re-created outgoing connection propagates this node's
+        # value to its downstream target, so the value must already be set for that to be faithful.
+        # A re-created incoming connection then overwrites this node's own input with the upstream
+        # value, matching the pre-delete state. Lock last so it does not block the value/edge sets.
         self._restore_parameter_values()
+        self._restore_connections()
         self._restore_lock_state()
 
     def redo(self) -> None:
@@ -331,16 +335,14 @@ class SetParameterValueRecorder(UndoRecorder):
             return RecorderCapture(state=None)
 
         node_name = request.node_name
-        node = None
         if node_name is None:
             context_manager = GriptapeNodes.ContextManager()
             if not context_manager.has_current_node():
                 # The set itself will fail; nothing to record.
                 return RecorderCapture(state=None)
-            node = context_manager.get_current_node()
-            node_name = node.name
-        if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node_name = context_manager.get_current_node().name
+
+        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             return RecorderCapture(state=None)
 
