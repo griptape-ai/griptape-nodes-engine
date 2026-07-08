@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import pytest
-from pydantic_ai.messages import ModelRequest, ModelResponse, TextPart, UserPromptPart
+from pydantic_ai.messages import ImageUrl, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
 
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
 
@@ -48,6 +48,22 @@ def test_save_and_load_history_round_trips(storage: LocalThreadStorageDriver) ->
     assert isinstance(reloaded[0], ModelRequest)
     assert isinstance(reloaded[1], ModelResponse)
     assert any(isinstance(p, TextPart) and p.content == "Hello!" for p in reloaded[1].parts)
+
+
+def test_image_url_in_user_prompt_round_trips(storage: LocalThreadStorageDriver) -> None:
+    """A user prompt carrying an ImageUrl reference survives save/load intact."""
+    thread_id, _ = storage.create_thread()
+    url = "http://localhost:8124/workspace/cat.png"
+    history: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+    storage.save_history(thread_id, history)
+    reloaded = storage.load_history(thread_id)
+
+    assert isinstance(reloaded[0], ModelRequest)
+    part = reloaded[0].parts[0]
+    assert isinstance(part, UserPromptPart)
+    assert part.content[0] == "look"
+    assert isinstance(part.content[1], ImageUrl)
+    assert part.content[1].url == url
 
 
 def test_list_threads_returns_message_counts_and_sorts(storage: LocalThreadStorageDriver) -> None:

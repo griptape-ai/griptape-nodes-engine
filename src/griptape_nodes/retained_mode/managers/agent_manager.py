@@ -25,13 +25,13 @@ import mimetypes
 import os
 import textwrap
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic_ai.messages import BinaryContent, ModelMessagesTypeAdapter
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
 
@@ -127,7 +127,7 @@ from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
 
 if TYPE_CHECKING:
-    from pydantic_ai.messages import UserContent
+    from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -231,6 +231,11 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # inlining it for the model, and the media type to assume when neither the
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+# History images are re-fetched from the local static-file server (loopback), so
+# a much shorter timeout applies: it bounds the per-turn stall when that server
+# is unreachable (e.g. its port shifted across restarts) instead of the 30s an
+# external attachment warrants.
+_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS = 5.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
 
 # Written into the workspace skills directory the first time a runner is
@@ -274,6 +279,19 @@ class _ActiveRun:
 
     cancel_event: asyncio.Event
     loop: asyncio.AbstractEventLoop
+
+
+@dataclass
+class _RehydratedMessage:
+    """A history message copy plus how many of its images were re-inlined.
+
+    ``attempted`` counts the ``ImageUrl`` parts found; ``succeeded`` counts those
+    whose bytes were re-downloaded, so the caller can log the aggregate.
+    """
+
+    message: ModelRequest
+    attempted: int
+    succeeded: int
 
 
 class AgentManager:
@@ -390,7 +408,7 @@ class AgentManager:
             provider_name=request.provider_name,
             model_name=request.model_name,
         )
-        prompt = await _compose_prompt(request.input, request.url_artifacts)
+        composed = await _compose_prompt(request.input, request.url_artifacts)
 
         event_manager = GriptapeNodes.EventManager()
 
@@ -407,7 +425,14 @@ class AgentManager:
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
         try:
-            result = await runner.run(prompt, thread_id=thread_id, event_sink=emit, cancel_event=cancel_event)
+            result = await runner.run(
+                composed.live,
+                thread_id=thread_id,
+                event_sink=emit,
+                cancel_event=cancel_event,
+                persist_prompt=composed.persist,
+                history_rehydrator=self._rehydrate_history,
+            )
         finally:
             # Only drop our own entry; a newer run for the same thread may have
             # replaced it (shouldn't happen for the chat sidebar, but stay safe).
@@ -445,6 +470,85 @@ class AgentManager:
             thread_id=result.thread_id,
             result_details="Agent execution completed successfully.",
         )
+
+    async def _rehydrate_history(self, messages: list[ModelMessage]) -> list[ModelMessage]:
+        """Return a copy of ``messages`` with ``ImageUrl`` attachments re-inlined.
+
+        History stores localhost static-file URLs the external provider cannot
+        fetch, so replayed turns need the raw bytes re-inlined. A part whose
+        download fails is dropped, matching ``_compose_prompt`` behavior.
+
+        The input is never mutated: rehydrated bytes belong only to the copy fed
+        to the model, so they can never be written back to disk. Messages that
+        carry no image are returned unchanged (same object). Downloads run
+        concurrently and against a short loopback timeout so an unreachable
+        static server bounds, rather than serializes, the per-turn stall.
+        """
+        # _message_has_image_url is True only for a ModelRequest, so every entry
+        # here is safe to hand to _rehydrate_message.
+        image_requests = [
+            (index, message)
+            for index, message in enumerate(messages)
+            if isinstance(message, ModelRequest) and _message_has_image_url(message)
+        ]
+        if not image_requests:
+            return messages
+        async with httpx.AsyncClient(timeout=_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+            # Rehydrate every image-bearing message concurrently so a slow or
+            # unreachable static server bounds the whole turn's stall to one
+            # timeout, not one per message.
+            results = await asyncio.gather(*(self._rehydrate_message(client, message) for _, message in image_requests))
+        result_by_position = {index: result for (index, _), result in zip(image_requests, results, strict=True)}
+        rehydrated_messages: list[ModelMessage] = []
+        attempted = 0
+        succeeded = 0
+        for index, message in enumerate(messages):
+            result = result_by_position.get(index)
+            if result is None:
+                rehydrated_messages.append(message)
+                continue
+            rehydrated_messages.append(result.message)
+            attempted += result.attempted
+            succeeded += result.succeeded
+        if succeeded < attempted:
+            logger.warning(
+                "Re-inlined %d/%d history image(s) for the chat turn; the rest could not be "
+                "downloaded from the local static-file server, so the model will not see them. "
+                "This usually means the static server moved to a different port across restarts.",
+                succeeded,
+                attempted,
+            )
+        return rehydrated_messages
+
+    async def _rehydrate_message(self, client: httpx.AsyncClient, message: ModelRequest) -> _RehydratedMessage:
+        """Return a copy of ``message`` with each user-prompt ``ImageUrl`` inlined.
+
+        Downloads for a message run concurrently. The result also carries how many
+        images were attempted versus successfully re-inlined so the caller can
+        report the aggregate.
+        """
+        attempted = 0
+        succeeded = 0
+        new_parts: list[Any] = []
+        for part in message.parts:
+            if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+                new_parts.append(part)
+                continue
+            images = [(index, item) for index, item in enumerate(part.content) if isinstance(item, ImageUrl)]
+            attempted += len(images)
+            downloads = await asyncio.gather(*(_download_image_content(client, image.url) for _, image in images))
+            downloaded_by_index = {index: content for (index, _), content in zip(images, downloads, strict=True)}
+            rehydrated: list[UserContent] = []
+            for index, item in enumerate(part.content):
+                if index not in downloaded_by_index:
+                    rehydrated.append(item)
+                    continue
+                content = downloaded_by_index[index]
+                if content is not None:
+                    succeeded += 1
+                    rehydrated.append(content)
+            new_parts.append(replace(part, content=rehydrated))
+        return _RehydratedMessage(message=replace(message, parts=new_parts), attempted=attempted, succeeded=succeeded)
 
     def on_handle_cancel_agent_request(self, request: CancelAgentRequest) -> ResultPayload:
         """Signal cooperative cancellation to the in-flight run for a thread.
@@ -992,7 +1096,20 @@ class AgentManager:
         return thread_id
 
 
-async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> str | list[UserContent]:
+@dataclass
+class ComposedPrompt:
+    """A user prompt in two forms: raw bytes for the live call, URLs to persist.
+
+    ``live`` inlines ``BinaryContent`` so the provider sees pixels (it cannot
+    fetch the localhost static-file URLs). ``persist`` swaps each image for an
+    ``ImageUrl`` so saved history stays small and the GUI renders thumbnails.
+    """
+
+    live: str | list[UserContent]
+    persist: str | list[UserContent]
+
+
+async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> ComposedPrompt:
     """Combine the plain text input with any attached image artifacts.
 
     Image attachments are downloaded server-side and inlined as
@@ -1000,28 +1117,50 @@ async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact
     The engine fetches the bytes itself, which is why this works even when the
     static file store hands out localhost URLs the model provider cannot reach.
 
-    Returns the plain ``text`` when there are no usable image attachments,
-    otherwise a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    Returns two aligned forms of the prompt. ``live`` is the plain ``text`` (no
+    attachments) or a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    ``persist`` mirrors it with each image as a lightweight ``ImageUrl`` so the
+    saved history stays small; a download that fails is dropped from both.
     """
     image_urls = [
         artifact.value for artifact in url_artifacts if artifact.type == "ImageUrlArtifact" and artifact.value
     ]
     if not image_urls:
-        return text
+        return ComposedPrompt(live=text, persist=text)
 
-    contents: list[UserContent] = []
+    live: list[UserContent] = []
+    persist: list[UserContent] = []
     if text:
-        contents.append(text)
+        live.append(text)
+        persist.append(text)
     async with httpx.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
         for url in image_urls:
             content = await _download_image_content(client, url)
-            if content is not None:
-                contents.append(content)
+            if content is None:
+                continue
+            live.append(content)
+            persist.append(ImageUrl(url=url))
 
     # Every download failed: fall back to plain text so the turn still runs.
-    if not any(isinstance(content, BinaryContent) for content in contents):
-        return text
-    return contents
+    if not any(isinstance(part, BinaryContent) for part in live):
+        return ComposedPrompt(live=text, persist=text)
+    return ComposedPrompt(live=live, persist=persist)
+
+
+def _message_has_image_url(message: ModelMessage) -> bool:
+    """Report whether ``message`` carries an ``ImageUrl`` in a user prompt.
+
+    Used to skip opening an HTTP client for text-only histories, the common
+    case, so rehydration only pays the download cost when there is an image.
+    """
+    if not isinstance(message, ModelRequest):
+        return False
+    for part in message.parts:
+        if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+            continue
+        if any(isinstance(item, ImageUrl) for item in part.content):
+            return True
+    return False
 
 
 async def _download_image_content(client: httpx.AsyncClient, url: str) -> BinaryContent | None:

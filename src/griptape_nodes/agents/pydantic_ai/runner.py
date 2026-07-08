@@ -34,6 +34,7 @@ from pydantic_ai.messages import (
     FinalResultEvent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelRequest,
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
@@ -42,6 +43,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
     ToolCallPart,
+    UserPromptPart,
 )
 from pydantic_ai_skills import SkillsCapability
 
@@ -59,7 +61,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pydantic_ai._run_context import RunContext
-    from pydantic_ai.messages import UserContent
+    from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
     from pydantic_ai.usage import UsageLimits
 
@@ -236,7 +238,7 @@ class PydanticAgentRunner:
     def image_toolset(self) -> ImageGenerationToolset | None:
         return self._image_toolset
 
-    async def run(
+    async def run(  # noqa: PLR0913
         self,
         prompt: str | Sequence[UserContent],
         *,
@@ -244,6 +246,8 @@ class PydanticAgentRunner:
         token_sink: Callable[[str], Awaitable[None] | None] | None = None,
         event_sink: Callable[[RunEvent], Awaitable[None] | None] | None = None,
         cancel_event: asyncio.Event | None = None,
+        persist_prompt: str | Sequence[UserContent] | None = None,
+        history_rehydrator: Callable[[list[ModelMessage]], Awaitable[list[ModelMessage]]] | None = None,
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -262,6 +266,16 @@ class PydanticAgentRunner:
                 cancelled and :meth:`run` returns an :class:`AgentRunResult` with
                 ``cancelled=True`` carrying the text streamed so far. The
                 cancelled turn is not persisted.
+            persist_prompt: When the live ``prompt`` inlines binary content, the
+                URL-reference form to store in this turn's user message instead
+                of it, keeping saved history small. ``None`` persists ``prompt``
+                as-is.
+            history_rehydrator: Optional async hook that returns a transformed
+                copy of the loaded message history for the model call (e.g.
+                re-downloading image URLs back to bytes). It MUST NOT mutate its
+                input: the pristine history is persisted again after this turn,
+                so any in-place edit would leak back onto disk. ``None`` sends
+                the loaded history to the model unchanged.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -269,7 +283,14 @@ class PydanticAgentRunner:
         if thread_id is None or not self.storage.thread_exists(thread_id):
             thread_id, _ = self.storage.create_thread()
 
+        # ``history`` is the pristine on-disk form (images as URL references); it
+        # is what we persist again after this turn. ``model_history`` may inline
+        # the bytes for the model call, but we never write it back, so rehydrated
+        # bytes never leak onto disk.
         history = self.storage.load_history(thread_id)
+        model_history = history
+        if history_rehydrator is not None:
+            model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
         logger.info(
@@ -292,7 +313,7 @@ class PydanticAgentRunner:
         run_task = asyncio.ensure_future(
             self._agent.run(
                 prompt,
-                message_history=history,
+                message_history=model_history,
                 usage_limits=self.usage_limits,
                 event_stream_handler=event_handler,
             )
@@ -324,7 +345,10 @@ class PydanticAgentRunner:
                 cancelled=True,
             )
 
-        new_messages = agent_result.all_messages()
+        # Persist the pristine history plus only this turn's new messages. Using
+        # ``new_messages()`` rather than ``all_messages()`` keeps any rehydrated
+        # bytes in ``model_history`` out of what we write back to disk.
+        new_messages = agent_result.new_messages()
         usage = agent_result.usage
 
         elapsed = time.monotonic() - started
@@ -354,11 +378,14 @@ class PydanticAgentRunner:
                 counters.tool_calls,
             )
 
-        self.storage.save_history(thread_id, list(new_messages))
+        messages_to_save = list(history) + list(new_messages)
+        if persist_prompt is not None:
+            _apply_persist_prompt(messages_to_save, persist_prompt)
+        self.storage.save_history(thread_id, messages_to_save)
         return AgentRunResult(
             thread_id=thread_id,
             output=text,
-            message_count=len(new_messages),
+            message_count=len(messages_to_save),
             image_urls=list(counters.image_urls),
         )
 
@@ -541,6 +568,25 @@ async def _push_event(
     result = event_sink(event)
     if asyncio.iscoroutine(result):
         await result
+
+
+def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Sequence[UserContent]) -> None:
+    """Rewrite the newest user turn's content to the URL-reference form in place.
+
+    Locates the last ``ModelRequest`` carrying a ``UserPromptPart`` and replaces
+    that part's ``content`` so history stores ``ImageUrl`` references instead of
+    inlined ``BinaryContent``. Does nothing when no user turn is found.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for index, part in enumerate(message.parts):
+            if isinstance(part, UserPromptPart):
+                message.parts = [
+                    UserPromptPart(content=persist_prompt, timestamp=part.timestamp) if i == index else existing
+                    for i, existing in enumerate(message.parts)
+                ]
+                return
 
 
 def _preview(value: str) -> str:

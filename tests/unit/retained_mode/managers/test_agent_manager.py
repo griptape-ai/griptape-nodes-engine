@@ -13,7 +13,7 @@ from pathlib import Path
 
 import httpx
 import pytest
-from pydantic_ai.messages import BinaryContent
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -59,9 +59,11 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _SKILLS_README,
     _VALID_PROVIDER_TYPES,
     AgentManager,
+    ComposedPrompt,
     _ActiveRun,
     _compose_prompt,
     _friendly_list_models_error,
+    _message_has_image_url,
 )
 
 
@@ -239,7 +241,7 @@ class TestComposePrompt:
     async def test_no_artifacts_returns_plain_text(self, patch_get: _GetRecorder) -> None:
         result = await _compose_prompt("hello", [])
 
-        assert result == "hello"
+        assert result == ComposedPrompt(live="hello", persist="hello")
         assert patch_get.requested_urls == []
 
     @pytest.mark.asyncio
@@ -248,7 +250,7 @@ class TestComposePrompt:
 
         result = await _compose_prompt("hello", artifacts)
 
-        assert result == "hello"
+        assert result == ComposedPrompt(live="hello", persist="hello")
         assert patch_get.requested_urls == []
 
     @pytest.mark.asyncio
@@ -258,13 +260,25 @@ class TestComposePrompt:
 
         result = await _compose_prompt("look", [_image_artifact(url)])
 
-        assert isinstance(result, list)
-        assert result[0] == "look"
-        image = result[1]
+        assert isinstance(result.live, list)
+        assert result.live[0] == "look"
+        image = result.live[1]
         assert isinstance(image, BinaryContent)
         assert image.data == b"png-bytes"
         assert image.media_type == "image/png"
         assert patch_get.requested_urls == [url]
+
+    @pytest.mark.asyncio
+    async def test_persist_form_swaps_bytes_for_image_url(self, patch_get: _GetRecorder) -> None:
+        # The persisted form mirrors the live form but carries the source URL as
+        # an ImageUrl instead of the inlined bytes, keeping history small.
+        url = "http://localhost:9/workspace/cat.png"
+        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+
+        result = await _compose_prompt("look", [_image_artifact(url)])
+
+        assert result.persist == ["look", ImageUrl(url=url)]
+        assert not any(isinstance(part, BinaryContent) for part in result.persist)
 
     @pytest.mark.asyncio
     async def test_reads_request_artifact_attributes(self, patch_get: _GetRecorder) -> None:
@@ -276,8 +290,8 @@ class TestComposePrompt:
 
         result = await _compose_prompt("who is this", [artifact])
 
-        assert isinstance(result, list)
-        binary_parts = [part for part in result if isinstance(part, BinaryContent)]
+        assert isinstance(result.live, list)
+        binary_parts = [part for part in result.live if isinstance(part, BinaryContent)]
         assert len(binary_parts) == 1
         assert binary_parts[0].data == b"dog"
 
@@ -290,10 +304,10 @@ class TestComposePrompt:
 
         result = await _compose_prompt("", [_image_artifact(url)])
 
-        assert isinstance(result, list)
+        assert isinstance(result.live, list)
         # Empty text contributes no leading string element.
-        assert len(result) == 1
-        image = result[0]
+        assert len(result.live) == 1
+        image = result.live[0]
         assert isinstance(image, BinaryContent)
         assert image.media_type == "image/jpeg"
 
@@ -304,9 +318,9 @@ class TestComposePrompt:
 
         result = await _compose_prompt("hi", [_image_artifact(url)])
 
-        assert isinstance(result, list)
-        assert isinstance(result[1], BinaryContent)
-        assert result[1].media_type == "image/png"
+        assert isinstance(result.live, list)
+        assert isinstance(result.live[1], BinaryContent)
+        assert result.live[1].media_type == "image/png"
 
     @pytest.mark.asyncio
     async def test_failed_download_is_dropped(self, patch_get: _GetRecorder) -> None:
@@ -316,17 +330,107 @@ class TestComposePrompt:
 
         result = await _compose_prompt("two", [_image_artifact(bad_url), _image_artifact(ok_url)])
 
-        assert isinstance(result, list)
-        binary_parts = [part for part in result if isinstance(part, BinaryContent)]
+        assert isinstance(result.live, list)
+        binary_parts = [part for part in result.live if isinstance(part, BinaryContent)]
         assert len(binary_parts) == 1
         assert binary_parts[0].data == b"ok"
+        # The dropped attachment leaves no ImageUrl in the persisted form either.
+        assert result.persist == ["two", ImageUrl(url=ok_url)]
 
     @pytest.mark.asyncio
     async def test_all_downloads_failing_falls_back_to_text(self, patch_get: _GetRecorder) -> None:
         result = await _compose_prompt("text", [_image_artifact("http://localhost:9/workspace/gone.png")])
 
-        assert result == "text"
+        assert result == ComposedPrompt(live="text", persist="text")
         assert patch_get.requested_urls == ["http://localhost:9/workspace/gone.png"]
+
+
+class TestMessageHasImageUrl:
+    def test_true_for_user_prompt_with_image_url(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url="http://x/a.png")])])
+
+        assert _message_has_image_url(message) is True
+
+    def test_false_for_text_only_user_prompt(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content="just text")])
+
+        assert _message_has_image_url(message) is False
+
+    def test_false_for_list_content_without_image_url(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content=["a", "b"])])
+
+        assert _message_has_image_url(message) is False
+
+
+class TestRehydrateHistory:
+    @pytest.mark.asyncio
+    async def test_text_only_history_returns_unchanged_without_downloading(
+        self, agent_manager: AgentManager, patch_get: _GetRecorder
+    ) -> None:
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hello")])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        assert result is messages
+        assert patch_get.requested_urls == []
+
+    @pytest.mark.asyncio
+    async def test_image_url_is_downloaded_back_to_binary_content(
+        self, agent_manager: AgentManager, patch_get: _GetRecorder
+    ) -> None:
+        url = "http://localhost:9/workspace/cat.png"
+        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content[0] == "look"
+        image = part.content[1]
+        assert isinstance(image, BinaryContent)
+        assert image.data == b"png-bytes"
+        assert patch_get.requested_urls == [url]
+        # The input must not be mutated: the persisted history stays an ImageUrl.
+        original_part = messages[0].parts[0]
+        assert isinstance(original_part, UserPromptPart)
+        assert isinstance(original_part.content[1], ImageUrl)
+
+    @pytest.mark.asyncio
+    async def test_failed_download_drops_the_part(self, agent_manager: AgentManager, patch_get: _GetRecorder) -> None:
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == ["look"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_preserve_order_with_partial_failure(
+        self, agent_manager: AgentManager, patch_get: _GetRecorder
+    ) -> None:
+        # Concurrent downloads must not reorder content: the surviving image
+        # keeps its slot and interleaved text stays put; the failed one drops.
+        ok_url = "http://localhost:9/workspace/ok.png"
+        bad_url = "http://localhost:9/workspace/gone.png"
+        patch_get.responses[ok_url] = httpx.Response(200, content=b"ok", headers={"content-type": "image/png"})
+        content = ["before", ImageUrl(url=bad_url), "middle", ImageUrl(url=ok_url), "after"]
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=content)])]
+
+        result = await agent_manager._rehydrate_history(messages)
+
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        # bad_url dropped; ok_url inlined; text order preserved.
+        assert part.content[0] == "before"
+        assert part.content[1] == "middle"
+        assert isinstance(part.content[2], BinaryContent)
+        assert part.content[2].data == b"ok"
+        assert part.content[3] == "after"
+        assert not any(isinstance(item, ImageUrl) for item in part.content)
 
 
 # ---------------------------------------------------------------------------
