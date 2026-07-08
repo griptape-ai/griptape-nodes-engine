@@ -896,6 +896,11 @@ class DeleteFileRequest(RequestPayload):
         file_entry: FileSystemEntry from directory listing (mutually exclusive with path)
         workspace_only: If True, constrain to workspace directory
         deletion_behavior: How to handle deletion (permanent, recycle bin only, or prefer recycle bin)
+        collect_deleted_paths: If True, recursively enumerate every descendant of a deleted
+            directory into the result's deleted_paths. Off by default because for large
+            directory trees this list can grow to many megabytes, bloating the broadcast
+            result. Callers that need the full list (e.g. reporting individual deletions)
+            opt in explicitly.
 
     Results: DeleteFileResultSuccess | DeleteFileResultFailure
     """
@@ -904,6 +909,7 @@ class DeleteFileRequest(RequestPayload):
     file_entry: FileSystemEntry | None = None
     workspace_only: bool | None = True
     deletion_behavior: DeletionBehavior = DeletionBehavior.PREFER_RECYCLE_BIN
+    collect_deleted_paths: bool = False
 
 
 @dataclass
@@ -914,7 +920,9 @@ class DeleteFileResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     Attributes:
         deleted_path: The absolute path that was deleted (primary path)
         was_directory: Whether the deleted item was a directory
-        deleted_paths: List of all paths that were deleted (for recursive deletes, includes all files/dirs)
+        deleted_paths: Paths that were deleted. Contains just the primary path unless the request
+            set collect_deleted_paths=True, in which case a deleted directory expands to every
+            descendant file/dir.
         outcome: The actual outcome of the deletion (permanently deleted or sent to recycle bin)
     """
 
