@@ -54,6 +54,23 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 
 
+def _values_equal(left: Any, right: Any) -> bool:
+    """Return whether two parameter values are equal, treating an ambiguous comparison as "not equal".
+
+    A value whose ``==`` returns a non-bool (e.g. a numpy array yields an element-wise result whose
+    truthiness raises) must not break no-op detection: if the comparison raises or does not yield a
+    plain bool, report the values as different so the edit is recorded rather than raising out of
+    create_batch and invalidating undo history.
+    """
+    try:
+        result = left == right
+    except Exception:
+        return False
+    if isinstance(result, bool):
+        return result
+    return False
+
+
 @dataclass
 class CreateNodeUndoEntry(UndoEntry):
     """Reverses a node creation by deleting the node; redo re-creates it under its original name."""
@@ -157,14 +174,26 @@ class DeleteNodeUndoEntry(UndoEntry):
 
     def _restore_parameter_values(self) -> None:
         for indirect_command in self.set_parameter_value_commands:
-            set_value_command = indirect_command.set_parameter_value_command
             if indirect_command.unique_value_uuid not in self.unique_parameter_uuid_to_values:
                 msg = (
                     f"Attempted to undo deletion of node '{self.node_name}'. Failed because the recorded value for "
-                    f"parameter '{set_value_command.parameter_name}' was missing from the captured unique values."
+                    f"parameter '{indirect_command.set_parameter_value_command.parameter_name}' was missing from the "
+                    f"captured unique values."
                 )
                 raise UndoEntryReplayError(msg)
-            set_value_command.value = self.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
+            # Deep-copy the command and its value per replay: the handler writes back to its request
+            # (value/data_type normalization) and equal values are dedup'd into one shared object,
+            # so dispatching the stored command directly would mutate the capture and let it drift --
+            # or corrupt every parameter that shared the value -- across repeated undo/redo cycles.
+            set_value_command = copy.deepcopy(indirect_command.set_parameter_value_command)
+            # A value that cannot be deep-copied is restored by reference; the handler's writeback
+            # still lands on the copied command rather than the shared capture.
+            value = self.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
+            try:  # noqa: SIM105
+                value = copy.deepcopy(value)
+            except Exception:  # noqa: S110
+                pass
+            set_value_command.value = value
             set_value_command.node_name = self.node_name
             result = GriptapeNodes.handle_request(set_value_command)
             if result.failed():
@@ -342,7 +371,7 @@ class SetParameterValueRecorder(UndoRecorder):
             return UndoBatch(label="", entries=[])
         capture: _ParameterEditCapture = state
         # A set that did not change the value is a no-op.
-        if capture.old_value == result.finalized_value:
+        if _values_equal(capture.old_value, result.finalized_value):
             return UndoBatch(label="", entries=[])
 
         undo_request = SetParameterValueRequest(

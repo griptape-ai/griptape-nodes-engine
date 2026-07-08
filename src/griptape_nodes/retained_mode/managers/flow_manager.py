@@ -268,7 +268,7 @@ class FlowManager:
     _global_dag_builder: DagBuilder
     _node_executor: NodeExecutor
 
-    def __init__(self, event_manager: EventManager, undo_manager: UndoManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager) -> None:
         event_manager.assign_manager_to_request_type(CreateFlowRequest, self.on_create_flow_request)
         event_manager.assign_manager_to_request_type(DeleteFlowRequest, self.on_delete_flow_request)
         event_manager.assign_manager_to_request_type(ListNodesInFlowRequest, self.on_list_nodes_in_flow_request)
@@ -320,18 +320,22 @@ class FlowManager:
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
 
-        # Register how connection requests are reversed for undo/redo. The UndoManager owns the
-        # mechanism; the flow domain owns the knowledge of how to reverse its own requests.
-        # Execution requests alter workflow state but are not undoable (undo is about editing, not
-        # running), so they stay declared as the non-undoable floor.
-        if undo_manager is not None:
-            undo_manager.register_recorder(CreateConnectionRequest, CreateConnectionRecorder())
-            undo_manager.register_recorder(DeleteConnectionRequest, DeleteConnectionRecorder())
-            undo_manager.register_non_undoable(
-                StartFlowRequest,
-                CancelFlowRequest,
-                UnresolveFlowRequest,
-            )
+    def register_undo_recorders(self, undo_manager: UndoManager) -> None:
+        """Register how connection requests are reversed for undo/redo.
+
+        The UndoManager owns the mechanism; the flow domain owns the knowledge of how to reverse
+        its own requests. Execution requests alter workflow state but are not undoable (undo is
+        about editing, not running), so they stay declared as the non-undoable floor. Called from
+        GriptapeNodes wiring after construction; isolated unit tests that build a FlowManager
+        directly simply skip it.
+        """
+        undo_manager.register_recorder(CreateConnectionRequest, CreateConnectionRecorder())
+        undo_manager.register_recorder(DeleteConnectionRequest, DeleteConnectionRecorder())
+        undo_manager.register_non_undoable(
+            StartFlowRequest,
+            CancelFlowRequest,
+            UnresolveFlowRequest,
+        )
 
     @property
     def global_single_node_resolution(self) -> bool:
