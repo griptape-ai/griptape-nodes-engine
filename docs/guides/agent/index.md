@@ -37,7 +37,8 @@ For example, you can ask it to:
 - **"Change the prompt on my Agent node to..."** — it updates node parameters directly
 - **"Explain what this workflow does"** — it reads your workflow structure and gives you a plain-language summary
 
-The agent has direct access to your workflow because Griptape Nodes runs a small background service that lets the agent read and control the canvas — nothing you need to set up or think about.
+!!! tip "How does the agent control my workflow?"
+    Griptape Nodes runs a built-in **MCP server** alongside the engine. MCP (Model Context Protocol) is an open standard that lets AI models call tools — in this case, tools for reading your canvas, creating nodes, running workflows, and more. The agent connects to this server automatically; there's nothing to configure.
 
 ## What's next
 
