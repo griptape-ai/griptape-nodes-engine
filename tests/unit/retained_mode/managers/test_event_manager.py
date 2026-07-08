@@ -12,6 +12,10 @@ from griptape_nodes.app.worker_routing import RemoteHandler
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.base_events import (
     EventResultSuccess,
+    ExecutionEvent,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
+    ProgressEvent,
     RequestPayload,
     ResultDetail,
     ResultDetails,
@@ -746,3 +750,94 @@ class TestAuthorizationCheckpointHooks:
         second = manager.evaluate_authorization_checkpoint(self._checkpoint())
         assert second is None
         assert len(calls) == 2  # noqa: PLR2004
+
+
+@dataclass
+class _FakeStreamEvent(ExecutionPayload):
+    """Minimal ExecutionPayload for exercising the execution-event feed."""
+
+    text: str = ""
+
+
+@dataclass
+class _OtherExecEvent(ExecutionPayload):
+    """A second ExecutionPayload type to prove type-scoped delivery."""
+
+    value: int = 0
+
+
+class TestExecutionEventSubscription:
+    """Nodes can tap the live execution-event feed via add_listener_to_execution_event."""
+
+    @staticmethod
+    def _wrap(payload: ExecutionPayload) -> ExecutionGriptapeNodeEvent:
+        return ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=payload))
+
+    @pytest.mark.asyncio
+    async def test_listener_receives_matching_payloads_in_order(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="he")))
+        manager.put_event(self._wrap(_FakeStreamEvent(text="llo")))
+
+        assert received == ["he", "llo"]
+
+    @pytest.mark.asyncio
+    async def test_only_subscribed_payload_type_is_delivered(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_OtherExecEvent(value=1)))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_remove_listener_stops_delivery(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+        manager.remove_listener_for_execution_event(_FakeStreamEvent, callback)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="x")))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_listener_exception_does_not_break_delivery(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def boom(_payload: _FakeStreamEvent) -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, boom)
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="ok")))
+
+        assert received == ["ok"]
+
+    @pytest.mark.asyncio
+    async def test_non_execution_events_are_ignored(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[ExecutionPayload] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, received.append)
+
+        # A ProgressEvent is not an ExecutionGriptapeNodeEvent; it must neither crash
+        # dispatch nor be delivered to execution listeners.
+        manager.put_event(ProgressEvent(value="x", node_name="n", parameter_name="output"))
+
+        assert received == []

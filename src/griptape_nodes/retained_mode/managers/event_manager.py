@@ -23,6 +23,8 @@ from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
     ProgressEvent,
     RequestPayload,
     ResultDetails,
@@ -48,6 +50,7 @@ if TYPE_CHECKING:
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
 AP = TypeVar("AP", bound=AppPayload, default=AppPayload)
+EP = TypeVar("EP", bound=ExecutionPayload, default=ExecutionPayload)
 
 
 _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
@@ -92,6 +95,10 @@ class EventManager:
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
+        # Dictionary to store ALL SUBSCRIBERS to execution events (the live feed of
+        # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
+        # tap the feed while it runs and react (e.g. stream tokens to a parameter).
+        self._execution_event_listeners: dict[type[ExecutionPayload], set[Callable]] = {}
         # Event queue for publishing events
         self._event_queue: asyncio.Queue | None = None
         # Keep track of which thread the event loop runs on
@@ -232,6 +239,8 @@ class EventManager:
         if self._event_queue is None:
             return
 
+        self._dispatch_to_execution_listeners(event)
+
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
             # _is_cross_thread_call() guarantees _event_loop is not None
@@ -250,6 +259,8 @@ class EventManager:
         """
         if self._event_queue is None:
             return
+
+        self._dispatch_to_execution_listeners(event)
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -832,6 +843,64 @@ class EventManager:
             self._app_event_listeners[app_event_type] = listener_set
 
         listener_set.add(callback)
+
+    def add_listener_to_execution_event(
+        self, execution_event_type: type[EP], callback: Callable[[EP], None]
+    ) -> None:
+        """Subscribe to a type of execution event on the live event feed.
+
+        Execution events (``ExecutionPayload`` subclasses such as ``AgentStreamEvent``,
+        ``AgentToolCallEvent``, ``ProgressEvent``-adjacent run signals) are emitted as
+        events flow through ``put_event``/``aput_event`` on their way to the UI. This
+        lets a node tap that feed while it runs and react in real time -- for example,
+        appending streamed agent tokens onto one of its own parameters.
+
+        The callback is invoked synchronously with the payload as each matching event
+        is emitted, on whatever thread emitted it. Keep callbacks cheap and non-blocking;
+        an exception in a callback is logged and does not interrupt event delivery.
+
+        Events carry no run identifier, so a subscriber that only wants its own run's
+        events should subscribe immediately before it triggers the run and unsubscribe
+        as soon as the run returns (see ``remove_listener_for_execution_event``).
+        """
+        listener_set = self._execution_event_listeners.get(execution_event_type)
+        if listener_set is None:
+            listener_set = set()
+            self._execution_event_listeners[execution_event_type] = listener_set
+
+        listener_set.add(callback)
+
+    def remove_listener_for_execution_event(
+        self, execution_event_type: type[EP], callback: Callable[[EP], None]
+    ) -> None:
+        """Unsubscribe a callback previously registered with ``add_listener_to_execution_event``."""
+        listener_set = self._execution_event_listeners.get(execution_event_type)
+        if listener_set is not None:
+            listener_set.discard(callback)
+            if not listener_set:
+                del self._execution_event_listeners[execution_event_type]
+
+    def _dispatch_to_execution_listeners(self, event: Any) -> None:
+        """Fan a queued execution event out to any subscribers before it reaches the UI.
+
+        Only ``ExecutionGriptapeNodeEvent``s carry an ``ExecutionPayload``; everything
+        else on the queue is ignored here. Dispatch is synchronous and best-effort so a
+        misbehaving subscriber never blocks or breaks the event queue.
+        """
+        if not self._execution_event_listeners or not isinstance(event, ExecutionGriptapeNodeEvent):
+            return
+        payload = event.wrapped_event.payload
+        listener_set = self._execution_event_listeners.get(type(payload))
+        if not listener_set:
+            return
+        for callback in list(listener_set):
+            try:
+                callback(payload)
+            except Exception:
+                logging.getLogger("griptape_nodes").exception(
+                    "Execution-event listener for %s raised; continuing event delivery.",
+                    type(payload).__name__,
+                )
 
     def remove_listener_for_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
