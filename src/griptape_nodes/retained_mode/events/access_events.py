@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -8,6 +9,19 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+
+class CodecAccessDirection(StrEnum):
+    """Direction a ``QueryCodecAccessRequest`` is asking about.
+
+    Values are the wire strings clients send. Using ``StrEnum`` means
+    parameter values coming back from the WS boundary as plain strings
+    (``"read"`` / ``"write"``) match without an explicit ``.value`` lookup,
+    while the type still catches typos on the Python side.
+    """
+
+    READ = "read"
+    WRITE = "write"
 
 
 @dataclass(frozen=True)
@@ -204,7 +218,7 @@ class QueryCodecAccessRequest(RequestPayload):
     """
 
     candidate_codecs: list[str] = field(default_factory=list)
-    direction: str = "read"
+    direction: CodecAccessDirection = CodecAccessDirection.READ
     container_format: str | None = None
 
 
