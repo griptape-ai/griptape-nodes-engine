@@ -2,7 +2,7 @@
 
 !!! warning "Billing Required for xAI API Usage"
 
-    The GrokPrompt node requires an xAI account and billing information to be set up before xAI API keys will work. Without completing the billing setup, any nodes using xAI will fail, even with a valid API key. See [this guide](../../how_to/keys/grok.md) for instructions on setting up a xAI account with billing.
+    The GrokPrompt node requires an xAI account and billing information to be set up before xAI API keys will work. Without completing the billing setup, any nodes using xAI will fail, even with a valid API key. See [this guide](../../guides/integrations/grok.md) for instructions on setting up a xAI account with billing.
 
 ## What is it?
 

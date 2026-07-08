@@ -63,6 +63,7 @@ docs = [
   "mkdocstrings[python]>=0.29.1",
   "mkdocs-mermaid2-plugin>=1.2.2",
   "mkdocs-llmstxt>=0.5.0",
+  "mkdocs-redirects>=1.2.2,<1.2.3",
   "pymdown-extensions>=10.17",
 ]
 test = [
