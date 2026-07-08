@@ -851,15 +851,17 @@ class EventManager:
     def add_listener_to_execution_event(self, execution_event_type: type[EP], callback: Callable[[EP], None]) -> None:
         """Subscribe to a type of execution event on the live event feed.
 
-        Execution events (``ExecutionPayload`` subclasses such as ``AgentStreamEvent``,
-        ``AgentToolCallEvent``, ``ProgressEvent``-adjacent run signals) are emitted as
-        events flow through ``put_event``/``aput_event`` on their way to the UI. This
-        lets a node tap that feed while it runs and react in real time -- for example,
-        appending streamed agent tokens onto one of its own parameters.
+        Execution events (``ExecutionPayload`` subclasses such as ``AgentStreamEvent``
+        and ``AgentToolCallEvent``) are emitted as events flow through
+        ``put_event``/``aput_event`` on their way to the UI. This lets a node tap that
+        feed while it runs and react in real time -- for example, appending streamed
+        agent tokens onto one of its own parameters.
 
         The callback is invoked synchronously with the payload as each matching event
         is emitted, on whatever thread emitted it. Keep callbacks cheap and non-blocking;
-        an exception in a callback is logged and does not interrupt event delivery.
+        an exception in a callback is logged and does not interrupt event delivery. Unlike
+        ``add_listener_to_app_event``, async callbacks are not supported and are rejected
+        here rather than silently dropped at dispatch time.
 
         Only the exact payload type is matched -- subscribing to a base class such as
         ``ExecutionPayload`` does not receive its subclasses (this mirrors
@@ -871,6 +873,14 @@ class EventManager:
         events should subscribe immediately before it triggers the run and unsubscribe
         as soon as the run returns (see ``remove_listener_for_execution_event``).
         """
+        if inspect.iscoroutinefunction(callback):
+            msg = (
+                f"Attempted to subscribe to execution event '{execution_event_type.__name__}'. "
+                f"Failed because callback '{getattr(callback, '__name__', callback)}' is a coroutine "
+                f"function; execution-event listeners are invoked synchronously on the emitting "
+                f"thread and must be plain (non-async) callables."
+            )
+            raise TypeError(msg)
         with self._execution_event_listeners_lock:
             listener_set = self._execution_event_listeners.get(execution_event_type)
             if listener_set is None:

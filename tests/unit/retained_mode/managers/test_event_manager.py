@@ -907,6 +907,30 @@ class TestExecutionEventSubscription:
             assert received[-1] == "final"
 
     @pytest.mark.asyncio
+    async def test_base_class_subscription_does_not_receive_subclasses(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[ExecutionPayload] = []
+        # Only the exact payload type is matched; subscribing to the base ExecutionPayload
+        # must not receive concrete subclasses like _FakeStreamEvent.
+        manager.add_listener_to_execution_event(ExecutionPayload, received.append)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="x")))
+
+        assert received == []
+
+    @pytest.mark.asyncio
+    async def test_async_callback_is_rejected(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        async def async_callback(_payload: _FakeStreamEvent) -> None:
+            pass
+
+        with pytest.raises(TypeError, match="coroutine"):
+            manager.add_listener_to_execution_event(_FakeStreamEvent, async_callback)  # pyright: ignore[reportArgumentType]
+
+    @pytest.mark.asyncio
     async def test_non_execution_events_are_ignored(self) -> None:
         manager = EventManager()
         manager.initialize_queue(asyncio.Queue())
