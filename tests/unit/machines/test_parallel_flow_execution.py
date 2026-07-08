@@ -397,8 +397,9 @@ class TestCollectValuesFromUpstreamNodes:
 
         Pushing an upstream value into a locked node would be rejected by the
         SetParameterValueRequest handler and escalated into a fatal error, making
-        the whole workflow un-runnable. Locking means "don't run this node", so
-        value collection into it must be a quiet no-op.
+        the whole workflow un-runnable. A locked node is frozen (skipped for
+        execution, keeps its existing outputs), so value collection into it must
+        be a quiet no-op.
         """
         locked_node = MagicMock(spec=BaseNode)
         locked_node.name = "locked_node"
