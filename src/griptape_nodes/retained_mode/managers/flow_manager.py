@@ -1117,23 +1117,26 @@ class FlowManager:
             ParameterType.attempt_get_builtin(source_param.output_type) == ParameterTypeBuiltin.CONTROL_TYPE
         )
         is_dest_node_locked = target_node.lock
-        # Capture the target's prior property value so undoing this connection can restore it.
-        # Deleting a connection does not wipe a PROPERTY parameter's value, so without this the
-        # value the connection is about to overwrite would be lost on undo. Non-PROPERTY targets
-        # are wiped on disconnect, which already matches their pre-connection state.
+        # Prior target value snapshot for undo. Populated only when the connection actually overwrites
+        # the target value (inside the value-passing branch below), so a connection that does not
+        # overwrite it (locked target, control parameter, initial setup) records no restore and undo
+        # stays a simple detach.
         target_prior_value_for_undo = None
         target_had_prior_value_for_undo = False
-        if (
-            not request.initial_setup
-            and ParameterMode.PROPERTY in target_param.allowed_modes
-            and target_param.name in target_node.parameter_values
-        ):
-            try:
-                target_prior_value_for_undo = copy.deepcopy(target_node.get_parameter_value(target_param.name))
-                target_had_prior_value_for_undo = True
-            except Exception:
-                target_had_prior_value_for_undo = False
         if (not is_control_parameter) and (not is_dest_node_locked) and (not request.initial_setup):
+            # Capture the value the connection is about to overwrite so undo can restore it. Deleting a
+            # connection does not wipe a PROPERTY parameter's value, so without this the overwritten
+            # value would be lost on undo. Non-PROPERTY targets are wiped on disconnect, which already
+            # matches their pre-connection state.
+            if (
+                ParameterMode.PROPERTY in target_param.allowed_modes
+                and target_param.name in target_node.parameter_values
+            ):
+                try:
+                    target_prior_value_for_undo = copy.deepcopy(target_node.get_parameter_value(target_param.name))
+                    target_had_prior_value_for_undo = True
+                except Exception:
+                    target_had_prior_value_for_undo = False
             # When creating a connection, pass the initial value from source to target parameter
             # Set incoming_connection_source fields to identify this as legitimate connection value passing
             # (not manual property setting) so it bypasses the INPUT+PROPERTY connection blocking logic
