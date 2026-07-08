@@ -830,6 +830,83 @@ class TestExecutionEventSubscription:
         assert received == ["ok"]
 
     @pytest.mark.asyncio
+    async def test_aput_event_dispatches_to_listener(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        manager.add_listener_to_execution_event(_FakeStreamEvent, lambda p: received.append(p.text))
+
+        await manager.aput_event(self._wrap(_FakeStreamEvent(text="async")))
+
+        assert received == ["async"]
+
+    @pytest.mark.asyncio
+    async def test_duplicate_add_is_idempotent(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+
+        manager.put_event(self._wrap(_FakeStreamEvent(text="once")))
+
+        assert received == ["once"]
+
+    @pytest.mark.asyncio
+    async def test_remove_unregistered_callback_is_noop(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        # Removing a callback that was never registered (and an unknown type) must not raise.
+        manager.remove_listener_for_execution_event(_FakeStreamEvent, lambda _p: None)
+        manager.remove_listener_for_execution_event(_OtherExecEvent, lambda _p: None)
+
+    @pytest.mark.asyncio
+    async def test_concurrent_emit_and_subscribe_is_thread_safe(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+        received: list[str] = []
+        received_lock = threading.Lock()
+
+        def callback(payload: _FakeStreamEvent) -> None:
+            with received_lock:
+                received.append(payload.text)
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, callback)
+
+        stop = threading.Event()
+
+        def emit() -> None:
+            while not stop.is_set():
+                manager.put_event(self._wrap(_FakeStreamEvent(text="t")))
+
+        # A worker thread emits continuously (the production path) while the main thread
+        # churns subscribe/unsubscribe. This must never raise "dict changed size during
+        # iteration" or corrupt the listener registry.
+        emitter = threading.Thread(target=emit)
+        emitter.start()
+        try:
+            for _ in range(500):
+                extra = lambda _p: None  # noqa: E731
+                manager.add_listener_to_execution_event(_FakeStreamEvent, extra)
+                manager.remove_listener_for_execution_event(_FakeStreamEvent, extra)
+        finally:
+            stop.set()
+            emitter.join()
+
+        # The originally-registered callback survives the churn and keeps receiving.
+        with received_lock:
+            baseline = len(received)
+        manager.put_event(self._wrap(_FakeStreamEvent(text="final")))
+        with received_lock:
+            assert len(received) == baseline + 1
+            assert received[-1] == "final"
+
+    @pytest.mark.asyncio
     async def test_non_execution_events_are_ignored(self) -> None:
         manager = EventManager()
         manager.initialize_queue(asyncio.Queue())

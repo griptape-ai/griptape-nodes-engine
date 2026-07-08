@@ -99,6 +99,10 @@ class EventManager:
         # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
         # tap the feed while it runs and react (e.g. stream tokens to a parameter).
         self._execution_event_listeners: dict[type[ExecutionPayload], set[Callable]] = {}
+        # put_event/aput_event dispatch this feed on whatever thread emitted the event
+        # (often a worker thread), while subscribe/unsubscribe happen on the run's
+        # thread, so guard the dict and snapshot the target set before iterating.
+        self._execution_event_listeners_lock = threading.Lock()
         # Event queue for publishing events
         self._event_queue: asyncio.Queue | None = None
         # Keep track of which thread the event loop runs on
@@ -844,9 +848,7 @@ class EventManager:
 
         listener_set.add(callback)
 
-    def add_listener_to_execution_event(
-        self, execution_event_type: type[EP], callback: Callable[[EP], None]
-    ) -> None:
+    def add_listener_to_execution_event(self, execution_event_type: type[EP], callback: Callable[[EP], None]) -> None:
         """Subscribe to a type of execution event on the live event feed.
 
         Execution events (``ExecutionPayload`` subclasses such as ``AgentStreamEvent``,
@@ -859,26 +861,39 @@ class EventManager:
         is emitted, on whatever thread emitted it. Keep callbacks cheap and non-blocking;
         an exception in a callback is logged and does not interrupt event delivery.
 
+        Only the exact payload type is matched -- subscribing to a base class such as
+        ``ExecutionPayload`` does not receive its subclasses (this mirrors
+        ``add_listener_to_app_event``). Execution events reach subscribers even when the
+        UI consumer suppresses them (suppression is applied downstream, not here), so
+        this feed is deliberately independent of ``should_suppress_event``.
+
         Events carry no run identifier, so a subscriber that only wants its own run's
         events should subscribe immediately before it triggers the run and unsubscribe
         as soon as the run returns (see ``remove_listener_for_execution_event``).
         """
-        listener_set = self._execution_event_listeners.get(execution_event_type)
-        if listener_set is None:
-            listener_set = set()
-            self._execution_event_listeners[execution_event_type] = listener_set
-
-        listener_set.add(callback)
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(execution_event_type)
+            if listener_set is None:
+                listener_set = set()
+                self._execution_event_listeners[execution_event_type] = listener_set
+            listener_set.add(callback)
 
     def remove_listener_for_execution_event(
         self, execution_event_type: type[EP], callback: Callable[[EP], None]
     ) -> None:
-        """Unsubscribe a callback previously registered with ``add_listener_to_execution_event``."""
-        listener_set = self._execution_event_listeners.get(execution_event_type)
-        if listener_set is not None:
-            listener_set.discard(callback)
-            if not listener_set:
-                del self._execution_event_listeners[execution_event_type]
+        """Unsubscribe a callback previously registered with ``add_listener_to_execution_event``.
+
+        Because dispatch invokes callbacks outside the lock (a callback may re-enter
+        ``put_event``), a callback can still fire once more if a concurrent emission on
+        another thread already snapshotted the listener set before this call. Callbacks
+        must tolerate a late invocation after they have been removed.
+        """
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(execution_event_type)
+            if listener_set is not None:
+                listener_set.discard(callback)
+                if not listener_set:
+                    del self._execution_event_listeners[execution_event_type]
 
     def _dispatch_to_execution_listeners(self, event: Any) -> None:
         """Fan a queued execution event out to any subscribers before it reaches the UI.
@@ -886,14 +901,20 @@ class EventManager:
         Only ``ExecutionGriptapeNodeEvent``s carry an ``ExecutionPayload``; everything
         else on the queue is ignored here. Dispatch is synchronous and best-effort so a
         misbehaving subscriber never blocks or breaks the event queue.
+
+        Runs on the emitting thread (frequently a worker thread), so the listener set is
+        snapshotted under the lock and callbacks are invoked outside it -- holding the
+        lock across a callback that re-enters ``put_event`` would deadlock.
         """
-        if not self._execution_event_listeners or not isinstance(event, ExecutionGriptapeNodeEvent):
+        if not isinstance(event, ExecutionGriptapeNodeEvent):
             return
         payload = event.wrapped_event.payload
-        listener_set = self._execution_event_listeners.get(type(payload))
-        if not listener_set:
-            return
-        for callback in list(listener_set):
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(type(payload))
+            if not listener_set:
+                return
+            callbacks = list(listener_set)
+        for callback in callbacks:
             try:
                 callback(payload)
             except Exception:
