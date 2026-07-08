@@ -151,6 +151,12 @@ class RecordingSession:
         # Count of currently-open recording dispatches. A dispatch records only when this is 0 on
         # entry, so a nested cascade (depth > 0) is owned by its recording ancestor rather than
         # recorded separately.
+        #
+        # The active frame, dispatch stack, and depth are shared session state that assume
+        # user-initiated requests are dispatched serially (one external request and its synchronous
+        # cascade finish before the next begins). The engine processes external requests one at a
+        # time, so this holds; two user-initiated requests interleaving mid-await would misattribute
+        # the second's mutations into the first's batch.
         self._recording_depth = 0
 
     def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:

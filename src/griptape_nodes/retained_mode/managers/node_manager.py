@@ -313,7 +313,7 @@ class _NodeInstantiationDeniedError(Exception):
 class NodeManager:
     _name_to_parent_flow_name: dict[str, str]
 
-    def __init__(self, event_manager: EventManager, undo_manager: UndoManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager) -> None:
         self._name_to_parent_flow_name = {}
 
         # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
@@ -413,23 +413,26 @@ class NodeManager:
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
 
-        # Register how node requests are reversed for undo/redo. The UndoManager owns the
-        # mechanism; the node domain owns the knowledge of how to reverse its own requests.
-        # undo_manager is None in isolated unit tests that construct NodeManager directly.
-        if undo_manager is not None:
-            undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
-            undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
-            undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
-            # Node mutations declared non-undoable act as the floor for the undo system: a user
-            # mutation of one of these neither records nor invalidates history. These are not yet
-            # undoable and become recorders as coverage grows.
-            undo_manager.register_non_undoable(
-                SetNodeMetadataRequest,
-                BatchSetNodeMetadataRequest,
-                SetLockNodeStateRequest,
-                ResolveNodeRequest,
-                UnresolveNodeRequest,
-            )
+    def register_undo_recorders(self, undo_manager: UndoManager) -> None:
+        """Register how node requests are reversed for undo/redo.
+
+        The UndoManager owns the mechanism; the node domain owns the knowledge of how to reverse
+        its own requests. Called from GriptapeNodes wiring after construction; isolated unit tests
+        that build a NodeManager directly simply skip it.
+        """
+        undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
+        undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
+        undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
+        # Node mutations declared non-undoable act as the floor for the undo system: a user
+        # mutation of one of these neither records nor invalidates history. These are not yet
+        # undoable and become recorders as coverage grows.
+        undo_manager.register_non_undoable(
+            SetNodeMetadataRequest,
+            BatchSetNodeMetadataRequest,
+            SetLockNodeStateRequest,
+            ResolveNodeRequest,
+            UnresolveNodeRequest,
+        )
 
     def handle_node_rename(self, old_name: str, new_name: str) -> None:
         # Get the node itself

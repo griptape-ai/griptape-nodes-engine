@@ -157,16 +157,18 @@ class GriptapeNodes(metaclass=SingletonMeta):
         # Initialize only if our managers haven't been created yet
         if not hasattr(self, "_event_manager"):
             self._event_manager = EventManager()
-            # Created early so domain managers (NodeManager, FlowManager, ...) can register their
-            # undo recorders and non-undoable request types with it from their own __init__.
+            # Created early so its recorders can be registered by the domain managers below.
             self._undo_manager = UndoManager(self._event_manager)
             self._resource_manager = ResourceManager(self._event_manager)
             self._config_manager = ConfigManager(self._event_manager)
             self._os_manager = OSManager(self._event_manager)
             self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
             self._object_manager = ObjectManager(self._event_manager)
-            self._node_manager = NodeManager(self._event_manager, self._undo_manager)
-            self._flow_manager = FlowManager(self._event_manager, self._undo_manager)
+            self._node_manager = NodeManager(self._event_manager)
+            self._flow_manager = FlowManager(self._event_manager)
+            # Wire the domain managers' undo recorders now that both they and the UndoManager exist.
+            self._node_manager.register_undo_recorders(self._undo_manager)
+            self._flow_manager.register_undo_recorders(self._undo_manager)
             self._context_manager = ContextManager(self._event_manager)
             self._worker_manager = WorkerManager(griptape_nodes=self, event_manager=self._event_manager)
             self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager)
