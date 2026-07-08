@@ -69,6 +69,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("griptape_nodes")
 
+DEFAULT_SKILLS_DIRECTORY = ".agents/skills"
+
 
 TokenSink = "Callable[[str], Awaitable[None] | None]"
 """Callback that receives streamed text tokens for relay to clients."""
@@ -159,7 +161,7 @@ class PydanticAgentRunner:
     image_config: ImageGenerationToolsetConfig | None = None
     static_files_manager: StaticFilesManager | None = None
     auto_load_skills: bool = True
-    skills_directory: str = ".agents/skills"
+    skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
 
     _agent: Agent[Any, str] = field(init=False)
