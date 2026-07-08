@@ -23,6 +23,7 @@ from dotenv.main import DotEnv
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import HuggingFaceModelParameter
+from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
@@ -532,6 +533,18 @@ dependencies = [
                 continue
 
             dest = destination / resolved_relative
+
+            # The destination can resolve to the same file as the source when the package
+            # destination lives inside the project root (e.g. the Nuke publisher writes the
+            # bundle next to files the workflow already references). Copying a file onto
+            # itself raises SameFileError, so treat it as already-in-place and skip.
+            if canonicalize_for_identity(absolute_path) == canonicalize_for_identity(dest):
+                copied.add(absolute_path)
+                logger.info(
+                    "Static file for node '%s' is already in place; skipping copy: %s", node_name, absolute_path
+                )
+                continue
+
             if absolute_path.is_dir():
                 self.copy_tree(absolute_path, dest)
             else:
