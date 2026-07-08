@@ -174,20 +174,42 @@ class ConfigManager:
         else:
             self._libraries_root_override = str(Path(path).expanduser().resolve())
 
-    def configured_global_workspace_path(self) -> Path:
-        """Return the absolute GLOBAL configured workspace_directory, ignoring per-project overrides.
+    def _resolve_configured_workspace_directory(self, *, include_runtime_override: bool) -> str:
+        """Resolve workspace_directory across the config layers, in load_configs' precedence order.
 
-        Reads workspace_directory from the user config, then the default config, mirroring
-        ProjectManager._decide_workspace_post_inheritance's global-default branch. Unlike
-        `workspace_path`, this never reflects the runtime `_workspace_dir_override` (which pins the
-        active workspace to a self-contained project's own folder), so it is the shared, project-
-        independent workspace root. The Settings default always populates default_config, so
-        workspace_directory is present in at least one layer.
+        Single source of truth for how workspace_directory is layered (highest priority first):
+        env var, then the runtime override (only when `include_runtime_override`), then workspace
+        config, project-adjacent config, user config, and finally the Settings default. load_configs
+        uses this WITH the override to set the active workspace_path; configured_global_workspace_path
+        uses it WITHOUT, to get the engine's workspace independent of any single project's pin. Keeping
+        both on this one helper is what stops the two precedences from drifting. The Settings default
+        always populates default_config, so a value is always returned.
         """
-        configured = self.get_config_value("workspace_directory", config_source="user_config", default=None)
-        if configured is None:
-            configured = self.get_config_value("workspace_directory", config_source="default_config", default=None)
-        return Path(configured).expanduser().resolve()
+        # env is applied last in load_configs, so it is highest priority; the runtime override sits
+        # just below env and above the config files.
+        if (env_value := get_dot_value(self.env_config, "workspace_directory", None)) is not None:
+            return env_value
+        if include_runtime_override and self._workspace_dir_override is not None:
+            return self._workspace_dir_override
+        for layer in (self.workspace_config, self.project_config, self.user_config):
+            if (configured := get_dot_value(layer, "workspace_directory", None)) is not None:
+                return configured
+        return self.default_config["workspace_directory"]
+
+    def configured_global_workspace_path(self) -> Path:
+        """Return the workspace_directory as configured, EXCLUDING the runtime per-project override.
+
+        The runtime `_workspace_dir_override` is the only layer that pins the active workspace to a
+        self-contained project's own folder (workspace_dir "./"); everything else (a
+        GTN_CONFIG_WORKSPACE_DIRECTORY env var, a project-adjacent or workspace `workspace_directory`,
+        the user/default config) describes where the ENGINE's workspace lives.
+
+        This is the base for the unset-libraries_dir fallback: libraries follow an engine that
+        relocates its whole workspace via env/adjacent config, but do NOT follow a single project's
+        self-contained workspace_dir pin (so a v1 self-contained project's unset libraries still land
+        in the shared workspace `libraries/`, matching pre-v1 behavior).
+        """
+        return Path(self._resolve_configured_workspace_directory(include_runtime_override=False)).expanduser().resolve()
 
     def resolved_libraries_root(self) -> Path:
         """Return the absolute directory under which libraries install and resolve.
@@ -311,8 +333,10 @@ class ConfigManager:
             merged_config = merge_dicts(merged_config, self.env_config)
             logger.debug("Merged config from environment variables: %s", list(self.env_config.keys()))
 
-        # Re-assign workspace path in case env var or project config overrides it
-        self.workspace_path = merged_config["workspace_directory"]
+        # Re-assign workspace path in case env var or project config overrides it. Uses the shared
+        # precedence resolver (WITH the runtime override) so the active workspace and
+        # configured_global_workspace_path() can never disagree on layer ordering.
+        self.workspace_path = self._resolve_configured_workspace_directory(include_runtime_override=True)
 
         # Validate the full config against the Settings model.
         try:
