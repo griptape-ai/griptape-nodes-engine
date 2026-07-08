@@ -475,26 +475,30 @@ def _build_path_tree(paths: list[str]) -> dict:
     return tree
 
 
-def _filter_list(items: list, subtree: dict) -> list:
-    return [_apply_path_tree(item, subtree) if isinstance(item, dict) else item for item in items]
+def _filter_list(items: list, subtree: dict, _path: str = "") -> list:
+    return [_apply_path_tree(item, subtree, _path) if isinstance(item, dict) else item for item in items]
 
 
-def _apply_wildcard_tree(data: dict, subtree: dict) -> dict:
+def _apply_wildcard_tree(data: dict, subtree: dict, _path: str = "") -> dict:
     # Applies subtree to every value in data, used when the dict's keys are arbitrary
     # (e.g. workflow file paths) rather than fixed field names. See _apply_path_tree.
     if not subtree:
         return dict(data)
     filtered = {}
     for k, v in data.items():
-        filtered[k] = _filter_list(v, subtree) if isinstance(v, list) else _apply_path_tree(v, subtree)
+        item_path = f"{_path}.{k}" if _path else k
+        filtered[k] = (
+            _filter_list(v, subtree, item_path) if isinstance(v, list) else _apply_path_tree(v, subtree, item_path)
+        )
     return filtered
 
 
-def _apply_path_tree(data: Any, tree: dict) -> Any:
+def _apply_path_tree(data: Any, tree: dict, _path: str = "") -> Any:
     # Called by EventResult.dict() to prune the unstructured result dict before WebSocket broadcast.
     # Frontend sets RequestPayload.fields (e.g. ["workflows.*.name"]) to shrink the wire payload;
     # safe_unstructure still materializes the full result in memory — only transmission is reduced.
     # Framework fields are re-added by the caller after this returns.
+    # _path tracks the dot-path to the current node for warning messages; callers omit it.
     if not isinstance(data, dict):
         return data
 
@@ -508,20 +512,22 @@ def _apply_path_tree(data: Any, tree: dict) -> Any:
                 "Use '*' only when all keys in the dict are arbitrary (e.g. file paths).",
                 named_siblings,
             )
-        return _apply_wildcard_tree(data, tree["*"])
+        return _apply_wildcard_tree(data, tree["*"], _path)
 
     # Named-key traversal: keep only fields present in the tree, drop everything else.
     result = {}
     for key, subtree in tree.items():
+        full_path = f"{_path}.{key}" if _path else key
         if key not in data:
+            logger.warning("fields filter: '%s' not found in result — typo or version skew?", full_path)
             continue
         value = data[key]
         if not subtree:
             result[key] = value  # leaf — keep value whole
         elif isinstance(value, list):
-            result[key] = _filter_list(value, subtree)
+            result[key] = _filter_list(value, subtree, full_path)
         else:
-            result[key] = _apply_path_tree(value, subtree)
+            result[key] = _apply_path_tree(value, subtree, full_path)
     return result
 
 
@@ -546,13 +552,6 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         result_dict = safe_unstructure(self.result)
         if self.request.fields is not None and self.result.succeeded():
             tree = _build_path_tree(self.request.fields)
-            for top_key in tree:
-                if top_key != "*" and top_key not in result_dict:
-                    logger.warning(
-                        "fields filter: '%s' not found in %s result — typo or version skew?",
-                        top_key,
-                        type(self.result).__name__,
-                    )
             filtered = _apply_path_tree(result_dict, tree)
             # Re-add framework fields unconditionally — callers always need result_details
             # and altered_workflow_state to handle the response, regardless of what they put

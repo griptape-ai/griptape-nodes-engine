@@ -140,8 +140,18 @@ class TestApplyPathTree:
     def test_named_field_kept(self) -> None:
         assert _apply_path_tree({"a": 1, "b": 2}, {"a": {}}) == {"a": 1}
 
-    def test_unmatched_key_returns_empty(self) -> None:
-        assert _apply_path_tree({"a": 1}, {"z": {}}) == {}
+    def test_unmatched_key_returns_empty_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            result = _apply_path_tree({"a": 1}, {"z": {}})
+        assert result == {}
+        assert "z" in caplog.text
+
+    def test_nested_unmatched_key_warns_with_full_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        # "situations.nme" — top-level key exists but nested key is a typo
+        data = {"situations": {"hello": "world"}}
+        with caplog.at_level(logging.WARNING):
+            _apply_path_tree(data, _build_path_tree(["situations.nme"]))
+        assert "situations.nme" in caplog.text
 
     def test_empty_tree_returns_empty(self) -> None:
         assert _apply_path_tree({"a": 1, "b": 2}, {}) == {}
