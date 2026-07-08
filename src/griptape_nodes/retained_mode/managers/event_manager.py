@@ -243,8 +243,6 @@ class EventManager:
         if self._event_queue is None:
             return
 
-        self._dispatch_to_execution_listeners(event)
-
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
             # _is_cross_thread_call() guarantees _event_loop is not None
@@ -252,6 +250,11 @@ class EventManager:
         else:
             # We're on the same thread as the event loop or no loop thread tracked, use direct method
             self._event_queue.put_nowait(event)
+
+        # Dispatch after enqueuing so a callback that re-enters put_event (e.g. writing a
+        # streamed token to a parameter) enqueues its own events *after* the triggering
+        # event, preserving source order on the queue.
+        self._dispatch_to_execution_listeners(event)
 
     async def aput_event(self, event: Any) -> None:
         """Put event into async queue from async context.
@@ -264,8 +267,6 @@ class EventManager:
         if self._event_queue is None:
             return
 
-        self._dispatch_to_execution_listeners(event)
-
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
             # _is_cross_thread_call() guarantees _event_loop is not None
@@ -273,6 +274,10 @@ class EventManager:
         else:
             # We're on the same thread as the event loop or no loop thread tracked, use async method
             await self._event_queue.put(event)
+
+        # Dispatch after enqueuing so a re-entrant emission from a callback lands on the
+        # queue after its triggering event (see put_event).
+        self._dispatch_to_execution_listeners(event)
 
     def add_pre_dispatch_hook(
         self,
@@ -873,7 +878,8 @@ class EventManager:
         events should subscribe immediately before it triggers the run and unsubscribe
         as soon as the run returns (see ``remove_listener_for_execution_event``).
         """
-        if inspect.iscoroutinefunction(callback):
+        callback_call = type(callback).__call__
+        if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(callback_call):
             msg = (
                 f"Attempted to subscribe to execution event '{execution_event_type.__name__}'. "
                 f"Failed because callback '{getattr(callback, '__name__', callback)}' is a coroutine "

@@ -931,6 +931,39 @@ class TestExecutionEventSubscription:
             manager.add_listener_to_execution_event(_FakeStreamEvent, async_callback)  # pyright: ignore[reportArgumentType]
 
     @pytest.mark.asyncio
+    async def test_async_callable_object_is_rejected(self) -> None:
+        manager = EventManager()
+        manager.initialize_queue(asyncio.Queue())
+
+        class AsyncCallable:
+            async def __call__(self, _payload: _FakeStreamEvent) -> None:
+                pass
+
+        with pytest.raises(TypeError, match="coroutine"):
+            manager.add_listener_to_execution_event(_FakeStreamEvent, AsyncCallable())  # pyright: ignore[reportArgumentType]
+
+    @pytest.mark.asyncio
+    async def test_reentrant_emission_is_enqueued_after_trigger(self) -> None:
+        manager = EventManager()
+        queue: asyncio.Queue = asyncio.Queue()
+        manager.initialize_queue(queue)
+
+        # A callback that re-enters put_event (as a node writing a streamed token would)
+        # must enqueue its follow-up event *after* the event that triggered it.
+        def on_stream(_payload: _FakeStreamEvent) -> None:
+            manager.put_event(self._wrap(_OtherExecEvent(value=99)))
+
+        manager.add_listener_to_execution_event(_FakeStreamEvent, on_stream)
+
+        trigger = self._wrap(_FakeStreamEvent(text="a"))
+        manager.put_event(trigger)
+
+        first = queue.get_nowait()
+        second = queue.get_nowait()
+        assert first is trigger
+        assert isinstance(second.wrapped_event.payload, _OtherExecEvent)
+
+    @pytest.mark.asyncio
     async def test_non_execution_events_are_ignored(self) -> None:
         manager = EventManager()
         manager.initialize_queue(asyncio.Queue())
