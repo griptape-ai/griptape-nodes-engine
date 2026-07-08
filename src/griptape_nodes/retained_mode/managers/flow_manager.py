@@ -316,9 +316,10 @@ class FlowManager:
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
 
-        # Connection and execution requests alter workflow state but are not yet undoable. Declaring
-        # them keeps them from invalidating undo history. Each becomes a recorder as coverage grows.
-        # undo_manager is None in isolated unit tests that construct FlowManager directly.
+        # Execution requests alter workflow state but are not undoable (undo is about editing, not
+        # running). Connection create/delete are recorded inline via record_inverse on the normal
+        # path of their handlers; they stay listed here as the floor so the rarer group-proxy remap
+        # paths (which do not record) do not invalidate history.
         if undo_manager is not None:
             undo_manager.register_non_undoable(
                 CreateConnectionRequest,
@@ -1149,6 +1150,24 @@ class FlowManager:
             if isinstance(target_node, ErrorProxyNode):
                 target_node.set_post_init_connections_modified()
 
+        # Record how to reverse this connection for undo: the inverse is deleting it, and redo
+        # re-creates it with the resolved names (so it does not depend on the Current Context).
+        GriptapeNodes.UndoManager().record_inverse(
+            DeleteConnectionRequest(
+                source_node_name=source_node_name,
+                source_parameter_name=request.source_parameter_name,
+                target_node_name=target_node_name,
+                target_parameter_name=request.target_parameter_name,
+            ),
+            label=f"Connect '{source_node_name}.{request.source_parameter_name}' to '{target_node_name}.{request.target_parameter_name}'",
+            forward=CreateConnectionRequest(
+                source_node_name=source_node_name,
+                source_parameter_name=request.source_parameter_name,
+                target_node_name=target_node_name,
+                target_parameter_name=request.target_parameter_name,
+            ),
+        )
+
         result = CreateConnectionResultSuccess(result_details=details)
 
         return result
@@ -1314,6 +1333,24 @@ class FlowManager:
             source_node.set_post_init_connections_modified()
         if isinstance(target_node, ErrorProxyNode):
             target_node.set_post_init_connections_modified()
+
+        # Record how to reverse this deletion for undo: the inverse re-creates the connection with
+        # the resolved names, and redo deletes it again.
+        GriptapeNodes.UndoManager().record_inverse(
+            CreateConnectionRequest(
+                source_node_name=source_node_name,
+                source_parameter_name=request.source_parameter_name,
+                target_node_name=target_node_name,
+                target_parameter_name=request.target_parameter_name,
+            ),
+            label=f"Disconnect '{source_node_name}.{request.source_parameter_name}' from '{target_node_name}.{request.target_parameter_name}'",
+            forward=DeleteConnectionRequest(
+                source_node_name=source_node_name,
+                source_parameter_name=request.source_parameter_name,
+                target_node_name=target_node_name,
+                target_parameter_name=request.target_parameter_name,
+            ),
+        )
 
         result = DeleteConnectionResultSuccess(result_details=details)
         return result

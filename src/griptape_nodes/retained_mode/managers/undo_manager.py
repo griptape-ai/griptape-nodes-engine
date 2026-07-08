@@ -178,6 +178,9 @@ class DispatchCapture:
     Attributes:
         request: The request being dispatched (used as the default redo target for record_inverse).
         opened_frame: True when this dispatch opened the active recording frame and must finalize it.
+        records: True when this dispatch contributes to the active frame. False for a dispatch nested
+            inside another recording dispatch (e.g. a delete's connection cascade), whose reversal is
+            owned by that ancestor; such a dispatch is tracked only so record_inverse can tell it apart.
         recorder: The recorder covering this request type, or None when the type has none.
         before_state: Recorder-specific state captured before the handler ran.
         declined: True when the recorder could not faithfully capture this request.
@@ -186,6 +189,7 @@ class DispatchCapture:
 
     request: RequestPayload
     opened_frame: bool
+    records: bool
     recorder: UndoRecorder | None
     before_state: Any
     declined: bool
@@ -201,14 +205,11 @@ class _RecordingFrame:
         entries: Reversible entries collected during the frame, in application order.
         invalidate: When True, the frame commits nothing and clears history (an unrecordable
             or partially-failed mutation occurred, so recorded inverses can no longer be trusted).
-        is_transaction: When True, nested dispatches contribute to this frame (grouping). When
-            False, the frame owner captures its own nested effects and nested dispatches are ignored.
     """
 
     label: str | None = None
     entries: list[UndoEntry] = field(default_factory=list)
     invalidate: bool = False
-    is_transaction: bool = False
 
 
 class UndoManager:
@@ -257,6 +258,10 @@ class UndoManager:
         self._non_undoable_types: set[type[RequestPayload]] = set()
         self._active_frame: _RecordingFrame | None = None
         self._dispatch_stack: list[DispatchCapture] = []
+        # Count of currently-open recording dispatches. A dispatch records only when this is 0 on
+        # entry, so a nested cascade (depth > 0) is owned by its recording ancestor rather than
+        # recorded separately.
+        self._recording_depth = 0
 
         event_manager.assign_manager_to_request_type(UndoRequest, self.on_undo_request)
         event_manager.assign_manager_to_request_type(RedoRequest, self.on_redo_request)
@@ -302,6 +307,9 @@ class UndoManager:
         if self._active_frame is None or not self._dispatch_stack:
             return
         capture = self._dispatch_stack[-1]
+        if not capture.records:
+            # Nested inside another recording dispatch; that ancestor owns the reversal.
+            return
         forward_source = forward if forward is not None else capture.request
         try:
             undo_requests = [_prepare_replay_request(request) for request in _as_sequence(inverse)]
@@ -328,30 +336,16 @@ class UndoManager:
         """Group every recordable mutation issued within the block into a single undo batch.
 
         Use for engine-side operations that issue multiple requests (e.g. paste) so undo reverts
-        them as one action. When a recording frame is already active, the block joins it and, for
-        the duration, promotes it to collect nested contributions under this label. During replay
-        the block is a no-op passthrough.
+        them as one action. Opens a recording frame that the block's requests contribute to; each
+        top-level request within the block becomes one entry (its own cascade stays folded in).
+        A no-op passthrough during replay, or when a recording frame is already active (the active
+        frame already groups that dispatch's work).
         """
-        if self._is_replaying:
+        if self._is_replaying or self._active_frame is not None:
             yield
             return
 
-        existing_frame = self._active_frame
-        if existing_frame is not None:
-            previous_is_transaction = existing_frame.is_transaction
-            existing_frame.is_transaction = True
-            if existing_frame.label is None:
-                existing_frame.label = label
-            try:
-                yield
-            except Exception:
-                existing_frame.invalidate = True
-                raise
-            finally:
-                existing_frame.is_transaction = previous_is_transaction
-            return
-
-        frame = _RecordingFrame(label=label, is_transaction=True)
+        frame = _RecordingFrame(label=label)
         self._active_frame = frame
         try:
             yield
@@ -365,10 +359,13 @@ class UndoManager:
     def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> DispatchCapture | None:
         """Observe a request before its handler runs; returns capture state for end_request_dispatch.
 
-        Called by the EventManager on every dispatch. Returns None when the dispatch does not
-        contribute to recording: the manager's own events, replay in progress, or a nested dispatch
-        under a non-transaction frame. History-clearing lifecycle types clear immediately and return
-        None. A recording frame is opened for a user-initiated top-level request (has request_id).
+        Called by the EventManager on every dispatch. Returns None for dispatches the undo system
+        ignores entirely (its own events, history-clearing lifecycle types, replay in progress).
+        Otherwise a DispatchCapture is always returned so the dispatch is tracked; capture.records
+        says whether it contributes to a recording frame. A dispatch records when it is the
+        outermost recordable dispatch in a frame -- opened by a user-initiated request (has
+        request_id) or, inside a transaction, by an engine-issued request -- but not when it is
+        nested inside another recording dispatch (that ancestor owns the reversal).
         """
         request_type = type(request)
         if request_type in self._OWN_EVENT_TYPES:
@@ -380,35 +377,39 @@ class UndoManager:
             return None
 
         opened_frame = False
+        records = False
         if self._active_frame is None:
-            if request_id is None:
-                return None
-            self._active_frame = _RecordingFrame()
-            opened_frame = True
-        elif not self._active_frame.is_transaction:
-            # Nested dispatch under a single-request frame: the frame owner already captures its
-            # own cascade (e.g. a delete's connection removals), so nested dispatches are ignored.
-            return None
-        # Otherwise a transaction frame is active and this dispatch contributes to it.
+            if request_id is not None:
+                self._active_frame = _RecordingFrame()
+                opened_frame = True
+                records = True
+        else:
+            # A frame is active (opened by an outer request or a transaction). Record only when this
+            # is the outermost dispatch within it; a nested cascade is owned by its ancestor.
+            records = self._recording_depth == 0
 
-        recorder = self._recorders.get(request_type)
+        recorder = None
         before_state = None
         declined = False
-        if recorder is not None:
-            try:
-                capture = recorder.capture_before(request)
-                before_state = capture.state
-                declined = capture.declined
-            except Exception:
-                logger.exception(
-                    "Undo recorder for request type '%s' raised during capture; treating as unrecordable.",
-                    request_type.__name__,
-                )
-                declined = True
+        if records:
+            self._recording_depth += 1
+            recorder = self._recorders.get(request_type)
+            if recorder is not None:
+                try:
+                    capture = recorder.capture_before(request)
+                    before_state = capture.state
+                    declined = capture.declined
+                except Exception:
+                    logger.exception(
+                        "Undo recorder for request type '%s' raised during capture; treating as unrecordable.",
+                        request_type.__name__,
+                    )
+                    declined = True
 
         dispatch_capture = DispatchCapture(
             request=request,
             opened_frame=opened_frame,
+            records=records,
             recorder=recorder,
             before_state=before_state,
             declined=declined,
@@ -421,13 +422,16 @@ class UndoManager:
     ) -> None:
         """Finish observing a dispatch: contribute to the active frame and finalize if it was opened.
 
-        A None result means the handler raised. Only the dispatch that opened the frame finalizes it
-        (commit a batch or clear history).
+        A None result means the handler raised. Only a recording dispatch contributes; only the
+        dispatch that opened the frame finalizes it (commit a batch or clear history).
         """
         if capture is None:
             return
         if self._dispatch_stack and self._dispatch_stack[-1] is capture:
             self._dispatch_stack.pop()
+        if not capture.records:
+            return
+        self._recording_depth -= 1
         frame = self._active_frame
         try:
             self._contribute_to_frame(frame, capture, request, result)
