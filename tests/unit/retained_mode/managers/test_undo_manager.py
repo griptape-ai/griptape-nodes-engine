@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -153,7 +153,9 @@ def _handle_record_inverse_probe(request: _RecordInverseProbeRequest) -> ResultP
         # An inverse carrying an un-deep-copyable value cannot be snapshotted; the action is simply
         # not undoable and history is left untouched (the type is declared non-undoable).
         GriptapeNodes.UndoManager().record_inverse(
-            SetParameterValueRequest(node_name=request.node_name, parameter_name="text", value=_Uncopyable()),
+            SetParameterValueRequest(
+                node_name=request.node_name, parameter_name="text", value=cast("Any", _Uncopyable())
+            ),
             label="Custom edit",
         )
         return _RecordInverseProbeResult(result_details="probe edit applied")
@@ -1824,6 +1826,7 @@ class TestRecordingSessionUnit:
         assert clone.request_id is None
         # The original is left untouched so the live request keeps its id.
         assert request.request_id == "abc"
+        assert isinstance(clone, SetParameterValueRequest)
         assert clone.value == "v"
 
     def test_register_recorder_rejects_duplicate(self) -> None:
@@ -1999,8 +2002,12 @@ class TestNodeRecorderUnit:
         assert batch.label == "Set 'N.text'"
         entry = batch.entries[0]
         assert isinstance(entry, RequestReplayUndoEntry)
-        assert entry.undo_requests[0].value == "old"
-        assert entry.redo_requests[0].value == "new"
+        undo_request = entry.undo_requests[0]
+        redo_request = entry.redo_requests[0]
+        assert isinstance(undo_request, SetParameterValueRequest)
+        assert isinstance(redo_request, SetParameterValueRequest)
+        assert undo_request.value == "old"
+        assert redo_request.value == "new"
 
 
 class TestConnectionRecorderUnit:
@@ -2008,7 +2015,7 @@ class TestConnectionRecorderUnit:
 
     @staticmethod
     def _endpoints(**overrides: object) -> _ConnectionEndpoints:
-        fields = {
+        fields: dict[str, object] = {
             "source_node_name": "S",
             "source_parameter_name": "out",
             "target_node_name": "T",

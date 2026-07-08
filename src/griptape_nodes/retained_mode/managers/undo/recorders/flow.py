@@ -97,7 +97,7 @@ class CreateConnectionRecorder(UndoRecorder):
         self._capture_prior_target_value(request, source_param, target_node, target_param, endpoints)
         return RecorderCapture(state=endpoints)
 
-    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:  # noqa: ARG002
+    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch:  # noqa: ARG002
         if state is None or not isinstance(result, CreateConnectionResultSuccess):
             return UndoBatch(label="", entries=[])
         endpoints: _ConnectionEndpoints = state
@@ -213,7 +213,7 @@ class DeleteConnectionRecorder(UndoRecorder):
             )
         )
 
-    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:  # noqa: ARG002
+    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch:  # noqa: ARG002
         if state is None or not isinstance(result, DeleteConnectionResultSuccess):
             return UndoBatch(label="", entries=[])
         endpoints: _ConnectionEndpoints = state
