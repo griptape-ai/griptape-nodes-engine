@@ -667,12 +667,12 @@ class TestUndoManager:
     def test_recorders_registered_by_node_domain(self, griptape_nodes: GriptapeNodes) -> None:
         """NodeManager registers its recorders with the UndoManager; the manager holds no domain literals."""
         undo_manager = griptape_nodes.UndoManager()
-        assert CreateNodeRequest in undo_manager._recorders
-        assert DeleteNodeRequest in undo_manager._recorders
+        assert CreateNodeRequest in undo_manager._recording._recorders
+        assert DeleteNodeRequest in undo_manager._recording._recorders
 
     def test_register_recorder_rejects_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
         """A second recorder for the same request type is a registration error, mirroring handlers."""
-        from griptape_nodes.retained_mode.managers.node_manager_undo import CreateNodeRecorder
+        from griptape_nodes.retained_mode.managers.undo.node import CreateNodeRecorder
 
         undo_manager = griptape_nodes.UndoManager()
         with pytest.raises(ValueError, match="already registered"):

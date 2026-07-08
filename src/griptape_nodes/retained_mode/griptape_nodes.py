@@ -65,7 +65,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
-    from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -141,7 +141,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
             StaticFilesManager,
         )
         from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
-        from griptape_nodes.retained_mode.managers.undo_manager import UndoManager
+        from griptape_nodes.retained_mode.managers.undo import UndoManager
         from griptape_nodes.retained_mode.managers.user_manager import UserManager
         from griptape_nodes.retained_mode.managers.variable_manager import (
             VariablesManager,
