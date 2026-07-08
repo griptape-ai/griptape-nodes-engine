@@ -3299,9 +3299,13 @@ class ProjectManager:
 
         template = current_project_result.project_info.template
         situations = {situation_name: situation.macro for situation_name, situation in template.situations.items()}
+        descriptions = {
+            situation_name: (situation.description or "") for situation_name, situation in template.situations.items()
+        }
 
         return GetAllSituationsForProjectResultSuccess(
             situations=situations,
+            descriptions=descriptions,
             result_details=f"Successfully retrieved all situations. Found {len(situations)} situations",
         )
 
