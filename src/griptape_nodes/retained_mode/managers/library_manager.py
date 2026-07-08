@@ -6335,6 +6335,7 @@ class LibraryManager:
             libraries_downloaded=libraries_downloaded,
             libraries_checked=libraries_checked,
             libraries_updated=libraries_updated,
+            libraries_deferred=libraries_deferred,
             update_summary=update_summary,
             result_details=details,
         )

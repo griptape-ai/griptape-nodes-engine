@@ -1253,6 +1253,8 @@ class SyncLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         libraries_downloaded: Number of libraries that were downloaded from git URLs
         libraries_checked: Number of libraries checked for updates
         libraries_updated: Number of libraries that were updated
+        libraries_deferred: Number of libraries with an available update that was withheld by the
+            age gate (soak period) and therefore not applied this sync
         update_summary: Dict mapping library names to their update info (old_version -> new_version, or status for downloads)
     """
 
@@ -1260,6 +1262,7 @@ class SyncLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     libraries_checked: int
     libraries_updated: int
     update_summary: dict[str, dict[str, str]]
+    libraries_deferred: int = 0
 
 
 @dataclass
