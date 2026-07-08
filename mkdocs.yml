@@ -58,6 +58,8 @@ plugins:
         guides/ai_providers/ollama.md: guides/agent/providers/ollama.md
         guides/ai_providers/lm_studio.md: guides/agent/providers/lm_studio.md
         guides/ai_providers/custom.md: guides/agent/providers/custom.md
+        guides/agent/choosing_a_model.md: guides/agent/index.md
+        guides/agent/sending_messages.md: guides/agent/index.md
         developing_nodes/index.md: development/custom_nodes/index.md
         developing_nodes/getting_started.md: development/custom_nodes/getting_started.md
         developing_nodes/comprehensive_guide.md: development/custom_nodes/comprehensive_guide.md
@@ -99,10 +101,8 @@ plugins:
           - tutorials/04_photography_team/index.md
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
-          - guides/agent/using_in_workflows.md: Using the Agent node in workflows
-          - guides/agent/choosing_a_model.md: Selecting an AI model for the agent
-          - guides/agent/sending_messages.md: Sending messages and attaching files
           - guides/agent/threads.md: Conversation threads and local storage locations
+          - guides/agent/using_in_workflows.md: Using the Agent node in workflows
           - guides/agent/personalization.md: Customizing agent tone, role, and system prompt
           - guides/agent/skills.md: Extending the agent with custom skill files
           - guides/agent/mcp_servers.md: Attaching MCP servers to an agent conversation
@@ -241,11 +241,8 @@ nav:
   - Guides:
       - Agent:
           - Overview: guides/agent/index.md
+          - Threads: guides/agent/threads.md
           - Using in Workflows: guides/agent/using_in_workflows.md
-          - Chat:
-              - Choosing a Model: guides/agent/choosing_a_model.md
-              - Sending Messages: guides/agent/sending_messages.md
-              - Threads: guides/agent/threads.md
           - Customization:
               - Personalization: guides/agent/personalization.md
               - Skills: guides/agent/skills.md

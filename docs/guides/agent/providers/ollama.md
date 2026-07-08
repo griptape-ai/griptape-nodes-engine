@@ -56,4 +56,4 @@ To add more models, run `ollama pull <model-name>` in a terminal and they'll app
 
 - [AI Providers overview](./index.md)
 - [LM Studio](./lm_studio.md) — another local provider option
-- [Local Models with Agents (MCP approach)](../mcp/advanced_local_models.md) — an alternative pattern using Ollama via MCP nodes in a workflow
+- [Local Models with Agents (MCP approach)](../../mcp/advanced_local_models.md) — an alternative pattern using Ollama via MCP nodes in a workflow
