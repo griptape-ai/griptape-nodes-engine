@@ -30,6 +30,8 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeResultSuccess,
     DeleteNodeRequest,
     DeleteNodeResultSuccess,
+    SetLockNodeStateRequest,
+    SetLockNodeStateResultSuccess,
 )
 from griptape_nodes.retained_mode.events.object_events import RenameObjectRequest
 from griptape_nodes.retained_mode.events.parameter_events import (
@@ -421,6 +423,52 @@ class TestUndoManager:
         restored = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="Target", parameter_name="text"))
         assert isinstance(restored, GetParameterValueResultSuccess)
         assert restored.value == "typed"
+
+    def test_undo_create_connection_to_locked_target_only_detaches(self, griptape_nodes: GriptapeNodes) -> None:
+        """A locked target is not overwritten by the connection, so undo just detaches and preserves history."""
+        self._register_library()
+        flow_name = self._make_flow(griptape_nodes)
+        self._create_node(flow_name, node_name="Source")
+        self._create_node(flow_name, node_name="Target")
+
+        assert self._user_request(
+            SetParameterValueRequest(node_name="Target", parameter_name="text", value="typed")
+        ).succeeded()
+        assert isinstance(
+            self._user_request(SetLockNodeStateRequest(node_name="Target", lock=True)),
+            SetLockNodeStateResultSuccess,
+        )
+        assert self._user_request(
+            SetParameterValueRequest(node_name="Source", parameter_name="text", value="world")
+        ).succeeded()
+
+        assert isinstance(
+            self._user_request(
+                CreateConnectionRequest(
+                    source_node_name="Source",
+                    source_parameter_name="text",
+                    target_node_name="Target",
+                    target_parameter_name="text",
+                )
+            ),
+            CreateConnectionResultSuccess,
+        )
+        # Locked target keeps its own value; the connection did not overwrite it.
+        blocked = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="Target", parameter_name="text"))
+        assert isinstance(blocked, GetParameterValueResultSuccess)
+        assert blocked.value == "typed"
+
+        # Undo must succeed by only detaching (no restore-set against the locked node) and must not
+        # wipe the earlier history.
+        undo_result = GriptapeNodes.handle_request(UndoRequest())
+        assert isinstance(undo_result, UndoResultSuccess)
+        assert not self._connection_exists("Target", "text")
+        after_undo = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="Target", parameter_name="text"))
+        assert isinstance(after_undo, GetParameterValueResultSuccess)
+        assert after_undo.value == "typed"
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert state.undo_labels != []
 
     def test_undo_delete_connection_restores_it(self, griptape_nodes: GriptapeNodes) -> None:
         self._register_library()
