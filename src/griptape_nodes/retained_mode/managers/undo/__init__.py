@@ -10,8 +10,7 @@ Per-domain reversal knowledge lives in sibling modules (e.g. `undo.node`) and is
 the manager by the owning domain manager.
 """
 
-from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
-from griptape_nodes.retained_mode.managers.undo.undo import (
+from griptape_nodes.retained_mode.managers.undo.core import (
     RecorderCapture,
     RequestReplayUndoEntry,
     UndoBatch,
@@ -21,6 +20,7 @@ from griptape_nodes.retained_mode.managers.undo.undo import (
     dispatch_expecting,
     dispatch_expecting_success,
 )
+from griptape_nodes.retained_mode.managers.undo.manager import UndoManager
 
 __all__ = [
     "RecorderCapture",

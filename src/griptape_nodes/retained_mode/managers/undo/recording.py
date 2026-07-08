@@ -28,7 +28,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromScratchRequest,
     RunWorkflowWithCurrentStateRequest,
 )
-from griptape_nodes.retained_mode.managers.undo.undo import (
+from griptape_nodes.retained_mode.managers.undo.core import (
     RequestReplayUndoEntry,
     UndoBatch,
     UndoEntry,

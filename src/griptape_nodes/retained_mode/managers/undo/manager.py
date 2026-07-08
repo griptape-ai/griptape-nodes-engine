@@ -29,8 +29,8 @@ from griptape_nodes.retained_mode.events.undo_events import (
     UndoResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.undo.core import UndoBatch, UndoEntryReplayError
 from griptape_nodes.retained_mode.managers.undo.recording import RecordingSession
-from griptape_nodes.retained_mode.managers.undo.undo import UndoBatch, UndoEntryReplayError
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -38,8 +38,8 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo.core import UndoRecorder
     from griptape_nodes.retained_mode.managers.undo.recording import DispatchCapture
-    from griptape_nodes.retained_mode.managers.undo.undo import UndoRecorder
 
 logger = logging.getLogger("griptape_nodes")
 
