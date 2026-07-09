@@ -6310,6 +6310,24 @@ class LibraryManager:
             update_result = result.result
 
             if not isinstance(update_result, UpdateLibraryResultSuccess):
+                # A commit that was old enough during the check pass can still be refused at update
+                # time if a newer commit landed on the remote in between; that comes back as an
+                # age-gate refusal, not a hard failure. Count it as a deferral (it applies on a later
+                # sync once the target ages) so the summary and counts stay accurate.
+                if isinstance(update_result, UpdateLibraryResultFailure) and update_result.age_gated:
+                    libraries_deferred += 1
+                    logger.info(
+                        "Library '%s' update (%s -> %s) was withheld by the age gate at update time; deferring.",
+                        library_name,
+                        old_version,
+                        new_version,
+                    )
+                    update_summary[library_name] = {
+                        "old_version": old_version,
+                        "new_version": new_version,
+                        "status": "deferred_age_gate",
+                    }
+                    continue
                 logger.error("Failed to update library '%s': %s", library_name, update_result.result_details)
                 update_summary[library_name] = {
                     "old_version": old_version,
