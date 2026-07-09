@@ -23,6 +23,8 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from griptape_nodes.common.macro_parser import SEQUENCE_VARIABLE_NAME
+from griptape_nodes.common.project_templates import SUB_DIRS_VARIABLE_NAME
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -51,6 +53,10 @@ from griptape_nodes.retained_mode.events.app_events import (
 
 # Runtime imports for ResultDetails since it's used at runtime
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetail, ResultDetails
+from griptape_nodes.retained_mode.events.config_events import (
+    GetConfigValueRequest,
+    GetConfigValueResultSuccess,
+)
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
@@ -82,6 +88,8 @@ from griptape_nodes.retained_mode.events.os_events import (
 from griptape_nodes.retained_mode.events.project_events import (
     GetSituationRequest,
     GetSituationResultSuccess,
+    ListRelatedProjectFilesRequest,
+    ListRelatedProjectFilesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -201,7 +209,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     WorkflowNotFoundProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
-from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
+from griptape_nodes.retained_mode.managers.settings import MAX_WORKFLOW_BACKUPS_KEY, WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.string_utils import normalize_display_name
@@ -2054,6 +2062,7 @@ class WorkflowManager:
         file_name: str,
         sub_dirs: str | None = None,
         situation_name: str = BuiltInSituation.SAVE_WORKFLOW,
+        extra_vars: dict[str, str | int] | None = None,
     ) -> WorkflowSavePath:
         """Build a workflow save destination via a named situation.
 
@@ -2069,12 +2078,18 @@ class WorkflowManager:
         ``situation_name`` defaults to ``save_workflow`` (overwrite-in-place
         semantics). Pass ``create_versioned_workflow`` for the versioned-save
         flow that bumps the padded index every save (issue #4945).
-        """
-        extra_vars: dict[str, str | int] = {}
-        if sub_dirs:
-            extra_vars["sub_dirs"] = sub_dirs
 
-        destination = ProjectFileDestination.from_situation(file_name, situation_name, **extra_vars)
+        ``extra_vars`` forwards additional macro variables to
+        ``ProjectFileDestination.from_situation``. Useful when the caller wants
+        to bind a value that the situation macro would otherwise expect the
+        seed-and-retry step to fill (e.g. ``_index`` for backup saves that
+        pre-compute the target index).
+        """
+        combined_vars: dict[str, str | int] = dict(extra_vars) if extra_vars else {}
+        if sub_dirs and SUB_DIRS_VARIABLE_NAME not in combined_vars:
+            combined_vars[SUB_DIRS_VARIABLE_NAME] = sub_dirs
+
+        destination = ProjectFileDestination.from_situation(file_name, situation_name, **combined_vars)
         relative_file_path = str(Path(sub_dirs) / file_name) if sub_dirs else file_name
         return WorkflowManager.WorkflowSavePath(
             destination=destination,
@@ -2366,12 +2381,180 @@ class WorkflowManager:
         # Ensure file_path is populated even for pre-existing entries (defensive).
         if existing_workflow.file_path is None:
             existing_workflow.file_path = relative_file_path
-        details = f"Successfully saved workflow to: {save_file_result.file_path}"
+
+        # Primary save is done. If the caller opted into the safety-net copy under the
+        # `save_workflow_backup` situation, run the backup step now — any failures inside
+        # it become WARNING entries alongside the success message rather than promoting
+        # the whole save to a failure. The result-details renderer emits the appropriate
+        # log lines from those entries, so we don't call `logger.warning` here.
+        backup_warnings: list[str] = []
+        if request.attempt_create_backup:
+            backup_warnings = await self._apply_workflow_backup(
+                source_filename=relative_file_path,
+                file_content=save_file_result.file_content,
+            )
+
+        # Collate save + any backup warnings into a single ResultDetail. If any
+        # backup warning fired, the whole result is WARNING (and every failure
+        # message is appended below the save-success line so the artist sees
+        # both the successful primary save AND every backup issue). Otherwise
+        # a plain INFO detail.
+        primary_save_line = f"Successfully saved workflow to: {save_file_result.file_path}"
+        if backup_warnings:
+            combined_message = "\n".join([primary_save_line, *backup_warnings])
+            result_detail = ResultDetail(level=logging.WARNING, message=combined_message)
+        else:
+            result_detail = ResultDetail(level=logging.INFO, message=primary_save_line)
+
         return SaveWorkflowResultSuccess(
             file_path=save_file_result.file_path,
             workflow_name=registry_key,
-            result_details=ResultDetails(message=details, level=logging.INFO),
+            result_details=ResultDetails(result_detail),
         )
+
+    async def _apply_workflow_backup(  # noqa: PLR0911
+        self,
+        *,
+        source_filename: str,
+        file_content: str,
+    ) -> list[str]:
+        """Write a ``save_workflow_backup`` copy of the just-saved workflow and prune older backups.
+
+        Name-agnostic: consumes the ``source_variables`` bag reverse-matched by
+        ``ListRelatedProjectFilesRequest`` verbatim, so the mapping between
+        ``FilenameParts`` and macro variable names lives in exactly one place
+        (``ProjectFileDestination.from_situation``) and this helper doesn't need
+        to know what the writer's macro chose to name its variables.
+
+        Returns an empty list on full success. Returns a list of artist-facing
+        warning messages when one or more steps failed — one message per failure,
+        NOT a collapsed summary — so the caller can attach each as its own
+        ``ResultDetail`` at ``logging.WARNING`` level. Never raises; the backup
+        is a safety net and its failure must never promote a successful primary
+        save to a failure.
+
+        Retention is race-safe by construction: the pre-write scan picks a strictly
+        monotonic ``_index`` (max present + 1), bypassing the ``save_workflow_backup``
+        situation's ``CREATE_NEW`` gap-fill so freed slots aren't reused. The prune
+        step re-scans post-write so a concurrent save that landed in the meantime is
+        represented in the retention math and never accidentally pruned.
+        """
+        # Step 1 — retention count.
+        # Read the "max workflow backups" config. If it's missing or unreadable, we
+        # cannot decide how many to keep — return a warning rather than silently
+        # picking a fabricated default.
+        config_result = GriptapeNodes.handle_request(GetConfigValueRequest(category_and_key=MAX_WORKFLOW_BACKUPS_KEY))
+        if not isinstance(config_result, GetConfigValueResultSuccess):
+            return [
+                f"Attempted to read the '{MAX_WORKFLOW_BACKUPS_KEY}' setting to determine backup retention. "
+                f"Failed with details '{config_result.result_details}' — the backup step was skipped, "
+                "but the primary save succeeded."
+            ]
+        max_backups = int(config_result.value)
+        if max_backups <= 0:
+            # Config explicitly disables backups for this user — that's not a failure,
+            # so we return an empty list and the outer save reports plain success.
+            return []
+
+        # Step 2 — see what backups already exist on disk. The request derives the
+        # writer's variables bag from `source_filename` via reverse-match, then
+        # scans SAVE_WORKFLOW_BACKUP against that bag. Scanning BEFORE our own
+        # write lets us pick a monotonically increasing `_index` and bypass the
+        # situation's CREATE_NEW gap-fill — so deleting v001 during a later prune
+        # doesn't cause the next save to reuse slot v001 (contradicting the
+        # artist's "oldest is v001, newest is vNNN" mental model).
+        pre_scan = await GriptapeNodes.ahandle_request(
+            ListRelatedProjectFilesRequest(
+                source_filename=source_filename,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+        if not isinstance(pre_scan, ListRelatedProjectFilesResultSuccess):
+            return [
+                f"Attempted to list existing backups for '{source_filename}' before writing a new one. "
+                f"Failed with details '{pre_scan.result_details}' — no backup was written for this save."
+            ]
+
+        present_numbers = pre_scan.sequence.present_numbers if pre_scan.sequence is not None else set()
+        next_index = (max(present_numbers) + 1) if present_numbers else 1
+
+        # Step 3 — write the backup copy at the exact slot we chose. The
+        # reverse-matched bag came from SAVE_WORKFLOW's macro (which has no
+        # `{###}` slot), so it never contains `_index`. We bind it here for
+        # CREATE_NEW's benefit; the bag is otherwise passed through opaquely.
+        backup_destination = ProjectFileDestination.from_situation_with_variables(
+            situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            variables={**pre_scan.source_variables, SEQUENCE_VARIABLE_NAME: next_index},
+        )
+        write_result = self._write_workflow_file(
+            backup_destination,
+            file_content,
+            f"backup v{next_index:03}",
+        )
+        if not write_result.success:
+            return [
+                f"Attempted to write a backup copy of '{source_filename}' to your project's backups folder "
+                f"as slot v{next_index:03}. Failed with details '{write_result.error_details}' — "
+                "no backup was written for this save."
+            ]
+
+        # Step 4 — re-scan post-write. Between our pre-scan and now, a concurrent
+        # save may have written another backup. Re-scanning ensures the retention
+        # decision reflects everything actually on disk right now, so we never
+        # delete a valid backup out from under a parallel save.
+        post_scan = await GriptapeNodes.ahandle_request(
+            ListRelatedProjectFilesRequest(
+                source_filename=source_filename,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+        if not isinstance(post_scan, ListRelatedProjectFilesResultSuccess):
+            return [
+                f"Attempted to re-check the backups folder for '{source_filename}' after writing "
+                f"backup v{next_index:03}, so older backups could be pruned. "
+                f"Failed with details '{post_scan.result_details}' — the new backup was written, "
+                "but you may now have more than the configured maximum until the next successful save."
+            ]
+        if post_scan.sequence is None:
+            return [
+                f"Attempted to re-check the backups folder for '{source_filename}' after writing "
+                f"backup v{next_index:03}. Failed because the re-check returned no entries at all — "
+                "the new backup was written, but retention could not be enforced this save."
+            ]
+
+        # Step 5 — prune anything past the retention count. Sort entries
+        # oldest-first (by numeric slot); the leading `overflow_count` entries
+        # are the ones exceeding the ceiling. Every deletion is attempted
+        # independently — a single failure records a warning and the loop keeps
+        # going so the artist sees exactly which files were left behind.
+        entries_by_number = {entry.number: entry for entry in post_scan.sequence.entries}
+        sorted_numbers = sorted(entries_by_number.keys())
+        overflow_count = len(sorted_numbers) - max_backups
+        if overflow_count <= 0:
+            return []
+
+        doomed_numbers = sorted_numbers[:overflow_count]
+
+        warnings: list[str] = []
+        for doomed in doomed_numbers:
+            entry = entries_by_number[doomed]
+            delete_result = await GriptapeNodes.ahandle_request(
+                DeleteFileRequest(
+                    path=entry.path,
+                    workspace_only=True,
+                    deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+                )
+            )
+            if isinstance(delete_result, DeleteFileResultFailure):
+                warnings.append(
+                    f"Attempted to remove older backup '{entry.path}' as part of retention pruning. "
+                    f"Failed with details '{delete_result.result_details}' — you may have more than the "
+                    "configured maximum until this file is removed manually."
+                )
+
+        return warnings
 
     class _ExistingMetadata(NamedTuple):
         display_name: str | None
@@ -2773,6 +2956,7 @@ class WorkflowManager:
         return SaveWorkflowFileFromSerializedFlowResultSuccess(
             file_path=final_file_path,
             workflow_metadata=workflow_metadata,
+            file_content=final_code_output,
             result_details=ResultDetails(message=details, level=logging.INFO),
         )
 

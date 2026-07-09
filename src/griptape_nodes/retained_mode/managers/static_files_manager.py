@@ -8,6 +8,10 @@ from typing import NamedTuple
 from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.common.project_templates import (
+    FILE_EXTENSION_VARIABLE_NAME,
+    FILE_NAME_BASE_VARIABLE_NAME,
+)
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
@@ -511,7 +515,7 @@ class StaticFilesManager:
         macro_result = GriptapeNodes.handle_request(
             GetPathForMacroRequest(
                 parsed_macro=parsed_macro,
-                variables={"file_name_base": parts.stem, "file_extension": parts.extension},
+                variables={FILE_NAME_BASE_VARIABLE_NAME: parts.stem, FILE_EXTENSION_VARIABLE_NAME: parts.extension},
             )
         )
         if not isinstance(macro_result, GetPathForMacroResultSuccess):
@@ -535,7 +539,7 @@ class StaticFilesManager:
             )
 
         policy = self._map_situation_policy(situation.policy.on_collision)
-        variables = {"file_name_base": parts.stem, "file_extension": parts.extension}
+        variables = {FILE_NAME_BASE_VARIABLE_NAME: parts.stem, FILE_EXTENSION_VARIABLE_NAME: parts.extension}
         metadata = SidecarContent(
             situation=SituationMetadata(
                 name=situation_name,

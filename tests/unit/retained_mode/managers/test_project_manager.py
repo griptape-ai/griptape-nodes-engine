@@ -9158,3 +9158,769 @@ class TestImportProject:
         import_result = await pm.on_import_project_request(import_request)
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates
+
+
+class TestScanSituationSequence:
+    """Tests for ``ProjectManager.scan_situation_sequence``.
+
+    The helper composes three existing requests (``GetSituationRequest``,
+    ``GetPathForMacroRequest``, ``ScanSequencesRequest``). Tests focus on the
+    composition contract: which discriminated failure comes back for each stage,
+    and that the successful path forwards the underlying sequence data verbatim.
+    """
+
+    @pytest.fixture
+    def project_manager_with_template(self) -> ProjectManager:
+        """ProjectManager wired to DEFAULT_PROJECT_TEMPLATE (which carries SAVE_WORKFLOW_BACKUP)."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_secrets = Mock()
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
+
+        project_path = Path("/test/project.yml")
+        project_id = str(project_path)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_path,
+            project_base_dir=project_path.parent,
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+        pm._successfully_loaded_project_templates[project_id] = project_info
+        pm._current_project_id = project_id
+        return pm
+
+    @pytest.mark.asyncio
+    async def test_situation_not_found_reports_situation_stage_failure(
+        self, project_manager_with_template: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            ScanSituationSequenceFailureReason,
+            ScanSituationSequenceRequest,
+            ScanSituationSequenceResultFailure,
+        )
+
+        result = await project_manager_with_template.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name="nonexistent_situation",
+                variables={"file_name_base": "wf", "file_extension": "py"},
+            )
+        )
+
+        assert isinstance(result, ScanSituationSequenceResultFailure)
+        assert result.failure_reason == ScanSituationSequenceFailureReason.SITUATION_NOT_FOUND
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_situation_without_sequence_slot_returns_single_file_result(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Slot-less situation resolves to a literal path and returns 0 or 1 entries.
+
+        SAVE_WORKFLOW has no ``{###}`` slot, so the underlying
+        ``NoTokenBehavior.SINGLE_FILE`` behaviour kicks in — no special failure, just
+        a normal empty (or single-entry) result.
+        """
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.os_events import ScanSequencesResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import (
+            ScanSituationSequenceRequest,
+            ScanSituationSequenceResultSuccess,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        # No entries on disk → empty sequence, valid result.
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultSuccess(
+                sequences=[],
+                has_entries=False,
+                directory_had_matching_files=False,
+                result_details="empty",
+            )
+        )
+
+        result = await project_manager_with_template.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name=BuiltInSituation.SAVE_WORKFLOW,
+                variables={"file_name_base": "wf", "file_extension": "py"},
+            )
+        )
+
+        assert isinstance(result, ScanSituationSequenceResultSuccess)
+        assert result.sequence is None
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_success_forwards_underlying_sequence(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """When the three-stage composition succeeds, the caller receives the raw Sequence."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.common.sequences.models import MissingItemPolicy, Sequence, SequenceEntry
+        from griptape_nodes.retained_mode.events.os_events import ScanSequencesResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import (
+            ScanSituationSequenceRequest,
+            ScanSituationSequenceResultSuccess,
+        )
+
+        # workflow_dir is optional in the macro (`{workflow_dir?:/}backups/...`), so no
+        # current workflow needs to be set. ContextManager is stubbed to satisfy the
+        # optional builtin's abstain path.
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        underlying_sequence = Sequence(
+            entries=[
+                SequenceEntry(number=1, padded_number="001", path="/workspace/backups/wf_backup_v001.py"),
+                SequenceEntry(number=3, padded_number="003", path="/workspace/backups/wf_backup_v003.py"),
+                SequenceEntry(number=5, padded_number="005", path="/workspace/backups/wf_backup_v005.py"),
+            ],
+            first=1,
+            last=5,
+            discovered_first=1,
+            discovered_last=5,
+            padding=3,
+            pattern="wf_backup_v###.py",
+            directory="/workspace/backups",
+            policy=MissingItemPolicy.SKIP,
+            present_numbers={1, 3, 5},
+        )
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultSuccess(
+                sequences=[underlying_sequence],
+                has_entries=True,
+                directory_had_matching_files=True,
+                discovered_first=1,
+                discovered_last=5,
+                result_details="scanned",
+            )
+        )
+
+        result = await project_manager_with_template.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                variables={"file_name_base": "wf", "file_extension": "py"},
+            )
+        )
+
+        assert isinstance(result, ScanSituationSequenceResultSuccess)
+        assert result.sequence is underlying_sequence
+        assert result.present_numbers == {1, 3, 5}
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_empty_directory_returns_success_with_no_sequence(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """An empty directory is a valid success, not a failure — ``sequence`` is None."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.os_events import ScanSequencesResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import (
+            ScanSituationSequenceRequest,
+            ScanSituationSequenceResultSuccess,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultSuccess(
+                sequences=[],
+                has_entries=False,
+                directory_had_matching_files=False,
+                result_details="empty",
+            )
+        )
+
+        result = await project_manager_with_template.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                variables={"file_name_base": "wf", "file_extension": "py"},
+            )
+        )
+
+        assert isinstance(result, ScanSituationSequenceResultSuccess)
+        assert result.sequence is None
+        assert result.present_numbers == set()
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_scan_failure_reports_scan_stage_and_preserves_reason(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Underlying scan failure surfaces as SCAN_FAILED with the underlying reason captured."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, ScanSequencesResultFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            ScanSituationSequenceFailureReason,
+            ScanSituationSequenceRequest,
+            ScanSituationSequenceResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultFailure(
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                result_details="permission denied on /workspace/backups",
+            )
+        )
+
+        result = await project_manager_with_template.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                variables={"file_name_base": "wf", "file_extension": "py"},
+            )
+        )
+
+        assert isinstance(result, ScanSituationSequenceResultFailure)
+        assert result.failure_reason == ScanSituationSequenceFailureReason.SCAN_FAILED
+        assert result.scan_failure_reason == FileIOFailureReason.PERMISSION_DENIED
+
+
+class TestListRelatedProjectFiles:
+    """Tests for ``ProjectManager.on_list_related_project_files_request``.
+
+    The handler reverse-matches a source filename against a source situation's macro
+    (deriving the writer's variables bag), then delegates to
+    ``ScanSituationSequenceRequest`` against a target situation. These tests focus on
+    the composition contract: which failure comes back for each pipeline stage, that
+    ``source_variables`` are forwarded correctly, and that the primitive is
+    genuinely name-agnostic (works with a customised source macro).
+    """
+
+    @pytest.fixture
+    def project_manager_with_template(self) -> ProjectManager:
+        """ProjectManager wired to DEFAULT_PROJECT_TEMPLATE."""
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_secrets = Mock()
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
+
+        project_path = Path("/test/project.yml")
+        project_id = str(project_path)
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        situation_schemas = pm._parse_situation_macros(DEFAULT_PROJECT_TEMPLATE.situations, validation)
+        directory_schemas = pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation)
+
+        project_info = ProjectInfo(
+            project_id=project_id,
+            project_file_path=project_path,
+            project_base_dir=project_path.parent,
+            template=DEFAULT_PROJECT_TEMPLATE,
+            validation=validation,
+            parsed_situation_schemas=situation_schemas,
+            parsed_directory_schemas=directory_schemas,
+        )
+        pm._successfully_loaded_project_templates[project_id] = project_info
+        pm._current_project_id = project_id
+        return pm
+
+    @staticmethod
+    def _install_scan_result(mock_griptape_nodes: Mock, sequence_entries: list[tuple[int, str]] | None) -> None:
+        """Wire ``GriptapeNodes.ahandle_request`` to return a ScanSequencesResultSuccess.
+
+        Passing ``None`` for ``sequence_entries`` produces an empty scan result.
+        """
+        from griptape_nodes.common.sequences.models import MissingItemPolicy, Sequence, SequenceEntry
+        from griptape_nodes.retained_mode.events.os_events import ScanSequencesResultSuccess
+
+        if sequence_entries is None or not sequence_entries:
+            mock_griptape_nodes.ahandle_request = AsyncMock(
+                return_value=ScanSequencesResultSuccess(
+                    sequences=[],
+                    has_entries=False,
+                    directory_had_matching_files=False,
+                    result_details="empty",
+                )
+            )
+            return
+
+        seq_entries = [SequenceEntry(number=n, padded_number=f"{n:03}", path=p) for n, p in sequence_entries]
+        numbers = {n for n, _ in sequence_entries}
+        sequence = Sequence(
+            entries=seq_entries,
+            first=min(numbers),
+            last=max(numbers),
+            discovered_first=min(numbers),
+            discovered_last=max(numbers),
+            padding=3,
+            pattern="scanned",
+            directory="/workspace/backups",
+            policy=MissingItemPolicy.SKIP,
+            present_numbers=numbers,
+        )
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultSuccess(
+                sequences=[sequence],
+                has_entries=True,
+                directory_had_matching_files=True,
+                discovered_first=min(numbers),
+                discovered_last=max(numbers),
+                result_details="scanned",
+            )
+        )
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_macro_form_input_derives_bag_and_lists_related_files(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Macro-form source_filename: reverse-match extracts bag, target scan runs against it."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultSuccess,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        self._install_scan_result(
+            mock_griptape_nodes,
+            [(1, "/workspace/backups/wf_backup_v001.py"), (2, "/workspace/backups/wf_backup_v002.py")],
+        )
+
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{workspace_dir}/wf.py",
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultSuccess)
+        # Reverse-match against SAVE_WORKFLOW's macro extracted the writer's bag.
+        assert result.source_variables == {"file_name_base": "wf", "file_extension": "py"}
+        # Target scan produced two entries; the underlying Sequence is passed through.
+        expected_entries = 2
+        assert result.sequence is not None
+        assert len(result.sequence.entries) == expected_entries
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_source_macro_mismatch_reports_source_stage_failure(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """A filename that doesn't match the source macro fails at SOURCE_MACRO_MISMATCH."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        # SAVE_WORKFLOW's macro expects `{workspace_dir}/…`. Feed it a completely
+        # different macro-form shape so the reverse-match can't extract a bag.
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{inputs}/something-else.png",
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_scan_stage_failure_propagates(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """A downstream ScanSituationSequenceRequest failure surfaces as SCAN_FAILED."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason, ScanSequencesResultFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+            ScanSituationSequenceFailureReason,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        mock_griptape_nodes.ahandle_request = AsyncMock(
+            return_value=ScanSequencesResultFailure(
+                failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                result_details="permission denied",
+            )
+        )
+
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{workspace_dir}/wf.py",
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SCAN_FAILED
+        # The underlying reason is forwarded so callers can branch on it.
+        assert result.scan_failure_reason == ScanSituationSequenceFailureReason.SCAN_FAILED
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_empty_target_returns_success_with_no_sequence(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """No on-disk matches for the target situation → Success with sequence=None."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultSuccess,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        self._install_scan_result(mock_griptape_nodes, [])
+
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{workspace_dir}/wf.py",
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultSuccess)
+        assert result.sequence is None
+        assert result.source_variables == {"file_name_base": "wf", "file_extension": "py"}
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_non_workflow_use_case_self_related_node_output(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Prove the primitive is generalized beyond workflows.
+
+        Uses SAVE_NODE_OUTPUT as both source and target — 'list all numbered
+        siblings of this node output'. If the plumbing were workflow-specific,
+        this call would break.
+        """
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultSuccess,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        self._install_scan_result(
+            mock_griptape_nodes,
+            [(1, "/workspace/outputs/render_v001.png"), (2, "/workspace/outputs/render_v002.png")],
+        )
+
+        # SAVE_NODE_OUTPUT's macro:
+        # {outputs}/{file_extension_directory?:/}{sub_dirs?:/}{file_name_base}_v{###}.{file_extension}
+        # A previously-saved output at v001 without directory prefix reverse-matches
+        # to file_name_base="render", file_extension="png".
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{outputs}/render_v001.png",
+                source_situation=BuiltInSituation.SAVE_NODE_OUTPUT,
+                target_situation=BuiltInSituation.SAVE_NODE_OUTPUT,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultSuccess)
+        assert result.source_variables.get("file_name_base") == "render"
+        assert result.source_variables.get("file_extension") == "png"
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_custom_variable_name_contract(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Name-agnosticism contract: a customised variable name flows through end-to-end.
+
+        If BOTH source and target situations are customised to bind ``episode_name``
+        instead of ``file_name_base``, the pipeline still works. The reverse-match
+        extracts ``episode_name`` from the source path, forwards it through the target
+        scan (which references ``{episode_name}`` in its rendered pattern), and the
+        response carries ``episode_name`` in ``source_variables``.
+
+        This is the load-bearing claim of the whole refactor: no Python code
+        outside ``ProjectFileDestination.from_situation`` knows what the writer's
+        macro chose to name its variables. The handler proves this by not caring
+        whether the shared variable is ``file_name_base`` or ``episode_name``.
+        """
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultSuccess,
+        )
+
+        # Inject customised source AND target situations, both using the bespoke
+        # variable name. The reverse-match reads `episode_name` from the source
+        # path; the target macro consumes `episode_name` for the scan pattern.
+        # We restore the originals after — the template is a module-level singleton
+        # shared across tests, so mutations here would poison other test classes.
+        current_project = project_manager_with_template._successfully_loaded_project_templates[
+            project_manager_with_template._current_project_id
+        ]
+        template = current_project.template
+        original_save = template.situations[BuiltInSituation.SAVE_WORKFLOW]
+        original_backup = template.situations[BuiltInSituation.SAVE_WORKFLOW_BACKUP]
+        template.situations[BuiltInSituation.SAVE_WORKFLOW] = SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW,
+            macro="{workspace_dir}/{episode_name}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+        template.situations[BuiltInSituation.SAVE_WORKFLOW_BACKUP] = SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            macro="{backups}/{episode_name}_backup_v{###}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
+        )
+        try:
+            mock_context_manager = Mock()
+            mock_context_manager.has_current_workflow.return_value = False
+            mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+            self._install_scan_result(mock_griptape_nodes, [])
+
+            result = await project_manager_with_template.on_list_related_project_files_request(
+                ListRelatedProjectFilesRequest(
+                    source_filename="{workspace_dir}/scene_one.py",
+                    source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                    target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                )
+            )
+        finally:
+            template.situations[BuiltInSituation.SAVE_WORKFLOW] = original_save
+            template.situations[BuiltInSituation.SAVE_WORKFLOW_BACKUP] = original_backup
+
+        assert isinstance(result, ListRelatedProjectFilesResultSuccess)
+        # The reverse-match extracted "episode_name" (not "file_name_base") —
+        # proving the pipeline is name-agnostic.
+        assert result.source_variables == {"episode_name": "scene_one", "file_extension": "py"}
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_source_and_target_must_agree_on_variable_name(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """Contract: source and target situations must agree on variable names.
+
+        The name-agnosticism claim is that Python code doesn't hardcode variable
+        names — but the *templates themselves* must agree, because they share the
+        variables bag through the pipeline. If SAVE_WORKFLOW binds ``episode_name``
+        but SAVE_WORKFLOW_BACKUP still expects ``file_name_base``, the reverse-match
+        succeeds (extracts ``episode_name``) but the target scan fails because its
+        macro references an unbound ``file_name_base``. That failure lands at the
+        scan stage, forwarded as ``SCAN_FAILED`` with the underlying
+        ``MACRO_RESOLUTION_ERROR`` reason preserved.
+
+        This test proves the *load-bearing* thing is name-agreement between source
+        and target — not any Python-side convention. Rename one macro but not the
+        other, and the pipeline fails at scan-stage the way you'd expect.
+        """
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+            ScanSituationSequenceFailureReason,
+        )
+
+        # Rename the variable in SAVE_WORKFLOW ONLY. SAVE_WORKFLOW_BACKUP retains
+        # the default `{file_name_base}` reference — so the target scan will fail
+        # with MISSING_REQUIRED_VARIABLES / MACRO_RESOLUTION_ERROR when it tries to
+        # render its macro with `episode_name` bound but not `file_name_base`.
+        current_project = project_manager_with_template._successfully_loaded_project_templates[
+            project_manager_with_template._current_project_id
+        ]
+        template = current_project.template
+        original_save = template.situations[BuiltInSituation.SAVE_WORKFLOW]
+        template.situations[BuiltInSituation.SAVE_WORKFLOW] = SituationTemplate(
+            name=BuiltInSituation.SAVE_WORKFLOW,
+            macro="{workspace_dir}/{episode_name}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+        )
+
+        try:
+            mock_context_manager = Mock()
+            mock_context_manager.has_current_workflow.return_value = False
+            mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+            # No scan-result install; the scan should never reach ScanSequencesRequest —
+            # it should bail at GetPathForMacroRequest when file_name_base is missing.
+
+            result = await project_manager_with_template.on_list_related_project_files_request(
+                ListRelatedProjectFilesRequest(
+                    source_filename="{workspace_dir}/scene_one.py",
+                    source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                    target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                )
+            )
+        finally:
+            template.situations[BuiltInSituation.SAVE_WORKFLOW] = original_save
+
+        # The pipeline fails at the scan stage — the reverse-match succeeded (extracted
+        # `episode_name`), but the target macro couldn't be rendered because it
+        # references `file_name_base` which isn't in the bag.
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SCAN_FAILED
+        # The underlying scan failure reason is preserved for callers to branch on.
+        assert result.scan_failure_reason == ScanSituationSequenceFailureReason.MACRO_RESOLUTION_ERROR
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_absolute_path_outside_project_reports_path_map_failed(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager, tmp_path: Path
+    ) -> None:
+        """An absolute path outside all project directories short-circuits with PATH_MAP_FAILED."""
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        # An absolute path outside `/workspace` (the fixture's workspace root)
+        # means AttemptMapAbsolutePathToProjectRequest returns mapped_path=None,
+        # and the handler surfaces that as PATH_MAP_FAILED. The path needs to be
+        # absolute on BOTH POSIX and Windows — a Unix-style leading-slash path is
+        # NOT absolute on Windows (which requires a drive letter), so we anchor
+        # off a well-known guaranteed-absolute-and-outside-workspace location.
+        # tmp_path is per-test and never under /workspace, and is guaranteed
+        # absolute on both platforms. We don't need it to exist on disk — the
+        # is_absolute() check + workspace-containment check are both purely
+        # structural.
+        outside_path = str(tmp_path / "outside_project" / "wf.py")
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename=outside_path,
+                source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.PATH_MAP_FAILED
+        assert outside_path in str(result.result_details)
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_unknown_source_situation_reports_source_macro_mismatch(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """A `source_situation` not in the template fails at SOURCE_MACRO_MISMATCH."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        result = await project_manager_with_template.on_list_related_project_files_request(
+            ListRelatedProjectFilesRequest(
+                source_filename="{workspace_dir}/wf.py",
+                source_situation="not_a_real_situation_name",
+                target_situation="save_workflow_backup",
+            )
+        )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH
+        assert "not_a_real_situation_name" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_no_current_project_reports_source_macro_mismatch(
+        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+    ) -> None:
+        """No current project → SOURCE_MACRO_MISMATCH.
+
+        If the project cache resolves the situation but no *current* project is set,
+        the directory-name enumeration step fails and the handler surfaces that as
+        SOURCE_MACRO_MISMATCH.
+        """
+        from griptape_nodes.common.project_templates.situation import BuiltInSituation
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListRelatedProjectFilesFailureReason,
+            ListRelatedProjectFilesRequest,
+            ListRelatedProjectFilesResultFailure,
+        )
+
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        # Simulate "current project was cleared after the situation lookup."
+        # We patch `on_get_current_project_request` to return a Failure directly,
+        # bypassing the situation-lookup path (which also relies on it).
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetCurrentProjectRequest,
+            GetCurrentProjectResultFailure,
+        )
+
+        original = project_manager_with_template.on_get_current_project_request
+        call_count = {"n": 0}
+
+        def fake_get_current(request: GetCurrentProjectRequest) -> object:
+            call_count["n"] += 1
+            # First call is inside on_get_situation_request; let it through.
+            # Second call is the one inside on_list_related_project_files_request
+            # itself, at the "build known_variables" step — fail that one.
+            if call_count["n"] < 2:  # noqa: PLR2004
+                return original(request)
+            return GetCurrentProjectResultFailure(result_details="project cache was cleared")
+
+        with patch.object(
+            project_manager_with_template, "on_get_current_project_request", side_effect=fake_get_current
+        ):
+            result = await project_manager_with_template.on_list_related_project_files_request(
+                ListRelatedProjectFilesRequest(
+                    source_filename="{workspace_dir}/wf.py",
+                    source_situation=BuiltInSituation.SAVE_WORKFLOW,
+                    target_situation=BuiltInSituation.SAVE_WORKFLOW_BACKUP,
+                )
+            )
+
+        assert isinstance(result, ListRelatedProjectFilesResultFailure)
+        assert result.failure_reason == ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH
+        assert "project cache was cleared" in str(result.result_details)

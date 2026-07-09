@@ -22,6 +22,7 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+MAX_WORKFLOW_BACKUPS_KEY = "max_workflow_backups"
 
 
 class Category(BaseModel):
@@ -482,4 +483,15 @@ class Settings(BaseModel):
     library: LibrarySettings = Field(
         category=LIBRARIES,
         default_factory=LibrarySettings,
+    )
+    max_workflow_backups: int = Field(
+        category=STORAGE,
+        default=5,
+        description=(
+            "Maximum number of workflow backup files retained per workflow. When a save is "
+            "made with `attempt_create_backup=True`, a copy of the workflow is written under "
+            "the project's `backups` directory (see the `save_workflow_backup` situation), "
+            "and older backups beyond this count are pruned. Set to 0 or a negative value to "
+            "disable backups even when a caller requests one."
+        ),
     )

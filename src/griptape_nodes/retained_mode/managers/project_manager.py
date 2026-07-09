@@ -19,6 +19,7 @@ from griptape_nodes.common.macro_parser import (
     MacroMatchFailureReason,
     MacroResolutionError,
     MacroResolutionFailureReason,
+    MacroSyntaxError,
     MacroVariables,
     ParsedMacro,
     ParsedStaticValue,
@@ -41,6 +42,7 @@ from griptape_nodes.common.project_templates import (
     schema_major_or_none,
     select_project_path,
 )
+from griptape_nodes.common.sequences.models import MissingItemPolicy, NoTokenBehavior, Sequence
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
 from griptape_nodes.files.file import File, FileLoadError, FileWriteError
 from griptape_nodes.files.path_utils import (
@@ -54,7 +56,13 @@ from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
     ReloadAllLibrariesResultFailure,
 )
-from griptape_nodes.retained_mode.events.os_events import ReadFileRequest, ReadFileResultSuccess
+from griptape_nodes.retained_mode.events.os_events import (
+    ReadFileRequest,
+    ReadFileResultSuccess,
+    ScanSequencesRequest,
+    ScanSequencesResultFailure,
+    ScanSequencesResultSuccess,
+)
 from griptape_nodes.retained_mode.events.project_events import (
     ActivateWorkspaceProjectRequest,
     ActivateWorkspaceProjectResultFailure,
@@ -91,6 +99,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     ImportProjectResultSuccess,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
+    ListRelatedProjectFilesFailureReason,
+    ListRelatedProjectFilesRequest,
+    ListRelatedProjectFilesResultFailure,
+    ListRelatedProjectFilesResultSuccess,
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultFailure,
     LoadProjectTemplateResultSuccess,
@@ -105,6 +117,10 @@ from griptape_nodes.retained_mode.events.project_events import (
     SaveProjectTemplateRequest,
     SaveProjectTemplateResultFailure,
     SaveProjectTemplateResultSuccess,
+    ScanSituationSequenceFailureReason,
+    ScanSituationSequenceRequest,
+    ScanSituationSequenceResultFailure,
+    ScanSituationSequenceResultSuccess,
     SetCurrentProjectRequest,
     SetCurrentProjectResultFailure,
     SetCurrentProjectResultSuccess,
@@ -521,6 +537,12 @@ class ProjectManager:
         )
         event_manager.assign_manager_to_request_type(GetSituationRequest, self.on_get_situation_request)
         event_manager.assign_manager_to_request_type(GetPathForMacroRequest, self.on_get_path_for_macro_request)
+        event_manager.assign_manager_to_request_type(
+            ScanSituationSequenceRequest, self.on_scan_situation_sequence_request
+        )
+        event_manager.assign_manager_to_request_type(
+            ListRelatedProjectFilesRequest, self.on_list_related_project_files_request
+        )
         event_manager.assign_manager_to_request_type(SetCurrentProjectRequest, self.on_set_current_project_request)
         event_manager.assign_manager_to_request_type(GetCurrentProjectRequest, self.on_get_current_project_request)
         event_manager.assign_manager_to_request_type(SaveProjectTemplateRequest, self.on_save_project_template_request)
@@ -1366,6 +1388,253 @@ class ProjectManager:
             resolved_path=resolved_path,
             absolute_path=absolute_path,
             result_details=f"Successfully resolved macro path. Result: {resolved_path}",
+        )
+
+    async def on_scan_situation_sequence_request(
+        self,
+        request: ScanSituationSequenceRequest,
+    ) -> ScanSituationSequenceResultSuccess | ScanSituationSequenceResultFailure:
+        """Resolve a situation's macro to a fileseq pattern and scan for on-disk instances.
+
+        Programmatic scan: caller supplies a variables bag. Composes three existing
+        primitives:
+
+        1. ``GetSituationRequest`` — look up the situation template by name.
+        2. ``GetPathForMacroRequest`` with ``UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN``
+           — resolve the bag, render any required ``{###}`` slot as its fileseq
+           pattern (e.g., ``####``).
+        3. ``ScanSequencesRequest`` with ``policy=SKIP`` and
+           ``no_token_behavior=SINGLE_FILE`` — enumerate on-disk entries. SKIP
+           yields a single flat ``present_numbers`` set; SINGLE_FILE handles
+           situations whose macro has no sequence slot (renders to a literal
+           path, returns 0 or 1 entries).
+
+        Callers holding a filename (rather than a bag) should reach for
+        ``ListRelatedProjectFilesRequest`` — its handler reverse-matches the
+        filename against a source situation's macro before delegating here.
+        """
+        situation_name = request.situation_name
+        variables = request.variables
+
+        # Step 1 — look up the situation template.
+        situation_result = self.on_get_situation_request(GetSituationRequest(situation_name=situation_name))
+        if not isinstance(situation_result, GetSituationResultSuccess):
+            return ScanSituationSequenceResultFailure(
+                failure_reason=ScanSituationSequenceFailureReason.SITUATION_NOT_FOUND,
+                result_details=(
+                    f"Attempted to scan sequence for situation '{situation_name}'. "
+                    f"Failed because the situation could not be retrieved: {situation_result.result_details}"
+                ),
+            )
+
+        # Step 2 — parse the situation's macro string into a ParsedMacro.
+        # Templates are validated at load time, so this rarely fails at runtime,
+        # but a broken template loaded from disk can still slip through.
+        situation = situation_result.situation
+        try:
+            parsed_macro = ParsedMacro(situation.macro)
+        except MacroSyntaxError as err:
+            return ScanSituationSequenceResultFailure(
+                failure_reason=ScanSituationSequenceFailureReason.MACRO_PARSE_ERROR,
+                result_details=(
+                    f"Attempted to scan sequence for situation '{situation_name}'. "
+                    f"Failed because the situation macro '{situation.macro}' could not be parsed: {err}"
+                ),
+            )
+
+        # Step 3 — render the macro. RENDER_SEQUENCE_PATTERN turns any unbound
+        # `{###}` slot into its `####` fileseq pattern; slot-less macros resolve
+        # to a literal path and the scan below treats them as SINGLE_FILE.
+        path_result = self.on_get_path_for_macro_request(
+            GetPathForMacroRequest(
+                parsed_macro=parsed_macro,
+                variables=variables,
+                unresolved_sequence_slot_behavior=UnresolvedSequenceSlotBehavior.RENDER_SEQUENCE_PATTERN,
+            )
+        )
+        if not isinstance(path_result, GetPathForMacroResultSuccess):
+            return ScanSituationSequenceResultFailure(
+                failure_reason=ScanSituationSequenceFailureReason.MACRO_RESOLUTION_ERROR,
+                result_details=(
+                    f"Attempted to scan sequence for situation '{situation_name}'. "
+                    f"Failed to render pattern from macro '{situation.macro}': {path_result.result_details}"
+                ),
+            )
+
+        # Step 4 — scan on-disk.
+        pattern = str(path_result.absolute_path)
+        scan_result = await GriptapeNodes.ahandle_request(
+            ScanSequencesRequest(
+                path=pattern,
+                policy=MissingItemPolicy.SKIP,
+                no_token_behavior=NoTokenBehavior.SINGLE_FILE,
+            )
+        )
+        if isinstance(scan_result, ScanSequencesResultFailure):
+            return ScanSituationSequenceResultFailure(
+                failure_reason=ScanSituationSequenceFailureReason.SCAN_FAILED,
+                pattern=pattern,
+                scan_failure_reason=scan_result.failure_reason,
+                result_details=(
+                    f"Attempted to scan sequence for situation '{situation_name}' using pattern '{pattern}'. "
+                    f"Failed because the sequence scan failed: {scan_result.result_details}"
+                ),
+            )
+        if not isinstance(scan_result, ScanSequencesResultSuccess):
+            # Defensive: request contract guarantees Success | Failure. Fail loud.
+            return ScanSituationSequenceResultFailure(
+                failure_reason=ScanSituationSequenceFailureReason.SCAN_FAILED,
+                pattern=pattern,
+                result_details=(
+                    f"Attempted to scan sequence for situation '{situation_name}' using pattern '{pattern}'. "
+                    f"Failed because the sequence scan returned an unexpected result type: {type(scan_result).__name__}"
+                ),
+            )
+
+        # Step 5 — unwrap the single Sequence. SKIP guarantees at most one; None
+        # when nothing on disk matched is a legitimate empty result, not a failure.
+        sequence: Sequence | None = scan_result.sequences[0] if scan_result.sequences else None
+        return ScanSituationSequenceResultSuccess(
+            sequence=sequence,
+            pattern=pattern,
+            result_details=f"Successfully scanned sequence for situation '{situation_name}' at pattern '{pattern}'.",
+        )
+
+    async def on_list_related_project_files_request(  # noqa: PLR0911
+        self,
+        request: ListRelatedProjectFilesRequest,
+    ) -> ListRelatedProjectFilesResultSuccess | ListRelatedProjectFilesResultFailure:
+        """Reverse-match a source filename, then scan a target situation for related files.
+
+        Pipeline:
+        1. Normalize `source_filename` to macro form. Absolute paths get mapped
+           via `AttemptMapAbsolutePathToProjectRequest`; macro-form input passes
+           through untouched.
+        2. Reverse-match the macro-form path against `source_situation`'s macro
+           via `ParsedMacro.extract_variables`, using the "self-reference known
+           variables" trick — directory placeholders (`{workspace_dir}` etc.) and
+           builtins get their own literal `{name}` form as the known value so
+           they match as static text in the reverse-match. This yields the
+           variables bag `source_situation`'s writer would have bound.
+        3. Delegate to `ScanSituationSequenceRequest(target_situation, bag)` and
+           forward its result.
+
+        See the request docstring for callable examples.
+        """
+        source_filename = request.source_filename
+        source_situation_name = request.source_situation
+        target_situation_name = request.target_situation
+
+        # Step 1 — normalize to macro form. `Path.is_absolute()` distinguishes
+        # macro-form (starts with `{...}`, not absolute on any OS) from real
+        # filesystem paths.
+        macro_form: str = source_filename
+        if Path(source_filename).is_absolute():
+            map_result = self.on_attempt_map_absolute_path_to_project_request(
+                AttemptMapAbsolutePathToProjectRequest(absolute_path=Path(source_filename))
+            )
+            if (
+                not isinstance(map_result, AttemptMapAbsolutePathToProjectResultSuccess)
+                or map_result.mapped_path is None
+            ):
+                details = "unmappable"
+                if isinstance(map_result, AttemptMapAbsolutePathToProjectResultFailure):
+                    details = map_result.result_details
+                return ListRelatedProjectFilesResultFailure(
+                    failure_reason=ListRelatedProjectFilesFailureReason.PATH_MAP_FAILED,
+                    result_details=(
+                        f"Attempted to list related files for source '{source_filename}'. "
+                        f"Failed because the absolute path could not be mapped to the current project: {details}"
+                    ),
+                )
+            macro_form = map_result.mapped_path
+
+        # Step 2 — reverse-match against source_situation's macro. Directory
+        # placeholders and builtins are pre-bound to their own literal form
+        # (e.g. `{workspace_dir}` → `"{workspace_dir}"`) so they match as static
+        # text in the reverse-matcher; unbound variables (`file_name_base` etc.)
+        # are what we actually want to extract.
+        source_situation_result = self.on_get_situation_request(
+            GetSituationRequest(situation_name=source_situation_name)
+        )
+        if not isinstance(source_situation_result, GetSituationResultSuccess):
+            return ListRelatedProjectFilesResultFailure(
+                failure_reason=ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH,
+                result_details=(
+                    f"Attempted to list related files. Failed because source situation "
+                    f"'{source_situation_name}' could not be retrieved: "
+                    f"{source_situation_result.result_details}"
+                ),
+            )
+        source_macro_str = source_situation_result.situation.macro
+        try:
+            source_parsed = ParsedMacro(source_macro_str)
+        except MacroSyntaxError as err:
+            return ListRelatedProjectFilesResultFailure(
+                failure_reason=ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH,
+                result_details=(
+                    f"Attempted to list related files. Failed because source situation "
+                    f"'{source_situation_name}' macro '{source_macro_str}' could not be parsed: {err}"
+                ),
+            )
+
+        # Build known_variables: for every variable referenced by the source
+        # macro that names a directory or builtin, bind it to its own literal
+        # `{name}` form. The reverse-matcher treats those as static text.
+        current_project_result = self.on_get_current_project_request(GetCurrentProjectRequest())
+        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+            return ListRelatedProjectFilesResultFailure(
+                failure_reason=ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH,
+                result_details=(
+                    f"Attempted to list related files for source '{source_filename}'. "
+                    f"Failed because no current project is set: {current_project_result.result_details}"
+                ),
+            )
+        directory_names = set(current_project_result.project_info.template.directories.keys())
+
+        referenced_var_names = {v.name for v in source_parsed.get_variables()}
+        known_variables: MacroVariables = {
+            name: f"{{{name}}}" for name in referenced_var_names if name in directory_names or name in BUILTIN_VARIABLES
+        }
+
+        source_variables = source_parsed.extract_variables(macro_form, known_variables, self._secrets_manager)
+        if source_variables is None:
+            return ListRelatedProjectFilesResultFailure(
+                failure_reason=ListRelatedProjectFilesFailureReason.SOURCE_MACRO_MISMATCH,
+                result_details=(
+                    f"Attempted to list related files. Failed because path '{macro_form}' does not match "
+                    f"source situation '{source_situation_name}' macro '{source_macro_str}'."
+                ),
+            )
+        # Drop the pre-bound directory/builtin variables — they were only there
+        # to satisfy the reverse-matcher's static-text check, not to travel
+        # forward into the target scan (where directories are resolved fresh).
+        source_variables = {k: v for k, v in source_variables.items() if k not in known_variables}
+
+        # Step 3 — delegate the scan.
+        scan_result = await self.on_scan_situation_sequence_request(
+            ScanSituationSequenceRequest(
+                situation_name=target_situation_name,
+                variables=source_variables,
+            )
+        )
+        if not isinstance(scan_result, ScanSituationSequenceResultSuccess):
+            return ListRelatedProjectFilesResultFailure(
+                failure_reason=ListRelatedProjectFilesFailureReason.SCAN_FAILED,
+                scan_failure_reason=scan_result.failure_reason,
+                result_details=(
+                    f"Attempted to list related files for source '{source_filename}' targeting situation "
+                    f"'{target_situation_name}'. Failed at the scan stage: {scan_result.result_details}"
+                ),
+            )
+
+        return ListRelatedProjectFilesResultSuccess(
+            sequence=scan_result.sequence,
+            source_variables=source_variables,
+            result_details=(
+                f"Successfully listed related files for source '{source_filename}' "
+                f"targeting situation '{target_situation_name}'."
+            ),
         )
 
     # Keys we refuse to silently clobber. Users can still set them from their
