@@ -124,7 +124,6 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             logger.warning("Snapshot undo: failed to serialize flow '%s'; not snapshotting.", flow_name)
             return None
         elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
         explicit_value_keys = _capture_explicit_value_keys(flow_name)
         if explicit_value_keys is None:
             # Could not enumerate every node's explicit values: proceeding with a partial map would
@@ -132,6 +131,7 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             # undoable" instead.
             logger.warning("Snapshot undo: incomplete value-key capture for flow '%s'; not snapshotting.", flow_name)
             return None
+        logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
         return FlowSnapshot(
             flow_name=flow_name,
             serialized_flow_commands=serialize_result.serialized_flow_commands,

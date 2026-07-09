@@ -411,3 +411,11 @@ class TestSnapshotStrategy:
         value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
         assert isinstance(value_result, GetParameterValueResultSuccess)
         assert value_result.value == ""
+
+        # Redo re-applies the after-snapshot against the now unlocked+empty node, exercising the
+        # unlock-during-restore-then-relock branch: the value is set while unlocked, then relocked.
+        assert isinstance(GriptapeNodes.handle_request(RedoRequest()), RedoResultSuccess)
+        assert node.lock is True
+        redo_value = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(redo_value, GetParameterValueResultSuccess)
+        assert redo_value.value == "hello"
