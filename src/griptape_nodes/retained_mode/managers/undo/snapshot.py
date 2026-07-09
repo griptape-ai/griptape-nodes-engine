@@ -57,11 +57,11 @@ from griptape_nodes.retained_mode.events.node_events import (
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.undo.core import (
-    CLEAR_HISTORY_REQUEST_TYPES,
-    OWN_EVENT_TYPES,
+    DispatchTriage,
     UndoBatch,
     UndoEntry,
     UndoEntryReplayError,
+    triage_dispatch,
 )
 
 if TYPE_CHECKING:
@@ -528,13 +528,12 @@ class SnapshotRecordingSession:
         self._depth -= 1
         self._finalize(committed=True)
 
-    def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> _SnapshotDispatch | None:  # noqa: PLR0911
+    def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> _SnapshotDispatch | None:
         request_type = type(request)
-        if request_type in OWN_EVENT_TYPES:
+        triage = triage_dispatch(request, is_replaying=self._is_replaying())
+        if triage is DispatchTriage.IGNORE:
             return None
-        if self._is_replaying():
-            return None
-        if isinstance(request, CLEAR_HISTORY_REQUEST_TYPES):
+        if triage is DispatchTriage.CLEAR_HISTORY:
             self._invalidate_history()
             # If a frame is open, make it finalize without committing onto the just-cleared stacks.
             if self._depth > 0:

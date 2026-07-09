@@ -15,12 +15,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
 from griptape_nodes.retained_mode.managers.undo.core import (
-    CLEAR_HISTORY_REQUEST_TYPES,
-    OWN_EVENT_TYPES,
+    DispatchTriage,
     RequestReplayUndoEntry,
     UndoBatch,
     UndoEntry,
     UndoRecorder,
+    triage_dispatch,
 )
 
 if TYPE_CHECKING:
@@ -235,13 +235,10 @@ class RecordingSession:
         nested inside another recording dispatch (that ancestor owns the reversal).
         """
         request_type = type(request)
-        if request_type in OWN_EVENT_TYPES:
+        triage = triage_dispatch(request, is_replaying=self._is_replaying())
+        if triage is DispatchTriage.IGNORE:
             return None
-        # Isolate replay first: an inverse dispatched during undo/redo must never clear history or
-        # be recorded, even if it is (or cascades into) a history-clearing lifecycle type.
-        if self._is_replaying():
-            return None
-        if isinstance(request, CLEAR_HISTORY_REQUEST_TYPES):
+        if triage is DispatchTriage.CLEAR_HISTORY:
             self._invalidate_history()
             # If a frame is open (a covered request cascaded into a lifecycle type, or a transaction
             # body mixed an edit with a context switch/import), invalidate it so finalizing the

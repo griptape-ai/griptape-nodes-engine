@@ -73,6 +73,7 @@ from griptape_nodes.retained_mode.managers.undo import (
     dispatch_expecting,
     dispatch_expecting_success,
 )
+from griptape_nodes.retained_mode.managers.undo.core import DispatchTriage, triage_dispatch
 from griptape_nodes.retained_mode.managers.undo.manager import MAX_UNDO_BATCHES, UndoManager
 from griptape_nodes.retained_mode.managers.undo.recorders.flow import (
     CreateConnectionRecorder,
@@ -1920,6 +1921,21 @@ class TestRecordingSessionUnit:
         session.end_request_dispatch(capture, RenameObjectRequest(object_name="a", requested_name="b"), None)
         assert committed == []
         assert invalidated == []
+
+    def test_triage_dispatch_classifies_by_lifecycle_policy(self) -> None:
+        """triage_dispatch centralizes the ignore / clear-history / proceed policy shared by both strategies."""
+        # Own events are ignored (never recorded, never clear history).
+        assert triage_dispatch(GetUndoStateRequest(), is_replaying=False) is DispatchTriage.IGNORE
+        # Replay is isolated before the clear-history check: a lifecycle type dispatched during a
+        # replay is ignored, not treated as history-clearing.
+        assert triage_dispatch(SetWorkflowContextRequest(workflow_name="w"), is_replaying=True) is DispatchTriage.IGNORE
+        # A history-clearing lifecycle request clears when not replaying.
+        assert (
+            triage_dispatch(SetWorkflowContextRequest(workflow_name="w"), is_replaying=False)
+            is DispatchTriage.CLEAR_HISTORY
+        )
+        # An ordinary edit proceeds to strategy-specific framing.
+        assert triage_dispatch(CreateNodeRequest(node_type="x"), is_replaying=False) is DispatchTriage.PROCEED
 
 
 class TestNodeRecorderUnit:

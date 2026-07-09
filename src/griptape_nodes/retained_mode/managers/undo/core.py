@@ -10,6 +10,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Protocol
 
 from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextRequest
@@ -55,6 +56,36 @@ OWN_EVENT_TYPES: tuple[type[RequestPayload], ...] = (
     GetUndoStateRequest,
     ClearUndoStateRequest,
 )
+
+
+class DispatchTriage(Enum):
+    """The shared lifecycle verdict for a dispatch, applied before any strategy-specific framing.
+
+    IGNORE: the undo system does not track this dispatch at all (its own events, or a replay in
+        progress). CLEAR_HISTORY: a lifecycle request that replaces or restructures the whole object
+        graph; the strategy clears history and flags any open frame. PROCEED: an ordinary dispatch
+        the strategy frames per its own logic.
+    """
+
+    IGNORE = auto()
+    CLEAR_HISTORY = auto()
+    PROCEED = auto()
+
+
+def triage_dispatch(request: RequestPayload, *, is_replaying: bool) -> DispatchTriage:
+    """Classify a dispatch by the shared lifecycle policy, before any strategy-specific framing.
+
+    Replay is isolated before the history-clearing check: an inverse dispatched during undo/redo
+    must never clear history, even if it is (or cascades into) a history-clearing lifecycle type.
+    Both recording strategies call this so the policy sequence lives in one place and cannot drift.
+    """
+    if type(request) in OWN_EVENT_TYPES:
+        return DispatchTriage.IGNORE
+    if is_replaying:
+        return DispatchTriage.IGNORE
+    if isinstance(request, CLEAR_HISTORY_REQUEST_TYPES):
+        return DispatchTriage.CLEAR_HISTORY
+    return DispatchTriage.PROCEED
 
 
 class UndoEntryReplayError(RuntimeError):
