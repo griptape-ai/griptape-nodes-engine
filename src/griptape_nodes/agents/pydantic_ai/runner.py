@@ -379,18 +379,19 @@ class PydanticAgentRunner:
                 counters.tool_calls,
             )
 
-        # Persisting `history + new_messages` (rather than `all_messages()`)
-        # relies on the loaded history ending in a ModelResponse: otherwise
-        # pydantic-ai would merge this turn's request into that trailing request
-        # and `new_messages` would duplicate its parts. Normal turns always end
-        # in a ModelResponse and cancelled turns are never saved, so this holds
-        # today; fail loud if a future change persists a partial turn.
+        # We persist `history + new_messages` rather than `all_messages()`, which
+        # assumes the loaded history is a sequence of complete turns ending in a
+        # ModelResponse. A trailing bare ModelRequest would mean a partial turn
+        # was saved earlier, so the two ways of reconstructing the transcript can
+        # drift; fail loud rather than silently persist a malformed history.
+        # Normal turns always end in a ModelResponse and cancelled turns are
+        # never saved, so this never fires today.
         turn_messages = list(new_messages)
         if history and not isinstance(history[-1], ModelResponse):
             msg = (
                 f"Attempted to persist thread {thread_id}. Failed because loaded history ends with "
-                f"{type(history[-1]).__name__}, not a ModelResponse; concatenating new messages would "
-                "duplicate content. This indicates a partial turn was saved earlier."
+                f"{type(history[-1]).__name__}, not a ModelResponse, indicating a partial turn was "
+                "saved earlier."
             )
             raise ValueError(msg)
         # Rewrite only this turn's messages so a restore can never reach into
