@@ -1188,6 +1188,106 @@ class TestWorkflowManager:
         assert isinstance(result, RenameWorkflowResultFailure)
         assert "OVERRIDE" in str(result.result_details)
 
+    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """PRESERVE_EXISTING with an unregistered source workflow falls back to the requested name.
+
+        Save-As-style path: caller asks to rename a workflow that isn't in the registry (e.g. the
+        entry was already deleted, or this is a first-save-as flow). We can't preserve a name we
+        don't have, so we hand the requested name through to SaveWorkflowRequest — better than
+        letting the save chain fall further and derive from the file stem.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            RenameDisplayNameBehavior,
+            RenameWorkflowRequest,
+            RenameWorkflowResultSuccess,
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        captured: dict[str, object] = {}
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, SaveWorkflowRequest):
+                captured["save_display_name"] = req.display_name
+                return SaveWorkflowResultSuccess(
+                    file_path="/workspace/never_registered_renamed.py",
+                    workflow_name="never_registered_renamed",
+                    result_details="ok",
+                )
+            msg = f"Unexpected request in save-as fallback test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with (
+            # Force the source lookup to miss — no registry entry to preserve from.
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=False),
+            patch.object(workflow_manager, "_persist_external_workflow_registration"),
+            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(
+                        workflow_name="never_registered",
+                        requested_name="never_registered_renamed",
+                        display_name_behavior=RenameDisplayNameBehavior.PRESERVE_EXISTING,
+                    )
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultSuccess)
+        assert captured["save_display_name"] == "never_registered_renamed"
+
+    def test_rename_surfaces_delete_failure_from_bookkeeping(self, griptape_nodes: GriptapeNodes) -> None:
+        """When the post-save delete of the old registry entry fails, rename surfaces RenameWorkflowResultFailure.
+
+        Save succeeds, but the follow-up DeleteWorkflowRequest for the old key comes back as
+        DeleteWorkflowResultFailure. The bookkeeping helper must translate that into a rename
+        failure so the caller doesn't see a bogus success while the registry is half-migrated.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            DeleteWorkflowRequest,
+            DeleteWorkflowResultFailure,
+            RenameWorkflowRequest,
+            RenameWorkflowResultFailure,
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        mock_source = MagicMock()
+        mock_source.file_path = "old.py"
+        mock_source.metadata.name = "Old Display"
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, SaveWorkflowRequest):
+                return SaveWorkflowResultSuccess(
+                    file_path="/workspace/new.py",
+                    workflow_name="new",
+                    result_details="ok",
+                )
+            if isinstance(req, DeleteWorkflowRequest):
+                return DeleteWorkflowResultFailure(result_details="registry locked")
+            msg = f"Unexpected request in delete-failure test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with (
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=True),
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_source),
+            patch.object(workflow_manager, "_persist_external_workflow_registration"),
+            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(workflow_name="old", requested_name="new")
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultFailure)
+        assert "old" in str(result.result_details)
+        assert "new" in str(result.result_details)
+
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
         workflow_manager = griptape_nodes.WorkflowManager()
