@@ -34,6 +34,7 @@ from griptape_nodes.retained_mode.managers.library_manager import (
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARY_MINIMUM_RELEASE_AGE_KEY,
 )
+from griptape_nodes.utils.git_utils import GitError
 from griptape_nodes.utils.library_utils import LibraryVersionInfo
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
@@ -318,6 +319,77 @@ class TestUpdateLibraryRequestAgeGate:
         assert isinstance(result, UpdateLibraryResultSuccess)
         mock_remote_age.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_unknown_target_commit_allows_update(self, griptape_nodes: GriptapeNodes) -> None:
+        """Fail-open: when the target commit timestamp cannot be read, the update still proceeds."""
+        library_manager = griptape_nodes.LibraryManager()
+        library_dir = Path("/var/lib/test_lib")
+
+        with (
+            patch.object(
+                library_manager,
+                "_validate_and_prepare_library_for_git_operation",
+                new=AsyncMock(return_value=self._validation_context(library_dir)),
+            ),
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
+            patch.object(
+                GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
+            ),
+            patch.object(
+                library_manager,
+                "_get_remote_target_commit_datetime",
+                new=AsyncMock(return_value=None),
+            ),
+            patch(f"{LIBRARY_MANAGER_MODULE}.update_library_git") as mock_update_git,
+            patch(f"{LIBRARY_MANAGER_MODULE}.is_on_tag", return_value=False),
+            patch.object(
+                library_manager,
+                "_reload_library_after_git_operation",
+                new=AsyncMock(return_value="2.0.0"),
+            ),
+        ):
+            result = await library_manager.update_library_request(
+                UpdateLibraryRequest(library_name="test_lib", overwrite_existing=False)
+            )
+
+        assert isinstance(result, UpdateLibraryResultSuccess)
+        mock_update_git.assert_called_once()
+
+
+class TestGetRemoteTargetCommitDatetime:
+    """Test the remote target-commit timestamp helper that feeds the update-path age gate."""
+
+    @pytest.mark.asyncio
+    async def test_returns_none_when_no_remote(self, griptape_nodes: GriptapeNodes) -> None:
+        """A library with no git remote cannot be age-checked, so the helper returns None."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.get_git_remote", return_value=None),
+            patch(f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version") as mock_clone,
+        ):
+            result = await library_manager._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
+
+        assert result is None
+        mock_clone.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_returns_none_on_git_error(self, griptape_nodes: GriptapeNodes) -> None:
+        """A git failure while reading the remote commit degrades to None (fail-open)."""
+        library_manager = griptape_nodes.LibraryManager()
+
+        with (
+            patch(f"{LIBRARY_MANAGER_MODULE}.get_git_remote", return_value="https://example.com/repo.git"),
+            patch(f"{LIBRARY_MANAGER_MODULE}.get_current_ref", return_value="main"),
+            patch(
+                f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version",
+                side_effect=GitError("boom"),
+            ),
+        ):
+            result = await library_manager._get_remote_target_commit_datetime(Path("/var/lib/test_lib"))
+
+        assert result is None
+
 
 class TestCheckLibraryUpdateRequestAgeGate:
     """Test that check_library_update_request surfaces the age-gate fields."""
@@ -503,3 +575,46 @@ class TestSyncLibrariesRequestAgeGate:
         }
         assert result.update_summary["updatable"]["status"] == "updated"
         assert "up_to_date" not in result.update_summary
+
+    @pytest.mark.asyncio
+    async def test_update_pass_age_gate_refusal_counts_as_deferred(self, griptape_nodes: GriptapeNodes) -> None:
+        """A library that passes the check but is refused by the update pass age gate is deferred, not failed.
+
+        This models a newer commit landing on the remote between the check and update passes: the
+        update request comes back as UpdateLibraryResultFailure(age_gated=True) rather than success.
+        """
+        library_manager = griptape_nodes.LibraryManager()
+        check_results = {
+            "raced": self._check_result(has_update=True, gated=False),
+        }
+
+        def dispatch(request: object) -> object:
+            if isinstance(request, LoadLibrariesRequest):
+                return LoadLibrariesResultSuccess(result_details="loaded")
+            if isinstance(request, ListRegisteredLibrariesRequest):
+                return ListRegisteredLibrariesResultSuccess(libraries=list(check_results), result_details="listed")
+            if isinstance(request, CheckLibraryUpdateRequest):
+                return check_results[request.library_name]
+            if isinstance(request, UpdateLibraryRequest):
+                return UpdateLibraryResultFailure(result_details="too young", age_gated=True)
+            error = f"Unexpected request routed through ahandle_request: {request!r}"
+            raise AssertionError(error)
+
+        with (
+            patch.object(
+                GriptapeNodes,
+                "ConfigManager",
+                return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS),
+            ),
+            patch.object(GriptapeNodes, "ahandle_request", new=AsyncMock(side_effect=dispatch)),
+        ):
+            result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
+
+        assert isinstance(result, SyncLibrariesResultSuccess)
+        assert result.libraries_updated == 0
+        assert result.libraries_deferred == 1
+        assert result.update_summary["raced"] == {
+            "old_version": "1.0.0",
+            "new_version": "2.0.0",
+            "status": "deferred_age_gate",
+        }
