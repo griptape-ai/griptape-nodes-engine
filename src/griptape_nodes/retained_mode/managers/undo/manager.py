@@ -96,6 +96,17 @@ class UndoManager:
         """Declare request types that mutate workflow state but are intentionally not undoable."""
         self._recording.register_non_undoable(*request_types)
 
+    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
+        """Declare editor mutations with no inverse recorder yet.
+
+        The inverse strategy floors them (neither records nor invalidates); state-reconciling
+        strategies (snapshot) still capture them. This lets a domain express "undoable by snapshot,
+        not yet by inverse" instead of overloading register_non_undoable, which the snapshot strategy
+        would otherwise treat as "never snapshot" and make common edits (node moves, locks) silently
+        non-undoable.
+        """
+        self._recording.register_inverse_floor(*request_types)
+
     def record_inverse(
         self,
         inverse: RequestPayload | Sequence[RequestPayload],

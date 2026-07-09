@@ -181,6 +181,15 @@ class RecordingSession:
         """
         self._non_undoable_types.update(request_types)
 
+    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
+        """Declare editor mutations that have no inverse recorder yet.
+
+        For the inverse strategy these behave exactly like non-undoable types (floor: neither record
+        nor invalidate). They are a separate category only so state-reconciling strategies (snapshot)
+        can still capture them; here the distinction does not matter.
+        """
+        self._non_undoable_types.update(request_types)
+
     def record_inverse(
         self,
         inverse: RequestPayload | Sequence[RequestPayload],

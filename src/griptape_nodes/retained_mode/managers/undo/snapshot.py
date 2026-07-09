@@ -97,22 +97,31 @@ class FlowSnapshot:
 
 
 def capture_workflow_snapshot() -> FlowSnapshot | None:
-    """Serialize the current top-level flow, or None when there is nothing to snapshot."""
-    top_level_result = GriptapeNodes.handle_request(GetTopLevelFlowRequest())
-    if not isinstance(top_level_result, GetTopLevelFlowResultSuccess) or top_level_result.flow_name is None:
-        return None
-    flow_name = top_level_result.flow_name
+    """Serialize the current top-level flow, or None when there is nothing to snapshot.
 
-    started = time.perf_counter()
-    serialize_result = GriptapeNodes.handle_request(
-        SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=False)
-    )
-    if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
-        logger.warning("Snapshot undo: failed to serialize flow '%s'; not snapshotting.", flow_name)
+    Never raises: capture runs inside begin_request_dispatch, which the EventManager calls before the
+    user's handler. A serialization failure must degrade to "this action is not undoable" (return
+    None) rather than propagate and break the edit the undo system is only meant to observe.
+    """
+    try:
+        top_level_result = GriptapeNodes.handle_request(GetTopLevelFlowRequest())
+        if not isinstance(top_level_result, GetTopLevelFlowResultSuccess) or top_level_result.flow_name is None:
+            return None
+        flow_name = top_level_result.flow_name
+
+        started = time.perf_counter()
+        serialize_result = GriptapeNodes.handle_request(
+            SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=False)
+        )
+        if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
+            logger.warning("Snapshot undo: failed to serialize flow '%s'; not snapshotting.", flow_name)
+            return None
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
+        return FlowSnapshot(flow_name=flow_name, serialized_flow_commands=serialize_result.serialized_flow_commands)
+    except Exception:
+        logger.exception("Snapshot undo: capturing the workflow snapshot raised; this action will not be undoable.")
         return None
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
-    return FlowSnapshot(flow_name=flow_name, serialized_flow_commands=serialize_result.serialized_flow_commands)
 
 
 def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
@@ -255,7 +264,9 @@ def _reconcile_node_state(
         msg = f"snapshot restore could not find node '{node_name}' to reconcile"
         raise UndoEntryReplayError(msg)
 
-    # Position / metadata. Created nodes already got it from their create command.
+    # Position / metadata. Created nodes already got it from their create command. SetNodeMetadata
+    # merges keys (it cannot remove one), so a metadata key present live but absent from the snapshot
+    # is not cleared; in practice the keys that change (e.g. position) are always present in both.
     target_metadata = node_commands.create_node_command.metadata
     if not force and target_metadata is not None and node.metadata != target_metadata:
         _require_success(
@@ -264,8 +275,32 @@ def _reconcile_node_state(
         )
 
     # Parameter values.
-    for indirect_command in commands.set_parameter_value_commands.get(node_commands.node_uuid, []):
+    _reconcile_node_values(node=node, node_name=node_name, node_commands=node_commands, commands=commands, force=force)
+
+    # Lock state.
+    lock_command = commands.set_lock_commands_per_node.get(node_commands.node_uuid)
+    target_lock = lock_command.lock if lock_command is not None else False
+    if node.lock != target_lock:
+        _require_success(
+            SetLockNodeStateRequest(node_name=node_name, lock=target_lock),
+            f"snapshot restore failed setting lock on node '{node_name}'",
+        )
+
+
+def _reconcile_node_values(
+    *,
+    node: BaseNode,
+    node_name: str,
+    node_commands: SerializedNodeCommands,
+    commands: SerializedFlowCommands,
+    force: bool,
+) -> None:
+    """Restore a node's parameter values to the snapshot, setting only what differs (unless forced)."""
+    snapshot_value_commands = commands.set_parameter_value_commands.get(node_commands.node_uuid, [])
+    snapshot_parameter_names: set[str] = set()
+    for indirect_command in snapshot_value_commands:
         parameter_name = indirect_command.set_parameter_value_command.parameter_name
+        snapshot_parameter_names.add(parameter_name)
         if indirect_command.unique_value_uuid not in commands.unique_parameter_uuid_to_values:
             continue
         target_value = commands.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
@@ -284,13 +319,26 @@ def _reconcile_node_state(
             f"snapshot restore failed setting value '{node_name}.{parameter_name}'",
         )
 
-    # Lock state.
-    lock_command = commands.set_lock_commands_per_node.get(node_commands.node_uuid)
-    target_lock = lock_command.lock if lock_command is not None else False
-    if node.lock != target_lock:
+    # A value the snapshot did not record must be cleared back to its default: the parameter had no
+    # explicit value when the snapshot was taken (serialization only emits a command for values that
+    # differ from a non-None default or were explicitly set), so leaving the live value in place
+    # would make undo fail to revert a first-time edit to such a parameter.
+    if force:
+        return
+    for parameter_name in list(node.parameter_values.keys()):
+        if parameter_name in snapshot_parameter_names:
+            continue
+        parameter = node.get_parameter_by_name(parameter_name)
+        if parameter is None:
+            continue
         _require_success(
-            SetLockNodeStateRequest(node_name=node_name, lock=target_lock),
-            f"snapshot restore failed setting lock on node '{node_name}'",
+            SetParameterValueRequest(
+                node_name=node_name,
+                parameter_name=parameter_name,
+                value=copy.deepcopy(parameter.default_value),
+                initial_setup=True,
+            ),
+            f"snapshot restore failed clearing value '{node_name}.{parameter_name}'",
         )
 
 
@@ -368,13 +416,23 @@ class SnapshotRecordingSession:
         self._before: FlowSnapshot | None = None
         self._label: str | None = None
         self._depth = 0
+        # Set when a history-clearing lifecycle request is seen while a frame is open, so the frame
+        # finalizes without committing a batch onto the just-cleared stacks.
+        self._invalidated = False
 
     def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:
         """No-op: the snapshot strategy needs no per-request reversal knowledge."""
 
     def register_non_undoable(self, *request_types: type[RequestPayload]) -> None:
-        """Honor non-undoable declarations so execution requests are not snapshotted."""
+        """Honor genuinely non-undoable declarations (execution/lifecycle) so they are not snapshotted."""
         self._non_undoable_types.update(request_types)
+
+    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
+        """No-op for the snapshot strategy.
+
+        These editor mutations have no inverse recorder yet, but the snapshot strategy captures and
+        reconciles them like any other edit, so it must NOT skip snapshotting them.
+        """
 
     def record_inverse(
         self,
@@ -403,7 +461,7 @@ class SnapshotRecordingSession:
         self._depth -= 1
         self._finalize(committed=True)
 
-    def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> _SnapshotDispatch | None:
+    def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> _SnapshotDispatch | None:  # noqa: PLR0911
         request_type = type(request)
         if request_type in self._OWN_EVENT_TYPES:
             return None
@@ -411,6 +469,9 @@ class SnapshotRecordingSession:
             return None
         if isinstance(request, self._CLEAR_HISTORY_REQUEST_TYPES):
             self._invalidate_history()
+            # If a frame is open, make it finalize without committing onto the just-cleared stacks.
+            if self._depth > 0:
+                self._invalidated = True
             return None
 
         # A frame is already open (an outer action or transaction): this dispatch is folded in.
@@ -423,7 +484,12 @@ class SnapshotRecordingSession:
         if request_id is None or request_type in self._non_undoable_types:
             return None
 
-        self._before = capture_workflow_snapshot()
+        before = capture_workflow_snapshot()
+        if before is None:
+            # Could not snapshot (nothing to capture, or serialization failed): do not open a frame,
+            # so this action is simply not undoable rather than committing an unusable batch.
+            return None
+        self._before = before
         self._label = "Edit"
         self._depth += 1
         return _SnapshotDispatch(opened=True)
@@ -449,8 +515,9 @@ class SnapshotRecordingSession:
     def _finalize(self, *, committed: bool) -> None:
         before = self._before
         label = self._label or "Edit"
+        invalidated = self._invalidated
         self._reset()
-        if not committed or before is None:
+        if invalidated or not committed or before is None:
             return
         after = capture_workflow_snapshot()
         if after is None:
@@ -461,3 +528,4 @@ class SnapshotRecordingSession:
         self._before = None
         self._label = None
         self._depth = 0
+        self._invalidated = False

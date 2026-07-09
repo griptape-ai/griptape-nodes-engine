@@ -423,13 +423,17 @@ class NodeManager:
         undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
         undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
         undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
-        # Node mutations declared non-undoable act as the floor for the undo system: a user
-        # mutation of one of these neither records nor invalidates history. These are not yet
-        # undoable and become recorders as coverage grows.
-        undo_manager.register_non_undoable(
+        # Editor mutations with no inverse recorder yet: the inverse strategy floors them (neither
+        # records nor invalidates), but the snapshot strategy captures and reconciles them, so node
+        # moves and lock toggles are undoable under snapshot. They become recorders as coverage grows.
+        undo_manager.register_inverse_floor(
             SetNodeMetadataRequest,
             BatchSetNodeMetadataRequest,
             SetLockNodeStateRequest,
+        )
+        # Execution/runtime state changes are not workflow edits and are never undoable by any
+        # strategy (the snapshot strategy also skips them, so running a node is not a snapshot point).
+        undo_manager.register_non_undoable(
             ResolveNodeRequest,
             UnresolveNodeRequest,
         )

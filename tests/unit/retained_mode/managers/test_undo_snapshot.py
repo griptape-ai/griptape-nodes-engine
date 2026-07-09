@@ -8,6 +8,7 @@ state; redo re-applies it) rather than per-request inverses.
 
 from __future__ import annotations
 
+import copy
 import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -26,6 +27,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
     DeleteNodeRequest,
+    SetNodeMetadataRequest,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterValueRequest,
@@ -61,6 +63,17 @@ class _ProbeNode(BaseNode):
                 type=ParameterTypeBuiltin.STR.value,
                 allowed_modes={ParameterMode.PROPERTY, ParameterMode.INPUT, ParameterMode.OUTPUT},
                 default_value="",
+            )
+        )
+        # A parameter whose default is None and which starts unset, so serialization records no
+        # value command for it until it is explicitly set (exercises the reconcile clear path).
+        self.add_parameter(
+            Parameter(
+                name="opt",
+                tooltip="optional value",
+                type=ParameterTypeBuiltin.STR.value,
+                allowed_modes={ParameterMode.PROPERTY, ParameterMode.INPUT, ParameterMode.OUTPUT},
+                default_value=None,
             )
         )
 
@@ -270,3 +283,76 @@ class TestSnapshotStrategy:
         # A was never touched (same instance); only B was recreated.
         assert obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode) is node_a_before
         assert obj.attempt_get_object_by_name_as_type("ProbeB", BaseNode) is not None
+
+    # ---------- Editor mutations that the inverse strategy floors are undoable under snapshot ----------
+
+    def test_node_move_is_its_own_undo_step(self, snapshot_engine: GriptapeNodes) -> None:
+        """A node move is captured as its own snapshot step and is undoable.
+
+        Regression: SetNodeMetadata is declared as an inverse-only floor. When that floor was reused
+        as the snapshot strategy's "do not snapshot" set, moving a node produced no undo step, so
+        moves could not be undone and unrelated undos appeared to ignore them.
+        """
+        flow_name = self._make_flow(snapshot_engine)
+        create_result = self._user_request(
+            CreateNodeRequest(
+                node_type=self._NODE_TYPE,
+                specific_library_name=self._LIBRARY_NAME,
+                node_name="ProbeA",
+                override_parent_flow_name=flow_name,
+                metadata={"position": {"x": 10, "y": 20}},
+            )
+        )
+        assert isinstance(create_result, CreateNodeResultSuccess)
+        obj = GriptapeNodes.ObjectManager()
+        node = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node is not None
+        original_position = copy.deepcopy(node.metadata.get("position"))
+
+        moved_metadata = {**copy.deepcopy(node.metadata), "position": {"x": 500, "y": 600}}
+        assert self._user_request(SetNodeMetadataRequest(node_name="ProbeA", metadata=moved_metadata)).succeeded()
+        assert node.metadata.get("position") == {"x": 500, "y": 600}
+
+        state = GriptapeNodes.handle_request(GetUndoStateRequest())
+        assert isinstance(state, GetUndoStateResultSuccess)
+        assert len(state.undo_labels) == 2  # create + move  # noqa: PLR2004
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        node_after = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node_after is not None
+        assert node_after.metadata.get("position") == original_position
+
+    def test_undo_edit_preserves_an_earlier_move(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undoing a value edit reverts only the edit; an earlier move stays applied."""
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        obj = GriptapeNodes.ObjectManager()
+        node = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node is not None
+
+        moved_metadata = {**copy.deepcopy(node.metadata), "position": {"x": 500, "y": 600}}
+        assert self._user_request(SetNodeMetadataRequest(node_name="ProbeA", metadata=moved_metadata)).succeeded()
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="hello")
+        ).succeeded()
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        node_after = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node_after is not None
+        assert node_after.metadata.get("position") == {"x": 500, "y": 600}
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value == ""
+
+    def test_undo_clears_first_time_value_on_none_default_param(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undoing the first set of a None-default parameter clears it (it had no snapshot command)."""
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeA", parameter_name="opt", value="set-once")
+        ).succeeded()
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="opt"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value is None
