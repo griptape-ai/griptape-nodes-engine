@@ -22,8 +22,7 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
-LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY = "library.update_age_gating_enabled"
-LIBRARY_UPDATE_MIN_AGE_HOURS_KEY = "library.update_min_age_hours"
+LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 
 
 class Category(BaseModel):
@@ -299,25 +298,19 @@ class LibrarySettings(BaseModel):
             "'never' skips installation and marks the library as degraded if required dependencies are missing."
         ),
     )
-    update_age_gating_enabled: bool = Field(
-        default=False,
+    minimum_release_age: float = Field(
+        default=0.0,
         description=(
-            "When True, a library update is withheld until the commit it would update to is at least "
-            "`update_min_age_hours` old (a minimum release age). This guards against automatically adopting a "
-            "freshly-pushed release before there is time to catch and yank a bad one. When False (default), "
-            "updates apply as soon as they are available. If the target commit's age cannot be determined "
-            "(e.g. the remote timestamp is unreadable), the update is allowed (fail-open) and a warning is "
-            "logged, so a metadata hiccup never permanently blocks updates."
-        ),
-    )
-    update_min_age_hours: float = Field(
-        default=24.0,
-        description=(
-            "Minimum age, in hours, of the target commit before an update may be applied. Only enforced when "
-            "`update_age_gating_enabled` is True. Age is measured from the target commit's git committer "
-            "timestamp, which is not necessarily when the release was published: rebased, cherry-picked, "
-            "backdated (GIT_COMMITTER_DATE), or force-moved tags can report an age that differs from the "
-            "actual publish time."
+            "Minimum age, in hours, of the target release before a library update is applied. When 0 (the "
+            "default), updates apply as soon as they are available. When greater than 0, an update is "
+            "withheld until the commit it would move to is at least this many hours old, guarding against "
+            "automatically adopting a freshly-pushed release before there is time to catch and yank a bad "
+            "one. If the target commit's age cannot be determined (e.g. the remote timestamp is unreadable), "
+            "the update is allowed (fail-open) and a warning is logged, so a metadata hiccup never "
+            "permanently blocks updates. Age is measured from the target commit's git committer timestamp, "
+            "which is not necessarily when the release was published: rebased, cherry-picked, backdated "
+            "(GIT_COMMITTER_DATE), or force-moved tags can report an age that differs from the actual publish "
+            "time."
         ),
     )
 
