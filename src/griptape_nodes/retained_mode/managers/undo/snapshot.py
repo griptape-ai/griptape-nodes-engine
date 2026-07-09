@@ -90,10 +90,17 @@ class FlowSnapshot:
     ``serialized_flow_commands`` is captured with ``include_create_flow_command=False`` so it
     deserializes into the existing flow rather than creating a new one, keeping the flow's identity
     (and name) stable across undo/redo.
+
+    ``explicit_value_keys`` records, per node name, the set of parameter names that had an explicit
+    value at capture time (``node.parameter_values`` keys). Serialization drops values that are
+    non-serializable or ``None``, so "absent from the serialized commands" does not mean "was unset";
+    the reconcile clear-path uses this set instead, so it only clears values genuinely added since
+    capture and never wipes a live non-serializable value on an unrelated undo.
     """
 
     flow_name: str
     serialized_flow_commands: SerializedFlowCommands
+    explicit_value_keys: dict[str, set[str]]
 
 
 def capture_workflow_snapshot() -> FlowSnapshot | None:
@@ -118,10 +125,32 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             return None
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
-        return FlowSnapshot(flow_name=flow_name, serialized_flow_commands=serialize_result.serialized_flow_commands)
+        return FlowSnapshot(
+            flow_name=flow_name,
+            serialized_flow_commands=serialize_result.serialized_flow_commands,
+            explicit_value_keys=_capture_explicit_value_keys(flow_name),
+        )
     except Exception:
         logger.exception("Snapshot undo: capturing the workflow snapshot raised; this action will not be undoable.")
         return None
+
+
+def _capture_explicit_value_keys(flow_name: str) -> dict[str, set[str]]:
+    """Record, per node, the parameter names that hold an explicit value right now.
+
+    Used by the reconcile clear-path so it can tell "unset at capture" from "set but not serialized"
+    (non-serializable or None values), and therefore never wipe a live value the snapshot could not
+    record.
+    """
+    keys: dict[str, set[str]] = {}
+    list_result = GriptapeNodes.handle_request(ListNodesInFlowRequest(flow_name=flow_name))
+    if not isinstance(list_result, ListNodesInFlowResultSuccess):
+        return keys
+    for node_name in list_result.node_names:
+        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        if node is not None:
+            keys[node_name] = set(node.parameter_values.keys())
+    return keys
 
 
 def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
@@ -188,6 +217,7 @@ def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
             node_name=node_name,
             node_commands=name_to_node_commands[node_name],
             commands=commands,
+            explicit_value_keys=snapshot.explicit_value_keys.get(node_name, set()),
             force=node_name in to_create,
         )
 
@@ -256,6 +286,7 @@ def _reconcile_node_state(
     node_name: str,
     node_commands: SerializedNodeCommands,
     commands: SerializedFlowCommands,
+    explicit_value_keys: set[str],
     force: bool,
 ) -> None:
     """Restore a node's position, parameter values, and lock, setting only what differs (unless forced)."""
@@ -269,38 +300,47 @@ def _reconcile_node_state(
     # is not cleared; in practice the keys that change (e.g. position) are always present in both.
     target_metadata = node_commands.create_node_command.metadata
     if not force and target_metadata is not None and node.metadata != target_metadata:
-        _require_success(
+        _try_reconcile(
             SetNodeMetadataRequest(node_name=node_name, metadata=copy.deepcopy(target_metadata)),
-            f"snapshot restore failed setting metadata on node '{node_name}'",
+            f"setting metadata on node '{node_name}'",
         )
 
     # Parameter values.
-    _reconcile_node_values(node=node, node_name=node_name, node_commands=node_commands, commands=commands, force=force)
+    _reconcile_node_values(
+        node=node,
+        node_commands=node_commands,
+        commands=commands,
+        explicit_value_keys=explicit_value_keys,
+        force=force,
+    )
 
     # Lock state.
     lock_command = commands.set_lock_commands_per_node.get(node_commands.node_uuid)
     target_lock = lock_command.lock if lock_command is not None else False
     if node.lock != target_lock:
-        _require_success(
+        _try_reconcile(
             SetLockNodeStateRequest(node_name=node_name, lock=target_lock),
-            f"snapshot restore failed setting lock on node '{node_name}'",
+            f"setting lock on node '{node_name}'",
         )
 
 
 def _reconcile_node_values(
     *,
     node: BaseNode,
-    node_name: str,
     node_commands: SerializedNodeCommands,
     commands: SerializedFlowCommands,
+    explicit_value_keys: set[str],
     force: bool,
 ) -> None:
     """Restore a node's parameter values to the snapshot, setting only what differs (unless forced)."""
-    snapshot_value_commands = commands.set_parameter_value_commands.get(node_commands.node_uuid, [])
-    snapshot_parameter_names: set[str] = set()
-    for indirect_command in snapshot_value_commands:
-        parameter_name = indirect_command.set_parameter_value_command.parameter_name
-        snapshot_parameter_names.add(parameter_name)
+    node_name = node.name
+    for indirect_command in commands.set_parameter_value_commands.get(node_commands.node_uuid, []):
+        set_command = indirect_command.set_parameter_value_command
+        # Output values live in parameter_output_values and are execution state, not editor state;
+        # replaying them as internal sets would clobber the real input value, so skip them.
+        if set_command.is_output:
+            continue
+        parameter_name = set_command.parameter_name
         if indirect_command.unique_value_uuid not in commands.unique_parameter_uuid_to_values:
             continue
         target_value = commands.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
@@ -309,36 +349,36 @@ def _reconcile_node_values(
         # Fresh request (do not mutate the snapshot's command; snapshots are reused across undo/redo).
         # initial_setup bypasses the input+property connection guard and avoids unresolving the node,
         # preserving execution state on nodes the restore did not otherwise change.
-        _require_success(
+        _try_reconcile(
             SetParameterValueRequest(
                 node_name=node_name,
                 parameter_name=parameter_name,
                 value=copy.deepcopy(target_value),
                 initial_setup=True,
             ),
-            f"snapshot restore failed setting value '{node_name}.{parameter_name}'",
+            f"setting value '{node_name}.{parameter_name}'",
         )
 
-    # A value the snapshot did not record must be cleared back to its default: the parameter had no
-    # explicit value when the snapshot was taken (serialization only emits a command for values that
-    # differ from a non-None default or were explicitly set), so leaving the live value in place
-    # would make undo fail to revert a first-time edit to such a parameter.
+    # Clear values added since the snapshot: a parameter that holds an explicit value now but did not
+    # at capture time must be reset to its default. Uses the captured explicit-value key set (not the
+    # serialized commands) so a live value the snapshot could not record (non-serializable, or None)
+    # is left intact rather than wiped.
     if force:
         return
     for parameter_name in list(node.parameter_values.keys()):
-        if parameter_name in snapshot_parameter_names:
+        if parameter_name in explicit_value_keys:
             continue
         parameter = node.get_parameter_by_name(parameter_name)
         if parameter is None:
             continue
-        _require_success(
+        _try_reconcile(
             SetParameterValueRequest(
                 node_name=node_name,
                 parameter_name=parameter_name,
                 value=copy.deepcopy(parameter.default_value),
                 initial_setup=True,
             ),
-            f"snapshot restore failed clearing value '{node_name}.{parameter_name}'",
+            f"clearing value '{node_name}.{parameter_name}'",
         )
 
 
@@ -356,6 +396,22 @@ def _require_success(request: RequestPayload, failure_message: str) -> ResultPay
         msg = f"{failure_message}: {result.result_details}"
         raise UndoEntryReplayError(msg)
     return result
+
+
+def _try_reconcile(request: RequestPayload, description: str) -> None:
+    """Apply a best-effort per-node reconcile step, logging (not raising) on failure.
+
+    Per-parameter/metadata/lock restores are best-effort: a single un-settable parameter (a rejecting
+    before_value_set hook, a default that is not a valid value, a type not accepted as input) must
+    not abort the whole replay, which would clear the entire undo history. Structural steps (node
+    create/delete, connections) stay fatal via _require_success because a wrong graph shape cannot be
+    trusted.
+    """
+    result = GriptapeNodes.handle_request(request)
+    if result.failed():
+        logger.warning(
+            "Snapshot undo: reconcile step (%s) failed; leaving as-is. %s", description, result.result_details
+        )
 
 
 @dataclass

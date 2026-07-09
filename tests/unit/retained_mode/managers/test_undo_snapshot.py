@@ -356,3 +356,28 @@ class TestSnapshotStrategy:
         value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="opt"))
         assert isinstance(value_result, GetParameterValueResultSuccess)
         assert value_result.value is None
+
+    def test_unrelated_undo_preserves_other_node_value(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undoing one node's move must not clear a value set on a different, untouched node.
+
+        Guards the reconcile clear-path: it runs over every survivor, and must only clear values
+        added since the snapshot, never a value that was already present.
+        """
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        self._create_node(flow_name, node_name="ProbeB")
+        assert self._user_request(
+            SetParameterValueRequest(node_name="ProbeB", parameter_name="text", value="keepB")
+        ).succeeded()
+
+        obj = GriptapeNodes.ObjectManager()
+        node_a = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node_a is not None
+        moved_metadata = {**copy.deepcopy(node_a.metadata), "position": {"x": 500, "y": 600}}
+        assert self._user_request(SetNodeMetadataRequest(node_name="ProbeA", metadata=moved_metadata)).succeeded()
+
+        # Undo the move on A; B's value is unrelated and must survive the reconcile over B.
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeB", parameter_name="text"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value == "keepB"
