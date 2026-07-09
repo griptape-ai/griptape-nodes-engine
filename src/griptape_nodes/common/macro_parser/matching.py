@@ -237,9 +237,14 @@ def _locate_next_anchor(
     - ``-1`` → ``extract_single_variable`` returns ``None`` for the current
       variable, so the whole extraction attempt for this emitted/omitted
       mask fails; ``find_matches_detailed`` then tries the next mask.
-    - Shifted positive → the extraction runs to completion and produces a
-      variable bag, but the bag fails ``find_matches_detailed``'s forward
-      round-trip against the original path, and the next mask is tried.
+    - Shifted positive → the anchor step does not short-circuit, so
+      extraction may continue with the wrong bound. It can still fall
+      through to ``None`` later (e.g. a format-spec reverse fails, a
+      static mismatches, or the empty-capture guard rejects the bag),
+      recovering via the same next-mask path as the ``-1`` case. If
+      extraction runs to completion, the resulting bag fails
+      ``find_matches_detailed``'s forward round-trip against the
+      original path, and the next mask is tried.
 
     This function is deliberately not the correctness boundary; it just
     narrows the search space and defers to the outer 2**k round-trip
