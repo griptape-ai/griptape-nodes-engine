@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import NamedTuple
+
 from griptape_nodes.common.macro_parser.exceptions import MacroParseFailureReason, MacroSyntaxError
 from griptape_nodes.common.macro_parser.formats import FormatSpec, LeadingSeparatorFormat, SeparatorFormat
 from griptape_nodes.common.macro_parser.segments import (
@@ -10,6 +12,20 @@ from griptape_nodes.common.macro_parser.segments import (
     ParsedVariable,
     VariableInfo,
 )
+
+
+class NextAnchor(NamedTuple):
+    """Next-anchor text and its provenance.
+
+    The provenance flag drives extraction direction: leading-separator
+    anchors search rightward (rfind) because a base name may legitimately
+    contain the anchor text as a substring; static anchors search leftward
+    (find) because they're literal delimiters at grammar-defined positions.
+    See ``extract_single_variable`` for the full argument.
+    """
+
+    text: str
+    from_leading_separator: bool
 
 
 def extract_unknown_variables(
@@ -89,12 +105,30 @@ def extract_single_variable(
     # with its own separator to fill — take the FIRST self-anchor (leaves
     # room for the following variable to consume its share).
     self_separator = _trailing_separator(variable)
-    next_anchor_text = find_next_anchor(remaining_segments)
+    next_anchor = find_next_anchor(remaining_segments)
     next_is_static = bool(remaining_segments) and isinstance(remaining_segments[0], ParsedStaticValue)
 
     next_end_pos: int | None = None
-    if next_anchor_text is not None:
-        anchor_pos = path.find(next_anchor_text, start_pos)
+    if next_anchor is not None:
+        # Direction of the next-anchor search:
+        # - Static-derived anchors (`/`, `.png`, ...) are literal delimiters at
+        #   grammar-defined positions. Their FIRST occurrence in the path is
+        #   the boundary — greedy left-to-right parsing for `{a}/{b}/{c}`
+        #   relies on this.
+        # - Leading-separator-derived anchors (e.g. `_v` from `{###?:^_v}`)
+        #   are hints about where a FOLLOWING (usually optional) variable
+        #   begins. A base name may legitimately CONTAIN the anchor text as
+        #   a substring — e.g. `my_v1_report_v007.py` has two `_v`. The
+        #   trailing occurrence is where the version marker actually lives,
+        #   so search rightward. If the base has an anchor lookalike but no
+        #   version emitted, the round-trip guard in `find_matches_detailed`
+        #   catches the misread and falls through to the omitted-mask
+        #   attempt. See cjkindel review on #4989.
+        anchor_pos = (
+            path.rfind(next_anchor.text, start_pos)
+            if next_anchor.from_leading_separator
+            else path.find(next_anchor.text, start_pos)
+        )
         if anchor_pos == -1:
             return None
         next_end_pos = anchor_pos
@@ -121,7 +155,7 @@ def extract_single_variable(
         end_pos = self_end_pos
     elif next_end_pos is not None:
         end_pos = next_end_pos
-    elif self_separator is None and next_anchor_text is None:
+    elif self_separator is None and next_anchor is None:
         # No more anchors - consume to end
         end_pos = len(path)
     else:
@@ -140,14 +174,15 @@ def extract_single_variable(
     return (reversed_value, end_pos)
 
 
-def find_next_anchor(segments: list[ParsedSegment]) -> str | None:
+def find_next_anchor(segments: list[ParsedSegment]) -> NextAnchor | None:
     """Find the next fixed text that bounds a preceding variable's extraction.
 
     An anchor is either:
-    - The text of the next `ParsedStaticValue` segment, or
+    - The text of the next `ParsedStaticValue` segment
+      (``from_leading_separator=False``), or
     - The `prefix` of a `LeadingSeparatorFormat` on the next `ParsedVariable`
       (e.g. `_v` inside `{###?:^_v}`), which is fixed text emitted iff the
-      variable emits.
+      variable emits (``from_leading_separator=True``).
 
     The former is authoritative — a static segment ALWAYS appears in the path.
     The latter is fixed text only when the following variable emits; if it
@@ -157,6 +192,10 @@ def find_next_anchor(segments: list[ParsedSegment]) -> str | None:
     and validates via forward round-trip — an over-shrunk range simply fails
     to round-trip and the next mask is tried.
 
+    The provenance flag on the returned ``NextAnchor`` drives the direction
+    of the search in ``extract_single_variable`` (leftmost for static,
+    rightmost for leading-separator — see the docstring there).
+
     Whichever comes FIRST in `segments` wins — the caller wants the
     tightest boundary.
 
@@ -164,15 +203,16 @@ def find_next_anchor(segments: list[ParsedSegment]) -> str | None:
         segments: List of segments to search
 
     Returns:
-        Anchor text, or None if no anchor is available.
+        ``NextAnchor(text, from_leading_separator)``, or ``None`` if no
+        anchor is available.
     """
     for seg in segments:
         if isinstance(seg, ParsedStaticValue):
-            return seg.text
+            return NextAnchor(text=seg.text, from_leading_separator=False)
         if isinstance(seg, ParsedVariable):
             leading_prefix = _leading_separator_prefix(seg)
             if leading_prefix is not None:
-                return leading_prefix
+                return NextAnchor(text=leading_prefix, from_leading_separator=True)
     return None
 
 

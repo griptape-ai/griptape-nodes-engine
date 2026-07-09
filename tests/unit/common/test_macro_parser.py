@@ -1869,3 +1869,53 @@ class TestReverseMatchOptionalVariable5025:
         known: MacroVariables = {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E", "f": "F"}
         # No unbound optionals → no 2^k search → no cap violation.
         assert macro.extract_variables("A_B_C_D_E_F_base", known, sm) == known
+
+    # --- Leading-separator anchors search rightward (cjkindel review) ---
+
+    def test_leading_separator_anchor_uses_rightmost_when_base_contains_prefix(self, sm: Any) -> None:
+        """Base names that CONTAIN the leading-separator prefix must still recover the index.
+
+        Regression coverage for the cjkindel review on #4989: `path.find("_v", ...)`
+        (leftmost) landed on `_v` inside `my_v1_report`, not on the actual version
+        marker `_v007`, and the extraction cascaded to
+        ``file_name_base="my_v1_report_v007"`` with no ``_index`` — reintroducing
+        the `_v###`-swallow bug #4956/#5025 was meant to fix. The fix uses
+        ``path.rfind`` for leading-separator anchors so the trailing occurrence
+        wins.
+        """
+        macro = ParsedMacro("{workspace_dir}/{file_name_base}{###?:^_v}.{file_extension}")
+        known: MacroVariables = {"workspace_dir": "/ws", "file_extension": "py"}
+        assert macro.extract_variables("/ws/my_v1_report_v007.py", known, sm) == {
+            "workspace_dir": "/ws",
+            "file_name_base": "my_v1_report",
+            "_index": 7,
+            "file_extension": "py",
+        }
+
+    def test_leading_separator_anchor_prefers_final_occurrence_across_multiple(self, sm: Any) -> None:
+        """Multiple lookalikes in the base — the LAST occurrence anchors the version."""
+        macro = ParsedMacro("{workspace_dir}/{file_name_base}{###?:^_v}.{file_extension}")
+        known: MacroVariables = {"workspace_dir": "/ws", "file_extension": "py"}
+        assert macro.extract_variables("/ws/my_v1_v2_v007.py", known, sm) == {
+            "workspace_dir": "/ws",
+            "file_name_base": "my_v1_v2",
+            "_index": 7,
+            "file_extension": "py",
+        }
+
+    def test_leading_separator_anchor_with_prefix_in_name_but_no_version_falls_through(self, sm: Any) -> None:
+        """Base with ``_v`` but no actual version → round-trip guard rejects false extraction.
+
+        `my_v1.py` matched against `{...}{###?:^_v}.{...}`: the emitted-mask
+        attempt with rfind extracts ``file_name_base="my", _index=1``, but the
+        forward round-trip renders ``my_v001.py`` (`:03` padding) which doesn't
+        match ``my_v1.py``. The attempt fails; the popcount-1 (index-off)
+        attempt succeeds with ``file_name_base="my_v1"``, no ``_index``.
+        """
+        macro = ParsedMacro("{workspace_dir}/{file_name_base}{###?:^_v}.{file_extension}")
+        known: MacroVariables = {"workspace_dir": "/ws", "file_extension": "py"}
+        assert macro.extract_variables("/ws/my_v1.py", known, sm) == {
+            "workspace_dir": "/ws",
+            "file_name_base": "my_v1",
+            "file_extension": "py",
+        }

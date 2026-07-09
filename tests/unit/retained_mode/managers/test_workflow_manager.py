@@ -2812,6 +2812,43 @@ class TestCreateVersionedWorkflow:
             assert macro_vars.get("file_extension") == "py"
             assert macro_vars.get("_index") == 1
 
+    def test_create_versioned_match_recovers_index_when_stem_contains_v(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Reverse-match handles base names that themselves contain the ``_v`` anchor lookalike.
+
+        Regression coverage for the cjkindel review on #4989: previously the
+        leftmost ``path.find("_v", ...)`` landed on the ``_v`` inside
+        ``my_v1_report`` (position 2), not on the version marker ``_v007``.
+        ``file_name_base`` swallowed the whole stem and ``_index`` was
+        dropped — the next save would produce ``my_v1_report_v007_1.py``
+        instead of ``my_v1_report_v008.py``, reintroducing the exact bug
+        #4956/#5025 set out to fix. The fix uses ``path.rfind`` for
+        leading-separator anchors.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_v1_report_v007",
+                file_name="my_v1_report_v007.py",
+                display_name="",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="my_v1_report_v007",
+                create_versioned=True,
+            )
+
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # file_name_base stops at the LAST `_v`, not the first — the
+            # `_v` inside `my_v1` is a lookalike, the trailing `_v` is the marker.
+            assert macro_vars.get("file_name_base") == "my_v1_report"
+            assert macro_vars.get("_index") == 7  # noqa: PLR2004 - literal version from setup
+            assert macro_vars.get("file_extension") == "py"
+
     def test_create_versioned_with_requested_name_matching_existing_workflow_runs_match(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
