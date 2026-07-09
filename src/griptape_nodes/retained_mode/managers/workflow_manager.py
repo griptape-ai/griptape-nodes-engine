@@ -1157,19 +1157,26 @@ class WorkflowManager:
         if display_name_error is not None:
             return RenameWorkflowResultFailure(result_details=display_name_error)
 
-        display_name = self._resolve_rename_display_name(request)
+        # Single source-of-truth lookup for the workflow being renamed. Threaded through the
+        # display-name resolver and post-save bookkeeping so we don't re-query the registry
+        # three more times (and can't disagree with ourselves mid-handler).
+        source = (
+            WorkflowRegistry.get_workflow_by_name(request.workflow_name)
+            if WorkflowRegistry.has_workflow_with_name(request.workflow_name)
+            else None
+        )
+
+        display_name = self._resolve_rename_display_name(request, source=source)
 
         # Rename keeps the workflow's location (unlike Move). Inherit the source workflow's
         # directory and prepend it to the sanitized stem so the renamed file stays put:
         # a workspace sub-dir ("bar/new_name") or an external absolute path ("/ext/new_name").
         # The combined name is NOT re-run through normalize_display_name, so its "/" survives.
         requested_file_name = sanitized_stem
-        if WorkflowRegistry.has_workflow_with_name(request.workflow_name):
-            source = WorkflowRegistry.get_workflow_by_name(request.workflow_name)
-            if source.file_path:
-                source_dir = PurePosixPath(source.file_path.replace("\\", "/")).parent
-                if str(source_dir) not in ("", "."):
-                    requested_file_name = f"{source_dir}/{sanitized_stem}"
+        if source is not None and source.file_path:
+            source_dir = PurePosixPath(source.file_path.replace("\\", "/")).parent
+            if str(source_dir) not in ("", "."):
+                requested_file_name = f"{source_dir}/{sanitized_stem}"
 
         save_workflow_request = await GriptapeNodes.ahandle_request(
             SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name)
@@ -1182,6 +1189,7 @@ class WorkflowManager:
         reconcile_error = await self._reconcile_rename_bookkeeping(
             old_workflow_name=request.workflow_name,
             save_result=save_workflow_request,
+            source=source,
         )
         if reconcile_error is not None:
             return RenameWorkflowResultFailure(result_details=reconcile_error)
@@ -1224,27 +1232,34 @@ class WorkflowManager:
             "or use PRESERVE_EXISTING / MATCH_FILE_NAME behavior."
         )
 
-    def _resolve_rename_display_name(self, request: RenameWorkflowRequest) -> str | None:
+    def _resolve_rename_display_name(self, request: RenameWorkflowRequest, *, source: Workflow | None) -> str:
         """Compute the display name (``metadata.name``) to pass into the follow-up SaveWorkflowRequest.
 
+        ``source`` is the already-resolved registry entry for ``request.workflow_name`` (or ``None``
+        when the workflow isn't registered) — passed in so we don't re-query the registry here.
+
         * ``OVERRIDE`` — return the caller-supplied ``display_name`` stripped of surrounding
-          whitespace. Matches ``_validate_rename_display_name``'s ``strip()``-based non-empty
-          gate so validation and resolution share one canonical form; a padded-but-valid
-          input like ``"  My Name  "`` can't leak whitespace into ``metadata.name``.
-        * ``PRESERVE_EXISTING`` — return the source workflow's current ``metadata.name``. If the source
-          isn't in the registry (uncommon Save-As-style path), fall through to the requested name so
-          the on-disk file still gets a sensible display name.
-        * ``MATCH_FILE_NAME`` — return the raw ``requested_name`` (legacy behavior; display name tracks
-          the new file name).
+          whitespace. ``_validate_rename_display_name`` guarantees it's non-empty after strip;
+          if this invariant is ever violated that's a genuine engine bug, so ``assert`` is
+          used to document it rather than a defensive fallback.
+        * ``PRESERVE_EXISTING`` — return the source workflow's current ``metadata.name`` (stripped).
+          If the source isn't registered OR its ``metadata.name`` is blank, fall through to the
+          requested name — better a sensible file-stem-derived label than propagating a corrupt
+          empty display name onto the renamed workflow.
+        * ``MATCH_FILE_NAME`` — return the raw ``requested_name`` (legacy behavior; display name
+          tracks the new file name).
         """
         if request.display_name_behavior is RenameDisplayNameBehavior.OVERRIDE:
-            # display_name is guaranteed non-empty after strip() by _validate_rename_display_name.
-            return request.display_name.strip() if request.display_name else request.display_name
-        if (
-            request.display_name_behavior is RenameDisplayNameBehavior.PRESERVE_EXISTING
-            and WorkflowRegistry.has_workflow_with_name(request.workflow_name)
-        ):
-            return WorkflowRegistry.get_workflow_by_name(request.workflow_name).metadata.name
+            # Invariant established by _validate_rename_display_name — reaching this branch
+            # with display_name=None is a genuine engine bug, so surface it loudly.
+            if request.display_name is None:
+                msg = "OVERRIDE reached _resolve_rename_display_name with display_name=None"
+                raise RuntimeError(msg)
+            return request.display_name.strip()
+        if request.display_name_behavior is RenameDisplayNameBehavior.PRESERVE_EXISTING and source is not None:
+            preserved = (source.metadata.name or "").strip()
+            if preserved:
+                return preserved
         return request.requested_name
 
     async def _reconcile_rename_bookkeeping(
@@ -1252,8 +1267,12 @@ class WorkflowManager:
         *,
         old_workflow_name: str,
         save_result: SaveWorkflowResultSuccess,
+        source: Workflow | None,
     ) -> str | None:
         """Post-save bookkeeping for a rename: rekey flags, persist external reg, delete old entry, sync context.
+
+        ``source`` is the pre-resolved registry entry for ``old_workflow_name`` (or ``None`` when
+        the workflow wasn't registered). Threaded from the outer handler so we don't re-query.
 
         Returns a failure message when the delete step fails; otherwise None. Extracted so the outer
         handler doesn't blow past the McCabe branch limit.
@@ -1271,7 +1290,7 @@ class WorkflowManager:
         # If the original workflow isn't registered, treat this as a Save As and skip deletion.
         # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
         # don't delete the file we just saved.
-        if WorkflowRegistry.has_workflow_with_name(old_workflow_name) and new_workflow_name != old_workflow_name:
+        if source is not None and new_workflow_name != old_workflow_name:
             delete_workflow_result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=old_workflow_name))
             if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
                 return (

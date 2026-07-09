@@ -1215,6 +1215,32 @@ class TestWorkflowManager:
         assert isinstance(result, RenameWorkflowResultFailure)
         assert "OVERRIDE" in str(result.result_details)
 
+    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_display_name_blank(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """PRESERVE_EXISTING with a blank source metadata.name falls back to the requested name.
+
+        The source is registered but its ``metadata.name`` is empty (or whitespace-only). Rather
+        than propagating that corrupt-ish value onto the renamed workflow — where the save
+        handler would treat "" as an explicit override and persist it — degrade gracefully to the
+        requested name so the on-disk file still gets a sensible display name.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="   ",  # whitespace-only: strip()==""
+            ),
+            request_kwargs={"display_name_behavior": RenameDisplayNameBehavior.PRESERVE_EXISTING},
+        )
+        assert captured["save_display_name"] == "my_workflow_renamed"
+
     def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(
         self, griptape_nodes: GriptapeNodes
     ) -> None:
