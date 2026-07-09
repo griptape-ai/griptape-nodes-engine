@@ -2650,6 +2650,12 @@ class WorkflowManager:
         if requested_file_name and target_workflow is None:
             return self._resolve_named_save_path(requested_file_name, situation_name=situation_name)
 
+        # target_workflow (set by Step 1 when the requested name maps to an existing
+        # registry entry) beats current_workflow: the workflow the UI named is what
+        # we want to reverse-match against, not whatever tab is focused. The prior
+        # ordering (current_workflow first) caused the "UI re-sends registry key as
+        # file_name" bug — see
+        # test_create_versioned_with_requested_name_matching_existing_workflow_runs_match.
         candidate_workflow = target_workflow if target_workflow is not None else current_workflow
         if candidate_workflow is not None and candidate_workflow.file_path is not None:
             matched = self._try_match_versioned_destination(candidate_workflow.file_path, situation_name=situation_name)
