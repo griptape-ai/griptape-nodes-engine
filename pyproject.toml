@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.92.0"
+version = "0.92.1"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.13"
