@@ -2290,17 +2290,20 @@ class WorkflowManager:
         # 1. Caller-supplied request.display_name — explicit intent always wins.
         # 2. existing.display_name from the registry — preserves the human-readable label
         #    across re-saves and version bumps (one workflow named "a" with v001, v002, ...).
-        # 3. request.file_name — what the user typed for this save. Used as the seed on a
-        #    fresh Save As so the typed name ("a") becomes the display label, not the
-        #    macro-resolved on-disk name ("a_v001").
+        # 3. The resolved local file_name from _determine_save_target — this is either the
+        #    user's typed Save-As stem (so "a" stays "a" and doesn't become "a_v001"), or
+        #    the sanitized display-name-derived stem for a first-save-of-unsaved-workflow
+        #    (so the synthetic "unsaved:<uuid>" key never leaks to metadata.name). Read the
+        #    local `file_name`, NOT `request.file_name` — the latter is un-normalized and
+        #    can still be "unsaved:<uuid>" on the wire for the fresh-save case.
         # 4. Resolved file_name fallback inside _generate_workflow_metadata_from_commands
         #    (last-resort safety net for code paths that supply nothing).
         if request.display_name is not None:
             resolved_display_name = request.display_name
         elif existing.display_name is not None:
             resolved_display_name = existing.display_name
-        elif request.file_name:
-            resolved_display_name = Path(request.file_name).stem
+        elif file_name:
+            resolved_display_name = file_name
         else:
             resolved_display_name = None
 

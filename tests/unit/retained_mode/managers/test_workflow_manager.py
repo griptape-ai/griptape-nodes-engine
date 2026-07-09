@@ -823,6 +823,7 @@ class TestWorkflowManager:
 
             def fake_save_file(**kwargs: object) -> object:
                 captured["file_name"] = kwargs.get("file_name")
+                captured["display_name"] = kwargs.get("display_name")
                 captured["destination"] = kwargs.get("destination")
                 fake_destination: object = kwargs.get("destination")
                 resolve = getattr(fake_destination, "resolve", None)
@@ -867,6 +868,12 @@ class TestWorkflowManager:
 
                 assert isinstance(result, SaveWorkflowResultSuccess)
                 assert captured["file_name"] == display_name
+                # Regression guard: metadata.name on disk (= display_name kwarg to
+                # _save_workflow_file_inline) must NOT be the synthetic unsaved-key. Prior
+                # bug read request.file_name directly for the display-name fallback,
+                # which leaked "unsaved:<uuid>" straight into metadata.name.
+                assert captured["display_name"] == display_name
+                assert unsaved_key not in str(captured["display_name"] or "")
                 destination_repr = str(captured["destination"]) if "destination" in captured else ""
                 assert unsaved_key not in destination_repr
             finally:
@@ -3312,7 +3319,10 @@ class TestSaveWorkflowDisplayNameFallback:
     Four branches with strict precedence (high → low):
     1. ``request.display_name`` — explicit caller intent always wins.
     2. ``existing.display_name`` — preserves human-readable label across re-saves.
-    3. ``Path(request.file_name).stem`` — what the user typed on a fresh Save As.
+    3. The local ``file_name`` produced by ``_determine_save_target`` — either the user's
+       typed Save-As stem (so "a" stays "a" and doesn't become "a_v001"), or the sanitized
+       metadata-derived stem for a first-save-of-unsaved-workflow (so "unsaved:<uuid>"
+       never leaks into ``metadata.name``).
     4. ``None`` → metadata generator's last-resort fallback uses resolved file_name.
 
     Drives ``on_save_workflow_request`` end-to-end with mocks; intercepts
@@ -3468,19 +3478,20 @@ class TestSaveWorkflowDisplayNameFallback:
             finally:
                 stub_path.unlink(missing_ok=True)
 
-    def test_no_request_display_name_no_existing_metadata_uses_file_name_stem(
+    def test_no_request_display_name_no_existing_metadata_uses_resolved_file_name_stem(
         self, griptape_nodes: GriptapeNodes
     ) -> None:
-        """Branch 3: fresh Save As with no registry entry — typed file_name's stem becomes the display name.
+        """Branch 3: fresh Save As with no registry entry — the resolved stem becomes the display name.
 
         This is the case that the manual-test bug surfaced: typing "a" should
         produce metadata.name="a" even though the macro resolves the on-disk
-        name to "a_v001". The fallback uses Path(file_name).stem so a typed
-        "episode/my_wf" yields the leaf "my_wf", not the full subdir path.
+        name to "a_v001". The fallback uses ``_determine_save_target``'s
+        resolved local ``file_name``, which strips any leading sub-directory
+        so a typed "episode/my_wf" yields the leaf "my_wf".
         """
         unsaved_key = "unsaved:branch3-test"
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            _register_unsaved_workflow(key=unsaved_key, name="ignored - we use request.file_name")
+            _register_unsaved_workflow(key=unsaved_key, name="ignored - we use resolved file_name")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
                 griptape_nodes,
@@ -3489,23 +3500,66 @@ class TestSaveWorkflowDisplayNameFallback:
                 current_workflow_name=unsaved_key,
             )
 
-            # Path(...).stem strips the directory and extension — "my_wf", not "episode/my_wf".
+            # _resolve_named_save_path returns parts.stem — "my_wf", not "episode/my_wf".
             assert captured == "my_wf"
 
-    def test_all_sources_empty_falls_through_to_none(self, griptape_nodes: GriptapeNodes) -> None:
-        """Branch 4: with no source for a display name, the chain returns None.
+    def test_first_save_of_unsaved_uses_metadata_derived_stem_not_synthetic_key(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """Fresh save of an unsaved workflow must not surface "unsaved:<uuid>" as the display name.
 
-        ``_generate_workflow_metadata_from_commands`` has its own last-resort
-        fallback (uses the resolved file_name when display_name is None);
-        verifying the chain emits None here confirms the four branches are
-        cleanly separated and the safety net engages downstream rather than
-        being short-circuited by an over-eager upstream default.
+        Regression guard for the bug where branch 3 read ``Path(request.file_name).stem``
+        and returned the whole "unsaved:<uuid>" string verbatim (no dot). Fix: branch 3
+        reads the local ``file_name`` from ``_determine_save_target``, which already
+        stripped the prefix and rebuilt the stem from ``metadata.name``.
         """
-        unsaved_key = "unsaved:branch4-test"
+        unsaved_key = "unsaved:branch3-regression"
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
-            # Unsaved workflow whose metadata.name will be used to derive raw_name
-            # (so _determine_save_target succeeds), but the fallback chain itself
-            # sees no display_name source and emits None.
+            _register_unsaved_workflow(key=unsaved_key, name="My Cool Workflow")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name=unsaved_key,
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured is not None
+            assert not captured.startswith("unsaved:"), f"synthetic key leaked into display name: {captured!r}"
+            # The resolved stem is the sanitized metadata.name.
+            assert captured == "My_Cool_Workflow"
+
+    def test_typed_save_as_name_survives_versioned_resolution(self, griptape_nodes: GriptapeNodes) -> None:
+        """The user typed "a" — display name stays "a" even when the macro resolves the file to "a_v001".
+
+        Pins the versioned-save UI re-save fix from commit 5c3f0bf3: branch 3 must feed off
+        the ``_determine_save_target`` local (which is the user's typed stem), not the
+        macro-resolved on-disk name. Without this, the display name would jump to
+        "a_v001" the moment a versioned save landed.
+        """
+        unsaved_key = "unsaved:typed-save-as"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="ignored - user typed a new name")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="a",
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured == "a"
+
+    def test_metadata_derived_stem_used_when_no_file_name_and_no_existing(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 3 (no request.file_name path): the metadata-derived stem still fills the display name.
+
+        Prior expectation for this scenario was ``None`` (rung 4), because rung 3 keyed off
+        ``request.file_name`` alone. After the fix, rung 3 uses the resolved local
+        ``file_name`` that ``_determine_save_target`` synthesizes from the unsaved workflow's
+        ``metadata.name`` — so the chain resolves before falling through to ``None``.
+        """
+        unsaved_key = "unsaved:branch4-legacy"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             _register_unsaved_workflow(key=unsaved_key, name="Used Only For Filename Derivation")
 
             captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
@@ -3515,10 +3569,7 @@ class TestSaveWorkflowDisplayNameFallback:
                 current_workflow_name=unsaved_key,
             )
 
-            # No request.display_name, no existing.display_name (the workflow
-            # isn't in the registry under the resolved key yet), no
-            # request.file_name → fall-through to None.
-            assert captured is None
+            assert captured == "Used_Only_For_Filename_Derivation"
 
 
 class TestScrubForAstConstant:
