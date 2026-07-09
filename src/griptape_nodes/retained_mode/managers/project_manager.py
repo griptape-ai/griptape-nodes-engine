@@ -368,6 +368,20 @@ class ProjectInfo:
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
 
 
+@dataclass(frozen=True)
+class ProjectChainEntry:
+    """One project in a resolved ancestry chain: its id and best-effort name.
+
+    `id` is the canonical registry key. `name` is the cached template name when the
+    project's template has loaded, otherwise None. Consumers that gate on the chain
+    (e.g. a project-scoped license policy) read `id` to match a project and `name`
+    for display; both mirror the facts a single-project authorization surfaces.
+    """
+
+    id: ProjectID
+    name: str | None = None
+
+
 class _ProjectActivationOutcome(NamedTuple):
     """Result of establishing a project's config/workspace/env layers and reloading.
 
@@ -2141,6 +2155,57 @@ class ProjectManager:
     def _cached_project_name(self, project_id: ProjectID) -> str | None:
         info = self._successfully_loaded_project_templates.get(project_id)
         return getattr(getattr(info, "template", None), "name", None)
+
+    def get_project_chain(self, project_id: ProjectID | None = None) -> list[ProjectChainEntry]:
+        """Resolve a project and its ancestors into an ordered, leaf-first chain.
+
+        Returns the project identified by `project_id` (the current project when
+        None) followed by each ancestor reached through the parent chain
+        (`parent_project_id`, or legacy `parent_project_path`), nearest first. Each
+        entry carries the project id and a best-effort display name (the cached
+        template name; absent when the project's template has not loaded).
+
+        This is the ancestry a project-scoped license policy is evaluated against:
+        loading or working in a child transitively pulls in every ancestor's
+        template (situations, directories, environment), so the policy is screened
+        once per entry and the child is permitted only when the policy permits the
+        child and all of its ancestors.
+
+        The walk consults only the in-memory registry (no disk I/O), in id-space
+        so an opaque GUID id and a legacy path-string id compare consistently: an
+        unregistered or unresolvable parent ends the chain, and a repeated id
+        breaks a cycle, so the result is always finite and free of duplicates. The
+        chain always has at least the starting project, even when it is not
+        registered (its id alone, no name), matching the single-project fact's
+        always-present contract.
+        """
+        start_id: ProjectID = project_id if project_id is not None else self._current_project_id
+
+        # Reverse map so a legacy parent_project_path link resolves to the parent's
+        # real (id-keyed) registry key rather than its path string, matching
+        # _check_parent_chain_cycles.
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
+        chain: list[ProjectChainEntry] = []
+        visited: set[ProjectID] = set()
+        current_id: ProjectID | None = start_id
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            info = self._successfully_loaded_project_templates.get(current_id)
+            template = info.template if info is not None else None
+            name = getattr(template, "name", None)
+            chain.append(ProjectChainEntry(id=current_id, name=str(name) if name else None))
+            if template is None:
+                # Unregistered/legacy project: surface its id, but there is no
+                # template to read a parent link from, so the chain ends here.
+                break
+            anchor = info.project_file_path if info is not None else None
+            current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
+        return chain
 
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
