@@ -231,13 +231,20 @@ def _locate_next_anchor(
     happens to appear earlier in the path (inside the base name, say), the
     bound over-tightens and rfind either returns ``-1`` (no anchor in the
     narrowed window) or a *shifted* anchor position pointing at an earlier
-    lookalike rather than the true marker. In either case the extraction
-    that follows is wrong, but the caller's 2**k round-trip search in
-    ``find_matches_detailed`` — not this function — is what filters the
-    bad result out: a shifted anchor produces a bag that fails forward
-    round-trip against the original path, so the next mask is tried. This
-    function is deliberately not the correctness boundary; it just narrows
-    the search space and defers to the outer safety net.
+    lookalike rather than the true marker. Each failure mode has its own
+    recovery path in the enclosing search:
+
+    - ``-1`` → ``extract_single_variable`` returns ``None`` for the current
+      variable, so the whole extraction attempt for this emitted/omitted
+      mask fails; ``find_matches_detailed`` then tries the next mask.
+    - Shifted positive → the extraction runs to completion and produces a
+      variable bag, but the bag fails ``find_matches_detailed``'s forward
+      round-trip against the original path, and the next mask is tried.
+
+    This function is deliberately not the correctness boundary; it just
+    narrows the search space and defers to the outer 2**k round-trip
+    search in ``find_matches_detailed`` for the final "is this reading
+    right" check.
 
     Returns the position, or ``-1`` if the anchor isn't found in the
     permitted range.
