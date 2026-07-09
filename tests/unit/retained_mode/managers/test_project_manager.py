@@ -1877,6 +1877,155 @@ situations:
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
+    async def test_app_initialization_complete_activates_seed_without_touching_defaults(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A seeded boot project is activated directly; the system-defaults gate is never consulted.
+
+        Regression guard for the boot ordering: with a project_file/workspace seed present,
+        on_app_initialization_complete activates the seed instead of first activating
+        SYSTEM_DEFAULTS_KEY. So a license policy that denies the defaults rest state does not
+        block boot -- the ACTIVATE_PROJECT checkpoint is never evaluated for SYSTEM_DEFAULTS_KEY.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        activated_subject_ids: list[str] = []
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT:
+                activated_subject_ids.append(checkpoint.subject_id)
+                if checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                    return CheckpointDenial(
+                        failures=(CheckpointFailure(detail="No license covers the default project."),)
+                    )
+            return None
+
+        event_manager = GriptapeNodes.EventManager()
+        event_manager.add_authorization_hook(deny_defaults)
+        try:
+            with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+                mock_file_instance = Mock()
+                mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+                mock_file_cls.return_value = mock_file_instance
+
+                await pm.on_app_initialization_complete(AppInitializationComplete())
+        finally:
+            event_manager.remove_authorization_hook(deny_defaults)
+
+        assert pm._current_project_id == str(workspace_project_path)
+        assert pm._initialization_complete is True
+        # The defaults rest state was never activated, so its (denying) gate was never hit.
+        assert SYSTEM_DEFAULTS_KEY not in activated_subject_ids
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_falls_back_to_defaults_when_seed_fails(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A seed that resolves but fails to load falls back to activating system defaults."""
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # File exists so the seed path resolves, but its YAML cannot be parsed.
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
+            mock_file_cls.return_value = mock_file_instance
+
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is True
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_does_not_complete_when_no_seed_and_defaults_denied(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """With no seed and a policy that denies system defaults, boot cannot complete.
+
+        This is the genuinely locked-out case: nothing is reachable, so the engine
+        surfaces the failure rather than pretending to have activated a project.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # No project_file seed and no workspace griptape-nodes-project.yml on disk.
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT and checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                return CheckpointDenial(failures=(CheckpointFailure(detail="No license covers the default project."),))
+            return None
+
+        event_manager = GriptapeNodes.EventManager()
+        event_manager.add_authorization_hook(deny_defaults)
+        try:
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+        finally:
+            event_manager.remove_authorization_hook(deny_defaults)
+
+        # The denied activation left the current project untouched and boot short-circuited.
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is False
+
+    @pytest.mark.asyncio
     async def test_load_workspace_project_uses_project_file_setting(self, pm: ProjectManager, tmp_path: Path) -> None:
         """When project_file config is set, that path is used instead of workspace default."""
         self._setup_system_defaults(pm, str(tmp_path))

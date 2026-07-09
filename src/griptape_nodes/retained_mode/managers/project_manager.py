@@ -3246,13 +3246,22 @@ class ProjectManager:
         ]
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        """Load system default project template when app initializes.
+        """Activate the boot project when the app initializes.
 
-        Called by EventManager after all libraries are loaded.
-        Loads system defaults, then checks workspace for a griptape-nodes-project.yml
-        overlay file and sets it as the current project if found. If a project has
-        already been explicitly selected before this event (e.g., by a CLI executor
-        via --project-file-path), preserves that choice and skips workspace discovery.
+        Called by EventManager after all libraries are loaded. Resolves the seeded
+        boot project (the project_file config setting, else a workspace-default
+        griptape-nodes-project.yml) and activates it directly. Only when no seed is
+        present, or the seed fails to load or activate, does the engine fall back to
+        activating system defaults as the rest state. If a project has already been
+        explicitly selected before this event (e.g., by a CLI executor via
+        --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        preserves that choice and skips seed discovery.
+
+        Activating the seed before system defaults means an engine whose license
+        policy denies the system-defaults rest state still boots straight into its
+        intended project, with no transition through defaults (the transition would
+        otherwise trip the ACTIVATE_PROJECT checkpoint on SYSTEM_DEFAULTS_KEY and abort
+        boot before the intended project was ever reached).
 
         A worker boots exactly like an orchestrator: it re-derives the current project
         from the same shared on-disk config (project_file / workspace default), so it
@@ -3262,26 +3271,44 @@ class ProjectManager:
         the orchestrator chose to ignore.
         """
         # If an explicit project was selected before init completed (e.g., by
-        # LocalWorkflowExecutor loading --project-file-path), keep it. Still load
-        # registered projects for visibility and mark init complete.
+        # LocalWorkflowExecutor loading --project-file-path, or the app orchestrator's
+        # ActivateWorkspaceProjectRequest), keep it. Still load registered projects for
+        # visibility and mark init complete.
         explicit_project_selected = self._current_project_id != SYSTEM_DEFAULTS_KEY
         if explicit_project_selected:
             await self._load_registered_projects()
             self._initialization_complete = True
             return
 
-        # Set system defaults as current project (using synthetic key for system defaults)
-        set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
-        result = await self.on_set_current_project_request(set_request)
+        # Activate the seeded boot project first, before touching system defaults.
+        # `_resolve_project_file_path` returns the project_file config seed (or the
+        # workspace-default griptape-nodes-project.yml) when one is present. Activating
+        # it directly keeps a policy-locked engine bootable: it never has to pass
+        # through the (possibly denied) system-defaults rest state to reach its
+        # intended project. When no seed is present -- or the seed fails to load or
+        # activate -- fall back to system defaults, matching the prior boot behavior.
+        seed_project_path = self._resolve_project_file_path()
+        seed_activated = False
+        if seed_project_path is not None:
+            seed_failure = await self._load_workspace_project()
+            if seed_failure is None:
+                seed_activated = True
+            else:
+                logger.error(
+                    "Attempted to activate seeded boot project at '%s'. Failed because %s. "
+                    "Falling back to system defaults.",
+                    seed_project_path,
+                    seed_failure,
+                )
 
-        if result.failed():
-            logger.error("Failed to set default project as current: %s", result.result_details)
-            return
-
-        logger.debug("Successfully loaded default project template")
-
-        # Check workspace for an optional project overlay file
-        await self._load_workspace_project()
+        if not seed_activated:
+            # Set system defaults as current project (using synthetic key for system defaults)
+            set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            result = await self.on_set_current_project_request(set_request)
+            if result.failed():
+                logger.error("Failed to set default project as current: %s", result.result_details)
+                return
+            logger.debug("Successfully loaded default project template")
 
         # Load any additional project templates previously registered by the user
         await self._load_registered_projects()
