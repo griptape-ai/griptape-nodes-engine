@@ -3257,11 +3257,9 @@ class ProjectManager:
         --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
         preserves that choice and skips seed discovery.
 
-        Activating the seed before system defaults means an engine whose license
-        policy denies the system-defaults rest state still boots straight into its
-        intended project, with no transition through defaults (the transition would
-        otherwise trip the ACTIVATE_PROJECT checkpoint on SYSTEM_DEFAULTS_KEY and abort
-        boot before the intended project was ever reached).
+        Activating the seed before system defaults keeps a policy-locked engine bootable:
+        one whose policy denies `<system-defaults>` would otherwise abort at that gate
+        before ever reaching the project it is permitted to run.
 
         A worker boots exactly like an orchestrator: it re-derives the current project
         from the same shared on-disk config (project_file / workspace default), so it
