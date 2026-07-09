@@ -3270,23 +3270,18 @@ class ProjectManager:
         worker honoring project_file does not "discover" a workspace griptape-nodes-project.yml
         the orchestrator chose to ignore.
         """
-        # If an explicit project was selected before init completed (e.g., by
-        # LocalWorkflowExecutor loading --project-file-path, or the app orchestrator's
-        # ActivateWorkspaceProjectRequest), keep it. Still load registered projects for
-        # visibility and mark init complete.
+        # If an explicit project was selected before init completed (CLI executor via
+        # --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        # keep it: load registered projects for visibility and mark init complete.
         explicit_project_selected = self._current_project_id != SYSTEM_DEFAULTS_KEY
         if explicit_project_selected:
             await self._load_registered_projects()
             self._initialization_complete = True
             return
 
-        # Activate the seeded boot project first, before touching system defaults.
-        # `_resolve_project_file_path` returns the project_file config seed (or the
-        # workspace-default griptape-nodes-project.yml) when one is present. Activating
-        # it directly keeps a policy-locked engine bootable: it never has to pass
-        # through the (possibly denied) system-defaults rest state to reach its
-        # intended project. When no seed is present -- or the seed fails to load or
-        # activate -- fall back to system defaults, matching the prior boot behavior.
+        # Activate the seeded boot project first (project_file config, else the
+        # workspace-default griptape-nodes-project.yml). Fall back to system defaults
+        # only when there is no seed or the seed fails to load or activate.
         seed_project_path = self._resolve_project_file_path()
         seed_activated = False
         if seed_project_path is not None:
@@ -3302,7 +3297,6 @@ class ProjectManager:
                 )
 
         if not seed_activated:
-            # Set system defaults as current project (using synthetic key for system defaults)
             set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
             result = await self.on_set_current_project_request(set_request)
             if result.failed():
@@ -3313,8 +3307,8 @@ class ProjectManager:
         # Load any additional project templates previously registered by the user
         await self._load_registered_projects()
 
-        # Mark initialization complete so subsequent project switches trigger
-        # workspace detection and library reload when the workspace actually changes.
+        # Subsequent project switches now trigger workspace detection and library
+        # reload when the workspace actually changes.
         self._initialization_complete = True
 
     def on_get_all_situations_for_project_request(
