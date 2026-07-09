@@ -141,47 +141,95 @@ class TestConfigManager:
                 assert manager.workspace_path == override_workspace.resolve()
                 assert manager.get_config_value("workspace_directory") == str(override_workspace)
 
-    def test_resolved_libraries_root_default_is_workspace_relative(self) -> None:
-        """With no override, the root is libraries_directory resolved against workspace_path."""
+    def test_resolved_libraries_root_default_is_global_workspace_relative(self, isolate_user_config: Path) -> None:
+        """With no override, the root is libraries_directory resolved against the GLOBAL workspace.
+
+        The fallback uses configured_global_workspace_path() (the user/default config
+        workspace_directory), NOT the active workspace_path override, so a self-contained project's
+        workspace pin does not relocate the shared libraries dir.
+        """
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
             workspace = Path(temp_dir) / "ws"
             workspace.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
-            manager.workspace_path = workspace
 
-            # default libraries_directory is "libraries" (relative -> under the workspace)
+            # default libraries_directory is "libraries" (relative -> under the global workspace)
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
 
-    def test_resolved_libraries_root_uses_override_verbatim(self) -> None:
-        """When an override is set, it is returned as-is, independent of workspace_path."""
+    def test_resolved_libraries_root_uses_override_verbatim(self, isolate_user_config: Path) -> None:
+        """When an override is set, it is returned as-is, independent of the global workspace."""
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
             workspace = Path(temp_dir) / "ws"
             workspace.mkdir()
             shared = Path(temp_dir) / "shared-libs"
             shared.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
-            manager.workspace_path = workspace
 
             manager.set_libraries_root_override(shared)
             assert manager.resolved_libraries_root() == shared.resolve()
 
-            # Clearing restores the workspace-relative default.
+            # Clearing restores the global-workspace-relative default.
             manager.set_libraries_root_override(None)
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
 
-    def test_clear_project_layers_clears_libraries_root_override(self) -> None:
+    def test_clear_project_layers_clears_libraries_root_override(self, isolate_user_config: Path) -> None:
         with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
             workspace = Path(temp_dir) / "ws"
             workspace.mkdir()
             shared = Path(temp_dir) / "shared-libs"
             shared.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
             manager = ConfigManager()
-            manager.workspace_path = workspace
             manager.set_libraries_root_override(shared)
 
             manager.clear_project_layers()
 
             assert manager.resolved_libraries_root() == (workspace / "libraries").resolve()
+
+    def test_resolved_libraries_root_fallback_ignores_active_workspace_override(
+        self, isolate_user_config: Path
+    ) -> None:
+        """A self-contained project's workspace override must NOT relocate the unset-libraries fallback.
+
+        Regression guard: with no libraries override, resolved_libraries_root resolves against the
+        GLOBAL configured workspace, not set_workspace_override's per-project pin. This is what keeps a
+        v1 self-contained project (workspace_dir "./") sharing the global libraries dir.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            global_ws = Path(temp_dir) / "global_ws"
+            global_ws.mkdir()
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
+            manager = ConfigManager()
+
+            # Simulate activating a self-contained project: its workspace is pinned to its own dir.
+            manager.set_workspace_override(project_dir)
+
+            # Libraries still resolve under the GLOBAL workspace, not the project's own folder.
+            assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
+            assert manager.resolved_libraries_root() != (project_dir / "libraries").resolve()
+
+    def test_resolved_libraries_root_v0_style_is_noop(self, isolate_user_config: Path) -> None:
+        """A v0-style project pins its workspace TO the global workspace, so the fallback is unchanged.
+
+        A v0 project has no workspace_dir, so activation sets the override to the global workspace
+        itself. The new global-workspace fallback then yields the same path the old workspace_path
+        fallback did -- documenting that this change is a no-op for v0 and only affects self-contained
+        v1 projects (whose override points at their own dir).
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            global_ws = Path(temp_dir) / "global_ws"
+            global_ws.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
+            manager = ConfigManager()
+
+            # v0 activation pins the override to the global workspace (branch 5 of decide_workspace).
+            manager.set_workspace_override(global_ws)
+
+            assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
 
     def test_coerce_to_type_bool_from_string(self) -> None:
         """Test that _coerce_to_type correctly converts string values to bool."""
@@ -963,6 +1011,14 @@ class TestProvisioningPreviewMatchesActivation:
         # The workspace layer was actually consumed (not a both-wrong pass).
         assert get_dot_value(live_merged, LIBRARIES_TO_REGISTER_KEY) == expected_libraries
         assert get_dot_value(live_merged, REQUIRES_ENGINE_KEY) == expected_engine_version
+
+    # Live-vs-offline parity for the unset-libraries fallback is covered by REAL-path tests, not a
+    # by-construction replica: the live side by
+    # TestConfigManager.test_resolved_libraries_root_fallback_ignores_active_workspace_override
+    # (resolved_libraries_root -> global, not the project override), and the offline side by
+    # test_library_manager.TestPreviewProjectProvisioning.test_probes_global_workspace_for_unset_libraries_fallback
+    # (drives the real on_preview_project_provisioning_request and fails if it stops probing the global
+    # workspace). Both now resolve against configured_global_workspace_path(), so they agree.
 
     def test_project_workspaces_override_branch(self, tmp_path: Path, isolate_user_config: Path) -> None:
         """project_workspaces maps the project to a separate workspace dir (apply_override=True)."""
