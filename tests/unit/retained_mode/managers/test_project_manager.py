@@ -1943,7 +1943,7 @@ situations:
 
     @pytest.mark.asyncio
     async def test_app_initialization_complete_falls_back_to_defaults_when_seed_fails(
-        self, pm: ProjectManager, tmp_path: Path
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """A seed that resolves but fails to load falls back to activating system defaults."""
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -1966,7 +1966,10 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls,
+            caplog.at_level(logging.ERROR, logger="griptape_nodes"),
+        ):
             mock_file_instance = Mock()
             mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
             mock_file_cls.return_value = mock_file_instance
@@ -1975,6 +1978,12 @@ situations:
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
         assert pm._initialization_complete is True
+        # The seed was resolved and attempted before the fallback: prove the ordering,
+        # not just the endpoint (which a never-attempted seed would also satisfy).
+        error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            str(workspace_project_path) in msg and "Falling back to system defaults" in msg for msg in error_messages
+        )
 
     @pytest.mark.asyncio
     async def test_app_initialization_complete_does_not_complete_when_no_seed_and_defaults_denied(
