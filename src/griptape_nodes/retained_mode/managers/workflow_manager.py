@@ -145,6 +145,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowsFromConfigRequest,
     RegisterWorkflowsFromConfigResultFailure,
     RegisterWorkflowsFromConfigResultSuccess,
+    RenameDisplayNameBehavior,
     RenameWorkflowRequest,
     RenameWorkflowResultFailure,
     RenameWorkflowResultSuccess,
@@ -1146,13 +1147,17 @@ class WorkflowManager:
         )
 
     async def on_rename_workflow_request(self, request: RenameWorkflowRequest) -> ResultPayload:
-        # Preserve the raw user input as the display name (metadata.name).
-        display_name = request.requested_name
         # Sanitize to a Python module-friendly name for the file stem (registry key).
         sanitized_stem = normalize_display_name(request.requested_name)
         if not sanitized_stem:
             details = f"Attempted to rename workflow '{request.workflow_name}'. The requested name '{request.requested_name}' produced an empty file name after sanitization."
             return RenameWorkflowResultFailure(result_details=details)
+
+        display_name_error = self._validate_rename_display_name(request)
+        if display_name_error is not None:
+            return RenameWorkflowResultFailure(result_details=display_name_error)
+
+        display_name = self._resolve_rename_display_name(request)
 
         # Rename keeps the workflow's location (unlike Move). Inherit the source workflow's
         # directory and prepend it to the sanitized stem so the renamed file stays put:
@@ -1174,48 +1179,109 @@ class WorkflowManager:
             details = f"Attempted to rename workflow '{request.workflow_name}' to '{requested_file_name}'. Failed while attempting to save."
             return RenameWorkflowResultFailure(result_details=details)
 
+        reconcile_error = await self._reconcile_rename_bookkeeping(
+            old_workflow_name=request.workflow_name,
+            save_result=save_workflow_request,
+        )
+        if reconcile_error is not None:
+            return RenameWorkflowResultFailure(result_details=reconcile_error)
+
         new_workflow_name = save_workflow_request.workflow_name
-
-        # Transfer the substitution flag to the new name before the delete call removes the old entry.
-        if new_workflow_name != request.workflow_name:
-            self._rekey_substitution_flag(request.workflow_name, new_workflow_name)
-
-        # If the renamed file landed outside the workspace, keep it registered at its new path
-        # (the old path's registration is stripped by the delete below).
-        self._persist_external_workflow_registration(str(save_workflow_request.file_path))
-
-        # If the original workflow isn't registered, treat this as a Save As and skip deletion.
-        # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
-        # don't delete the file we just saved.
-        if (
-            WorkflowRegistry.has_workflow_with_name(request.workflow_name)
-            and new_workflow_name != request.workflow_name
-        ):
-            delete_workflow_result = await GriptapeNodes.ahandle_request(
-                DeleteWorkflowRequest(name=request.workflow_name)
-            )
-            if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
-                details = (
-                    f"Attempted to rename workflow '{request.workflow_name}' to '{new_workflow_name}'. "
-                    "Failed while attempting to remove the original file name from the registry."
-                )
-                return RenameWorkflowResultFailure(result_details=details)
-
-        # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately.
-        context_manager = GriptapeNodes.ContextManager()
-        if (
-            context_manager.has_current_workflow()
-            and context_manager.get_current_workflow_name() == request.workflow_name
-        ):
-            context_manager.set_current_workflow_name(new_workflow_name)
-
         return RenameWorkflowResultSuccess(
             new_workflow_name=new_workflow_name,
             result_details=ResultDetails(
                 message=f"Successfully renamed workflow to: {new_workflow_name}", level=logging.INFO
             ),
         )
+
+    def _validate_rename_display_name(self, request: RenameWorkflowRequest) -> str | None:
+        """Return a failure message when the request's display-name arguments are invalid, else None.
+
+        Two failure conditions:
+        * ``display_name`` supplied with a non-OVERRIDE behavior — the field would be silently
+          ignored, which is almost always a caller mistake (e.g. picked OVERRIDE mentally but
+          forgot to switch the enum).
+        * OVERRIDE with a missing or blank ``display_name`` — the field is the whole point of
+          OVERRIDE mode and must carry a non-empty value.
+
+        PRESERVE_EXISTING and MATCH_FILE_NAME with ``display_name=None`` derive the value from
+        existing state or the requested file name and have nothing to check.
+        """
+        if request.display_name is not None and request.display_name_behavior is not RenameDisplayNameBehavior.OVERRIDE:
+            return (
+                f"Attempted to rename workflow '{request.workflow_name}' with "
+                f"display_name_behavior={request.display_name_behavior.value} and display_name="
+                f"{request.display_name!r}. Failed because 'display_name' is only consulted when "
+                "display_name_behavior=OVERRIDE. Either switch to OVERRIDE, or remove display_name."
+            )
+        if request.display_name_behavior is not RenameDisplayNameBehavior.OVERRIDE:
+            return None
+        if request.display_name and request.display_name.strip():
+            return None
+        return (
+            f"Attempted to rename workflow '{request.workflow_name}' with display_name_behavior=OVERRIDE. "
+            "Failed because 'display_name' was not provided or was empty. Provide a non-empty display_name, "
+            "or use PRESERVE_EXISTING / MATCH_FILE_NAME behavior."
+        )
+
+    def _resolve_rename_display_name(self, request: RenameWorkflowRequest) -> str | None:
+        """Compute the display name (``metadata.name``) to pass into the follow-up SaveWorkflowRequest.
+
+        * ``OVERRIDE`` — return the caller-supplied ``display_name`` verbatim.
+        * ``PRESERVE_EXISTING`` — return the source workflow's current ``metadata.name``. If the source
+          isn't in the registry (uncommon Save-As-style path), fall through to the requested name so
+          the on-disk file still gets a sensible display name.
+        * ``MATCH_FILE_NAME`` — return the raw ``requested_name`` (legacy behavior; display name tracks
+          the new file name).
+        """
+        if request.display_name_behavior is RenameDisplayNameBehavior.OVERRIDE:
+            return request.display_name
+        if (
+            request.display_name_behavior is RenameDisplayNameBehavior.PRESERVE_EXISTING
+            and WorkflowRegistry.has_workflow_with_name(request.workflow_name)
+        ):
+            return WorkflowRegistry.get_workflow_by_name(request.workflow_name).metadata.name
+        return request.requested_name
+
+    async def _reconcile_rename_bookkeeping(
+        self,
+        *,
+        old_workflow_name: str,
+        save_result: SaveWorkflowResultSuccess,
+    ) -> str | None:
+        """Post-save bookkeeping for a rename: rekey flags, persist external reg, delete old entry, sync context.
+
+        Returns a failure message when the delete step fails; otherwise None. Extracted so the outer
+        handler doesn't blow past the McCabe branch limit.
+        """
+        new_workflow_name = save_result.workflow_name
+
+        # Transfer the substitution flag to the new name before the delete call removes the old entry.
+        if new_workflow_name != old_workflow_name:
+            self._rekey_substitution_flag(old_workflow_name, new_workflow_name)
+
+        # If the renamed file landed outside the workspace, keep it registered at its new path
+        # (the old path's registration is stripped by the delete below).
+        self._persist_external_workflow_registration(str(save_result.file_path))
+
+        # If the original workflow isn't registered, treat this as a Save As and skip deletion.
+        # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
+        # don't delete the file we just saved.
+        if WorkflowRegistry.has_workflow_with_name(old_workflow_name) and new_workflow_name != old_workflow_name:
+            delete_workflow_result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=old_workflow_name))
+            if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
+                return (
+                    f"Attempted to rename workflow '{old_workflow_name}' to '{new_workflow_name}'. "
+                    "Failed while attempting to remove the original file name from the registry."
+                )
+
+        # If the renamed workflow is the current context, update the context name so the
+        # heartbeat and other callers reflect the new registry key immediately.
+        context_manager = GriptapeNodes.ContextManager()
+        if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
+            context_manager.set_current_workflow_name(new_workflow_name)
+
+        return None
 
     def _build_workflow_info_key(self, file_path: str) -> str:
         """Build the key used to look up a workflow in _workflow_file_path_to_info.
