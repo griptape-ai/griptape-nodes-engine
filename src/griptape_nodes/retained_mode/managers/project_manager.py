@@ -2168,25 +2168,30 @@ class ProjectManager:
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
 
-        # License-policy checkpoint: gate activating a user project on its id. The
-        # system-defaults rest state is always allowed -- it is the fallback a
-        # failed activation rolls back to. A denial rejects the switch with the
-        # missing permissions and leaves the current project untouched (the
-        # activation below never runs).
-        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
-            denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
-                AuthorizationCheckpoint(
-                    action=CheckpointAction.ACTIVATE_PROJECT,
-                    subject_type=CheckpointSubjectType.PROJECT,
-                    subject_id=resolved_project_id,
-                    attributes=self._project_checkpoint_attributes(resolved_project_id),
-                )
+        # License-policy checkpoint: gate every activation on the project id,
+        # including the system-defaults rest state. The engine bakes in no policy
+        # of its own -- it always asks and the consumer decides, which keeps this
+        # leaf-activation gate consistent with the ancestry screening that already
+        # treats the rest state as an ordinary chain entry. A consumer that wants
+        # the defaults to stay reachable permits SYSTEM_DEFAULTS_KEY (as the shipped
+        # license policies do); with no policy installed the checkpoint allows. A
+        # denial rejects the switch with the missing permissions and leaves the
+        # current project untouched (the activation below never runs). Rollback
+        # re-activates the previous project through _activate_project directly, so
+        # it never re-enters this gate.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.ACTIVATE_PROJECT,
+                subject_type=CheckpointSubjectType.PROJECT,
+                subject_id=resolved_project_id,
+                attributes=self._project_checkpoint_attributes(resolved_project_id),
             )
-            if denial is not None:
-                reason = denial.reason()
-                return SetCurrentProjectResultFailure(
-                    result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
-                )
+        )
+        if denial is not None:
+            reason = denial.reason()
+            return SetCurrentProjectResultFailure(
+                result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
+            )
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:
