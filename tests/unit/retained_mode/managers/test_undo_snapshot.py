@@ -27,6 +27,7 @@ from griptape_nodes.retained_mode.events.node_events import (
     CreateNodeRequest,
     CreateNodeResultSuccess,
     DeleteNodeRequest,
+    SetLockNodeStateRequest,
     SetNodeMetadataRequest,
 )
 from griptape_nodes.retained_mode.events.parameter_events import (
@@ -381,3 +382,32 @@ class TestSnapshotStrategy:
         value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeB", parameter_name="text"))
         assert isinstance(value_result, GetParameterValueResultSuccess)
         assert value_result.value == "keepB"
+
+    def test_undo_restores_value_on_a_node_that_ends_locked(self, snapshot_engine: GriptapeNodes) -> None:
+        """Undo restores a value even when the batch also locked the node (unlock happens first).
+
+        Regression: reconcile applied values before restoring lock, so a value set on a node that is
+        currently locked was silently rejected, leaving stale post-edit values after undo.
+        """
+        flow_name = self._make_flow(snapshot_engine)
+        self._create_node(flow_name, node_name="ProbeA")
+        undo_manager = GriptapeNodes.UndoManager()
+
+        # One undoable batch that both sets a value and locks the node.
+        with undo_manager.transaction("Edit and lock"):
+            snapshot_engine.handle_request(
+                SetParameterValueRequest(node_name="ProbeA", parameter_name="text", value="hello")
+            )
+            snapshot_engine.handle_request(SetLockNodeStateRequest(node_name="ProbeA", lock=True))
+
+        obj = GriptapeNodes.ObjectManager()
+        node = obj.attempt_get_object_by_name_as_type("ProbeA", BaseNode)
+        assert node is not None
+        assert node.lock is True
+
+        assert isinstance(GriptapeNodes.handle_request(UndoRequest()), UndoResultSuccess)
+        # The node must be unlocked again and its value reverted (the reconcile unlocks before setting).
+        assert node.lock is False
+        value_result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name="ProbeA", parameter_name="text"))
+        assert isinstance(value_result, GetParameterValueResultSuccess)
+        assert value_result.value == ""

@@ -125,31 +125,40 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             return None
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
+        explicit_value_keys = _capture_explicit_value_keys(flow_name)
+        if explicit_value_keys is None:
+            # Could not enumerate every node's explicit values: proceeding with a partial map would
+            # let the reconcile clear-path wipe values on nodes missing from it. Treat as "not
+            # undoable" instead.
+            logger.warning("Snapshot undo: incomplete value-key capture for flow '%s'; not snapshotting.", flow_name)
+            return None
         return FlowSnapshot(
             flow_name=flow_name,
             serialized_flow_commands=serialize_result.serialized_flow_commands,
-            explicit_value_keys=_capture_explicit_value_keys(flow_name),
+            explicit_value_keys=explicit_value_keys,
         )
     except Exception:
         logger.exception("Snapshot undo: capturing the workflow snapshot raised; this action will not be undoable.")
         return None
 
 
-def _capture_explicit_value_keys(flow_name: str) -> dict[str, set[str]]:
+def _capture_explicit_value_keys(flow_name: str) -> dict[str, set[str]] | None:
     """Record, per node, the parameter names that hold an explicit value right now.
 
-    Used by the reconcile clear-path so it can tell "unset at capture" from "set but not serialized"
-    (non-serializable or None values), and therefore never wipe a live value the snapshot could not
-    record.
+    Returns None if the node set cannot be fully enumerated, so the caller can decline to snapshot
+    rather than proceed with a partial map (a missing node would default to "no explicit values" and
+    have all its live values wiped by the reconcile clear-path). Used so the clear-path can tell
+    "unset at capture" from "set but not serialized" (non-serializable or None values).
     """
-    keys: dict[str, set[str]] = {}
     list_result = GriptapeNodes.handle_request(ListNodesInFlowRequest(flow_name=flow_name))
     if not isinstance(list_result, ListNodesInFlowResultSuccess):
-        return keys
+        return None
+    keys: dict[str, set[str]] = {}
     for node_name in list_result.node_names:
         node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
-        if node is not None:
-            keys[node_name] = set(node.parameter_values.keys())
+        if node is None:
+            return None
+        keys[node_name] = set(node.parameter_values.keys())
     return keys
 
 
@@ -217,7 +226,7 @@ def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
             node_name=node_name,
             node_commands=name_to_node_commands[node_name],
             commands=commands,
-            explicit_value_keys=snapshot.explicit_value_keys.get(node_name, set()),
+            explicit_value_keys=snapshot.explicit_value_keys.get(node_name),
             force=node_name in to_create,
         )
 
@@ -286,7 +295,7 @@ def _reconcile_node_state(
     node_name: str,
     node_commands: SerializedNodeCommands,
     commands: SerializedFlowCommands,
-    explicit_value_keys: set[str],
+    explicit_value_keys: set[str] | None,
     force: bool,
 ) -> None:
     """Restore a node's position, parameter values, and lock, setting only what differs (unless forced)."""
@@ -305,7 +314,8 @@ def _reconcile_node_state(
             f"setting metadata on node '{node_name}'",
         )
 
-    # Parameter values.
+    # Parameter values. This may lazily unlock the node (a locked node rejects value sets); the lock
+    # step below then restores the target lock state, so this must run before it.
     _reconcile_node_values(
         node=node,
         node_commands=node_commands,
@@ -314,7 +324,7 @@ def _reconcile_node_state(
         force=force,
     )
 
-    # Lock state.
+    # Lock state (last: after any value restore that required temporarily unlocking the node).
     lock_command = commands.set_lock_commands_per_node.get(node_commands.node_uuid)
     target_lock = lock_command.lock if lock_command is not None else False
     if node.lock != target_lock:
@@ -329,7 +339,7 @@ def _reconcile_node_values(
     node: BaseNode,
     node_commands: SerializedNodeCommands,
     commands: SerializedFlowCommands,
-    explicit_value_keys: set[str],
+    explicit_value_keys: set[str] | None,
     force: bool,
 ) -> None:
     """Restore a node's parameter values to the snapshot, setting only what differs (unless forced)."""
@@ -346,6 +356,7 @@ def _reconcile_node_values(
         target_value = commands.unique_parameter_uuid_to_values[indirect_command.unique_value_uuid]
         if not force and _values_equal(node.get_parameter_value(parameter_name), target_value):
             continue
+        _ensure_node_unlocked(node)
         # Fresh request (do not mutate the snapshot's command; snapshots are reused across undo/redo).
         # initial_setup bypasses the input+property connection guard and avoids unresolving the node,
         # preserving execution state on nodes the restore did not otherwise change.
@@ -359,18 +370,26 @@ def _reconcile_node_values(
             f"setting value '{node_name}.{parameter_name}'",
         )
 
-    # Clear values added since the snapshot: a parameter that holds an explicit value now but did not
-    # at capture time must be reset to its default. Uses the captured explicit-value key set (not the
-    # serialized commands) so a live value the snapshot could not record (non-serializable, or None)
-    # is left intact rather than wiped.
-    if force:
-        return
+    # A None key set (node missing from the capture map) means the snapshot cannot vouch for this
+    # node, so nothing is cleared. Created nodes (force) start clean and need no clearing.
+    if not force and explicit_value_keys is not None:
+        _clear_added_node_values(node, explicit_value_keys)
+
+
+def _clear_added_node_values(node: BaseNode, explicit_value_keys: set[str]) -> None:
+    """Reset parameters that hold an explicit value now but did not at capture time to their default.
+
+    Uses the captured explicit-value key set (not the serialized commands) so a live value the
+    snapshot could not record (non-serializable, or None) is left intact rather than wiped.
+    """
+    node_name = node.name
     for parameter_name in list(node.parameter_values.keys()):
         if parameter_name in explicit_value_keys:
             continue
         parameter = node.get_parameter_by_name(parameter_name)
         if parameter is None:
             continue
+        _ensure_node_unlocked(node)
         _try_reconcile(
             SetParameterValueRequest(
                 node_name=node_name,
@@ -379,6 +398,19 @@ def _reconcile_node_values(
                 initial_setup=True,
             ),
             f"clearing value '{node_name}.{parameter_name}'",
+        )
+
+
+def _ensure_node_unlocked(node: BaseNode) -> None:
+    """Unlock a node so its values can be restored; idempotent (no-op if already unlocked).
+
+    A locked node rejects value sets regardless of initial_setup. The caller restores the target
+    lock state afterward, so unlocking here is only a transient step during reconcile.
+    """
+    if node.lock:
+        _try_reconcile(
+            SetLockNodeStateRequest(node_name=node.name, lock=False),
+            f"unlocking node '{node.name}' to restore its values",
         )
 
 
