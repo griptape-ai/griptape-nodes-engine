@@ -7,14 +7,19 @@ plumbing without hitting Griptape Cloud.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
 import pytest
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
+    BinaryContent,
+    ImageUrl,
     ModelMessage,
+    ModelRequest,
     TextPart,
     ToolCallPart,
+    UserPromptPart,
 )
 from pydantic_ai.models.function import AgentInfo, DeltaToolCall, FunctionModel
 
@@ -261,3 +266,109 @@ async def test_event_sink_receives_text_tool_call_and_tool_result(tmp_path: Path
     assert tool_results[0].is_error is False
 
     assert "".join(d.delta for d in text_deltas) == "Got it."
+
+
+@pytest.mark.asyncio
+async def test_persist_prompt_swaps_binary_for_image_url_in_saved_history(tmp_path: Path) -> None:
+    """`persist_prompt` stores the URL-reference form, not the live bytes."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        yield "done"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+
+    url = "http://localhost:8124/workspace/cat.png"
+    live = ["look", BinaryContent(data=b"png-bytes", media_type="image/png")]
+    persist = ["look", ImageUrl(url=url)]
+    result = await runner.run(live, persist_prompt=persist)
+
+    reloaded = runner.storage.load_history(result.thread_id)
+    user_parts = [
+        part
+        for message in reloaded
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart)
+    ]
+    assert len(user_parts) == 1
+    content = user_parts[0].content
+    assert any(isinstance(item, ImageUrl) and item.url == url for item in content)
+    assert not any(isinstance(item, BinaryContent) for item in content)
+
+
+@pytest.mark.asyncio
+async def test_history_rehydrator_transforms_loaded_history_before_model_call(tmp_path: Path) -> None:
+    """The rehydrator runs on loaded history before it reaches the model."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    seen_by_model: list[list[ModelMessage]] = []
+
+    async def stream(messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        seen_by_model.append(list(messages))
+        yield "ok"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+
+    # Seed a thread whose history carries an ImageUrl reference.
+    url = "http://localhost:8124/workspace/cat.png"
+    thread_id, _ = runner.storage.create_thread()
+    seed: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+    runner.storage.save_history(thread_id, seed)
+
+    # A non-mutating rehydrator, per the run() contract: returns fresh objects
+    # and leaves the input pristine so the on-disk form is never touched.
+    async def rehydrate(messages: list[ModelMessage]) -> list[ModelMessage]:
+        rehydrated: list[ModelMessage] = []
+        for message in messages:
+            if not isinstance(message, ModelRequest):
+                rehydrated.append(message)
+                continue
+            new_parts: list[Any] = []
+            for part in message.parts:
+                if isinstance(part, UserPromptPart) and not isinstance(part.content, str):
+                    new_parts.append(
+                        replace(
+                            part,
+                            content=[
+                                BinaryContent(data=b"bytes", media_type="image/png")
+                                if isinstance(item, ImageUrl)
+                                else item
+                                for item in part.content
+                            ],
+                        )
+                    )
+                else:
+                    new_parts.append(part)
+            rehydrated.append(replace(message, parts=new_parts))
+        return rehydrated
+
+    await runner.run("follow up", thread_id=thread_id, history_rehydrator=rehydrate)
+
+    # The model saw the rehydrated history: the ImageUrl became BinaryContent.
+    replayed_user_parts = [
+        part
+        for message in seen_by_model[0]
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart) and not isinstance(part.content, str)
+    ]
+    assert any(isinstance(item, BinaryContent) for part in replayed_user_parts for item in part.content)
+    assert not any(isinstance(item, ImageUrl) for part in replayed_user_parts for item in part.content)
+
+    # Regression: the rehydrated bytes must NOT be written back to disk. The
+    # prior turn stays an ImageUrl reference so history never re-bloats.
+    reloaded = runner.storage.load_history(thread_id)
+    prior_user_parts = [
+        part
+        for message in reloaded
+        if isinstance(message, ModelRequest)
+        for part in message.parts
+        if isinstance(part, UserPromptPart) and not isinstance(part.content, str)
+    ]
+    assert any(isinstance(item, ImageUrl) for part in prior_user_parts for item in part.content)
+    assert not any(isinstance(item, BinaryContent) for part in prior_user_parts for item in part.content)
