@@ -226,6 +226,15 @@ def _locate_next_anchor(
     ``_v`` inside ``_video``. Unbounded rfind is fine when no static
     segment follows (nothing after the optional is anchored).
 
+    The bound uses the FIRST occurrence of the downstream static — a
+    deliberately conservative choice. If the downstream static's text also
+    happens to appear earlier in the path (inside the base name, say), the
+    bound over-tightens and rfind returns ``-1``, which is treated as
+    "anchor not found." This can only ever produce a *false negative* that
+    the caller's 2**k round-trip search recovers from — it can never yield
+    a wrong positive. See ``find_matches_detailed`` for the outer safety
+    net.
+
     Returns the position, or ``-1`` if the anchor isn't found in the
     permitted range.
     """
