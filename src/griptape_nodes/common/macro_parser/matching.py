@@ -229,11 +229,15 @@ def _locate_next_anchor(
     The bound uses the FIRST occurrence of the downstream static — a
     deliberately conservative choice. If the downstream static's text also
     happens to appear earlier in the path (inside the base name, say), the
-    bound over-tightens and rfind returns ``-1``, which is treated as
-    "anchor not found." This can only ever produce a *false negative* that
-    the caller's 2**k round-trip search recovers from — it can never yield
-    a wrong positive. See ``find_matches_detailed`` for the outer safety
-    net.
+    bound over-tightens and rfind either returns ``-1`` (no anchor in the
+    narrowed window) or a *shifted* anchor position pointing at an earlier
+    lookalike rather than the true marker. In either case the extraction
+    that follows is wrong, but the caller's 2**k round-trip search in
+    ``find_matches_detailed`` — not this function — is what filters the
+    bad result out: a shifted anchor produces a bag that fails forward
+    round-trip against the original path, so the next mask is tried. This
+    function is deliberately not the correctness boundary; it just narrows
+    the search space and defers to the outer safety net.
 
     Returns the position, or ``-1`` if the anchor isn't found in the
     permitted range.
