@@ -110,25 +110,7 @@ def extract_single_variable(
 
     next_end_pos: int | None = None
     if next_anchor is not None:
-        # Direction of the next-anchor search:
-        # - Static-derived anchors (`/`, `.png`, ...) are literal delimiters at
-        #   grammar-defined positions. Their FIRST occurrence in the path is
-        #   the boundary — greedy left-to-right parsing for `{a}/{b}/{c}`
-        #   relies on this.
-        # - Leading-separator-derived anchors (e.g. `_v` from `{###?:^_v}`)
-        #   are hints about where a FOLLOWING (usually optional) variable
-        #   begins. A base name may legitimately CONTAIN the anchor text as
-        #   a substring — e.g. `my_v1_report_v007.py` has two `_v`. The
-        #   trailing occurrence is where the version marker actually lives,
-        #   so search rightward. If the base has an anchor lookalike but no
-        #   version emitted, the round-trip guard in `find_matches_detailed`
-        #   catches the misread and falls through to the omitted-mask
-        #   attempt. See cjkindel review on #4989.
-        anchor_pos = (
-            path.rfind(next_anchor.text, start_pos)
-            if next_anchor.from_leading_separator
-            else path.find(next_anchor.text, start_pos)
-        )
+        anchor_pos = _locate_next_anchor(next_anchor, remaining_segments, path, start_pos)
         if anchor_pos == -1:
             return None
         next_end_pos = anchor_pos
@@ -213,6 +195,64 @@ def find_next_anchor(segments: list[ParsedSegment]) -> NextAnchor | None:
             leading_prefix = _leading_separator_prefix(seg)
             if leading_prefix is not None:
                 return NextAnchor(text=leading_prefix, from_leading_separator=True)
+    return None
+
+
+def _locate_next_anchor(
+    next_anchor: NextAnchor,
+    remaining_segments: list[ParsedSegment],
+    path: str,
+    start_pos: int,
+) -> int:
+    """Locate ``next_anchor`` in ``path`` at or after ``start_pos``.
+
+    Search direction depends on provenance:
+
+    - Static-derived anchors (``/``, ``.png``, ...) are literal delimiters at
+      grammar-defined positions. Their FIRST occurrence in the path is the
+      boundary — greedy left-to-right parsing for ``{a}/{b}/{c}`` relies
+      on this.
+    - Leading-separator-derived anchors (e.g. ``_v`` from ``{###?:^_v}``)
+      are hints about where a FOLLOWING (usually optional) variable begins.
+      A base name may legitimately contain the anchor text as a substring
+      — e.g. ``my_v1_report_v007.py`` has two ``_v``. The trailing
+      occurrence is where the version marker actually lives, so search
+      rightward. See cjkindel review on #4989.
+
+    For the rfind case, the search is bounded at the position of the next
+    STATIC anchor (if any exists) so it can't overshoot into text that
+    belongs to a downstream segment — e.g. ``{base}{###?:^_v}_video.{ext}``
+    on ``my_report_v007_video.mp4``: without the bound, rfind would land on
+    ``_v`` inside ``_video``. Unbounded rfind is fine when no static
+    segment follows (nothing after the optional is anchored).
+
+    Returns the position, or ``-1`` if the anchor isn't found in the
+    permitted range.
+    """
+    if not next_anchor.from_leading_separator:
+        return path.find(next_anchor.text, start_pos)
+
+    downstream_static_text = _find_downstream_static_text(remaining_segments)
+    if downstream_static_text is None:
+        return path.rfind(next_anchor.text, start_pos)
+    downstream_static_pos = path.find(downstream_static_text, start_pos)
+    if downstream_static_pos == -1:
+        return path.rfind(next_anchor.text, start_pos)
+    return path.rfind(next_anchor.text, start_pos, downstream_static_pos)
+
+
+def _find_downstream_static_text(segments: list[ParsedSegment]) -> str | None:
+    """Return the text of the next ``ParsedStaticValue`` segment, or None.
+
+    Unlike ``find_next_anchor`` this ignores leading-separator anchors and
+    walks past variables to the first genuinely-static segment — used only
+    to bound the rightward rfind for a leading-separator anchor so the
+    rfind can't overshoot into text that belongs to a downstream segment.
+    See ``extract_single_variable`` for the argument.
+    """
+    for seg in segments:
+        if isinstance(seg, ParsedStaticValue):
+            return seg.text
     return None
 
 

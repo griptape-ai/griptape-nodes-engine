@@ -1919,3 +1919,34 @@ class TestReverseMatchOptionalVariable5025:
             "file_name_base": "my_v1",
             "file_extension": "py",
         }
+
+    def test_leading_separator_rfind_is_bounded_by_downstream_static(self, sm: Any) -> None:
+        """Rightward search for a leading-separator anchor is bounded at the next static segment.
+
+        Overshoot regression coverage: a template that places prefix-containing
+        static text AFTER a leading-separator optional would otherwise let the
+        rfind land on the prefix lookalike inside that downstream static, misroute
+        extraction, and lose the correct emitted-mask reading to a lossier
+        omitted-mask match.
+
+        Template: ``{base}{###?:^_v}_video.{ext}`` matching
+        ``my_report_v007_video.mp4``. Without the bound, ``path.rfind("_v", ...)``
+        lands on the ``_v`` inside ``_video`` (position 15), the emitted attempt
+        collapses to an empty capture, and only the omitted attempt survives —
+        giving ``base="my_report_v007", _index=None``. With the bound
+        (``rfind`` limited to ``[start_pos, position_of_"_video")``), rfind lands
+        on the version marker at position 9 and the correct
+        ``base="my_report", _index=7`` extraction round-trips.
+        """
+        macro = ParsedMacro("{base}{###?:^_v}_video.{ext}")
+        known: MacroVariables = {"ext": "mp4"}
+        assert macro.extract_variables("my_report_v007_video.mp4", known, sm) == {
+            "base": "my_report",
+            "_index": 7,
+            "ext": "mp4",
+        }
+        # And the no-version case: base still recovered correctly, index dropped.
+        assert macro.extract_variables("my_report_video.mp4", known, sm) == {
+            "base": "my_report",
+            "ext": "mp4",
+        }
