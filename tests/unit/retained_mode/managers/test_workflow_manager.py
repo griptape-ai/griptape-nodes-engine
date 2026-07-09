@@ -1114,6 +1114,33 @@ class TestWorkflowManager:
         )
         assert captured["save_display_name"] == "Renamed On Purpose"
 
+    def test_rename_override_strips_surrounding_whitespace(self, griptape_nodes: GriptapeNodes) -> None:
+        """OVERRIDE forwards ``display_name`` stripped so validation and resolution agree on the canonical form.
+
+        Regression coverage: ``_validate_rename_display_name`` gates OVERRIDE on
+        ``display_name.strip()`` being truthy, so a padded input like ``"  My Name  "``
+        passes validation. Without a matching ``strip()`` in ``_resolve_rename_display_name``,
+        the whitespace would leak into ``metadata.name``.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="My Cool Workflow",
+            ),
+            request_kwargs={
+                "display_name_behavior": RenameDisplayNameBehavior.OVERRIDE,
+                "display_name": "  My Name  ",
+            },
+        )
+        assert captured["save_display_name"] == "My Name"
+
     @pytest.mark.parametrize(
         "non_override_behavior",
         [

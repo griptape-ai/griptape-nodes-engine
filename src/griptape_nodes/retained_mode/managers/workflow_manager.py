@@ -1227,7 +1227,10 @@ class WorkflowManager:
     def _resolve_rename_display_name(self, request: RenameWorkflowRequest) -> str | None:
         """Compute the display name (``metadata.name``) to pass into the follow-up SaveWorkflowRequest.
 
-        * ``OVERRIDE`` — return the caller-supplied ``display_name`` verbatim.
+        * ``OVERRIDE`` — return the caller-supplied ``display_name`` stripped of surrounding
+          whitespace. Matches ``_validate_rename_display_name``'s ``strip()``-based non-empty
+          gate so validation and resolution share one canonical form; a padded-but-valid
+          input like ``"  My Name  "`` can't leak whitespace into ``metadata.name``.
         * ``PRESERVE_EXISTING`` — return the source workflow's current ``metadata.name``. If the source
           isn't in the registry (uncommon Save-As-style path), fall through to the requested name so
           the on-disk file still gets a sensible display name.
@@ -1235,7 +1238,8 @@ class WorkflowManager:
           the new file name).
         """
         if request.display_name_behavior is RenameDisplayNameBehavior.OVERRIDE:
-            return request.display_name
+            # display_name is guaranteed non-empty after strip() by _validate_rename_display_name.
+            return request.display_name.strip() if request.display_name else request.display_name
         if (
             request.display_name_behavior is RenameDisplayNameBehavior.PRESERVE_EXISTING
             and WorkflowRegistry.has_workflow_with_name(request.workflow_name)
