@@ -1312,8 +1312,10 @@ class TestWorkflowManager:
             )
 
         assert isinstance(result, RenameWorkflowResultFailure)
-        assert "old" in str(result.result_details)
-        assert "new" in str(result.result_details)
+        # Match the quoted-name form the failure message renders so the assertions
+        # don't pass on incidental substrings ("renew", "olden", ...).
+        assert "'old'" in str(result.result_details)
+        assert "'new'" in str(result.result_details)
 
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""
