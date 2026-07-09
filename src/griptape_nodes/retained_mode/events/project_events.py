@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 # Runtime import (not TYPE_CHECKING): the Path-typed request fields below rely on
@@ -738,7 +738,10 @@ class GetAllSituationsForProjectRequest(RequestPayload):
 class GetAllSituationsForProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Success result containing all situations."""
 
-    situations: dict[str, str]
+    situations: dict[str, str]  # name -> macro
+    # name -> description. Optional and defaulted so existing callers that don't
+    # read descriptions are unaffected; consumers that want richer dropdowns can opt in.
+    descriptions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
