@@ -14,21 +14,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, cast
 
-from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextRequest
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
-from griptape_nodes.retained_mode.events.undo_events import (
-    ClearUndoStateRequest,
-    GetUndoStateRequest,
-    RedoRequest,
-    UndoRequest,
-)
-from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowRequest,
-    RunWorkflowFromRegistryRequest,
-    RunWorkflowFromScratchRequest,
-    RunWorkflowWithCurrentStateRequest,
-)
 from griptape_nodes.retained_mode.managers.undo.core import (
+    CLEAR_HISTORY_REQUEST_TYPES,
+    OWN_EVENT_TYPES,
     RequestReplayUndoEntry,
     UndoBatch,
     UndoEntry,
@@ -112,27 +100,6 @@ class RecordingSession:
     The session never touches the undo/redo stacks. It reports a completed batch via commit_batch,
     a lost-trust condition via invalidate_history, and reads replay state via is_replaying.
     """
-
-    # Request types that invalidate all undo history whenever they are dispatched, regardless of
-    # origin, because they replace or restructure the whole object graph. This is global lifecycle
-    # policy (not per-feature domain knowledge), so it stays centralized here.
-    _CLEAR_HISTORY_REQUEST_TYPES: tuple[type[RequestPayload], ...] = (
-        ClearAllObjectStateRequest,
-        SetWorkflowContextRequest,
-        RunWorkflowFromScratchRequest,
-        RunWorkflowFromRegistryRequest,
-        RunWorkflowWithCurrentStateRequest,
-        ImportWorkflowRequest,
-    )
-
-    # The manager's own request types. They alter workflow state by design (undo/redo) or not at
-    # all (state/clear) and must never be recorded or clear history.
-    _OWN_EVENT_TYPES: tuple[type[RequestPayload], ...] = (
-        UndoRequest,
-        RedoRequest,
-        GetUndoStateRequest,
-        ClearUndoStateRequest,
-    )
 
     def __init__(
         self,
@@ -268,14 +235,20 @@ class RecordingSession:
         nested inside another recording dispatch (that ancestor owns the reversal).
         """
         request_type = type(request)
-        if request_type in self._OWN_EVENT_TYPES:
+        if request_type in OWN_EVENT_TYPES:
             return None
         # Isolate replay first: an inverse dispatched during undo/redo must never clear history or
         # be recorded, even if it is (or cascades into) a history-clearing lifecycle type.
         if self._is_replaying():
             return None
-        if isinstance(request, self._CLEAR_HISTORY_REQUEST_TYPES):
+        if isinstance(request, CLEAR_HISTORY_REQUEST_TYPES):
             self._invalidate_history()
+            # If a frame is open (a covered request cascaded into a lifecycle type, or a transaction
+            # body mixed an edit with a context switch/import), invalidate it so finalizing the
+            # opening dispatch does not re-commit a now-untrustworthy batch onto the just-cleared
+            # stack. Mirrors SnapshotRecordingSession, which flags its own open frame in this case.
+            if self._active_frame is not None:
+                self._active_frame.invalidate = True
             return None
 
         # Nothing to track: no recording frame is open and this dispatch cannot open one (only a
@@ -288,10 +261,11 @@ class RecordingSession:
         opened_frame = False
         records = False
         if self._active_frame is None:
-            if request_id is not None:
-                self._active_frame = _RecordingFrame()
-                opened_frame = True
-                records = True
+            # Reaching here with no active frame means request_id is set (the frame-less, id-less
+            # case returned above), so this user-initiated request opens a frame and records.
+            self._active_frame = _RecordingFrame()
+            opened_frame = True
+            records = True
         else:
             # A frame is active (opened by an outer request or a transaction). Record only when this
             # is the outermost dispatch within it; a nested cascade is owned by its ancestor.
@@ -360,9 +334,12 @@ class RecordingSession:
         if frame is None:
             return
         if result is None:
-            # Handler raised mid-dispatch. If this dispatch intended to record, the workflow state
-            # is now partially mutated and any recorded inverse can no longer be trusted.
-            if capture.recorder is not None or capture.recorded_inverse:
+            # Handler raised mid-dispatch: the workflow may now be partially mutated, so history can
+            # no longer be trusted. Fail closed and invalidate, unless this request type is
+            # explicitly declared non-undoable (those never affect history, by contract) and recorded
+            # no inverse. Mirrors the success path, which invalidates for any uncovered type that
+            # altered state; here altered_workflow_state is unknown, so a mutation is assumed.
+            if capture.recorded_inverse or type(request) not in self._non_undoable_types:
                 frame.invalidate = True
             return
         if result.failed():

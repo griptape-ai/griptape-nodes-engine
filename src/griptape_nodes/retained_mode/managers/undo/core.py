@@ -10,12 +10,51 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Protocol
 
+from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextRequest
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+from griptape_nodes.retained_mode.events.undo_events import (
+    ClearUndoStateRequest,
+    GetUndoStateRequest,
+    RedoRequest,
+    UndoRequest,
+)
+from griptape_nodes.retained_mode.events.workflow_events import (
+    ImportWorkflowRequest,
+    RunWorkflowFromRegistryRequest,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowWithCurrentStateRequest,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+    from contextlib import AbstractContextManager
+
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
+
+
+# Request types that invalidate all undo history whenever they are dispatched, regardless of origin,
+# because they replace or restructure the whole object graph. This is global lifecycle policy shared
+# by every recording strategy, so it lives here rather than being duplicated in each session.
+CLEAR_HISTORY_REQUEST_TYPES: tuple[type[RequestPayload], ...] = (
+    ClearAllObjectStateRequest,
+    SetWorkflowContextRequest,
+    RunWorkflowFromScratchRequest,
+    RunWorkflowFromRegistryRequest,
+    RunWorkflowWithCurrentStateRequest,
+    ImportWorkflowRequest,
+)
+
+# The undo manager's own request types. They alter workflow state by design (undo/redo) or not at all
+# (state/clear) and must never be recorded or clear history.
+OWN_EVENT_TYPES: tuple[type[RequestPayload], ...] = (
+    UndoRequest,
+    RedoRequest,
+    GetUndoStateRequest,
+    ClearUndoStateRequest,
+)
 
 
 class UndoEntryReplayError(RuntimeError):
@@ -137,3 +176,47 @@ class UndoRecorder(ABC):
         of the request the recorder deliberately does not reverse. Return None to invalidate history
         (the recorder cannot faithfully reverse a mutation that did happen).
         """
+
+
+class RecordingStrategy(Protocol):
+    """The surface UndoManager and the EventManager dispatch path drive, independent of strategy.
+
+    Two implementations exist and are interchangeable behind this contract: the default
+    inverse-command RecordingSession and the experimental whole-flow SnapshotRecordingSession. The
+    manager selects one at startup and holds it as a RecordingStrategy without knowing which, so the
+    two can diverge in mechanism but not in the surface (or the shared lifecycle policy) they honor.
+    """
+
+    def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:
+        """Register the recorder a domain uses to reverse one of its request types."""
+        ...
+
+    def register_non_undoable(self, *request_types: type[RequestPayload]) -> None:
+        """Declare request types that mutate workflow state but are intentionally not undoable."""
+        ...
+
+    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
+        """Declare editor mutations that have no inverse recorder yet."""
+        ...
+
+    def record_inverse(
+        self,
+        inverse: RequestPayload | Sequence[RequestPayload],
+        label: str,
+        *,
+        forward: RequestPayload | Sequence[RequestPayload] | None = None,
+    ) -> None:
+        """Declare how to reverse the operation being handled in the current dispatch."""
+        ...
+
+    def transaction(self, label: str) -> AbstractContextManager[None]:
+        """Group every recordable mutation issued within the block into a single undo batch."""
+        ...
+
+    def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> Any:
+        """Observe a request before its handler runs; return an opaque capture for end_request_dispatch."""
+        ...
+
+    def end_request_dispatch(self, capture: Any, request: RequestPayload, result: ResultPayload | None) -> None:
+        """Finish observing a dispatch: contribute to the active frame and finalize if it opened one."""
+        ...

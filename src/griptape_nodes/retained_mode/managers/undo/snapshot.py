@@ -40,7 +40,6 @@ from griptape_nodes.retained_mode.events.connection_events import (
     ListConnectionsForNodeRequest,
     ListConnectionsForNodeResultSuccess,
 )
-from griptape_nodes.retained_mode.events.context_events import SetWorkflowContextRequest
 from griptape_nodes.retained_mode.events.flow_events import (
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
@@ -55,22 +54,15 @@ from griptape_nodes.retained_mode.events.node_events import (
     SetLockNodeStateRequest,
     SetNodeMetadataRequest,
 )
-from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-from griptape_nodes.retained_mode.events.undo_events import (
-    ClearUndoStateRequest,
-    GetUndoStateRequest,
-    RedoRequest,
-    UndoRequest,
-)
-from griptape_nodes.retained_mode.events.workflow_events import (
-    ImportWorkflowRequest,
-    RunWorkflowFromRegistryRequest,
-    RunWorkflowFromScratchRequest,
-    RunWorkflowWithCurrentStateRequest,
-)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.undo.core import UndoBatch, UndoEntry, UndoEntryReplayError
+from griptape_nodes.retained_mode.managers.undo.core import (
+    CLEAR_HISTORY_REQUEST_TYPES,
+    OWN_EVENT_TYPES,
+    UndoBatch,
+    UndoEntry,
+    UndoEntryReplayError,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
@@ -468,27 +460,14 @@ class _SnapshotDispatch:
 
 
 class SnapshotRecordingSession:
-    """Drop-in alternative to RecordingSession that records whole-flow snapshots instead of inverses.
+    """Implements RecordingStrategy by recording whole-flow snapshots instead of per-request inverses.
 
-    Implements the same surface UndoManager and the EventManager dispatch path use. Recorders and
-    record_inverse are ignored (snapshots need no per-request knowledge); register_non_undoable is
-    honored so execution requests are not snapshotted.
+    Interchangeable with RecordingSession behind the RecordingStrategy contract that UndoManager and
+    the EventManager dispatch path drive. Recorders and record_inverse are ignored (snapshots need no
+    per-request knowledge); register_non_undoable is honored so execution requests are not
+    snapshotted. Shared lifecycle policy (CLEAR_HISTORY_REQUEST_TYPES, OWN_EVENT_TYPES) is honored
+    identically to RecordingSession.
     """
-
-    _CLEAR_HISTORY_REQUEST_TYPES: tuple[type[RequestPayload], ...] = (
-        ClearAllObjectStateRequest,
-        SetWorkflowContextRequest,
-        RunWorkflowFromScratchRequest,
-        RunWorkflowFromRegistryRequest,
-        RunWorkflowWithCurrentStateRequest,
-        ImportWorkflowRequest,
-    )
-    _OWN_EVENT_TYPES: tuple[type[RequestPayload], ...] = (
-        UndoRequest,
-        RedoRequest,
-        GetUndoStateRequest,
-        ClearUndoStateRequest,
-    )
 
     def __init__(
         self,
@@ -551,11 +530,11 @@ class SnapshotRecordingSession:
 
     def begin_request_dispatch(self, request: RequestPayload, request_id: str | None) -> _SnapshotDispatch | None:  # noqa: PLR0911
         request_type = type(request)
-        if request_type in self._OWN_EVENT_TYPES:
+        if request_type in OWN_EVENT_TYPES:
             return None
         if self._is_replaying():
             return None
-        if isinstance(request, self._CLEAR_HISTORY_REQUEST_TYPES):
+        if isinstance(request, CLEAR_HISTORY_REQUEST_TYPES):
             self._invalidate_history()
             # If a frame is open, make it finalize without committing onto the just-cleared stacks.
             if self._depth > 0:
@@ -595,10 +574,6 @@ class SnapshotRecordingSession:
             return
         committed = result is not None and result.succeeded() and result.altered_workflow_state
         self._finalize(committed=committed)
-
-    def clear_history(self) -> None:
-        """Reset in-flight snapshot state (the manager owns the stacks)."""
-        self._reset()
 
     def _finalize(self, *, committed: bool) -> None:
         before = self._before

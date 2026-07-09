@@ -69,10 +69,11 @@ from griptape_nodes.retained_mode.managers.undo import (
     UndoBatch,
     UndoEntry,
     UndoEntryReplayError,
+    UndoRecorder,
     dispatch_expecting,
     dispatch_expecting_success,
 )
-from griptape_nodes.retained_mode.managers.undo.manager import MAX_UNDO_BATCHES
+from griptape_nodes.retained_mode.managers.undo.manager import MAX_UNDO_BATCHES, UndoManager
 from griptape_nodes.retained_mode.managers.undo.recorders.flow import (
     CreateConnectionRecorder,
     DeleteConnectionRecorder,
@@ -97,6 +98,11 @@ from griptape_nodes.retained_mode.managers.undo.recording import (
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
+
+
+def _registered_recorders(undo_manager: UndoManager) -> dict[type[RequestPayload], UndoRecorder]:
+    """Recorders on the default inverse RecordingSession (these tests run under the inverse strategy)."""
+    return cast("RecordingSession", undo_manager._recording)._recorders
 
 
 class _ProbeNode(BaseNode):
@@ -807,11 +813,12 @@ class TestUndoManager:
     def test_recorders_registered_by_node_domain(self, griptape_nodes: GriptapeNodes) -> None:
         """NodeManager registers its recorders with the UndoManager; the manager holds no domain literals."""
         undo_manager = griptape_nodes.UndoManager()
-        assert CreateNodeRequest in undo_manager._recording._recorders
-        assert DeleteNodeRequest in undo_manager._recording._recorders
-        assert SetParameterValueRequest in undo_manager._recording._recorders
-        assert CreateConnectionRequest in undo_manager._recording._recorders
-        assert DeleteConnectionRequest in undo_manager._recording._recorders
+        recorders = _registered_recorders(undo_manager)
+        assert CreateNodeRequest in recorders
+        assert DeleteNodeRequest in recorders
+        assert SetParameterValueRequest in recorders
+        assert CreateConnectionRequest in recorders
+        assert DeleteConnectionRequest in recorders
 
     def test_register_recorder_rejects_duplicate(self, griptape_nodes: GriptapeNodes) -> None:
         """A second recorder for the same request type is a registration error, mirroring handlers."""
@@ -1271,7 +1278,7 @@ class TestUndoManager:
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)
         self._create_node(flow_name, node_name="ProbeA")
-        recorder = griptape_nodes.UndoManager()._recording._recorders[CreateNodeRequest]
+        recorder = _registered_recorders(griptape_nodes.UndoManager())[CreateNodeRequest]
         monkeypatch.setattr(recorder, "capture_before", lambda request: RecorderCapture(declined=True))  # noqa: ARG005
 
         self._create_node(flow_name, node_name="ProbeB")
@@ -1288,7 +1295,7 @@ class TestUndoManager:
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)
         self._create_node(flow_name, node_name="ProbeA")
-        recorder = griptape_nodes.UndoManager()._recording._recorders[CreateNodeRequest]
+        recorder = _registered_recorders(griptape_nodes.UndoManager())[CreateNodeRequest]
 
         def _boom(request: RequestPayload) -> RecorderCapture:  # noqa: ARG001
             msg = "capture failed"
@@ -1310,7 +1317,7 @@ class TestUndoManager:
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)
         self._create_node(flow_name, node_name="ProbeA")
-        recorder = griptape_nodes.UndoManager()._recording._recorders[CreateNodeRequest]
+        recorder = _registered_recorders(griptape_nodes.UndoManager())[CreateNodeRequest]
 
         def _boom(request, result, state):  # noqa: ANN001, ANN202, ARG001
             msg = "batch failed"
@@ -1332,7 +1339,7 @@ class TestUndoManager:
         self._register_library()
         flow_name = self._make_flow(griptape_nodes)
         self._create_node(flow_name, node_name="ProbeA")
-        recorder = griptape_nodes.UndoManager()._recording._recorders[CreateNodeRequest]
+        recorder = _registered_recorders(griptape_nodes.UndoManager())[CreateNodeRequest]
         monkeypatch.setattr(recorder, "create_batch", lambda request, result, state: None)  # noqa: ARG005
 
         self._create_node(flow_name, node_name="ProbeB")
@@ -1872,6 +1879,47 @@ class TestRecordingSessionUnit:
 
         assert session._active_frame is not None
         assert session._active_frame.entries == []
+
+    def test_clear_history_request_inside_frame_invalidates(self) -> None:
+        """A history-clearing lifecycle request seen while a frame is open invalidates that frame.
+
+        The clear-history dispatch wipes the stacks immediately; without also flagging the open
+        frame, finalizing the opening dispatch would re-commit a now-untrustworthy batch onto the
+        just-cleared stack. Mirrors SnapshotRecordingSession's fail-closed handling.
+        """
+        session, committed, invalidated = self._make_session()
+        outer = session.begin_request_dispatch(CreateNodeRequest(node_type="x"), request_id="rid")
+        # A history-clearing lifecycle request cascades in mid-frame.
+        inner = session.begin_request_dispatch(SetWorkflowContextRequest(workflow_name="w"), request_id=None)
+        assert inner is None
+        assert invalidated == [True]
+        assert session._active_frame is not None
+        assert session._active_frame.invalidate is True
+        # Finalizing the opening dispatch must not commit onto the just-cleared stack.
+        session.end_request_dispatch(
+            outer, CreateNodeRequest(node_type="x"), CreateConnectionResultSuccess(result_details="ok")
+        )
+        assert committed == []
+
+    def test_uncovered_handler_raise_fails_closed(self) -> None:
+        """An uncovered request type whose handler raised mid-frame invalidates history (fail closed)."""
+        session, committed, invalidated = self._make_session()
+        capture = session.begin_request_dispatch(CreateNodeRequest(node_type="x"), request_id="rid")
+        # result is None => handler raised; no recorder, no recorded inverse, not declared non-undoable.
+        session.end_request_dispatch(capture, CreateNodeRequest(node_type="x"), None)
+        assert committed == []
+        assert invalidated == [True]
+
+    def test_non_undoable_handler_raise_does_not_invalidate(self) -> None:
+        """A declared-non-undoable request that raised leaves history intact (never affects it, by contract)."""
+        session, committed, invalidated = self._make_session()
+        session.register_non_undoable(RenameObjectRequest)
+        capture = session.begin_request_dispatch(
+            RenameObjectRequest(object_name="a", requested_name="b"), request_id="rid"
+        )
+        session.end_request_dispatch(capture, RenameObjectRequest(object_name="a", requested_name="b"), None)
+        assert committed == []
+        assert invalidated == []
 
 
 class TestNodeRecorderUnit:

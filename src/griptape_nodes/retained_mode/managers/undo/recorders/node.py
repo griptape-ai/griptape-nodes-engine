@@ -324,6 +324,12 @@ class SetParameterValueRecorder(UndoRecorder):
     (initial_setup), output-value writes, and downstream propagation (an incoming connection
     source) -- are folded into the originating action instead, so they are treated as no-ops here.
     A set that does not change the value is likewise a no-op.
+
+    Scope: only the edited parameter's value is reversed. If setting it triggers same-node side
+    effects (an ``after_value_set`` hook that recomputes this node's other parameters or output
+    values), those derived values are not restored on undo; only downstream propagation is
+    re-driven by replaying the value set. Parameters known to drive such side effects should not
+    be recorded here. The snapshot strategy, which captures whole-node state, has no such gap.
     """
 
     def capture_before(self, request: RequestPayload) -> RecorderCapture:  # noqa: PLR0911

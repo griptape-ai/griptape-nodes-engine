@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 import os
 from collections import deque
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING
 
 from griptape_nodes.retained_mode.events.undo_events import (
     ClearUndoStateRequest,
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
-    from griptape_nodes.retained_mode.managers.undo.core import UndoRecorder
+    from griptape_nodes.retained_mode.managers.undo.core import RecordingStrategy, UndoRecorder
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -65,16 +65,10 @@ class UndoManager:
             from griptape_nodes.retained_mode.managers.undo.snapshot import SnapshotRecordingSession
 
             logger.info("UndoManager: using experimental whole-flow snapshot strategy.")
-            # The snapshot session is a structural stand-in for RecordingSession (same surface used
-            # here); cast so the attribute keeps one type. It is a drop-in for the methods called
-            # below, not a subclass, so it does not expose RecordingSession internals.
-            self._recording: RecordingSession = cast(
-                "RecordingSession",
-                SnapshotRecordingSession(
-                    is_replaying=lambda: self._is_replaying,
-                    commit_batch=self._commit_batch,
-                    invalidate_history=self.clear_history,
-                ),
+            self._recording: RecordingStrategy = SnapshotRecordingSession(
+                is_replaying=lambda: self._is_replaying,
+                commit_batch=self._commit_batch,
+                invalidate_history=self.clear_history,
             )
         else:
             self._recording = RecordingSession(
@@ -133,7 +127,7 @@ class UndoManager:
         self, capture: object | None, request: RequestPayload, result: ResultPayload | None
     ) -> None:
         """Finish observing a dispatch: contribute to the active frame and finalize if it was opened."""
-        self._recording.end_request_dispatch(cast("Any", capture), request, result)
+        self._recording.end_request_dispatch(capture, request, result)
 
     def clear_history(self) -> None:
         """Drop all undo and redo history."""
