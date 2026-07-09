@@ -5373,13 +5373,16 @@ class LibraryManager:
     def _read_age_gate_config(self) -> AgeGateConfig:
         """Read the age-gate config keys once. Centralizes the key literals and default handling."""
         config_mgr = GriptapeNodes.ConfigManager()
-        enabled = bool(
-            config_mgr.get_config_value(LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY, default=False, cast_type=bool)
-        )
-        min_age_hours = float(
-            config_mgr.get_config_value(LIBRARY_UPDATE_MIN_AGE_HOURS_KEY, default=24.0, cast_type=float)
-        )
-        return AgeGateConfig(enabled=enabled, min_age_hours=min_age_hours)
+        # get_config_value returns None for an explicit `null` override (it bypasses both cast_type
+        # and the default in that case), so coalesce None back to the defaults here to keep the age
+        # gate fail-open rather than raising when float(None) is attempted.
+        enabled = config_mgr.get_config_value(LIBRARY_UPDATE_AGE_GATING_ENABLED_KEY, default=False, cast_type=bool)
+        min_age_hours = config_mgr.get_config_value(LIBRARY_UPDATE_MIN_AGE_HOURS_KEY, default=24.0, cast_type=float)
+        if enabled is None:
+            enabled = False
+        if min_age_hours is None:
+            min_age_hours = 24.0
+        return AgeGateConfig(enabled=bool(enabled), min_age_hours=float(min_age_hours))
 
     def _evaluate_update_age_gate(
         self, commit_datetime: datetime | None, config: AgeGateConfig | None = None
@@ -6256,9 +6259,12 @@ class LibraryManager:
                     check_result.current_version,
                     check_result.latest_version,
                 )
+                # Record the pending target version (not the current one) so consumers can surface
+                # "held at X, pending Y". The `deferred_age_gate` status disambiguates this from an
+                # applied update where old != new.
                 update_summary[library_name] = {
                     "old_version": check_result.current_version or "unknown",
-                    "new_version": check_result.current_version or "unknown",
+                    "new_version": check_result.latest_version or "unknown",
                     "status": "deferred_age_gate",
                 }
                 continue
