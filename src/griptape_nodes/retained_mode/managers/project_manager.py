@@ -2233,25 +2233,30 @@ class ProjectManager:
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
 
-        # License-policy checkpoint: gate activating a user project on its id. The
-        # system-defaults rest state is always allowed -- it is the fallback a
-        # failed activation rolls back to. A denial rejects the switch with the
-        # missing permissions and leaves the current project untouched (the
-        # activation below never runs).
-        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
-            denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
-                AuthorizationCheckpoint(
-                    action=CheckpointAction.ACTIVATE_PROJECT,
-                    subject_type=CheckpointSubjectType.PROJECT,
-                    subject_id=resolved_project_id,
-                    attributes=self._project_checkpoint_attributes(resolved_project_id),
-                )
+        # License-policy checkpoint: gate every activation on the project id,
+        # including the system-defaults rest state. The engine bakes in no policy
+        # of its own -- it always asks and the consumer decides, which keeps this
+        # leaf-activation gate consistent with the ancestry screening that already
+        # treats the rest state as an ordinary chain entry. A consumer that wants
+        # the defaults to stay reachable permits SYSTEM_DEFAULTS_KEY (as the shipped
+        # license policies do); with no policy installed the checkpoint allows. A
+        # denial rejects the switch with the missing permissions and leaves the
+        # current project untouched (the activation below never runs). Rollback
+        # re-activates the previous project through _activate_project directly, so
+        # it never re-enters this gate.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.ACTIVATE_PROJECT,
+                subject_type=CheckpointSubjectType.PROJECT,
+                subject_id=resolved_project_id,
+                attributes=self._project_checkpoint_attributes(resolved_project_id),
             )
-            if denial is not None:
-                reason = denial.reason()
-                return SetCurrentProjectResultFailure(
-                    result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
-                )
+        )
+        if denial is not None:
+            reason = denial.reason()
+            return SetCurrentProjectResultFailure(
+                result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
+            )
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:
@@ -3306,13 +3311,20 @@ class ProjectManager:
         ]
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        """Load system default project template when app initializes.
+        """Activate the boot project when the app initializes.
 
-        Called by EventManager after all libraries are loaded.
-        Loads system defaults, then checks workspace for a griptape-nodes-project.yml
-        overlay file and sets it as the current project if found. If a project has
-        already been explicitly selected before this event (e.g., by a CLI executor
-        via --project-file-path), preserves that choice and skips workspace discovery.
+        Called by EventManager after all libraries are loaded. Resolves the seeded
+        boot project (the project_file config setting, else a workspace-default
+        griptape-nodes-project.yml) and activates it directly. Only when no seed is
+        present, or the seed fails to load or activate, does the engine fall back to
+        activating system defaults as the rest state. If a project has already been
+        explicitly selected before this event (e.g., by a CLI executor via
+        --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        preserves that choice and skips seed discovery.
+
+        Activating the seed before system defaults keeps a policy-locked engine bootable:
+        one whose policy denies `<system-defaults>` would otherwise abort at that gate
+        before ever reaching the project it is permitted to run.
 
         A worker boots exactly like an orchestrator: it re-derives the current project
         from the same shared on-disk config (project_file / workspace default), so it
@@ -3321,33 +3333,45 @@ class ProjectManager:
         worker honoring project_file does not "discover" a workspace griptape-nodes-project.yml
         the orchestrator chose to ignore.
         """
-        # If an explicit project was selected before init completed (e.g., by
-        # LocalWorkflowExecutor loading --project-file-path), keep it. Still load
-        # registered projects for visibility and mark init complete.
+        # If an explicit project was selected before init completed (CLI executor via
+        # --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        # keep it: load registered projects for visibility and mark init complete.
         explicit_project_selected = self._current_project_id != SYSTEM_DEFAULTS_KEY
         if explicit_project_selected:
             await self._load_registered_projects()
             self._initialization_complete = True
             return
 
-        # Set system defaults as current project (using synthetic key for system defaults)
-        set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
-        result = await self.on_set_current_project_request(set_request)
+        # Activate the seeded boot project first (project_file config, else the
+        # workspace-default griptape-nodes-project.yml). Fall back to system defaults
+        # only when there is no seed or the seed fails to load or activate.
+        seed_project_path = self._resolve_project_file_path()
+        seed_activated = False
+        if seed_project_path is not None:
+            seed_failure = await self._load_workspace_project()
+            if seed_failure is None:
+                seed_activated = True
+            else:
+                logger.error(
+                    "Attempted to activate seeded boot project at '%s'. Failed because %s. "
+                    "Falling back to system defaults.",
+                    seed_project_path,
+                    seed_failure,
+                )
 
-        if result.failed():
-            logger.error("Failed to set default project as current: %s", result.result_details)
-            return
-
-        logger.debug("Successfully loaded default project template")
-
-        # Check workspace for an optional project overlay file
-        await self._load_workspace_project()
+        if not seed_activated:
+            set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            result = await self.on_set_current_project_request(set_request)
+            if result.failed():
+                logger.error("Failed to set default project as current: %s", result.result_details)
+                return
+            logger.debug("Successfully loaded default project template")
 
         # Load any additional project templates previously registered by the user
         await self._load_registered_projects()
 
-        # Mark initialization complete so subsequent project switches trigger
-        # workspace detection and library reload when the workspace actually changes.
+        # Subsequent project switches now trigger workspace detection and library
+        # reload when the workspace actually changes.
         self._initialization_complete = True
 
     def on_get_all_situations_for_project_request(
