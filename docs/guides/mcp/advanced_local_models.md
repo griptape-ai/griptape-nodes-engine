@@ -1,5 +1,11 @@
 # Local Models with Agents
 
+!!! tip "Using local models in the chat sidebar or Agent node?"
+
+    If you want to use Ollama or LM Studio as the AI provider for the **chat sidebar** or an **Agent node** directly, see [AI Providers](../agent/providers/index.md). That's the simpler path for most use cases.
+
+    This tutorial covers a different pattern: routing a **local model through an MCP server** inside a workflow, which gives the model access to local files and tools while keeping all data on your machine.
+
 This advanced tutorial demonstrates how to use **local AI models** with MCP servers to handle sensitive data without sending it to external services. This is perfect for internal documents, private files, or any data you want to keep on your local machine.
 
 ## Why Use Local Models with MCP?
