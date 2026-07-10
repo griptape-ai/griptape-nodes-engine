@@ -3903,10 +3903,12 @@ class ProjectManager:
         logger.debug("Found workspace project file at '%s', loading", workspace_project_path)
 
         # Build the id-index so the seed's parent chain can resolve an id-based parent that
-        # is only registered (not yet loaded). Cleared in the finally so runtime parent
-        # lookups fall through to the live registry.
-        await self._build_boot_id_index()
+        # is only registered (not yet loaded). Inside the try so a raise mid-build still hits
+        # the finally clear; cleared after so runtime parent lookups fall through to the
+        # live registry.
         try:
+            await self._build_boot_id_index()
+
             # Delegate load/merge/cache to the shared loader. persist_path=False keeps the
             # seed out of projects_to_register (it is re-discovered from config each boot).
             load_result = await self._load_and_cache_project_template(workspace_project_path, persist_path=False)
