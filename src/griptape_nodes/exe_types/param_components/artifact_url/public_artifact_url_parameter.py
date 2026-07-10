@@ -65,18 +65,18 @@ class PublicArtifactUrlParameter:
     def _get_bucket_id(cls, base_url: str, api_key: str, timeout: float | None = None) -> str:
         bucket_id: str | None = cls._get_secret_value(cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
-        buckets = GriptapeCloudStorageDriver.list_buckets(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=timeout,
-        )
-
         # A blank/whitespace-only secret is treated the same as an unset one: it can't
         # point at a real bucket and, left alone, produces confusing downstream 404s from
-        # request URLs like `/api/buckets//assets/...`. Fall back to auto-selecting a bucket.
+        # request URLs like `/api/buckets//assets/...`. Validate a configured ID with a
+        # direct GET rather than scanning `list_buckets` -- that endpoint is paginated, so
+        # a valid bucket beyond the first page would otherwise be flagged as invalid.
         if bucket_id is not None and bucket_id.strip():
-            valid_bucket_ids = {bucket["bucket_id"] for bucket in buckets}
-            if bucket_id not in valid_bucket_ids:
+            if not GriptapeCloudStorageDriver.bucket_exists(
+                bucket_id,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            ):
                 msg = (
                     f"The {cls.BUCKET_ID_NAME} secret is configured to an invalid bucket ID "
                     f"('{bucket_id}'). No Griptape Cloud storage bucket with that ID exists. "
@@ -86,9 +86,15 @@ class PublicArtifactUrlParameter:
                 raise RuntimeError(msg)
             return bucket_id
 
+        # Unset or blank secret: fall back to auto-selecting a bucket.
+        buckets = GriptapeCloudStorageDriver.list_buckets(
+            base_url=base_url,
+            api_key=api_key,
+            timeout=timeout,
+        )
         if len(buckets) == 0:
             msg = (
-                f"The {cls.BUCKET_ID_NAME} secret is configured to a blank/invalid bucket ID "
+                f"The {cls.BUCKET_ID_NAME} secret is configured to a blank bucket ID "
                 "and no Griptape Cloud storage buckets are available to fall back to. "
                 f"Set the {cls.BUCKET_ID_NAME} secret to a valid bucket ID."
                 if bucket_id is not None

@@ -82,22 +82,48 @@ class TestGetBucketId:
     A blank or invalid bucket secret used to be returned verbatim and only failed later
     as an opaque 404 from a `/api/buckets//assets/...` URL. These tests pin the fail-fast
     behavior: a valid ID passes through, a blank one falls back to auto-select, and an
-    invalid/unmatched one raises a clear, actionable error.
+    invalid ID raises a clear, actionable error.
+
+    A configured ID is validated with a direct `bucket_exists` GET rather than scanning
+    the paginated `list_buckets` result, so a valid bucket beyond the first page is not
+    mistaken for a missing one.
     """
 
     MODULE = "griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_parameter"
 
-    def _patch(self, mocker: Any, *, bucket_id_value: str | None, buckets: list[dict]) -> None:
+    def _patch(
+        self,
+        mocker: Any,
+        *,
+        bucket_id_value: str | None,
+        bucket_exists: bool = True,
+        buckets: list[dict] | None = None,
+    ) -> tuple[Mock, Mock]:
         mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=bucket_id_value)
-        mocker.patch(
-            f"{self.MODULE}.GriptapeCloudStorageDriver.list_buckets",
-            return_value=buckets,
+        exists_mock = mocker.patch(
+            f"{self.MODULE}.GriptapeCloudStorageDriver.bucket_exists",
+            return_value=bucket_exists,
         )
+        list_mock = mocker.patch(
+            f"{self.MODULE}.GriptapeCloudStorageDriver.list_buckets",
+            return_value=buckets or [],
+        )
+        return exists_mock, list_mock
 
     def test_valid_bucket_id_passes_through(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value="bucket-123", buckets=[{"bucket_id": "bucket-123"}])
+        exists_mock, list_mock = self._patch(mocker, bucket_id_value="bucket-123", bucket_exists=True)
 
         assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "bucket-123"
+        # A configured ID is validated directly; the paginated list is never consulted.
+        exists_mock.assert_called_once()
+        list_mock.assert_not_called()
+
+    def test_valid_bucket_id_beyond_first_page_still_validates(self, mocker: Any) -> None:
+        # Regression: the bucket exists but is not on the default `list_buckets` page.
+        # `bucket_exists` (a direct GET) must be the source of truth, not the list.
+        self._patch(mocker, bucket_id_value="page-2-bucket", bucket_exists=True, buckets=[{"bucket_id": "page-1"}])
+
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "page-2-bucket"
 
     def test_unset_secret_auto_selects_first_bucket(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value=None, buckets=[{"bucket_id": "auto-1"}, {"bucket_id": "auto-2"}])
@@ -110,7 +136,7 @@ class TestGetBucketId:
         assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "auto-1"
 
     def test_invalid_bucket_id_raises_clear_error(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value="does-not-exist", buckets=[{"bucket_id": "real-1"}])
+        self._patch(mocker, bucket_id_value="does-not-exist", bucket_exists=False)
 
         with pytest.raises(RuntimeError, match="invalid bucket ID") as excinfo:
             PublicArtifactUrlParameter._get_bucket_id("https://base", "key")

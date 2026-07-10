@@ -1,6 +1,7 @@
 import logging
 import os
 from collections.abc import Callable
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
@@ -328,6 +329,41 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             raise RuntimeError(msg) from e
 
         return response.json().get("buckets", [])
+
+    @staticmethod
+    def bucket_exists(bucket_id: str, *, base_url: str, api_key: str, timeout: float | None = None) -> bool:
+        """Check whether a specific bucket exists in Griptape Cloud.
+
+        Uses a direct GET on the bucket resource rather than scanning ``list_buckets``,
+        which is paginated -- a valid bucket beyond the first page would otherwise look
+        missing. A 404 means the bucket does not exist (or is not visible to this API key);
+        any other HTTP error is surfaced so callers don't mistake it for a missing bucket.
+
+        Args:
+            bucket_id: The ID of the bucket to check.
+            base_url: The base URL for the Griptape Cloud API.
+            api_key: The API key for authentication.
+            timeout: Optional request timeout in seconds.
+
+        Returns:
+            True if the bucket exists and is accessible, False if it does not.
+
+        Raises:
+            RuntimeError: If the existence check fails for a reason other than a 404.
+        """
+        headers = {"Authorization": f"Bearer {api_key}"}
+        url = urljoin(base_url, f"/api/buckets/{bucket_id}")
+
+        try:
+            request_with_retry("GET", url, headers=headers, timeout=timeout)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == HTTPStatus.NOT_FOUND:
+                return False
+            msg = f"Failed to check bucket '{bucket_id}': {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
+
+        return True
 
     def delete_file(self, path: Path) -> None:
         """Delete a file from the bucket.

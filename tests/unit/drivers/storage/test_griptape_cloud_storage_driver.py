@@ -2,6 +2,7 @@ import logging
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import httpx
 import pytest
 
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
@@ -254,6 +255,64 @@ class TestGriptapeCloudStorageDriverUploadTimeout:
             assert mock_request.call_count == 1
             _, call_kwargs = mock_request.call_args
             assert call_kwargs["timeout"] == REQUEST_TIMEOUT_SECONDS
+
+
+class TestGriptapeCloudStorageDriverBucketExists:
+    """Test GriptapeCloudStorageDriver.bucket_exists() static method.
+
+    `bucket_exists` does a direct GET on the bucket resource so a valid bucket beyond
+    the first page of `list_buckets` is still recognized. A 404 means "does not exist";
+    any other HTTP error is surfaced rather than being swallowed as a missing bucket.
+    """
+
+    MODULE = "griptape_nodes.drivers.storage.griptape_cloud_storage_driver"
+
+    def test_returns_true_when_bucket_found(self) -> None:
+        with patch(f"{self.MODULE}.request_with_retry") as mock_request:
+            mock_request.return_value = Mock()
+
+            result = GriptapeCloudStorageDriver.bucket_exists(
+                TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY
+            )
+
+        assert result is True
+        args, _ = mock_request.call_args
+        assert args[0] == "GET"
+        assert args[1].endswith(f"/api/buckets/{TEST_BUCKET_ID}")
+
+    def test_returns_false_on_404(self) -> None:
+        response = Mock()
+        response.status_code = 404
+        error = httpx.HTTPStatusError("not found", request=Mock(), response=response)
+
+        with patch(f"{self.MODULE}.request_with_retry", side_effect=error):
+            result = GriptapeCloudStorageDriver.bucket_exists(
+                "missing-bucket", base_url="https://base", api_key=TEST_API_KEY
+            )
+
+        assert result is False
+
+    def test_raises_on_non_404_error(self) -> None:
+        response = Mock()
+        response.status_code = 500
+        error = httpx.HTTPStatusError("server error", request=Mock(), response=response)
+
+        with (
+            patch(f"{self.MODULE}.request_with_retry", side_effect=error),
+            pytest.raises(RuntimeError, match="Failed to check bucket"),
+        ):
+            GriptapeCloudStorageDriver.bucket_exists(TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY)
+
+    def test_passes_timeout_through(self) -> None:
+        with patch(f"{self.MODULE}.request_with_retry") as mock_request:
+            mock_request.return_value = Mock()
+
+            GriptapeCloudStorageDriver.bucket_exists(
+                TEST_BUCKET_ID, base_url="https://base", api_key=TEST_API_KEY, timeout=REQUEST_TIMEOUT_SECONDS
+            )
+
+        _, call_kwargs = mock_request.call_args
+        assert call_kwargs["timeout"] == REQUEST_TIMEOUT_SECONDS
 
 
 class TestGriptapeCloudStorageDriverExtractBucketId:
