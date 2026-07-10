@@ -86,7 +86,9 @@ class TestGetBucketId:
 
     A configured ID is validated with a direct `bucket_exists` GET rather than scanning
     the paginated `list_buckets` result, so a valid bucket beyond the first page is not
-    mistaken for a missing one.
+    mistaken for a missing one. When the secret is unset/blank, the fallback is the
+    organization's default bucket -- guaranteed to exist and undeletable -- not the first
+    entry of a paginated bucket list.
     """
 
     MODULE = "griptape_nodes.exe_types.param_components.artifact_url.public_artifact_url_parameter"
@@ -97,43 +99,43 @@ class TestGetBucketId:
         *,
         bucket_id_value: str | None,
         bucket_exists: bool = True,
-        buckets: list[dict] | None = None,
+        default_bucket_id: str | None = None,
     ) -> tuple[Mock, Mock]:
         mocker.patch.object(PublicArtifactUrlParameter, "_get_secret_value", return_value=bucket_id_value)
         exists_mock = mocker.patch(
             f"{self.MODULE}.GriptapeCloudStorageDriver.bucket_exists",
             return_value=bucket_exists,
         )
-        list_mock = mocker.patch(
-            f"{self.MODULE}.GriptapeCloudStorageDriver.list_buckets",
-            return_value=buckets or [],
+        default_mock = mocker.patch(
+            f"{self.MODULE}.GriptapeCloudStorageDriver.get_default_bucket_id",
+            return_value=default_bucket_id,
         )
-        return exists_mock, list_mock
+        return exists_mock, default_mock
 
     def test_valid_bucket_id_passes_through(self, mocker: Any) -> None:
-        exists_mock, list_mock = self._patch(mocker, bucket_id_value="bucket-123", bucket_exists=True)
+        exists_mock, default_mock = self._patch(mocker, bucket_id_value="bucket-123", bucket_exists=True)
 
         assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "bucket-123"
-        # A configured ID is validated directly; the paginated list is never consulted.
+        # A configured ID is validated directly; the org default is never consulted.
         exists_mock.assert_called_once()
-        list_mock.assert_not_called()
+        default_mock.assert_not_called()
 
     def test_valid_bucket_id_beyond_first_page_still_validates(self, mocker: Any) -> None:
         # Regression: the bucket exists but is not on the default `list_buckets` page.
         # `bucket_exists` (a direct GET) must be the source of truth, not the list.
-        self._patch(mocker, bucket_id_value="page-2-bucket", bucket_exists=True, buckets=[{"bucket_id": "page-1"}])
+        self._patch(mocker, bucket_id_value="page-2-bucket", bucket_exists=True)
 
         assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "page-2-bucket"
 
-    def test_unset_secret_auto_selects_first_bucket(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value=None, buckets=[{"bucket_id": "auto-1"}, {"bucket_id": "auto-2"}])
+    def test_unset_secret_falls_back_to_org_default_bucket(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value=None, default_bucket_id="org-default")
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "auto-1"
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "org-default"
 
-    def test_blank_secret_auto_selects_first_bucket(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value="   ", buckets=[{"bucket_id": "auto-1"}])
+    def test_blank_secret_falls_back_to_org_default_bucket(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="   ", default_bucket_id="org-default")
 
-        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "auto-1"
+        assert PublicArtifactUrlParameter._get_bucket_id("https://base", "key") == "org-default"
 
     def test_invalid_bucket_id_raises_clear_error(self, mocker: Any) -> None:
         self._patch(mocker, bucket_id_value="does-not-exist", bucket_exists=False)
@@ -145,14 +147,14 @@ class TestGetBucketId:
         assert PublicArtifactUrlParameter.BUCKET_ID_NAME in message
         assert "does-not-exist" in message
 
-    def test_blank_secret_with_no_buckets_names_the_secret(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value="", buckets=[])
+    def test_blank_secret_with_no_default_bucket_names_the_secret(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value="", default_bucket_id=None)
 
         with pytest.raises(RuntimeError, match=PublicArtifactUrlParameter.BUCKET_ID_NAME):
             PublicArtifactUrlParameter._get_bucket_id("https://base", "key")
 
-    def test_unset_secret_with_no_buckets_raises_original_message(self, mocker: Any) -> None:
-        self._patch(mocker, bucket_id_value=None, buckets=[])
+    def test_unset_secret_with_no_default_bucket_raises_original_message(self, mocker: Any) -> None:
+        self._patch(mocker, bucket_id_value=None, default_bucket_id=None)
 
         with pytest.raises(RuntimeError, match="No Griptape Cloud storage buckets found"):
             PublicArtifactUrlParameter._get_bucket_id("https://base", "key")

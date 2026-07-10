@@ -86,23 +86,25 @@ class PublicArtifactUrlParameter:
                 raise RuntimeError(msg)
             return bucket_id
 
-        # Unset or blank secret: fall back to auto-selecting a bucket.
-        buckets = GriptapeCloudStorageDriver.list_buckets(
+        # Unset or blank secret: fall back to the organization's default bucket. That
+        # bucket is guaranteed to exist and cannot be deleted, so it's a stable fallback --
+        # unlike auto-selecting the first entry of the paginated `list_buckets` result.
+        default_bucket_id = GriptapeCloudStorageDriver.get_default_bucket_id(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout,
         )
-        if len(buckets) == 0:
+        if not default_bucket_id:
             msg = (
                 f"The {cls.BUCKET_ID_NAME} secret is configured to a blank bucket ID "
-                "and no Griptape Cloud storage buckets are available to fall back to. "
+                "and no Griptape Cloud organization default bucket is available to fall back to. "
                 f"Set the {cls.BUCKET_ID_NAME} secret to a valid bucket ID."
                 if bucket_id is not None
                 else "No Griptape Cloud storage buckets found!"
             )
             raise RuntimeError(msg)
 
-        return buckets[0]["bucket_id"]
+        return default_bucket_id
 
     @classmethod
     def _get_config_value(cls, key: str, default: Any | None = None) -> Any | None:
