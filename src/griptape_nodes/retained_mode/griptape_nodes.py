@@ -166,9 +166,9 @@ class GriptapeNodes(metaclass=SingletonMeta):
             self._object_manager = ObjectManager(self._event_manager)
             self._node_manager = NodeManager(self._event_manager)
             self._flow_manager = FlowManager(self._event_manager)
-            # Wire the domain managers' undo recorders now that both they and the UndoManager exist.
-            self._node_manager.register_undo_recorders(self._undo_manager)
-            self._flow_manager.register_undo_recorders(self._undo_manager)
+            # Wire the domain managers' undo policy now that both they and the UndoManager exist.
+            self._node_manager.register_undo_policy(self._undo_manager)
+            self._flow_manager.register_undo_policy(self._undo_manager)
             self._context_manager = ContextManager(self._event_manager)
             self._worker_manager = WorkerManager(griptape_nodes=self, event_manager=self._event_manager)
             self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager)

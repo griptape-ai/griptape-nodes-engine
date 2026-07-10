@@ -1,18 +1,15 @@
-"""Tests for the experimental whole-flow snapshot undo strategy (prototype).
+"""Tests for the whole-flow snapshot undo strategy.
 
-These force GRIPTAPE_NODES_UNDO_STRATEGY=snapshot and rebuild the GriptapeNodes singleton so the
-UndoManager wires the SnapshotRecordingSession, then drive the same user-request flow the inverse
-strategy is tested with. They verify the snapshot round trip (undo restores the previous whole-flow
-state; redo re-applies it) rather than per-request inverses.
+These rebuild the GriptapeNodes singleton so the UndoManager wires the SnapshotRecordingSession
+(the default and only strategy), then drive user-request flows and verify the snapshot round trip:
+undo reconciles the flow back to the previous whole-flow state; redo re-applies it.
 """
 
 from __future__ import annotations
 
 import copy
-import os
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
-from unittest.mock import patch
 
 import pytest
 
@@ -88,19 +85,18 @@ class TestSnapshotStrategy:
 
     @pytest.fixture
     def snapshot_engine(self) -> Iterator[GriptapeNodes]:
-        """Rebuild the singleton under snapshot mode so UndoManager uses the snapshot session."""
+        """Rebuild the singleton so the UndoManager wires the (default) snapshot session."""
         from griptape_nodes.node_library.library_registry import LibraryRegistry
         from griptape_nodes.utils.metaclasses import SingletonMeta
 
-        with patch.dict(os.environ, {"GRIPTAPE_NODES_UNDO_STRATEGY": "snapshot"}):
-            SingletonMeta._instances.clear()
-            LibraryRegistry._clear()
-            griptape_nodes = GriptapeNodes()
-            assert isinstance(GriptapeNodes.UndoManager()._recording, SnapshotRecordingSession)
-            self._register_library()
-            yield griptape_nodes
-            SingletonMeta._instances.clear()
-            LibraryRegistry._clear()
+        SingletonMeta._instances.clear()
+        LibraryRegistry._clear()
+        griptape_nodes = GriptapeNodes()
+        assert isinstance(GriptapeNodes.UndoManager()._recording, SnapshotRecordingSession)
+        self._register_library()
+        yield griptape_nodes
+        SingletonMeta._instances.clear()
+        LibraryRegistry._clear()
 
     def _register_library(self) -> None:
         from griptape_nodes.node_library.library_registry import (

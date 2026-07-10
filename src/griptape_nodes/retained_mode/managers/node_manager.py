@@ -237,11 +237,6 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointSubjectType,
 )
-from griptape_nodes.retained_mode.managers.undo.recorders.node import (
-    CreateNodeRecorder,
-    DeleteNodeRecorder,
-    SetParameterValueRecorder,
-)
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
 
 logger = logging.getLogger("griptape_nodes")
@@ -413,33 +408,15 @@ class NodeManager:
         event_manager.assign_manager_to_request_type(ExecuteNodeRequest, self.on_execute_node_request)
         event_manager.assign_manager_to_request_type(CancelExecuteNodeRequest, self.on_cancel_execute_node_request)
 
-    def register_undo_recorders(self, undo_manager: UndoManager) -> None:
-        """Register how node requests are reversed for undo/redo.
+    def register_undo_policy(self, undo_manager: UndoManager) -> None:
+        """Declare the node domain's undo policy: which of its requests are not undoable.
 
-        The UndoManager owns the mechanism; the node domain owns the knowledge of how to reverse
-        its own requests. Called from GriptapeNodes wiring after construction; isolated unit tests
-        that build a NodeManager directly simply skip it.
+        The snapshot strategy captures editor mutations (node create/delete, value/metadata/lock
+        edits) automatically; the domain only needs to name the requests the undo system must never
+        treat as an edit. Execution/runtime state changes are not workflow edits, so running or
+        unresolving a node is never a snapshot point. Called from GriptapeNodes wiring after
+        construction; isolated unit tests that build a NodeManager directly simply skip it.
         """
-        undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
-        undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
-        undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
-        # Under the hybrid strategy, route these recorder-backed types through the surgical (inverse)
-        # path instead of a whole-flow snapshot; a no-op under the pure inverse/snapshot strategies.
-        undo_manager.register_surgical(
-            CreateNodeRequest,
-            DeleteNodeRequest,
-            SetParameterValueRequest,
-        )
-        # Editor mutations with no inverse recorder yet: the inverse strategy floors them (neither
-        # records nor invalidates), but the snapshot strategy captures and reconciles them, so node
-        # moves and lock toggles are undoable under snapshot. They become recorders as coverage grows.
-        undo_manager.register_inverse_floor(
-            SetNodeMetadataRequest,
-            BatchSetNodeMetadataRequest,
-            SetLockNodeStateRequest,
-        )
-        # Execution/runtime state changes are not workflow edits and are never undoable by any
-        # strategy (the snapshot strategy also skips them, so running a node is not a snapshot point).
         undo_manager.register_non_undoable(
             ResolveNodeRequest,
             UnresolveNodeRequest,

@@ -1,14 +1,19 @@
 """The vocabulary domains use to describe reversible operations.
 
-This module is domain-agnostic: it defines what an undo entry and a recorder are, plus the
-replay helpers domains call to issue their inverses. `UndoManager` (mechanism) and the per-domain
-recorders (knowledge) both build on these types.
+This module is domain-agnostic: it defines what an undo entry and an undo batch are, the shared
+lifecycle triage every recording strategy applies, and the `RecordingStrategy` contract a strategy
+implements. `UndoManager` (the mechanism) and the concrete strategies (currently the whole-flow
+`SnapshotRecordingSession`) both build on these types.
+
+The `RecordingStrategy` protocol is the extension seam: a future finer-grained strategy (e.g. one
+that captures per-touched-entity state deltas instead of whole-flow snapshots) implements this same
+contract and drops in behind `UndoManager` without changing the dispatch path or the lifecycle
+policy.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Any, Protocol
@@ -27,13 +32,11 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RunWorkflowFromScratchRequest,
     RunWorkflowWithCurrentStateRequest,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
     from contextlib import AbstractContextManager
 
-    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload, ResultPayloadSuccess
+    from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
 
 
 # Request types that invalidate all undo history whenever they are dispatched, regardless of origin,
@@ -75,9 +78,9 @@ class DispatchTriage(Enum):
 def triage_dispatch(request: RequestPayload, *, is_replaying: bool) -> DispatchTriage:
     """Classify a dispatch by the shared lifecycle policy, before any strategy-specific framing.
 
-    Replay is isolated before the history-clearing check: an inverse dispatched during undo/redo
+    Replay is isolated before the history-clearing check: a mutation dispatched during undo/redo
     must never clear history, even if it is (or cascades into) a history-clearing lifecycle type.
-    Both recording strategies call this so the policy sequence lives in one place and cannot drift.
+    Every recording strategy calls this so the policy sequence lives in one place and cannot drift.
     """
     if type(request) in OWN_EVENT_TYPES:
         return DispatchTriage.IGNORE
@@ -90,32 +93,6 @@ def triage_dispatch(request: RequestPayload, *, is_replaying: bool) -> DispatchT
 
 class UndoEntryReplayError(RuntimeError):
     """Raised when replaying an undo/redo entry fails and the undo history can no longer be trusted."""
-
-
-def dispatch_expecting[T: "ResultPayloadSuccess"](
-    request: RequestPayload, success_type: type[T], action_description: str
-) -> T:
-    """Dispatch a request during undo/redo replay, raising if it does not produce the expected success result.
-
-    Domain-defined undo entries use this to replay a specific inverse and assert its result type.
-    """
-    result = GriptapeNodes.handle_request(request)
-    if not isinstance(result, success_type):
-        msg = f"Attempted to {action_description}. Failed with result details: {result.result_details}"
-        raise UndoEntryReplayError(msg)
-    return result
-
-
-def dispatch_expecting_success(request: RequestPayload, action_description: str) -> ResultPayload:
-    """Dispatch a request during undo/redo replay, raising if it fails.
-
-    Used by the generic RequestReplayUndoEntry, which does not care about the concrete result type.
-    """
-    result = GriptapeNodes.handle_request(request)
-    if result.failed():
-        msg = f"Attempted to {action_description}. Failed with result details: {result.result_details}"
-        raise UndoEntryReplayError(msg)
-    return result
 
 
 class UndoEntry(ABC):
@@ -147,101 +124,17 @@ class UndoBatch:
     entries: list[UndoEntry]
 
 
-@dataclass
-class RequestReplayUndoEntry(UndoEntry):
-    """Generic entry that reverts/re-applies an operation by replaying stored requests.
-
-    Produced by UndoManager.record_inverse: the undo direction replays the inverse request(s)
-    the handler supplied; the redo direction replays the original forward request(s).
-    """
-
-    undo_requests: list[RequestPayload]
-    redo_requests: list[RequestPayload]
-
-    def undo(self) -> None:
-        for request in self.undo_requests:
-            # Deep-copy before dispatch so a handler that writes back to its request (e.g.
-            # SetParameterValue normalizing value/data_type) cannot mutate the stored inverse and
-            # let it drift across repeated undo/redo cycles.
-            dispatch_expecting_success(deepcopy(request), f"undo via replaying {type(request).__name__}")
-
-    def redo(self) -> None:
-        for request in self.redo_requests:
-            dispatch_expecting_success(deepcopy(request), f"redo via replaying {type(request).__name__}")
-
-
-@dataclass
-class RecorderCapture:
-    """Outcome of a recorder's before-dispatch capture.
-
-    Attributes:
-        declined: True when the recorder cannot faithfully record this request (the manager
-            treats the request as an unrecordable mutation and invalidates history if it succeeds).
-        state: Opaque recorder-specific state handed back to create_batch after dispatch.
-    """
-
-    declined: bool = False
-    state: Any = None
-
-
-class UndoRecorder(ABC):
-    """Records the information needed to build an UndoBatch for one request type.
-
-    A recorder lives in the module that owns the reversal knowledge for its domain (e.g. node
-    recorders live in undo.recorders.node) and is registered via UndoManager.register_recorder by
-    the owning manager. Use a recorder (rather than record_inverse) when reversing an operation
-    requires state captured *before* the handler runs (e.g. serializing a node before it is
-    deleted) or *after* it (e.g. the assigned name of a freshly created node).
-    """
-
-    @abstractmethod
-    def capture_before(self, request: RequestPayload) -> RecorderCapture:
-        """Capture any 'before' state required to reverse the request. Runs before the handler."""
-
-    @abstractmethod
-    def create_batch(self, request: RequestPayload, result: ResultPayload, state: Any) -> UndoBatch | None:
-        """Build the undo batch after the handler succeeded.
-
-        Return a batch with one or more entries to record the reversal. Return an empty batch (no
-        entries) to record nothing without invalidating history -- e.g. a no-op edit, or a variant
-        of the request the recorder deliberately does not reverse. Return None to invalidate history
-        (the recorder cannot faithfully reverse a mutation that did happen).
-        """
-
-
 class RecordingStrategy(Protocol):
     """The surface UndoManager and the EventManager dispatch path drive, independent of strategy.
 
-    Two implementations exist and are interchangeable behind this contract: the default
-    inverse-command RecordingSession and the experimental whole-flow SnapshotRecordingSession. The
-    manager selects one at startup and holds it as a RecordingStrategy without knowing which, so the
-    two can diverge in mechanism but not in the surface (or the shared lifecycle policy) they honor.
+    One implementation exists today (the whole-flow SnapshotRecordingSession); this protocol is the
+    seam a future finer-grained strategy plugs into. UndoManager holds a strategy without knowing
+    which, so strategies can diverge in mechanism but not in the surface (or the shared lifecycle
+    policy) they honor.
     """
-
-    def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:
-        """Register the recorder a domain uses to reverse one of its request types."""
-        ...
 
     def register_non_undoable(self, *request_types: type[RequestPayload]) -> None:
         """Declare request types that mutate workflow state but are intentionally not undoable."""
-        ...
-
-    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
-        """Declare editor mutations that have no inverse recorder yet."""
-        ...
-
-    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
-        """Declare request types the hybrid strategy reverses surgically instead of by whole-flow snapshot."""
-        ...
-
-    def record_inverse(
-        self,
-        inverse: RequestPayload | Sequence[RequestPayload],
-        label: str,
-        *,
-        forward: RequestPayload | Sequence[RequestPayload] | None = None,
-    ) -> None:
-        """Declare how to reverse the operation being handled in the current dispatch."""
         ...
 
     def transaction(self, label: str) -> AbstractContextManager[None]:

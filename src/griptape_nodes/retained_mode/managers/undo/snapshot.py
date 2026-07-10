@@ -1,14 +1,16 @@
-"""Prototype: full-workflow snapshot strategy for undo/redo.
+"""The whole-flow snapshot strategy for undo/redo.
 
-An experimental alternative to the inverse-command recorders. Instead of computing a per-request
-inverse, this snapshots the whole top-level flow around each user action and restores by replacing
-the flow's contents. Selected at startup via ``GRIPTAPE_NODES_UNDO_STRATEGY=snapshot``; the default
-remains the inverse-command ``RecordingSession``.
+The undo system's recording strategy: instead of computing a per-request inverse, it snapshots the
+whole top-level flow around each user action and restores by reconciling the flow's contents. This
+is state-centric -- it reasons about *what changed* (which nodes/connections/values exist now vs.
+then), not about which request produced the change -- so every way of producing an effect (create a
+node directly, duplicate, paste, import) undoes identically.
 
-It exists so the two approaches can be compared head to head in the editor behind the same
-keybindings and stacks. It deliberately makes no attempt to be efficient.
+It is deliberately simple over efficient; it is the coarse baseline. `RecordingStrategy` (in
+`undo.core`) is the seam for layering in a finer-grained strategy later (e.g. one that captures
+per-touched-entity deltas instead of the whole flow) without changing the manager or dispatch path.
 
-Scope and known limitations (prototype):
+Scope and known limitations:
 
 - Single top-level flow (the common editor case). Multiple top-level flows or subflow-only state
   are not handled.
@@ -20,7 +22,7 @@ Scope and known limitations (prototype):
 - Survivor parameter *structure* changes (a dynamic parameter added or removed by the undone action)
   are not reconciled; values, positions, locks, connections, and whole-node add/delete are.
 
-Capture and restore timings are logged at INFO so the cost can be observed against inverse commands.
+Capture and restore timings are logged at INFO so the cost can be observed.
 """
 
 from __future__ import annotations
@@ -65,12 +67,11 @@ from griptape_nodes.retained_mode.managers.undo.core import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator
 
     from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
-    from griptape_nodes.retained_mode.managers.undo.core import UndoRecorder
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -460,13 +461,12 @@ class _SnapshotDispatch:
 
 
 class SnapshotRecordingSession:
-    """Implements RecordingStrategy by recording whole-flow snapshots instead of per-request inverses.
+    """Implements RecordingStrategy by recording whole-flow snapshots around each user action.
 
-    Interchangeable with RecordingSession behind the RecordingStrategy contract that UndoManager and
-    the EventManager dispatch path drive. Recorders and record_inverse are ignored (snapshots need no
-    per-request knowledge); register_non_undoable is honored so execution requests are not
-    snapshotted. Shared lifecycle policy (CLEAR_HISTORY_REQUEST_TYPES, OWN_EVENT_TYPES) is honored
-    identically to RecordingSession.
+    Honors register_non_undoable so execution requests are not snapshotted, and the shared lifecycle
+    policy (CLEAR_HISTORY_REQUEST_TYPES, OWN_EVENT_TYPES) via triage_dispatch. It needs no per-request
+    reversal knowledge: a snapshot captures whole-flow state, so it is agnostic to which request
+    produced a change.
     """
 
     def __init__(
@@ -487,31 +487,9 @@ class SnapshotRecordingSession:
         # finalizes without committing a batch onto the just-cleared stacks.
         self._invalidated = False
 
-    def register_recorder(self, request_type: type[RequestPayload], recorder: UndoRecorder) -> None:
-        """No-op: the snapshot strategy needs no per-request reversal knowledge."""
-
     def register_non_undoable(self, *request_types: type[RequestPayload]) -> None:
         """Honor genuinely non-undoable declarations (execution/lifecycle) so they are not snapshotted."""
         self._non_undoable_types.update(request_types)
-
-    def register_inverse_floor(self, *request_types: type[RequestPayload]) -> None:
-        """No-op for the snapshot strategy.
-
-        These editor mutations have no inverse recorder yet, but the snapshot strategy captures and
-        reconciles them like any other edit, so it must NOT skip snapshotting them.
-        """
-
-    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
-        """No-op: the snapshot strategy snapshots every covered type; it never reverses surgically."""
-
-    def record_inverse(
-        self,
-        inverse: RequestPayload | Sequence[RequestPayload],
-        label: str,
-        *,
-        forward: RequestPayload | Sequence[RequestPayload] | None = None,
-    ) -> None:
-        """No-op: inverses are irrelevant to the snapshot strategy."""
 
     @contextmanager
     def transaction(self, label: str) -> Iterator[None]:

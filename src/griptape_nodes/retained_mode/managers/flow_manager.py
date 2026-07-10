@@ -174,10 +174,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
-from griptape_nodes.retained_mode.managers.undo.recorders.flow import (
-    CreateConnectionRecorder,
-    DeleteConnectionRecorder,
-)
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
@@ -320,20 +316,15 @@ class FlowManager:
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
 
-    def register_undo_recorders(self, undo_manager: UndoManager) -> None:
-        """Register how connection requests are reversed for undo/redo.
+    def register_undo_policy(self, undo_manager: UndoManager) -> None:
+        """Declare the flow domain's undo policy: which of its requests are not undoable.
 
-        The UndoManager owns the mechanism; the flow domain owns the knowledge of how to reverse
-        its own requests. Execution requests alter workflow state but are not undoable (undo is
-        about editing, not running), so they stay declared as the non-undoable floor. Called from
-        GriptapeNodes wiring after construction; isolated unit tests that build a FlowManager
-        directly simply skip it.
+        The snapshot strategy captures connection edits automatically; the domain only names the
+        requests the undo system must never treat as an edit. Execution requests alter workflow
+        state but are not undoable (undo is about editing, not running), so they are never snapshot
+        points. Called from GriptapeNodes wiring after construction; isolated unit tests that build a
+        FlowManager directly simply skip it.
         """
-        undo_manager.register_recorder(CreateConnectionRequest, CreateConnectionRecorder())
-        undo_manager.register_recorder(DeleteConnectionRequest, DeleteConnectionRecorder())
-        # Under the hybrid strategy, route connection edits through the surgical (inverse) path
-        # instead of a whole-flow snapshot; a no-op under the pure inverse/snapshot strategies.
-        undo_manager.register_surgical(CreateConnectionRequest, DeleteConnectionRequest)
         undo_manager.register_non_undoable(
             StartFlowRequest,
             CancelFlowRequest,
