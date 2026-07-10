@@ -65,6 +65,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _compose_prompt,
     _friendly_list_models_error,
     _message_has_image_url,
+    _rehydrate_history,
 )
 
 
@@ -365,25 +366,21 @@ class TestMessageHasImageUrl:
 
 class TestRehydrateHistory:
     @pytest.mark.asyncio
-    async def test_text_only_history_returns_unchanged_without_downloading(
-        self, agent_manager: AgentManager, patch_get: _GetRecorder
-    ) -> None:
+    async def test_text_only_history_returns_unchanged_without_downloading(self, patch_get: _GetRecorder) -> None:
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hello")])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         assert result is messages
         assert patch_get.requested_urls == []
 
     @pytest.mark.asyncio
-    async def test_image_url_is_downloaded_back_to_binary_content(
-        self, agent_manager: AgentManager, patch_get: _GetRecorder
-    ) -> None:
+    async def test_image_url_is_downloaded_back_to_binary_content(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/cat.png"
         patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         part = result[0].parts[0]
         assert isinstance(part, UserPromptPart)
@@ -398,11 +395,11 @@ class TestRehydrateHistory:
         assert isinstance(original_part.content[1], ImageUrl)
 
     @pytest.mark.asyncio
-    async def test_failed_download_drops_the_part(self, agent_manager: AgentManager, patch_get: _GetRecorder) -> None:
+    async def test_failed_download_drops_the_part(self, patch_get: _GetRecorder) -> None:
         url = "http://localhost:9/workspace/gone.png"
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         assert patch_get.requested_urls == [url]
         part = result[0].parts[0]
@@ -410,15 +407,13 @@ class TestRehydrateHistory:
         assert part.content == ["look"]
 
     @pytest.mark.asyncio
-    async def test_image_only_turn_all_failing_gets_placeholder_text(
-        self, agent_manager: AgentManager, patch_get: _GetRecorder
-    ) -> None:
+    async def test_image_only_turn_all_failing_gets_placeholder_text(self, patch_get: _GetRecorder) -> None:
         # An image-only turn whose every image fails must not become empty
         # content (some providers reject an empty user message on replay).
         url = "http://localhost:9/workspace/gone.png"
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=[ImageUrl(url=url)])])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         assert patch_get.requested_urls == [url]
         part = result[0].parts[0]
@@ -426,15 +421,13 @@ class TestRehydrateHistory:
         assert part.content == [_UNAVAILABLE_IMAGE_PLACEHOLDER]
 
     @pytest.mark.asyncio
-    async def test_failed_image_with_text_keeps_text_without_placeholder(
-        self, agent_manager: AgentManager, patch_get: _GetRecorder
-    ) -> None:
+    async def test_failed_image_with_text_keeps_text_without_placeholder(self, patch_get: _GetRecorder) -> None:
         # When the turn still has text after a failed download, the text carries
         # the turn: no placeholder is added.
         url = "http://localhost:9/workspace/gone.png"
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["hi", ImageUrl(url=url)])])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         assert patch_get.requested_urls == [url]
         part = result[0].parts[0]
@@ -442,9 +435,7 @@ class TestRehydrateHistory:
         assert part.content == ["hi"]
 
     @pytest.mark.asyncio
-    async def test_multiple_images_preserve_order_with_partial_failure(
-        self, agent_manager: AgentManager, patch_get: _GetRecorder
-    ) -> None:
+    async def test_multiple_images_preserve_order_with_partial_failure(self, patch_get: _GetRecorder) -> None:
         # Concurrent downloads must not reorder content: the surviving image
         # keeps its slot and interleaved text stays put; the failed one drops.
         ok_url = "http://localhost:9/workspace/ok.png"
@@ -453,7 +444,7 @@ class TestRehydrateHistory:
         content = ["before", ImageUrl(url=bad_url), "middle", ImageUrl(url=ok_url), "after"]
         messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=content)])]
 
-        result = await agent_manager._rehydrate_history(messages)
+        result = await _rehydrate_history(messages)
 
         part = result[0].parts[0]
         assert isinstance(part, UserPromptPart)
