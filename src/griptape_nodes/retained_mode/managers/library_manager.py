@@ -13,6 +13,7 @@ import sys
 import sysconfig
 from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
@@ -231,6 +232,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
+    LIBRARY_MINIMUM_RELEASE_AGE_KEY,
     REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
     LibraryDependencyInstallBehavior,
@@ -317,6 +319,34 @@ class LibraryUpdateResult(NamedTuple):
     old_version: str
     new_version: str
     result: ResultPayload
+
+
+class UpdateAgeGateDecision(NamedTuple):
+    """Outcome of evaluating the library update age gate against a target commit.
+
+    ``gated`` is True only when the gate is enabled and the target commit is younger than the
+    configured minimum release age. ``age_hours`` is the target commit's age at evaluation time, or
+    None when the commit timestamp could not be determined.
+    """
+
+    enabled: bool
+    gated: bool
+    age_hours: float | None
+    minimum_release_age_hours: float
+
+
+class MinimumReleaseAgeConfig(NamedTuple):
+    """The minimum-release-age setting, read once so callers avoid duplicate config lookups.
+
+    ``hours`` is the configured minimum release age in hours; 0 (or negative) disables the gate.
+    ``enabled`` is derived so call sites can branch on intent without re-deriving it.
+    """
+
+    hours: float
+
+    @property
+    def enabled(self) -> bool:
+        return self.hours > 0
 
 
 class LibraryManager:
@@ -5349,6 +5379,84 @@ class LibraryManager:
             return None
         return LibraryManager.ResolvedDiscoveryPath(path=library_path, registered_path=entry.path)
 
+    def _read_minimum_release_age_config(self) -> MinimumReleaseAgeConfig:
+        """Read the minimum-release-age setting once. Centralizes the key literal and default handling."""
+        config_mgr = GriptapeNodes.ConfigManager()
+        # get_config_value returns None for an explicit `null` override (it bypasses both cast_type
+        # and the default in that case), so coalesce None back to the default here to keep the gate
+        # fail-open rather than raising when float(None) is attempted.
+        hours = config_mgr.get_config_value(LIBRARY_MINIMUM_RELEASE_AGE_KEY, default=0.0, cast_type=float)
+        if hours is None:
+            hours = 0.0
+        return MinimumReleaseAgeConfig(hours=float(hours))
+
+    def _evaluate_update_age_gate(
+        self, commit_datetime: datetime | None, config: MinimumReleaseAgeConfig | None = None
+    ) -> UpdateAgeGateDecision:
+        """Decide whether an update to a commit is withheld by the minimum release age.
+
+        When the gate is disabled the update is never gated. When enabled but the commit timestamp is
+        unknown, the update is allowed (age cannot be verified) and a warning is logged rather than
+        wedging updates permanently.
+
+        Args:
+            commit_datetime: The timezone-aware timestamp of the commit the update would move to.
+            config: Pre-read minimum-release-age config. When None, it is read from config. Callers
+                that must inspect ``enabled`` before deciding whether to fetch the commit datetime
+                should read it once via _read_minimum_release_age_config and pass it here to avoid a
+                duplicate lookup.
+
+        Returns:
+            UpdateAgeGateDecision describing whether the gate is enabled, whether this update is
+            gated, the commit's age in hours, and the configured minimum release age.
+        """
+        if config is None:
+            config = self._read_minimum_release_age_config()
+        enabled = config.enabled
+        minimum_release_age_hours = config.hours
+
+        if not enabled:
+            return UpdateAgeGateDecision(
+                enabled=False, gated=False, age_hours=None, minimum_release_age_hours=minimum_release_age_hours
+            )
+
+        if commit_datetime is None:
+            logger.warning(
+                "The library minimum release age is set but the target commit timestamp could not be "
+                "determined. Allowing the update without an age check."
+            )
+            return UpdateAgeGateDecision(
+                enabled=True, gated=False, age_hours=None, minimum_release_age_hours=minimum_release_age_hours
+            )
+
+        # Treat a naive timestamp as UTC so the subtraction below never raises.
+        if commit_datetime.tzinfo is None:
+            commit_datetime = commit_datetime.replace(tzinfo=UTC)
+
+        age_hours = (datetime.now(tz=UTC) - commit_datetime).total_seconds() / 3600.0
+        gated = age_hours < minimum_release_age_hours
+        return UpdateAgeGateDecision(
+            enabled=True, gated=gated, age_hours=age_hours, minimum_release_age_hours=minimum_release_age_hours
+        )
+
+    async def _get_remote_target_commit_datetime(self, library_dir: Path) -> datetime | None:
+        """Fetch the timestamp of the commit an update would move a library to.
+
+        Resolves the library's git remote and current ref, then reads the target commit's metadata
+        from the remote. Returns None when the remote, ref, or timestamp cannot be determined; the
+        age gate treats None as "cannot verify" and allows the update.
+        """
+        try:
+            git_remote = await asyncio.to_thread(get_git_remote, library_dir)
+            if git_remote is None:
+                return None
+            git_ref = await asyncio.to_thread(get_current_ref, library_dir)
+            version_info = await asyncio.to_thread(clone_and_get_library_version, git_remote, git_ref or "HEAD")
+        except GitError as e:
+            logger.warning("Failed to determine target commit age for library at %s: %s", library_dir, e)
+            return None
+        return version_info.commit_datetime
+
     async def check_library_update_request(self, request: CheckLibraryUpdateRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         """Check if a library has updates available via git."""
         library_name = request.library_name
@@ -5496,8 +5604,30 @@ class LibraryManager:
             )
             return CheckLibraryUpdateResultFailure(result_details=details)
 
-        details = f"Successfully checked for updates for Library '{library_name}'. Current version: {current_version}, Latest version: {latest_version}, Has update: {has_update} ({update_reason})"
-        logger.info(details)
+        # Evaluate the age gate only when an update actually exists, so callers can surface a
+        # "pending age gate" state. Skipping the evaluation when up to date avoids a spurious
+        # "timestamp could not be determined" warning (there is simply nothing to gate) and the
+        # cost of the decision on the common no-update path.
+        if has_update:
+            age_gate = self._evaluate_update_age_gate(version_info.commit_datetime)
+            update_gated_by_age = age_gate.gated
+            target_commit_age_hours = age_gate.age_hours
+            minimum_release_age_hours = age_gate.minimum_release_age_hours if age_gate.enabled else None
+        else:
+            update_gated_by_age = False
+            target_commit_age_hours = None
+            minimum_release_age_hours = None
+
+        if update_gated_by_age:
+            details = (
+                f"Update available for Library '{library_name}' ({current_version} -> {latest_version}), but the "
+                f"target commit is {target_commit_age_hours:.1f}h old, younger than the required "
+                f"{minimum_release_age_hours:.1f}h minimum release age. Update will be available once the target commit ages."
+            )
+            logger.info(details)
+        else:
+            details = f"Successfully checked for updates for Library '{library_name}'. Current version: {current_version}, Latest version: {latest_version}, Has update: {has_update} ({update_reason})"
+            logger.info(details)
 
         return CheckLibraryUpdateResultSuccess(
             has_update=has_update,
@@ -5507,6 +5637,9 @@ class LibraryManager:
             git_ref=git_ref,
             local_commit=local_commit,
             remote_commit=remote_commit,
+            update_gated_by_age=update_gated_by_age,
+            target_commit_age_hours=target_commit_age_hours,
+            minimum_release_age_hours=minimum_release_age_hours,
             result_details=details,
         )
 
@@ -5642,7 +5775,7 @@ class LibraryManager:
 
         return new_version
 
-    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:
+    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901
         """Update a library to the latest version using the appropriate git strategy.
 
         Automatically detects whether the library uses branch-based or tag-based workflow:
@@ -5668,6 +5801,21 @@ class LibraryManager:
         if await asyncio.to_thread(is_monorepo, library_dir):
             details = f"Cannot update Library '{library_name}'. Repository contains multiple libraries and must be updated manually."
             return UpdateLibraryResultFailure(result_details=details)
+
+        # Enforce the update age gate before mutating the working tree. Only pay the
+        # remote round-trip when gating is actually enabled, so the common (disabled) path is free.
+        minimum_release_age_config = self._read_minimum_release_age_config()
+        if minimum_release_age_config.enabled:
+            target_commit_datetime = await self._get_remote_target_commit_datetime(library_dir)
+            age_gate = self._evaluate_update_age_gate(target_commit_datetime, config=minimum_release_age_config)
+            if age_gate.gated:
+                details = (
+                    f"Cannot update Library '{library_name}' yet: the target commit is "
+                    f"{age_gate.age_hours:.1f}h old, younger than the required {age_gate.minimum_release_age_hours:.1f}h "
+                    f"minimum release age (library.minimum_release_age). Try again once the target commit ages."
+                )
+                logger.info(details)
+                return UpdateLibraryResultFailure(result_details=details, age_gated=True)
 
         # Perform git update (auto-detects branch vs tag workflow)
         try:
@@ -6018,7 +6166,7 @@ class LibraryManager:
             library_name=library_name, dependencies_installed=len(pip_dependencies), result_details=details
         )
 
-    async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0915
+    async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
         # Phase 1: Download missing libraries from both config keys
         config_mgr = GriptapeNodes.ConfigManager()
@@ -6097,6 +6245,7 @@ class LibraryManager:
         # Process check results and determine which libraries need updates
         libraries_checked = len(libraries_to_check)
         libraries_updated = 0
+        libraries_deferred = 0
         libraries_to_update: list[LibraryUpdateInfo] = []
 
         for library_name, check_result in check_results.items():
@@ -6110,6 +6259,27 @@ class LibraryManager:
 
             if not check_result.has_update:
                 logger.info("Library '%s' is up to date (version %s)", library_name, check_result.current_version)
+                continue
+
+            # An update exists but is withheld by the age gate: skip it this cycle rather than
+            # attempting an update that update_library_request would refuse. It will apply on a
+            # later sync once the target commit reaches the minimum age.
+            if check_result.update_gated_by_age:
+                libraries_deferred += 1
+                logger.info(
+                    "Library '%s' has an update (%s -> %s) withheld by the age gate; skipping this sync.",
+                    library_name,
+                    check_result.current_version,
+                    check_result.latest_version,
+                )
+                # Record the pending target version (not the current one) so consumers can surface
+                # "held at X, pending Y". The `deferred_age_gate` status disambiguates this from an
+                # applied update where old != new.
+                update_summary[library_name] = {
+                    "old_version": check_result.current_version or "unknown",
+                    "new_version": check_result.latest_version or "unknown",
+                    "status": "deferred_age_gate",
+                }
                 continue
 
             # Library has an update available
@@ -6153,6 +6323,24 @@ class LibraryManager:
             update_result = result.result
 
             if not isinstance(update_result, UpdateLibraryResultSuccess):
+                # A commit that was old enough during the check pass can still be refused at update
+                # time if a newer commit landed on the remote in between; that comes back as an
+                # age-gate refusal, not a hard failure. Count it as a deferral (it applies on a later
+                # sync once the target ages) so the summary and counts stay accurate.
+                if isinstance(update_result, UpdateLibraryResultFailure) and update_result.age_gated:
+                    libraries_deferred += 1
+                    logger.info(
+                        "Library '%s' update (%s -> %s) was withheld by the age gate at update time; deferring.",
+                        library_name,
+                        old_version,
+                        new_version,
+                    )
+                    update_summary[library_name] = {
+                        "old_version": old_version,
+                        "new_version": new_version,
+                        "status": "deferred_age_gate",
+                    }
+                    continue
                 logger.error("Failed to update library '%s': %s", library_name, update_result.result_details)
                 update_summary[library_name] = {
                     "old_version": old_version,
@@ -6177,11 +6365,14 @@ class LibraryManager:
 
         # Build result details
         details = f"Downloaded {libraries_downloaded} libraries. Checked {libraries_checked} libraries. {libraries_updated} updated."
+        if libraries_deferred:
+            details += f" {libraries_deferred} withheld by age gate."
         logger.info(details)
         return SyncLibrariesResultSuccess(
             libraries_downloaded=libraries_downloaded,
             libraries_checked=libraries_checked,
             libraries_updated=libraries_updated,
+            libraries_deferred=libraries_deferred,
             update_summary=update_summary,
             result_details=details,
         )
@@ -6197,11 +6388,15 @@ class LibraryManager:
 
         # Perform sparse checkout to get library JSON
         try:
-            library_version, commit_sha, library_data_raw = sparse_checkout_library_json(normalized_url, ref)
+            checkout = sparse_checkout_library_json(normalized_url, ref)
         except GitCloneError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
             logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
+
+        library_version = checkout.library_version
+        commit_sha = checkout.commit_sha
+        library_data_raw = checkout.library_data
 
         # Validate and create LibrarySchema
         try:
