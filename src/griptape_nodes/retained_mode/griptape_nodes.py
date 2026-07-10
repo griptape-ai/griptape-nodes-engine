@@ -475,6 +475,9 @@ class GriptapeNodes(metaclass=SingletonMeta):
                 user=user,
                 user_organization=user_organization,
                 is_initializing=GriptapeNodes.LibraryManager().is_initializing(),
+                # Set on worker processes (injected at spawn by WorkerManager), unset on the
+                # orchestrator. Lets a discovery client tell workers apart and nest them.
+                orchestrator_engine_id=os.getenv("GTN_ORCHESTRATOR_ENGINE_ID"),
                 result_details="Engine heartbeat successful",
                 **instance_info,
                 **workflow_info,
