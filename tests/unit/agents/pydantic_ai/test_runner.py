@@ -17,6 +17,7 @@ from pydantic_ai.messages import (
     ImageUrl,
     ModelMessage,
     ModelRequest,
+    ModelResponse,
     TextPart,
     ToolCallPart,
     UserPromptPart,
@@ -159,6 +160,30 @@ async def test_history_carries_across_runs(tmp_path: Path) -> None:
 
     assert seen_history[0] < seen_history[1]
     assert first.thread_id == second.thread_id
+
+
+@pytest.mark.asyncio
+async def test_run_raises_when_history_ends_without_response(tmp_path: Path) -> None:
+    """A partial-turn history (no trailing ModelResponse) fails loud, not silently.
+
+    Persisting `history + new_messages` would duplicate the trailing request's
+    parts if pydantic-ai merged this turn into it, so run() refuses.
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    threads_dir = tmp_path / "threads"
+
+    async def stream(_messages: list[ModelMessage], _info: AgentInfo) -> AsyncIterator[str]:
+        yield "ok"
+
+    runner = _runner_with_function_model(workspace, threads_dir, stream)
+    thread_id, _ = runner.storage.create_thread()
+    # A history that ends with a bare request (no assistant response) is the
+    # partial-turn state the guard rejects.
+    runner.storage.save_history(thread_id, [ModelRequest(parts=[UserPromptPart(content="orphan")])])
+
+    with pytest.raises(ValueError, match="not a ModelResponse"):
+        await runner.run("next", thread_id=thread_id)
 
 
 @pytest.mark.asyncio
@@ -314,10 +339,15 @@ async def test_history_rehydrator_transforms_loaded_history_before_model_call(tm
 
     runner = _runner_with_function_model(workspace, threads_dir, stream)
 
-    # Seed a thread whose history carries an ImageUrl reference.
+    # Seed a thread whose history carries an ImageUrl reference. A realistic
+    # saved turn ends with a ModelResponse, which run() requires before it
+    # appends the next turn.
     url = "http://localhost:8124/workspace/cat.png"
     thread_id, _ = runner.storage.create_thread()
-    seed: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+    seed: list[ModelMessage] = [
+        ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])]),
+        ModelResponse(parts=[TextPart(content="a cat")]),
+    ]
     runner.storage.save_history(thread_id, seed)
 
     # A non-mutating rehydrator, per the run() contract: returns fresh objects

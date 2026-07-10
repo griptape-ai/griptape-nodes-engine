@@ -25,7 +25,7 @@ import contextlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent
@@ -35,6 +35,7 @@ from pydantic_ai.messages import (
     FunctionToolCallEvent,
     FunctionToolResultEvent,
     ModelRequest,
+    ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
@@ -378,9 +379,26 @@ class PydanticAgentRunner:
                 counters.tool_calls,
             )
 
-        messages_to_save = list(history) + list(new_messages)
+        # We persist `history + new_messages` rather than `all_messages()`, which
+        # assumes the loaded history is a sequence of complete turns ending in a
+        # ModelResponse. A trailing bare ModelRequest would mean a partial turn
+        # was saved earlier, so the two ways of reconstructing the transcript can
+        # drift; fail loud rather than silently persist a malformed history.
+        # Normal turns always end in a ModelResponse and cancelled turns are
+        # never saved, so this never fires today.
+        turn_messages = list(new_messages)
+        if history and not isinstance(history[-1], ModelResponse):
+            msg = (
+                f"Attempted to persist thread {thread_id}. Failed because loaded history ends with "
+                f"{type(history[-1]).__name__}, not a ModelResponse, indicating a partial turn was "
+                "saved earlier."
+            )
+            raise ValueError(msg)
+        # Rewrite only this turn's messages so a restore can never reach into
+        # pristine history and clobber an older user turn.
         if persist_prompt is not None:
-            _apply_persist_prompt(messages_to_save, persist_prompt)
+            _apply_persist_prompt(turn_messages, persist_prompt)
+        messages_to_save = list(history) + turn_messages
         self.storage.save_history(thread_id, messages_to_save)
         return AgentRunResult(
             thread_id=thread_id,
@@ -581,12 +599,12 @@ def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Se
         if not isinstance(message, ModelRequest):
             continue
         for index, part in enumerate(message.parts):
-            if isinstance(part, UserPromptPart):
-                message.parts = [
-                    UserPromptPart(content=persist_prompt, timestamp=part.timestamp) if i == index else existing
-                    for i, existing in enumerate(message.parts)
-                ]
-                return
+            if not isinstance(part, UserPromptPart):
+                continue
+            new_parts = list(message.parts)
+            new_parts[index] = replace(part, content=persist_prompt)
+            message.parts = new_parts
+            return
 
 
 def _preview(value: str) -> str:
