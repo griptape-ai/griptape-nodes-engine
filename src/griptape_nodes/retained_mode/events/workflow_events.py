@@ -260,6 +260,28 @@ class DeleteWorkflowResultFailure(ResultPayloadFailure):
     """Workflow deletion failed. Common causes: workflow not found, deletion not allowed, registry error."""
 
 
+class RenameDisplayNameBehavior(StrEnum):
+    """Controls what happens to ``WorkflowMetadata.name`` (the human-facing display name) on rename.
+
+    Rename is always a file-name operation; the display name is independent metadata. This enum
+    lets callers decide whether the rename should touch it.
+
+    Values:
+        MATCH_FILE_NAME: Overwrite the display name with the (unsanitized) requested new name.
+            Historical behavior and the default so on-the-wire parity with existing callers is
+            preserved.
+        PRESERVE_EXISTING: Leave the current display name untouched. Opt-in; the file moves but
+            ``metadata.name`` stays put. Use this to fix the "renaming a workflow silently rewrites
+            its display name" corruption path (engine #4992).
+        OVERRIDE: Set the display name to the caller-supplied ``display_name`` value, independent
+            of the file name. Requires ``display_name`` to be non-empty.
+    """
+
+    PRESERVE_EXISTING = "preserve_existing"
+    MATCH_FILE_NAME = "match_file_name"
+    OVERRIDE = "override"
+
+
 @dataclass
 @PayloadRegistry.register
 class RenameWorkflowRequest(RequestPayload):
@@ -270,13 +292,22 @@ class RenameWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Current name of the workflow
-        requested_name: New name for the workflow
+        requested_name: New name for the workflow (drives the on-disk filename)
+        display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
+            ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
+            display name preserved on rename must opt in with ``PRESERVE_EXISTING``. See
+            :class:`RenameDisplayNameBehavior`.
+        display_name: New display name. Required (non-empty) when ``display_name_behavior`` is
+            ``OVERRIDE``. MUST be ``None`` for the other behaviors — supplying it there is
+            rejected up front to catch callers who set it thinking it will take effect.
 
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
     workflow_name: str
     requested_name: str
+    display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
+    display_name: str | None = None
 
 
 @dataclass

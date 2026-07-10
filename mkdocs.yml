@@ -191,15 +191,15 @@ theme:
   palette:
     # Dark mode
     - scheme: slate
-      primary: black
-      accent: deep orange
+      primary: custom
+      accent: custom
       toggle:
         icon: material/lightbulb-outline
         name: Switch to light mode
     # Light mode
     - scheme: default
-      primary: deep indigo
-      accent: deep orange
+      primary: custom
+      accent: custom
       toggle:
         icon: material/lightbulb
         name: Switch to dark mode

@@ -3,7 +3,7 @@ import asyncio
 import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import anyio
@@ -886,9 +886,20 @@ class TestWorkflowManager:
         source_file_path: str
         save_file_path: str
         save_workflow_name: str
+        source_display_name: str = "source-display-name"
 
-    def _run_rename(self, workflow_manager: WorkflowManager, scenario: "TestWorkflowManager._RenameScenario") -> dict:
-        """Drive on_rename_workflow_request with mocked save/delete, capturing the SaveWorkflowRequest."""
+    def _run_rename(
+        self,
+        workflow_manager: WorkflowManager,
+        scenario: "TestWorkflowManager._RenameScenario",
+        *,
+        request_kwargs: dict[str, Any] | None = None,
+    ) -> dict:
+        """Drive on_rename_workflow_request with mocked save/delete, capturing the SaveWorkflowRequest.
+
+        ``request_kwargs`` is merged into the RenameWorkflowRequest constructor so individual tests can
+        exercise display_name_behavior / display_name without changing the shared scenario tuple.
+        """
         from griptape_nodes.retained_mode.events.workflow_events import (
             DeleteWorkflowResultSuccess,
             RenameWorkflowRequest,
@@ -899,11 +910,13 @@ class TestWorkflowManager:
 
         mock_source = MagicMock()
         mock_source.file_path = scenario.source_file_path
+        mock_source.metadata.name = scenario.source_display_name
         captured: dict[str, object] = {}
 
         async def fake_ahandle_request(req: object) -> object:
             if isinstance(req, SaveWorkflowRequest):
                 captured["save_file_name"] = req.file_name
+                captured["save_display_name"] = req.display_name
                 return SaveWorkflowResultSuccess(
                     file_path=scenario.save_file_path,
                     workflow_name=scenario.save_workflow_name,
@@ -919,7 +932,11 @@ class TestWorkflowManager:
         ):
             result = asyncio.run(
                 workflow_manager.on_rename_workflow_request(
-                    RenameWorkflowRequest(workflow_name=scenario.workflow_name, requested_name=scenario.requested_name)
+                    RenameWorkflowRequest(
+                        workflow_name=scenario.workflow_name,
+                        requested_name=scenario.requested_name,
+                        **(request_kwargs or {}),
+                    )
                 )
             )
 
@@ -986,6 +1003,297 @@ class TestWorkflowManager:
             ),
         )
         assert captured["result_new_name"] == "bar/new_name"
+
+    def test_rename_default_matches_file_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """Default behavior (MATCH_FILE_NAME): display name tracks the new file basename.
+
+        Preserves historical wire behavior — callers who don't set display_name_behavior see the
+        same result they did before the enum was introduced.
+        """
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="My Cool Workflow",
+            ),
+        )
+        assert captured["save_display_name"] == "my_workflow_renamed"
+
+    def test_rename_preserve_existing_keeps_display_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """PRESERVE_EXISTING opt-in: SaveWorkflowRequest receives the source's metadata.name, not the new file stem.
+
+        Fix for issue #4992 — with this enum value, renaming a workflow whose display name diverges
+        from its filename no longer overwrites metadata.name.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="My Cool Workflow",
+            ),
+            request_kwargs={"display_name_behavior": RenameDisplayNameBehavior.PRESERVE_EXISTING},
+        )
+        assert captured["save_display_name"] == "My Cool Workflow"
+
+    def test_rename_override_uses_provided_display_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """OVERRIDE forwards the caller-supplied display_name to SaveWorkflowRequest."""
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="My Cool Workflow",
+            ),
+            request_kwargs={
+                "display_name_behavior": RenameDisplayNameBehavior.OVERRIDE,
+                "display_name": "Renamed On Purpose",
+            },
+        )
+        assert captured["save_display_name"] == "Renamed On Purpose"
+
+    def test_rename_override_strips_surrounding_whitespace(self, griptape_nodes: GriptapeNodes) -> None:
+        """OVERRIDE forwards ``display_name`` stripped so validation and resolution agree on the canonical form.
+
+        Regression coverage: ``_validate_rename_display_name`` gates OVERRIDE on
+        ``display_name.strip()`` being truthy, so a padded input like ``"  My Name  "``
+        passes validation. Without a matching ``strip()`` in ``_resolve_rename_display_name``,
+        the whitespace would leak into ``metadata.name``.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="My Cool Workflow",
+            ),
+            request_kwargs={
+                "display_name_behavior": RenameDisplayNameBehavior.OVERRIDE,
+                "display_name": "  My Name  ",
+            },
+        )
+        assert captured["save_display_name"] == "My Name"
+
+    @pytest.mark.parametrize(
+        "non_override_behavior",
+        [
+            "PRESERVE_EXISTING",
+            "MATCH_FILE_NAME",
+        ],
+    )
+    def test_rename_rejects_display_name_without_override(
+        self,
+        griptape_nodes: GriptapeNodes,
+        non_override_behavior: str,
+    ) -> None:
+        """Supplying display_name with a non-OVERRIDE behavior fails fast so it can't be silently ignored."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            RenameDisplayNameBehavior,
+            RenameWorkflowRequest,
+            RenameWorkflowResultFailure,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        async def fake_ahandle_request(req: object) -> object:
+            msg = f"Save/delete must not run when display_name is used with non-OVERRIDE; got {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(
+                        workflow_name="my_workflow",
+                        requested_name="my_workflow_renamed",
+                        display_name_behavior=RenameDisplayNameBehavior[non_override_behavior],
+                        display_name="Silently Ignored",
+                    )
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultFailure)
+        assert "only consulted when display_name_behavior=OVERRIDE" in str(result.result_details)
+
+    @pytest.mark.parametrize("empty_display_name", [None, "", "   "])
+    def test_rename_override_rejects_missing_display_name(
+        self,
+        griptape_nodes: GriptapeNodes,
+        empty_display_name: str | None,
+    ) -> None:
+        """OVERRIDE without a non-empty display_name fails fast without invoking the save pipeline."""
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            RenameDisplayNameBehavior,
+            RenameWorkflowRequest,
+            RenameWorkflowResultFailure,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        async def fake_ahandle_request(req: object) -> object:
+            msg = f"Save/delete must not run when OVERRIDE has no display_name; got {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(
+                        workflow_name="my_workflow",
+                        requested_name="my_workflow_renamed",
+                        display_name_behavior=RenameDisplayNameBehavior.OVERRIDE,
+                        display_name=empty_display_name,
+                    )
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultFailure)
+        assert "OVERRIDE" in str(result.result_details)
+
+    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_display_name_blank(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """PRESERVE_EXISTING with a blank source metadata.name falls back to the requested name.
+
+        The source is registered but its ``metadata.name`` is empty (or whitespace-only). Rather
+        than propagating that corrupt-ish value onto the renamed workflow — where the save
+        handler would treat "" as an explicit override and persist it — degrade gracefully to the
+        requested name so the on-disk file still gets a sensible display name.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import RenameDisplayNameBehavior
+
+        captured = self._run_rename(
+            griptape_nodes.WorkflowManager(),
+            self._RenameScenario(
+                workflow_name="my_workflow",
+                requested_name="my_workflow_renamed",
+                source_file_path="my_workflow.py",
+                save_file_path="/workspace/my_workflow_renamed.py",
+                save_workflow_name="my_workflow_renamed",
+                source_display_name="   ",  # whitespace-only: strip()==""
+            ),
+            request_kwargs={"display_name_behavior": RenameDisplayNameBehavior.PRESERVE_EXISTING},
+        )
+        assert captured["save_display_name"] == "my_workflow_renamed"
+
+    def test_rename_preserve_existing_falls_back_to_requested_name_when_source_missing(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """PRESERVE_EXISTING with an unregistered source workflow falls back to the requested name.
+
+        Save-As-style path: caller asks to rename a workflow that isn't in the registry (e.g. the
+        entry was already deleted, or this is a first-save-as flow). We can't preserve a name we
+        don't have, so we hand the requested name through to SaveWorkflowRequest — better than
+        letting the save chain fall further and derive from the file stem.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            RenameDisplayNameBehavior,
+            RenameWorkflowRequest,
+            RenameWorkflowResultSuccess,
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        captured: dict[str, object] = {}
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, SaveWorkflowRequest):
+                captured["save_display_name"] = req.display_name
+                return SaveWorkflowResultSuccess(
+                    file_path="/workspace/never_registered_renamed.py",
+                    workflow_name="never_registered_renamed",
+                    result_details="ok",
+                )
+            msg = f"Unexpected request in save-as fallback test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with (
+            # Force the source lookup to miss — no registry entry to preserve from.
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=False),
+            patch.object(workflow_manager, "_persist_external_workflow_registration"),
+            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(
+                        workflow_name="never_registered",
+                        requested_name="never_registered_renamed",
+                        display_name_behavior=RenameDisplayNameBehavior.PRESERVE_EXISTING,
+                    )
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultSuccess)
+        assert captured["save_display_name"] == "never_registered_renamed"
+
+    def test_rename_surfaces_delete_failure_from_bookkeeping(self, griptape_nodes: GriptapeNodes) -> None:
+        """When the post-save delete of the old registry entry fails, rename surfaces RenameWorkflowResultFailure.
+
+        Save succeeds, but the follow-up DeleteWorkflowRequest for the old key comes back as
+        DeleteWorkflowResultFailure. The bookkeeping helper must translate that into a rename
+        failure so the caller doesn't see a bogus success while the registry is half-migrated.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            DeleteWorkflowRequest,
+            DeleteWorkflowResultFailure,
+            RenameWorkflowRequest,
+            RenameWorkflowResultFailure,
+            SaveWorkflowRequest,
+            SaveWorkflowResultSuccess,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        mock_source = MagicMock()
+        mock_source.file_path = "old.py"
+        mock_source.metadata.name = "Old Display"
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, SaveWorkflowRequest):
+                return SaveWorkflowResultSuccess(
+                    file_path="/workspace/new.py",
+                    workflow_name="new",
+                    result_details="ok",
+                )
+            if isinstance(req, DeleteWorkflowRequest):
+                return DeleteWorkflowResultFailure(result_details="registry locked")
+            msg = f"Unexpected request in delete-failure test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        with (
+            patch.object(WorkflowRegistry, "has_workflow_with_name", return_value=True),
+            patch.object(WorkflowRegistry, "get_workflow_by_name", return_value=mock_source),
+            patch.object(workflow_manager, "_persist_external_workflow_registration"),
+            patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+        ):
+            result = asyncio.run(
+                workflow_manager.on_rename_workflow_request(
+                    RenameWorkflowRequest(workflow_name="old", requested_name="new")
+                )
+            )
+
+        assert isinstance(result, RenameWorkflowResultFailure)
+        # Match the quoted-name form the failure message renders so the assertions
+        # don't pass on incidental substrings ("renew", "olden", ...).
+        assert "'old'" in str(result.result_details)
+        assert "'new'" in str(result.result_details)
 
     def test_resolve_named_save_path_absolute_skips_sub_dirs(self, griptape_nodes: GriptapeNodes) -> None:
         """An absolute requested name routes the full path to _build_workflow_save_path with no sub_dirs."""

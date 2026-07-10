@@ -2258,6 +2258,164 @@ situations:
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
+    async def test_app_initialization_complete_activates_seed_without_touching_defaults(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A seeded boot project is activated directly; the system-defaults gate is never consulted.
+
+        Regression guard for the boot ordering: with a project_file/workspace seed present,
+        on_app_initialization_complete activates the seed instead of first activating
+        SYSTEM_DEFAULTS_KEY. So a license policy that denies the defaults rest state does not
+        block boot -- the ACTIVATE_PROJECT checkpoint is never evaluated for SYSTEM_DEFAULTS_KEY.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        activated_subject_ids: list[str] = []
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT:
+                activated_subject_ids.append(checkpoint.subject_id)
+                if checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                    return CheckpointDenial(
+                        failures=(CheckpointFailure(detail="No license covers the default project."),)
+                    )
+            return None
+
+        event_manager = GriptapeNodes.EventManager()
+        event_manager.add_authorization_hook(deny_defaults)
+        try:
+            with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+                mock_file_instance = Mock()
+                mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+                mock_file_cls.return_value = mock_file_instance
+
+                await pm.on_app_initialization_complete(AppInitializationComplete())
+        finally:
+            event_manager.remove_authorization_hook(deny_defaults)
+
+        assert pm._current_project_id == str(workspace_project_path)
+        assert pm._initialization_complete is True
+        # The defaults rest state was never activated, so its (denying) gate was never hit.
+        assert SYSTEM_DEFAULTS_KEY not in activated_subject_ids
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_falls_back_to_defaults_when_seed_fails(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A seed that resolves but fails to load falls back to activating system defaults."""
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # File exists so the seed path resolves, but its YAML cannot be parsed.
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls,
+            caplog.at_level(logging.ERROR, logger="griptape_nodes"),
+        ):
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
+            mock_file_cls.return_value = mock_file_instance
+
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is True
+        # The seed was resolved and attempted before the fallback: prove the ordering,
+        # not just the endpoint (which a never-attempted seed would also satisfy).
+        error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            str(workspace_project_path) in msg and "Falling back to system defaults" in msg for msg in error_messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_does_not_complete_when_no_seed_and_defaults_denied(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """With no seed and a policy that denies system defaults, boot cannot complete.
+
+        This is the genuinely locked-out case: nothing is reachable, so the engine
+        surfaces the failure rather than pretending to have activated a project.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # No project_file seed and no workspace griptape-nodes-project.yml on disk.
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT and checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                return CheckpointDenial(failures=(CheckpointFailure(detail="No license covers the default project."),))
+            return None
+
+        event_manager = GriptapeNodes.EventManager()
+        event_manager.add_authorization_hook(deny_defaults)
+        try:
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+        finally:
+            event_manager.remove_authorization_hook(deny_defaults)
+
+        # The denied activation left the current project untouched and boot short-circuited.
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is False
+
+    @pytest.mark.asyncio
     async def test_load_workspace_project_uses_project_file_setting(self, pm: ProjectManager, tmp_path: Path) -> None:
         """When project_file config is set, that path is used instead of workspace default."""
         self._setup_system_defaults(pm, str(tmp_path))
@@ -8544,22 +8702,51 @@ class TestProjectActivationAuthorizationCheckpoint:
 
     @pytest.mark.asyncio
     @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    async def test_system_defaults_bypasses_checkpoint(
+    async def test_system_defaults_evaluates_checkpoint(
         self, mock_griptape_nodes: Mock, project_manager: ProjectManager
     ) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
             SetCurrentProjectRequest,
             SetCurrentProjectResultSuccess,
         )
-        from griptape_nodes.retained_mode.managers.project_manager import _ProjectActivationOutcome
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, _ProjectActivationOutcome
 
+        # The engine bakes in no exemption: the rest state is gated like any other
+        # project. The consumer allows it (returns None), so activation proceeds.
+        checkpoint = mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint
+        checkpoint.return_value = None
         outcome = _ProjectActivationOutcome(failure=None, workspace_changed=False)
         with patch.object(project_manager, "_activate_project", new=AsyncMock(return_value=outcome)):
             result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
 
         assert isinstance(result, SetCurrentProjectResultSuccess)
-        # The rest state is always allowed; the checkpoint is never consulted.
-        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.assert_not_called()
+        # The checkpoint is consulted even for the rest state; the policy decides.
+        checkpoint.assert_called_once()
+        assert checkpoint.call_args.args[0].subject_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    async def test_system_defaults_denial_blocks_activation(
+        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+    ) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        # A consumer is free to deny even the rest state; the engine enforces that
+        # decision rather than exempting the defaults on its own.
+        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=(CheckpointFailure(detail="No license covers the default project."),)
+        )
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "No license covers the default project." in str(result.result_details)
+        activate.assert_not_called()
 
 
 # A minimal but realistic standalone project template used to seed an on-disk
@@ -9539,3 +9726,119 @@ class TestImportProject:
         import_result = await pm.on_import_project_request(import_request)
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates
+
+
+class TestProjectManagerGetProjectChain:
+    """`get_project_chain` resolves a project and its ancestors, leaf-first."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    @staticmethod
+    def _register(
+        pm: ProjectManager,
+        project_id: str,
+        *,
+        name: str | None = None,
+        parent_id: str | None = None,
+        file: Path | None = None,
+    ) -> None:
+        """Register an id-linked project directly in the in-memory registry.
+
+        The parent link is an explicit `parent_project_id`, so the walk resolves it
+        through the registry without touching disk; `name` rides on the template so
+        each chain entry can assert a distinct display name.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        update: dict[str, Any] = {"id": project_id, "parent_project_id": parent_id}
+        if name is not None:
+            update["name"] = name
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(update=update)
+        pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+            project_id=project_id,
+            project_file_path=file,
+            project_base_dir=file.parent if file is not None else Path("/"),
+            template=template,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+    def test_chain_for_parentless_project_is_just_itself(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "solo", name="Solo")
+        pm._current_project_id = "solo"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="solo", name="Solo")]
+
+    def test_chain_walks_parents_leaf_first(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "mid", name="Mid", parent_id="root")
+        self._register(pm, "leaf", name="Leaf", parent_id="mid")
+        pm._current_project_id = "leaf"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="mid", name="Mid"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_accepts_explicit_project_id_overriding_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "leaf", name="Leaf", parent_id="root")
+        pm._current_project_id = "root"
+        assert pm.get_project_chain("leaf") == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_breaks_on_cycle_without_repeating(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        # a -> b -> a: the walk must terminate at the first repeated id.
+        self._register(pm, "a", name="A", parent_id="b")
+        self._register(pm, "b", name="B", parent_id="a")
+        pm._current_project_id = "a"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="a", name="A"),
+            ProjectChainEntry(id="b", name="B"),
+        ]
+
+    def test_chain_surfaces_unregistered_parent_by_id_then_stops(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "leaf", name="Leaf", parent_id="ghost")
+        pm._current_project_id = "leaf"
+        # The unregistered parent's id is surfaced (so a policy can still match it),
+        # but it has no template to walk further and no resolved name.
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="ghost", name=None),
+        ]
+
+    def test_chain_for_unregistered_start_is_just_its_id(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        pm._current_project_id = "missing"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="missing", name=None)]
+
+    def test_chain_defaults_to_current_project(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = self._pm()
+        # __init__ registers system defaults and points the current id at them.
+        chain = pm.get_project_chain()
+        assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
