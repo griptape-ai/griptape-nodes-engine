@@ -302,14 +302,14 @@ class LibrarySettings(BaseModel):
     lazy_node_loading: bool = Field(
         default=True,
         description=(
-            "When True (the default), node modules are imported lazily on first use (creating, "
-            "executing, or introspecting a node of that type) rather than at startup, which speeds "
-            "up engine startup for libraries with many or heavy nodes. The tradeoff is that a broken "
-            "node's import error is not reported until that node is first used. When False, the engine "
-            "imports every node's Python module at startup, so an import error surfaces immediately as "
-            "a library problem, before the node is placed on a canvas; set this while authoring nodes "
-            "if you want that check. Nodes in the sandbox library are always loaded eagerly regardless "
-            "of this setting."
+            "When True (the default), a node's Python module is imported lazily the first time a node "
+            "of that type is created (or the type is otherwise resolved, such as when introspected) "
+            "rather than at startup, which speeds up engine startup for libraries with many or heavy "
+            "nodes. The tradeoff is that a broken node's import error is not reported until that type is "
+            "first created. When False, the engine imports every node's Python module at startup, so an "
+            "import error surfaces immediately as a library problem, before the node is placed on a "
+            "canvas; set this while authoring nodes if you want that check. Nodes in the sandbox library "
+            "are always loaded eagerly regardless of this setting."
         ),
     )
     minimum_release_age: float = Field(
