@@ -1358,7 +1358,7 @@ class TestDeleteFileRequest:
         subdir.mkdir()
         (subdir / "file3.txt").write_text("content3")
 
-        request = DeleteFileRequest(path=str(dir_path), workspace_only=False)
+        request = DeleteFileRequest(path=str(dir_path), workspace_only=False, collect_deleted_paths=True)
 
         result = await os_manager.on_delete_file_request(request)
 
@@ -1370,6 +1370,28 @@ class TestDeleteFileRequest:
         assert any(str(dir_path / "file1.txt") in path for path in result.deleted_paths)
         assert any(str(dir_path / "file2.txt") in path for path in result.deleted_paths)
         assert any(str(subdir / "file3.txt") in path for path in result.deleted_paths)
+        assert not dir_path.exists()
+
+    @pytest.mark.asyncio
+    async def test_delete_directory_without_collect_returns_only_top_level(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Test that deleting a directory without collect_deleted_paths returns only the top-level path."""
+        os_manager = griptape_nodes.OSManager()
+        dir_path = temp_dir / "testdir"
+        dir_path.mkdir()
+        (dir_path / "file1.txt").write_text("content1")
+        subdir = dir_path / "subdir"
+        subdir.mkdir()
+        (subdir / "file2.txt").write_text("content2")
+
+        request = DeleteFileRequest(path=str(dir_path), workspace_only=False)
+
+        result = await os_manager.on_delete_file_request(request)
+
+        assert isinstance(result, DeleteFileResultSuccess)
+        assert result.was_directory is True
+        assert result.deleted_paths == [result.deleted_path]
         assert not dir_path.exists()
 
     @pytest.mark.asyncio
@@ -2199,3 +2221,46 @@ class TestMakeDirectoryRequest:
 
         assert isinstance(result, MakeDirectoryResultFailure)
         assert result.failure_reason == FileIOFailureReason.PERMISSION_DENIED
+
+
+class TestCopyFile:
+    """Tests for OSManager._copy_file, covering the SMB EPERM regression (issue #5109)."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_copy_file_copies_contents(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A basic copy replicates contents and returns the byte count."""
+        os_manager = griptape_nodes.OSManager()
+        src = temp_dir / "src.txt"
+        dst = temp_dir / "dst.txt"
+        content = "hello, world"
+        src.write_text(content)
+
+        bytes_copied = os_manager._copy_file(src, dst)
+
+        assert dst.read_text() == content
+        assert bytes_copied == len(content.encode())
+
+    def test_copy_file_ignores_eperm_from_metadata(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """An EPERM from the metadata step (e.g. chflags SF_ARCHIVED on an SMB mount) must not fail the copy.
+
+        Regression test for issue #5109: shutil.copy2 propagates the EPERM that chflags raises when
+        replicating BSD file flags onto an SMB destination, even though the file contents copy fine.
+        _copy_file copies contents first and then best-effort the metadata, swallowing the EPERM.
+        """
+        os_manager = griptape_nodes.OSManager()
+        src = temp_dir / "src.txt"
+        dst = temp_dir / "dst.txt"
+        content = "contents survive metadata failure"
+        src.write_text(content)
+
+        with patch("shutil.copystat", side_effect=PermissionError(1, "Operation not permitted")):
+            bytes_copied = os_manager._copy_file(src, dst)
+
+        # The copy succeeds: contents are on disk and the byte count is returned.
+        assert dst.read_text() == content
+        assert bytes_copied == len(content.encode())
