@@ -824,13 +824,15 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies.pip_dependencies = []
         schema.metadata.dependencies.pip_install_flags = []
-        mock_python_path = MagicMock()
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
             patch.object(
-                mgr, "_init_library_venv", new_callable=AsyncMock, return_value=mock_python_path
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ) as mock_init_venv,
             patch.object(mgr, "_can_write_to_venv_location", return_value=True),
             patch(
@@ -855,13 +857,15 @@ class TestLibraryManagerInstallLibraryDependencies:
         schema.name = "test_lib"
         schema.metadata.library_version = "1.0.0"
         schema.metadata.dependencies = None
-        mock_python_path = MagicMock()
 
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
             patch.object(
-                mgr, "_init_library_venv", new_callable=AsyncMock, return_value=mock_python_path
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ) as mock_init_venv,
             patch.object(mgr, "_can_write_to_venv_location", return_value=True),
             patch(
@@ -913,7 +917,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
+            ),
             patch.object(mgr, "_can_write_to_venv_location", return_value=False),
         ):
             result = await mgr.install_library_dependencies_request(
@@ -937,7 +946,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()),
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
+            ),
             patch.object(mgr, "_can_write_to_venv_location", return_value=True),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
@@ -954,6 +968,46 @@ class TestLibraryManagerInstallLibraryDependencies:
             )
 
         assert isinstance(result, InstallLibraryDependenciesResultFailure)
+
+    @pytest.mark.asyncio
+    async def test_reused_venv_with_successful_install_is_not_rebuilt(self, griptape_nodes: GriptapeNodes) -> None:
+        """A reused venv whose first install succeeds must not be rebuilt."""
+        mgr = griptape_nodes.LibraryManager()
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.dependencies.pip_dependencies = ["a==1"]
+        schema.metadata.dependencies.pip_install_flags = []
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
+            patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
+            ),
+            patch.object(mgr, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
+            patch.object(mgr, "_can_write_to_venv_location", return_value=True),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                new_callable=AsyncMock,
+            ) as mock_subprocess,
+            patch.object(griptape_nodes.ConfigManager(), "get_config_value", side_effect=_fake_config_value),
+        ):
+            result = await mgr.install_library_dependencies_request(
+                InstallLibraryDependenciesRequest(library_file_path="/mock.json")
+            )
+
+        assert isinstance(result, InstallLibraryDependenciesResultSuccess)
+        assert result.dependencies_installed == 1
+        mock_reset.assert_not_called()
+        mock_subprocess.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_rebuilds_reused_venv_and_retries_when_install_fails(self, griptape_nodes: GriptapeNodes) -> None:
