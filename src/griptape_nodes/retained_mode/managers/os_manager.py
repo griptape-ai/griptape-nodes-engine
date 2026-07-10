@@ -3861,7 +3861,7 @@ class OSManager:
         is_directory = await anyio.Path(resolved_path).is_dir()
 
         # Collect all paths that will be deleted (for reporting)
-        if is_directory:
+        if is_directory and request.collect_deleted_paths:
             # Collect all file and directory paths before deletion
             deleted_paths = [str(item) async for item in anyio.Path(resolved_path).rglob("*")]
             deleted_paths.append(str(resolved_path))
