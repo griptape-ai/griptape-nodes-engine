@@ -21,15 +21,12 @@ Scope and known limitations:
   though a snapshot is still captured on every candidate edit (O(workflow size) to capture).
 - Survivor parameter *structure* changes (a dynamic parameter added or removed by the undone action)
   are not reconciled; values, positions, locks, connections, and whole-node add/delete are.
-
-Capture and restore timings are logged at INFO so the cost can be observed.
 """
 
 from __future__ import annotations
 
 import copy
 import logging
-import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -109,14 +106,12 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             return None
         flow_name = top_level_result.flow_name
 
-        started = time.perf_counter()
         serialize_result = GriptapeNodes.handle_request(
             SerializeFlowToCommandsRequest(flow_name=flow_name, include_create_flow_command=False)
         )
         if not isinstance(serialize_result, SerializeFlowToCommandsResultSuccess):
             logger.warning("Snapshot undo: failed to serialize flow '%s'; not snapshotting.", flow_name)
             return None
-        elapsed_ms = (time.perf_counter() - started) * 1000
         explicit_value_keys = _capture_explicit_value_keys(flow_name)
         if explicit_value_keys is None:
             # Could not enumerate every node's explicit values: proceeding with a partial map would
@@ -124,7 +119,6 @@ def capture_workflow_snapshot() -> FlowSnapshot | None:
             # undoable" instead.
             logger.warning("Snapshot undo: incomplete value-key capture for flow '%s'; not snapshotting.", flow_name)
             return None
-        logger.info("Snapshot undo: captured flow '%s' in %.1f ms.", flow_name, elapsed_ms)
         return FlowSnapshot(
             flow_name=flow_name,
             serialized_flow_commands=serialize_result.serialized_flow_commands,
@@ -169,7 +163,6 @@ def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
         msg = f"snapshot restore could not find flow '{snapshot.flow_name}'"
         raise UndoEntryReplayError(msg)
 
-    started = time.perf_counter()
     commands = snapshot.serialized_flow_commands
 
     # Match nodes by name (the create command carries the node's stable name).
@@ -222,16 +215,6 @@ def restore_workflow_snapshot(snapshot: FlowSnapshot) -> None:
             explicit_value_keys=snapshot.explicit_value_keys.get(node_name),
             force=node_name in to_create,
         )
-
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    logger.info(
-        "Snapshot undo: reconciled flow '%s' in %.1f ms (+%d nodes, -%d nodes, %d survivors).",
-        snapshot.flow_name,
-        elapsed_ms,
-        len(to_create),
-        len(to_delete),
-        len(target_names & current_names),
-    )
 
 
 def _reconcile_connections(
