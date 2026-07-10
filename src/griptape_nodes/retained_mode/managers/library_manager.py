@@ -3256,30 +3256,6 @@ class LibraryManager:
 
         return module
 
-    def _load_class_from_file(self, file_path: Path | str, class_name: str, library_name: str) -> type[BaseNode]:
-        """Dynamically load a class from a Python file with support for hot reloading.
-
-        Args:
-            file_path: Path to the Python file
-            class_name: Name of the class to load
-            library_name: Name of the library
-
-        Returns:
-            The loaded class
-
-        Raises:
-            ImportError: If the module cannot be imported
-            AttributeError: If the class doesn't exist in the module
-            TypeError: If the loaded class isn't a BaseNode-derived class
-        """
-        try:
-            module = self._load_module_from_file(file_path, library_name)
-        except ImportError as err:
-            msg = f"Attempted to load class '{class_name}'. Error: {err}"
-            raise ImportError(msg) from err
-
-        return self._get_node_class_from_module(module, class_name, file_path)
-
     @staticmethod
     def _get_node_class_from_module(module: ModuleType, class_name: str, file_path: Path | str) -> type[BaseNode]:
         """Extract and validate a BaseNode subclass from an already-imported module.
@@ -4820,13 +4796,16 @@ class LibraryManager:
         library_info.problems.extend(problems)
 
         # Load nodes into the library (modifies library_info in place)
-        # Note: library_info is passed as parameter from lifecycle handler
+        # Note: library_info is passed as parameter from lifecycle handler.
+        # Sandbox nodes always load eagerly (not gated on library.lazy_node_loading): they are
+        # being actively authored, so import errors should surface immediately, not on first use.
         await asyncio.to_thread(
             self._attempt_load_nodes_from_library,
             library_data=library_data,
             library=library,
             base_dir=sandbox_library_dir,
             library_info=library_info,
+            lazy_loading=False,
         )
 
     def _find_files_in_dir(self, directory: Path, extension: str) -> list[Path]:
