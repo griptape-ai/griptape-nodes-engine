@@ -2117,16 +2117,20 @@ situations:
 
     @pytest.mark.asyncio
     async def test_load_workspace_project_read_failure_keeps_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
-        """A file read failure leaves system defaults as current project."""
-        from griptape_nodes.files.file import FileLoadError
-        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        """A file read failure leaves system defaults as current project.
+
+        _load_workspace_project now delegates to _load_and_cache_project_template, which
+        reads via ReadFileRequest. Make the seed path a directory: it passes the
+        _resolve_project_file_path existence check but fails the file read, so the
+        delegated load returns a failure and the seed activation is skipped.
+        """
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
 
         self._setup_system_defaults(pm, str(tmp_path))
 
-        # Create the file so the existence check passes
+        # A directory at the seed path exists but cannot be read as a file.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.mkdir()
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -2138,17 +2142,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(
-                side_effect=FileLoadError(
-                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
-                    result_details="permission denied",
-                )
-            )
-            mock_file_cls.return_value = mock_file_instance
-
-            await pm._load_workspace_project()
+        await pm._load_workspace_project()
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
@@ -2159,8 +2153,10 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
+        # Invalid YAML on disk: the delegated loader reads it via ReadFileRequest, fails
+        # to parse it into an overlay, and returns a failure without activating.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.write_text("not: valid: yaml: ][")
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -2172,12 +2168,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: ][")
-            mock_file_cls.return_value = mock_file_instance
-
-            await pm._load_workspace_project()
+        await pm._load_workspace_project()
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
@@ -2509,6 +2500,131 @@ situations:
             await pm._load_workspace_project()
 
         assert pm._current_project_id == str(workspace_project_path)
+
+    @pytest.mark.asyncio
+    async def test_seed_child_inherits_parent_situations_and_directories(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A child activated as the boot seed inherits its parent's situations/directories.
+
+        Regression for the bug where the seed loader merged only onto system defaults and
+        dropped the parent chain (so a child seed lost its parent's situations/directories
+        until a manual Reload from Disk). The seed now loads through the shared
+        parent-chain-aware loader, so inheritance resolves on boot.
+        """
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        # Parent (registered elsewhere) defines a situation + directory the child does not.
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "situations:\n"
+            "  save_prompt:\n"
+            "    macro: '{prompts}/{file_name_base}.{file_extension}'\n"
+            "    policy:\n"
+            "      on_collision: create_new\n"
+            "      create_dirs: true\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+        await pm._load_and_cache_project_template(parent_path, persist_path=False)
+
+        # Child is the workspace seed and declares only its parent link + an env var.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Child\n"
+            "id: child-xyz\n"
+            "parent_project_id: 'parent-abc'\n"
+            "environment:\n"
+            "  SHOW: child\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        # Activation resolves the workspace via adjacent project config; return no
+        # workspace_directory so the decision falls through to the global default.
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        await pm._load_workspace_project()
+
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        # Inherited from the parent (would be absent under the old defaults-only merge).
+        assert "save_prompt" in child_info.template.situations
+        assert "prompts" in child_info.template.directories
+        # The child's own override is still applied.
+        assert child_info.template.environment.get("SHOW") == "child"
+
+    @pytest.mark.asyncio
+    async def test_seed_child_resolves_id_parent_registered_only_in_config(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Boot resolves a child seed's id-parent that lives only in projects_to_register.
+
+        Covers the ordering fix: on_app_initialization_complete builds the boot id-index
+        before activating the seed, so an id-based parent that has not been loaded yet
+        (only registered in projects_to_register) is still locatable when the seed's
+        parent chain resolves.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+
+        # Child is the workspace-dir seed; only the parent is in projects_to_register.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\nname: Child\nid: child-xyz\nparent_project_id: 'parent-abc'\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_path)]
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        assert "prompts" in child_info.template.directories
+        # The boot id-index is boot-only and cleared once loading finishes.
+        assert pm._boot_id_to_file_path == {}
 
 
 class TestLoadSelectsDefaultByMajor:
@@ -8092,9 +8208,12 @@ situations:
 
     @pytest.mark.asyncio
     async def test_unloadable_workspace_project_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
-        """A project file that resolves but fails to load returns Failure (still on system defaults)."""
-        from griptape_nodes.files.file import FileLoadError
-        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        """A project file that resolves but fails to load returns Failure (still on system defaults).
+
+        The seed loads through _load_and_cache_project_template (ReadFileRequest). A directory
+        at the seed path passes the existence check but fails the file read, so activation
+        never takes and the handler returns Failure.
+        """
         from griptape_nodes.retained_mode.events.project_events import (
             ActivateWorkspaceProjectRequest,
             ActivateWorkspaceProjectResultFailure,
@@ -8103,9 +8222,9 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
-        # File exists so the path resolves, but the read fails so activation cannot take.
+        # A directory at the seed path exists (path resolves) but cannot be read as a file.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.mkdir()
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -8117,17 +8236,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(
-                side_effect=FileLoadError(
-                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
-                    result_details="permission denied",
-                )
-            )
-            mock_file_cls.return_value = mock_file_instance
-
-            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
 
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
@@ -8151,6 +8260,8 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
+        # Malformed YAML on disk: the delegated loader reads it via ReadFileRequest and
+        # fails to parse it, so the handler surfaces the failure detail.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
         workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
 
@@ -8164,12 +8275,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
-            mock_file_cls.return_value = mock_file_instance
-
-            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
 
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert str(workspace_project_path) in str(result.result_details)
