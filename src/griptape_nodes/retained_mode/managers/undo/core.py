@@ -230,6 +230,10 @@ class RecordingStrategy(Protocol):
         """Declare editor mutations that have no inverse recorder yet."""
         ...
 
+    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
+        """Declare request types the hybrid strategy reverses surgically instead of by whole-flow snapshot."""
+        ...
+
     def record_inverse(
         self,
         inverse: RequestPayload | Sequence[RequestPayload],

@@ -47,7 +47,8 @@ logger = logging.getLogger("griptape_nodes")
 MAX_UNDO_BATCHES = 100
 
 # Selects the recording strategy at startup. "inverse" (default) records per-request inverses via
-# recorders/record_inverse; "snapshot" is the experimental whole-flow snapshot prototype.
+# recorders/record_inverse; "snapshot" is the experimental whole-flow snapshot prototype; "hybrid"
+# routes surgical (recorder-backed) types to the inverse path and everything else to snapshots.
 _UNDO_STRATEGY_ENV_VAR = "GRIPTAPE_NODES_UNDO_STRATEGY"
 
 
@@ -66,6 +67,17 @@ class UndoManager:
 
             logger.info("UndoManager: using experimental whole-flow snapshot strategy.")
             self._recording: RecordingStrategy = SnapshotRecordingSession(
+                is_replaying=lambda: self._is_replaying,
+                commit_batch=self._commit_batch,
+                invalidate_history=self.clear_history,
+            )
+        elif strategy == "hybrid":
+            # Lazy import: the hybrid prototype composes the snapshot session and so pulls in the
+            # same flow/serialization events not needed by the default path.
+            from griptape_nodes.retained_mode.managers.undo.hybrid import HybridRecordingSession
+
+            logger.info("UndoManager: using experimental hybrid snapshot/inverse strategy.")
+            self._recording = HybridRecordingSession(
                 is_replaying=lambda: self._is_replaying,
                 commit_batch=self._commit_batch,
                 invalidate_history=self.clear_history,
@@ -100,6 +112,15 @@ class UndoManager:
         non-undoable.
         """
         self._recording.register_inverse_floor(*request_types)
+
+    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
+        """Declare recorder-backed types the hybrid strategy reverses surgically instead of by snapshot.
+
+        A no-op under the pure inverse and pure snapshot strategies; only the hybrid strategy routes
+        these types to its inverse inner session. Types declared surgical must also have a recorder
+        registered via register_recorder.
+        """
+        self._recording.register_surgical(*request_types)
 
     def record_inverse(
         self,

@@ -423,6 +423,13 @@ class NodeManager:
         undo_manager.register_recorder(CreateNodeRequest, CreateNodeRecorder())
         undo_manager.register_recorder(DeleteNodeRequest, DeleteNodeRecorder())
         undo_manager.register_recorder(SetParameterValueRequest, SetParameterValueRecorder())
+        # Under the hybrid strategy, route these recorder-backed types through the surgical (inverse)
+        # path instead of a whole-flow snapshot; a no-op under the pure inverse/snapshot strategies.
+        undo_manager.register_surgical(
+            CreateNodeRequest,
+            DeleteNodeRequest,
+            SetParameterValueRequest,
+        )
         # Editor mutations with no inverse recorder yet: the inverse strategy floors them (neither
         # records nor invalidates), but the snapshot strategy captures and reconciles them, so node
         # moves and lock toggles are undoable under snapshot. They become recorders as coverage grows.

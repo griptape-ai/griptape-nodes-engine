@@ -157,6 +157,13 @@ class RecordingSession:
         """
         self._non_undoable_types.update(request_types)
 
+    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
+        """No-op: the inverse strategy already reverses every covered type surgically via recorders.
+
+        Only the hybrid strategy distinguishes surgical from snapshot; the pure inverse session has
+        no whole-flow snapshot to fall back to, so the declaration carries no extra meaning here.
+        """
+
     def record_inverse(
         self,
         inverse: RequestPayload | Sequence[RequestPayload],

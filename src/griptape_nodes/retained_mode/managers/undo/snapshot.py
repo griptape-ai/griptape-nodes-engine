@@ -501,6 +501,9 @@ class SnapshotRecordingSession:
         reconciles them like any other edit, so it must NOT skip snapshotting them.
         """
 
+    def register_surgical(self, *request_types: type[RequestPayload]) -> None:
+        """No-op: the snapshot strategy snapshots every covered type; it never reverses surgically."""
+
     def record_inverse(
         self,
         inverse: RequestPayload | Sequence[RequestPayload],

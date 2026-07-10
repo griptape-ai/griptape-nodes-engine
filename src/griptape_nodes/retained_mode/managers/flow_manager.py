@@ -331,6 +331,9 @@ class FlowManager:
         """
         undo_manager.register_recorder(CreateConnectionRequest, CreateConnectionRecorder())
         undo_manager.register_recorder(DeleteConnectionRequest, DeleteConnectionRecorder())
+        # Under the hybrid strategy, route connection edits through the surgical (inverse) path
+        # instead of a whole-flow snapshot; a no-op under the pure inverse/snapshot strategies.
+        undo_manager.register_surgical(CreateConnectionRequest, DeleteConnectionRequest)
         undo_manager.register_non_undoable(
             StartFlowRequest,
             CancelFlowRequest,
