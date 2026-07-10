@@ -53,6 +53,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import LibraryVenvInitResult
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
@@ -968,11 +969,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.is_venv_functional",
-                return_value=True,
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
             ),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()),
             patch.object(
                 mgr, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
             ) as mock_reset,
@@ -1013,11 +1015,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.is_venv_functional",
-                return_value=False,
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=False),
             ),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()),
             patch.object(mgr, "_reset_and_init_library_venv", new_callable=AsyncMock) as mock_reset,
             patch.object(mgr, "_can_write_to_venv_location", return_value=True),
             patch(
@@ -1053,11 +1056,12 @@ class TestLibraryManagerInstallLibraryDependencies:
         with (
             patch.object(mgr, "load_library_metadata_from_file_request", return_value=self._metadata_result(schema)),
             patch.object(mgr, "_get_library_venv_path", return_value=MagicMock()),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.is_venv_functional",
-                return_value=True,
+            patch.object(
+                mgr,
+                "_init_library_venv",
+                new_callable=AsyncMock,
+                return_value=LibraryVenvInitResult(python_path=MagicMock(), reused=True),
             ),
-            patch.object(mgr, "_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()),
             patch.object(
                 mgr, "_reset_and_init_library_venv", new_callable=AsyncMock, return_value=MagicMock()
             ) as mock_reset,
@@ -1129,7 +1133,8 @@ class TestLibraryManagerVenvHealth:
         ):
             python_path = await mgr._init_library_venv(venv_path)
 
-        assert python_path == expected_python
+        assert python_path.python_path == expected_python
+        assert python_path.reused is True
         mock_subprocess.assert_not_called()
         mock_find_uv.assert_not_called()
         assert (venv_path / "pyvenv.cfg").exists()
@@ -1169,7 +1174,8 @@ class TestLibraryManagerVenvHealth:
             python_path = await mgr._init_library_venv(venv_path)
 
         mock_subprocess.assert_called_once()
-        assert python_path == recreated_python_path["path"]
+        assert python_path.python_path == recreated_python_path["path"]
+        assert python_path.reused is False
         assert not (venv_path / "stray.txt").exists()
 
     @pytest.mark.asyncio
@@ -1199,8 +1205,65 @@ class TestLibraryManagerVenvHealth:
             python_path = await mgr._init_library_venv(venv_path)
 
         mock_subprocess.assert_called_once()
-        assert python_path.exists()
+        assert python_path.python_path.exists()
+        assert python_path.reused is False
         assert (venv_path / "pyvenv.cfg").exists()
+
+    @pytest.mark.asyncio
+    async def test_reset_wipes_functional_venv_and_recreates_it(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """_reset_and_init_library_venv wipes even a functional venv, unlike _init_library_venv."""
+        mgr = griptape_nodes.LibraryManager()
+        venv_path = tmp_path / ".venv"
+        self._make_functional_venv(venv_path)
+        # A functional venv would be reused by _init_library_venv; prove reset wipes it anyway.
+        (venv_path / "stray.txt").write_text("old")
+
+        recreated_python_path: dict[str, Path] = {}
+
+        async def fake_subprocess_run(args: list[str], **_: object) -> MagicMock:
+            recreated_python_path["path"] = self._make_functional_venv(Path(args[2]))
+            return MagicMock()
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.subprocess_run",
+                side_effect=fake_subprocess_run,
+            ) as mock_subprocess,
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.find_uv_bin",
+                return_value="/fake/uv",
+            ),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.OSManager.check_available_disk_space",
+                return_value=True,
+            ),
+            patch.object(griptape_nodes.ConfigManager(), "get_config_value", side_effect=_fake_config_value),
+        ):
+            python_path = await mgr._reset_and_init_library_venv(venv_path)
+
+        mock_subprocess.assert_called_once()
+        assert python_path == recreated_python_path["path"]
+        assert not (venv_path / "stray.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_reset_raises_runtime_error_when_removal_fails(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A failure to remove the existing venv surfaces as RuntimeError."""
+        mgr = griptape_nodes.LibraryManager()
+        venv_path = tmp_path / ".venv"
+        self._make_functional_venv(venv_path)
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
+                side_effect=OSError("permission denied"),
+            ),
+            pytest.raises(RuntimeError, match="Failed to remove virtual environment"),
+        ):
+            await mgr._reset_and_init_library_venv(venv_path)
 
 
 class TestListRegisteredLibraries:

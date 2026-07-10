@@ -349,6 +349,14 @@ class MinimumReleaseAgeConfig(NamedTuple):
         return self.hours > 0
 
 
+class LibraryVenvInitResult(NamedTuple):
+    """Result of initializing a library virtual environment."""
+
+    python_path: Path
+    reused: bool
+
+
+
 class LibraryManager:
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
@@ -2482,18 +2490,16 @@ class LibraryManager:
             # Determine venv path for dependency installation
             venv_path = self._get_library_venv_path(package_name, None)
 
-            # Check if a functional venv already exists; a broken directory will be
-            # recreated by _init_library_venv, in which case dependencies must be installed.
-            venv_already_exists = is_venv_functional(venv_path)
-
-            # Only install dependencies if conditions are met
+            # A broken directory is recreated by _init_library_venv, in which case dependencies
+            # must be installed; a reused functional venv already has them.
             try:
-                library_python_venv_path = await self._init_library_venv(venv_path)
+                venv_init = await self._init_library_venv(venv_path)
             except RuntimeError as e:
                 details = f"Attempted to install library '{request.requirement_specifier}'. Failed when creating the virtual environment: {e}"
                 return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
+            library_python_venv_path = venv_init.python_path
 
-            if venv_already_exists:
+            if venv_init.reused:
                 logger.debug(
                     "Skipping dependency installation for package '%s' - venv already exists at %s",
                     package_name,
@@ -2550,7 +2556,7 @@ class LibraryManager:
             result_details=f"Successfully registered library from requirement specifier: {request.requirement_specifier}",
         )
 
-    async def _init_library_venv(self, library_venv_path: Path) -> Path:
+    async def _init_library_venv(self, library_venv_path: Path) -> LibraryVenvInitResult:
         """Initialize a virtual environment for the library.
 
         If a functional virtual environment already exists at the path, it is reused.
@@ -2562,7 +2568,7 @@ class LibraryManager:
             library_venv_path: Path to the virtual environment directory
 
         Returns:
-            Path to the Python executable in the virtual environment
+            The Python executable path and whether an existing functional venv was reused.
 
         Raises:
             RuntimeError: If the virtual environment cannot be created.
@@ -2571,7 +2577,7 @@ class LibraryManager:
 
         if is_venv_functional(library_venv_path):
             logger.debug("Reusing existing virtual environment at %s", library_venv_path)
-            return venv_python_path(library_venv_path)
+            return LibraryVenvInitResult(python_path=venv_python_path(library_venv_path), reused=True)
 
         if await anyio.Path(library_venv_path).exists():
             logger.warning(
@@ -2609,7 +2615,7 @@ class LibraryManager:
             raise RuntimeError(msg) from e
         logger.debug("Created virtual environment at %s", library_venv_path)
 
-        return venv_python_path(library_venv_path)
+        return LibraryVenvInitResult(python_path=venv_python_path(library_venv_path), reused=False)
 
     def _check_library_requirements(
         self, requirements: dict[str, Any], library_name: str
@@ -6116,15 +6122,12 @@ class LibraryManager:
         # Advanced library hooks (before_library_nodes_loaded) expect the venv to exist.
         venv_path = self._get_library_venv_path(library_name, library_file_path)
 
-        # A functional venv here is reused by _init_library_venv rather than rebuilt. The
-        # recovery path below relies on this to decide whether a failed install is worth
-        # rebuilding for.
-        venv_reused = is_venv_functional(venv_path)
         try:
-            library_venv_python_path = await self._init_library_venv(venv_path)
+            venv_init = await self._init_library_venv(venv_path)
         except RuntimeError as e:
             details = f"Failed to initialize venv for library '{library_name}': {e}"
             return InstallLibraryDependenciesResultFailure(result_details=details)
+        library_venv_python_path = venv_init.python_path
 
         if not self._can_write_to_venv_location(library_venv_python_path):
             details = f"Venv location for library '{library_name}' at {venv_path} is not writable"
@@ -6151,7 +6154,7 @@ class LibraryManager:
         is_debug = config_manager.get_config_value("log_level").upper() == "DEBUG"
 
         try:
-            if venv_reused:
+            if venv_init.reused:
                 # A reused venv may be corrupt (e.g. a dist-info directory missing its
                 # METADATA file), which makes uv fail while planning the install. Rebuild it
                 # once and retry against a clean environment.
@@ -6181,30 +6184,6 @@ class LibraryManager:
         return InstallLibraryDependenciesResultSuccess(
             library_name=library_name, dependencies_installed=len(pip_dependencies), result_details=details
         )
-
-    async def _reset_and_init_library_venv(self, venv_path: Path) -> Path:
-        """Delete the venv (if present) and recreate it from scratch.
-
-        Used when a reused venv cannot be trusted: an in-place dependency install failed in a
-        way that indicates a corrupt environment.
-
-        Args:
-            venv_path: Path to the virtual environment directory
-
-        Returns:
-            Path to the Python executable in the freshly created virtual environment
-
-        Raises:
-            RuntimeError: If the existing venv cannot be removed or the new one cannot be created.
-        """
-        if await anyio.Path(venv_path).exists():
-            logger.info("Rebuilding virtual environment at %s", venv_path)
-            try:
-                await asyncio.to_thread(shutil.rmtree, venv_path, onexc=OSManager.remove_readonly)
-            except OSError as e:
-                msg = f"Failed to remove virtual environment at {venv_path}: {e}"
-                raise RuntimeError(msg) from e
-        return await self._init_library_venv(venv_path)
 
     async def _install_deps_with_recovery(
         self,
@@ -6244,6 +6223,30 @@ class LibraryManager:
         await self._run_uv_pip_install(
             library_venv_python_path, pip_dependencies, pip_install_flags, capture_output=capture_output
         )
+
+    async def _reset_and_init_library_venv(self, venv_path: Path) -> Path:
+        """Delete the venv (if present) and recreate it from scratch.
+
+        Used when a reused venv cannot be trusted: an in-place dependency install failed in a
+        way that indicates a corrupt environment.
+
+        Args:
+            venv_path: Path to the virtual environment directory
+
+        Returns:
+            Path to the Python executable in the freshly created virtual environment
+
+        Raises:
+            RuntimeError: If the existing venv cannot be removed or the new one cannot be created.
+        """
+        if await anyio.Path(venv_path).exists():
+            logger.info("Rebuilding virtual environment at %s", venv_path)
+            try:
+                await asyncio.to_thread(shutil.rmtree, venv_path, onexc=OSManager.remove_readonly)
+            except OSError as e:
+                msg = f"Failed to remove virtual environment at {venv_path}: {e}"
+                raise RuntimeError(msg) from e
+        return (await self._init_library_venv(venv_path)).python_path
 
     async def _run_uv_pip_install(
         self,
