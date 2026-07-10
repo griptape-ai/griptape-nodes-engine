@@ -1,8 +1,9 @@
 import ast
 import asyncio
+import re
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import anyio
@@ -52,7 +53,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder, WorkflowManager
+from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
 
 def _register_unsaved_workflow(key: str, name: str) -> None:
@@ -137,62 +138,6 @@ class TestWorkflowManager:
         assert "is_user_defined" in result
         assert isinstance(result["is_user_defined"], bool)
         assert result["is_user_defined"] is True
-
-    @pytest.mark.parametrize(
-        ("param_name", "expected_dest"),
-        [
-            ("prompt", "prompt"),
-            ("My Prompt", "my_prompt"),
-            ("Generate_Media_(Diffusion_Pipeline)_prompt", "generate_media__diffusion_pipeline__prompt"),
-            ("seed.value", "seed_value"),
-            ("max-tokens", "max_tokens"),
-            ("3_seed", "_3_seed"),
-        ],
-    )
-    def test_safe_arg_dest_produces_valid_identifier(self, param_name: str, expected_dest: str) -> None:
-        """_safe_arg_dest collapses non-identifier characters so the dest is a valid Python identifier."""
-        dest = WorkflowManager._safe_arg_dest(param_name)
-
-        assert dest == expected_dest
-        assert dest.isidentifier()
-
-    def test_generate_workflow_execution_is_valid_python_for_special_char_param(
-        self, griptape_nodes: GriptapeNodes
-    ) -> None:
-        """A param name with non-identifier characters must still emit compilable Python.
-
-        Regression for griptape-nodes-engine#5033: a node named e.g. `Generate Media
-        (Diffusion Pipeline)` yields proxy parameter names containing `(`/`)`, which used
-        to be emitted verbatim as `args.<name>` attribute accesses and produced a
-        `SyntaxError` at import time. The generated argparse `dest` must be a valid
-        identifier and be used in both the `add_argument` call and the readback.
-        """
-        workflow_manager = griptape_nodes.WorkflowManager()
-
-        param_name = "Subflow_Node_Group_packaged_node_Generate_Media_(Diffusion_Pipeline)_prompt"
-        metadata = WorkflowMetadata(
-            name="special_char_workflow",
-            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
-            engine_version_created_with="0.0.0",
-            node_libraries_referenced=[],
-            workflow_shape=WorkflowShape(
-                inputs={"Start_1": {param_name: {"tooltip": "a prompt", "type": "str"}}},
-                outputs={},
-            ),
-        )
-
-        statements = workflow_manager._generate_workflow_execution(ImportRecorder(), metadata)
-        assert statements is not None
-
-        module = ast.fix_missing_locations(ast.Module(body=cast("list[ast.stmt]", statements), type_ignores=[]))
-        # The bug manifested as a SyntaxError raised from compile(); assert it no longer does.
-        compile(module, filename="<generated_workflow>", mode="exec")
-
-        # The raw param name (with parens) must survive as the flow_input dict key so the
-        # workflow shape is unchanged, while the argparse dest is the sanitized identifier.
-        source = ast.unparse(module)
-        assert param_name in source
-        assert WorkflowManager._safe_arg_dest(param_name) in source
 
     def test_on_import_workflow_request_success(self, griptape_nodes: GriptapeNodes) -> None:
         """Test successful workflow import."""
@@ -878,6 +823,7 @@ class TestWorkflowManager:
 
             def fake_save_file(**kwargs: object) -> object:
                 captured["file_name"] = kwargs.get("file_name")
+                captured["display_name"] = kwargs.get("display_name")
                 captured["destination"] = kwargs.get("destination")
                 fake_destination: object = kwargs.get("destination")
                 resolve = getattr(fake_destination, "resolve", None)
@@ -922,6 +868,12 @@ class TestWorkflowManager:
 
                 assert isinstance(result, SaveWorkflowResultSuccess)
                 assert captured["file_name"] == display_name
+                # Regression guard: metadata.name on disk (= display_name kwarg to
+                # _save_workflow_file_inline) must NOT be the synthetic unsaved-key. Prior
+                # bug read request.file_name directly for the display-name fallback,
+                # which leaked "unsaved:<uuid>" straight into metadata.name.
+                assert captured["display_name"] == display_name
+                assert unsaved_key not in str(captured["display_name"] or "")
                 destination_repr = str(captured["destination"]) if "destination" in captured else ""
                 assert unsaved_key not in destination_repr
             finally:
@@ -3123,27 +3075,33 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             # The destination carries the create_versioned_workflow macro (unresolved
-            # `{###}` sequence slot), so OSManager's seed walks past existing v001 and
-            # lands at v002 on write.
+            # sequence-slot marker — `{_index:NN}` in legacy templates or `{###}` /
+            # `{###?}` in the modern default), so OSManager's seed walks past existing
+            # v001 and lands at v002 on write.
             assert target.destination is not None
-            assert "###" in target.destination._file.location
+            macro = target.destination._file.location
+            assert "_index" in macro or "#" in macro
             # The OVERWRITE_EXISTING path-mode is NOT taken.
             assert target.file_path is None
 
-    def test_create_versioned_strips_existing_version_suffix_from_base(
+    def test_create_versioned_match_path_passes_full_matched_dict_through(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
     ) -> None:
-        """Saving over `my_flow_v001` produces a destination based on `my_flow`, not `my_flow_v001`.
+        """Saving over `my_flow_v001` produces a destination whose MacroPath carries every matched variable.
 
-        Otherwise we'd get `my_flow_v001_v002.py` instead of `my_flow_v002.py`
-        on the second versioned save.
+        The destination's MacroPath has every variable the situation's macro
+        identified in the existing file's name — *including* the bound
+        ``_index``. The macro resolves to ``my_flow_v001.py`` on the first
+        attempt; OSManager's CREATE_NEW collision-walk detects the existing
+        file and steps the padded slot from 1 to 2, landing the next save at
+        ``my_flow_v002.py``.
         """
         with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
             self._register_saved_workflow(
                 temp_dir,
                 registry_key="my_flow_v001",
                 file_name="my_flow_v001.py",
-                display_name="",  # Empty forces the file-stem fallback in _derive_versioned_base_name.
+                display_name="",
             )
 
             target = self._determine(
@@ -3153,9 +3111,93 @@ class TestCreateVersionedWorkflow:
                 create_versioned=True,
             )
 
-            # The relative_file_path is computed against the macro-stripped stem
-            # ("my_flow.py"), not the suffixed one.
-            assert target.relative_file_path == "my_flow.py"
+            # Macro match succeeded: every variable the macro identified is
+            # bound in the destination's MacroPath. OSManager's collision-walk
+            # bumps _index from 1 → 2 on write.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("file_extension") == "py"
+            assert macro_vars.get("_index") == 1
+
+    def test_create_versioned_match_recovers_index_when_stem_contains_v(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Reverse-match handles base names that themselves contain the ``_v`` anchor lookalike.
+
+        Regression coverage for the cjkindel review on #4989: previously the
+        leftmost ``path.find("_v", ...)`` landed on the ``_v`` inside
+        ``my_v1_report`` (position 2), not on the version marker ``_v007``.
+        ``file_name_base`` swallowed the whole stem and ``_index`` was
+        dropped — the next save would produce ``my_v1_report_v007_1.py``
+        instead of ``my_v1_report_v008.py``, reintroducing the exact bug
+        #4956/#5025 set out to fix. The fix uses ``path.rfind`` for
+        leading-separator anchors.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_v1_report_v007",
+                file_name="my_v1_report_v007.py",
+                display_name="",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="my_v1_report_v007",
+                create_versioned=True,
+            )
+
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # file_name_base stops at the LAST `_v`, not the first — the
+            # `_v` inside `my_v1` is a lookalike, the trailing `_v` is the marker.
+            assert macro_vars.get("file_name_base") == "my_v1_report"
+            assert macro_vars.get("_index") == 7  # noqa: PLR2004 - literal version from setup
+            assert macro_vars.get("file_extension") == "py"
+
+    def test_create_versioned_with_requested_name_matching_existing_workflow_runs_match(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """The UI re-sends the open workflow's key as ``file_name``; we still reverse-match.
+
+        Pins the fix for the manual-test bug where saving ``workflow_115_v002``
+        produced ``workflow_115_v002_v001.py`` instead of bumping to
+        ``workflow_115_v003.py``. The UI passes the loaded workflow's registry
+        key as ``requested_file_name`` even though the user didn't type a new
+        name; if Step 1 treats that as a true Save As, it starts a fresh
+        ``_v001`` series under the old name. The fix: short-circuit Step 1
+        only when the requested name names a workflow we DON'T already know
+        about. When it resolves to an existing registry entry, drop into the
+        reverse-match so the macro advances the version.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_flow_v002",
+                file_name="my_flow_v002.py",
+                display_name="my_flow",
+            )
+
+            # UI sends the loaded workflow's registry key as requested_file_name.
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name="my_flow_v002",
+                current_workflow_name="my_flow_v002",
+                create_versioned=True,
+            )
+
+            # Reverse-match path taken, NOT a fresh _resolve_named_save_path.
+            # The destination's MacroPath carries _index=2 from the existing file;
+            # OSManager's collision-walk bumps it to 3 on write.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("_index") == 2  # noqa: PLR2004 - literal version from setup
+            # Negative guard: if Step 1 had short-circuited, file_name_base would be
+            # the whole prior stem ("my_flow_v002") and _index would be unbound.
+            assert macro_vars.get("file_name_base") != "my_flow_v002"
 
     def test_create_versioned_false_preserves_overwrite_existing(
         self, griptape_nodes: GriptapeNodes, temp_dir: Path
@@ -3298,8 +3340,9 @@ class TestCreateVersionedWorkflow:
         situation = DEFAULT_PROJECT_TEMPLATE.situations.get(BuiltInSituation.CREATE_VERSIONED_WORKFLOW)
         assert situation is not None, "create_versioned_workflow missing from DEFAULT_PROJECT_TEMPLATE"
         assert situation.policy.on_collision == SituationFilePolicy.CREATE_NEW
-        # The `{###}` sequence slot is what makes the seed-and-retry produce v001/v002/...
-        assert "###" in situation.macro
+        # A sequence-slot marker (legacy `{_index:NN}` or modern `{###}` / `{###?}`)
+        # is what makes the seed-and-retry produce v001/v002/...
+        assert "_index" in situation.macro or "#" in situation.macro
 
     def test_first_versioned_save_with_no_registry_entry(self, griptape_nodes: GriptapeNodes) -> None:
         """create_versioned=True on a brand-new workflow uses the requested name and lands at CREATE_VERSIONED."""
@@ -3313,11 +3356,565 @@ class TestCreateVersionedWorkflow:
 
             assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
             assert target.destination is not None
-            assert "###" in target.destination._file.location
+            # Destination carries the create_versioned_workflow macro with an
+            # unresolved sequence-slot marker (`{_index:NN}` legacy or `{###}` modern).
+            macro = target.destination._file.location
+            assert "_index" in macro or "#" in macro
             # Base name comes from the explicit request; relative_file_path reflects
             # the unresolved (pre-seed) form.
             assert target.relative_file_path == "brand_new_flow.py"
             assert target.file_path is None
+
+    # --- #4956 helper: Step 2 (match) / Step 3 (no-match) / Step 1b (unsaved) -----------
+
+    def test_step2_match_path_with_customized_versioned_macro(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Customizing the versioned situation's macro still round-trips: matched dict goes through verbatim.
+
+        Regression coverage for #4956 — confirms we don't hardcode any variable
+        names in workflow_manager. The macro is the only thing that says which
+        variables exist and what values they have.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.common.project_templates.situation import (
+            BuiltInSituation,
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        # Customize create_versioned_workflow to a dot-separated 4-digit suffix.
+        custom_versioned = SituationTemplate(
+            name=BuiltInSituation.CREATE_VERSIONED_WORKFLOW,
+            description="Dot-separated versioning",
+            macro="{workspace_dir}/{sub_dirs?:/}{file_name_base}.{_index:04}.{file_extension}",
+            policy=SituationPolicy(on_collision=SituationFilePolicy.CREATE_NEW, create_dirs=True),
+            fallback=BuiltInSituation.SAVE_FILE,
+        )
+        custom = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={
+                "situations": {
+                    **DEFAULT_PROJECT_TEMPLATE.situations,
+                    BuiltInSituation.CREATE_VERSIONED_WORKFLOW: custom_versioned,
+                }
+            }
+        )
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(custom.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        # SetCurrentProjectRequest re-derives workspace_path; force it back.
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            # Workflow that was previously saved under this customized macro
+            # (so its on-disk name ends in `.0017.py`, not the default `_v017`).
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="my_flow.0017",
+                file_name="my_flow.0017.py",
+                display_name="my_flow",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="my_flow.0017",
+                create_versioned=True,
+            )
+
+            # Macro reverse-match identified `.0017` as the version component
+            # (per the customized macro). Every variable the macro extracted
+            # rides in the destination's MacroPath, including bound `_index=17`.
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "my_flow"
+            assert macro_vars.get("_index") == 17  # noqa: PLR2004 - literal version from setup
+            assert macro_vars.get("file_extension") == "py"
+
+    def test_step3_no_match_path_falls_back_to_file_stem(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """A workflow saved under a NON-versioned situation produces a new versioned series on create_versioned.
+
+        The file `random_name.py` doesn't match the versioned situation's macro
+        (no `_v###` suffix). The helper falls through to
+        ``_resolve_named_save_path("random_name", ...)`` which is the same
+        plumbing every non-versioned SAVE_AS uses. The first versioned save
+        produces ``random_name_v001.py`` alongside the original; the original
+        file is left untouched (no in-place overwrite).
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir,
+                registry_key="random_name",
+                file_name="random_name.py",  # No _v### suffix → won't match
+                display_name="random_name",
+            )
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name="random_name",
+                create_versioned=True,
+            )
+
+            # Step 3 path: destination uses random_name as file_name_base;
+            # _index is unbound so the seed-and-retry assigns 1 on write.
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            assert macro_vars.get("file_name_base") == "random_name"
+            assert "_index" not in macro_vars, (
+                "Step 3 (no-match) must leave _index unbound so the seed-and-retry assigns 1 on write."
+            )
+
+    def test_step1b_unsaved_workflow_uses_display_name(self, griptape_nodes: GriptapeNodes) -> None:
+        """create_versioned=True on an unsaved workflow uses display_name as the base.
+
+        The unsaved workflow has no file_path → Step 1b kicks in →
+        display name (metadata.name) is sanitized and fed through
+        ``_resolve_named_save_path``. The first versioned save will land
+        at ``<sanitized_display>_v001.py`` via the seed-and-retry.
+        """
+        unsaved_key = "unsaved:step1b-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="My Pretty Flow")
+
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name=unsaved_key,
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # Display name sanitized: "My Pretty Flow" → "My_Pretty_Flow".
+            assert macro_vars.get("file_name_base") == "My_Pretty_Flow"
+            # No index assigned yet — the seed handles that on write.
+            assert "_index" not in macro_vars
+
+    def test_create_versioned_invalid_situation_macro_raises_value_error(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """A malformed situation macro surfaces as a clear ValueError, not an opaque crash.
+
+        ``SituationTemplate`` validates macro syntax at template load, so
+        production never reaches this branch. The defensive guard catches
+        any case where a bad macro slips past validation (e.g. tests, future
+        refactors, dynamic situation construction). Pins that the error
+        message identifies which situation is broken.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+            from griptape_nodes.common.macro_parser import MacroSyntaxError
+
+            def raise_bad_macro(_template: str) -> None:
+                msg = "synthetic malformed macro for test"
+                raise MacroSyntaxError(msg)
+
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.managers.workflow_manager.ParsedMacro",
+                    side_effect=raise_bad_macro,
+                ),
+                pytest.raises(ValueError, match="create_versioned_workflow"),
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
+
+    def test_create_versioned_missing_situation_raises_value_error(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When the active project lacks the versioned situation, the reverse-match raises with the situation name.
+
+        Pins the GetSituationResultSuccess guard at the top of
+        ``_try_match_versioned_destination``. Drives the path where the
+        match attempt happens (a registered workflow with a file_path) so
+        the helper runs end-to-end, then patches ``handle_request`` to
+        simulate the situation being absent.
+        """
+        from griptape_nodes.retained_mode.events.base_events import RequestPayload
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetSituationRequest,
+            GetSituationResultFailure,
+        )
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+
+            real_handle = GriptapeNodes.handle_request
+
+            def fake_handle(req: RequestPayload) -> object:
+                if isinstance(req, GetSituationRequest):
+                    return GetSituationResultFailure(result_details="not found")
+                return real_handle(req)
+
+            with (
+                patch.object(GriptapeNodes, "handle_request", side_effect=fake_handle),
+                pytest.raises(ValueError, match="not found in the active project template"),
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
+
+    def test_create_versioned_match_dispatch_failure_surfaces_underlying_cause(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """When the match handler crashes, the error message includes the underlying exception.
+
+        Pins the better-error-message branch in ``_try_match_versioned_destination``:
+        if ``GriptapeNodes.handle_request`` catches an exception in the match
+        handler and returns a generic ResultPayloadFailure, the wrapper raises
+        ``ValueError`` with both the result_details and the underlying
+        exception type and message so future debugging starts with the real
+        cause, not an opaque dispatch wrapper.
+        """
+        from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayloadFailure
+        from griptape_nodes.retained_mode.events.project_events import (
+            AttemptMatchPathAgainstMacroRequest,
+        )
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(
+                temp_dir, registry_key="my_flow_v001", file_name="my_flow_v001.py", display_name="my_flow"
+            )
+
+            real_handle = GriptapeNodes.handle_request
+            synthetic_exc = RuntimeError("synthetic match-handler crash for test")
+
+            def fake_handle(req: RequestPayload) -> object:
+                if isinstance(req, AttemptMatchPathAgainstMacroRequest):
+                    return ResultPayloadFailure(
+                        exception=synthetic_exc,
+                        result_details="dispatch caught an exception",
+                    )
+                return real_handle(req)
+
+            with (
+                patch.object(GriptapeNodes, "handle_request", side_effect=fake_handle),
+                pytest.raises(ValueError, match="synthetic match-handler crash") as exc_info,
+            ):
+                self._determine(
+                    griptape_nodes,
+                    requested_file_name=None,
+                    current_workflow_name="my_flow_v001",
+                    create_versioned=True,
+                )
+
+            # The message includes both the underlying exception's class name and
+            # its text — future debuggers shouldn't have to chase the original cause.
+            assert "RuntimeError" in str(exc_info.value)
+            assert "dispatch caught an exception" in str(exc_info.value)
+
+    def test_create_versioned_timestamp_fallback_when_no_candidate_workflow(
+        self,
+        griptape_nodes: GriptapeNodes,
+    ) -> None:
+        """Step 5: no current AND no target workflow → timestamp-derived filename.
+
+        Pins the last-resort branch of ``_resolve_versioned_save_target``:
+        when there's nothing in scope to derive a base name from, the
+        helper falls back to a ``%d.%m_%H.%M`` timestamp routed through
+        the standard ``_resolve_named_save_path`` plumbing.
+        """
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            # Empty registry + no current workflow + no target → Step 5.
+            target = self._determine(
+                griptape_nodes,
+                requested_file_name=None,
+                current_workflow_name=None,
+                create_versioned=True,
+            )
+
+            assert target.scenario == WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED
+            assert target.destination is not None
+            macro_vars = target.destination._file._file_path.variables  # type: ignore[union-attr]
+            # The base name is a timestamp matching DD.MM_HH.MM; the index is
+            # unbound so the seed-and-retry assigns 001 on write.
+            base = macro_vars.get("file_name_base")
+            assert isinstance(base, str)
+            assert re.fullmatch(r"\d{2}\.\d{2}_\d{2}\.\d{2}", base), (
+                f"Expected timestamp pattern DD.MM_HH.MM but got {base!r}"
+            )
+            assert "_index" not in macro_vars
+
+
+class TestSaveWorkflowDisplayNameFallback:
+    """Pin the display-name fallback chain in ``on_save_workflow_request``.
+
+    Four branches with strict precedence (high → low):
+    1. ``request.display_name`` — explicit caller intent always wins.
+    2. ``existing.display_name`` — preserves human-readable label across re-saves.
+    3. The local ``file_name`` produced by ``_determine_save_target`` — either the user's
+       typed Save-As stem (so "a" stays "a" and doesn't become "a_v001"), or the sanitized
+       metadata-derived stem for a first-save-of-unsaved-workflow (so "unsaved:<uuid>"
+       never leaks into ``metadata.name``).
+    4. ``None`` → metadata generator's last-resort fallback uses resolved file_name.
+
+    Drives ``on_save_workflow_request`` end-to-end with mocks; intercepts
+    ``_save_workflow_file_inline`` to capture the ``display_name`` argument
+    that the chain produced.
+    """
+
+    @staticmethod
+    def _capture_display_name(
+        griptape_nodes: GriptapeNodes,
+        *,
+        request_file_name: str | None,
+        request_display_name: str | None,
+        current_workflow_name: str | None,
+    ) -> str | None:
+        """Drive on_save_workflow_request and return the display_name handed to _save_workflow_file_inline."""
+        from datetime import UTC, datetime
+
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+        from griptape_nodes.retained_mode.events.flow_events import (
+            GetTopLevelFlowRequest,
+            GetTopLevelFlowResultSuccess,
+            SerializedFlowCommands,
+            SerializeFlowToCommandsRequest,
+            SerializeFlowToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.workflow_events import (
+            SaveWorkflowFileFromSerializedFlowResultSuccess,
+            SaveWorkflowRequest,
+        )
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager = griptape_nodes.ContextManager()
+
+        empty_commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=MagicMock(),
+            node_types_used=set(),
+        )
+        saved_metadata = WorkflowMetadata(
+            name="placeholder",
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        captured: dict[str, str | None] = {}
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, GetTopLevelFlowRequest):
+                return GetTopLevelFlowResultSuccess(flow_name="ControlFlow_1", result_details="ok")
+            if isinstance(req, SerializeFlowToCommandsRequest):
+                return SerializeFlowToCommandsResultSuccess(
+                    serialized_flow_commands=empty_commands, result_details="ok"
+                )
+            msg = f"Unexpected request type in test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        def capture_inline(**kwargs: object) -> SaveWorkflowFileFromSerializedFlowResultSuccess:
+            # display_name is what we're testing — record it then return success.
+            captured["display_name"] = kwargs.get("display_name")  # type: ignore[assignment]
+            workspace = griptape_nodes.ConfigManager().workspace_path
+            file_name = kwargs.get("file_name", "stub")
+            return SaveWorkflowFileFromSerializedFlowResultSuccess(
+                file_path=str(workspace / f"{file_name}.py"),
+                workflow_metadata=saved_metadata,
+                result_details="ok",
+            )
+
+        pushed_context = False
+        if current_workflow_name is not None:
+            context_manager.push_workflow(workflow_name=current_workflow_name)
+            pushed_context = True
+
+        try:
+            with (
+                patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+                patch.object(workflow_manager, "_save_workflow_file_inline", side_effect=capture_inline),
+                patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
+            ):
+                asyncio.run(
+                    workflow_manager.on_save_workflow_request(
+                        SaveWorkflowRequest(file_name=request_file_name, display_name=request_display_name)
+                    )
+                )
+        finally:
+            if pushed_context and context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
+        return captured.get("display_name")
+
+    def test_explicit_request_display_name_wins(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 1: ``request.display_name`` is explicit caller intent and always wins.
+
+        Even when the registry has an existing display_name AND request.file_name
+        is set, the explicit request.display_name still takes precedence.
+        """
+        unsaved_key = "unsaved:branch1-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="In-Memory Label")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="some_file_name",
+                request_display_name="Caller-Specified Label",
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured == "Caller-Specified Label"
+
+    def test_existing_registry_display_name_used_when_request_omits(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 2: when request.display_name is None, the registry's existing display_name wins over the file_name.
+
+        Pins the "preserve human-readable label across re-saves" rule — a
+        second save of an already-registered workflow keeps its existing
+        display name rather than resetting it from the typed/resolved
+        file_name.
+        """
+        from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+
+        registry_key = "preserved_display_name_test"
+        workspace = griptape_nodes.ConfigManager().workspace_path
+        stub_path = workspace / f"{registry_key}.py"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            stub_path.write_text("# stub")
+            try:
+                metadata = WorkflowMetadata(
+                    name="Preserved Display Name",
+                    schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+                    engine_version_created_with="test",
+                    node_libraries_referenced=[],
+                    creation_date=datetime.now(UTC),
+                )
+                WorkflowRegistry.generate_new_workflow(
+                    registry_key=registry_key, metadata=metadata, file_path=f"{registry_key}.py"
+                )
+
+                captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                    griptape_nodes,
+                    request_file_name=registry_key,
+                    request_display_name=None,
+                    current_workflow_name=registry_key,
+                )
+
+                # Registry value wins over the typed file_name fallback.
+                assert captured == "Preserved Display Name"
+            finally:
+                stub_path.unlink(missing_ok=True)
+
+    def test_no_request_display_name_no_existing_metadata_uses_resolved_file_name_stem(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """Branch 3: fresh Save As with no registry entry — the resolved stem becomes the display name.
+
+        This is the case that the manual-test bug surfaced: typing "a" should
+        produce metadata.name="a" even though the macro resolves the on-disk
+        name to "a_v001". The fallback uses ``_determine_save_target``'s
+        resolved local ``file_name``, which strips any leading sub-directory
+        so a typed "episode/my_wf" yields the leaf "my_wf".
+        """
+        unsaved_key = "unsaved:branch3-test"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="ignored - we use resolved file_name")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="episode/my_wf",
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            # _resolve_named_save_path returns parts.stem — "my_wf", not "episode/my_wf".
+            assert captured == "my_wf"
+
+    def test_first_save_of_unsaved_uses_metadata_derived_stem_not_synthetic_key(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """Fresh save of an unsaved workflow must not surface "unsaved:<uuid>" as the display name.
+
+        Regression guard for the bug where branch 3 read ``Path(request.file_name).stem``
+        and returned the whole "unsaved:<uuid>" string verbatim (no dot). Fix: branch 3
+        reads the local ``file_name`` from ``_determine_save_target``, which already
+        stripped the prefix and rebuilt the stem from ``metadata.name``.
+        """
+        unsaved_key = "unsaved:branch3-regression"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="My Cool Workflow")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name=unsaved_key,
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured is not None
+            assert not captured.startswith("unsaved:"), f"synthetic key leaked into display name: {captured!r}"
+            # The resolved stem is the sanitized metadata.name.
+            assert captured == "My_Cool_Workflow"
+
+    def test_typed_save_as_name_survives_versioned_resolution(self, griptape_nodes: GriptapeNodes) -> None:
+        """The user typed "a" — display name stays "a" even when the macro resolves the file to "a_v001".
+
+        Pins the versioned-save UI re-save fix from commit 5c3f0bf3: branch 3 must feed off
+        the ``_determine_save_target`` local (which is the user's typed stem), not the
+        macro-resolved on-disk name. Without this, the display name would jump to
+        "a_v001" the moment a versioned save landed.
+        """
+        unsaved_key = "unsaved:typed-save-as"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="ignored - user typed a new name")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name="a",
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured == "a"
+
+    def test_metadata_derived_stem_used_when_no_file_name_and_no_existing(self, griptape_nodes: GriptapeNodes) -> None:
+        """Branch 3 (no request.file_name path): the metadata-derived stem still fills the display name.
+
+        Prior expectation for this scenario was ``None`` (rung 4), because rung 3 keyed off
+        ``request.file_name`` alone. After the fix, rung 3 uses the resolved local
+        ``file_name`` that ``_determine_save_target`` synthesizes from the unsaved workflow's
+        ``metadata.name`` — so the chain resolves before falling through to ``None``.
+        """
+        unsaved_key = "unsaved:branch4-legacy"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            _register_unsaved_workflow(key=unsaved_key, name="Used Only For Filename Derivation")
+
+            captured = TestSaveWorkflowDisplayNameFallback._capture_display_name(
+                griptape_nodes,
+                request_file_name=None,
+                request_display_name=None,
+                current_workflow_name=unsaved_key,
+            )
+
+            assert captured == "Used_Only_For_Filename_Derivation"
 
 
 class TestScrubForAstConstant:

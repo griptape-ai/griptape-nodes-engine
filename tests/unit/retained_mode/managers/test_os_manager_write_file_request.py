@@ -1666,6 +1666,61 @@ class TestOptionalPaddedIndexCollision:
     # tries to apply `:03` to the separator-prepended string `1_` and errors). That's
     # a parser-level bug, not the collision-walk bug this PR fixes — out of scope here.
 
+    # --- Bound padded slot (the #4956 case) -----------------------------------------
+
+    def test_bound_padded_slot_walks_forward_from_current_value(self, outputs_dir: Path) -> None:
+        """A CREATE_NEW write with `_index` pre-bound to N advances to N+1 on collision.
+
+        Regression coverage for #4956: when a caller has reverse-matched an existing
+        versioned file (e.g. via ``ParsedMacro.extract_variables``) and passes the
+        resulting variables — including the bound index — to the destination, the
+        collision-walk must step the padded slot forward from its bound value. Under
+        the old gate that required the slot to be UNBOUND to walk it, this test would
+        produce ``file_v008_1.png`` (suffix-synthesized) instead of ``file_v008.py``.
+        """
+        # Pre-create v007 (the matched file) so the first write attempt collides.
+        (outputs_dir / "file_v007.png").write_bytes(b"existing v007")
+
+        # Pass `_index=7` in the variables dict (simulating a reverse-match result).
+        # The macro resolves to file_v007.png, which exists → collision-walk runs.
+        # The walk must start at 8 (bound_value + 1), NOT at 1 (unbound default).
+        macro_path = MacroPath(ParsedMacro("{outputs}/file_v{_index:03}.png"), {"_index": 7})
+        self._save(macro_path, b"next version")
+
+        assert (outputs_dir / "file_v008.png").exists()
+        assert (outputs_dir / "file_v008.png").read_bytes() == b"next version"
+        # Negative: the buggy suffix-synthesis fallback would produce these.
+        assert not (outputs_dir / "file_v007_1.png").exists()
+        assert not (outputs_dir / "file_v001.png").exists()
+
+    def test_bound_optional_sequence_slot_walks_forward_from_current_value(self, outputs_dir: Path) -> None:
+        """A CREATE_NEW write with an OPTIONAL sequence slot pre-bound to N advances to N+1.
+
+        The companion to ``test_bound_padded_slot_walks_forward_from_current_value``
+        for the template shape ``create_versioned_workflow`` actually uses:
+        ``{###?:^_v}`` — an *optional* sequence slot with a leading separator.
+        Byte-for-byte the two forms render the same when the slot is bound
+        (``_v007`` either way), but the walk logic in
+        ``on_write_file_request`` branches on
+        ``padded_index_var.info.is_required`` — the required branch was
+        tested; the optional branch's bound-slot path is what
+        ``create_versioned_workflow`` walks in production.
+        """
+        # Pre-create v007 so the first write attempt collides.
+        (outputs_dir / "file_v007.png").write_bytes(b"existing v007")
+
+        # Optional sequence-slot form + leading `_v` prefix — the same shape used
+        # by `CREATE_VERSIONED_WORKFLOW` in the default project template.
+        macro_path = MacroPath(ParsedMacro("{outputs}/file{###?:^_v}.png"), {"_index": 7})
+        self._save(macro_path, b"next version")
+
+        assert (outputs_dir / "file_v008.png").exists()
+        assert (outputs_dir / "file_v008.png").read_bytes() == b"next version"
+        # Negative: walk restarting from 1 (unbound-optional default) would leave v001.
+        assert not (outputs_dir / "file_v001.png").exists()
+        # Negative: suffix-synthesis fallback shape.
+        assert not (outputs_dir / "file_v007_1.png").exists()
+
 
 class TestCreateNewMacroIndexSeedDefensiveFallthrough:
     """Defensive paths around the auto-index seed and the collision-walk loop.

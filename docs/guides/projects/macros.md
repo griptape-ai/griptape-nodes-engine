@@ -282,9 +282,11 @@ Builtin variables (like `workflow_name`, `project_dir`) are also supplied automa
 
 ## Reverse matching
 
-The macro system can also work in reverse: given an actual path and a macro template, it can extract the values of the variables. This is used when the system needs to identify whether a file belongs to a known project directory and what metadata is encoded in its name.
+The macro system can also work in reverse: given an actual path and a macro template, it can extract the values of the variables. This is used when the system needs to identify whether a file belongs to a known project directory and what metadata is encoded in its name — e.g. the `create_versioned_workflow` save path re-reads an existing file's name to figure out which `_index` to bump.
 
-For example:
+The public API is `ParsedMacro.extract_variables(path, known_variables, secrets_manager)` (or `matches(...)` for a boolean check).
+
+Basic example:
 
 ```
 Template:  {outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}
@@ -292,7 +294,73 @@ Path:      outputs/StyleTransfer_portrait003.png
 Extracted: outputs="outputs", node_name="StyleTransfer", file_name_base="portrait", _index=3, file_extension="png"
 ```
 
-Numeric padding is reversed by parsing the number (`"003"` → integer `3`). Case transformations and slugification cannot be reliably reversed and return the value as-is.
+### How extraction decides where each variable ends
+
+For a template like `{a}/{b}/{c}.{ext}` the extractor walks left to right. Each variable's value ends at the next **anchor** — a fixed piece of text that must appear in the path. Two kinds of anchors exist:
+
+- **Next-segment anchor.** The text of the following static segment (e.g. `.png`), or the leading-separator prefix of the following variable (e.g. `_v` inside `{###?:^_v}`).
+- **Self-anchor.** The variable's own trailing separator (e.g. the `_` in `{node_name?:_}`).
+
+The extractor uses whichever produces the tightest, self-consistent split. When both are available, the search direction depends on what follows: if the next segment is a static, take the LATEST self-anchor before the static (tightest right-edge split); if the next segment is another variable, take the FIRST self-anchor (leave room for the following variable to consume its share). This is what makes `{a?:_}{b?:_}file.png` on `first_second_file.png` split into `a=first, b=second` rather than `a=first_second, b=""`.
+
+### Optional variables (`?`) — how ambiguity is resolved
+
+An optional variable may or may not have emitted at the time the path was written. Reverse-matching enumerates **all 2ᵏ combinations** of "each optional emitted vs. omitted" (where *k* is the number of optional-unbound variables in the template), extracts each combination, and validates via forward round-trip: the extracted values are re-resolved through the template and the result must match the input path byte-for-byte.
+
+Combinations are tried in **popcount-descending** order — the richest interpretation (most optionals emitted, most information recovered) is preferred over lossier readings. The first combination whose round-trip succeeds wins.
+
+Worked example — the canonical case:
+
+```
+Template: {workspace_dir}/{sub_dirs?:/}{file_name_base}{###?:^_v}.{file_extension}
+Known:    workspace_dir="/ws", file_extension="py"
+Path:     /ws/my_flow_v001.py
+
+Attempt 1 (both optionals emitted): sub_dirs="my_flow", file_name_base="",
+          _index=1 → resolves to "/ws/my_flow/_v001.py" — MISS.
+Attempt 2 (sub_dirs on, _index off): sub_dirs="my_flow_v001", file_name_base=""
+          → resolves to "/ws/my_flow_v001/.py" — MISS.
+Attempt 3 (sub_dirs off, _index on): file_name_base="my_flow", _index=1
+          → resolves to "/ws/my_flow_v001.py" — MATCH ✓
+```
+
+The 4th combination is not attempted once the 3rd wins.
+
+**Consequences worth knowing:**
+
+- An emitted optional that captures the empty string is rejected before the round-trip runs — capturing an empty value contradicts the "the slot emitted" assumption.
+- Round-trip validation catches greedy misreads: an extraction that resolves to a different string than the input path can never win. This is why the extractor's greedy anchor choices are safe — a wrong choice fails to round-trip and the next combination is tried.
+- When multiple combinations round-trip, the highest-popcount one wins. Ties within a popcount are broken by mask value (ascending), which is deterministic but has no semantic meaning — see "Building unambiguous templates" below.
+
+### Building unambiguous templates
+
+Two variables with no fixed text between them are grammatically ambiguous when both are unbound — the grammar has no way to say which side of the ambiguous boundary a character belongs to. Reverse-matching will still return *some* valid answer (any reading that round-trips is legal), but which specific reading isn't predictable across templates.
+
+**Design guidance:**
+
+- Put a **static separator** (or a distinctive leading-separator prefix) between adjacent variables when you want reliable reverse-matching. `{name}_{version}` is unambiguous; `{name}{version}` isn't.
+- The **sequence-slot form with a leading separator** — `{###?:^_v}` — is the recommended pattern for versioned filenames. The `_v` prefix is a distinctive anchor that lets the extractor find the version boundary regardless of what comes before it.
+- Pre-supply values you know via `known_variables`. Every known variable removes one dimension from the 2ᵏ search and eliminates one source of ambiguity.
+
+### Format specs on the reverse path
+
+Not every format spec has a lossless inverse. When a spec can't be reversed unambiguously the extractor returns the raw string and lets the caller decide what to do with it.
+
+| Format spec                        | Reversal behavior                                                                                                                                                          |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `:03` (numeric padding)            | Parsed as an integer (`"005"` → `5`). A non-numeric value fails the spec and disqualifies that extraction attempt.                                                         |
+| `{###}` / `{###?}` (sequence slot) | Same as numeric padding — parses to `int`. When bound, the value is available as `_index`.                                                                                 |
+| `:_` (trailing separator)          | Strips the trailing separator if present. Idempotent when absent.                                                                                                          |
+| `:^_v` (leading separator)         | Strips the prefix if present. Idempotent when absent. When followed by a preceding variable's extraction, the prefix also serves as an anchor.                             |
+| `:lower` / `:upper` / `:title` / … | Case transformations return the extracted substring as-is; the original casing is not recoverable. Callers that need round-trip fidelity should avoid these on match keys. |
+| `:slug` / `:snake` / `:pascal` / … | Same — one-way transforms return the raw extracted value.                                                                                                                  |
+| `\|default_value`                  | Defaults are a forward-only construct. On the reverse path the variable is either extracted from the path or left unbound; the default text is never re-injected.          |
+
+### Practical limits
+
+- Reverse-matching caps the number of optional-unbound variables at 5 (2⁵ = 32 combinations). Templates with 6 or more optional-unbound variables raise `MacroParseFailureReason.TOO_MANY_OPTIONAL_VARIABLES`. Real-world templates in the tree top out at 3 optionals; the cap exists to prevent runaway work on pathological grammars.
+- The cap counts only optionals that aren't bound by `known_variables`. Pre-binding an optional removes it from the search space, so a template with 6 optional variables can still reverse-match if all 6 are supplied by the caller.
+- Path matching is **byte-exact**. Cross-platform callers should normalize path separators to forward slashes before calling `extract_variables` — the built-in project-directory match handler does this automatically for auto-resolved directory builtins.
 
 ## Syntax errors
 

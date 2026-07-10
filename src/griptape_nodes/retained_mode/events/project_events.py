@@ -526,6 +526,12 @@ class AttemptMatchPathAgainstMacroRequest(RequestPayload):
         parsed_macro: Parsed macro template to match against
         file_path: Path string to test
         known_variables: Variables we already know
+        auto_resolve_builtins: If True, the handler resolves every builtin variable
+            (workspace_dir, workflow_dir, ...) from the current project and merges
+            them under ``known_variables`` (caller wins on collision). Use when
+            reverse-matching a path against a macro that depends on directory
+            anchors and the caller doesn't already have those values in hand.
+            Default False preserves strict-match semantics.
 
     Results: AttemptMatchPathAgainstMacroResultSuccess | AttemptMatchPathAgainstMacroResultFailure
     """
@@ -533,6 +539,7 @@ class AttemptMatchPathAgainstMacroRequest(RequestPayload):
     parsed_macro: ParsedMacro
     file_path: str
     known_variables: MacroVariables
+    auto_resolve_builtins: bool = False
 
 
 @dataclass

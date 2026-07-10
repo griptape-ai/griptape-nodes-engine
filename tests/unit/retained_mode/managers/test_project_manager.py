@@ -103,6 +103,387 @@ class TestProjectManagerMacroHandlers:
         assert result.match_failure is None
         assert result.extracted_variables == {"file_name": "test.txt"}
 
+    def test_match_path_auto_resolve_off_treats_builtins_as_unknowns(self, project_manager: ProjectManager) -> None:
+        """Default ``auto_resolve_builtins=False`` keeps the handler from anchoring builtins.
+
+        ``extract_variables`` is greedy: without an anchor value for
+        ``workspace_dir``, the matcher consumes it as the empty string and
+        ``file_name_base`` absorbs the entire leading path. The whole-string
+        match technically "succeeds", but the resulting dict is structurally
+        wrong — the workspace boundary was lost. This is precisely why
+        workflow_manager opts into auto-resolution, and why the default has
+        to leave existing callers' strict contract untouched.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+
+        request = AttemptMatchPathAgainstMacroRequest(
+            parsed_macro=parsed_macro,
+            file_path="/projects/demo/my_workflow.py",
+            known_variables={},
+            # auto_resolve_builtins defaults to False — handler must NOT inject builtins.
+        )
+
+        result = project_manager.on_match_path_against_macro_request(request)
+
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        # Greedy match with no workspace anchor: workspace_dir defaults to empty,
+        # file_name_base absorbs the leading path. Documents the wrong-but-syntactically-valid
+        # extraction that the auto-resolve flag exists to prevent.
+        assert result.extracted_variables == {
+            "workspace_dir": "",
+            "file_name_base": "projects/demo/my_workflow",
+            "file_extension": "py",
+        }
+
+    def test_match_path_auto_resolve_on_supplies_builtin_anchors(self, tmp_path: Path) -> None:
+        """``auto_resolve_builtins=True`` lets the handler resolve ``{workspace_dir}`` itself.
+
+        Drives the handler through ``handle_request`` against a real loaded project
+        so the builtin resolver can actually return a workspace value. Without the
+        flag, this same macro/path pair fails (see ``test_match_path_auto_resolve_off``);
+        with it, the handler injects ``workspace_dir`` and the match succeeds.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        workspace = tmp_path.resolve()
+        original_workspace = GriptapeNodes.ConfigManager().workspace_path
+        project_yml = workspace / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        # SetCurrentProjectRequest re-derives workspace_path; force it back.
+        GriptapeNodes.ConfigManager().workspace_path = workspace
+
+        try:
+            # Macro templates use forward-slash separators (the cross-platform
+            # convention). On Windows the OS-native absolute path comes back
+            # with backslashes; normalize to POSIX so the static-text
+            # comparison between `{workspace_dir}` and the next segment lines
+            # up regardless of OS. The match handler POSIX-normalizes its
+            # auto-resolved directory builtins, so both sides agree on
+            # separator without the caller having to inject workspace_dir.
+            parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+            absolute_path = (workspace / "my_workflow.py").as_posix()
+
+            request = AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=parsed_macro,
+                file_path=absolute_path,
+                known_variables={},
+                auto_resolve_builtins=True,
+            )
+
+            result = GriptapeNodes.handle_request(request)
+
+            assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+            assert result.match_failure is None
+            assert result.extracted_variables is not None
+            assert result.extracted_variables.get("file_name_base") == "my_workflow"
+            assert result.extracted_variables.get("file_extension") == "py"
+            # workspace_dir was supplied by the handler — auto-resolution made the match possible.
+            assert "workspace_dir" in result.extracted_variables
+        finally:
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+            GriptapeNodes.ConfigManager().workspace_path = original_workspace
+
+    def test_match_path_auto_resolve_rejects_conflicting_caller_override(self, tmp_path: Path) -> None:
+        """Caller-supplied builtin overrides that disagree with the project are rejected.
+
+        Pins the shared "no silent override of builtins" policy: every handler
+        that mixes user-supplied variables with project-derived builtins refuses
+        to let the caller silently shadow the builtin. The match handler hits the
+        same conflict-detection helper as ``GetPathForMacroRequest`` and
+        ``GetStateForMacroRequest``, so the rejection shape is consistent across
+        the public API surface.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            AttemptMatchPathAgainstMacroResultFailure,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        workspace = tmp_path.resolve()
+        original_workspace = GriptapeNodes.ConfigManager().workspace_path
+        project_yml = workspace / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        GriptapeNodes.ConfigManager().workspace_path = workspace
+
+        try:
+            # Caller asserts workspace_dir is "/elsewhere" — different from the real workspace.
+            # Under the unified policy this is a contract violation, not a silent override.
+            parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+            request = AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=parsed_macro,
+                file_path="/elsewhere/my_workflow.py",
+                known_variables={"workspace_dir": "/elsewhere"},
+                auto_resolve_builtins=True,
+            )
+
+            result = GriptapeNodes.handle_request(request)
+
+            # Hard failure (not a match-failure result_success): caller violated
+            # the "no override of builtins" contract that all macro handlers share.
+            assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+            assert "workspace_dir" in str(result.result_details)
+        finally:
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+            GriptapeNodes.ConfigManager().workspace_path = original_workspace
+
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    def test_match_path_auto_resolve_supplies_non_directory_builtin_verbatim(
+        self,
+        mock_griptape_nodes: Mock,
+        project_manager: ProjectManager,
+        tmp_path: Path,
+    ) -> None:
+        """Auto-resolved non-directory builtins pass through without POSIX normalization.
+
+        ``on_attempt_match_path_against_macro_request`` POSIX-normalizes
+        auto-resolved *directory* builtins so reverse-match works on Windows
+        (macros use forward-slash separators). Non-directory builtins like
+        ``workflow_name`` are just strings; the normalization loop gates on
+        ``builtin_info.is_directory`` and skips them, so their value reaches
+        the extractor verbatim.
+
+        Existing coverage exercises directory builtins only
+        (``test_match_path_auto_resolve_on_supplies_builtin_anchors``,
+        ``test_match_path_auto_resolve_rejects_conflicting_caller_override``).
+        This test locks the non-directory branch — a future "always
+        normalize" simplification would silently corrupt workflow names.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # A current workflow named `My Cool Workflow` — the space is deliberate:
+        # a POSIX-normalization pass would leave the space alone, but if a future
+        # refactor pushed non-directory builtins through `Path(...).as_posix()`
+        # by mistake, backslash handling could mangle the value. Distinctive
+        # enough to catch that class of regression.
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_name.return_value = "My Cool Workflow"
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        # Register a synthetic project so `on_get_current_project_request` succeeds
+        # and the auto-resolve branch actually runs.
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+        project_manager._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
+        project_manager._current_project_id = SYSTEM_DEFAULTS_KEY
+
+        parsed_macro = ParsedMacro("{workflow_name}/render.png")
+        request = AttemptMatchPathAgainstMacroRequest(
+            parsed_macro=parsed_macro,
+            file_path="My Cool Workflow/render.png",
+            known_variables={},
+            auto_resolve_builtins=True,
+        )
+
+        result = project_manager.on_match_path_against_macro_request(request)
+
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        assert result.extracted_variables is not None
+        # workflow_name was supplied by auto-resolve AND passed through unchanged —
+        # the POSIX-normalization loop's `is_directory` gate skipped it.
+        assert result.extracted_variables["workflow_name"] == "My Cool Workflow"
+
+    def test_resolve_builtins_into_bag_flags_directory_path_conflict(
+        self, project_manager: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Directory builtins compare via ``resolve_path_safely``; disagreeing paths conflict.
+
+        Companion to
+        ``test_resolve_builtins_into_bag_flags_non_directory_string_conflict``
+        below. Directory builtins (``workspace_dir``, ``project_dir``, …) run
+        both sides through ``resolve_path_safely`` before comparing, so
+        different spellings of the same path don't false-alarm. This test
+        pins the branch where the paths are genuinely different, which the
+        rule *must* catch.
+
+        Currently this branch is only hit transitively via
+        ``test_match_path_auto_resolve_rejects_conflicting_caller_override``;
+        the direct-unit test locks it against a "just use string compare for
+        everything" simplification.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # The resolved builtin for `workspace_dir` is a real path so the
+        # `resolve_path_safely` comparison has something concrete to work with.
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        # Caller asserts a directory that isn't the workspace.
+        bag = cast("dict[str, Any]", {"workspace_dir": "/completely/different/path"})
+        result = project_manager._resolve_builtins_into_bag(bag, ["workspace_dir"], project_info)
+
+        # `resolve_path_safely` normalizes both sides and picks up the disagreement.
+        assert "workspace_dir" in result.conflicts
+        assert result.unavailable == {}
+
+    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
+    def test_resolve_builtins_into_bag_records_unavailable_when_no_workflow(
+        self,
+        mock_griptape_nodes: Mock,
+        project_manager: ProjectManager,
+        tmp_path: Path,
+    ) -> None:
+        """Builtins whose resolver raises are recorded in ``unavailable``, not treated as conflicts.
+
+        ``_get_builtin_variable_value`` raises ``RuntimeError('No current
+        workflow')`` for ``workflow_name`` / ``workflow_dir`` when no
+        workflow context is active. The helper must catch that and add the
+        name to ``unavailable`` (with the exception attached) so callers can
+        report the missing precondition. Currently this branch is untested.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # No current workflow → workflow_name / workflow_dir resolvers raise RuntimeError.
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        bag = cast("dict[str, Any]", {})
+        result = project_manager._resolve_builtins_into_bag(
+            bag,
+            ["workflow_name", "workflow_dir", "workspace_dir"],
+            project_info,
+        )
+
+        # workflow_* resolvers both raised — recorded as unavailable with the exception attached.
+        assert "workflow_name" in result.unavailable
+        assert "workflow_dir" in result.unavailable
+        assert isinstance(result.unavailable["workflow_name"], RuntimeError)
+        assert "No current workflow" in str(result.unavailable["workflow_name"])
+        # workspace_dir resolves fine → not in unavailable, and injected into the bag.
+        assert "workspace_dir" not in result.unavailable
+        assert bag["workspace_dir"] == str(tmp_path.resolve())
+        # Unavailable is not a conflict — callers distinguish the two.
+        assert result.conflicts == set()
+
+    def test_resolve_builtins_into_bag_flags_non_directory_string_conflict(
+        self, project_manager: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Non-directory builtins compare as strings; mismatched values are flagged as conflicts.
+
+        Directory builtins (``workspace_dir`` etc.) compare via
+        ``resolve_path_safely`` so two spellings of the same path don't
+        false-alarm; non-directory builtins (``workflow_name``,
+        ``project_name``, etc.) compare verbatim. Pins the string-compare
+        branch of ``_resolve_builtins_into_bag``: a caller-supplied
+        ``static_files_dir`` that disagrees with the resolved value
+        is reported as a conflict.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # The mock config from the fixture returns a Mock for any config key —
+        # we need a concrete string so the conflict comparison is meaningful.
+        cast("Mock", project_manager._config_manager).get_config_value.return_value = "staticfiles"
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        # Caller asserts a value that disagrees with the resolved builtin.
+        bag = cast("dict[str, Any]", {"static_files_dir": "user-overridden-value"})
+        result = project_manager._resolve_builtins_into_bag(bag, ["static_files_dir"], project_info)
+
+        # String compare picked up the disagreement → conflict recorded.
+        assert "static_files_dir" in result.conflicts
+        # No values were available beyond what was supplied / the unresolved branch.
+        assert result.unavailable == {}
+
 
 class TestProjectManagerInitialization:
     """Test ProjectManager initialization and state."""

@@ -23,6 +23,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from griptape_nodes.common.macro_parser import MacroSyntaxError, MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.flow import ControlFlow
@@ -34,7 +35,7 @@ from griptape_nodes.files.path_utils import (
     derive_registry_key,
     resolve_workspace_path,
 )
-from griptape_nodes.files.project_file import ProjectFileDestination
+from griptape_nodes.files.project_file import SITUATION_TO_FILE_POLICY, ProjectFileDestination
 from griptape_nodes.node_library.workflow_registry import (
     Workflow,
     WorkflowMetadata,
@@ -80,8 +81,11 @@ from griptape_nodes.retained_mode.events.os_events import (
     GetFileInfoResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
+    AttemptMatchPathAgainstMacroRequest,
+    AttemptMatchPathAgainstMacroResultSuccess,
     GetSituationRequest,
     GetSituationResultSuccess,
+    MacroPath,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     BranchWorkflowRequest,
@@ -202,6 +206,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     WorkflowNotFoundProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
+from griptape_nodes.retained_mode.managers.project_manager import BUILTIN_VARIABLES
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 from griptape_nodes.utils.ast_utils import rewrite_string_comments
 from griptape_nodes.utils.file_utils import find_files_recursive
@@ -2370,8 +2375,26 @@ class WorkflowManager:
 
         # Build save request inline (preserve existing display_name/description/image/is_template if present)
         existing = self._get_existing_metadata(registry_key)
-        # Prefer an explicitly provided display_name over the preserved existing value.
-        resolved_display_name = request.display_name if request.display_name is not None else existing.display_name
+        # Display name precedence (high to low):
+        # 1. Caller-supplied request.display_name — explicit intent always wins.
+        # 2. existing.display_name from the registry — preserves the human-readable label
+        #    across re-saves and version bumps (one workflow named "a" with v001, v002, ...).
+        # 3. The resolved local file_name from _determine_save_target — this is either the
+        #    user's typed Save-As stem (so "a" stays "a" and doesn't become "a_v001"), or
+        #    the sanitized display-name-derived stem for a first-save-of-unsaved-workflow
+        #    (so the synthetic "unsaved:<uuid>" key never leaks to metadata.name). Read the
+        #    local `file_name`, NOT `request.file_name` — the latter is un-normalized and
+        #    can still be "unsaved:<uuid>" on the wire for the fresh-save case.
+        # 4. Resolved file_name fallback inside _generate_workflow_metadata_from_commands
+        #    (last-resort safety net for code paths that supply nothing).
+        if request.display_name is not None:
+            resolved_display_name = request.display_name
+        elif existing.display_name is not None:
+            resolved_display_name = existing.display_name
+        elif file_name:
+            resolved_display_name = file_name
+        else:
+            resolved_display_name = None
 
         save_file_result = self._save_workflow_file_inline(
             destination=destination,
@@ -2570,18 +2593,16 @@ class WorkflowManager:
 
         # CREATE_VERSIONED short-circuits the OVERWRITE_EXISTING branch. Even when
         # the workflow is already in the registry with a saved file_path, a versioned
-        # save re-resolves the macro so OSManager's seed-and-retry walks past
-        # existing versions and produces the next one. We still need a base filename;
-        # prefer the user's requested name → current workflow's display name →
-        # registry-derived stem from the existing file_path.
+        # save re-resolves the macro so OSManager walks past existing versions and
+        # produces the next one. The helper handles all three sub-cases (match,
+        # no-match, unsaved) and returns the destination + display strings; the
+        # macro layer is the single source of truth for "where does it go?".
         if create_versioned:
-            base_name = self._derive_versioned_base_name(
+            file_name, destination, relative_file_path = self._resolve_versioned_save_target(
+                situation_name=situation_name,
                 requested_file_name=requested_file_name,
                 current_workflow=current_workflow,
                 target_workflow=target_workflow,
-            )
-            file_name, destination, relative_file_path = self._resolve_named_save_path(
-                base_name, situation_name=situation_name
             )
             creation_date = (
                 current_workflow.metadata.creation_date if current_workflow is not None else datetime.now(tz=UTC)
@@ -2680,41 +2701,171 @@ class WorkflowManager:
             branched_from=branched_from,
         )
 
-    @staticmethod
-    def _derive_versioned_base_name(
+    def _resolve_versioned_save_target(
+        self,
         *,
+        situation_name: str,
         requested_file_name: str | None,
         current_workflow: Workflow | None,
         target_workflow: Workflow | None,
-    ) -> str:
-        """Pick the base filename for a versioned save.
+    ) -> NamedSavePath:
+        """Build the ``(file_name, destination, relative_file_path)`` triple for a versioned save.
 
-        Priority:
-        1. Explicit ``requested_file_name`` (user typed it).
-        2. The current workflow's display name (``metadata.name``), sanitized.
-        3. The current workflow's existing on-disk stem with any trailing
-           ``_v###`` version suffix stripped — so saving over ``foo_v001.py``
-           produces ``foo_v002.py`` (not ``foo_v001_v001.py``).
-        4. The target workflow's on-disk stem (same suffix strip), if no
-           current workflow is in scope.
-        5. A timestamp fallback when no other source is available.
+        Priority order:
+
+        1. Explicit ``requested_file_name`` *for a workflow we don't already
+           know about* (true Save-As to a brand-new name). When the requested
+           name maps to an existing registry entry — e.g. the UI re-sends the
+           current workflow's key as ``file_name`` — treat that workflow as
+           the source of truth and fall through to Step 2 so the macro
+           reverse-match advances the version.
+        2. Candidate workflow's existing ``file_path`` that matches the
+           versioned situation's macro. The matched variables ride through
+           the new ``MacroPath``; OSManager's collision-walk steps the
+           padded slot forward on write.
+        3. Candidate workflow's existing ``file_path`` that does NOT match.
+           Use the file's stem as the base and route through the standard
+           ``_resolve_named_save_path`` plumbing the same way a
+           non-versioned SAVE_AS does. The versioned situation's macro
+           decides where the new file lands.
+        4. Candidate workflow with no ``file_path`` (unsaved). Sanitize
+           ``metadata.name`` and route through ``_resolve_named_save_path``.
+        5. Timestamp fallback when no candidate workflow exists.
         """
-        if requested_file_name:
-            return requested_file_name
+        # Step 1 only fires for a truly novel requested name. If the name
+        # resolves to a workflow already in the registry (target_workflow is set),
+        # that's the same identity we'd reverse-match from anyway, so drop into
+        # Step 2 instead of starting a fresh "_v001" series under the old name.
+        if requested_file_name and target_workflow is None:
+            return self._resolve_named_save_path(requested_file_name, situation_name=situation_name)
 
-        candidate_workflow = current_workflow if current_workflow is not None else target_workflow
+        # target_workflow (set by Step 1 when the requested name maps to an existing
+        # registry entry) beats current_workflow: the workflow the UI named is what
+        # we want to reverse-match against, not whatever tab is focused. The prior
+        # ordering (current_workflow first) caused the "UI re-sends registry key as
+        # file_name" bug — see
+        # test_create_versioned_with_requested_name_matching_existing_workflow_runs_match.
+        candidate_workflow = target_workflow if target_workflow is not None else current_workflow
+        if candidate_workflow is not None and candidate_workflow.file_path is not None:
+            matched = self._try_match_versioned_destination(candidate_workflow.file_path, situation_name=situation_name)
+            if matched is not None:
+                return matched
+            # The existing file isn't part of a sequence this situation
+            # recognizes. Treat the file's stem like a user-typed name and
+            # go through the standard SAVE_AS plumbing.
+            stem = derive_registry_key(candidate_workflow.file_path)
+            return self._resolve_named_save_path(stem, situation_name=situation_name)
+
         if candidate_workflow is not None:
             display_name = (candidate_workflow.metadata.name or "").strip()
             sanitized = re.sub(r"[^A-Za-z0-9._/-]+", "_", display_name).strip("_/")
             if sanitized:
-                return sanitized
-            if candidate_workflow.file_path is not None:
-                stem = derive_registry_key(candidate_workflow.file_path)
-                # Strip a trailing _v### so the next versioned save bumps the
-                # index against the same base name.
-                return re.sub(r"_v\d+$", "", stem)
+                return self._resolve_named_save_path(sanitized, situation_name=situation_name)
 
-        return datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
+        timestamp_name = datetime.now(tz=UTC).strftime("%d.%m_%H.%M")
+        return self._resolve_named_save_path(timestamp_name, situation_name=situation_name)
+
+    def _try_match_versioned_destination(self, file_path: str, *, situation_name: str) -> NamedSavePath | None:
+        """Reverse-match ``file_path`` against the situation's macro; build a destination on success.
+
+        Returns ``None`` only when the macro doesn't recognize the file —
+        e.g. the file was created under a different situation, or lives
+        outside the workspace. The caller treats that as "start a new
+        versioned series from the file's stem" and falls through to the
+        standard save plumbing.
+
+        Raises ``ValueError`` when the active project is in a state where
+        reverse-matching can't run at all — missing situation, no current
+        project, or no resolvable ``workspace_dir`` builtin. These are
+        configuration problems that the caller surfaces to the user.
+
+        On match, the returned ``NamedSavePath`` carries a
+        ``ProjectFileDestination`` whose ``MacroPath`` has every variable
+        the macro identified — minus builtins, which ProjectManager
+        re-derives at resolve time and rejects caller overrides for.
+        """
+        result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        if not isinstance(result, GetSituationResultSuccess):
+            msg = (
+                f"Attempted to build a versioned save destination. "
+                f"Failed because situation '{situation_name}' was not found in the active project template."
+            )
+            raise ValueError(msg)  # noqa: TRY004 - missing situation is a config error, not a type error
+
+        situation = result.situation
+        try:
+            parsed_macro = ParsedMacro(situation.macro)
+        except MacroSyntaxError as err:
+            msg = (
+                f"Attempted to build a versioned save destination for '{file_path}'. "
+                f"Failed because situation '{situation_name}' has an invalid macro '{situation.macro}': {err}"
+            )
+            raise ValueError(msg) from err
+        # The match handler expects the path to match the macro template
+        # end-to-end. Use WorkflowRegistry.get_complete_file_path — the same
+        # absolutize helper non-versioned saves use — so the anchor value
+        # the macro sees here matches the rest of the save plumbing.
+        #
+        # Macro templates use forward-slash separators (the cross-platform
+        # convention). On Windows the absolute path comes back with
+        # backslashes; normalize to POSIX so the static-text comparison
+        # between `{workspace_dir}` and the next segment lines up. The
+        # match handler's auto-resolve path POSIX-normalizes the directory
+        # builtins it injects, so both sides agree on separator regardless
+        # of OS.
+        absolute_path = Path(WorkflowRegistry.get_complete_file_path(file_path)).as_posix()
+
+        match_result = GriptapeNodes.handle_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=parsed_macro,
+                file_path=absolute_path,
+                known_variables={},
+                auto_resolve_builtins=True,
+            )
+        )
+        if not isinstance(match_result, AttemptMatchPathAgainstMacroResultSuccess):
+            # The dispatcher caught an exception inside the handler and returned a
+            # generic ResultPayloadFailure. Surface its result_details and exception
+            # so users see the underlying cause instead of an opaque wrapper.
+            inner = getattr(match_result, "result_details", None)
+            exc = getattr(match_result, "exception", None)
+            msg = f"Attempted to build a versioned save destination for '{file_path}'. Match handler failed: {inner}"
+            if exc is not None:
+                msg = f"{msg} (underlying: {type(exc).__name__}: {exc})"
+            raise ValueError(msg)  # noqa: TRY004 - handler dispatch failure is a state error
+        if match_result.extracted_variables is None:
+            # The macro didn't match this file. Not an error — the caller
+            # falls through to the standard "new versioned series from the
+            # file stem" plumbing.
+            return None
+        extracted = match_result.extracted_variables
+
+        # Drop builtins from the dict before re-feeding to MacroPath: the
+        # ProjectManager re-derives those at resolve time and rejects
+        # caller overrides that disagree with the runtime values.
+        next_version_variables: MacroVariables = {
+            name: value for name, value in extracted.items() if name not in BUILTIN_VARIABLES
+        }
+
+        macro_path = MacroPath(parsed_macro=parsed_macro, variables=next_version_variables)
+        destination = ProjectFileDestination(
+            macro_path,
+            existing_file_policy=SITUATION_TO_FILE_POLICY.get(
+                situation.policy.on_collision, ExistingFilePolicy.CREATE_NEW
+            ),
+            create_parents=situation.policy.create_dirs,
+        )
+
+        # file_name and relative_file_path are pre-write display strings the
+        # registry keys by; the post-write reconciliation block in
+        # on_save_workflow_request swaps in the actually-written path. Use
+        # the matched file's existing path verbatim — by the time we resolve
+        # post-write, the registry will be coherent with what's on disk.
+        return WorkflowManager.NamedSavePath(
+            file_name=Path(file_path).stem,
+            destination=destination,
+            relative_file_path=file_path,
+        )
 
     def _warn_if_situation_policy_mismatches_intent(self, situation_name: str, *, create_versioned: bool) -> None:
         """Log a warning when a situation's policy doesn't match the caller's intent.

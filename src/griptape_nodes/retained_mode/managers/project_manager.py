@@ -142,7 +142,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
@@ -392,6 +392,21 @@ class _ProjectActivationOutcome(NamedTuple):
 
     failure: SetCurrentProjectResultFailure | None
     workspace_changed: bool
+
+
+class _BuiltinResolutionResult(NamedTuple):
+    """Outcome of merging project-derived builtins into a caller-supplied variable bag.
+
+    `conflicts` are names where the caller already had a value AND it disagreed with
+    the resolved builtin (per the project's "no silent override of builtins" policy).
+    `unavailable` maps each unavailable builtin name to the exception that explains
+    why (e.g. "No current workflow"). Callers decide separately whether
+    unavailability of a *required* builtin is fatal; when they raise, they should
+    surface the exception text so users can tell which precondition is missing.
+    """
+
+    conflicts: set[str]
+    unavailable: dict[str, Exception]
 
 
 class WorkspaceDecision(NamedTuple):
@@ -1193,7 +1208,6 @@ class ProjectManager:
             )
 
         resolution_bag: MacroVariables = {}
-        disallowed_overrides: set[str] = set()
         # Directories and project env vars may reference each other, builtins, or shell
         # env vars via inner macros (e.g. `watch_output: "{watch_folder}/outputs"`).
         # A shared resolver caches results across both sources so nested references
@@ -1215,37 +1229,26 @@ class ProjectManager:
             elif var_name in user_provided_names:
                 resolution_bag[var_name] = effective_variables[var_name]
 
-            if var_name in BUILTIN_VARIABLES:
-                try:
-                    builtin_value = self._get_builtin_variable_value(var_name, project_info)
-                except (RuntimeError, NotImplementedError) as e:
-                    if not var_info.is_required:
-                        continue
-                    return GetPathForMacroResultFailure(
-                        failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
-                        result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_name}' cannot be resolved: {e}",
-                    )
-                # Confirm no monkey business with trying to override builtin values
-                existing = resolution_bag.get(var_name)
-                if existing is not None:
-                    # For directory builtin variables, compare as resolved paths
-                    builtin_info = _BUILTIN_VARIABLE_INFO.get(var_name)
-                    if builtin_info and builtin_info.is_directory:
-                        resolved_existing = resolve_path_safely(Path(str(existing)))
-                        resolved_builtin = resolve_path_safely(Path(builtin_value))
-                        if resolved_existing != resolved_builtin:
-                            disallowed_overrides.add(var_name)
-                    elif str(existing) != builtin_value:
-                        disallowed_overrides.add(var_name)
-                else:
-                    resolution_bag[var_name] = builtin_value
-
-        # Check if user tried to override builtins with different values
-        if disallowed_overrides:
+        # Merge builtins for every referenced builtin name. Shared helper enforces
+        # the "no silent override of builtins" policy: caller-supplied values that
+        # conflict with project-derived builtins are reported as conflicts.
+        referenced_names = {vi.name for vi in variable_infos}
+        builtin_resolution = self._resolve_builtins_into_bag(resolution_bag, referenced_names, project_info)
+        # A required builtin we couldn't resolve is a hard failure; an optional
+        # one is silently skipped (the macro won't render it). Surface the
+        # underlying exception text so users can tell which precondition is missing.
+        for var_info in variable_infos:
+            unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
+            if unavailable_reason is not None and var_info.is_required:
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                    result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
+                )
+        if builtin_resolution.conflicts:
             return GetPathForMacroResultFailure(
                 failure_reason=PathResolutionFailureReason.RESERVED_NAME_COLLISION,
-                conflicting_variables=disallowed_overrides,
-                result_details=f"Attempted to resolve macro path. Failed because cannot override builtin variables: {', '.join(sorted(disallowed_overrides))}",
+                conflicting_variables=builtin_resolution.conflicts,
+                result_details=f"Attempted to resolve macro path. Failed because cannot override builtin variables: {', '.join(sorted(builtin_resolution.conflicts))}",
             )
 
         # Project env vars fill any remaining referenced variable names. Precedence (high to
@@ -2933,14 +2936,54 @@ class ProjectManager:
         """Attempt to match a path against a macro schema and extract variables.
 
         Flow:
-        1. Check secrets manager is available (failure = true error)
-        2. Call ParsedMacro.extract_variables() with path and known variables
-        3. If match succeeds, return success with extracted_variables
-        4. If match fails, return success with match_failure (not an error)
+        1. Seed the variable bag with the caller's ``known_variables``.
+        2. If ``auto_resolve_builtins`` is set, inject project-derived builtins
+           via ``_resolve_builtins_into_bag``. The shared helper enforces the
+           "no silent override of builtins" policy: a caller who supplied a
+           conflicting value for a builtin gets a hard failure.
+        3. Call ParsedMacro.extract_variables() with the merged bag.
+        4. If match succeeds, return success with extracted_variables.
+        5. If match fails, return success with match_failure (not an error).
         """
+        merged_known_variables: MacroVariables = dict(request.known_variables)
+        if request.auto_resolve_builtins:
+            current_project_result = self.on_get_current_project_request(GetCurrentProjectRequest())
+            if isinstance(current_project_result, GetCurrentProjectResultSuccess):
+                resolution = self._resolve_builtins_into_bag(
+                    merged_known_variables,
+                    BUILTIN_VARIABLES,
+                    current_project_result.project_info,
+                )
+                if resolution.conflicts:
+                    return AttemptMatchPathAgainstMacroResultFailure(
+                        result_details=(
+                            f"Attempted to match path '{request.file_path}' against macro "
+                            f"'{request.parsed_macro.template}'. Failed because caller-supplied "
+                            f"known_variables conflict with project-derived builtin values: "
+                            f"{', '.join(sorted(resolution.conflicts))}"
+                        ),
+                    )
+                # POSIX-normalize auto-resolved directory builtins so reverse-match
+                # works cross-platform. Macro templates use forward-slash separators
+                # (the authoring convention); on Windows the builtins come back with
+                # backslashes and the literal-text comparison between segments would
+                # then fail. Only touch auto-resolved values — a caller who supplied
+                # their own known_variables gets them used verbatim. Non-directory
+                # builtins (workflow_name, project_name, ...) aren't paths, so they
+                # pass through untouched.
+                for builtin_name in BUILTIN_VARIABLES:
+                    if builtin_name in request.known_variables:
+                        continue
+                    builtin_info = _BUILTIN_VARIABLE_INFO.get(builtin_name)
+                    if builtin_info is None or not builtin_info.is_directory:
+                        continue
+                    value = merged_known_variables.get(builtin_name)
+                    if isinstance(value, str):
+                        merged_known_variables[builtin_name] = Path(value).as_posix()
+
         extracted = request.parsed_macro.extract_variables(
             request.file_path,
-            request.known_variables,
+            merged_known_variables,
             self._secrets_manager,
         )
 
@@ -2951,7 +2994,7 @@ class ProjectManager:
                 match_failure=MacroMatchFailure(
                     failure_reason=MacroMatchFailureReason.STATIC_TEXT_MISMATCH,
                     expected_pattern=request.parsed_macro.template,
-                    known_variables_used=request.known_variables,
+                    known_variables_used=merged_known_variables,
                     error_details=f"Path '{request.file_path}' does not match macro pattern",
                 ),
                 result_details=f"Attempted to match path '{request.file_path}' against macro '{request.parsed_macro.template}'. Pattern did not match",
@@ -2964,7 +3007,7 @@ class ProjectManager:
             result_details=f"Successfully matched path '{request.file_path}' against macro '{request.parsed_macro.template}'. Extracted {len(extracted)} variables",
         )
 
-    def on_get_state_for_macro_request(  # noqa: C901
+    def on_get_state_for_macro_request(
         self, request: GetStateForMacroRequest
     ) -> GetStateForMacroResultSuccess | GetStateForMacroResultFailure:
         """Analyze a macro and return comprehensive state information.
@@ -3001,6 +3044,24 @@ class ProjectManager:
         missing_required_variables: set[str] = set()
         conflicting_variables: set[str] = set()
 
+        # Run the shared "merge builtins, detect conflicts" pass so state analysis
+        # and actual resolution agree on what counts as a conflict (path-aware
+        # compare for directory builtins, etc.). We use a throwaway bag because
+        # state analysis reports what the caller would hit at resolve time
+        # without mutating the request.
+        referenced_names = {vi.name for vi in all_variables}
+        analysis_bag: MacroVariables = dict(request.variables)
+        builtin_resolution = self._resolve_builtins_into_bag(analysis_bag, referenced_names, project_info)
+        # An unavailable required builtin is fatal here too — mirrors the path
+        # handler so callers don't see "looks resolvable" when it actually isn't.
+        for var_info in all_variables:
+            unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
+            if unavailable_reason is not None and var_info.is_required:
+                return GetStateForMacroResultFailure(
+                    result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
+                )
+        conflicting_variables.update(builtin_resolution.conflicts)
+
         for var_info in all_variables:
             var_name = var_info.name
 
@@ -3012,21 +3073,8 @@ class ProjectManager:
             if var_name in user_provided_names:
                 satisfied_variables.add(var_name)
 
-            if var_name in BUILTIN_VARIABLES:
-                try:
-                    builtin_value = self._get_builtin_variable_value(var_name, project_info)
-                except (RuntimeError, NotImplementedError) as e:
-                    if not var_info.is_required:
-                        continue
-                    return GetStateForMacroResultFailure(
-                        result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_name}' cannot be resolved: {e}",
-                    )
-
+            if var_name in BUILTIN_VARIABLES and var_name not in builtin_resolution.unavailable:
                 satisfied_variables.add(var_name)
-                if var_name in user_provided_names:
-                    user_value = str(request.variables[var_name])
-                    if user_value != builtin_value:
-                        conflicting_variables.add(var_name)
 
             if var_info.is_required and var_name not in satisfied_variables:
                 missing_required_variables.add(var_name)
@@ -3535,6 +3583,58 @@ class ProjectManager:
                 validation.add_error(f"directories.{directory_name}.path_macro", f"Failed to parse macro: {e}")
 
         return directory_schemas
+
+    def _resolve_builtins_into_bag(
+        self,
+        bag: MacroVariables,
+        considered_names: Iterable[str],
+        project_info: ProjectInfo,
+    ) -> _BuiltinResolutionResult:
+        """Inject project-derived builtin values into ``bag``; flag any caller overrides.
+
+        Single source of truth for the policy "callers may NOT silently override
+        builtins with conflicting values." Every handler that mixes user-supplied
+        variables with builtins (path resolution, state analysis, reverse-match)
+        goes through here so the conflict-detection rule stays consistent.
+
+        For each name in ``considered_names`` that is a builtin:
+        - Resolve the builtin from ``project_info``.
+        - If ``bag`` already has a value AND it differs from the resolved builtin,
+          record a conflict (directory builtins compare as resolved paths; others
+          compare as strings).
+        - If ``bag`` has no value, inject the resolved builtin.
+        - If the builtin can't be resolved in the current context (no current
+          workflow, etc.), record the name → underlying exception in
+          ``unavailable`` and skip. Callers that treat unavailability of a
+          *required* builtin as fatal must check the unavailable map themselves
+          and surface the exception text so users can tell which precondition
+          is missing; this helper does not raise.
+
+        ``bag`` is mutated in place.
+        """
+        conflicts: set[str] = set()
+        unavailable: dict[str, Exception] = {}
+        for var_name in considered_names:
+            if var_name not in BUILTIN_VARIABLES:
+                continue
+            try:
+                builtin_value = self._get_builtin_variable_value(var_name, project_info)
+            except (RuntimeError, NotImplementedError) as e:
+                unavailable[var_name] = e
+                continue
+            existing = bag.get(var_name)
+            if existing is None:
+                bag[var_name] = builtin_value
+                continue
+            builtin_info = _BUILTIN_VARIABLE_INFO.get(var_name)
+            if builtin_info is not None and builtin_info.is_directory:
+                resolved_existing = resolve_path_safely(Path(str(existing)))
+                resolved_builtin = resolve_path_safely(Path(builtin_value))
+                if resolved_existing != resolved_builtin:
+                    conflicts.add(var_name)
+            elif str(existing) != builtin_value:
+                conflicts.add(var_name)
+        return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
     def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:  # noqa: C901
         """Get the value of a single builtin variable.
