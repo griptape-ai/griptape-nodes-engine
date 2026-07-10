@@ -8281,6 +8281,68 @@ situations:
         assert str(workspace_project_path) in str(result.result_details)
         assert "Failed because" in str(result.result_details)
 
+    @pytest.mark.asyncio
+    async def test_activate_child_seed_resolves_id_parent_registered_only_in_config(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """The app-orchestrator seam resolves a child seed's id-parent that is only registered.
+
+        This is the seam GUI boot drives (on_activate_workspace_project_request runs before
+        _load_registered_projects, so the live registry is empty). The seed's parent chain
+        must still resolve via the boot id-index that _load_workspace_project builds, so a
+        child whose parent lives only in projects_to_register inherits the parent's
+        directories on boot rather than silently dropping them.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+
+        # Child is the workspace-dir seed; only the parent is in projects_to_register, so
+        # it is NOT in the live registry when the seam runs.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\nname: Child\nid: child-xyz\nparent_project_id: 'parent-abc'\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_path)]
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        assert "prompts" in child_info.template.directories
+        # The boot id-index is boot-only and cleared once the seed load finishes.
+        assert pm._boot_id_to_file_path == {}
+
 
 class TestProjectId:
     """Tests for opaque project ids (internal#110) and id-based parent links (engine#4806).

@@ -534,10 +534,14 @@ class ProjectManager:
         self._applied_env_snapshot: dict[str, str | None] = {}
 
         # Transient id -> file path index used during boot to resolve id-based
-        # parents whose child may load before the parent. Populated by a pre-pass
-        # in _load_registered_projects and consulted by _resolve_parent_chain;
-        # empty (and ignored) outside boot, where the live registry suffices.
+        # parents whose child may load before the parent. Built by
+        # _build_boot_id_index (before the seed and again in _load_registered_projects)
+        # and consulted by _resolve_parent_chain; empty (and ignored) outside boot,
+        # where the live registry suffices. `_boot_id_index_built` guards against
+        # re-reading every overlay when the index is legitimately empty (registered
+        # files exist but none declare an id).
         self._boot_id_to_file_path: dict[str, Path] = {}
+        self._boot_id_index_built: bool = False
 
         # Register event handlers
         event_manager.assign_manager_to_request_type(LoadProjectTemplateRequest, self.on_load_project_template_request)
@@ -971,9 +975,10 @@ class ProjectManager:
         """Locate a parent project's file path from its opaque id.
 
         Checks the live registry first (the parent is normally already loaded at
-        runtime), then the transient boot index built by _load_registered_projects
-        for the child-before-parent case during startup. Returns None when the id
-        is not registered on this engine, which the caller treats as fail-closed.
+        runtime), then the transient boot index built by _build_boot_id_index
+        (during seed activation and registered-project loading) for the
+        child-before-parent case during startup. Returns None when the id is not
+        registered on this engine, which the caller treats as fail-closed.
         """
         existing = self._successfully_loaded_project_templates.get(parent_project_id)
         if existing is not None and existing.project_file_path is not None:
@@ -3390,13 +3395,6 @@ class ProjectManager:
             self._initialization_complete = True
             return
 
-        # Build the id -> path index before activating the seed. The seed loads through
-        # the shared parent-chain-aware loader, which resolves an id-based parent via this
-        # index; without it a child seed whose parent lives only in projects_to_register
-        # could not locate its parent (the registry is still empty this early in boot).
-        # _load_registered_projects clears the index in its finally below.
-        await self._build_boot_id_index()
-
         # Activate the seeded boot project first (project_file config, else the
         # workspace-default griptape-nodes-project.yml). Fall back to system defaults
         # only when there is no seed or the seed fails to load or activate.
@@ -3887,6 +3885,12 @@ class ProjectManager:
         The seed is loaded with persist_path=False: it is already discovered each boot via
         project_file / workspace default, so it must not be appended to projects_to_register.
 
+        Builds the boot id-index around the load so a child seed can resolve an id-based
+        parent that has not been loaded yet (registered only in projects_to_register, hence
+        absent from the live registry this early in boot). Both boot seams that reach here --
+        on_app_initialization_complete and on_activate_workspace_project_request -- get the
+        index for free, and the finally clears it so no stale boot state leaks into runtime.
+
         Returns a failure-detail string when a resolved project file fails to load or
         activate (the same text that is logged), or None on success or when no project
         file is present. Callers that report activation outcome use this signal directly
@@ -3898,31 +3902,38 @@ class ProjectManager:
 
         logger.debug("Found workspace project file at '%s', loading", workspace_project_path)
 
-        # Delegate load/merge/cache to the shared loader. persist_path=False keeps the
-        # seed out of projects_to_register (it is re-discovered from config each boot).
-        load_result = await self._load_and_cache_project_template(workspace_project_path, persist_path=False)
-        if isinstance(load_result, LoadProjectTemplateResultFailure):
-            logger.error(
-                "Attempted to load workspace project from '%s'. Failed with: %s",
-                workspace_project_path,
-                load_result.result_details,
-            )
-            return f"the project failed to load: {load_result.result_details}"
+        # Build the id-index so the seed's parent chain can resolve an id-based parent that
+        # is only registered (not yet loaded). Cleared in the finally so runtime parent
+        # lookups fall through to the live registry.
+        await self._build_boot_id_index()
+        try:
+            # Delegate load/merge/cache to the shared loader. persist_path=False keeps the
+            # seed out of projects_to_register (it is re-discovered from config each boot).
+            load_result = await self._load_and_cache_project_template(workspace_project_path, persist_path=False)
+            if isinstance(load_result, LoadProjectTemplateResultFailure):
+                logger.error(
+                    "Attempted to load workspace project from '%s'. Failed with: %s",
+                    workspace_project_path,
+                    load_result.result_details,
+                )
+                return f"the project failed to load: {load_result.result_details}"
 
-        project_id = load_result.project_id
-        set_request = SetCurrentProjectRequest(project_id=project_id)
-        set_result = await self.on_set_current_project_request(set_request)
+            project_id = load_result.project_id
+            set_request = SetCurrentProjectRequest(project_id=project_id)
+            set_result = await self.on_set_current_project_request(set_request)
 
-        if set_result.failed():
-            logger.error(
-                "Attempted to set workspace project '%s' as current. Failed with: %s",
-                workspace_project_path,
-                set_result.result_details,
-            )
-            return f"setting it as the current project failed: {set_result.result_details}"
+            if set_result.failed():
+                logger.error(
+                    "Attempted to set workspace project '%s' as current. Failed with: %s",
+                    workspace_project_path,
+                    set_result.result_details,
+                )
+                return f"setting it as the current project failed: {set_result.result_details}"
 
-        logger.debug("Successfully loaded workspace project from '%s'", workspace_project_path)
-        return None
+            logger.debug("Successfully loaded workspace project from '%s'", workspace_project_path)
+            return None
+        finally:
+            self._clear_boot_id_index()
 
     async def _load_registered_projects(self) -> None:
         """Load project templates from paths persisted in user config.
@@ -3982,7 +3993,7 @@ class ProjectManager:
                 await self._load_projects_from_directory(directory)
         finally:
             # The index is only meaningful during boot.
-            self._boot_id_to_file_path = {}
+            self._clear_boot_id_index()
 
     async def _build_boot_id_index(self, file_paths: list[Path] | None = None) -> None:
         """Populate `_boot_id_to_file_path` (id -> canonical path) for registered project files.
@@ -3990,13 +4001,15 @@ class ProjectManager:
         Lets `_resolve_parent_chain` locate an id-based parent even when the child is
         loaded before its parent during boot (e.g. the child is the activated seed and
         its parent is only in projects_to_register). At runtime the live registry serves
-        parent lookups, so this index is boot-only and cleared once boot loading finishes.
+        parent lookups, so this index is boot-only and cleared once each boot loader
+        finishes (see `_clear_boot_id_index`).
 
-        Idempotent: a no-op when the index is already populated, so the seed-activation
-        pre-build and the `_load_registered_projects` rebuild don't read every overlay
-        twice. `file_paths` defaults to the resolved registered file entries.
+        Idempotent within a build/clear cycle: guarded by `_boot_id_index_built` (not the
+        dict's emptiness) so a legitimately empty index -- registered files exist but none
+        declare an id -- is not rebuilt by re-reading every overlay. `file_paths` defaults
+        to the resolved registered file entries.
         """
-        if self._boot_id_to_file_path:
+        if self._boot_id_index_built:
             return
         if file_paths is None:
             registered_entries: list[str | dict | PerPlatformProjectPath] = (
@@ -4012,6 +4025,12 @@ class ProjectManager:
             _, overlay = read_load
             if overlay.id is not None:
                 self._boot_id_to_file_path[overlay.id] = canonical_path
+        self._boot_id_index_built = True
+
+    def _clear_boot_id_index(self) -> None:
+        """Reset the boot id-index and its built-guard so a later boot loader rebuilds it."""
+        self._boot_id_to_file_path = {}
+        self._boot_id_index_built = False
 
     def _resolve_registered_entry_paths(
         self, registered_entries: list[str | dict | PerPlatformProjectPath]
