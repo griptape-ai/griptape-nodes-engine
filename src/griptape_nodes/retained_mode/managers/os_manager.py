@@ -3283,8 +3283,33 @@ class OSManager:
         src_normalized = normalize_path_for_platform(src_path)
         dest_normalized = normalize_path_for_platform(dest_path)
 
-        # Copy file preserving metadata
-        shutil.copy2(src_normalized, dest_normalized)
+        # Copy file preserving metadata.
+        #
+        # We deliberately avoid shutil.copy2 here. copy2 copies the contents and
+        # then calls shutil.copystat to replicate metadata, which on BSD-derived
+        # platforms (macOS) includes BSD file flags via os.chflags(). SMB mounts
+        # surface the DOS "archive" attribute as SF_ARCHIVED, and that flag can
+        # only be set by root on a local volume -- so chflags(dst, SF_ARCHIVED)
+        # raises EPERM. copystat only swallows EOPNOTSUPP/ENOTSUP, not EPERM, so
+        # the exception propagates and the whole copy is reported as failed even
+        # though the file contents copied fine (see issue #5109).
+        #
+        # Instead, copy contents explicitly and then best-effort the metadata,
+        # ignoring an EPERM raised by the flags step so metadata that can't be
+        # replicated on the destination filesystem doesn't fail the copy.
+        shutil.copyfile(src_normalized, dest_normalized)
+        try:
+            shutil.copystat(src_normalized, dest_normalized)
+        except PermissionError:
+            # chflags() couldn't replicate BSD file flags on the destination
+            # (e.g. SF_ARCHIVED on an SMB mount). Contents and the permission
+            # bits that matter are already in place; the copy has effectively
+            # succeeded, so warn rather than fail.
+            logger.warning(
+                "Could not replicate all file metadata from %s to %s (EPERM); file contents copied successfully.",
+                src_normalized,
+                dest_normalized,
+            )
 
         # Return size of copied file
         return Path(src_normalized).stat().st_size
