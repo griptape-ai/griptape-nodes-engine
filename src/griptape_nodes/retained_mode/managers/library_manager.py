@@ -356,7 +356,6 @@ class LibraryVenvInitResult(NamedTuple):
     reused: bool
 
 
-
 class LibraryManager:
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
@@ -2495,7 +2494,7 @@ class LibraryManager:
             try:
                 venv_init = await self._init_library_venv(venv_path)
             except RuntimeError as e:
-                details = f"Attempted to install library '{request.requirement_specifier}'. Failed when creating the virtual environment: {e}"
+                details = f"Attempted to prepare the environment for library '{request.requirement_specifier}'. Failed due to: {e}"
                 return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
             library_python_venv_path = venv_init.python_path
 
@@ -6105,7 +6104,7 @@ class LibraryManager:
         metadata_result = self.load_library_metadata_from_file_request(metadata_request)
 
         if not isinstance(metadata_result, LoadLibraryMetadataFromFileResultSuccess):
-            details = f"Failed to load library metadata from {library_file_path}: {metadata_result.result_details}"
+            details = f"Attempted to read the library configuration at {library_file_path}. Failed due to: {metadata_result.result_details}"
             return InstallLibraryDependenciesResultFailure(result_details=details)
 
         library_data = metadata_result.library_schema
@@ -6125,12 +6124,12 @@ class LibraryManager:
         try:
             venv_init = await self._init_library_venv(venv_path)
         except RuntimeError as e:
-            details = f"Failed to initialize venv for library '{library_name}': {e}"
+            details = f"Attempted to prepare the environment for library '{library_name}'. Failed due to: {e}"
             return InstallLibraryDependenciesResultFailure(result_details=details)
         library_venv_python_path = venv_init.python_path
 
         if not self._can_write_to_venv_location(library_venv_python_path):
-            details = f"Venv location for library '{library_name}' at {venv_path} is not writable"
+            details = f"Attempted to set up the environment for library '{library_name}' at {venv_path}. Failed due to: the location is not writable."
             logger.warning(details)
             return InstallLibraryDependenciesResultFailure(result_details=details)
 
@@ -6139,7 +6138,7 @@ class LibraryManager:
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(Path(venv_path), min_space_gb):
             error_msg = OSManager.format_disk_space_error(Path(venv_path))
-            details = f"Insufficient disk space for dependencies (requires {min_space_gb} GB) for library '{library_name}': {error_msg}"
+            details = f"Attempted to install the components required by library '{library_name}'. Failed due to insufficient disk space (requires {min_space_gb} GB): {error_msg}"
             return InstallLibraryDependenciesResultFailure(result_details=details)
 
         if not pip_dependencies:
@@ -6173,10 +6172,13 @@ class LibraryManager:
                     library_venv_python_path, pip_dependencies, pip_install_flags, capture_output=not is_debug
                 )
         except subprocess.CalledProcessError as e:
-            details = f"Failed to install dependencies for library '{library_name}': return code={e.returncode}, stderr={e.stderr}"
+            reason = e.stderr or f"the installer exited with code {e.returncode}"
+            details = (
+                f"Attempted to install the components required by library '{library_name}'. Failed due to: {reason}"
+            )
             return InstallLibraryDependenciesResultFailure(result_details=details)
         except RuntimeError as e:
-            details = f"Failed to rebuild venv for library '{library_name}': {e}"
+            details = f"Attempted to rebuild the environment for library '{library_name}'. Failed due to: {e}"
             return InstallLibraryDependenciesResultFailure(result_details=details)
 
         details = f"Installed {len(pip_dependencies)} dependencies for library '{library_name}'"
@@ -6244,7 +6246,7 @@ class LibraryManager:
             try:
                 await asyncio.to_thread(shutil.rmtree, venv_path, onexc=OSManager.remove_readonly)
             except OSError as e:
-                msg = f"Failed to remove virtual environment at {venv_path}: {e}"
+                msg = f"the existing environment at {venv_path} could not be removed: {e}"
                 raise RuntimeError(msg) from e
         return (await self._init_library_venv(venv_path)).python_path
 

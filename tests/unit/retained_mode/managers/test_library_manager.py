@@ -1315,7 +1315,7 @@ class TestLibraryManagerVenvHealth:
                 "griptape_nodes.retained_mode.managers.library_manager.shutil.rmtree",
                 side_effect=OSError("permission denied"),
             ),
-            pytest.raises(RuntimeError, match="Failed to remove virtual environment"),
+            pytest.raises(RuntimeError, match="could not be removed"),
         ):
             await mgr._reset_and_init_library_venv(venv_path)
 
