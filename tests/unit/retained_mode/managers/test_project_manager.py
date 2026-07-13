@@ -10010,3 +10010,153 @@ class TestProjectManagerGetProjectChain:
         # __init__ registers system defaults and points the current id at them.
         chain = pm.get_project_chain()
         assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
+
+
+class TestProjectVariableEvents:
+    """ListProjectVariablesRequest and GetProjectVariableRequest handlers."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    def test_list_variables_returns_metadata_for_current_project(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectVariablesRequest,
+            ListProjectVariablesResultSuccess,
+        )
+
+        pm = self._pm()
+        result = pm.on_list_project_variables_request(ListProjectVariablesRequest())
+        assert isinstance(result, ListProjectVariablesResultSuccess)
+        # System defaults' variable layer at least holds the builtins.
+        names = {v.name for v in result.variables}
+        assert "workspace_dir" in names
+        assert "project_dir" in names
+
+    def test_list_variables_never_invokes_value(self) -> None:
+        """Even if some variables would raise on .value, metadata listing succeeds."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectVariablesRequest,
+            ListProjectVariablesResultSuccess,
+        )
+
+        pm = self._pm()
+        # Inject a computed variable that raises on read; listing must not touch it.
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable
+
+        def blow_up() -> str:
+            msg = "should never be called during metadata list"
+            raise RuntimeError(msg)
+
+        info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
+        info.variable_layer.set(ComputedFlowVariable(name="landmine", type="str", resolver=blow_up))
+
+        result = pm.on_list_project_variables_request(ListProjectVariablesRequest())
+        assert isinstance(result, ListProjectVariablesResultSuccess)
+        assert "landmine" in {v.name for v in result.variables}
+
+    def test_list_variables_unknown_project_fails(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectVariablesRequest,
+            ListProjectVariablesResultFailure,
+        )
+
+        pm = self._pm()
+        result = pm.on_list_project_variables_request(ListProjectVariablesRequest(project_id="not_loaded"))
+        assert isinstance(result, ListProjectVariablesResultFailure)
+
+    def test_get_variable_resolves_available_builtin(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultSuccess,
+        )
+
+        pm = self._pm()
+        # workspace_dir resolves off self._config_manager.workspace_path — set it via Mock.
+        pm._config_manager.workspace_path = Path("/synthetic/ws")
+        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
+        assert isinstance(result, GetProjectVariableResultSuccess)
+        assert result.variable.value == "/synthetic/ws"
+
+    def test_get_variable_missing_name_fails(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultFailure,
+        )
+
+        pm = self._pm()
+        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="not_defined_in_any_project"))
+        assert isinstance(result, GetProjectVariableResultFailure)
+
+    def test_get_variable_resolver_raises_returns_failure(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable
+
+        pm = self._pm()
+
+        def blow_up() -> str:
+            msg = "context not ready"
+            raise RuntimeError(msg)
+
+        info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
+        info.variable_layer.set(ComputedFlowVariable(name="volatile", type="str", resolver=blow_up))
+
+        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="volatile"))
+        assert isinstance(result, GetProjectVariableResultFailure)
+        assert "context not ready" in str(result.result_details)
+
+    def test_get_variable_unknown_project_fails(self) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultFailure,
+        )
+
+        pm = self._pm()
+        result = pm.on_get_project_variable_request(
+            GetProjectVariableRequest(name="workspace_dir", project_id="not_loaded")
+        )
+        assert isinstance(result, GetProjectVariableResultFailure)
+
+    def test_get_variable_success_returns_plain_flow_variable(self) -> None:
+        """Regression: Success must package a plain FlowVariable, not ComputedFlowVariable.
+
+        Live-resolving objects cannot cross the request boundary — cattrs unstructure
+        during broadcast invokes the resolver, which either crashes (if it raises) or
+        silently snapshots (dropping live semantics on the wire).
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable, FlowVariable
+
+        pm = self._pm()
+        pm._config_manager.workspace_path = Path("/synthetic/ws")
+        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
+        assert isinstance(result, GetProjectVariableResultSuccess)
+        # Must be a *plain* FlowVariable, not a ComputedFlowVariable subclass.
+        assert type(result.variable) is FlowVariable
+        assert not isinstance(result.variable, ComputedFlowVariable)
+        # And the snapshot value is preserved.
+        assert result.variable.value == "/synthetic/ws"
+
+    def test_get_variable_success_serializes_cleanly(self) -> None:
+        """Regression: the Success response must survive cattrs unstructure without invoking any resolver."""
+        from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+        from griptape_nodes.retained_mode.events.project_events import (
+            GetProjectVariableRequest,
+            GetProjectVariableResultSuccess,
+        )
+
+        pm = self._pm()
+        pm._config_manager.workspace_path = Path("/synthetic/ws")
+        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
+        assert isinstance(result, GetProjectVariableResultSuccess)
+        serialized = safe_unstructure(result)
+        assert serialized["variable"]["name"] == "workspace_dir"
+        assert serialized["variable"]["value"] == "/synthetic/ws"

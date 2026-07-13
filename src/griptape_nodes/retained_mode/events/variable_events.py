@@ -57,13 +57,16 @@ class GetVariableRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -88,13 +91,16 @@ class GetVariableValueRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -120,14 +126,17 @@ class SetVariableValueRequest(RequestPayload):
     Args:
         value: The new value to set
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     value: Any
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -150,13 +159,16 @@ class GetVariableTypeRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -182,14 +194,17 @@ class SetVariableTypeRequest(RequestPayload):
     Args:
         type: The new user-defined type (e.g., "JSON", "str", "int")
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     type: str
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -212,13 +227,16 @@ class DeleteVariableRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -242,14 +260,17 @@ class RenameVariableRequest(RequestPayload):
     Args:
         new_name: The new name for the variable
         name: Current variable name
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     new_name: str
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -272,13 +293,16 @@ class HasVariableRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -303,12 +327,16 @@ class ListVariablesRequest(RequestPayload):
     """List all variables in the specified scope.
 
     Args:
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global; use ALL to get variables from all flows for GUI enumeration)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global; use ALL to get variables from all flows for
+            GUI enumeration)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -333,13 +361,16 @@ class GetVariableDetailsRequest(RequestPayload):
 
     Args:
         name: Variable name to lookup
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     name: str
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -404,12 +435,14 @@ class ListSubstitutablesRequest(RequestPayload):
     for that.
 
     Args:
-        lookup_scope: Variable lookup strategy (default: hierarchical)
+        lookup_scope: Variable lookup strategy (default: hierarchical — flow → project → global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -433,13 +466,15 @@ class ListSubstitutablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFail
 #                                Use for anything that works with variables the
 #                                user explicitly created (variable panel, nodes).
 #
-#   ResolveSubstitutionRequest → user variables + project macros merged, as a
-#                                flat dict. Use at execution time when you need
-#                                the complete set of values that can substitute
-#                                into {VAR} tokens. Project macros are the base
-#                                layer; user variables override on conflict.
+#   ResolveSubstitutionRequest → every variable visible in scope, as a flat
+#                                dict. Use at execution time when you need the
+#                                complete set of values that can substitute
+#                                into {VAR} tokens. Uses layered resolution
+#                                (flow → project → global for HIERARCHICAL);
+#                                closer layers shadow farther ones on name
+#                                conflict.
 #
-#   ListSubstitutablesRequest  → same combined set, but as list[Substitutable]
+#   ListSubstitutablesRequest  → same layered set, but as list[Substitutable]
 #                                with source/read_only metadata. Use for any
 #                                frontend picker or autocomplete — not for
 #                                execution paths.
@@ -452,27 +487,31 @@ class ResolveSubstitutionRequest(RequestPayload):
     """Resolve the complete {VAR} substitution context for execution.
 
     USE THIS when a node is about to run and you need every value that can
-    substitute into a {VAR} token — user-defined variables and project macros
-    (workspace_dir, workflow_name, template directories, etc.) merged into one
-    dict. User variables take priority over project macros on name conflict.
+    substitute into a {VAR} token — user-defined variables plus project layer
+    entries (workspace_dir, workflow_name, template directories, etc.). Layered
+    resolution applies: closer layers shadow farther ones (flow → project →
+    global for HIERARCHICAL).
 
     DO NOT use this to inspect what variables a user has defined — use
     GetVariablesRequest for that. DO NOT use this to populate a UI picker —
     use ListSubstitutablesRequest for that (it carries source/read_only metadata).
 
     When ``names`` is non-empty, looks up each name individually and fails
-    (all-or-nothing) if any name is not found in either user vars or macros.
+    (all-or-nothing) if any name is not found in scope.
     When ``names`` is empty, returns every substitutable value in scope.
 
     Args:
         names: Specific names to retrieve. Empty means "all in scope".
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     names: list[str] = field(default_factory=list)
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -504,8 +543,9 @@ class GetVariablesRequest(RequestPayload):
 
     USE THIS when you want only the variables a user explicitly created —
     the variable panel, the GetVariable node, anything that works with the
-    user's own variable definitions. Returns a flat dict; no project macros
-    (workspace_dir, workflow_name, etc.) are included.
+    user's own variable definitions. Returns a flat dict; project layer
+    entries (workspace_dir, workflow_name, template directories, etc.) are
+    excluded.
 
     DO NOT use this at execution time when you need the full substitution
     context — use ResolveSubstitutionRequest for that.
@@ -516,13 +556,16 @@ class GetVariablesRequest(RequestPayload):
 
     Args:
         names: Specific variable names to retrieve. Empty means "all in scope".
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     names: list[str] = field(default_factory=list)
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass
@@ -550,13 +593,16 @@ class SetVariablesRequest(RequestPayload):
 
     Args:
         variables: Mapping of variable name → new value
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow, ancestor flows, then global)
+        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
+            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
+        project_id: Which project's variable layer to consult (None = current project)
     """
 
     variables: dict[str, Any]
     lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
+    project_id: str | None = None
 
 
 @dataclass

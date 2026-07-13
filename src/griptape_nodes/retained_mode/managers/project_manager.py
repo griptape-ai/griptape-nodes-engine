@@ -80,6 +80,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetProjectTemplateRequest,
     GetProjectTemplateResultFailure,
     GetProjectTemplateResultSuccess,
+    GetProjectVariableRequest,
+    GetProjectVariableResultFailure,
+    GetProjectVariableResultSuccess,
     GetSituationRequest,
     GetSituationResultFailure,
     GetSituationResultSuccess,
@@ -91,6 +94,9 @@ from griptape_nodes.retained_mode.events.project_events import (
     ImportProjectResultSuccess,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
+    ListProjectVariablesRequest,
+    ListProjectVariablesResultFailure,
+    ListProjectVariablesResultSuccess,
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultFailure,
     LoadProjectTemplateResultSuccess,
@@ -118,6 +124,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
+from griptape_nodes.retained_mode.events.variable_events import VariableDetails
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -138,7 +145,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable, FlowVariable, VariableLayer
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -589,6 +596,10 @@ class ProjectManager:
             PreviewImportProjectRequest, self.on_preview_import_project_request
         )
         event_manager.assign_manager_to_request_type(ImportProjectRequest, self.on_import_project_request)
+        event_manager.assign_manager_to_request_type(
+            ListProjectVariablesRequest, self.on_list_project_variables_request
+        )
+        event_manager.assign_manager_to_request_type(GetProjectVariableRequest, self.on_get_project_variable_request)
 
         # Register app initialization listener
         event_manager.add_listener_to_app_event(
@@ -3529,19 +3540,121 @@ class ProjectManager:
         return variables
 
     def _populate_project_variable_layer(self, project_info: ProjectInfo) -> None:
-        """(Re)populate a project's VariableLayer from its resolved substitution variables.
+        """Wire the project's variable layer with resolvers, not stored values.
 
-        Builtins and directories that can't be resolved right now are omitted —
-        matching get_project_substitution_variables' silent-skip policy. Values are
-        wrapped as FlowVariables with owning_flow_name=None (they are not flow-owned)
-        so the rest of the variables machinery treats them uniformly.
+        Called once at project load. All entries are ComputedFlowVariable and thus
+        READ_ONLY — their .value property invokes the resolver on every access, so
+        callers always see live values (workflow_dir, workflow_name, etc. reflect
+        the current context) without any cache-invalidation machinery.
+
+        Every declared name is registered even if its resolver would currently raise;
+        callers reading .value may hit exceptions when the underlying context isn't
+        ready (e.g. {workflow_dir} before the workflow is saved). Use
+        GetProjectVariableRequest to catch resolution failures at the request boundary.
         """
         project_info.variable_layer.clear()
-        for name, value in self.get_project_substitution_variables(project_info).items():
-            declared_type = "int" if isinstance(value, int) and not isinstance(value, bool) else "str"
+
+        # Builtins
+        for name in BUILTIN_VARIABLES:
             project_info.variable_layer.set(
-                FlowVariable(name=name, owning_flow_name=None, type=declared_type, value=value)
+                ComputedFlowVariable(
+                    name=name,
+                    type="str",
+                    resolver=lambda name=name, project_info=project_info: self._get_builtin_variable_value(
+                        name, project_info
+                    ),
+                )
             )
+
+        # Template directories
+        directory_resolver = self._build_variable_resolver(project_info.template, project_info)
+        for name in project_info.template.directories:
+            project_info.variable_layer.set(
+                ComputedFlowVariable(
+                    name=name,
+                    type="str",
+                    resolver=lambda name=name, r=directory_resolver: r.resolve_directory(name),
+                )
+            )
+
+    def on_list_project_variables_request(
+        self, request: ListProjectVariablesRequest
+    ) -> ListProjectVariablesResultSuccess | ListProjectVariablesResultFailure:
+        """List metadata for every variable in a project's variable layer.
+
+        No .value access — some entries may raise on read; callers use
+        GetProjectVariableRequest per name to safely resolve values.
+        """
+        project_id = request.project_id if request.project_id is not None else self._current_project_id
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return ListProjectVariablesResultFailure(
+                result_details=f"Attempted to list variables for project '{project_id}'. Failed because the project is not loaded."
+            )
+
+        details = [
+            VariableDetails(name=var.name, owning_flow_name=None, type=var.type)
+            for var in project_info.variable_layer.list()
+        ]
+        return ListProjectVariablesResultSuccess(
+            variables=details,
+            result_details=f"Successfully listed {len(details)} project variable(s).",
+        )
+
+    def on_get_project_variable_request(
+        self, request: GetProjectVariableRequest
+    ) -> GetProjectVariableResultSuccess | GetProjectVariableResultFailure:
+        """Return a single project variable, resolving its value.
+
+        Failure covers three cases: project not loaded, name not defined in this
+        project, and defined-but-resolution-raised (e.g. {workflow_dir} before
+        the workflow is saved). The result_details string distinguishes them.
+        """
+        project_id = request.project_id if request.project_id is not None else self._current_project_id
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return GetProjectVariableResultFailure(
+                result_details=(
+                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
+                    f"Failed because the project is not loaded."
+                )
+            )
+
+        variable = project_info.variable_layer.get(request.name)
+        if variable is None:
+            return GetProjectVariableResultFailure(
+                result_details=(
+                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
+                    f"Failed because no variable with that name is defined in this project."
+                )
+            )
+
+        # Resolve .value now and package a plain FlowVariable so ComputedFlowVariable
+        # never crosses the request boundary. Serialization (broadcast to UI, worker
+        # RPC) would otherwise invoke the resolver during cattrs unstructure — which
+        # either drops resolver semantics silently or crashes the broadcast if the
+        # resolver raises. Making resolution a per-request event turns those into
+        # explicit Failure responses instead.
+        try:
+            resolved_value = variable.value
+        except (RuntimeError, NotImplementedError, ValueError) as e:
+            return GetProjectVariableResultFailure(
+                result_details=(
+                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
+                    f"Failed while resolving its value: {e}"
+                )
+            )
+
+        return GetProjectVariableResultSuccess(
+            variable=FlowVariable(
+                name=variable.name,
+                owning_flow_name=variable.owning_flow_name,
+                type=variable.type,
+                value=resolved_value,
+                permission=variable.permission,
+            ),
+            result_details=f"Successfully retrieved project variable '{request.name}'.",
+        )
 
     # Helper methods (private)
 
