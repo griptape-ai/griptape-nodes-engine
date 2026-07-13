@@ -32,7 +32,10 @@ class EchoNode(DataNode):
         )
 
     def process(self) -> None:
-        self.parameter_output_values["text"] = self.get_parameter_value("text") or ""
+        if not self.get_parameter_value("text"):
+            msg = "Echo node must have text input"
+            raise ValueError(msg)
+        self.parameter_output_values["text"] = self.get_parameter_value("text")
 
 
 class TimedEchoNode(DataNode):

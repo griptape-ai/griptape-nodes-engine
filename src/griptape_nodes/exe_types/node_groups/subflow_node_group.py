@@ -122,6 +122,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             metadata=subflow_metadata,
         )
         result = GriptapeNodes.handle_request(request)
+        if isinstance(result, CreateFlowResultSuccess):
+            # Final name may be different that initial name due to de-dupe.
+            self.metadata["subflow_name"] = result.flow_name
 
         if not isinstance(result, CreateFlowResultSuccess):
             logger.warning("%s failed to create subflow '%s': %s", self.name, subflow_name, result.result_details)
