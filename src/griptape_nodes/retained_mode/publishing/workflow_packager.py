@@ -17,12 +17,15 @@ import shutil
 import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
+from urllib.parse import urlparse
+from urllib.request import url2pathname
 
 from dotenv import set_key
 from dotenv.main import DotEnv
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import HuggingFaceModelParameter
+from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
 from griptape_nodes.retained_mode.events.app_events import (
@@ -308,30 +311,34 @@ class WorkflowPackager:
             return "pypi", None
         direct_url_info = json.loads(direct_url_text)
         url = direct_url_info.get("url", "")
-        commit = None
         if url.startswith("file://"):
             git_exe = shutil.which("git")
             if git_exe is None:
                 return "file", None
+            # For editable installs, dist.locate_file("") points at the ephemeral venv's
+            # site-packages, not the source checkout. The checkout (which holds the .git
+            # metadata) is recorded in direct_url.json's url, so resolve the commit from
+            # there. `git -C ... rev-parse` also handles worktrees, whose .git is a file
+            # rather than a directory.
+            source_dir = Path(url2pathname(urlparse(url).path))
             try:
-                pkg_dir = Path(str(dist.locate_file(""))).resolve()
-                git_root = next(p for p in (pkg_dir, *pkg_dir.parents) if (p / ".git").is_dir())
                 commit = (
                     subprocess.check_output(  # noqa: S603
-                        [git_exe, "rev-parse", "--short", "HEAD"],
-                        cwd=git_root,
+                        [git_exe, "-C", str(source_dir), "rev-parse", "HEAD"],
                         stderr=subprocess.DEVNULL,
                     )
                     .decode()
                     .strip()
                 )
-            except (StopIteration, subprocess.CalledProcessError):
+            except (subprocess.CalledProcessError, OSError):
                 return "file", None
             else:
                 return "git", commit
 
         if "vcs_info" in direct_url_info:
-            commit_id = direct_url_info["vcs_info"].get("commit_id", "")[:7]
+            commit_id = direct_url_info["vcs_info"].get("commit_id", "")
+            if not commit_id:
+                return "pypi", None
             return "git", commit_id
 
         return "pypi", None
@@ -532,6 +539,18 @@ dependencies = [
                 continue
 
             dest = destination / resolved_relative
+
+            # The destination can resolve to the same file as the source when the package
+            # destination lives inside the project root (e.g. the Nuke publisher writes the
+            # bundle next to files the workflow already references). Copying a file onto
+            # itself raises SameFileError, so treat it as already-in-place and skip.
+            if canonicalize_for_identity(absolute_path) == canonicalize_for_identity(dest):
+                copied.add(absolute_path)
+                logger.info(
+                    "Static file for node '%s' is already in place; skipping copy: %s", node_name, absolute_path
+                )
+                continue
+
             if absolute_path.is_dir():
                 self.copy_tree(absolute_path, dest)
             else:

@@ -9,10 +9,11 @@ the real config system.
 import asyncio
 import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import httpx
 import pytest
-from pydantic_ai.messages import BinaryContent
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -55,11 +56,16 @@ from griptape_nodes.retained_mode.events.agent_events import (
 )
 from griptape_nodes.retained_mode.managers.agent_manager import (
     _PROTECTED_PROVIDER_NAME,
+    _SKILLS_README,
+    _UNAVAILABLE_IMAGE_PLACEHOLDER,
     _VALID_PROVIDER_TYPES,
     AgentManager,
+    ComposedPrompt,
     _ActiveRun,
     _compose_prompt,
     _friendly_list_models_error,
+    _message_has_image_url,
+    _rehydrate_history,
 )
 
 
@@ -86,6 +92,33 @@ def providers_manager(monkeypatch: pytest.MonkeyPatch) -> AgentManager:
     manager._image_model_name = IMAGE_MODEL_CHOICES[0] if IMAGE_MODEL_CHOICES else "gpt-image-1-mini"
     monkeypatch.setattr(manager, "_persist_providers", lambda: None)
     return manager
+
+
+class TestEnsureSkillsDirectory:
+    """`_ensure_skills_directory` scaffolds `.agents/skills` without ever raising."""
+
+    def test_creates_directory_and_readme(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        agent_manager._ensure_skills_directory(tmp_path)
+
+        skills_dir = tmp_path / ".agents/skills"
+        assert skills_dir.is_dir()
+        assert (skills_dir / "README.md").read_text(encoding="utf-8") == _SKILLS_README
+
+    def test_existing_readme_is_not_overwritten(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        skills_dir = tmp_path / ".agents/skills"
+        skills_dir.mkdir(parents=True)
+        readme = skills_dir / "README.md"
+        readme.write_text("user edits", encoding="utf-8")
+
+        agent_manager._ensure_skills_directory(tmp_path)
+
+        assert readme.read_text(encoding="utf-8") == "user edits"
+
+    def test_scaffold_failure_does_not_raise(self, agent_manager: AgentManager, tmp_path: Path) -> None:
+        blocker = tmp_path / "not-a-dir"
+        blocker.write_text("", encoding="utf-8")
+
+        agent_manager._ensure_skills_directory(blocker)
 
 
 class TestComposeInstructions:
@@ -210,7 +243,7 @@ class TestComposePrompt:
     async def test_no_artifacts_returns_plain_text(self, patch_get: _GetRecorder) -> None:
         result = await _compose_prompt("hello", [])
 
-        assert result == "hello"
+        assert result == ComposedPrompt(live="hello", persist="hello")
         assert patch_get.requested_urls == []
 
     @pytest.mark.asyncio
@@ -219,7 +252,7 @@ class TestComposePrompt:
 
         result = await _compose_prompt("hello", artifacts)
 
-        assert result == "hello"
+        assert result == ComposedPrompt(live="hello", persist="hello")
         assert patch_get.requested_urls == []
 
     @pytest.mark.asyncio
@@ -229,13 +262,25 @@ class TestComposePrompt:
 
         result = await _compose_prompt("look", [_image_artifact(url)])
 
-        assert isinstance(result, list)
-        assert result[0] == "look"
-        image = result[1]
+        assert isinstance(result.live, list)
+        assert result.live[0] == "look"
+        image = result.live[1]
         assert isinstance(image, BinaryContent)
         assert image.data == b"png-bytes"
         assert image.media_type == "image/png"
         assert patch_get.requested_urls == [url]
+
+    @pytest.mark.asyncio
+    async def test_persist_form_swaps_bytes_for_image_url(self, patch_get: _GetRecorder) -> None:
+        # The persisted form mirrors the live form but carries the source URL as
+        # an ImageUrl instead of the inlined bytes, keeping history small.
+        url = "http://localhost:9/workspace/cat.png"
+        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+
+        result = await _compose_prompt("look", [_image_artifact(url)])
+
+        assert result.persist == ["look", ImageUrl(url=url)]
+        assert not any(isinstance(part, BinaryContent) for part in result.persist)
 
     @pytest.mark.asyncio
     async def test_reads_request_artifact_attributes(self, patch_get: _GetRecorder) -> None:
@@ -247,8 +292,8 @@ class TestComposePrompt:
 
         result = await _compose_prompt("who is this", [artifact])
 
-        assert isinstance(result, list)
-        binary_parts = [part for part in result if isinstance(part, BinaryContent)]
+        assert isinstance(result.live, list)
+        binary_parts = [part for part in result.live if isinstance(part, BinaryContent)]
         assert len(binary_parts) == 1
         assert binary_parts[0].data == b"dog"
 
@@ -261,10 +306,10 @@ class TestComposePrompt:
 
         result = await _compose_prompt("", [_image_artifact(url)])
 
-        assert isinstance(result, list)
+        assert isinstance(result.live, list)
         # Empty text contributes no leading string element.
-        assert len(result) == 1
-        image = result[0]
+        assert len(result.live) == 1
+        image = result.live[0]
         assert isinstance(image, BinaryContent)
         assert image.media_type == "image/jpeg"
 
@@ -275,9 +320,9 @@ class TestComposePrompt:
 
         result = await _compose_prompt("hi", [_image_artifact(url)])
 
-        assert isinstance(result, list)
-        assert isinstance(result[1], BinaryContent)
-        assert result[1].media_type == "image/png"
+        assert isinstance(result.live, list)
+        assert isinstance(result.live[1], BinaryContent)
+        assert result.live[1].media_type == "image/png"
 
     @pytest.mark.asyncio
     async def test_failed_download_is_dropped(self, patch_get: _GetRecorder) -> None:
@@ -287,17 +332,129 @@ class TestComposePrompt:
 
         result = await _compose_prompt("two", [_image_artifact(bad_url), _image_artifact(ok_url)])
 
-        assert isinstance(result, list)
-        binary_parts = [part for part in result if isinstance(part, BinaryContent)]
+        assert isinstance(result.live, list)
+        binary_parts = [part for part in result.live if isinstance(part, BinaryContent)]
         assert len(binary_parts) == 1
         assert binary_parts[0].data == b"ok"
+        # The dropped attachment leaves no ImageUrl in the persisted form either.
+        assert result.persist == ["two", ImageUrl(url=ok_url)]
 
     @pytest.mark.asyncio
     async def test_all_downloads_failing_falls_back_to_text(self, patch_get: _GetRecorder) -> None:
         result = await _compose_prompt("text", [_image_artifact("http://localhost:9/workspace/gone.png")])
 
-        assert result == "text"
+        assert result == ComposedPrompt(live="text", persist="text")
         assert patch_get.requested_urls == ["http://localhost:9/workspace/gone.png"]
+
+
+class TestMessageHasImageUrl:
+    def test_true_for_user_prompt_with_image_url(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url="http://x/a.png")])])
+
+        assert _message_has_image_url(message) is True
+
+    def test_false_for_text_only_user_prompt(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content="just text")])
+
+        assert _message_has_image_url(message) is False
+
+    def test_false_for_list_content_without_image_url(self) -> None:
+        message = ModelRequest(parts=[UserPromptPart(content=["a", "b"])])
+
+        assert _message_has_image_url(message) is False
+
+
+class TestRehydrateHistory:
+    @pytest.mark.asyncio
+    async def test_text_only_history_returns_unchanged_without_downloading(self, patch_get: _GetRecorder) -> None:
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content="hello")])]
+
+        result = await _rehydrate_history(messages)
+
+        assert result is messages
+        assert patch_get.requested_urls == []
+
+    @pytest.mark.asyncio
+    async def test_image_url_is_downloaded_back_to_binary_content(self, patch_get: _GetRecorder) -> None:
+        url = "http://localhost:9/workspace/cat.png"
+        patch_get.responses[url] = httpx.Response(200, content=b"png-bytes", headers={"content-type": "image/png"})
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+
+        result = await _rehydrate_history(messages)
+
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content[0] == "look"
+        image = part.content[1]
+        assert isinstance(image, BinaryContent)
+        assert image.data == b"png-bytes"
+        assert patch_get.requested_urls == [url]
+        # The input must not be mutated: the persisted history stays an ImageUrl.
+        original_part = messages[0].parts[0]
+        assert isinstance(original_part, UserPromptPart)
+        assert isinstance(original_part.content[1], ImageUrl)
+
+    @pytest.mark.asyncio
+    async def test_failed_download_drops_the_part(self, patch_get: _GetRecorder) -> None:
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["look", ImageUrl(url=url)])])]
+
+        result = await _rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == ["look"]
+
+    @pytest.mark.asyncio
+    async def test_image_only_turn_all_failing_gets_placeholder_text(self, patch_get: _GetRecorder) -> None:
+        # An image-only turn whose every image fails must not become empty
+        # content (some providers reject an empty user message on replay).
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=[ImageUrl(url=url)])])]
+
+        result = await _rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == [_UNAVAILABLE_IMAGE_PLACEHOLDER]
+
+    @pytest.mark.asyncio
+    async def test_failed_image_with_text_keeps_text_without_placeholder(self, patch_get: _GetRecorder) -> None:
+        # When the turn still has text after a failed download, the text carries
+        # the turn: no placeholder is added.
+        url = "http://localhost:9/workspace/gone.png"
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=["hi", ImageUrl(url=url)])])]
+
+        result = await _rehydrate_history(messages)
+
+        assert patch_get.requested_urls == [url]
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        assert part.content == ["hi"]
+
+    @pytest.mark.asyncio
+    async def test_multiple_images_preserve_order_with_partial_failure(self, patch_get: _GetRecorder) -> None:
+        # Concurrent downloads must not reorder content: the surviving image
+        # keeps its slot and interleaved text stays put; the failed one drops.
+        ok_url = "http://localhost:9/workspace/ok.png"
+        bad_url = "http://localhost:9/workspace/gone.png"
+        patch_get.responses[ok_url] = httpx.Response(200, content=b"ok", headers={"content-type": "image/png"})
+        content = ["before", ImageUrl(url=bad_url), "middle", ImageUrl(url=ok_url), "after"]
+        messages: list[ModelMessage] = [ModelRequest(parts=[UserPromptPart(content=content)])]
+
+        result = await _rehydrate_history(messages)
+
+        part = result[0].parts[0]
+        assert isinstance(part, UserPromptPart)
+        # bad_url dropped; ok_url inlined; text order preserved.
+        assert part.content[0] == "before"
+        assert part.content[1] == "middle"
+        assert isinstance(part.content[2], BinaryContent)
+        assert part.content[2].data == b"ok"
+        assert part.content[3] == "after"
+        assert not any(isinstance(item, ImageUrl) for item in part.content)
 
 
 # ---------------------------------------------------------------------------
@@ -417,6 +574,27 @@ class TestCreateAgentProvider:
         assert isinstance(result, CreateAgentProviderResultFailure)
         assert "vllm" in str(result.result_details)
 
+    def test_create_persists_enabled_and_icon(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(
+                provider=CreateProviderPayload(name="home-ollama", type="ollama", enabled=False, icon="server")
+            )
+        )
+
+        assert isinstance(result, CreateAgentProviderResultSuccess)
+        created = next(p for p in providers_manager._providers if p.name == "home-ollama")
+        assert created.enabled is False
+        assert created.icon == "server"
+
+    def test_create_defaults_to_enabled(self, providers_manager: AgentManager) -> None:
+        providers_manager.on_handle_create_agent_provider_request(
+            CreateAgentProviderRequest(provider=CreateProviderPayload(name="home-ollama", type="ollama"))
+        )
+
+        created = next(p for p in providers_manager._providers if p.name == "home-ollama")
+        assert created.enabled is True
+        assert created.icon is None
+
     def test_create_all_valid_types_accepted(self, providers_manager: AgentManager) -> None:
         for provider_type in _VALID_PROVIDER_TYPES:
             unique_name = f"test-{provider_type}"
@@ -479,6 +657,56 @@ class TestUpdateAgentProvider:
 
         assert isinstance(result, UpdateAgentProviderResultFailure)
         assert "sglang" in str(result.result_details)
+
+    def test_update_toggles_enabled(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(enabled=False))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultSuccess)
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.enabled is False
+        assert updated.model == "llama3.2"  # untouched
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(enabled=True))
+        )
+
+        assert updated.enabled is True
+
+    def test_update_preserves_enabled_when_omitted(self, providers_manager: AgentManager) -> None:
+        provider = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        provider.enabled = False
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(model="phi3"))
+        )
+
+        assert provider.enabled is False
+
+    def test_update_sets_and_clears_icon(self, providers_manager: AgentManager) -> None:
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(icon="server"))
+        )
+
+        updated = next(p for p in providers_manager._providers if p.name == "my-ollama")
+        assert updated.icon == "server"
+
+        providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="my-ollama", provider=UpdateProviderPayload(icon=""))
+        )
+
+        assert updated.icon is None
+
+    def test_update_fails_when_disabling_protected_provider(self, providers_manager: AgentManager) -> None:
+        result = providers_manager.on_handle_update_agent_provider_request(
+            UpdateAgentProviderRequest(name="griptape_cloud", provider=UpdateProviderPayload(enabled=False))
+        )
+
+        assert isinstance(result, UpdateAgentProviderResultFailure)
+        assert "protected" in str(result.result_details)
+        protected = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
+        assert protected.enabled is True
 
     def test_update_valid_type_change_succeeds(self, providers_manager: AgentManager) -> None:
         result = providers_manager.on_handle_update_agent_provider_request(

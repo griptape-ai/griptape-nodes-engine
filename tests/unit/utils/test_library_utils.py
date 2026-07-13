@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -10,7 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.retained_mode.managers.settings import LibraryDownload, LibraryRegistration
-from griptape_nodes.utils.git_utils import GitCloneError
+from griptape_nodes.utils.git_utils import GitCloneError, LibraryJsonCheckout
 from griptape_nodes.utils.library_utils import (
     clone_and_get_library_version,
     filter_old_xdg_library_paths,
@@ -102,27 +103,37 @@ class TestCloneAndGetLibraryVersion:
     def test_clone_and_get_library_version_calls_sparse_checkout(self) -> None:
         """Test that clone_and_get_library_version delegates to sparse_checkout_library_json."""
         with patch("griptape_nodes.utils.library_utils.sparse_checkout_library_json") as mock_sparse:
-            mock_sparse.return_value = ("1.0.0", "abc123def456", {"metadata": {"engine_version": "0.70.0"}})
+            mock_sparse.return_value = LibraryJsonCheckout(
+                library_version="1.0.0",
+                commit_sha="abc123def456",
+                commit_datetime=None,
+                library_data={"metadata": {"engine_version": "0.70.0"}},
+            )
 
             result = clone_and_get_library_version("https://github.com/user/repo.git")
 
             mock_sparse.assert_called_once_with("https://github.com/user/repo.git", ref="HEAD")
-            assert result == ("1.0.0", "abc123def456", "0.70.0")
+            assert result == ("1.0.0", "abc123def456", "0.70.0", None)
 
     def test_clone_and_get_library_version_returns_version_commit_and_engine_version(self) -> None:
-        """Test that clone_and_get_library_version returns version, commit, and engine_version."""
+        """Test that clone_and_get_library_version returns version, commit, engine_version, and commit datetime."""
+        commit_datetime = datetime(2024, 1, 15, 12, 30, tzinfo=UTC)
         with patch("griptape_nodes.utils.library_utils.sparse_checkout_library_json") as mock_sparse:
-            mock_sparse.return_value = ("2.5.1", "def789ghi012", {"metadata": {"engine_version": "0.71.0"}})
+            mock_sparse.return_value = LibraryJsonCheckout(
+                library_version="2.5.1",
+                commit_sha="def789ghi012",
+                commit_datetime=commit_datetime,
+                library_data={"metadata": {"engine_version": "0.71.0"}},
+            )
 
             result = clone_and_get_library_version("https://github.com/user/repo.git")
 
-            # Verify returns tuple of (version, commit, engine_version)
-            assert result == ("2.5.1", "def789ghi012", "0.71.0")
-            assert isinstance(result, tuple)
-            version, commit, engine_version = result
-            assert version == "2.5.1"
-            assert commit == "def789ghi012"
-            assert engine_version == "0.71.0"
+            # Verify returns (version, commit, engine_version, commit_datetime)
+            assert result == ("2.5.1", "def789ghi012", "0.71.0", commit_datetime)
+            assert result.library_version == "2.5.1"
+            assert result.commit_sha == "def789ghi012"
+            assert result.engine_version == "0.71.0"
+            assert result.commit_datetime == commit_datetime
 
     def test_clone_and_get_library_version_propagates_errors(self) -> None:
         """Test that errors from sparse_checkout_library_json are propagated."""

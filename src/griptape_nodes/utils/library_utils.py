@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 from xdg_base_dirs import xdg_data_home
@@ -16,6 +16,9 @@ from griptape_nodes.utils.git_utils import (
     sparse_checkout_library_json,
 )
 
+if TYPE_CHECKING:
+    from datetime import datetime
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,6 +28,7 @@ class LibraryVersionInfo(NamedTuple):
     library_version: str
     commit_sha: str
     engine_version: str
+    commit_datetime: datetime | None = None
 
 
 # Mapping of old XDG library names to their git URLs
@@ -67,14 +71,19 @@ def clone_and_get_library_version(remote_url: str, ref: str = "HEAD") -> Library
         ref: The git reference (branch, tag, or commit SHA) to check. Defaults to "HEAD".
 
     Returns:
-        LibraryVersionInfo: Library version, commit SHA, and engine version from the repository.
+        LibraryVersionInfo: Library version, commit SHA, engine version, and commit datetime from the repository.
 
     Raises:
         GitCloneError: If sparse checkout fails or library metadata is invalid.
     """
-    library_version, commit_sha, library_data = sparse_checkout_library_json(remote_url, ref=ref)
-    engine_version = library_data.get("metadata", {}).get("engine_version", "")
-    return LibraryVersionInfo(library_version=library_version, commit_sha=commit_sha, engine_version=engine_version)
+    checkout = sparse_checkout_library_json(remote_url, ref=ref)
+    engine_version = checkout.library_data.get("metadata", {}).get("engine_version", "")
+    return LibraryVersionInfo(
+        library_version=checkout.library_version,
+        commit_sha=checkout.commit_sha,
+        engine_version=engine_version,
+        commit_datetime=checkout.commit_datetime,
+    )
 
 
 def filter_old_xdg_library_paths(library_paths: list[Any]) -> tuple[list[Any], set[str]]:

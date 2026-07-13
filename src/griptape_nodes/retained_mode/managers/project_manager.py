@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -41,7 +42,7 @@ from griptape_nodes.common.project_templates import (
     select_project_path,
 )
 from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_rules
-from griptape_nodes.files.file import File, FileLoadError, FileWriteError
+from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
     resolve_file_path,
@@ -141,7 +142,7 @@ from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterable
 
     from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
@@ -367,6 +368,20 @@ class ProjectInfo:
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
 
 
+@dataclass(frozen=True)
+class ProjectChainEntry:
+    """One project in a resolved ancestry chain: its id and best-effort name.
+
+    `id` is the canonical registry key. `name` is the cached template name when the
+    project's template has loaded, otherwise None. Consumers that gate on the chain
+    (e.g. a project-scoped license policy) read `id` to match a project and `name`
+    for display; both mirror the facts a single-project authorization surfaces.
+    """
+
+    id: ProjectID
+    name: str | None = None
+
+
 class _ProjectActivationOutcome(NamedTuple):
     """Result of establishing a project's config/workspace/env layers and reloading.
 
@@ -377,6 +392,21 @@ class _ProjectActivationOutcome(NamedTuple):
 
     failure: SetCurrentProjectResultFailure | None
     workspace_changed: bool
+
+
+class _BuiltinResolutionResult(NamedTuple):
+    """Outcome of merging project-derived builtins into a caller-supplied variable bag.
+
+    `conflicts` are names where the caller already had a value AND it disagreed with
+    the resolved builtin (per the project's "no silent override of builtins" policy).
+    `unavailable` maps each unavailable builtin name to the exception that explains
+    why (e.g. "No current workflow"). Callers decide separately whether
+    unavailability of a *required* builtin is fatal; when they raise, they should
+    surface the exception text so users can tell which precondition is missing.
+    """
+
+    conflicts: set[str]
+    unavailable: dict[str, Exception]
 
 
 class WorkspaceDecision(NamedTuple):
@@ -504,10 +534,14 @@ class ProjectManager:
         self._applied_env_snapshot: dict[str, str | None] = {}
 
         # Transient id -> file path index used during boot to resolve id-based
-        # parents whose child may load before the parent. Populated by a pre-pass
-        # in _load_registered_projects and consulted by _resolve_parent_chain;
-        # empty (and ignored) outside boot, where the live registry suffices.
+        # parents whose child may load before the parent. Built by
+        # _build_boot_id_index (before the seed and again in _load_registered_projects)
+        # and consulted by _resolve_parent_chain; empty (and ignored) outside boot,
+        # where the live registry suffices. `_boot_id_index_built` guards against
+        # re-reading every overlay when the index is legitimately empty (registered
+        # files exist but none declare an id).
         self._boot_id_to_file_path: dict[str, Path] = {}
+        self._boot_id_index_built: bool = False
 
         # Register event handlers
         event_manager.assign_manager_to_request_type(LoadProjectTemplateRequest, self.on_load_project_template_request)
@@ -941,9 +975,10 @@ class ProjectManager:
         """Locate a parent project's file path from its opaque id.
 
         Checks the live registry first (the parent is normally already loaded at
-        runtime), then the transient boot index built by _load_registered_projects
-        for the child-before-parent case during startup. Returns None when the id
-        is not registered on this engine, which the caller treats as fail-closed.
+        runtime), then the transient boot index built by _build_boot_id_index
+        (during seed activation and registered-project loading) for the
+        child-before-parent case during startup. Returns None when the id is not
+        registered on this engine, which the caller treats as fail-closed.
         """
         existing = self._successfully_loaded_project_templates.get(parent_project_id)
         if existing is not None and existing.project_file_path is not None:
@@ -1178,7 +1213,6 @@ class ProjectManager:
             )
 
         resolution_bag: MacroVariables = {}
-        disallowed_overrides: set[str] = set()
         # Directories and project env vars may reference each other, builtins, or shell
         # env vars via inner macros (e.g. `watch_output: "{watch_folder}/outputs"`).
         # A shared resolver caches results across both sources so nested references
@@ -1200,37 +1234,26 @@ class ProjectManager:
             elif var_name in user_provided_names:
                 resolution_bag[var_name] = effective_variables[var_name]
 
-            if var_name in BUILTIN_VARIABLES:
-                try:
-                    builtin_value = self._get_builtin_variable_value(var_name, project_info)
-                except (RuntimeError, NotImplementedError) as e:
-                    if not var_info.is_required:
-                        continue
-                    return GetPathForMacroResultFailure(
-                        failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
-                        result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_name}' cannot be resolved: {e}",
-                    )
-                # Confirm no monkey business with trying to override builtin values
-                existing = resolution_bag.get(var_name)
-                if existing is not None:
-                    # For directory builtin variables, compare as resolved paths
-                    builtin_info = _BUILTIN_VARIABLE_INFO.get(var_name)
-                    if builtin_info and builtin_info.is_directory:
-                        resolved_existing = resolve_path_safely(Path(str(existing)))
-                        resolved_builtin = resolve_path_safely(Path(builtin_value))
-                        if resolved_existing != resolved_builtin:
-                            disallowed_overrides.add(var_name)
-                    elif str(existing) != builtin_value:
-                        disallowed_overrides.add(var_name)
-                else:
-                    resolution_bag[var_name] = builtin_value
-
-        # Check if user tried to override builtins with different values
-        if disallowed_overrides:
+        # Merge builtins for every referenced builtin name. Shared helper enforces
+        # the "no silent override of builtins" policy: caller-supplied values that
+        # conflict with project-derived builtins are reported as conflicts.
+        referenced_names = {vi.name for vi in variable_infos}
+        builtin_resolution = self._resolve_builtins_into_bag(resolution_bag, referenced_names, project_info)
+        # A required builtin we couldn't resolve is a hard failure; an optional
+        # one is silently skipped (the macro won't render it). Surface the
+        # underlying exception text so users can tell which precondition is missing.
+        for var_info in variable_infos:
+            unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
+            if unavailable_reason is not None and var_info.is_required:
+                return GetPathForMacroResultFailure(
+                    failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
+                    result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
+                )
+        if builtin_resolution.conflicts:
             return GetPathForMacroResultFailure(
                 failure_reason=PathResolutionFailureReason.RESERVED_NAME_COLLISION,
-                conflicting_variables=disallowed_overrides,
-                result_details=f"Attempted to resolve macro path. Failed because cannot override builtin variables: {', '.join(sorted(disallowed_overrides))}",
+                conflicting_variables=builtin_resolution.conflicts,
+                result_details=f"Attempted to resolve macro path. Failed because cannot override builtin variables: {', '.join(sorted(builtin_resolution.conflicts))}",
             )
 
         # Project env vars fill any remaining referenced variable names. Precedence (high to
@@ -2141,6 +2164,57 @@ class ProjectManager:
         info = self._successfully_loaded_project_templates.get(project_id)
         return getattr(getattr(info, "template", None), "name", None)
 
+    def get_project_chain(self, project_id: ProjectID | None = None) -> list[ProjectChainEntry]:
+        """Resolve a project and its ancestors into an ordered, leaf-first chain.
+
+        Returns the project identified by `project_id` (the current project when
+        None) followed by each ancestor reached through the parent chain
+        (`parent_project_id`, or legacy `parent_project_path`), nearest first. Each
+        entry carries the project id and a best-effort display name (the cached
+        template name; absent when the project's template has not loaded).
+
+        This is the ancestry a project-scoped license policy is evaluated against:
+        loading or working in a child transitively pulls in every ancestor's
+        template (situations, directories, environment), so the policy is screened
+        once per entry and the child is permitted only when the policy permits the
+        child and all of its ancestors.
+
+        The walk consults only the in-memory registry (no disk I/O), in id-space
+        so an opaque GUID id and a legacy path-string id compare consistently: an
+        unregistered or unresolvable parent ends the chain, and a repeated id
+        breaks a cycle, so the result is always finite and free of duplicates. The
+        chain always has at least the starting project, even when it is not
+        registered (its id alone, no name), matching the single-project fact's
+        always-present contract.
+        """
+        start_id: ProjectID = project_id if project_id is not None else self._current_project_id
+
+        # Reverse map so a legacy parent_project_path link resolves to the parent's
+        # real (id-keyed) registry key rather than its path string, matching
+        # _check_parent_chain_cycles.
+        file_path_to_id: dict[Path, ProjectID] = {
+            info.project_file_path: pid
+            for pid, info in self._successfully_loaded_project_templates.items()
+            if info.project_file_path is not None
+        }
+
+        chain: list[ProjectChainEntry] = []
+        visited: set[ProjectID] = set()
+        current_id: ProjectID | None = start_id
+        while current_id is not None and current_id not in visited:
+            visited.add(current_id)
+            info = self._successfully_loaded_project_templates.get(current_id)
+            template = info.template if info is not None else None
+            name = getattr(template, "name", None)
+            chain.append(ProjectChainEntry(id=current_id, name=str(name) if name else None))
+            if template is None:
+                # Unregistered/legacy project: surface its id, but there is no
+                # template to read a parent link from, so the chain ends here.
+                break
+            anchor = info.project_file_path if info is not None else None
+            current_id = self._reduce_parent_link_to_id(template, anchor, file_path_to_id)
+        return chain
+
     async def on_set_current_project_request(
         self, request: SetCurrentProjectRequest
     ) -> SetCurrentProjectResultSuccess | SetCurrentProjectResultFailure:
@@ -2167,25 +2241,30 @@ class ProjectManager:
         # still hits. SYSTEM_DEFAULTS_KEY is a synthetic id and is preserved as-is.
         resolved_project_id: ProjectID = request.project_id if request.project_id is not None else SYSTEM_DEFAULTS_KEY
 
-        # License-policy checkpoint: gate activating a user project on its id. The
-        # system-defaults rest state is always allowed -- it is the fallback a
-        # failed activation rolls back to. A denial rejects the switch with the
-        # missing permissions and leaves the current project untouched (the
-        # activation below never runs).
-        if resolved_project_id != SYSTEM_DEFAULTS_KEY:
-            denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
-                AuthorizationCheckpoint(
-                    action=CheckpointAction.ACTIVATE_PROJECT,
-                    subject_type=CheckpointSubjectType.PROJECT,
-                    subject_id=resolved_project_id,
-                    attributes=self._project_checkpoint_attributes(resolved_project_id),
-                )
+        # License-policy checkpoint: gate every activation on the project id,
+        # including the system-defaults rest state. The engine bakes in no policy
+        # of its own -- it always asks and the consumer decides, which keeps this
+        # leaf-activation gate consistent with the ancestry screening that already
+        # treats the rest state as an ordinary chain entry. A consumer that wants
+        # the defaults to stay reachable permits SYSTEM_DEFAULTS_KEY (as the shipped
+        # license policies do); with no policy installed the checkpoint allows. A
+        # denial rejects the switch with the missing permissions and leaves the
+        # current project untouched (the activation below never runs). Rollback
+        # re-activates the previous project through _activate_project directly, so
+        # it never re-enters this gate.
+        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+            AuthorizationCheckpoint(
+                action=CheckpointAction.ACTIVATE_PROJECT,
+                subject_type=CheckpointSubjectType.PROJECT,
+                subject_id=resolved_project_id,
+                attributes=self._project_checkpoint_attributes(resolved_project_id),
             )
-            if denial is not None:
-                reason = denial.reason()
-                return SetCurrentProjectResultFailure(
-                    result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
-                )
+        )
+        if denial is not None:
+            reason = denial.reason()
+            return SetCurrentProjectResultFailure(
+                result_details=f"Attempted to set current project '{resolved_project_id}'. Failed because: {reason}"
+            )
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:
@@ -2862,14 +2941,54 @@ class ProjectManager:
         """Attempt to match a path against a macro schema and extract variables.
 
         Flow:
-        1. Check secrets manager is available (failure = true error)
-        2. Call ParsedMacro.extract_variables() with path and known variables
-        3. If match succeeds, return success with extracted_variables
-        4. If match fails, return success with match_failure (not an error)
+        1. Seed the variable bag with the caller's ``known_variables``.
+        2. If ``auto_resolve_builtins`` is set, inject project-derived builtins
+           via ``_resolve_builtins_into_bag``. The shared helper enforces the
+           "no silent override of builtins" policy: a caller who supplied a
+           conflicting value for a builtin gets a hard failure.
+        3. Call ParsedMacro.extract_variables() with the merged bag.
+        4. If match succeeds, return success with extracted_variables.
+        5. If match fails, return success with match_failure (not an error).
         """
+        merged_known_variables: MacroVariables = dict(request.known_variables)
+        if request.auto_resolve_builtins:
+            current_project_result = self.on_get_current_project_request(GetCurrentProjectRequest())
+            if isinstance(current_project_result, GetCurrentProjectResultSuccess):
+                resolution = self._resolve_builtins_into_bag(
+                    merged_known_variables,
+                    BUILTIN_VARIABLES,
+                    current_project_result.project_info,
+                )
+                if resolution.conflicts:
+                    return AttemptMatchPathAgainstMacroResultFailure(
+                        result_details=(
+                            f"Attempted to match path '{request.file_path}' against macro "
+                            f"'{request.parsed_macro.template}'. Failed because caller-supplied "
+                            f"known_variables conflict with project-derived builtin values: "
+                            f"{', '.join(sorted(resolution.conflicts))}"
+                        ),
+                    )
+                # POSIX-normalize auto-resolved directory builtins so reverse-match
+                # works cross-platform. Macro templates use forward-slash separators
+                # (the authoring convention); on Windows the builtins come back with
+                # backslashes and the literal-text comparison between segments would
+                # then fail. Only touch auto-resolved values — a caller who supplied
+                # their own known_variables gets them used verbatim. Non-directory
+                # builtins (workflow_name, project_name, ...) aren't paths, so they
+                # pass through untouched.
+                for builtin_name in BUILTIN_VARIABLES:
+                    if builtin_name in request.known_variables:
+                        continue
+                    builtin_info = _BUILTIN_VARIABLE_INFO.get(builtin_name)
+                    if builtin_info is None or not builtin_info.is_directory:
+                        continue
+                    value = merged_known_variables.get(builtin_name)
+                    if isinstance(value, str):
+                        merged_known_variables[builtin_name] = Path(value).as_posix()
+
         extracted = request.parsed_macro.extract_variables(
             request.file_path,
-            request.known_variables,
+            merged_known_variables,
             self._secrets_manager,
         )
 
@@ -2880,7 +2999,7 @@ class ProjectManager:
                 match_failure=MacroMatchFailure(
                     failure_reason=MacroMatchFailureReason.STATIC_TEXT_MISMATCH,
                     expected_pattern=request.parsed_macro.template,
-                    known_variables_used=request.known_variables,
+                    known_variables_used=merged_known_variables,
                     error_details=f"Path '{request.file_path}' does not match macro pattern",
                 ),
                 result_details=f"Attempted to match path '{request.file_path}' against macro '{request.parsed_macro.template}'. Pattern did not match",
@@ -2893,7 +3012,7 @@ class ProjectManager:
             result_details=f"Successfully matched path '{request.file_path}' against macro '{request.parsed_macro.template}'. Extracted {len(extracted)} variables",
         )
 
-    def on_get_state_for_macro_request(  # noqa: C901
+    def on_get_state_for_macro_request(
         self, request: GetStateForMacroRequest
     ) -> GetStateForMacroResultSuccess | GetStateForMacroResultFailure:
         """Analyze a macro and return comprehensive state information.
@@ -2930,6 +3049,24 @@ class ProjectManager:
         missing_required_variables: set[str] = set()
         conflicting_variables: set[str] = set()
 
+        # Run the shared "merge builtins, detect conflicts" pass so state analysis
+        # and actual resolution agree on what counts as a conflict (path-aware
+        # compare for directory builtins, etc.). We use a throwaway bag because
+        # state analysis reports what the caller would hit at resolve time
+        # without mutating the request.
+        referenced_names = {vi.name for vi in all_variables}
+        analysis_bag: MacroVariables = dict(request.variables)
+        builtin_resolution = self._resolve_builtins_into_bag(analysis_bag, referenced_names, project_info)
+        # An unavailable required builtin is fatal here too — mirrors the path
+        # handler so callers don't see "looks resolvable" when it actually isn't.
+        for var_info in all_variables:
+            unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
+            if unavailable_reason is not None and var_info.is_required:
+                return GetStateForMacroResultFailure(
+                    result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
+                )
+        conflicting_variables.update(builtin_resolution.conflicts)
+
         for var_info in all_variables:
             var_name = var_info.name
 
@@ -2941,21 +3078,8 @@ class ProjectManager:
             if var_name in user_provided_names:
                 satisfied_variables.add(var_name)
 
-            if var_name in BUILTIN_VARIABLES:
-                try:
-                    builtin_value = self._get_builtin_variable_value(var_name, project_info)
-                except (RuntimeError, NotImplementedError) as e:
-                    if not var_info.is_required:
-                        continue
-                    return GetStateForMacroResultFailure(
-                        result_details=f"Attempted to analyze macro state. Failed because builtin variable '{var_name}' cannot be resolved: {e}",
-                    )
-
+            if var_name in BUILTIN_VARIABLES and var_name not in builtin_resolution.unavailable:
                 satisfied_variables.add(var_name)
-                if var_name in user_provided_names:
-                    user_value = str(request.variables[var_name])
-                    if user_value != builtin_value:
-                        conflicting_variables.add(var_name)
 
             if var_info.is_required and var_name not in satisfied_variables:
                 missing_required_variables.add(var_name)
@@ -3240,13 +3364,20 @@ class ProjectManager:
         ]
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        """Load system default project template when app initializes.
+        """Activate the boot project when the app initializes.
 
-        Called by EventManager after all libraries are loaded.
-        Loads system defaults, then checks workspace for a griptape-nodes-project.yml
-        overlay file and sets it as the current project if found. If a project has
-        already been explicitly selected before this event (e.g., by a CLI executor
-        via --project-file-path), preserves that choice and skips workspace discovery.
+        Called by EventManager after all libraries are loaded. Resolves the seeded
+        boot project (the project_file config setting, else a workspace-default
+        griptape-nodes-project.yml) and activates it directly. Only when no seed is
+        present, or the seed fails to load or activate, does the engine fall back to
+        activating system defaults as the rest state. If a project has already been
+        explicitly selected before this event (e.g., by a CLI executor via
+        --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        preserves that choice and skips seed discovery.
+
+        Activating the seed before system defaults keeps a policy-locked engine bootable:
+        one whose policy denies `<system-defaults>` would otherwise abort at that gate
+        before ever reaching the project it is permitted to run.
 
         A worker boots exactly like an orchestrator: it re-derives the current project
         from the same shared on-disk config (project_file / workspace default), so it
@@ -3255,33 +3386,45 @@ class ProjectManager:
         worker honoring project_file does not "discover" a workspace griptape-nodes-project.yml
         the orchestrator chose to ignore.
         """
-        # If an explicit project was selected before init completed (e.g., by
-        # LocalWorkflowExecutor loading --project-file-path), keep it. Still load
-        # registered projects for visibility and mark init complete.
+        # If an explicit project was selected before init completed (CLI executor via
+        # --project-file-path, or the app orchestrator's ActivateWorkspaceProjectRequest),
+        # keep it: load registered projects for visibility and mark init complete.
         explicit_project_selected = self._current_project_id != SYSTEM_DEFAULTS_KEY
         if explicit_project_selected:
             await self._load_registered_projects()
             self._initialization_complete = True
             return
 
-        # Set system defaults as current project (using synthetic key for system defaults)
-        set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
-        result = await self.on_set_current_project_request(set_request)
+        # Activate the seeded boot project first (project_file config, else the
+        # workspace-default griptape-nodes-project.yml). Fall back to system defaults
+        # only when there is no seed or the seed fails to load or activate.
+        seed_project_path = self._resolve_project_file_path()
+        seed_activated = False
+        if seed_project_path is not None:
+            seed_failure = await self._load_workspace_project()
+            if seed_failure is None:
+                seed_activated = True
+            else:
+                logger.error(
+                    "Attempted to activate seeded boot project at '%s'. Failed because %s. "
+                    "Falling back to system defaults.",
+                    seed_project_path,
+                    seed_failure,
+                )
 
-        if result.failed():
-            logger.error("Failed to set default project as current: %s", result.result_details)
-            return
-
-        logger.debug("Successfully loaded default project template")
-
-        # Check workspace for an optional project overlay file
-        await self._load_workspace_project()
+        if not seed_activated:
+            set_request = SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY)
+            result = await self.on_set_current_project_request(set_request)
+            if result.failed():
+                logger.error("Failed to set default project as current: %s", result.result_details)
+                return
+            logger.debug("Successfully loaded default project template")
 
         # Load any additional project templates previously registered by the user
         await self._load_registered_projects()
 
-        # Mark initialization complete so subsequent project switches trigger
-        # workspace detection and library reload when the workspace actually changes.
+        # Subsequent project switches now trigger workspace detection and library
+        # reload when the workspace actually changes.
         self._initialization_complete = True
 
     def on_get_all_situations_for_project_request(
@@ -3298,9 +3441,13 @@ class ProjectManager:
 
         template = current_project_result.project_info.template
         situations = {situation_name: situation.macro for situation_name, situation in template.situations.items()}
+        descriptions = {
+            situation_name: (situation.description or "") for situation_name, situation in template.situations.items()
+        }
 
         return GetAllSituationsForProjectResultSuccess(
             situations=situations,
+            descriptions=descriptions,
             result_details=f"Successfully retrieved all situations. Found {len(situations)} situations",
         )
 
@@ -3354,6 +3501,26 @@ class ProjectManager:
             mapped_path=mapped_path,
             result_details=f"Successfully mapped absolute path to '{mapped_path}'",
         )
+
+    def get_project_substitution_variables(self, project_info: ProjectInfo) -> dict[str, str | int]:
+        """Return all project-level variables available for {VAR} substitution.
+
+        Collects builtin variables (workspace_dir, workflow_name, etc.) and
+        project template directories (inputs, outputs, etc.). Variables that
+        cannot be resolved in the current context (e.g. workflow_dir before a
+        workflow is saved) are silently omitted.
+        """
+        resolver = self._build_variable_resolver(project_info.template, project_info)
+        variables: dict[str, str | int] = {}
+        for name in BUILTIN_VARIABLES:
+            with contextlib.suppress(RuntimeError, NotImplementedError):
+                variables[name] = resolver._get_builtin(name)
+        for name in project_info.template.directories:
+            try:
+                variables[name] = resolver.resolve_directory(name)
+            except (RuntimeError, NotImplementedError) as e:
+                logger.debug("Skipping directory variable %r: %s", name, e)
+        return variables
 
     # Helper methods (private)
 
@@ -3421,6 +3588,58 @@ class ProjectManager:
                 validation.add_error(f"directories.{directory_name}.path_macro", f"Failed to parse macro: {e}")
 
         return directory_schemas
+
+    def _resolve_builtins_into_bag(
+        self,
+        bag: MacroVariables,
+        considered_names: Iterable[str],
+        project_info: ProjectInfo,
+    ) -> _BuiltinResolutionResult:
+        """Inject project-derived builtin values into ``bag``; flag any caller overrides.
+
+        Single source of truth for the policy "callers may NOT silently override
+        builtins with conflicting values." Every handler that mixes user-supplied
+        variables with builtins (path resolution, state analysis, reverse-match)
+        goes through here so the conflict-detection rule stays consistent.
+
+        For each name in ``considered_names`` that is a builtin:
+        - Resolve the builtin from ``project_info``.
+        - If ``bag`` already has a value AND it differs from the resolved builtin,
+          record a conflict (directory builtins compare as resolved paths; others
+          compare as strings).
+        - If ``bag`` has no value, inject the resolved builtin.
+        - If the builtin can't be resolved in the current context (no current
+          workflow, etc.), record the name → underlying exception in
+          ``unavailable`` and skip. Callers that treat unavailability of a
+          *required* builtin as fatal must check the unavailable map themselves
+          and surface the exception text so users can tell which precondition
+          is missing; this helper does not raise.
+
+        ``bag`` is mutated in place.
+        """
+        conflicts: set[str] = set()
+        unavailable: dict[str, Exception] = {}
+        for var_name in considered_names:
+            if var_name not in BUILTIN_VARIABLES:
+                continue
+            try:
+                builtin_value = self._get_builtin_variable_value(var_name, project_info)
+            except (RuntimeError, NotImplementedError) as e:
+                unavailable[var_name] = e
+                continue
+            existing = bag.get(var_name)
+            if existing is None:
+                bag[var_name] = builtin_value
+                continue
+            builtin_info = _BUILTIN_VARIABLE_INFO.get(var_name)
+            if builtin_info is not None and builtin_info.is_directory:
+                resolved_existing = resolve_path_safely(Path(str(existing)))
+                resolved_builtin = resolve_path_safely(Path(builtin_value))
+                if resolved_existing != resolved_builtin:
+                    conflicts.add(var_name)
+            elif str(existing) != builtin_value:
+                conflicts.add(var_name)
+        return _BuiltinResolutionResult(conflicts=conflicts, unavailable=unavailable)
 
     def _get_builtin_variable_value(self, var_name: str, project_info: ProjectInfo) -> str:  # noqa: C901
         """Get the value of a single builtin variable.
@@ -3654,12 +3873,23 @@ class ProjectManager:
 
         return workspace_project_path
 
-    async def _load_workspace_project(self) -> str | None:  # noqa: PLR0911
-        """Load workspace-level project template overlay if present.
+    async def _load_workspace_project(self) -> str | None:
+        """Load the seeded boot project (project_file config, else workspace default) if present.
 
-        Checks for a project file using _resolve_project_file_path. If found, loads
-        it as an overlay on top of system defaults and sets it as the current project.
-        If no file is found, the system defaults remain current.
+        Checks for a project file using _resolve_project_file_path. If found, loads it
+        through the shared _load_and_cache_project_template loader -- so it resolves the
+        parent chain, runs the id-collision guard, parses macros, and applies the
+        LOAD_PROJECT license checkpoint exactly like every other project -- then sets it
+        as the current project. If no file is found, the system defaults remain current.
+
+        The seed is loaded with persist_path=False: it is already discovered each boot via
+        project_file / workspace default, so it must not be appended to projects_to_register.
+
+        Builds the boot id-index around the load so a child seed can resolve an id-based
+        parent that has not been loaded yet (registered only in projects_to_register, hence
+        absent from the live registry this early in boot). Both boot seams that reach here --
+        on_app_initialization_complete and on_activate_workspace_project_request -- get the
+        index for free, and the finally clears it so no stale boot state leaks into runtime.
 
         Returns a failure-detail string when a resolved project file fails to load or
         activate (the same text that is logged), or None on success or when no project
@@ -3670,94 +3900,42 @@ class ProjectManager:
         if workspace_project_path is None:
             return None
 
-        workspace_project_path = workspace_project_path.resolve()
         logger.debug("Found workspace project file at '%s', loading", workspace_project_path)
 
+        # Build the id-index so the seed's parent chain can resolve an id-based parent that
+        # is only registered (not yet loaded). Inside the try so a raise mid-build still hits
+        # the finally clear; cleared after so runtime parent lookups fall through to the
+        # live registry.
         try:
-            yaml_text = await File(str(workspace_project_path)).aread_text()
-        except FileLoadError as e:
-            logger.error(
-                "Attempted to read workspace project file at '%s'. Failed with: %s",
-                workspace_project_path,
-                e.result_details,
-            )
-            return f"the project file could not be read: {e.result_details}"
+            await self._build_boot_id_index()
 
-        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        overlay = load_partial_project_template(yaml_text, validation)
+            # Delegate load/merge/cache to the shared loader. persist_path=False keeps the
+            # seed out of projects_to_register (it is re-discovered from config each boot).
+            load_result = await self._load_and_cache_project_template(workspace_project_path, persist_path=False)
+            if isinstance(load_result, LoadProjectTemplateResultFailure):
+                logger.error(
+                    "Attempted to load workspace project from '%s'. Failed with: %s",
+                    workspace_project_path,
+                    load_result.result_details,
+                )
+                return f"the project failed to load: {load_result.result_details}"
 
-        if overlay is None:
-            logger.error(
-                "Attempted to load workspace project from '%s'. Failed because YAML could not be parsed",
-                workspace_project_path,
-            )
-            return "the project YAML could not be parsed"
+            project_id = load_result.project_id
+            set_request = SetCurrentProjectRequest(project_id=project_id)
+            set_result = await self.on_set_current_project_request(set_request)
 
-        # Derive the project id (the registry key). An explicit overlay id wins;
-        # a legacy project with no id falls back to the file path string. From
-        # here on the id identifies the project and the path is only a locator.
-        project_id = overlay.id if overlay.id is not None else str(workspace_project_path)
+            if set_result.failed():
+                logger.error(
+                    "Attempted to set workspace project '%s' as current. Failed with: %s",
+                    workspace_project_path,
+                    set_result.result_details,
+                )
+                return f"setting it as the current project failed: {set_result.result_details}"
 
-        # Fail closed on an id collision: a *different* file already holds this
-        # id. Reloading the same file (same id, same path) is a no-op refresh.
-        existing = self._successfully_loaded_project_templates.get(project_id)
-        if existing is not None and existing.project_file_path != workspace_project_path:
-            logger.error(
-                "Attempted to load workspace project from '%s'. Failed because its id '%s' is already used by a "
-                "different project at '%s'.",
-                workspace_project_path,
-                project_id,
-                existing.project_file_path,
-            )
-            return f"its id '{project_id}' is already used by a different project at '{existing.project_file_path}'"
-
-        template = ProjectTemplate.merge(
-            default_template_for_version(overlay.project_template_schema_version), overlay, validation
-        )
-
-        if not validation.is_usable():
-            problem_details = "; ".join(
-                f"{p.field_path} (line {p.line_number}): {p.message}"
-                if p.line_number is not None
-                else f"{p.field_path}: {p.message}"
-                for p in validation.problems
-            )
-            logger.error(
-                "Attempted to load workspace project from '%s'. Failed because template is not usable (status: %s). Problems: %s",
-                workspace_project_path,
-                validation.status,
-                problem_details,
-            )
-            return f"the project template is not usable (status: {validation.status}). Problems: {problem_details}"
-
-        situation_schemas = self._parse_situation_macros(template.situations, validation)
-        directory_schemas = self._parse_directory_macros(template.directories, validation)
-
-        project_info = ProjectInfo(
-            project_id=project_id,
-            project_file_path=workspace_project_path,
-            project_base_dir=workspace_project_path.parent,
-            template=template,
-            validation=validation,
-            parsed_situation_schemas=situation_schemas,
-            parsed_directory_schemas=directory_schemas,
-        )
-        self._successfully_loaded_project_templates[project_id] = project_info
-        self._registered_template_status[workspace_project_path] = validation
-
-        set_request = SetCurrentProjectRequest(project_id=project_id)
-        set_result = await self.on_set_current_project_request(set_request)
-
-        if set_result.failed():
-            logger.error(
-                "Attempted to set workspace project '%s' as current. Failed with: %s",
-                workspace_project_path,
-                set_result.result_details,
-            )
-            return f"setting it as the current project failed: {set_result.result_details}"
-
-        logger.debug("Successfully loaded workspace project from '%s'", workspace_project_path)
-        return None
+            logger.debug("Successfully loaded workspace project from '%s'", workspace_project_path)
+            return None
+        finally:
+            self._clear_boot_id_index()
 
     async def _load_registered_projects(self) -> None:
         """Load project templates from paths persisted in user config.
@@ -3784,17 +3962,12 @@ class ProjectManager:
         directory_paths = [path for path in resolved_paths if path.is_dir()]
         file_paths = [path for path in resolved_paths if not path.is_dir()]
 
-        # Pre-pass: index id -> canonical path so child-before-parent ordering
-        # still resolves id-based parents (which carry no path) during the load
-        # loop below.
-        self._boot_id_to_file_path = {}
-        for canonical_path in file_paths:
-            read_load = await self._read_overlay(canonical_path)
-            if isinstance(read_load, LoadProjectTemplateResultFailure):
-                continue
-            _, overlay = read_load
-            if overlay.id is not None:
-                self._boot_id_to_file_path[overlay.id] = canonical_path
+        # Ensure the id -> canonical path index is built so child-before-parent
+        # ordering resolves id-based parents (which carry no path) during the load
+        # loop below. on_app_initialization_complete may have already built it
+        # before activating the boot seed; _build_boot_id_index is idempotent and
+        # a no-op when the index is already populated.
+        await self._build_boot_id_index(file_paths)
 
         try:
             for canonical_path in file_paths:
@@ -3822,7 +3995,44 @@ class ProjectManager:
                 await self._load_projects_from_directory(directory)
         finally:
             # The index is only meaningful during boot.
-            self._boot_id_to_file_path = {}
+            self._clear_boot_id_index()
+
+    async def _build_boot_id_index(self, file_paths: list[Path] | None = None) -> None:
+        """Populate `_boot_id_to_file_path` (id -> canonical path) for registered project files.
+
+        Lets `_resolve_parent_chain` locate an id-based parent even when the child is
+        loaded before its parent during boot (e.g. the child is the activated seed and
+        its parent is only in projects_to_register). At runtime the live registry serves
+        parent lookups, so this index is boot-only and cleared once each boot loader
+        finishes (see `_clear_boot_id_index`).
+
+        Idempotent within a build/clear cycle: guarded by `_boot_id_index_built` (not the
+        dict's emptiness) so a legitimately empty index -- registered files exist but none
+        declare an id -- is not rebuilt by re-reading every overlay. `file_paths` defaults
+        to the resolved registered file entries.
+        """
+        if self._boot_id_index_built:
+            return
+        if file_paths is None:
+            registered_entries: list[str | dict | PerPlatformProjectPath] = (
+                self._config_manager.get_config_value(PROJECTS_TO_REGISTER_KEY, default=[]) or []
+            )
+            resolved_paths = self._resolve_registered_entry_paths(registered_entries)
+            file_paths = [path for path in resolved_paths if not path.is_dir()]
+
+        for canonical_path in file_paths:
+            read_load = await self._read_overlay(canonical_path)
+            if isinstance(read_load, LoadProjectTemplateResultFailure):
+                continue
+            _, overlay = read_load
+            if overlay.id is not None:
+                self._boot_id_to_file_path[overlay.id] = canonical_path
+        self._boot_id_index_built = True
+
+    def _clear_boot_id_index(self) -> None:
+        """Reset the boot id-index and its built-guard so a later boot loader rebuilds it."""
+        self._boot_id_to_file_path = {}
+        self._boot_id_index_built = False
 
     def _resolve_registered_entry_paths(
         self, registered_entries: list[str | dict | PerPlatformProjectPath]

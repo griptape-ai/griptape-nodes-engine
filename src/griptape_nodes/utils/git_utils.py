@@ -6,8 +6,9 @@ import json
 import logging
 import subprocess
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import NamedTuple
+from typing import NamedTuple, cast
 from urllib.parse import urlparse
 
 import pygit2
@@ -53,6 +54,44 @@ class GitUrlWithRef(NamedTuple):
 
     url: str
     ref: str | None
+
+
+class LibraryJsonCheckout(NamedTuple):
+    """Result of fetching a library's JSON metadata from a git remote.
+
+    ``commit_datetime`` is the timezone-aware timestamp of the checked-out commit, or None when
+    it could not be determined.
+    """
+
+    library_version: str
+    commit_sha: str
+    commit_datetime: datetime | None
+    library_data: dict
+
+
+def parse_commit_datetime(iso_string: str) -> datetime | None:
+    """Parse a git commit timestamp in strict ISO 8601 form into a timezone-aware datetime.
+
+    Args:
+        iso_string: The commit timestamp string (e.g. from ``git log --format=%cI``).
+
+    Returns:
+        A timezone-aware datetime, or None if the string is empty or cannot be parsed. Naive
+        timestamps are assumed to be UTC.
+    """
+    iso_string = iso_string.strip()
+    if not iso_string:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(iso_string)
+    except ValueError:
+        logger.debug("Failed to parse git commit datetime %r", iso_string)
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def is_git_url(url: str) -> bool:
@@ -1128,7 +1167,7 @@ def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
     return library_data["metadata"]["library_version"]
 
 
-def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, dict]:
+def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> LibraryJsonCheckout:
     """Perform sparse checkout using git CLI to fetch only library JSON file.
 
     This is the most efficient method as it only downloads files matching the sparse
@@ -1139,7 +1178,7 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, 
         ref: The git reference (branch, tag, or commit) to checkout.
 
     Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
+        LibraryJsonCheckout: The library version, commit SHA, commit datetime, and library data.
 
     Raises:
         GitCloneError: If sparse checkout fails or library metadata is invalid.
@@ -1205,6 +1244,21 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, 
             )
             commit_sha = rev_parse_result.stdout.strip()
 
+            # Get the committer date of the checked-out commit (strict ISO 8601). This is a
+            # best-effort field for the update age gate; a failure here must not fail the whole
+            # checkout, which backs the core version-check path, so degrade to None on error
+            # (mirroring the pygit2 path below).
+            commit_datetime = None
+            try:
+                commit_date_result = _run_git_command(
+                    ["git", "log", "-1", "--format=%cI", "HEAD"],
+                    temp_dir,
+                    "Git log failed",
+                )
+                commit_datetime = parse_commit_datetime(commit_date_result.stdout.strip())
+            except GitCloneError as e:
+                logger.debug("Failed to read commit datetime from sparse checkout of %s: %s", remote_url, e)
+
             # Read the JSON data before temp directory is deleted
             try:
                 with library_json_path.open(encoding="utf-8") as f:
@@ -1217,10 +1271,15 @@ def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, 
             msg = f"Subprocess error during sparse checkout from {remote_url}: {e}"
             raise GitCloneError(msg) from e
 
-        return (library_version, commit_sha, library_data)
+        return LibraryJsonCheckout(
+            library_version=library_version,
+            commit_sha=commit_sha,
+            commit_datetime=commit_datetime,
+            library_data=library_data,
+        )
 
 
-def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dict]:
+def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> LibraryJsonCheckout:
     """Perform shallow clone using pygit2 to fetch library JSON file.
 
     This is a fallback method when git CLI is not available. It downloads all files
@@ -1231,7 +1290,7 @@ def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dic
         ref: The git reference (branch, tag, or commit) to checkout.
 
     Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
+        LibraryJsonCheckout: The library version, commit SHA, commit datetime, and library data.
 
     Raises:
         GitCloneError: If clone fails or library metadata is invalid.
@@ -1284,6 +1343,16 @@ def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dic
             # Get commit SHA
             commit_sha = str(repo.head.target)
 
+            # Get the committer date of the checked-out commit. Peel to a commit first: for an
+            # annotated tag repo.head.target is the tag OID, and indexing it yields a pygit2.Tag
+            # (no commit_time). This is a best-effort field, so any failure degrades to None.
+            commit_datetime = None
+            try:
+                commit_obj = cast("pygit2.Commit", repo[repo.head.target].peel(pygit2.Commit))
+                commit_datetime = datetime.fromtimestamp(commit_obj.commit_time, tz=UTC)
+            except (pygit2.GitError, KeyError, AttributeError, ValueError, OverflowError, OSError) as e:
+                logger.debug("Failed to read commit datetime from clone of %s: %s", remote_url, e)
+
             # Read the JSON data before temp directory is deleted
             try:
                 with library_json_path.open(encoding="utf-8") as f:
@@ -1301,10 +1370,15 @@ def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dic
             if repo is not None:
                 repo.free()
 
-        return (library_version, commit_sha, library_data)
+        return LibraryJsonCheckout(
+            library_version=library_version,
+            commit_sha=commit_sha,
+            commit_datetime=commit_datetime,
+            library_data=library_data,
+        )
 
 
-def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> tuple[str, str, dict]:
+def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJsonCheckout:
     """Fetch library JSON file from a git repository.
 
     This function uses the most efficient method available:
@@ -1316,7 +1390,7 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> tuple[st
         ref: The git reference (branch, tag, or commit) to checkout. Defaults to HEAD.
 
     Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
+        LibraryJsonCheckout: The library version, commit SHA, commit datetime, and library data.
 
     Raises:
         GitCloneError: If the operation fails or library metadata is invalid.

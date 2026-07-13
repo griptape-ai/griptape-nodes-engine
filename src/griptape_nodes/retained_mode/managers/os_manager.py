@@ -8,10 +8,11 @@ import shutil
 import stat
 import subprocess
 import sys
+import uuid
 from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import anyio
 import portalocker
@@ -30,6 +31,7 @@ from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailure
 from griptape_nodes.common.macro_parser.formats import NumericPaddingFormat, SequenceFormat
 from griptape_nodes.common.macro_parser.resolution import partial_resolve
 from griptape_nodes.common.macro_parser.segments import ParsedStaticValue, ParsedVariable
+from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.common.sequences import (
     InvalidSubsetBoundsError,
     InvalidTemplateError,
@@ -120,10 +122,15 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileRequest,
     WriteFileResultFailure,
     WriteFileResultSuccess,
+    WriteTempFileRequest,
+    WriteTempFileResultFailure,
+    WriteTempFileResultSuccess,
 )
 from griptape_nodes.retained_mode.events.project_events import (
     GetPathForMacroRequest,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultSuccess,
     MacroPath,
 )
 from griptape_nodes.retained_mode.events.resource_events import (
@@ -134,10 +141,14 @@ from griptape_nodes.retained_mode.events.resource_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes, logger
+from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
 from griptape_nodes.retained_mode.managers.resource_types.cpu_resource import CPUResourceType
 from griptape_nodes.retained_mode.managers.resource_types.os_resource import Architecture, OSResourceType, Platform
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 # File is not in static directory (or not a local file), create small preview
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
@@ -232,6 +243,30 @@ class FilePathValidationError(Exception):
         """
         super().__init__(message)
         self.reason = reason
+
+
+class StagingFailedError(Exception):
+    """Raised when ``OSManager._stage_bytes_at_temp`` cannot land bytes on disk.
+
+    The on-disk vet path catches this to fail closed: if the bytes cannot even
+    be staged for inspection, the write cannot be verified as compliant and
+    must be refused. Carries the ``FileIOFailureReason`` that would have
+    appeared in a ``WriteTempFileResultFailure`` so the public
+    ``on_write_temp_file_request`` handler can preserve the failure reason
+    when translating the exception back into a request result.
+    """
+
+    def __init__(self, message: str, failure_reason: FileIOFailureReason) -> None:
+        super().__init__(message)
+        self.failure_reason = failure_reason
+
+
+@dataclass(frozen=True)
+class _StagedTempOutcome:
+    """Result of ``OSManager._stage_bytes_at_temp`` on the success path."""
+
+    staged_path: str
+    bytes_written: int
 
 
 @dataclass
@@ -373,6 +408,10 @@ class OSManager:
 
             event_manager.assign_manager_to_request_type(
                 request_type=WriteFileRequest, callback=self.on_write_file_request
+            )
+
+            event_manager.assign_manager_to_request_type(
+                request_type=WriteTempFileRequest, callback=self.on_write_temp_file_request
             )
 
             event_manager.assign_manager_to_request_type(
@@ -1199,18 +1238,24 @@ class OSManager:
         None, the caller walks *its* slot (using ProjectManager so unresolved project
         directories like ``{outputs}`` get substituted each iteration).
 
-        When the caller passed a MacroPath whose unresolved variable carries a
-        ``NumericPaddingFormat`` — required ``{x:NN}`` OR optional ``{x?:NN}`` — we
-        walk that slot against the user's ORIGINAL macro. Incrementing it produces
-        consistent zero-padded width across the sequence (``v001 → v002 → v003``).
+        When the caller passed a MacroPath whose macro carries a sequence-slot marker
+        (``SequenceFormat`` from ``{###}`` shorthand, or legacy ``NumericPaddingFormat``
+        from ``{x:NN}`` / ``{x?:NN}``), AND regardless of whether the caller pre-bound
+        that slot, we walk that slot against the user's ORIGINAL macro. Incrementing it
+        produces consistent zero-padded width across the sequence
+        (``v001 → v002 → v003``). Discrimination goes through ``_has_sequence_slot_marker``
+        so both marker types are recognized uniformly.
 
-        The ``is_required`` distinction matters for the SEED step (we only seed required
-        slots; optional slots happily resolve as omitted on the first attempt). It does
-        NOT matter for the walk: by the time we're in collision-fallback the first
-        attempt has already failed via "file exists," and the user's intent for either
-        shape is "give me a padded index here." Walking either kind closes #4544 and
-        #4092 — optional ``{_index?:03}`` collisions previously rendered as ``_1``
-        (unpadded suffix injection) instead of ``_001`` (padded walk).
+        The bound/unbound distinction matters for *starting* the walk (see the
+        start-index logic in ``on_write_file_request``'s CREATE_NEW arm) but not for
+        *selecting* the slot: by the time we're in collision-fallback the first
+        attempt has already failed via "file exists," and the user's intent for any
+        padded slot is "give me a padded index here." Walking unbound padded slots
+        keeps optional collisions in their padded form (``_001`` instead of ``_1``);
+        walking bound padded slots covers the reverse-match case — a matched file
+        whose variables came back from ``ParsedMacro.extract_variables`` lands here
+        with the index slot bound, and we still want ``v007 → v008`` instead of
+        ``v007_1``.
 
         Otherwise (plain string path, or a MacroPath without ANY padded slot), fall
         back to ``_convert_str_path_to_macro_with_index`` which synthesizes
@@ -1218,11 +1263,13 @@ class OSManager:
         """
         if isinstance(request.file_path, MacroPath):
             for segment in request.file_path.parsed_macro.segments:
-                if (
-                    isinstance(segment, ParsedVariable)
-                    and segment.info.name not in request.file_path.variables
-                    and OSManager._has_sequence_slot_marker(segment)
-                ):
+                # `_has_sequence_slot_marker` recognizes both `SequenceFormat` (from
+                # `{###}` shorthand) and legacy `NumericPaddingFormat` (from `{x:NN}`)
+                # as sequence-slot markers. We do NOT gate on "not already bound" —
+                # the reverse-match flow (#4956) intentionally binds `_index` in the
+                # variables dict before landing here, and we still want that slot to
+                # be the one we walk forward on collision.
+                if isinstance(segment, ParsedVariable) and OSManager._has_sequence_slot_marker(segment):
                     return request.file_path, segment
         return self._convert_str_path_to_macro_with_index(str(file_path)), None
 
@@ -2379,18 +2426,56 @@ class OSManager:
                 result_details=msg,
             )
 
-        # Sniff bytes ONCE and align the destination suffix to the sniffed format
-        # before any scan, write, or candidate generation runs. Without this, the
-        # scan globs the template's suffix while the post-write rename moves the
-        # file to the sniffed suffix; the next CREATE_NEW save with the same bytes
-        # globs the wrong family, returns an already-used index, writes, and the
-        # rename clobbers the prior save. (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
+        # Sniff bytes ONCE up front. The sniffed format drives two independent
+        # decisions -- the codec-permission vet (which must run even for
+        # extension-less destinations) and the extension-coercion planner
+        # (only relevant when there IS a destination extension to reconcile).
+        # ``sniff_extension`` returns None for non-bytes content, so a non-None
+        # sniffed_ext also implies ``request.content`` is bytes; downstream code
+        # relies on that.
+        sniffed_ext = (
+            GriptapeNodes.ArtifactManager().sniff_extension(request.content)
+            if isinstance(request.content, bytes)
+            else None
+        )
+
+        # Write vet. Runs BEFORE extension coercion so an extension-less
+        # destination (e.g. "movie") does not silently bypass the gate --
+        # sniff on bytes is independent of the destination suffix. Appends
+        # skip the vet: the tail alone has no container header to classify.
+        # Whether the vet actually does any work is the provider's call:
+        # opting out is a single ``None`` return in ``get_write_vetting_policy``,
+        # short-circuited inside ``_run_write_vet``.
+        if sniffed_ext is not None and not request.append:
+            vet_failure = self._run_write_vet(
+                content=request.content,  # type: ignore[arg-type]
+                sniffed_ext=sniffed_ext,
+                file_path=file_path,
+                caller_variables=request.file_path.variables if isinstance(request.file_path, MacroPath) else None,
+            )
+            if vet_failure is not None:
+                return vet_failure
+
+        # Align the destination suffix to the sniffed format before any scan,
+        # write, or candidate generation runs. Without this, the scan globs
+        # the template's suffix while the post-write rename moves the file to
+        # the sniffed suffix; the next CREATE_NEW save with the same bytes
+        # globs the wrong family, returns an already-used index, writes, and
+        # the rename clobbers the prior save.
+        # (https://github.com/griptape-ai/griptape-nodes-engine/issues/4924)
         # Strict mode fails here before touching the disk.
-        alignment = self._apply_extension_coercion(request, file_path)
+        alignment = self._apply_extension_coercion(request, file_path, sniffed_ext)
         if isinstance(alignment, WriteFileResultFailure):
             return alignment
-        sniffed_ext = alignment.sniffed_ext
         file_path = alignment.aligned_path
+        # ``alignment.sniffed_ext`` is the *swap-only* signal: non-None only
+        # when the on-disk suffix was actually rewritten. Do NOT reuse the raw
+        # ``sniffed_ext`` local for on-disk-name-sensitive downstream code
+        # (indexed-fallback walk, sidecar update). The raw sniff is truthy
+        # for alias pairs too (jpg/jpeg, tif/tiff, m4v/mp4), where the file
+        # lands at the caller's requested suffix and downstream consumers
+        # would otherwise disagree with the on-disk name.
+        swapped_ext = alignment.sniffed_ext
 
         # Normalize path
         normalized_path = normalize_path_for_platform(file_path)
@@ -2520,20 +2605,37 @@ class OSManager:
                     #    via `_resolve_macro_path_to_string` so project directories get
                     #    substituted. Skip the filesystem scan; just walk forward.
                     #
-                    #    Starting index depends on whether the seed already tried index=1:
-                    #    - Required `{x:NN}`: seed in COMMON SETUP assigned 1 → start at 2.
-                    #    - Optional `{x?:NN}`: seed didn't fire (it's gated on required);
-                    #      the first attempt resolved with the slot OMITTED → start at 1
-                    #      so this loop is the FIRST place we try a value.
+                    #    Three starting-index cases depending on whether the slot was
+                    #    bound at request time, and (if unbound) whether the seed gate
+                    #    in COMMON SETUP already tried 1:
+                    #    - Bound to value N (caller reverse-matched an existing file,
+                    #      e.g. `_index=7` from `my_file_v007.py`): start at N+1.
+                    #      The slot's value is the "current version"; we want the next.
+                    #    - Required `{x:NN}` unbound: seed in COMMON SETUP assigned 1 →
+                    #      start at 2.
+                    #    - Optional `{x?:NN}` unbound: seed didn't fire (it's gated on
+                    #      required); the first attempt resolved with the slot OMITTED
+                    #      → start at 1 so this loop is the FIRST place we try a value.
                     # B. Synthesized MacroPath from `_convert_str_path_to_macro_with_index`
                     #    — variables is empty, template is fully static except `{_index}`.
                     #    Run the existing scan to find a starting index (`output.png`
                     #    exists, scan finds `output_1.png`, …, `output_4.png`, returns 5).
                     walking_original = padded_index_var is not None
                     if walking_original:
-                        # padded_index_var is the var the walk targets. is_required tells
-                        # us whether the seed already tried 1 in COMMON SETUP.
-                        start_idx = 2 if padded_index_var.info.is_required else 1
+                        # padded_index_var is the var the walk targets. Three cases:
+                        bound_value = (
+                            request.file_path.variables.get(padded_index_var.info.name)
+                            if isinstance(request.file_path, MacroPath)
+                            else None
+                        )
+                        if isinstance(bound_value, int):
+                            start_idx = bound_value + 1
+                        elif padded_index_var.info.is_required:
+                            # Seed already tried 1 in COMMON SETUP.
+                            start_idx = 2
+                        else:
+                            # Optional + unbound: seed didn't fire; this loop is the first try.
+                            start_idx = 1
                     else:
                         starting_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
                         start_idx = starting_index if starting_index is not None else 1
@@ -2602,9 +2704,13 @@ class OSManager:
                         # try-first attempt. The synthesized-macro path inherits this
                         # because its template comes from the already-swapped file_path;
                         # the walking-original path uses the user's original suffix and
-                        # needs this swap every iteration.
-                        if sniffed_ext is not None:
-                            candidate_path = candidate_path.with_suffix(f".{sniffed_ext}")
+                        # needs this swap every iteration. Use ``swapped_ext`` (non-None
+                        # only when a genuine swap happened) rather than the raw sniff:
+                        # alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) leave the on-disk
+                        # suffix at the caller's request, and the walked candidate must
+                        # follow suit.
+                        if swapped_ext is not None:
+                            candidate_path = candidate_path.with_suffix(f".{swapped_ext}")
 
                         # Ensure parent directory for this candidate
                         parent_failure_reason = self._ensure_parent_directory_ready(
@@ -2656,15 +2762,19 @@ class OSManager:
         # Sidecar provenance must reflect the on-disk extension, not the requested one.
         # The actual reconciliation already happened at the top of the handler via
         # the sniff-and-swap; this just keeps the sidecar's file_extension variable
-        # (when present) consistent with what the bytes turned out to be.
+        # (when present) consistent with what the bytes turned out to be. Use
+        # ``swapped_ext`` (non-None only when a genuine swap happened) rather
+        # than the raw sniff: for alias pairs (jpg/jpeg, tif/tiff, m4v/mp4) the
+        # file lands at the caller's requested suffix, and the sidecar's
+        # ``file_extension`` should stay whatever the caller supplied.
         if (
-            sniffed_ext is not None
+            swapped_ext is not None
             and request.file_metadata is not None
             and request.file_metadata.situation is not None
         ):
             sidecar_variables = request.file_metadata.situation.variables
             if sidecar_variables is not None and "file_extension" in sidecar_variables:
-                sidecar_variables["file_extension"] = sniffed_ext
+                sidecar_variables["file_extension"] = swapped_ext
 
         # Write sidecar metadata file if caller opted in by providing file_metadata
         if request.file_metadata is not None:
@@ -2682,27 +2792,246 @@ class OSManager:
             result_details=result_details,
         )
 
-    def _apply_extension_coercion(  # noqa: PLR0911
+    def on_write_temp_file_request(self, request: WriteTempFileRequest) -> ResultPayload:
+        """Write a temp file at the project-scoped ``SAVE_TEMP_FILE`` situation path.
+
+        Distinct from ``on_write_file_request``: callers do not choose the
+        destination -- the ``SAVE_TEMP_FILE`` situation's macro decides. Thin
+        wrapper around ``_stage_bytes_at_temp``; the shared helper is what the
+        internal codec-vet path calls without re-entering ``handle_request``.
+
+        The handler does NOT synthesize any variable bindings on the caller's
+        behalf. Callers are responsible for supplying enough variables to
+        fully resolve the macro (unresolved required slots surface as a
+        Failure); if a caller wants collision-safe filenames they must include
+        a uuid or similar in ``variables["file_name_base"]``.
+        """
+        try:
+            outcome = self._stage_bytes_at_temp(request.content, request.variables)
+        except StagingFailedError as exc:
+            return WriteTempFileResultFailure(
+                failure_reason=exc.failure_reason,
+                result_details=str(exc),
+            )
+        return WriteTempFileResultSuccess(
+            staged_path=outcome.staged_path,
+            bytes_written=outcome.bytes_written,
+            result_details=f"Temp file written at {outcome.staged_path}",
+        )
+
+    def _stage_bytes_at_temp(self, content: bytes, variables: MacroVariables) -> _StagedTempOutcome:
+        """Land ``content`` at the SAVE_TEMP_FILE path resolved with ``variables``.
+
+        Resolves the SAVE_TEMP_FILE situation, resolves its macro against the
+        caller's variables (merged with project builtins by
+        ``GetPathForMacroRequest``), ensures the parent dir, and delegates the
+        write to ``_attempt_file_write``. Called by both the public
+        ``on_write_temp_file_request`` handler and the internal codec-vet path
+        in ``on_write_file_request``. The vet path calls this directly rather
+        than round-tripping through ``handle_request`` so a provider vetting a
+        path never re-enters the request dispatcher.
+
+        Raises ``StagingFailedError`` on any failure, tagged with the
+        ``FileIOFailureReason`` that would have appeared in the request result.
+        """
+        situation_result = GriptapeNodes.handle_request(
+            GetSituationRequest(situation_name=BuiltInSituation.SAVE_TEMP_FILE)
+        )
+        if not isinstance(situation_result, GetSituationResultSuccess):
+            msg = (
+                f"Attempted to write temp file. Failed because the '{BuiltInSituation.SAVE_TEMP_FILE}' "
+                f"situation is not registered in the current project template."
+            )
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        try:
+            parsed_macro = ParsedMacro(situation_result.situation.macro)
+        except MacroSyntaxError as exc:
+            msg = f"Attempted to write temp file. Failed to parse SAVE_TEMP_FILE macro: {exc}"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH) from exc
+
+        path_result = GriptapeNodes.handle_request(
+            GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables)
+        )
+        if not isinstance(path_result, GetPathForMacroResultSuccess):
+            msg = f"Attempted to write temp file. Failed to resolve SAVE_TEMP_FILE macro: {path_result.result_details}"
+            raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
+
+        staged_path = path_result.absolute_path
+
+        parent_failure_reason = self._ensure_parent_directory_ready(staged_path, create_parents=True)
+        if parent_failure_reason is not None:
+            msg = f"Attempted to write temp file at '{staged_path}'. Failed to prepare parent directory."
+            raise StagingFailedError(msg, parent_failure_reason)
+
+        normalized_path = normalize_path_for_platform(staged_path)
+        attempt = self._attempt_file_write(
+            normalized_path=Path(normalized_path),
+            content=content,
+            encoding="utf-8",  # ignored for bytes content
+            mode="w",
+            file_path_display=staged_path,
+            fail_if_file_exists=False,  # uuid stem makes this unreachable, but be explicit
+            fail_if_file_locked=True,
+        )
+        if attempt.failure_reason is not None:
+            # ``error_message`` is guaranteed set when ``failure_reason`` is set.
+            raise StagingFailedError(attempt.error_message or "unknown write failure", attempt.failure_reason)
+        # ``bytes_written`` is guaranteed set on the success path.
+        return _StagedTempOutcome(staged_path=str(staged_path), bytes_written=attempt.bytes_written)  # type: ignore[arg-type]
+
+    def _truncate_and_delete_staged(self, staged_path: str) -> None:
+        r"""Neutralize and remove a staged codec-vet temp file.
+
+        Truncate the file to a single ``\x00`` byte, then delete it. Truncate
+        first so that even if the delete fails, whatever remains on disk
+        cannot be interpreted as a video: ffprobe on a 1-byte file finds no
+        container header. Delete second so the normal case leaves nothing
+        behind.
+
+        The truncate calls ``_attempt_file_write`` directly rather than
+        dispatching ``WriteFileRequest`` -- routing a single null byte back
+        through ``on_write_file_request`` would re-run the sniff / vet /
+        extension-coercion pipeline against the very cleanup path that just
+        stripped the bytes we care about. Sniffing that byte is harmless
+        today (returns None), but any future check bolted onto the write
+        handler would fire on cleanup too.
+
+        The delete dispatches ``DeleteFileRequest`` via ``handle_request``,
+        specifically so it flows through ``on_delete_file_request``: that's
+        where workspace containment, permanent-vs-trash policy, and audit
+        logging live. Skipping the request layer here would silently opt
+        codec-vet cleanup out of every one of those.
+
+        Best-effort: logs on failure, never raises. A cleanup failure must
+        not mask the vet's real result.
+        """
+        try:
+            normalized = Path(normalize_path_for_platform(Path(staged_path)))
+            attempt = self._attempt_file_write(
+                normalized_path=normalized,
+                content=b"\x00",
+                encoding="utf-8",
+                mode="w",
+                file_path_display=staged_path,
+                fail_if_file_exists=False,
+                fail_if_file_locked=True,
+            )
+            if attempt.failure_reason is not None:
+                logger.error(
+                    "Attempted to truncate staged codec-vet temp at '%s'. Failed: %s",
+                    staged_path,
+                    attempt.error_message,
+                )
+        except OSError as exc:
+            logger.error("Attempted to truncate staged codec-vet temp at '%s'. Failed: %s", staged_path, exc)
+
+        delete_result = GriptapeNodes.handle_request(
+            DeleteFileRequest(
+                path=staged_path,
+                workspace_only=False,
+                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+            )
+        )
+        if not isinstance(delete_result, DeleteFileResultSuccess):
+            logger.error(
+                "Attempted to delete staged codec-vet temp at '%s'. Failed: %s (file has been truncated).",
+                staged_path,
+                delete_result.result_details,
+            )
+
+    def _run_write_vet(
+        self,
+        *,
+        content: bytes,
+        sniffed_ext: str,
+        file_path: Path,
+        caller_variables: MacroVariables | None,
+    ) -> WriteFileResultFailure | None:
+        """Ask the format's provider to vet the pending write.
+
+        Reads the provider's declared ``WriteVettingPolicy`` and dispatches
+        accordingly:
+
+        - ``None`` -- provider opts out. No staging, no dispatch, no cost.
+        - ``FROM_BYTES`` -- hand the raw bytes to the provider directly.
+        - ``FROM_PATH`` -- stage bytes at the SAVE_TEMP_FILE path, hand the
+          resulting path to the provider, and truncate + delete the staged
+          file in a ``finally`` regardless of outcome. Staging failure is
+          treated as fail-closed: an unstageable vet cannot verify the write.
+
+        Returns a ``WriteFileResultFailure`` when the vet refuses (or fails
+        closed), or ``None`` when the write is permitted.
+
+        An unrecognized ``WriteVettingPolicy`` raises loudly: silently
+        falling through would let a policy variant added without updating
+        this switch bless every write that reached it.
+        """
+        artifact_manager = GriptapeNodes.ArtifactManager()
+        policy = artifact_manager.get_write_vetting_policy(sniffed_ext)
+        denial: CheckpointDenial | None = None
+
+        match policy:
+            case None:
+                return None
+            case WriteVettingPolicy.FROM_BYTES:
+                denial = artifact_manager.check_write_format_from_bytes(content, sniffed_ext)
+            case WriteVettingPolicy.FROM_PATH:
+                staging_variables: MacroVariables = dict(caller_variables) if caller_variables else {}
+                # Vet's required overrides sit on top of caller variables --
+                # ``file_name_base`` must be a uuid to keep concurrent vet
+                # stagings from colliding under SAVE_TEMP_FILE's OVERWRITE
+                # policy; ``file_extension`` must match the sniffed container
+                # so ffprobe's extension-based demuxer dispatch picks correctly.
+                staging_variables["file_name_base"] = uuid.uuid4().hex
+                staging_variables["file_extension"] = sniffed_ext
+
+                try:
+                    outcome = self._stage_bytes_at_temp(content, staging_variables)
+                except StagingFailedError as exc:
+                    return WriteFileResultFailure(
+                        failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+                        result_details=(f"Cannot save '{file_path.name}': staging for verification failed ({exc})."),
+                    )
+                try:
+                    denial = artifact_manager.check_write_format_from_path(outcome.staged_path, sniffed_ext)
+                finally:
+                    self._truncate_and_delete_staged(outcome.staged_path)
+            case _:
+                msg = f"Unrecognized WriteVettingPolicy '{policy}' returned by provider for format '{sniffed_ext}'."
+                raise RuntimeError(msg)
+
+        if denial is None:
+            return None
+        return WriteFileResultFailure(
+            failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
+            result_details=f"Cannot save '{file_path.name}': {denial.reason()}",
+        )
+
+    def _apply_extension_coercion(
         self,
         request: WriteFileRequest,
         file_path: Path,
+        sniffed_ext: str | None,
     ) -> ExtensionAlignment | WriteFileResultFailure:
-        """Reconcile the destination suffix with the sniffed byte format.
+        """Reconcile the destination suffix with the pre-sniffed byte format.
 
-        Runs once at the top of ``on_write_file_request`` so the planner and the
-        on-disk filename agree on the extension before any scan or write begins.
-        The two relevant signals are the sniffed canonical extension and the
-        path's current suffix:
+        ``on_write_file_request`` sniffs once up front and hands the result in,
+        so this method never sniffs on its own; its single responsibility is
+        deciding whether to rewrite the destination suffix.
 
-        - No bytes / unrecognized bytes / empty suffix → no swap; pass the path
-          through unchanged. An unrecognized-bytes case logs a warning so callers
-          can spot it in logs.
+        The three relevant signals are the pre-sniffed extension, the path's
+        current suffix, and ``coerce_extension_to_match_bytes``:
+
+        - No sniff / no bytes / empty destination suffix → no swap; pass the
+          path through unchanged. Unrecognized bytes with a non-empty suffix
+          log a warning so callers can spot it in logs.
         - Sniffed matches the path's canonical suffix → no swap.
         - Sniffed differs and ``coerce_extension_to_match_bytes=True`` (default)
           → swap to the sniffed suffix and return the new path.
-        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` → return
-          a ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the caller
-          can early-exit before touching the disk.
+        - Sniffed differs and ``coerce_extension_to_match_bytes=False`` →
+          return ``WriteFileResultFailure`` with ``EXTENSION_MISMATCH`` so the
+          caller can early-exit before touching the disk.
         """
         content = request.content
         if not isinstance(content, bytes):
@@ -2712,8 +3041,7 @@ class OSManager:
         if not destination_suffix:
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        sniffed = GriptapeNodes.ArtifactManager().sniff_extension(content)
-        if sniffed is None:
+        if sniffed_ext is None:
             logger.warning(
                 "Attempted to identify the format of bytes destined for '%s'. "
                 "Could not recognize the bytes as a known file format, so the file will be written "
@@ -2723,38 +3051,30 @@ class OSManager:
             )
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
-        denial = GriptapeNodes.ArtifactManager().check_write_permission(content, sniffed)
-        if denial is not None:
-            msg = f"Cannot save '{file_path.name}': {denial.reason()}"
-            return WriteFileResultFailure(
-                failure_reason=FileIOFailureReason.CODEC_NOT_PERMITTED,
-                result_details=msg,
-            )
-
-        if canonical_extension(destination_suffix) == canonical_extension(sniffed):
+        if canonical_extension(destination_suffix) == canonical_extension(sniffed_ext):
             return ExtensionAlignment(aligned_path=file_path, sniffed_ext=None)
 
         if not request.coerce_extension_to_match_bytes:
             msg = (
-                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed}'. "
+                f"Attempted to write to file '{file_path}' with bytes that look like '.{sniffed_ext}'. "
                 f"Failed because the requested extension '.{destination_suffix}' does not match the "
                 f"byte content and coerce_extension_to_match_bytes=False. Either rename the destination "
-                f"to '.{sniffed}' or supply bytes that match '.{destination_suffix}'."
+                f"to '.{sniffed_ext}' or supply bytes that match '.{destination_suffix}'."
             )
             return WriteFileResultFailure(
                 failure_reason=FileIOFailureReason.EXTENSION_MISMATCH,
                 result_details=msg,
             )
 
-        aligned_path = file_path.with_suffix(f".{sniffed}")
+        aligned_path = file_path.with_suffix(f".{sniffed_ext}")
         logger.warning(
             "Attempted to write '%s'. The bytes look like '.%s', so the destination has been "
             "adjusted to '%s' to match the byte content.",
             file_path,
-            sniffed,
+            sniffed_ext,
             aligned_path,
         )
-        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed)
+        return ExtensionAlignment(aligned_path=aligned_path, sniffed_ext=sniffed_ext)
 
     def _ensure_parent_directory_ready(
         self,
@@ -2963,8 +3283,33 @@ class OSManager:
         src_normalized = normalize_path_for_platform(src_path)
         dest_normalized = normalize_path_for_platform(dest_path)
 
-        # Copy file preserving metadata
-        shutil.copy2(src_normalized, dest_normalized)
+        # Copy file preserving metadata.
+        #
+        # We deliberately avoid shutil.copy2 here. copy2 copies the contents and
+        # then calls shutil.copystat to replicate metadata, which on BSD-derived
+        # platforms (macOS) includes BSD file flags via os.chflags(). SMB mounts
+        # surface the DOS "archive" attribute as SF_ARCHIVED, and that flag can
+        # only be set by root on a local volume -- so chflags(dst, SF_ARCHIVED)
+        # raises EPERM. copystat only swallows EOPNOTSUPP/ENOTSUP, not EPERM, so
+        # the exception propagates and the whole copy is reported as failed even
+        # though the file contents copied fine (see issue #5109).
+        #
+        # Instead, copy contents explicitly and then best-effort the metadata,
+        # ignoring an EPERM raised by the flags step so metadata that can't be
+        # replicated on the destination filesystem doesn't fail the copy.
+        shutil.copyfile(src_normalized, dest_normalized)
+        try:
+            shutil.copystat(src_normalized, dest_normalized)
+        except PermissionError:
+            # chflags() couldn't replicate BSD file flags on the destination
+            # (e.g. SF_ARCHIVED on an SMB mount). Contents and the permission
+            # bits that matter are already in place; the copy has effectively
+            # succeeded, so warn rather than fail.
+            logger.warning(
+                "Could not replicate all file metadata from %s to %s (EPERM); file contents copied successfully.",
+                src_normalized,
+                dest_normalized,
+            )
 
         # Return size of copied file
         return Path(src_normalized).stat().st_size
@@ -3516,7 +3861,7 @@ class OSManager:
         is_directory = await anyio.Path(resolved_path).is_dir()
 
         # Collect all paths that will be deleted (for reporting)
-        if is_directory:
+        if is_directory and request.collect_deleted_paths:
             # Collect all file and directory paths before deletion
             deleted_paths = [str(item) async for item in anyio.Path(resolved_path).rglob("*")]
             deleted_paths.append(str(resolved_path))

@@ -51,7 +51,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Use specific, narrow exception blocks** - Catch only the specific exception types that can be raised. Keep try blocks as small as possible — wrap only the exact lines that raise. Never use bare `except:` or catch `Exception` unless explicitly required.
 
-**Include context in error messages** - Use the format: "Attempted to do X. Failed with data Y because of Z." Include `{self.name}` when available. Include relevant parameter names and operation context.
+**Write artist-comprehensible, user-facing error messages** - User-facing error messages must be understandable by artists, not just engineers. Avoid stack-trace jargon, internal type names, and implementation details. Use the format: "Attempted to do X to Y. Failed due to Z." Include `{self.name}` when available. Include relevant parameter names and operation context.
 
 ## Path Handling
 

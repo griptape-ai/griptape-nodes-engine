@@ -25,7 +25,7 @@ import contextlib
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from pydantic_ai import Agent
@@ -34,6 +34,8 @@ from pydantic_ai.messages import (
     FinalResultEvent,
     FunctionToolCallEvent,
     FunctionToolResultEvent,
+    ModelRequest,
+    ModelResponse,
     PartDeltaEvent,
     PartStartEvent,
     RetryPromptPart,
@@ -42,6 +44,7 @@ from pydantic_ai.messages import (
     ThinkingPart,
     ThinkingPartDelta,
     ToolCallPart,
+    UserPromptPart,
 )
 from pydantic_ai_skills import SkillsCapability
 
@@ -59,7 +62,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pydantic_ai._run_context import RunContext
-    from pydantic_ai.messages import UserContent
+    from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
     from pydantic_ai.usage import UsageLimits
 
@@ -68,6 +71,8 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger("griptape_nodes")
+
+DEFAULT_SKILLS_DIRECTORY = ".agents/skills"
 
 
 TokenSink = "Callable[[str], Awaitable[None] | None]"
@@ -159,7 +164,7 @@ class PydanticAgentRunner:
     image_config: ImageGenerationToolsetConfig | None = None
     static_files_manager: StaticFilesManager | None = None
     auto_load_skills: bool = True
-    skills_directory: str = ".agents/skills"
+    skills_directory: str = DEFAULT_SKILLS_DIRECTORY
     usage_limits: UsageLimits | None = None
 
     _agent: Agent[Any, str] = field(init=False)
@@ -234,7 +239,7 @@ class PydanticAgentRunner:
     def image_toolset(self) -> ImageGenerationToolset | None:
         return self._image_toolset
 
-    async def run(
+    async def run(  # noqa: PLR0913
         self,
         prompt: str | Sequence[UserContent],
         *,
@@ -242,6 +247,8 @@ class PydanticAgentRunner:
         token_sink: Callable[[str], Awaitable[None] | None] | None = None,
         event_sink: Callable[[RunEvent], Awaitable[None] | None] | None = None,
         cancel_event: asyncio.Event | None = None,
+        persist_prompt: str | Sequence[UserContent] | None = None,
+        history_rehydrator: Callable[[list[ModelMessage]], Awaitable[list[ModelMessage]]] | None = None,
     ) -> AgentRunResult:
         """Run the agent against ``prompt``, streaming events and saving history.
 
@@ -260,6 +267,16 @@ class PydanticAgentRunner:
                 cancelled and :meth:`run` returns an :class:`AgentRunResult` with
                 ``cancelled=True`` carrying the text streamed so far. The
                 cancelled turn is not persisted.
+            persist_prompt: When the live ``prompt`` inlines binary content, the
+                URL-reference form to store in this turn's user message instead
+                of it, keeping saved history small. ``None`` persists ``prompt``
+                as-is.
+            history_rehydrator: Optional async hook that returns a transformed
+                copy of the loaded message history for the model call (e.g.
+                re-downloading image URLs back to bytes). It MUST NOT mutate its
+                input: the pristine history is persisted again after this turn,
+                so any in-place edit would leak back onto disk. ``None`` sends
+                the loaded history to the model unchanged.
 
         Returns:
             An :class:`AgentRunResult` describing the new state of the thread.
@@ -267,7 +284,14 @@ class PydanticAgentRunner:
         if thread_id is None or not self.storage.thread_exists(thread_id):
             thread_id, _ = self.storage.create_thread()
 
+        # ``history`` is the pristine on-disk form (images as URL references); it
+        # is what we persist again after this turn. ``model_history`` may inline
+        # the bytes for the model call, but we never write it back, so rehydrated
+        # bytes never leak onto disk.
         history = self.storage.load_history(thread_id)
+        model_history = history
+        if history_rehydrator is not None:
+            model_history = await history_rehydrator(history)
         run_id = thread_id[:8]
 
         logger.info(
@@ -290,7 +314,7 @@ class PydanticAgentRunner:
         run_task = asyncio.ensure_future(
             self._agent.run(
                 prompt,
-                message_history=history,
+                message_history=model_history,
                 usage_limits=self.usage_limits,
                 event_stream_handler=event_handler,
             )
@@ -322,7 +346,10 @@ class PydanticAgentRunner:
                 cancelled=True,
             )
 
-        new_messages = agent_result.all_messages()
+        # Persist the pristine history plus only this turn's new messages. Using
+        # ``new_messages()`` rather than ``all_messages()`` keeps any rehydrated
+        # bytes in ``model_history`` out of what we write back to disk.
+        new_messages = agent_result.new_messages()
         usage = agent_result.usage
 
         elapsed = time.monotonic() - started
@@ -352,11 +379,31 @@ class PydanticAgentRunner:
                 counters.tool_calls,
             )
 
-        self.storage.save_history(thread_id, list(new_messages))
+        # We persist `history + new_messages` rather than `all_messages()`, which
+        # assumes the loaded history is a sequence of complete turns ending in a
+        # ModelResponse. A trailing bare ModelRequest would mean a partial turn
+        # was saved earlier, so the two ways of reconstructing the transcript can
+        # drift; fail loud rather than silently persist a malformed history.
+        # Normal turns always end in a ModelResponse and cancelled turns are
+        # never saved, so this never fires today.
+        turn_messages = list(new_messages)
+        if history and not isinstance(history[-1], ModelResponse):
+            msg = (
+                f"Attempted to persist thread {thread_id}. Failed because loaded history ends with "
+                f"{type(history[-1]).__name__}, not a ModelResponse, indicating a partial turn was "
+                "saved earlier."
+            )
+            raise ValueError(msg)
+        # Rewrite only this turn's messages so a restore can never reach into
+        # pristine history and clobber an older user turn.
+        if persist_prompt is not None:
+            _apply_persist_prompt(turn_messages, persist_prompt)
+        messages_to_save = list(history) + turn_messages
+        self.storage.save_history(thread_id, messages_to_save)
         return AgentRunResult(
             thread_id=thread_id,
             output=text,
-            message_count=len(new_messages),
+            message_count=len(messages_to_save),
             image_urls=list(counters.image_urls),
         )
 
@@ -539,6 +586,25 @@ async def _push_event(
     result = event_sink(event)
     if asyncio.iscoroutine(result):
         await result
+
+
+def _apply_persist_prompt(messages: list[ModelMessage], persist_prompt: str | Sequence[UserContent]) -> None:
+    """Rewrite the newest user turn's content to the URL-reference form in place.
+
+    Locates the last ``ModelRequest`` carrying a ``UserPromptPart`` and replaces
+    that part's ``content`` so history stores ``ImageUrl`` references instead of
+    inlined ``BinaryContent``. Does nothing when no user turn is found.
+    """
+    for message in reversed(messages):
+        if not isinstance(message, ModelRequest):
+            continue
+        for index, part in enumerate(message.parts):
+            if not isinstance(part, UserPromptPart):
+                continue
+            new_parts = list(message.parts)
+            new_parts[index] = replace(part, content=persist_prompt)
+            message.parts = new_parts
+            return
 
 
 def _preview(value: str) -> str:
