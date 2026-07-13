@@ -58,7 +58,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableScope
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariableScope
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -74,10 +74,10 @@ class VariablesManager:
     """Manager for variables with scoped access control."""
 
     def __init__(self, event_manager: EventManager | None = None) -> None:
-        # Storage for flow-scoped variables: {flow_name: {variable_name: FlowVariable}}
-        self._flow_variables: dict[str, dict[str, FlowVariable]] = {}
-        # Storage for global variables: {variable_name: FlowVariable}
-        self._global_variables: dict[str, FlowVariable] = {}
+        # Storage for flow-scoped variables: one VariableLayer per flow, lazily created.
+        self._flow_layers: dict[str, VariableLayer] = {}
+        # Storage for global variables: single VariableLayer.
+        self._global_layer: VariableLayer = VariableLayer()
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(CreateVariableRequest, self.on_create_variable_request)
             event_manager.assign_manager_to_request_type(GetVariableRequest, self.on_get_variable_request)
@@ -101,8 +101,16 @@ class VariablesManager:
 
     def clear_object_state(self) -> None:
         """Clear all variables."""
-        self._flow_variables.clear()
-        self._global_variables.clear()
+        self._flow_layers.clear()
+        self._global_layer.clear()
+
+    def _get_or_create_flow_layer(self, flow_name: str) -> VariableLayer:
+        """Return the flow's VariableLayer, lazily creating an empty one on first touch."""
+        layer = self._flow_layers.get(flow_name)
+        if layer is None:
+            layer = VariableLayer()
+            self._flow_layers[flow_name] = layer
+        return layer
 
     def _get_starting_flow(self, starting_flow: str | None) -> str:
         """Get the starting flow name, using Context Manager if None."""
@@ -145,8 +153,10 @@ class VariablesManager:
 
     def _find_variable_in_flow(self, flow_name: str, variable_name: str) -> FlowVariable | None:
         """Find a variable in a specific flow."""
-        flow_vars = self._flow_variables.get(flow_name, {})
-        return flow_vars.get(variable_name)
+        layer = self._flow_layers.get(flow_name)
+        if layer is None:
+            return None
+        return layer.get(variable_name)
 
     def _find_variable_hierarchical(
         self, starting_flow: str, variable_name: str, lookup_scope: VariableScope
@@ -159,7 +169,7 @@ class VariablesManager:
                 return VariableLookupResult(variable=variable, found_scope=found_scope)
 
             case VariableScope.GLOBAL_ONLY:
-                variable = self._global_variables.get(variable_name)
+                variable = self._global_layer.get(variable_name)
                 found_scope = VariableScope.GLOBAL_ONLY if variable else None
                 return VariableLookupResult(variable=variable, found_scope=found_scope)
 
@@ -177,7 +187,7 @@ class VariablesManager:
                         return VariableLookupResult(variable=variable, found_scope=found_scope)
 
                 # Check global variables as fallback
-                variable = self._global_variables.get(variable_name)
+                variable = self._global_layer.get(variable_name)
                 found_scope = VariableScope.GLOBAL_ONLY if variable else None
                 return VariableLookupResult(variable=variable, found_scope=found_scope)
 
@@ -195,7 +205,7 @@ class VariablesManager:
         """Create a new variable."""
         if request.is_global:
             # Check for name collision in global variables
-            if request.name in self._global_variables:
+            if self._global_layer.has(request.name):
                 return CreateVariableResultFailure(
                     result_details=f"Attempted to create a global variable named '{request.name}'. Failed because a variable with that name already exists."
                 )
@@ -208,7 +218,7 @@ class VariablesManager:
                 value=request.value,
             )
 
-            self._global_variables[request.name] = variable
+            self._global_layer.set(variable)
             return CreateVariableResultSuccess(result_details=f"Successfully created global variable '{request.name}'.")
 
         # Get the target flow
@@ -219,12 +229,10 @@ class VariablesManager:
                 result_details=f"Attempted to create variable '{request.name}'. Failed to determine target flow: {e}"
             )
 
-        # Initialize flow storage if needed
-        if target_flow not in self._flow_variables:
-            self._flow_variables[target_flow] = {}
+        flow_layer = self._get_or_create_flow_layer(target_flow)
 
         # Check for name collision in target flow
-        if request.name in self._flow_variables[target_flow]:
+        if flow_layer.has(request.name):
             return CreateVariableResultFailure(
                 result_details=f"Attempted to create a variable named '{request.name}' in flow '{target_flow}'. Failed because a variable with that name already exists."
             )
@@ -237,7 +245,7 @@ class VariablesManager:
             value=request.value,
         )
 
-        self._flow_variables[target_flow][request.name] = variable
+        flow_layer.set(variable)
         return CreateVariableResultSuccess(
             result_details=f"Successfully created variable '{request.name}' in flow '{target_flow}'."
         )
@@ -364,12 +372,12 @@ class VariablesManager:
         # Remove from appropriate storage based on owning flow
         if variable.owning_flow_name is None:
             # Global variable
-            del self._global_variables[variable.name]
+            self._global_layer.delete(variable.name)
         else:
             # Flow-scoped variable
-            flow_vars = self._flow_variables.get(variable.owning_flow_name, {})
-            if variable.name in flow_vars:
-                del flow_vars[variable.name]
+            flow_layer = self._flow_layers.get(variable.owning_flow_name)
+            if flow_layer is not None and flow_layer.has(variable.name):
+                flow_layer.delete(variable.name)
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
@@ -400,19 +408,16 @@ class VariablesManager:
 
         # Update the variable name and storage key
         old_name = variable.name
-        variable.name = request.new_name
 
         # Update in appropriate storage based on owning flow
         if variable.owning_flow_name is None:
             # Global variable
-            del self._global_variables[old_name]
-            self._global_variables[request.new_name] = variable
+            self._global_layer.rename(old_name, request.new_name)
         else:
             # Flow-scoped variable
-            flow_vars = self._flow_variables.get(variable.owning_flow_name, {})
-            if old_name in flow_vars:
-                del flow_vars[old_name]
-                flow_vars[request.new_name] = variable
+            flow_layer = self._flow_layers.get(variable.owning_flow_name)
+            if flow_layer is not None and flow_layer.has(old_name):
+                flow_layer.rename(old_name, request.new_name)
 
         return RenameVariableResultSuccess(
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
@@ -440,12 +445,13 @@ class VariablesManager:
         """Get variables for the specified scope."""
         match lookup_scope:
             case VariableScope.CURRENT_FLOW_ONLY:
-                if starting_flow in self._flow_variables:
-                    return list(self._flow_variables[starting_flow].values())
-                return []
+                layer = self._flow_layers.get(starting_flow)
+                if layer is None:
+                    return []
+                return layer.list()
 
             case VariableScope.GLOBAL_ONLY:
-                return list(self._global_variables.values())
+                return self._global_layer.list()
 
             case VariableScope.HIERARCHICAL:
                 return self._get_hierarchical_variables(starting_flow)
@@ -476,14 +482,16 @@ class VariablesManager:
 
         # Add variables from flows (child to parent to implement shadowing)
         for flow_name in hierarchy:
-            flow_vars = self._flow_variables.get(flow_name, {})
-            for var in flow_vars.values():
+            flow_layer = self._flow_layers.get(flow_name)
+            if flow_layer is None:
+                continue
+            for var in flow_layer.list():
                 if var.name not in seen_names:
                     variables.append(var)
                     seen_names.add(var.name)
 
         # Add global variables (lowest priority, can be shadowed by flow variables)
-        variables.extend(var for var in self._global_variables.values() if var.name not in seen_names)
+        variables.extend(var for var in self._global_layer.list() if var.name not in seen_names)
 
         return variables
 
@@ -496,11 +504,11 @@ class VariablesManager:
         variables = []
 
         # Add all flow variables (no shadowing - include all)
-        for flow_vars in self._flow_variables.values():
-            variables.extend(flow_vars.values())
+        for flow_layer in self._flow_layers.values():
+            variables.extend(flow_layer.list())
 
         # Add all global variables
-        variables.extend(self._global_variables.values())
+        variables.extend(self._global_layer.list())
 
         return variables
 

@@ -138,6 +138,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -366,6 +367,10 @@ class ProjectInfo:
     # Cached parsed macros (populated during load for performance)
     parsed_situation_schemas: dict[str, ParsedMacro]  # situation_name -> ParsedMacro
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
+
+    # The project's variable layer, populated by ProjectManager on load / reload.
+    # Not yet consulted by VariablesManager resolution — reserved for the next step.
+    variable_layer: VariableLayer = field(default_factory=VariableLayer)
 
 
 @dataclass(frozen=True)
@@ -744,6 +749,7 @@ class ProjectManager:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
+        self._populate_project_variable_layer(project_info)
 
         # Store in new consolidated dict
         self._successfully_loaded_project_templates[project_id] = project_info
@@ -3522,6 +3528,21 @@ class ProjectManager:
                 logger.debug("Skipping directory variable %r: %s", name, e)
         return variables
 
+    def _populate_project_variable_layer(self, project_info: ProjectInfo) -> None:
+        """(Re)populate a project's VariableLayer from its resolved substitution variables.
+
+        Builtins and directories that can't be resolved right now are omitted —
+        matching get_project_substitution_variables' silent-skip policy. Values are
+        wrapped as FlowVariables with owning_flow_name=None (they are not flow-owned)
+        so the rest of the variables machinery treats them uniformly.
+        """
+        project_info.variable_layer.clear()
+        for name, value in self.get_project_substitution_variables(project_info).items():
+            declared_type = "int" if isinstance(value, int) and not isinstance(value, bool) else "str"
+            project_info.variable_layer.set(
+                FlowVariable(name=name, owning_flow_name=None, type=declared_type, value=value)
+            )
+
     # Helper methods (private)
 
     @staticmethod
@@ -3834,6 +3855,7 @@ class ProjectManager:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
+        self._populate_project_variable_layer(project_info)
 
         # Store in new consolidated dict
         self._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
