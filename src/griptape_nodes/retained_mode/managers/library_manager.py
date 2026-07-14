@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib.abc
+import importlib.machinery
 import importlib.util
 import json
 import logging
@@ -280,7 +282,7 @@ from griptape_nodes.utils.version_utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Sequence
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
@@ -294,6 +296,58 @@ logger = logging.getLogger("griptape_nodes")
 EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
 
 TRegisteredEventData = TypeVar("TRegisteredEventData")
+
+
+class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
+    """Imports lazily registered library node modules on demand via their stable namespace.
+
+    Saved workflows reference node-file classes through their stable namespace
+    (``griptape_nodes.node_libraries.<lib>.<file>``), both as ``from`` imports emitted into the
+    generated Python and inside pickled parameter values. With eager node loading those modules
+    are already aliased into ``sys.modules`` when the library registers, so the imports resolve.
+    With lazy loading nothing is imported until a node class is first resolved, so opening a
+    workflow before then would fail with ``No module named 'griptape_nodes.node_libraries'``.
+
+    This finder fills that gap: importing a stable namespace triggers the same memoized module
+    load that the deferred node-class loaders use, and the synthetic parent packages
+    (``griptape_nodes.node_libraries`` and ``griptape_nodes.node_libraries.<lib>``, which do not
+    exist on disk) are materialized as empty namespace packages so the dotted import chain
+    resolves.
+    """
+
+    def __init__(self, library_manager: LibraryManager) -> None:
+        self._library_manager = library_manager
+
+    def find_spec(
+        self,
+        fullname: str,
+        path: Sequence[str] | None = None,  # noqa: ARG002 (MetaPathFinder protocol)
+        target: ModuleType | None = None,  # noqa: ARG002 (MetaPathFinder protocol)
+    ) -> importlib.machinery.ModuleSpec | None:
+        package_root = LibraryManager.STABLE_NAMESPACE_PREFIX.rstrip(".")
+        if fullname != package_root and not fullname.startswith(LibraryManager.STABLE_NAMESPACE_PREFIX):
+            return None
+
+        pending_loaders = self._library_manager._pending_stable_module_loaders
+        if fullname in pending_loaders:
+            return importlib.util.spec_from_loader(fullname, self)
+
+        # Synthesize the namespace-package parents of any known stable namespace so the import
+        # machinery can walk the dotted chain down to the leaf loader above. Known namespaces
+        # cover both pending (lazy, not yet imported) and already-loaded library modules.
+        child_prefix = f"{fullname}."
+        known_namespaces = (*pending_loaders, *self._library_manager._stable_to_dynamic_module_mapping)
+        if fullname == package_root or any(namespace.startswith(child_prefix) for namespace in known_namespaces):
+            return importlib.machinery.ModuleSpec(fullname, None, is_package=True)
+
+        return None
+
+    def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
+        module_loader = self._library_manager._pending_stable_module_loaders[spec.name]
+        return module_loader()
+
+    def exec_module(self, module: ModuleType) -> None:
+        """No-op: the module was fully executed by the memoized loader in create_module."""
 
 
 class LibraryGitOperationContext(NamedTuple):
@@ -359,6 +413,10 @@ class LibraryVenvInitResult(NamedTuple):
 
 class LibraryManager:
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
+    # Prefix for the stable, deterministic module namespaces that library node files are
+    # importable under. Anything under this prefix is a dynamically loaded library module
+    # whose import path only exists in-process once its library has been registered.
+    STABLE_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
     LIBRARY_CONFIG_GLOB_PATTERN = "griptape[_-]nodes[_-]library.json"
 
@@ -504,6 +562,15 @@ class LibraryManager:
     _dynamic_to_stable_module_mapping: dict[str, str]  # dynamic_module_name -> stable_namespace
     _stable_to_dynamic_module_mapping: dict[str, str]  # stable_namespace -> dynamic_module_name
     _library_to_stable_modules: dict[str, set[str]]  # library_name -> set of stable_namespaces
+    # Deferred module loaders for lazily registered node files, keyed by stable namespace.
+    # Populated at (lazy) library registration time and consumed by StableNamespaceImportFinder
+    # so a saved workflow can import `griptape_nodes.node_libraries.<lib>.<file>` before any
+    # node class from that file has been resolved. An entry is dropped as soon as its module
+    # actually loads (sys.modules satisfies imports from then on) or when its library unloads.
+    _pending_stable_module_loaders: dict[str, Callable[[], ModuleType]]  # stable_namespace -> module loader
+    _library_to_pending_stable_namespaces: dict[str, set[str]]  # library_name -> pending stable_namespaces
+    # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
+    _stable_namespace_finder: StableNamespaceImportFinder
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
@@ -512,6 +579,9 @@ class LibraryManager:
         self._dynamic_to_stable_module_mapping = {}
         self._stable_to_dynamic_module_mapping = {}
         self._library_to_stable_modules = {}
+        self._pending_stable_module_loaders = {}
+        self._library_to_pending_stable_namespaces = {}
+        self._install_stable_namespace_finder()
         # Two separate handler registration systems exist in this manager:
         #
         # 1. EventManager.assign_manager_to_request_type() — singleton (one handler per
@@ -3008,7 +3078,45 @@ class LibraryManager:
         # Convert file path to safe module name
         safe_file_name = file_path.stem.replace("-", "_")
 
-        return f"griptape_nodes.node_libraries.{safe_library_name}.{safe_file_name}"
+        return f"{self.STABLE_NAMESPACE_PREFIX}{safe_library_name}.{safe_file_name}"
+
+    def _install_stable_namespace_finder(self) -> None:
+        """Install the meta-path finder that resolves stable namespaces for lazy node modules.
+
+        Any finder left behind by a previously constructed LibraryManager (tests construct
+        several per process) is removed first so exactly one finder, backed by this manager's
+        state, is consulted.
+        """
+        sys.meta_path[:] = [finder for finder in sys.meta_path if not isinstance(finder, StableNamespaceImportFinder)]
+        self._stable_namespace_finder = StableNamespaceImportFinder(self)
+        sys.meta_path.append(self._stable_namespace_finder)
+
+    def _register_pending_stable_module_loader(
+        self, stable_namespace: str, library_name: str, module_loader: Callable[[], ModuleType]
+    ) -> None:
+        """Make a lazily registered node file importable via its stable namespace.
+
+        The loader is the same memoized per-file loader the node-class loaders share, so an
+        import through StableNamespaceImportFinder and a later class resolution reuse one
+        module object (and the file's top-level code runs once).
+
+        Args:
+            stable_namespace: Stable namespace the file will be importable under
+            library_name: Name of the owning library (for cleanup on unload)
+            module_loader: Memoized zero-argument loader that imports the file's module
+        """
+        self._pending_stable_module_loaders[stable_namespace] = module_loader
+        self._library_to_pending_stable_namespaces.setdefault(library_name, set()).add(stable_namespace)
+
+    def _unregister_pending_stable_module_loaders_for_library(self, library_name: str) -> None:
+        """Drop pending (never-imported) stable module loaders for a library on unload.
+
+        Args:
+            library_name: Name of the library to clean up
+        """
+        pending_namespaces = self._library_to_pending_stable_namespaces.pop(library_name, set())
+        for stable_namespace in pending_namespaces:
+            self._pending_stable_module_loaders.pop(stable_namespace, None)
 
     def _register_stable_module_alias(
         self, dynamic_module_name: str, stable_namespace: str, module: ModuleType, library_name: str
@@ -3033,6 +3141,11 @@ class LibraryManager:
 
         # Register the stable alias in sys.modules
         sys.modules[stable_namespace] = module
+
+        # The module is importable through sys.modules now; retire its pending loader so the
+        # meta-path finder can never serve a stale module object after this one is unloaded.
+        self._pending_stable_module_loaders.pop(stable_namespace, None)
+        self._library_to_pending_stable_namespaces.get(library_key, set()).discard(stable_namespace)
 
         details = f"Registered stable alias: {stable_namespace} -> {dynamic_module_name} (library: {library_key})"
         logger.debug(details)
@@ -3067,6 +3180,8 @@ class LibraryManager:
         Args:
             library_name: Name of the library to clean up
         """
+        self._unregister_pending_stable_module_loaders_for_library(library_name)
+
         library_key = library_name
         if library_key not in self._library_to_stable_modules:
             return
@@ -3298,6 +3413,24 @@ class LibraryManager:
 
         return load_module
 
+    def _get_or_create_module_loader(
+        self,
+        node_file_path: Path,
+        library_name: str,
+        module_loaders: dict[Path, Callable[[], ModuleType]],
+    ) -> Callable[[], ModuleType]:
+        """Get the memoized module loader for a node file, creating and caching one if needed.
+
+        All consumers of a file's module (node-class loaders and the stable-namespace import
+        finder) must share one memoized loader so the file is imported exactly once per
+        library load.
+        """
+        module_loader = module_loaders.get(node_file_path)
+        if module_loader is None:
+            module_loader = self._make_memoized_module_loader(node_file_path, library_name)
+            module_loaders[node_file_path] = module_loader
+        return module_loader
+
     def _make_node_class_loader(
         self,
         node_file_path: Path,
@@ -3312,10 +3445,7 @@ class LibraryManager:
         even when its classes are resolved at different times. Binds its arguments as method
         parameters (not loop variables), so the closure is safe to build inside a per-node loop.
         """
-        module_loader = module_loaders.get(node_file_path)
-        if module_loader is None:
-            module_loader = self._make_memoized_module_loader(node_file_path, library_name)
-            module_loaders[node_file_path] = module_loader
+        module_loader = self._get_or_create_module_loader(node_file_path, library_name, module_loaders)
 
         def load() -> type[BaseNode]:
             module = module_loader()
@@ -4373,9 +4503,15 @@ class LibraryManager:
         Always returns True: registration itself does not import the module, so an import
         error cannot be detected here (it surfaces when the node is first used).
         """
-        loader = self._make_node_class_loader(
-            node_file_path, node_definition.class_name, library.get_library_data().name, module_loaders
-        )
+        library_name = library.get_library_data().name
+        loader = self._make_node_class_loader(node_file_path, node_definition.class_name, library_name, module_loaders)
+        # Saved workflows import (and unpickle) classes from this file via its stable namespace
+        # (`griptape_nodes.node_libraries.<lib>.<file>`). With eager loading that namespace is in
+        # sys.modules by now; with lazy loading it is not, so register a pending loader that the
+        # StableNamespaceImportFinder resolves on first import of the namespace.
+        stable_namespace = self._create_stable_namespace(library_name, node_file_path)
+        module_loader = self._get_or_create_module_loader(node_file_path, library_name, module_loaders)
+        self._register_pending_stable_module_loader(stable_namespace, library_name, module_loader)
         library_problem = library.register_lazy_node_type(
             node_definition.class_name, metadata=node_definition.metadata, loader=loader
         )
