@@ -14,8 +14,10 @@ strings per process).
 
 from __future__ import annotations
 
+import gc
 import pickle
 import sys
+import weakref
 from typing import TYPE_CHECKING
 
 import pytest
@@ -170,6 +172,37 @@ class TestStableNamespaceLoading:
         assert first.__name__ == second.__name__
         assert first is not second
         assert sys.modules[second.__name__] is second
+
+    def test_hot_reload_preserves_live_instances_and_releases_old_generation(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Old classes remain alive only while their instances still reference them."""
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision_behavior.py")
+
+        first = manager._load_module_from_file(file_path, "My Test Library")
+        old_module_ref = weakref.ref(first)
+        old_class = first.Widget
+        old_class_ref = weakref.ref(old_class)
+        widget_count = 7
+        old_instance = old_class(widget_count)
+
+        second = manager._load_module_from_file(file_path, "My Test Library")
+        del first
+        del old_class
+        gc.collect()
+
+        # Replacing sys.modules and the parent-package attribute releases the old module.
+        # A live instance intentionally keeps its old class generation alive and usable.
+        assert old_module_ref() is None
+        assert old_class_ref() is not None
+        assert old_instance.count == widget_count
+        assert not isinstance(old_instance, second.Widget)
+
+        del old_instance
+        gc.collect()
+
+        assert old_class_ref() is None
 
     def test_unload_removes_stable_modules(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """Unloading a library tears its stable modules out of sys.modules and its parent."""
