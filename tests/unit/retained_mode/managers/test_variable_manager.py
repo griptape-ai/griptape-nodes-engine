@@ -196,6 +196,26 @@ class TestGetVariablesRequest:
         assert isinstance(result, GetVariablesResultSuccess)
         assert "workspace_dir" not in result.variables
 
+    def test_global_colliding_with_project_name_is_still_returned(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """A user global sharing a name with a project builtin must not be shadowed out.
+
+        The project layer is excluded from this view entirely, so the user's own global
+        value is returned rather than being masked by (and filtered away with) the
+        same-named project builtin.
+        """
+        griptape_nodes.handle_request(
+            CreateVariableRequest(name="workspace_dir", type="str", value="/user/global", is_global=True)
+        )
+        with project_macros({"workspace_dir": "/project/builtin"}):
+            bulk = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+            named = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["workspace_dir"]))
+        assert isinstance(bulk, GetVariablesResultSuccess)
+        assert bulk.variables.get("workspace_dir") == "/user/global"
+        assert isinstance(named, GetVariablesResultSuccess)
+        assert named.variables == {"workspace_dir": "/user/global"}
+
     def test_named_lookup_returns_requested_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         _add_variable(griptape_nodes, "SHOT", "sc001")
         _add_variable(griptape_nodes, "SHOW", "myshow")
@@ -374,7 +394,7 @@ class TestVariablePermission:
         assert isinstance(result, SetVariableValueResultFailure)
         # The message must name the layer the variable was actually resolved from —
         # 'project', recorded at discovery, not inferred from the search scope.
-        assert "read-only project layer" in str(result.result_details)
+        assert "project layer" in str(result.result_details)
 
     def test_delete_project_variable_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):

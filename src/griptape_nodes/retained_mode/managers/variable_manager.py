@@ -81,6 +81,18 @@ class VariableLookupResult(NamedTuple):
     found_layer: VariableLayerKind | None = None
 
 
+class ResolvedVariable(NamedTuple):
+    """A variable paired with the layer it was resolved from.
+
+    Enumeration paths carry real layer provenance rather than reconstructing it
+    from names — a user global named ``project_dir`` and the project builtin
+    ``project_dir`` are distinguishable by ``layer``, not by name.
+    """
+
+    variable: FlowVariable
+    layer: VariableLayerKind
+
+
 class VariablesManager:
     """Manager for variables with scoped access control."""
 
@@ -188,22 +200,23 @@ class VariablesManager:
             return []
         return [v.name for v in result.variables]
 
-    def _collect_resolvable_project_variables(self, project_id: str | None, seen: set[str]) -> list[FlowVariable]:
+    def _collect_resolvable_project_variables(self, project_id: str | None, seen: set[str]) -> list[ResolvedVariable]:
         """List project variables via events, resolving each name and skipping resolution failures.
 
         Mutates `seen` to include each collected name so downstream layers can shadow correctly.
         Preserves the pre-layering silent-skip behavior of get_project_substitution_variables
         for bulk enumeration: variables whose resolver raises today (e.g. workflow_dir before
-        the workflow is saved) are omitted from the returned list.
+        the workflow is saved) are omitted from the returned list. Each entry carries
+        VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
         """
-        collected: list[FlowVariable] = []
+        collected: list[ResolvedVariable] = []
         for name in self._list_project_variable_names(project_id):
             if name in seen:
                 continue
             variable = self._get_project_variable(name, project_id)
             if variable is None:
                 continue
-            collected.append(variable)
+            collected.append(ResolvedVariable(variable=variable, layer=VariableLayerKind.PROJECT))
             seen.add(name)
         return collected
 
@@ -294,12 +307,27 @@ class VariablesManager:
                 raise ValueError(msg)
 
     @staticmethod
-    def _refuse_write_if_read_only(
-        variable: FlowVariable, verb: str, found_layer: VariableLayerKind | None
-    ) -> str | None:
-        """If the variable is READ_ONLY, return an artist-comprehensible failure message. Else None."""
+    def _refuse_write(variable: FlowVariable, verb: str, found_layer: VariableLayerKind | None) -> str | None:
+        """Return a failure message if this variable can't be written through this API, else None.
+
+        Two independent reasons a write is refused:
+
+        - The resolved variable lives in the PROJECT layer. The Variables API has no
+          write-through path to a project's variables — they're owned by the project
+          (template builtins/directories, or the project's own bag) and mutated through
+          the project, not here. This holds regardless of the entry's stored permission:
+          routing such a write by ``owning_flow_name`` would misfire into the global
+          layer (KeyError) or silently mutate a throwaway snapshot, so it must be
+          rejected at the boundary.
+        - The variable is READ_ONLY.
+        """
+        layer = found_layer.value if found_layer is not None else "unknown"
+        if found_layer is VariableLayerKind.PROJECT:
+            return (
+                f"Attempted to {verb} variable '{variable.name}'. Found in the {layer} layer, which is not "
+                f"writable through this request — modify the project to change its variables."
+            )
         if variable.permission is VariablePermission.READ_ONLY:
-            layer = found_layer.value if found_layer is not None else "unknown"
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
@@ -411,9 +439,7 @@ class VariablesManager:
                 result_details=f"Attempted to set value for variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(
-            result.variable, verb="set the value of", found_layer=result.found_layer
-        )
+        refusal = self._refuse_write(result.variable, verb="set the value of", found_layer=result.found_layer)
         if refusal is not None:
             return SetVariableValueResultFailure(result_details=refusal)
 
@@ -460,9 +486,7 @@ class VariablesManager:
                 result_details=f"Attempted to set type for variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(
-            result.variable, verb="set the type of", found_layer=result.found_layer
-        )
+        refusal = self._refuse_write(result.variable, verb="set the type of", found_layer=result.found_layer)
         if refusal is not None:
             return SetVariableTypeResultFailure(result_details=refusal)
 
@@ -490,7 +514,7 @@ class VariablesManager:
                 result_details=f"Attempted to delete variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="delete", found_layer=result.found_layer)
+        refusal = self._refuse_write(result.variable, verb="delete", found_layer=result.found_layer)
         if refusal is not None:
             return DeleteVariableResultFailure(result_details=refusal)
 
@@ -527,7 +551,7 @@ class VariablesManager:
                 result_details=f"Attempted to rename variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="rename", found_layer=result.found_layer)
+        refusal = self._refuse_write(result.variable, verb="rename", found_layer=result.found_layer)
         if refusal is not None:
             return RenameVariableResultFailure(result_details=refusal)
 
@@ -579,38 +603,51 @@ class VariablesManager:
 
     def _get_variables_by_scope(  # noqa: PLR0911
         self, starting_flow: str, lookup_scope: VariableScope, project_id: str | None
-    ) -> list[FlowVariable]:
-        """Get variables for the specified scope."""
+    ) -> list[ResolvedVariable]:
+        """Get variables for the specified scope, each tagged with the layer it came from."""
         match lookup_scope:
             case VariableScope.CURRENT_FLOW_ONLY:
+                # Just this flow's own layer — no ancestors, project, or global.
                 layer = self._flow_layers.get(starting_flow)
                 if layer is None:
                     return []
-                return layer.list()
+                return [ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in layer.list()]
 
             case VariableScope.PROJECT_ONLY:
+                # Just the project layer (entries tagged PROJECT inside the helper).
                 return self._collect_resolvable_project_variables(project_id, set())
 
             case VariableScope.GLOBAL_ONLY:
-                return self._global_layer.list()
+                # Just the global layer.
+                return [ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in self._global_layer.list()]
 
             case VariableScope.HIERARCHICAL:
+                # Full chain: flow ancestry → project → global, with shadowing.
                 return self._get_hierarchical_variables(starting_flow, project_id)
 
             case VariableScope.HIERARCHICAL_FROM_PROJECT:
+                # Project → global (skips flows). `seen` tracks names already claimed by
+                # the project layer so project shadows global: the helper tags project
+                # entries and fills `seen`; then we add only the globals not shadowed,
+                # tagged GLOBAL because they come from self._global_layer.
                 seen: set[str] = set()
                 result = self._collect_resolvable_project_variables(project_id, seen)
-                result.extend(v for v in self._global_layer.list() if v.name not in seen)
+                result.extend(
+                    ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL)
+                    for v in self._global_layer.list()
+                    if v.name not in seen
+                )
                 return result
 
             case VariableScope.ALL:
+                # Every layer, no shadowing — for GUI enumeration.
                 return self._get_all_variables(project_id)
 
             case _:
                 msg = f"Attempted to get variables from starting flow '{starting_flow}', but encountered an unknown/unexpected variable scope '{lookup_scope.value}'"
                 raise ValueError(msg)
 
-    def _get_hierarchical_variables(self, starting_flow: str, project_id: str | None) -> list[FlowVariable]:
+    def _get_hierarchical_variables(self, starting_flow: str, project_id: str | None) -> list[ResolvedVariable]:
         """Get variables using hierarchical lookup with shadowing.
 
         Variable shadowing precedence (innermost wins):
@@ -620,7 +657,7 @@ class VariablesManager:
         """
         hierarchy = self._get_flow_hierarchy(starting_flow)
         seen_names: set[str] = set()
-        variables: list[FlowVariable] = []
+        variables: list[ResolvedVariable] = []
 
         # Flow ancestry (innermost first)
         for flow_name in hierarchy:
@@ -629,35 +666,63 @@ class VariablesManager:
                 continue
             for var in flow_layer.list():
                 if var.name not in seen_names:
-                    variables.append(var)
+                    variables.append(ResolvedVariable(variable=var, layer=VariableLayerKind.FLOW))
                     seen_names.add(var.name)
 
         # Project layer (shadows global, shadowed by flow)
         variables.extend(self._collect_resolvable_project_variables(project_id, seen_names))
 
         # Global layer (lowest priority)
-        variables.extend(var for var in self._global_layer.list() if var.name not in seen_names)
+        variables.extend(
+            ResolvedVariable(variable=var, layer=VariableLayerKind.GLOBAL)
+            for var in self._global_layer.list()
+            if var.name not in seen_names
+        )
 
         return variables
 
-    def _get_all_variables(self, project_id: str | None) -> list[FlowVariable]:
+    def _get_all_variables(self, project_id: str | None) -> list[ResolvedVariable]:
         """Get all variables from every layer for GUI enumeration.
 
         Note: This returns ALL variables without shadowing - variables with the same
         name from different flows / project / global will all be included.
         Project entries whose resolvers currently raise are omitted.
         """
-        variables: list[FlowVariable] = []
+        variables: list[ResolvedVariable] = []
 
         for flow_layer in self._flow_layers.values():
-            variables.extend(flow_layer.list())
+            variables.extend(ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in flow_layer.list())
 
         # Project layer entries — silent-skip resolution failures for enumeration.
         variables.extend(self._collect_resolvable_project_variables(project_id, set()))
 
-        variables.extend(self._global_layer.list())
+        variables.extend(
+            ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in self._global_layer.list()
+        )
 
         return variables
+
+    def _get_user_variables(self, starting_flow: str) -> dict[str, FlowVariable]:
+        """Return user-defined variables visible from ``starting_flow`` (flow chain → global).
+
+        The project layer is deliberately excluded — this is the "user variables only"
+        view. Flow variables shadow global variables of the same name (innermost flow
+        wins), matching HIERARCHICAL flow shadowing, but the project layer never
+        participates, so it can't shadow a same-named user global.
+        """
+        resolved: dict[str, FlowVariable] = {}
+        # Innermost flow first; setdefault keeps the first seen, so a child flow's
+        # variable shadows a same-named ancestor's.
+        for flow_name in self._get_flow_hierarchy(starting_flow):
+            flow_layer = self._flow_layers.get(flow_name)
+            if flow_layer is None:
+                continue
+            for var in flow_layer.list():
+                resolved.setdefault(var.name, var)
+        # Global is lowest priority: only fills names no flow already claimed.
+        for var in self._global_layer.list():
+            resolved.setdefault(var.name, var)
+        return resolved
 
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
         """List all variables in the specified scope."""
@@ -668,10 +733,10 @@ class VariablesManager:
                 result_details=f"Attempted to list variables. Failed to determine starting flow: {e}"
             )
 
-        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
+        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
 
         # Sort by name for consistent output
-        variables = sorted(variables, key=lambda v: v.name)
+        variables = sorted((r.variable for r in resolved), key=lambda v: v.name)
         return ListVariablesResultSuccess(
             variables=variables, result_details=f"Successfully listed {len(variables)} variables."
         )
@@ -693,25 +758,22 @@ class VariablesManager:
                 result_details=f"Attempted to list substitutables. Failed to determine starting flow: {e}"
             )
 
-        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
-        # Names owned by the project layer — used to tag source=MACRO. Project variables
-        # arrive here as plain FlowVariables (unwrapped at the request boundary), so we
-        # can't use isinstance to distinguish them.
-        project_names = set(self._list_project_variable_names(request.project_id))
+        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
 
         # Only str/int values (excluding bool) can actually substitute into {VAR} tokens.
         substitutables: list[Substitutable] = []
-        for variable in variables:
-            try:
-                value = variable.value
-            except (RuntimeError, NotImplementedError, ValueError) as e:
-                logger.debug("Skipping variable %r whose value cannot be resolved: %s", variable.name, e)
-                continue
-            filtered = VariableResolver._filter_for_substitution({variable.name: value})
+        for resolved_variable in resolved:
+            variable = resolved_variable.variable
+            filtered = VariableResolver._filter_for_substitution({variable.name: variable.value})
             if variable.name not in filtered:
                 continue
-            from_project = variable.name in project_names and variable.owning_flow_name is None
-            source = SubstitutableSource.MACRO if from_project else SubstitutableSource.VARIABLE
+            # Layer provenance is recorded at collection time, so a project builtin and a
+            # same-named user global are distinguished by layer, not by name-matching.
+            source = (
+                SubstitutableSource.MACRO
+                if resolved_variable.layer is VariableLayerKind.PROJECT
+                else SubstitutableSource.VARIABLE
+            )
             read_only = variable.permission is VariablePermission.READ_ONLY
             substitutables.append(
                 Substitutable(name=variable.name, value=filtered[variable.name], source=source, read_only=read_only)
@@ -726,7 +788,9 @@ class VariablesManager:
     def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
         """Get user-defined variable values visible from the starting flow.
 
-        Returns only user-defined workflow variables — project layer entries are excluded.
+        Returns only user-defined workflow variables — the project layer is excluded
+        entirely (not merely filtered out afterward), so a user global that shares a
+        name with a project builtin is still returned rather than being shadowed by it.
         """
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -735,26 +799,19 @@ class VariablesManager:
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
             )
 
-        # Names owned by the project layer — used to filter out project-layer entries,
-        # which arrive here as plain FlowVariables after being unwrapped at the request
-        # boundary (isinstance check won't identify them).
-        project_names = set(self._list_project_variable_names(request.project_id))
+        # User-defined view: flow chain → global, no project layer. Building the set from
+        # the non-project layers means the project layer never occupies a name slot, so
+        # it can't shadow a same-named user global.
+        user_variables = self._get_user_variables(starting_flow)
 
         if request.names:
             result: dict[str, Any] = {}
             missing: list[str] = []
             for name in request.names:
-                lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
-                from_project = (
-                    lookup.variable is not None
-                    and lookup.variable.name in project_names
-                    and lookup.variable.owning_flow_name is None
-                )
-                if lookup.variable is None or from_project:
-                    # Project-layer entries are excluded from the user-vars-only view.
-                    missing.append(name)
+                if name in user_variables:
+                    result[name] = user_variables[name].value
                 else:
-                    result[name] = lookup.variable.value
+                    missing.append(name)
             if missing:
                 return GetVariablesResultFailure(
                     result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
@@ -763,9 +820,7 @@ class VariablesManager:
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
             )
 
-        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
-        # Drop project layer entries — they aren't user-defined variables.
-        all_vars = {v.name: v.value for v in variables if not (v.name in project_names and v.owning_flow_name is None)}
+        all_vars = {name: variable.value for name, variable in user_variables.items()}
         return GetVariablesResultSuccess(
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
@@ -792,11 +847,7 @@ class VariablesManager:
                 if lookup.variable is None:
                     missing.add(name)
                     continue
-                try:
-                    result[name] = lookup.variable.value
-                except (RuntimeError, NotImplementedError, ValueError) as e:
-                    logger.debug("Skipping variable %r whose value cannot be resolved: %s", name, e)
-                    missing.add(name)
+                result[name] = lookup.variable.value
             if missing:
                 missing_list = sorted(missing)
                 logger.warning("Variable substitution incomplete: resolved %s, missing %s", list(result), missing_list)
@@ -809,13 +860,8 @@ class VariablesManager:
                 variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
             )
 
-        variables = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
-        all_vars: dict[str, Any] = {}
-        for variable in variables:
-            try:
-                all_vars[variable.name] = variable.value
-            except (RuntimeError, NotImplementedError, ValueError) as e:
-                logger.debug("Skipping variable %r whose value cannot be resolved: %s", variable.name, e)
+        resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
+        all_vars: dict[str, Any] = {r.variable.name: r.variable.value for r in resolved}
         return ResolveSubstitutionResultSuccess(
             variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
         )
@@ -823,8 +869,9 @@ class VariablesManager:
     def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
         """Set multiple variable values atomically (all-or-nothing).
 
-        Refuses batches that would touch any READ_ONLY variable — the whole batch fails
-        so callers see the constraint without any partial writes.
+        Refuses the whole batch if any variable isn't writable through this API
+        (READ_ONLY, or resolved from the project layer) — callers see the constraint
+        with no partial writes.
         """
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -836,21 +883,24 @@ class VariablesManager:
         # Validate all variables exist and are writable before writing any (all-or-nothing).
         found: dict[str, FlowVariable] = {}
         missing: list[str] = []
-        read_only_hits: list[str] = []
+        not_writable: list[str] = []
         for name in request.variables:
             lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
             if lookup.variable is None:
                 missing.append(name)
                 continue
-            if lookup.variable.permission is VariablePermission.READ_ONLY:
-                read_only_hits.append(name)
+            # Same writability gate as the single-value path: rejects READ_ONLY and
+            # project-layer variables (which have no write-through path via this API).
+            if self._refuse_write(lookup.variable, verb="set", found_layer=lookup.found_layer) is not None:
+                not_writable.append(name)
                 continue
             found[name] = lookup.variable
 
-        if read_only_hits:
+        if not_writable:
             return SetVariablesResultFailure(
                 result_details=(
-                    f"Attempted to set variables {read_only_hits!r}. At least one was found in a read-only layer."
+                    f"Attempted to set variables {not_writable!r}. At least one is not writable through "
+                    f"this request (read-only, or owned by the project layer)."
                 )
             )
 

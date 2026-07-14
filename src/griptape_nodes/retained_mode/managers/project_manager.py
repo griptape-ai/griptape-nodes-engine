@@ -3554,6 +3554,23 @@ class ProjectManager:
         names.extend(v.name for v in project_info.variable_layer.list() if v.name not in computed)
         return names
 
+    def _project_variable_details(self, project_info: ProjectInfo) -> list[VariableDetails]:
+        """Return metadata for every project variable, with the correct type per source.
+
+        Builtins and template directories resolve to path/string values, so they report
+        ``type="str"``. User-bag entries carry their own stored ``type`` (e.g. int, JSON),
+        so we surface that rather than hardcoding. No values are resolved. ``owning_flow_name``
+        is ``None`` for all project entries — they are not flow-owned.
+        """
+        computed = set(BUILTIN_VARIABLES) | set(project_info.template.directories.keys())
+        details = [VariableDetails(name=name, owning_flow_name=None, type="str") for name in sorted(computed)]
+        details.extend(
+            VariableDetails(name=v.name, owning_flow_name=None, type=v.type)
+            for v in project_info.variable_layer.list()
+            if v.name not in computed
+        )
+        return details
+
     def _resolve_project_variable(self, name: str, project_info: ProjectInfo) -> FlowVariable:
         """Resolve a project variable to a fully-formed FlowVariable.
 
@@ -3610,10 +3627,7 @@ class ProjectManager:
                 result_details=f"Attempted to list variables for project '{project_id}'. Failed because the project is not loaded."
             )
 
-        details = [
-            VariableDetails(name=name, owning_flow_name=None, type="str")
-            for name in self._project_variable_names(project_info)
-        ]
+        details = self._project_variable_details(project_info)
         return ListProjectVariablesResultSuccess(
             variables=details,
             result_details=f"Successfully listed {len(details)} project variable(s).",
