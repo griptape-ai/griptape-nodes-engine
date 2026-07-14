@@ -1009,6 +1009,48 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         manager._unregister_all_stable_module_aliases_for_library("Collision Library")
         manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
 
+    def test_collided_reference_both_files_define_class_fails_safely(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A plain-namespace reference both colliding files can satisfy must not silently guess.
+
+        With identical class names, the plain base namespace is genuinely ambiguous: the
+        writing process may have assigned it to either file depending on load order. Even
+        though a normal module lookup would succeed here, extraction must fail with the
+        artist-readable ambiguity error rather than return whichever file currently owns
+        the name.
+        """
+        file_a = tmp_path / "first" / "collide.py"
+        file_a.parent.mkdir()
+        file_a.write_text(self._MODULE_SOURCE)
+        file_b = tmp_path / "second" / "collide.py"
+        file_b.parent.mkdir()
+        file_b.write_text(self._MODULE_SOURCE)
+
+        manager = griptape_nodes.LibraryManager()
+        module_a = manager._load_module_from_file(file_a, "Collision Library")
+        module_b = manager._load_module_from_file(file_b, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the collision"
+
+        pickled = pickle.dumps(module_a.CollisionBehavior.OVERWRITE)
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "ambiguous_collision.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        details = str(result.result_details)
+        assert "more than one loaded library" in details
+        assert "collision_library.collide" in details
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+
     def test_ambiguous_legacy_module_yields_artist_readable_error(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:

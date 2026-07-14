@@ -3019,7 +3019,10 @@ class LibraryManager:
         short, deterministic suffix derived from the file's identity so both modules can
         coexist, and warn so the collision can be resolved at the source.
 
-        Loading the same file again (hot reload) is not a collision and keeps its namespace.
+        Loading the same file again (hot reload) is not a collision and keeps its namespace,
+        including when the file previously lost a collision whose winner has since unloaded:
+        a tracked file's namespace is sticky for the life of the process so already pickled
+        references and live class identities stay coherent.
 
         The disambiguation suffix hashes the absolute file path, so it is stable per install
         but not portable across machines; recovering pre-existing pickles for collided files
@@ -3033,15 +3036,15 @@ class LibraryManager:
             The stable namespace to register the module under.
         """
         base_namespace = self._create_stable_namespace(library_name, file_path)
+        disambiguated = f"{base_namespace}_{self._collision_suffix(file_path)}"
+        if self._stable_module_to_file.get(disambiguated) == file_path:
+            return disambiguated
+
         existing_file = self._stable_module_to_file.get(base_namespace)
         if existing_file is None or existing_file == file_path:
             return base_namespace
 
         # Genuine collision between two distinct files: disambiguate the newcomer.
-        disambiguated = f"{base_namespace}_{self._collision_suffix(file_path)}"
-        if self._stable_module_to_file.get(disambiguated) == file_path:
-            return disambiguated
-
         details = (
             f"Two node files in library '{library_name}' map to the same module namespace "
             f"'{base_namespace}': '{existing_file}' and '{file_path}'. Loading the latter as "
@@ -3197,17 +3200,18 @@ class LibraryManager:
         if match is None:
             return None
 
-        # "set_variables_from_data_py" -> "set_variables_from_data". The volatile format
-        # replaced '.' with '_' in the full file name; stable stems replace '-' with '_'.
+        # Old engines built the token as file_path.name.replace(".", "_"), e.g.
+        # "set_variables_from_data.py" -> "set_variables_from_data_py". Reconstruct that
+        # exact token from each tracked file so hyphens and extra dots keep distinguishing
+        # files the way they did in the old format.
         file_token = match.group("file_token")
-        stem = file_token.removesuffix("_py").replace("-", "_")
 
         matching_modules: list[ModuleType] = []
         for stable_namespace, file_path in sorted(self._stable_module_to_file.items()):
-            # Match on the file's own stem, not the namespace leaf: a module that lost a
+            # Match on the file's own name, not the namespace leaf: a module that lost a
             # namespace collision carries a disambiguation suffix in its namespace, but its
-            # file stem is still what the volatile name recorded.
-            if file_path.stem.replace("-", "_") != stem:
+            # file name is still what the volatile name recorded.
+            if file_path.name.replace(".", "_") != file_token:
                 continue
             module = sys.modules.get(stable_namespace)
             if module is None:
