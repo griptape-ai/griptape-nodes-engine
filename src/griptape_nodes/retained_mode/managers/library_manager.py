@@ -376,6 +376,21 @@ def loads_with_library_recovery(data: bytes) -> Any:
     return LibraryAwareUnpickler(BytesIO(data)).load()
 
 
+class StableModuleFile(NamedTuple):
+    """Paths recorded for a loaded stable library module.
+
+    ``canonical_path`` is the symlink-resolved identity used for hot-reload and collision
+    detection and for the deterministic collision suffix, so two spellings of the same file
+    compare equal. ``logical_path`` is the path as loaded, with symlinks not followed; its
+    file name drives the stable namespace and legacy volatile-token matching so persisted
+    module names do not change when a node file is reached through a differently named
+    symlink.
+    """
+
+    canonical_path: Path
+    logical_path: Path
+
+
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
@@ -592,10 +607,12 @@ class LibraryManager:
     #     _library_to_stable_modules:
     #         "RunwayML Library": {"griptape_nodes.node_libraries.runwayml_library.image_to_video"}
     #     _stable_module_to_file:
-    #         "griptape_nodes.node_libraries.runwayml_library.image_to_video": Path(".../image_to_video.py")
+    #         "griptape_nodes.node_libraries.runwayml_library.image_to_video" maps to a
+    #         StableModuleFile whose canonical_path and logical_path both point at
+    #         ".../image_to_video.py" (they differ only when the file is a symlink).
     #
     _library_to_stable_modules: dict[str, set[str]]  # library_name -> set of stable_namespaces
-    _stable_module_to_file: dict[str, Path]  # stable_namespace -> canonical file path it was loaded from
+    _stable_module_to_file: dict[str, StableModuleFile]  # stable_namespace -> paths it was loaded from
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
@@ -3064,7 +3081,8 @@ class LibraryManager:
 
         Args:
             library_name: Name of the library
-            file_path: Path to the Python file
+            file_path: Logical (symlinks not followed) path to the Python file, so a file
+                reached through a differently named symlink keeps the name it was loaded by
 
         Returns:
             Stable namespace string like 'griptape_nodes.node_libraries.runwayml_library.image_to_video'
@@ -3079,7 +3097,7 @@ class LibraryManager:
 
         return f"{self.STABLE_NAMESPACE_PREFIX}{safe_library_name}.{safe_file_name}"
 
-    def _resolve_stable_namespace(self, library_name: str, file_path: Path) -> str:
+    def _resolve_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
         """Resolve the stable namespace to load a file under, disambiguating collisions.
 
         Two different files in a library can share a stem (e.g. ``video/compare.py`` and
@@ -3099,24 +3117,26 @@ class LibraryManager:
 
         Args:
             library_name: Name of the library
-            file_path: Canonical path to the Python file being loaded
+            canonical_path: Symlink-resolved path of the file being loaded (identity)
+            logical_path: Path as loaded, symlinks not followed (naming)
 
         Returns:
             The stable namespace to register the module under.
         """
-        base_namespace = self._create_stable_namespace(library_name, file_path)
-        disambiguated = f"{base_namespace}_{self._collision_suffix(file_path)}"
-        if self._stable_module_to_file.get(disambiguated) == file_path:
+        base_namespace = self._create_stable_namespace(library_name, logical_path)
+        disambiguated = f"{base_namespace}_{self._collision_suffix(canonical_path)}"
+        existing_disambiguated = self._stable_module_to_file.get(disambiguated)
+        if existing_disambiguated is not None and existing_disambiguated.canonical_path == canonical_path:
             return disambiguated
 
-        existing_file = self._stable_module_to_file.get(base_namespace)
-        if existing_file is None or existing_file == file_path:
+        existing = self._stable_module_to_file.get(base_namespace)
+        if existing is None or existing.canonical_path == canonical_path:
             return base_namespace
 
         # Genuine collision between two distinct files: disambiguate the newcomer.
         details = (
             f"Two node files in library '{library_name}' map to the same module namespace "
-            f"'{base_namespace}': '{existing_file}' and '{file_path}'. Loading the latter as "
+            f"'{base_namespace}': '{existing.logical_path}' and '{logical_path}'. Loading the latter as "
             f"'{disambiguated}'. Rename one of the files to avoid this collision."
         )
         logger.warning(details)
@@ -3155,7 +3175,7 @@ class LibraryManager:
                     setattr(parent, child_name, sys.modules[package_name])
 
     def _track_stable_module(
-        self, stable_namespace: str, module: ModuleType, library_name: str, file_path: Path
+        self, stable_namespace: str, module: ModuleType, library_name: str, module_file: StableModuleFile
     ) -> None:
         """Record a loaded stable module so it can be torn down when its library unloads.
 
@@ -3163,13 +3183,14 @@ class LibraryManager:
             stable_namespace: The stable namespace the module was registered under
             module: The loaded module
             library_name: Name of the owning library
-            file_path: Canonical path the module was loaded from. Stored for collision
-                detection in _resolve_stable_namespace, which must compare against the exact
-                same canonical value it resolved with; re-deriving from module.__file__ could
+            module_file: Canonical and logical paths the module was loaded from. The
+                canonical path is stored for collision detection in
+                _resolve_stable_namespace, which must compare against the exact same
+                canonical value it resolved with; re-deriving from module.__file__ could
                 drift (or be unset) and misclassify a hot reload as a collision.
         """
         self._library_to_stable_modules.setdefault(library_name, set()).add(stable_namespace)
-        self._stable_module_to_file[stable_namespace] = file_path
+        self._stable_module_to_file[stable_namespace] = module_file
 
         # Wire the leaf module onto its parent package for attribute-based import navigation.
         parent_name, _, child_name = stable_namespace.rpartition(".")
@@ -3179,6 +3200,11 @@ class LibraryManager:
 
     def _unregister_all_stable_module_aliases_for_library(self, library_name: str) -> None:
         """Remove all stable modules for a library from sys.modules during unload/reload.
+
+        A namespace can be shared: two library names that sanitize identically and point at
+        the same canonical file resolve to one module. A shared namespace is only torn out
+        of sys.modules when its last owning library unloads; unloading it earlier would
+        strand the remaining library with classes that can no longer be imported or pickled.
 
         Args:
             library_name: Name of the library to clean up
@@ -3191,6 +3217,14 @@ class LibraryManager:
         logger.debug(details)
 
         for stable_namespace in stable_namespaces:
+            still_owned = any(
+                stable_namespace in owned_namespaces for owned_namespaces in self._library_to_stable_modules.values()
+            )
+            if still_owned:
+                details = f"Keeping shared stable module '{stable_namespace}': another library still owns it."
+                logger.debug(details)
+                continue
+
             sys.modules.pop(stable_namespace, None)
             self._stable_module_to_file.pop(stable_namespace, None)
 
@@ -3276,11 +3310,11 @@ class LibraryManager:
         file_token = match.group("file_token")
 
         matching_modules: list[ModuleType] = []
-        for stable_namespace, file_path in sorted(self._stable_module_to_file.items()):
-            # Match on the file's own name, not the namespace leaf: a module that lost a
-            # namespace collision carries a disambiguation suffix in its namespace, but its
-            # file name is still what the volatile name recorded.
-            if file_path.name.replace(".", "_") != file_token:
+        for stable_namespace, module_file in sorted(self._stable_module_to_file.items()):
+            # Match on the file's own logical name, not the namespace leaf: a module that
+            # lost a namespace collision carries a disambiguation suffix in its namespace,
+            # but its file name is still what the volatile name recorded.
+            if module_file.logical_path.name.replace(".", "_") != file_token:
                 continue
             module = sys.modules.get(stable_namespace)
             if module is None:
@@ -3322,11 +3356,11 @@ class LibraryManager:
             return None
 
         matching_modules: list[ModuleType] = []
-        for stable_namespace, file_path in sorted(self._stable_module_to_file.items()):
+        for stable_namespace, module_file in sorted(self._stable_module_to_file.items()):
             # A file registers under its base namespace when it loads first, or under the
             # base plus its deterministic collision suffix when it loads second. Either name
             # can appear in a pickle, so both count as this file's possible names.
-            suffix = self._collision_suffix(file_path)
+            suffix = self._collision_suffix(module_file.canonical_path)
             base_namespace = stable_namespace.removesuffix(f"_{suffix}")
             if module_name not in (base_namespace, f"{base_namespace}_{suffix}"):
                 continue
@@ -3479,13 +3513,20 @@ class LibraryManager:
         Raises:
             ImportError: If the module cannot be imported
         """
-        # Canonicalize so hot-reload detection and collision detection compare stable identities.
-        file_path = canonicalize_for_identity(file_path)
+        # The canonical (symlink-resolved) path is the file's identity for hot-reload and
+        # collision detection; the logical path preserves the name the file was loaded by so
+        # a differently named symlink keeps its persisted namespace.
+        module_file = StableModuleFile(
+            canonical_path=canonicalize_for_identity(file_path),
+            logical_path=canonicalize_for_io(file_path),
+        )
 
-        stable_namespace = self._resolve_stable_namespace(library_name, file_path)
+        stable_namespace = self._resolve_stable_namespace(
+            library_name, canonical_path=module_file.canonical_path, logical_path=module_file.logical_path
+        )
         self._ensure_parent_packages(stable_namespace)
 
-        spec = importlib.util.spec_from_file_location(stable_namespace, file_path)
+        spec = importlib.util.spec_from_file_location(stable_namespace, module_file.canonical_path)
         if spec is None or spec.loader is None:
             msg = f"Could not load module specification from {file_path}"
             raise ImportError(msg)
@@ -3510,7 +3551,7 @@ class LibraryManager:
             msg = f"Module at '{file_path}' failed to {verb} with error: {err}"
             raise ImportError(msg) from err
 
-        self._track_stable_module(stable_namespace, module, library_name, file_path)
+        self._track_stable_module(stable_namespace, module, library_name, module_file)
         if is_reload:
             details = f"Hot reloaded module: {stable_namespace} from {file_path}"
             logger.debug(details)
