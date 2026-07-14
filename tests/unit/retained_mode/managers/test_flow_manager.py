@@ -927,4 +927,8 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
-        assert "library that isn't loaded" in str(result.result_details)
+        details = str(result.result_details)
+        assert "doesn't have loaded" in details
+        # The artist-facing message names the node file, not the internal volatile token.
+        assert "not_installed_anywhere" in details
+        assert "gtn_dynamic_module" not in details

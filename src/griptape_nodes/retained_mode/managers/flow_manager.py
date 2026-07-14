@@ -4187,11 +4187,18 @@ class FlowManager:
             # by engines that predate stable-namespace module loading.
             serialized_flow_commands = _FlowCommandsUnpickler(BytesIO(pickled_data)).load()
         except ModuleNotFoundError as e:
+            missing_module = e.name or "unknown"
+            display_name = GriptapeNodes.LibraryManager().get_module_display_name(missing_module)
+            logger.debug(
+                "Flow commands embedded in '%s' reference unresolvable module '%s'.",
+                file_url_or_path,
+                missing_module,
+            )
             return ExtractFlowCommandsFromImageMetadataResultFailure(
                 result_details=(
                     f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because it "
-                    f"uses node types from a library that isn't loaded ({e.name}). Install or enable the "
-                    "library it came from, then try again."
+                    f"uses node types this engine doesn't have loaded (needs '{display_name}'). Install or "
+                    "enable the library it came from, then try again."
                 ),
                 file_path=file_url_or_path,
             )
