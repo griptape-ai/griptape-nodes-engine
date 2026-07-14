@@ -136,20 +136,28 @@ class TestStableNamespaceLoading:
         assert restored_enum is reloaded.Behavior.OVERWRITE
         assert restored_widget.count == widget_count
 
-    def test_same_stem_collision_is_disambiguated(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        """Two different files sharing a stem in one library get distinct namespaces."""
+    def test_same_stem_collision_is_disambiguated(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Two different files sharing a stem get distinct namespaces and one warning."""
         manager = griptape_nodes.LibraryManager()
         first = _write_module(tmp_path / "video", "compare.py")
         second = _write_module(tmp_path / "traits", "compare.py")
 
         module_a = manager._load_module_from_file(first, "My Test Library")
         module_b = manager._load_module_from_file(second, "My Test Library")
+        reloaded_b = manager._load_module_from_file(second, "My Test Library")
 
         assert module_a.__name__ == "griptape_nodes.node_libraries.my_test_library.compare"
         assert module_b.__name__ != module_a.__name__
         assert module_b.__name__.startswith("griptape_nodes.node_libraries.my_test_library.compare_")
+        assert reloaded_b.__name__ == module_b.__name__
         assert sys.modules[module_a.__name__] is module_a
-        assert sys.modules[module_b.__name__] is module_b
+        assert sys.modules[reloaded_b.__name__] is reloaded_b
+        collision_warnings = [
+            record for record in caplog.records if "map to the same module namespace" in record.message
+        ]
+        assert len(collision_warnings) == 1
 
     def test_hot_reload_keeps_same_namespace(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """Reloading the same file reuses its namespace and replaces the module object."""

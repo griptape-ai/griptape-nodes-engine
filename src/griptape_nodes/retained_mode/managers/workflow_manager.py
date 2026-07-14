@@ -4550,12 +4550,11 @@ class WorkflowManager:
 
         # Serialize the unique values as pickled strings.
         # Library node modules are executed under their stable namespace, so the class
-        # __module__ pickle records is already stable and portable. The patch step below is
-        # now a safety net that reconciles any stragglers (see _patch_and_pickle_object).
+        # __module__ pickle records is already stable and portable. The helper below also
+        # reconciles SerializableMixin module_name fields with that namespace before pickling.
         unique_parameter_dict = {}
 
         for uuid, unique_parameter_value in unique_parameter_uuid_to_values.items():
-            # Dynamic Module Strategy:
             # When we pickle objects from library modules (like VideoUrlArtifact), pickle
             # stores the class's __module__ attribute in the binary data. Library modules are
             # loaded under a stable namespace such as:
@@ -4563,8 +4562,7 @@ class WorkflowManager:
             #
             # That namespace resolves in any process where the owning library is loaded, so
             # the workflow can be reloaded (or the value unpickled from image metadata) after
-            # an engine restart. _patch_and_pickle_object walks the object tree and reconciles
-            # any object whose __module__ is not yet the stable namespace before pickling.
+            # an engine restart.
             unique_parameter_bytes = self._patch_and_pickle_object(unique_parameter_value)
 
             # Encode the bytes as a string using latin1
@@ -6339,20 +6337,13 @@ class WorkflowManager:
                 self._walk_object_tree(attr_value, process_class_fn, visited)
 
     def _patch_and_pickle_object(self, obj: Any) -> bytes:
-        """Reconcile any non-stable module references, pickle the object, then restore.
+        """Reconcile SerializableMixin module names, pickle the object, then restore.
 
-        Library node modules are executed under a stable namespace (e.g.
-        "griptape_nodes.node_libraries.runwayml_library.image_to_video"), so the class
-        __module__ pickle records is normally already stable and portable. This method is a
-        safety net for objects whose __module__ has drifted from the stable namespace (for
-        instance, a class re-exported from another module): it walks the object tree and,
-        for any object still pointing at a library namespace under a non-canonical name,
-        temporarily rewrites __module__ / module_name to the stable namespace before
-        pickling, then restores the originals to avoid side effects.
-
-        Keeping module references stable is what lets a workflow (or a value embedded in
-        saved image metadata) unpickle in a fresh Python process where the owning library
-        has been loaded.
+        Library node modules execute under their stable namespace, so classes already carry
+        a portable __module__. SerializableMixin instances separately persist a module_name
+        field; this method walks the object tree, temporarily aligns that field with the
+        class's stable module namespace, pickles the object, and restores the original value
+        to avoid side effects.
 
         Args:
             obj: Object to patch and pickle (may contain nested structures)
@@ -6360,35 +6351,20 @@ class WorkflowManager:
         Returns:
             Pickled bytes with stable module references
         """
-        patched_classes: list[tuple[type, str]] = []
         patched_instances: list[tuple[Any, str]] = []
 
-        def patch_class(class_type: type, instance: Any) -> None:
-            """Patch a single class instance to use stable namespace."""
+        def patch_instance_module_name(class_type: type, instance: Any) -> None:
             module = getmodule(class_type)
-            if module and GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
-                stable_namespace = GriptapeNodes.LibraryManager().get_stable_namespace_for_dynamic_module(
-                    module.__name__
-                )
-                if stable_namespace:
-                    # Patch class __module__ (affects pickle class reference)
-                    if class_type.__module__ != stable_namespace:
-                        patched_classes.append((class_type, class_type.__module__))
-                        class_type.__module__ = stable_namespace
-
-                    # Patch instance module_name field (affects SerializableMixin serialization)
-                    if hasattr(instance, "module_name") and instance.module_name != stable_namespace:
-                        patched_instances.append((instance, instance.module_name))
-                        instance.module_name = stable_namespace
+            if module is None or not GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
+                return
+            if hasattr(instance, "module_name") and instance.module_name != module.__name__:
+                patched_instances.append((instance, instance.module_name))
+                instance.module_name = module.__name__
 
         try:
-            # Apply patches to entire object tree
-            self._walk_object_tree(obj, patch_class)
+            self._walk_object_tree(obj, patch_instance_module_name)
             return pickle.dumps(obj)
         finally:
-            # Always restore original names to avoid affecting other code
-            for class_obj, original_name in patched_classes:
-                class_obj.__module__ = original_name
             for instance_obj, original_name in patched_instances:
                 instance_obj.module_name = original_name
 
@@ -6431,21 +6407,13 @@ class WorkflowManager:
             module = getmodule(class_type)
             if module and module.__name__ not in global_modules_set:
                 if GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
-                    # Use stable namespace for dynamic modules. Route into deferred_imports
-                    # so the caller can emit these inside build_workflow() after
+                    # Library modules already carry their stable namespace. Route the import
+                    # into deferred_imports so build_workflow() emits it after
                     # RegisterLibraryFromFileRequest has added the library to sys.path.
-                    stable_namespace = GriptapeNodes.LibraryManager().get_stable_namespace_for_dynamic_module(
-                        module.__name__
-                    )
-                    if stable_namespace:
-                        if deferred_imports is not None:
-                            deferred_imports.setdefault(stable_namespace, set()).add(class_type.__name__)
-                        else:
-                            import_recorder.add_from_import(stable_namespace, class_type.__name__)
+                    if deferred_imports is not None:
+                        deferred_imports.setdefault(module.__name__, set()).add(class_type.__name__)
                     else:
-                        msg = f"Missing stable namespace for {module.__name__} type {class_type.__name__}"
-                        logger.error(msg)
-                        raise RuntimeError(msg)
+                        import_recorder.add_from_import(module.__name__, class_type.__name__)
                 else:
                     # Use regular module name for standard modules
                     import_recorder.add_from_import(module.__name__, class_type.__name__)

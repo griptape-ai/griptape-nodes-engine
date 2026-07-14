@@ -364,6 +364,11 @@ class LibraryManager:
     # executed under. Anything under this prefix is a dynamically loaded library module
     # whose import path only exists in-process once its library has been registered.
     STABLE_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
+    # Module-name format used by engines that executed library node files under a volatile,
+    # per-process name: "gtn_dynamic_module_<file name with '.' -> '_'>_<hash(str(path))>".
+    # Python randomizes hash() of strings per process, so old pickles using these names need
+    # read-time translation to the stable modules now loaded in this process.
+    _VOLATILE_DYNAMIC_MODULE_PATTERN = re.compile(r"^gtn_dynamic_module_(?P<file_token>.+?)_(?P<path_hash>-?\d+)$")
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
     LIBRARY_CONFIG_GLOB_PATTERN = "griptape[_-]nodes[_-]library.json"
 
@@ -3025,6 +3030,9 @@ class LibraryManager:
         # Genuine collision between two distinct files: disambiguate the newcomer.
         suffix = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:8]  # noqa: S324
         disambiguated = f"{base_namespace}_{suffix}"
+        if self._stable_module_to_file.get(disambiguated) == file_path:
+            return disambiguated
+
         details = (
             f"Two node files in library '{library_name}' map to the same module namespace "
             f"'{base_namespace}': '{existing_file}' and '{file_path}'. Loading the latter as "
@@ -3154,13 +3162,6 @@ class LibraryManager:
             False
         """
         return module_name.startswith(self.STABLE_NAMESPACE_PREFIX)
-
-    # Module-name format used by engines that executed library node files under a volatile,
-    # per-process name: "gtn_dynamic_module_<file name with '.' -> '_'>_<hash(str(path))>".
-    # Python randomizes hash() of strings per process, so these names never resolve in a
-    # later process. Pickles written by those engines (e.g. flow commands embedded in saved
-    # image metadata) still reference them, so we translate on read.
-    _VOLATILE_DYNAMIC_MODULE_PATTERN = re.compile(r"^gtn_dynamic_module_(?P<file_token>.+?)_(?P<path_hash>-?\d+)$")
 
     def resolve_volatile_dynamic_module(self, module_name: str, class_name: str) -> ModuleType | None:
         """Resolve a volatile dynamic module name from an old pickle to a loaded stable module.
