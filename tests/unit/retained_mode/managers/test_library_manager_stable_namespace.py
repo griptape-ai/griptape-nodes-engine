@@ -234,3 +234,19 @@ class TestVolatileDynamicModuleResolution:
         resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_collision-behavior_py_99", "Behavior")
 
         assert resolved is module
+
+
+class TestModuleDisplayName:
+    @pytest.mark.parametrize(
+        ("module_name", "expected"),
+        [
+            ("griptape_nodes.node_libraries", "a node library"),
+            ("griptape_nodes.node_libraries.my_library.node_file", "my_library.node_file"),
+            ("gtn_dynamic_module_node_file_py_-123", "node_file"),
+            ("griptape.artifacts", "griptape.artifacts"),
+        ],
+    )
+    def test_returns_artist_readable_name(self, griptape_nodes: GriptapeNodes, module_name: str, expected: str) -> None:
+        manager = griptape_nodes.LibraryManager()
+
+        assert manager.get_module_display_name(module_name) == expected
