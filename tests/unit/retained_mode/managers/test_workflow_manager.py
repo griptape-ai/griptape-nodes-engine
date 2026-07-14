@@ -2033,6 +2033,53 @@ class TestWorkflowManager:
             "Library import must NOT be in import_recorder (would appear at module top level)"
         )
 
+    def test_generate_unique_values_code_uses_library_recovery_loader(self, griptape_nodes: GriptapeNodes) -> None:
+        """Pickled parameter values must decode through loads_with_library_recovery.
+
+        Plain pickle.loads cannot recover references to library modules whose namespace
+        ownership changed because two node files collide and registered in a different
+        order than when the workflow was saved.
+        """
+        from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+        from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        import_recorder = ImportRecorder()
+        unique_values = {
+            SerializedNodeCommands.UniqueParameterValueUUID("11111111-1111-1111-1111-111111111111"): "some value"
+        }
+
+        module = workflow_manager._generate_unique_values_code(
+            unique_values,  # type: ignore[arg-type]
+            prefix="flow0",
+            import_recorder=import_recorder,
+        )
+
+        generated = ast.unparse(module)
+        assert "loads_with_library_recovery(" in generated
+        assert "pickle.loads(" not in generated
+        recovery_module = "griptape_nodes.retained_mode.managers.library_manager"
+        assert "loads_with_library_recovery" in import_recorder.from_imports.get(recovery_module, set())
+
+    def test_deferred_import_statements_tolerate_missing_modules(self, griptape_nodes: GriptapeNodes) -> None:
+        """Deferred library imports must not abort build_workflow when a namespace is absent.
+
+        A collision-suffixed namespace recorded at save time can legitimately not exist
+        after registration order flips; the import only warms the module, and unpickling
+        recovers the reference through loads_with_library_recovery.
+        """
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        stmts = workflow_manager._build_deferred_import_statements(
+            {"griptape_nodes.node_libraries.missing_lib.gone_abcd1234": {"GhostClass"}}
+        )
+
+        assert len(stmts) == 1
+        generated = ast.unparse(ast.Module(body=stmts, type_ignores=[]))
+        assert "from griptape_nodes.node_libraries.missing_lib.gone_abcd1234 import GhostClass" in generated
+        # Executing the guarded import against a namespace that does not exist must not raise.
+        exec(compile(ast.Module(body=stmts, type_ignores=[]), "<deferred_imports>", "exec"), {})  # noqa: S102
+
 
 class TestWorkflowVariablePersistence:
     """Round-trip tests: variables created in a flow must survive save + load."""

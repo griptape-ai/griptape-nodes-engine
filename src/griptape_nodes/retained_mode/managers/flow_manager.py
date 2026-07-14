@@ -4,7 +4,6 @@ import asyncio
 import base64
 import copy
 import logging
-import pickle
 from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
@@ -173,7 +172,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.library_manager import AmbiguousLegacyModuleError
+from griptape_nodes.retained_mode.managers.library_manager import (
+    AmbiguousLegacyModuleError,
+    loads_with_library_recovery,
+)
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -184,40 +186,6 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 logger = logging.getLogger("griptape_nodes")
-
-
-class _FlowCommandsUnpickler(pickle.Unpickler):
-    """Unpickler for flow commands embedded in saved image metadata.
-
-    Images saved by engines that executed library node files under volatile, per-process
-    module names embed pickles referencing names like
-    ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``, which cannot be
-    imported in a later process. Images can also reference a stable namespace that this
-    process assigned differently because two node files collide on the same base namespace
-    and loaded in a different order. Both kinds of reference are remapped through the
-    LibraryManager to the class now loaded under its stable namespace so those images remain
-    loadable.
-    """
-
-    def find_class(self, module: str, name: str) -> Any:
-        library_manager = GriptapeNodes.LibraryManager()
-        # Stable-namespace references resolve through collision-aware lookup first: when two
-        # node files collide on a base namespace, which file owns the plain name depends on
-        # load order, so a plain lookup could silently return the other file's class. The
-        # resolver finds the single loaded module that defines the class regardless of which
-        # namespace it currently owns, and raises AmbiguousLegacyModuleError instead of
-        # guessing when more than one collided module defines it.
-        if library_manager.is_dynamic_module(module):
-            resolved_class = library_manager.resolve_collided_stable_class(module, name)
-            if resolved_class is not None:
-                return resolved_class
-        try:
-            return super().find_class(module, name)
-        except ModuleNotFoundError:
-            resolved_class = library_manager.resolve_volatile_dynamic_class(module, name)
-            if resolved_class is None:
-                raise
-            return resolved_class
 
 
 class DagExecutionType(StrEnum):
@@ -4197,9 +4165,10 @@ class FlowManager:
         try:
             # Pickle is safe here: we're deserializing workflow data from images saved by this application.
             # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands.
-            # _FlowCommandsUnpickler additionally remaps volatile module names from images saved
-            # by engines that predate stable-namespace module loading.
-            serialized_flow_commands = _FlowCommandsUnpickler(BytesIO(pickled_data)).load()
+            # loads_with_library_recovery additionally remaps volatile module names from images
+            # saved by engines that predate stable-namespace module loading, and collided
+            # stable namespaces whose ownership depends on library load order.
+            serialized_flow_commands = loads_with_library_recovery(pickled_data)
         except AmbiguousLegacyModuleError as e:
             display_candidates = [
                 GriptapeNodes.LibraryManager().get_module_display_name(module_name)
@@ -4209,8 +4178,8 @@ class FlowManager:
             return ExtractFlowCommandsFromImageMetadataResultFailure(
                 result_details=(
                     f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because more than "
-                    f"one loaded library provides node type '{e.class_name}' ({candidates}). Disable one of the "
-                    "matching libraries, then try again."
+                    f"one loaded node file provides '{e.class_name}' ({candidates}). Rename one of the conflicting "
+                    "node files, or disable a library that provides one of them, then try again."
                 ),
                 file_path=file_url_or_path,
             )

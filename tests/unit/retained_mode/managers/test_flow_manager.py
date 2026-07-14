@@ -1045,7 +1045,7 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         details = str(result.result_details)
-        assert "more than one loaded library" in details
+        assert "more than one loaded node file" in details
         assert "collision_library.collide" in details
 
         manager._unregister_all_stable_module_aliases_for_library("Collision Library")
@@ -1084,7 +1084,7 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
 
         assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
         details = str(result.result_details)
-        assert "more than one loaded library" in details
+        assert "more than one loaded node file" in details
         assert "first_library.set_variables_from_data" in details
         assert "second_library.set_variables_from_data" in details
         assert "gtn_dynamic_module" not in details

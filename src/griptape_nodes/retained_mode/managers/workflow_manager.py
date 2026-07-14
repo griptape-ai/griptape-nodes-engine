@@ -4543,7 +4543,9 @@ class WorkflowManager:
         if len(unique_parameter_uuid_to_values) == 0:
             return ast.Module(body=[], type_ignores=[])
 
-        import_recorder.add_import("pickle")
+        import_recorder.add_from_import(
+            "griptape_nodes.retained_mode.managers.library_manager", "loads_with_library_recovery"
+        )
 
         # Get the list of manually-curated, globally available modules
         global_modules_set = {"builtins", "__main__"}
@@ -4593,13 +4595,7 @@ class WorkflowManager:
                 keys=[ast.Constant(value=str(uuid), lineno=1, col_offset=0) for uuid in unique_parameter_dict],
                 values=[
                     ast.Call(
-                        func=ast.Attribute(
-                            value=ast.Name(id="pickle", ctx=ast.Load(), lineno=1, col_offset=0),
-                            attr="loads",
-                            ctx=ast.Load(),
-                            lineno=1,
-                            col_offset=0,
-                        ),
+                        func=ast.Name(id="loads_with_library_recovery", ctx=ast.Load(), lineno=1, col_offset=0),
                         args=[ast.Constant(value=byte_str.encode("latin1"), lineno=1, col_offset=0)],
                         keywords=[],
                         lineno=1,
@@ -4624,19 +4620,38 @@ class WorkflowManager:
         return full_ast
 
     def _build_deferred_import_statements(self, deferred_imports: dict[str, set[str]]) -> list[ast.stmt]:
-        """Convert deferred library imports into ast.ImportFrom statements for insertion into build_workflow().
+        """Convert deferred library imports into guarded ast.ImportFrom statements for build_workflow().
+
+        Each import is wrapped in ``try/except ImportError`` because its only job is to
+        force-load the library module before the pickled parameter values are decoded.
+        The recorded namespace can legitimately be absent in a later process (two node
+        files colliding on one base namespace swap names when registration order flips);
+        unpickling recovers such references through loads_with_library_recovery, so a
+        missing module here must not abort the workflow.
 
         Sorted by module name (and class names within each module) for deterministic output.
         """
         stmts: list[ast.stmt] = []
         for module, classes in sorted(deferred_imports.items()):
-            node = ast.ImportFrom(
+            import_node = ast.ImportFrom(
                 module=module,
                 names=[ast.alias(name=cls) for cls in sorted(classes)],
                 level=0,
             )
-            ast.fix_missing_locations(node)
-            stmts.append(node)
+            guarded = ast.Try(
+                body=[import_node],
+                handlers=[
+                    ast.ExceptHandler(
+                        type=ast.Name(id="ImportError", ctx=ast.Load()),
+                        name=None,
+                        body=[ast.Pass()],
+                    )
+                ],
+                orelse=[],
+                finalbody=[],
+            )
+            ast.fix_missing_locations(guarded)
+            stmts.append(guarded)
         return stmts
 
     def _generate_create_flow(
