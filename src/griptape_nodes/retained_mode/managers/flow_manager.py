@@ -192,19 +192,32 @@ class _FlowCommandsUnpickler(pickle.Unpickler):
     Images saved by engines that executed library node files under volatile, per-process
     module names embed pickles referencing names like
     ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``, which cannot be
-    imported in a later process. When standard resolution fails, this asks the
-    LibraryManager to map the volatile name to the module now loaded under its stable
+    imported in a later process. Images can also reference a stable namespace that this
+    process assigned differently because two node files collide on the same base namespace
+    and loaded in a different order. When standard resolution fails, this asks the
+    LibraryManager to map the recorded name to the class now loaded under its stable
     namespace so those images remain loadable.
     """
 
     def find_class(self, module: str, name: str) -> Any:
+        library_manager = GriptapeNodes.LibraryManager()
         try:
             return super().find_class(module, name)
         except ModuleNotFoundError:
-            resolved_module = GriptapeNodes.LibraryManager().resolve_volatile_dynamic_module(module, name)
-            if resolved_module is None:
+            resolved_class = library_manager.resolve_volatile_dynamic_class(module, name)
+            if resolved_class is None:
+                resolved_class = library_manager.resolve_collided_stable_class(module, name)
+            if resolved_class is None:
                 raise
-            return getattr(resolved_module, name)
+            return resolved_class
+        except AttributeError:
+            # The module imported but does not define the class: with colliding node files,
+            # the base namespace may belong to a different file in this process than in the
+            # process that wrote the pickle.
+            resolved_class = library_manager.resolve_collided_stable_class(module, name)
+            if resolved_class is None:
+                raise
+            return resolved_class
 
 
 class DagExecutionType(StrEnum):

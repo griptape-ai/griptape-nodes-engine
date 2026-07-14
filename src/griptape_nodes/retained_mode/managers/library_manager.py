@@ -3037,12 +3037,8 @@ class LibraryManager:
         if existing_file is None or existing_file == file_path:
             return base_namespace
 
-        # Genuine collision between two distinct files: disambiguate the newcomer. The digest
-        # only needs to be a stable, low-collision suffix for a module name (not security), so
-        # the algorithm choice is irrelevant; sha256 with usedforsecurity=False keeps static
-        # analysis quiet about weak hashing.
-        suffix = hashlib.sha256(str(file_path).encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
-        disambiguated = f"{base_namespace}_{suffix}"
+        # Genuine collision between two distinct files: disambiguate the newcomer.
+        disambiguated = f"{base_namespace}_{self._collision_suffix(file_path)}"
         if self._stable_module_to_file.get(disambiguated) == file_path:
             return disambiguated
 
@@ -3176,49 +3172,146 @@ class LibraryManager:
         """
         return module_name.startswith(self.STABLE_NAMESPACE_PREFIX)
 
-    def resolve_volatile_dynamic_module(self, module_name: str, class_name: str) -> ModuleType | None:
-        """Resolve a volatile dynamic module name from an old pickle to a loaded stable module.
+    def resolve_volatile_dynamic_class(self, module_name: str, class_name: str) -> Any | None:
+        """Resolve a volatile dynamic module reference from an old pickle to a loaded class.
 
         Older engines executed library node files under per-process module names like
         ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``. Values pickled
         back then (for instance, flow commands embedded in a saved image) still reference
-        those names. This maps such a name back to the module now loaded under its stable
-        namespace by matching the file stem and requiring the referenced class to exist.
+        those names. This maps such a reference to the class now loaded under the file's
+        stable namespace by matching the file stem and requiring the class to exist there.
 
         Args:
             module_name: The module name recorded in the pickle
-            class_name: The class the pickle wants from that module
+            class_name: The class the pickle wants from that module. May be a dotted
+                qualified name (e.g. ``LifecycleNode.TriggerBehavior``) for nested classes.
 
         Returns:
-            The loaded stable module that defines ``class_name``, or None if the name is not
-            a volatile dynamic module name or no loaded module matches.
+            The class defined by the single matching stable module, or None if the name is
+            not a volatile dynamic module name or no loaded module matches.
+
+        Raises:
+            AmbiguousLegacyModuleError: If more than one loaded module defines the class.
         """
         match = self._VOLATILE_DYNAMIC_MODULE_PATTERN.match(module_name)
         if match is None:
             return None
 
         # "set_variables_from_data_py" -> "set_variables_from_data". The volatile format
-        # replaced '.' with '_' in the full file name; stable namespaces use the stem with
-        # '-' replaced by '_'.
+        # replaced '.' with '_' in the full file name; stable stems replace '-' with '_'.
         file_token = match.group("file_token")
         stem = file_token.removesuffix("_py").replace("-", "_")
 
-        matches: list[ModuleType] = []
-        for stable_namespace in sorted(self._stable_module_to_file):
-            if stable_namespace.rsplit(".", 1)[-1] != stem:
+        matching_modules: list[ModuleType] = []
+        for stable_namespace, file_path in sorted(self._stable_module_to_file.items()):
+            # Match on the file's own stem, not the namespace leaf: a module that lost a
+            # namespace collision carries a disambiguation suffix in its namespace, but its
+            # file stem is still what the volatile name recorded.
+            if file_path.stem.replace("-", "_") != stem:
                 continue
             module = sys.modules.get(stable_namespace)
             if module is None:
                 continue
-            candidate = getattr(module, class_name, None)
-            if getattr(candidate, "__module__", None) == module.__name__:
-                matches.append(module)
+            if self._get_class_defined_in_module(module, class_name) is None:
+                continue
+            matching_modules.append(module)
 
-        if not matches:
+        if not matching_modules:
             return None
-        if len(matches) > 1:
-            raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matches])
-        return matches[0]
+        if len(matching_modules) > 1:
+            raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matching_modules])
+        return self._get_class_defined_in_module(matching_modules[0], class_name)
+
+    def resolve_collided_stable_class(self, module_name: str, class_name: str) -> Any | None:
+        """Resolve a stable-namespace reference whose owning file was in a namespace collision.
+
+        When two node files collide on the same base namespace, which file owns the plain
+        name and which gets the deterministic suffix depends on load order. A pickle written
+        by an earlier process can therefore reference a namespace that this process assigned
+        to the other file, or a suffixed name this process never registered at all. This
+        searches every loaded stable module that could have been registered under the
+        referenced name in some load order (same base namespace) and resolves the one that
+        actually defines the class.
+
+        Args:
+            module_name: The stable-namespace module name recorded in the pickle
+            class_name: The class the pickle wants from that module. May be a dotted
+                qualified name (e.g. ``LifecycleNode.TriggerBehavior``) for nested classes.
+
+        Returns:
+            The class defined by the single matching stable module, or None if the name is
+            not a stable namespace or no loaded module matches.
+
+        Raises:
+            AmbiguousLegacyModuleError: If more than one loaded module defines the class.
+        """
+        if not self.is_dynamic_module(module_name):
+            return None
+
+        matching_modules: list[ModuleType] = []
+        for stable_namespace, file_path in sorted(self._stable_module_to_file.items()):
+            # A file registers under its base namespace when it loads first, or under the
+            # base plus its deterministic collision suffix when it loads second. Either name
+            # can appear in a pickle, so both count as this file's possible names.
+            suffix = self._collision_suffix(file_path)
+            base_namespace = stable_namespace.removesuffix(f"_{suffix}")
+            if module_name not in (base_namespace, f"{base_namespace}_{suffix}"):
+                continue
+            module = sys.modules.get(stable_namespace)
+            if module is None:
+                continue
+            if self._get_class_defined_in_module(module, class_name) is None:
+                continue
+            matching_modules.append(module)
+
+        if not matching_modules:
+            return None
+        if len(matching_modules) > 1:
+            raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matching_modules])
+        return self._get_class_defined_in_module(matching_modules[0], class_name)
+
+    @staticmethod
+    def _collision_suffix(file_path: Path) -> str:
+        """Deterministic disambiguation suffix for a node file that lost a namespace collision.
+
+        The digest only needs to be a stable, low-collision suffix for a module name (not
+        security), so the algorithm choice is irrelevant; sha256 with usedforsecurity=False
+        keeps static analysis quiet about weak hashing.
+
+        Args:
+            file_path: Canonical path of the node file
+
+        Returns:
+            An 8-character hex suffix that is a pure function of the file path.
+        """
+        return hashlib.sha256(str(file_path).encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
+
+    @staticmethod
+    def _get_class_defined_in_module(module: ModuleType, class_name: str) -> Any | None:
+        """Look up a (possibly dotted) class reference that a module itself defines.
+
+        Pickles created with protocol 4 and later record nested classes as dotted qualified
+        names (e.g. ``LifecycleNode.TriggerBehavior``), so each component is resolved in
+        sequence. The outermost attribute must be defined by the module itself (not merely
+        imported into it) for the lookup to count.
+
+        Args:
+            module: The module to search
+            class_name: Plain or dotted qualified class name
+
+        Returns:
+            The resolved class, or None if any component is missing or the outermost
+            attribute is not defined by this module.
+        """
+        parts = class_name.split(".")
+        candidate: Any = getattr(module, parts[0], None)
+        if getattr(candidate, "__module__", None) != module.__name__:
+            return None
+        for part in parts[1:]:
+            candidate = getattr(candidate, part, None)
+            if candidate is None:
+                return None
+        return candidate
 
     def get_module_display_name(self, module_name: str) -> str:
         """Human-readable form of a library module reference, for user-facing messages.
