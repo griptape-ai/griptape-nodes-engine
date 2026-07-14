@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -17,6 +18,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
 from pathlib import Path
+from types import ModuleType
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
 
 import anyio
@@ -280,7 +282,6 @@ from griptape_nodes.utils.version_utils import (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
@@ -358,6 +359,10 @@ class LibraryVenvInitResult(NamedTuple):
 
 class LibraryManager:
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
+    # Prefix for the stable, deterministic module namespaces that library node files are
+    # executed under. Anything under this prefix is a dynamically loaded library module
+    # whose import path only exists in-process once its library has been registered.
+    STABLE_NAMESPACE_PREFIX = "griptape_nodes.node_libraries."
     LIBRARY_CONFIG_FILENAME = "griptape_nodes_library.json"
     LIBRARY_CONFIG_GLOB_PATTERN = "griptape[_-]nodes[_-]library.json"
 
@@ -485,32 +490,34 @@ class LibraryManager:
         path: Path
         registered_path: str
 
-    # Stable module namespace mappings for workflow serialization
-    # These mappings ensure that dynamically loaded modules can be reliably imported
-    # in generated workflow code by providing stable, predictable import paths.
+    # Stable module namespace tracking for workflow serialization.
     #
-    # Example mappings:
-    # dynamic to stable module mapping:
-    #     "gtn_dynamic_module_image_to_video_py_123456789": "griptape_nodes.node_libraries.runwayml_library.image_to_video"
+    # Library node files are executed under a stable, deterministic module name (their
+    # "stable namespace") rather than a volatile per-process name. This makes the class
+    # __module__ stamped into pickles reproducible across engine restarts, so pickled
+    # parameter values (including objects embedded in saved images) unpickle reliably.
     #
-    # stable to dynamic module mapping:
-    #     "griptape_nodes.node_libraries.runwayml_library.image_to_video": "gtn_dynamic_module_image_to_video_py_123456789"
+    # Stable namespaces look like:
+    #     "griptape_nodes.node_libraries.runwayml_library.image_to_video"
     #
-    # library to stable modules:
-    #     "RunwayML Library": {"griptape_nodes.node_libraries.runwayml_library.image_to_video", "griptape_nodes.node_libraries.runwayml_library.text_to_image"},
-    #     "Sandbox Library": {"griptape_nodes.node_libraries.sandbox.my_custom_node"}
+    # We track which stable namespaces each library owns so they can be torn out of
+    # sys.modules when the library is unloaded, and which file each namespace was loaded
+    # from so that two different files mapping to the same namespace are detected instead
+    # of silently clobbering one another:
+    #     _library_to_stable_modules:
+    #         "RunwayML Library": {"griptape_nodes.node_libraries.runwayml_library.image_to_video"}
+    #     _stable_module_to_file:
+    #         "griptape_nodes.node_libraries.runwayml_library.image_to_video": Path(".../image_to_video.py")
     #
-    _dynamic_to_stable_module_mapping: dict[str, str]  # dynamic_module_name -> stable_namespace
-    _stable_to_dynamic_module_mapping: dict[str, str]  # stable_namespace -> dynamic_module_name
     _library_to_stable_modules: dict[str, set[str]]  # library_name -> set of stable_namespaces
+    _stable_module_to_file: dict[str, Path]  # stable_namespace -> canonical file path it was loaded from
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
     def __init__(self, event_manager: EventManager, *, worker_manager: WorkerManager) -> None:
         self._library_file_path_to_info = {}
-        self._dynamic_to_stable_module_mapping = {}
-        self._stable_to_dynamic_module_mapping = {}
         self._library_to_stable_modules = {}
+        self._stable_module_to_file = {}
         # Two separate handler registration systems exist in this manager:
         #
         # 1. EventManager.assign_manager_to_request_type() — singleton (one handler per
@@ -2964,7 +2971,11 @@ class LibraryManager:
         return result
 
     def _create_stable_namespace(self, library_name: str, file_path: Path) -> str:
-        """Create a stable namespace for a dynamic module.
+        """Create the stable module namespace a library node file is executed under.
+
+        The format is intentionally identical to the namespace previously used only as a
+        sys.modules alias, because it is already embedded in the pickled parameter values of
+        saved workflows. Changing it would break loading those workflows.
 
         Args:
             library_name: Name of the library
@@ -2981,124 +2992,153 @@ class LibraryManager:
         # Convert file path to safe module name
         safe_file_name = file_path.stem.replace("-", "_")
 
-        return f"griptape_nodes.node_libraries.{safe_library_name}.{safe_file_name}"
+        return f"{self.STABLE_NAMESPACE_PREFIX}{safe_library_name}.{safe_file_name}"
 
-    def _register_stable_module_alias(
-        self, dynamic_module_name: str, stable_namespace: str, module: ModuleType, library_name: str
-    ) -> None:
-        """Register a stable alias for a dynamic module in sys.modules.
+    def _resolve_stable_namespace(self, library_name: str, file_path: Path) -> str:
+        """Resolve the stable namespace to load a file under, disambiguating collisions.
+
+        Two different files in a library can share a stem (e.g. ``video/compare.py`` and
+        ``traits/compare.py``), which would map both to the same stable namespace and make
+        the second load clobber the first in sys.modules. When that happens we append a
+        short, deterministic suffix derived from the file's identity so both modules can
+        coexist, and warn so the collision can be resolved at the source.
+
+        Loading the same file again (hot reload) is not a collision and keeps its namespace.
 
         Args:
-            dynamic_module_name: Original dynamic module name
-            stable_namespace: Stable namespace to alias to
-            module: The loaded module
             library_name: Name of the library
+            file_path: Canonical path to the Python file being loaded
+
+        Returns:
+            The stable namespace to register the module under.
         """
-        # Update our mapping
-        self._dynamic_to_stable_module_mapping[dynamic_module_name] = stable_namespace
-        self._stable_to_dynamic_module_mapping[stable_namespace] = dynamic_module_name
+        base_namespace = self._create_stable_namespace(library_name, file_path)
+        existing_file = self._stable_module_to_file.get(base_namespace)
+        if existing_file is None or existing_file == file_path:
+            return base_namespace
 
-        # Track library-to-modules mapping for bulk cleanup
-        library_key = library_name
-        if library_key not in self._library_to_stable_modules:
-            self._library_to_stable_modules[library_key] = set()
-        self._library_to_stable_modules[library_key].add(stable_namespace)
+        # Genuine collision between two distinct files: disambiguate the newcomer.
+        suffix = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:8]  # noqa: S324
+        disambiguated = f"{base_namespace}_{suffix}"
+        details = (
+            f"Two node files in library '{library_name}' map to the same module namespace "
+            f"'{base_namespace}': '{existing_file}' and '{file_path}'. Loading the latter as "
+            f"'{disambiguated}'. Rename one of the files to avoid this collision."
+        )
+        logger.warning(details)
+        return disambiguated
 
-        # Register the stable alias in sys.modules
-        sys.modules[stable_namespace] = module
+    def _ensure_parent_packages(self, stable_namespace: str) -> None:
+        """Ensure the synthetic parent packages of a stable namespace exist in sys.modules.
 
-        details = f"Registered stable alias: {stable_namespace} -> {dynamic_module_name} (library: {library_key})"
-        logger.debug(details)
-
-    def _unregister_stable_module_alias(self, dynamic_module_name: str) -> None:
-        """Unregister a stable alias for a dynamic module during hot reload.
+        A module named ``griptape_nodes.node_libraries.<lib>.<file>`` can only be imported
+        (and therefore unpickled) if every parent package is importable. Those parents are
+        synthetic: there is no ``node_libraries`` package on disk. We register each missing
+        parent as an empty namespace package and wire it onto its own parent so the dotted
+        import chain resolves. The real ``griptape_nodes`` package is left untouched.
 
         Args:
-            dynamic_module_name: Original dynamic module name
+            stable_namespace: Fully qualified stable namespace whose parents to create
         """
-        if dynamic_module_name in self._dynamic_to_stable_module_mapping:
-            stable_namespace = self._dynamic_to_stable_module_mapping[dynamic_module_name]
+        parts = stable_namespace.split(".")
+        for depth in range(1, len(parts)):
+            package_name = ".".join(parts[:depth])
+            if package_name not in sys.modules:
+                package = ModuleType(package_name)
+                # Empty __path__ marks this as a (namespace) package so dotted imports resolve.
+                package.__path__ = []  # type: ignore[attr-defined]
+                sys.modules[package_name] = package
 
-            # Remove from sys.modules if it exists
-            if stable_namespace in sys.modules:
-                del sys.modules[stable_namespace]
+            # Wire this package onto its parent so attribute-based import navigation works.
+            if depth > 1:
+                parent = sys.modules[".".join(parts[: depth - 1])]
+                child_name = parts[depth - 1]
+                if not hasattr(parent, child_name):
+                    setattr(parent, child_name, sys.modules[package_name])
 
-            # Remove from library tracking
-            for library_modules in self._library_to_stable_modules.values():
-                library_modules.discard(stable_namespace)
+    def _track_stable_module(self, stable_namespace: str, module: ModuleType, library_name: str) -> None:
+        """Record a loaded stable module so it can be torn down when its library unloads.
 
-            # Remove from our mappings
-            del self._dynamic_to_stable_module_mapping[dynamic_module_name]
-            del self._stable_to_dynamic_module_mapping[stable_namespace]
+        Args:
+            stable_namespace: The stable namespace the module was registered under
+            module: The loaded module
+            library_name: Name of the owning library
+        """
+        self._library_to_stable_modules.setdefault(library_name, set()).add(stable_namespace)
+        self._stable_module_to_file[stable_namespace] = Path(module.__file__) if module.__file__ else Path()
 
-            details = f"Unregistered stable alias: {stable_namespace}"
-            logger.debug(details)
+        # Wire the leaf module onto its parent package for attribute-based import navigation.
+        parent_name, _, child_name = stable_namespace.rpartition(".")
+        parent = sys.modules.get(parent_name)
+        if parent is not None:
+            setattr(parent, child_name, module)
 
     def _unregister_all_stable_module_aliases_for_library(self, library_name: str) -> None:
-        """Unregister all stable module aliases for a library during library unload/reload.
+        """Remove all stable modules for a library from sys.modules during unload/reload.
 
         Args:
             library_name: Name of the library to clean up
         """
-        library_key = library_name
-        if library_key not in self._library_to_stable_modules:
+        stable_namespaces = self._library_to_stable_modules.pop(library_name, set())
+        if not stable_namespaces:
             return
 
-        stable_namespaces = self._library_to_stable_modules[library_key].copy()
-        details = f"Unregistering {len(stable_namespaces)} stable aliases for library: {library_name}"
+        details = f"Unregistering {len(stable_namespaces)} stable modules for library: {library_name}"
         logger.debug(details)
 
         for stable_namespace in stable_namespaces:
-            # Remove from sys.modules if it exists
-            if stable_namespace in sys.modules:
-                del sys.modules[stable_namespace]
+            sys.modules.pop(stable_namespace, None)
+            self._stable_module_to_file.pop(stable_namespace, None)
 
-            # Find and remove from dynamic mapping
-            dynamic_module_name = self._stable_to_dynamic_module_mapping.get(stable_namespace)
-            if dynamic_module_name:
-                self._dynamic_to_stable_module_mapping.pop(dynamic_module_name, None)
-            self._stable_to_dynamic_module_mapping.pop(stable_namespace, None)
+            # Detach the leaf from its parent package so a stale attribute isn't left behind.
+            parent_name, _, child_name = stable_namespace.rpartition(".")
+            parent = sys.modules.get(parent_name)
+            if parent is not None and hasattr(parent, child_name):
+                with contextlib.suppress(AttributeError):
+                    delattr(parent, child_name)
 
-        # Clear the library's module set
-        del self._library_to_stable_modules[library_key]
-        details = f"Completed cleanup of stable aliases for library: '{library_name}'."
+        details = f"Completed cleanup of stable modules for library: '{library_name}'."
         logger.debug(details)
 
     def get_stable_namespace_for_dynamic_module(self, dynamic_module_name: str) -> str | None:
-        """Get the stable namespace for a dynamic module name.
+        """Get the stable namespace for a dynamically loaded library module name.
 
-        This method is used during workflow serialization to convert dynamic module names
-        (like "gtn_dynamic_module_image_to_video_py_123456789") to stable namespace imports
-        (like "griptape_nodes.node_libraries.runwayml_library.image_to_video").
+        Library node files are executed directly under their stable namespace, so a module
+        name that is already a stable namespace is its own answer. Non-library modules have
+        no stable namespace.
 
         Args:
-            dynamic_module_name: The dynamic module name to look up
+            dynamic_module_name: The module name to look up
 
         Returns:
-            The stable namespace string, or None if not found
+            The stable namespace string, or None if the module is not a library module
 
         Example:
-            >>> manager.get_stable_namespace_for_dynamic_module("gtn_dynamic_module_image_to_video_py_123456789")
+            >>> manager.get_stable_namespace_for_dynamic_module(
+            ...     "griptape_nodes.node_libraries.runwayml_library.image_to_video"
+            ... )
             "griptape_nodes.node_libraries.runwayml_library.image_to_video"
         """
-        return self._dynamic_to_stable_module_mapping.get(dynamic_module_name)
+        if self.is_dynamic_module(dynamic_module_name):
+            return dynamic_module_name
+        return None
 
     def is_dynamic_module(self, module_name: str) -> bool:
-        """Check if a module name represents a dynamically loaded module.
+        """Check if a module name represents a dynamically loaded library module.
 
         Args:
             module_name: The module name to check
 
         Returns:
-            True if this is a dynamic module name, False otherwise
+            True if this is a library module namespace, False otherwise
 
         Example:
-            >>> manager.is_dynamic_module("gtn_dynamic_module_image_to_video_py_123456789")
+            >>> manager.is_dynamic_module("griptape_nodes.node_libraries.runwayml_library.image_to_video")
             True
             >>> manager.is_dynamic_module("griptape.artifacts")
             False
         """
-        return module_name.startswith("gtn_dynamic_module_")
+        return module_name.startswith(self.STABLE_NAMESPACE_PREFIX)
 
     @staticmethod
     def _get_root_cause_from_exception(exception: BaseException) -> BaseException:
@@ -3150,7 +3190,14 @@ class LibraryManager:
             return is_compatible, current_engine_version
 
     def _load_module_from_file(self, file_path: Path | str, library_name: str) -> ModuleType:
-        """Dynamically load a module from a Python file with support for hot reloading.
+        """Dynamically load a library node module from a Python file, with hot-reload support.
+
+        The module is executed under its stable namespace (e.g.
+        ``griptape_nodes.node_libraries.<lib>.<file>``) rather than a volatile per-process
+        name. Because the module's ``__name__`` is stable and deterministic, every class it
+        defines carries a stable ``__module__``, so pickled parameter values embed a module
+        reference that resolves after an engine restart (or when a saved image is dragged
+        back onto the canvas) as long as the owning library is loaded.
 
         Args:
             file_path: Path to the Python file
@@ -3162,71 +3209,41 @@ class LibraryManager:
         Raises:
             ImportError: If the module cannot be imported
         """
-        # Ensure file_path is a Path object
-        file_path = Path(file_path)
+        # Canonicalize so hot-reload detection and collision detection compare stable identities.
+        file_path = canonicalize_for_identity(file_path)
 
-        # Generate a unique module name
-        module_name = f"gtn_dynamic_module_{file_path.name.replace('.', '_')}_{hash(str(file_path))}"
+        stable_namespace = self._resolve_stable_namespace(library_name, file_path)
+        self._ensure_parent_packages(stable_namespace)
 
-        # Create stable namespace
-        stable_namespace = self._create_stable_namespace(library_name, file_path)
+        spec = importlib.util.spec_from_file_location(stable_namespace, file_path)
+        if spec is None or spec.loader is None:
+            msg = f"Could not load module specification from {file_path}"
+            raise ImportError(msg)
 
-        # Check if this module is already loaded
-        if module_name in sys.modules:
-            # For dynamically loaded modules, we need to re-create the module
-            # with a fresh spec rather than using importlib.reload
+        module = importlib.util.module_from_spec(spec)
 
-            # Unregister old stable alias
-            self._unregister_stable_module_alias(module_name)
+        # Preserve the previous module (if any) so a failed reload can be rolled back. Loading
+        # under a stable name means hot reload is just re-exec under the same key; already
+        # instantiated objects keep their old class, same as before.
+        is_reload = stable_namespace in sys.modules
+        previous_module = sys.modules.get(stable_namespace)
+        sys.modules[stable_namespace] = module
 
-            # Remove the old module from sys.modules
-            old_module = sys.modules.pop(module_name)
+        try:
+            spec.loader.exec_module(module)
+        except Exception as err:
+            if previous_module is not None:
+                sys.modules[stable_namespace] = previous_module
+            else:
+                sys.modules.pop(stable_namespace, None)
+            verb = "reload" if is_reload else "load"
+            msg = f"Module at '{file_path}' failed to {verb} with error: {err}"
+            raise ImportError(msg) from err
 
-            # Create a fresh spec and module
-            spec = importlib.util.spec_from_file_location(module_name, file_path)
-            if spec is None or spec.loader is None:
-                msg = f"Could not load module specification from {file_path}"
-                raise ImportError(msg)
-
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-
-            try:
-                # Execute the module with the new code
-                spec.loader.exec_module(module)
-                # Register new stable alias
-                self._register_stable_module_alias(module_name, stable_namespace, module, library_name)
-                details = f"Hot reloaded module: {module_name} from {file_path}"
-                logger.debug(details)
-            except Exception as e:
-                # Restore the old module in case of failure
-                sys.modules[module_name] = old_module
-                msg = f"Error reloading module {module_name} from {file_path}: {e}"
-                raise ImportError(msg) from e
-
-        # Load it for the first time
-        else:
-            # Load the module specification
-            spec = importlib.util.spec_from_file_location(module_name, file_path)
-            if spec is None or spec.loader is None:
-                msg = f"Could not load module specification from {file_path}"
-                raise ImportError(msg)
-
-            # Create the module
-            module = importlib.util.module_from_spec(spec)
-
-            # Add to sys.modules to handle recursive imports
-            sys.modules[module_name] = module
-
-            # Execute the module
-            try:
-                spec.loader.exec_module(module)
-                # Register stable alias
-                self._register_stable_module_alias(module_name, stable_namespace, module, library_name)
-            except Exception as err:
-                msg = f"Module at '{file_path}' failed to load with error: {err}"
-                raise ImportError(msg) from err
-
+        self._track_stable_module(stable_namespace, module, library_name)
+        if is_reload:
+            details = f"Hot reloaded module: {stable_namespace} from {file_path}"
+            logger.debug(details)
         return module
 
     def _load_class_from_file(self, file_path: Path | str, class_name: str, library_name: str) -> type[BaseNode]:
