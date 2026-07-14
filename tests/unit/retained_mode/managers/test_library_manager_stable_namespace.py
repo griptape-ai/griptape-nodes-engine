@@ -241,6 +241,55 @@ class TestStableNamespaceLoading:
         assert manager.get_stable_namespace_for_dynamic_module(stable) == stable
         assert manager.get_stable_namespace_for_dynamic_module("griptape.artifacts") is None
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="symlink creation requires privileges on Windows")
+    def test_symlinked_file_keeps_its_logical_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """A node file loaded through a differently named symlink keeps the symlink's name.
+
+        The namespace is part of every pickled reference, so it must follow the name the
+        file was loaded by (what earlier engine versions recorded), not the symlink target.
+        """
+        manager = griptape_nodes.LibraryManager()
+        target = _write_module(tmp_path, "actual_behavior.py")
+        alias = tmp_path / "alias_behavior.py"
+        alias.symlink_to(target)
+
+        module = manager._load_module_from_file(alias, "My Test Library")
+
+        expected = "griptape_nodes.node_libraries.my_test_library.alias_behavior"
+        assert module.__name__ == expected
+        # Legacy volatile tokens were built from the loaded (symlink) name too.
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_alias_behavior_py_42", "Behavior")
+        assert resolved is module.Behavior
+
+    def test_shared_namespace_survives_until_last_owner_unloads(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Two libraries resolving to the same module must not unload it out from under each other.
+
+        'My Test Library' and 'My-Test Library' sanitize to the same namespace segment; when
+        both point at the same file, they share one stable module. Unloading the first
+        library must keep the module importable for the second; only the final unload
+        removes it.
+        """
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision_behavior.py")
+
+        module_first = manager._load_module_from_file(file_path, "My Test Library")
+        module_second = manager._load_module_from_file(file_path, "My-Test Library")
+        assert module_second.__name__ == module_first.__name__, "sanity: both libraries must share the namespace"
+        namespace = module_second.__name__
+
+        manager._unregister_all_stable_module_aliases_for_library("My Test Library")
+
+        assert namespace in sys.modules, "the module must survive while another library still owns it"
+        assert manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_42", "Behavior") is (
+            sys.modules[namespace].Behavior
+        )
+
+        manager._unregister_all_stable_module_aliases_for_library("My-Test Library")
+
+        assert namespace not in sys.modules, "the final owner's unload must remove the module"
+
 
 @pytest.mark.usefixtures("restore_sys_modules")
 class TestVolatileDynamicModuleResolution:
