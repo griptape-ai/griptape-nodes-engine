@@ -904,6 +904,111 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
 
         manager._unregister_all_stable_module_aliases_for_library(library_name)
 
+    def test_unpickles_nested_class_saved_with_volatile_module_name(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A legacy pickle referencing a nested class (dotted qualified name) still loads.
+
+        Pickle protocol 4+ records nested classes as dotted names like
+        ``SetVariablesNode.CollisionBehavior``; legacy recovery must resolve each component
+        in sequence rather than a single getattr.
+        """
+        import sys
+        import types
+
+        nested_source = (
+            "from enum import StrEnum\n\n\n"
+            "class SetVariablesNode:\n"
+            "    class CollisionBehavior(StrEnum):\n"
+            '        OVERWRITE = "Overwrite existing"\n'
+            '        PRESERVE = "Preserve existing"\n'
+        )
+
+        volatile_name = "gtn_dynamic_module_set_variables_from_data_py_4816193767510271467"
+        volatile_module = types.ModuleType(volatile_name)
+        exec(nested_source, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.SetVariablesNode.CollisionBehavior.PRESERVE)
+        del sys.modules[volatile_name]
+        assert b"SetVariablesNode" in pickled, "sanity: the pickle must reference the nested qualified name"
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "nested_legacy.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(nested_source)
+        manager = griptape_nodes.LibraryManager()
+        loaded = manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands is loaded.SetVariablesNode.CollisionBehavior.PRESERVE
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_unpickles_collided_values_after_reverse_load_order(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Values pickled under both collided namespaces load after the ownership flips.
+
+        'Collision Library' and 'Collision-Library' sanitize to the same namespace segment,
+        so their same-stem node files collide on one base namespace. An image saved while A
+        owned the plain name embeds references to both the plain name (A's value) and the
+        suffixed name (B's value). Reloading in the opposite order flips ownership; both
+        references must still resolve to their original classes.
+        """
+        import sys
+
+        source_a = 'from enum import StrEnum\n\n\nclass AlphaBehavior(StrEnum):\n    OVERWRITE = "Overwrite existing"\n'
+        source_b = 'from enum import StrEnum\n\n\nclass BetaBehavior(StrEnum):\n    PRESERVE = "Preserve existing"\n'
+        file_a = tmp_path / "first" / "collide.py"
+        file_a.parent.mkdir()
+        file_a.write_text(source_a)
+        file_b = tmp_path / "second" / "collide.py"
+        file_b.parent.mkdir()
+        file_b.write_text(source_b)
+
+        manager = griptape_nodes.LibraryManager()
+        module_a = manager._load_module_from_file(file_a, "Collision Library")
+        module_b = manager._load_module_from_file(file_b, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the first collision"
+
+        pickled = pickle.dumps([module_a.AlphaBehavior.OVERWRITE, module_b.BetaBehavior.PRESERVE])
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "collided.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        # Simulate a fresh engine that registers the libraries in the opposite order.
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+        module_b2 = manager._load_module_from_file(file_b, "Collision-Library")
+        module_a2 = manager._load_module_from_file(file_a, "Collision Library")
+        assert module_b2.__name__ == module_a.__name__, "sanity: reverse order must flip base ownership"
+        assert module_b.__name__ not in sys.modules, "sanity: B's suffixed name must be gone after the flip"
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        recovered_values = result.serialized_flow_commands
+        assert isinstance(recovered_values, list)
+        recovered_alpha, recovered_beta = recovered_values
+        assert recovered_alpha is module_a2.AlphaBehavior.OVERWRITE
+        assert recovered_beta is module_b2.BetaBehavior.PRESERVE
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+
     def test_ambiguous_legacy_module_yields_artist_readable_error(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:

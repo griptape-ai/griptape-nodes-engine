@@ -43,6 +43,16 @@ class Widget:
         self.count = count
 """
 
+_NESTED_MODULE_SOURCE = """
+from enum import StrEnum
+
+
+class Node:
+    class Behavior(StrEnum):
+        OVERWRITE = "Overwrite existing"
+        PRESERVE = "Preserve existing"
+"""
+
 
 @pytest.fixture
 def restore_sys_modules() -> object:
@@ -230,39 +240,37 @@ class TestStableNamespaceLoading:
 
 @pytest.mark.usefixtures("restore_sys_modules")
 class TestVolatileDynamicModuleResolution:
-    """Mapping old volatile pickle module names back to loaded stable modules."""
+    """Mapping old volatile pickle module names back to classes in loaded stable modules."""
 
-    def test_resolves_to_loaded_stable_module(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+    def test_resolves_to_class_in_loaded_stable_module(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         manager = griptape_nodes.LibraryManager()
         file_path = _write_module(tmp_path, "collision_behavior.py")
         module = manager._load_module_from_file(file_path, "My Test Library")
 
-        resolved = manager.resolve_volatile_dynamic_module(
+        resolved = manager.resolve_volatile_dynamic_class(
             "gtn_dynamic_module_collision_behavior_py_-8859640815979518826", "Behavior"
         )
 
-        assert resolved is module
+        assert resolved is module.Behavior
 
     def test_returns_none_for_non_volatile_name(self, griptape_nodes: GriptapeNodes) -> None:
         manager = griptape_nodes.LibraryManager()
 
-        assert manager.resolve_volatile_dynamic_module("griptape.artifacts", "TextArtifact") is None
+        assert manager.resolve_volatile_dynamic_class("griptape.artifacts", "TextArtifact") is None
 
     def test_returns_none_when_class_missing(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         manager = griptape_nodes.LibraryManager()
         file_path = _write_module(tmp_path, "collision_behavior.py")
         manager._load_module_from_file(file_path, "My Test Library")
 
-        resolved = manager.resolve_volatile_dynamic_module(
-            "gtn_dynamic_module_collision_behavior_py_123", "NoSuchClass"
-        )
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_123", "NoSuchClass")
 
         assert resolved is None
 
     def test_returns_none_when_no_module_loaded(self, griptape_nodes: GriptapeNodes) -> None:
         manager = griptape_nodes.LibraryManager()
 
-        resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_never_loaded_py_42", "Behavior")
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_never_loaded_py_42", "Behavior")
 
         assert resolved is None
 
@@ -276,9 +284,43 @@ class TestVolatileDynamicModuleResolution:
         second = manager._load_module_from_file(second_file, "Second Library")
 
         with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
-            manager.resolve_volatile_dynamic_module("gtn_dynamic_module_collision_behavior_py_42", "Behavior")
+            manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_42", "Behavior")
 
         assert exc_info.value.candidate_modules == (first.__name__, second.__name__)
+
+    def test_collision_suffixed_module_participates_in_ambiguity_detection(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A module disambiguated with a collision suffix still counts as a legacy candidate.
+
+        Its namespace leaf no longer equals the legacy file stem, so matching must go through
+        the tracked file path. If it were skipped, the lookup would silently resolve to the
+        first-loaded library instead of failing safely on the ambiguity.
+        """
+        manager = griptape_nodes.LibraryManager()
+        first_file = _write_module(tmp_path / "video", "compare.py")
+        second_file = _write_module(tmp_path / "traits", "compare.py")
+        first = manager._load_module_from_file(first_file, "My Test Library")
+        second = manager._load_module_from_file(second_file, "My Test Library")
+        assert second.__name__.startswith(first.__name__ + "_"), "sanity: second module must carry a suffix"
+
+        with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
+            manager.resolve_volatile_dynamic_class("gtn_dynamic_module_compare_py_42", "Behavior")
+
+        assert exc_info.value.candidate_modules == (first.__name__, second.__name__)
+
+    def test_resolves_nested_class_via_dotted_qualified_name(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Pickle protocol 4+ records nested classes as dotted names like 'Node.Behavior'."""
+        manager = griptape_nodes.LibraryManager()
+        file_path = tmp_path / "nested_behavior.py"
+        file_path.write_text(_NESTED_MODULE_SOURCE)
+        module = manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_nested_behavior_py_42", "Node.Behavior")
+
+        assert resolved is module.Node.Behavior
 
     def test_resolves_hyphenated_file_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """Volatile names kept hyphens ('.'->'_' only); stable stems use '_'. Both must match."""
@@ -286,9 +328,98 @@ class TestVolatileDynamicModuleResolution:
         file_path = _write_module(tmp_path, "collision-behavior.py")
         module = manager._load_module_from_file(file_path, "My Test Library")
 
-        resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_collision-behavior_py_99", "Behavior")
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision-behavior_py_99", "Behavior")
 
-        assert resolved is module
+        assert resolved is module.Behavior
+
+
+@pytest.mark.usefixtures("restore_sys_modules")
+class TestCollidedStableNamespaceResolution:
+    """Resolving stable-namespace pickle references across collision load-order flips.
+
+    Which colliding file owns the plain base namespace and which gets the deterministic
+    suffix depends on load order. A pickle from an earlier process can therefore reference
+    either name for either file; resolution must find the class regardless.
+    """
+
+    _SOURCE_A = 'from enum import StrEnum\n\n\nclass AlphaBehavior(StrEnum):\n    OVERWRITE = "Overwrite existing"\n'
+    _SOURCE_B = 'from enum import StrEnum\n\n\nclass BetaBehavior(StrEnum):\n    PRESERVE = "Preserve existing"\n'
+
+    def _write_colliding_files(self, tmp_path: Path) -> tuple[Path, Path]:
+        first_file = tmp_path / "first" / "collide.py"
+        first_file.parent.mkdir(parents=True, exist_ok=True)
+        first_file.write_text(self._SOURCE_A)
+        second_file = tmp_path / "second" / "collide.py"
+        second_file.parent.mkdir(parents=True, exist_ok=True)
+        second_file.write_text(self._SOURCE_B)
+        return first_file, second_file
+
+    def test_pickles_from_both_collided_files_survive_reverse_load_order(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Values pickled under either collided name resolve after the ownership flip.
+
+        'Collision Library' and 'Collision-Library' sanitize to the same namespace segment,
+        so both files map to the same base namespace. Load A then B, record the names their
+        pickles would embed, reload in reverse order (flipping who owns the plain name), and
+        resolve both recorded references.
+        """
+        manager = griptape_nodes.LibraryManager()
+        first_file, second_file = self._write_colliding_files(tmp_path)
+
+        module_a = manager._load_module_from_file(first_file, "Collision Library")
+        module_b = manager._load_module_from_file(second_file, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the first collision"
+        name_recorded_for_a = module_a.__name__
+        name_recorded_for_b = module_b.__name__
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+        module_b2 = manager._load_module_from_file(second_file, "Collision-Library")
+        module_a2 = manager._load_module_from_file(first_file, "Collision Library")
+        assert module_b2.__name__ == name_recorded_for_a, "sanity: reverse order must flip base ownership"
+
+        resolved_a = manager.resolve_collided_stable_class(name_recorded_for_a, "AlphaBehavior")
+        resolved_b = manager.resolve_collided_stable_class(name_recorded_for_b, "BetaBehavior")
+
+        assert resolved_a is module_a2.AlphaBehavior
+        assert resolved_b is module_b2.BetaBehavior
+
+    def test_raises_when_both_collided_files_define_the_class(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A base-namespace reference both files can satisfy fails safely instead of guessing."""
+        manager = griptape_nodes.LibraryManager()
+        first_file = tmp_path / "first" / "collide.py"
+        first_file.parent.mkdir(parents=True, exist_ok=True)
+        first_file.write_text(_MODULE_SOURCE)
+        second_file = tmp_path / "second" / "collide.py"
+        second_file.parent.mkdir(parents=True, exist_ok=True)
+        second_file.write_text(_MODULE_SOURCE)
+
+        module_a = manager._load_module_from_file(first_file, "Collision Library")
+        module_b = manager._load_module_from_file(second_file, "Collision-Library")
+
+        with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
+            manager.resolve_collided_stable_class(module_a.__name__, "Behavior")
+
+        assert exc_info.value.candidate_modules == (module_a.__name__, module_b.__name__)
+
+    def test_returns_none_for_non_stable_namespace(self, griptape_nodes: GriptapeNodes) -> None:
+        manager = griptape_nodes.LibraryManager()
+
+        assert manager.resolve_collided_stable_class("griptape.artifacts", "TextArtifact") is None
+
+    def test_returns_none_when_no_collided_module_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision_behavior.py")
+        manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_collided_stable_class(
+            "griptape_nodes.node_libraries.some_other_library.other_file", "Behavior"
+        )
+
+        assert resolved is None
 
 
 class TestModuleDisplayName:

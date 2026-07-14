@@ -204,7 +204,7 @@ def test_legacy_dynamic_module_image_recovers_in_fresh_process(tmp_path: Path) -
     ``gtn_dynamic_module_lifecycle_node_py_<hash>`` name (exec'ing the checked-in fixture
     source, so the enum class is real), pickle a member of its enum, then drop the module.
     A fresh engine process never has this exact volatile name. The subprocess below never
-    calls ``LibraryManager.resolve_volatile_dynamic_module`` itself; it only issues
+    calls ``LibraryManager.resolve_volatile_dynamic_class`` itself; it only issues
     ``ExtractFlowCommandsFromImageMetadataRequest`` and relies on the real handler
     (``_FlowCommandsUnpickler``) to do the remapping as an implementation detail.
     """
@@ -362,7 +362,9 @@ def test_namespace_collision_across_libraries_survives_unload_and_reverse_reload
     gives the first library the plain stable namespace and disambiguates the second with a
     hash suffix. Unloading the base-namespace winner must not disturb the loser's module.
     Unloading both and reloading in the opposite order must flip who gets the plain name, and
-    must never leave a stale leaf module behind from either lifecycle.
+    must never leave a stale leaf module behind from either lifecycle. Class references
+    pickled under the pre-flip names (plain for the winner, suffixed for the loser) must
+    still resolve to their original libraries after the flip.
     """
     library_json_a = _materialize_library(COLLISION_LIBRARY_A_DIR, tmp_path / "library_a")
     library_json_b = _materialize_library(COLLISION_LIBRARY_B_DIR, tmp_path / "library_b")
@@ -370,7 +372,11 @@ def test_namespace_collision_across_libraries_survives_unload_and_reverse_reload
     env = _isolated_env(tmp_path / "xdg", tmp_path / "workspace")
     response = _run_driver(
         "collision",
-        {"library_json_a": str(library_json_a), "library_json_b": str(library_json_b)},
+        {
+            "library_json_a": str(library_json_a),
+            "library_json_b": str(library_json_b),
+            "image_path": str(tmp_path / "collision.png"),
+        },
         env=env,
         tmp_path=tmp_path,
     )
@@ -392,3 +398,12 @@ def test_namespace_collision_across_libraries_survives_unload_and_reverse_reload
     assert response["namespace_a2"] != COLLISION_STABLE_NAMESPACE
     assert response["namespace_a2"].startswith(COLLISION_STABLE_NAMESPACE + "_")
     assert set(response["modules_after_reverse_load"]) == {response["namespace_a2"], response["namespace_b2"]}
+
+    assert response["recovered_a_name"] == "CollisionNodeA"
+    assert response["recovered_a_module"] == response["namespace_a2"], (
+        "A's class, pickled under the plain namespace, must resolve to A's post-flip module"
+    )
+    assert response["recovered_b_name"] == "CollisionNodeB"
+    assert response["recovered_b_module"] == response["namespace_b2"], (
+        "B's class, pickled under the suffixed namespace, must resolve to B's post-flip module"
+    )

@@ -237,7 +237,7 @@ def cmd_legacy_image(request: dict[str, Any]) -> dict[str, Any]:
     The PNG was crafted by the test process using a volatile ``gtn_dynamic_module_..._<hash>``
     module name that never existed here. Goes through the public
     ``ExtractFlowCommandsFromImageMetadataRequest`` only; the volatile-name resolution inside
-    ``_FlowCommandsUnpickler``/``LibraryManager.resolve_volatile_dynamic_module`` runs as an
+    ``_FlowCommandsUnpickler``/``LibraryManager.resolve_volatile_dynamic_class`` runs as an
     implementation detail of that request, never called directly.
     """
     from griptape_nodes.retained_mode.events.flow_events import (
@@ -393,15 +393,33 @@ def cmd_sandbox_lifecycle(request: dict[str, Any]) -> dict[str, Any]:
 
 
 def cmd_collision(request: dict[str, Any]) -> dict[str, Any]:
-    """Two libraries whose sanitized names collide, loaded/unloaded/reloaded in both orders."""
+    """Two libraries whose sanitized names collide, loaded/unloaded/reloaded in both orders.
+
+    Also proves the pickle contract across the load-order flip: values pickled while the
+    first library owned the plain base namespace (one referencing the plain name, one the
+    disambiguation-suffixed name) must still resolve after the libraries reload in the
+    opposite order and namespace ownership flips.
+    """
+    import base64
+    import pickle
+
+    from PIL import Image
+    from PIL.PngImagePlugin import PngInfo
+
+    from griptape_nodes.retained_mode.events.flow_events import (
+        ExtractFlowCommandsFromImageMetadataRequest,
+        ExtractFlowCommandsFromImageMetadataResultSuccess,
+    )
     from griptape_nodes.retained_mode.events.library_events import (
         UnloadLibraryFromRegistryRequest,
         UnloadLibraryFromRegistryResultSuccess,
     )
+    from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
     library_json_a = request["library_json_a"]
     library_json_b = request["library_json_b"]
+    image_path = Path(request["image_path"])
     stable_prefix = "griptape_nodes.node_libraries.collision_library"
 
     _create_flow("CollisionFlow")
@@ -431,6 +449,16 @@ def cmd_collision(request: dict[str, Any]) -> dict[str, Any]:
     )
     modules_after_first_load = _leaf_modules()
 
+    # Pickle a class reference from each library while A owns the plain namespace: A's
+    # reference records the plain name, B's records the disambiguation-suffixed name.
+    class_a = sys.modules[namespace_a1].CollisionNodeA
+    class_b = sys.modules[namespace_b1].CollisionNodeB
+    pickled = pickle.dumps([class_a, class_b])
+    assert namespace_b1.encode() in pickled, "sanity: the pickle must embed the suffixed namespace"
+    info = PngInfo()
+    info.add_text(FLOW_COMMANDS_KEY, base64.b64encode(pickled).decode("ascii"))
+    Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
     unload_a = GriptapeNodes.handle_request(UnloadLibraryFromRegistryRequest(library_name="Collision Library"))
     assert isinstance(unload_a, UnloadLibraryFromRegistryResultSuccess), (
         f"Failed to unload 'Collision Library': {unload_a.result_details}"
@@ -457,6 +485,19 @@ def cmd_collision(request: dict[str, Any]) -> dict[str, Any]:
     )
     modules_after_reverse_load = _leaf_modules()
 
+    # Both pickled references were recorded under the pre-flip ownership; extracting the
+    # image through the public request must recover both classes from their libraries'
+    # current (post-flip) modules.
+    extract_result = GriptapeNodes.handle_request(
+        ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+    )
+    assert isinstance(extract_result, ExtractFlowCommandsFromImageMetadataResultSuccess), (
+        f"Failed to extract collided flow commands after reverse reload: {extract_result.result_details}"
+    )
+    recovered_classes = extract_result.serialized_flow_commands
+    assert isinstance(recovered_classes, list), f"Expected the unpickled class list, got {type(recovered_classes)}"
+    recovered_a, recovered_b = recovered_classes
+
     return {
         "ok": True,
         "namespace_a1": namespace_a1,
@@ -468,6 +509,10 @@ def cmd_collision(request: dict[str, Any]) -> dict[str, Any]:
         "namespace_b2": namespace_b2,
         "namespace_a2": namespace_a2,
         "modules_after_reverse_load": modules_after_reverse_load,
+        "recovered_a_name": recovered_a.__name__,
+        "recovered_a_module": recovered_a.__module__,
+        "recovered_b_name": recovered_b.__name__,
+        "recovered_b_module": recovered_b.__module__,
     }
 
 
