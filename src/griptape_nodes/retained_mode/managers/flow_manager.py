@@ -194,27 +194,27 @@ class _FlowCommandsUnpickler(pickle.Unpickler):
     ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``, which cannot be
     imported in a later process. Images can also reference a stable namespace that this
     process assigned differently because two node files collide on the same base namespace
-    and loaded in a different order. When standard resolution fails, this asks the
-    LibraryManager to map the recorded name to the class now loaded under its stable
-    namespace so those images remain loadable.
+    and loaded in a different order. Both kinds of reference are remapped through the
+    LibraryManager to the class now loaded under its stable namespace so those images remain
+    loadable.
     """
 
     def find_class(self, module: str, name: str) -> Any:
         library_manager = GriptapeNodes.LibraryManager()
+        # Stable-namespace references resolve through collision-aware lookup first: when two
+        # node files collide on a base namespace, which file owns the plain name depends on
+        # load order, so a plain lookup could silently return the other file's class. The
+        # resolver finds the single loaded module that defines the class regardless of which
+        # namespace it currently owns, and raises AmbiguousLegacyModuleError instead of
+        # guessing when more than one collided module defines it.
+        if library_manager.is_dynamic_module(module):
+            resolved_class = library_manager.resolve_collided_stable_class(module, name)
+            if resolved_class is not None:
+                return resolved_class
         try:
             return super().find_class(module, name)
         except ModuleNotFoundError:
             resolved_class = library_manager.resolve_volatile_dynamic_class(module, name)
-            if resolved_class is None:
-                resolved_class = library_manager.resolve_collided_stable_class(module, name)
-            if resolved_class is None:
-                raise
-            return resolved_class
-        except AttributeError:
-            # The module imported but does not define the class: with colliding node files,
-            # the base namespace may belong to a different file in this process than in the
-            # process that wrote the pickle.
-            resolved_class = library_manager.resolve_collided_stable_class(module, name)
             if resolved_class is None:
                 raise
             return resolved_class

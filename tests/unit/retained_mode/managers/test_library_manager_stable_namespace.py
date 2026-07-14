@@ -323,7 +323,7 @@ class TestVolatileDynamicModuleResolution:
         assert resolved is module.Node.Behavior
 
     def test_resolves_hyphenated_file_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        """Volatile names kept hyphens ('.'->'_' only); stable stems use '_'. Both must match."""
+        """Volatile names kept hyphens ('.'->'_' only); the reconstructed token must too."""
         manager = griptape_nodes.LibraryManager()
         file_path = _write_module(tmp_path, "collision-behavior.py")
         module = manager._load_module_from_file(file_path, "My Test Library")
@@ -331,6 +331,38 @@ class TestVolatileDynamicModuleResolution:
         resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision-behavior_py_99", "Behavior")
 
         assert resolved is module.Behavior
+
+    def test_resolves_dotted_file_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """Volatile names replaced every '.' in the file name, not just the '.py' suffix."""
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision.behavior.py")
+        module = manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_99", "Behavior")
+
+        assert resolved is module.Behavior
+
+    def test_hyphen_and_underscore_files_stay_distinct(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """'foo-bar.py' and 'foo_bar.py' had distinct volatile tokens; both must resolve exactly.
+
+        Their stable stems collapse to the same namespace (collision suffix disambiguates),
+        but their legacy tokens differ by the hyphen, so neither lookup may be ambiguous.
+        """
+        manager = griptape_nodes.LibraryManager()
+        hyphen_file = _write_module(tmp_path / "first", "collision-behavior.py")
+        underscore_file = _write_module(tmp_path / "second", "collision_behavior.py")
+        hyphen_module = manager._load_module_from_file(hyphen_file, "My Test Library")
+        underscore_module = manager._load_module_from_file(underscore_file, "My Test Library")
+
+        resolved_hyphen = manager.resolve_volatile_dynamic_class(
+            "gtn_dynamic_module_collision-behavior_py_1", "Behavior"
+        )
+        resolved_underscore = manager.resolve_volatile_dynamic_class(
+            "gtn_dynamic_module_collision_behavior_py_2", "Behavior"
+        )
+
+        assert resolved_hyphen is hyphen_module.Behavior
+        assert resolved_underscore is underscore_module.Behavior
 
 
 @pytest.mark.usefixtures("restore_sys_modules")
@@ -404,6 +436,27 @@ class TestCollidedStableNamespaceResolution:
             manager.resolve_collided_stable_class(module_a.__name__, "Behavior")
 
         assert exc_info.value.candidate_modules == (module_a.__name__, module_b.__name__)
+
+    def test_collision_loser_keeps_namespace_after_winner_unloads(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A tracked file's namespace is sticky: reloading the loser must not claim the freed base.
+
+        If the loser silently moved to the base namespace on hot reload, its old module would
+        remain registered under the suffixed name (stale classes, ambiguous legacy lookups)
+        and references already pickled under the suffixed name would drift.
+        """
+        manager = griptape_nodes.LibraryManager()
+        first_file, second_file = self._write_colliding_files(tmp_path)
+        module_a = manager._load_module_from_file(first_file, "Collision Library")
+        module_b = manager._load_module_from_file(second_file, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the collision"
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        reloaded_b = manager._load_module_from_file(second_file, "Collision-Library")
+
+        assert reloaded_b.__name__ == module_b.__name__, "the loser must keep its suffixed namespace"
+        assert module_a.__name__ not in sys.modules, "the freed base namespace must stay free"
 
     def test_returns_none_for_non_stable_namespace(self, griptape_nodes: GriptapeNodes) -> None:
         manager = griptape_nodes.LibraryManager()
