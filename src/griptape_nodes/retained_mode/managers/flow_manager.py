@@ -173,6 +173,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.library_manager import AmbiguousLegacyModuleError
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -4186,6 +4187,20 @@ class FlowManager:
             # _FlowCommandsUnpickler additionally remaps volatile module names from images saved
             # by engines that predate stable-namespace module loading.
             serialized_flow_commands = _FlowCommandsUnpickler(BytesIO(pickled_data)).load()
+        except AmbiguousLegacyModuleError as e:
+            display_candidates = [
+                GriptapeNodes.LibraryManager().get_module_display_name(module_name)
+                for module_name in e.candidate_modules
+            ]
+            candidates = ", ".join(f"'{candidate}'" for candidate in display_candidates)
+            return ExtractFlowCommandsFromImageMetadataResultFailure(
+                result_details=(
+                    f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because more than "
+                    f"one loaded library provides node type '{e.class_name}' ({candidates}). Disable one of the "
+                    "matching libraries, then try again."
+                ),
+                file_path=file_url_or_path,
+            )
         except ModuleNotFoundError as e:
             missing_module = e.name or "unknown"
             display_name = GriptapeNodes.LibraryManager().get_module_display_name(missing_module)

@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import AmbiguousLegacyModuleError, LibraryManager
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -265,6 +265,20 @@ class TestVolatileDynamicModuleResolution:
         resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_never_loaded_py_42", "Behavior")
 
         assert resolved is None
+
+    def test_raises_when_multiple_libraries_define_the_legacy_class(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        manager = griptape_nodes.LibraryManager()
+        first_file = _write_module(tmp_path / "first", "collision_behavior.py")
+        second_file = _write_module(tmp_path / "second", "collision_behavior.py")
+        first = manager._load_module_from_file(first_file, "First Library")
+        second = manager._load_module_from_file(second_file, "Second Library")
+
+        with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
+            manager.resolve_volatile_dynamic_module("gtn_dynamic_module_collision_behavior_py_42", "Behavior")
+
+        assert exc_info.value.candidate_modules == (first.__name__, second.__name__)
 
     def test_resolves_hyphenated_file_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """Volatile names kept hyphens ('.'->'_' only); stable stems use '_'. Both must match."""

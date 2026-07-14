@@ -297,6 +297,16 @@ EXCLUDED_SCAN_DIRECTORIES = frozenset({"venv", "__pycache__"})
 TRegisteredEventData = TypeVar("TRegisteredEventData")
 
 
+class AmbiguousLegacyModuleError(Exception):
+    """Raised when an old pickle's module reference matches multiple loaded libraries."""
+
+    def __init__(self, class_name: str, candidate_modules: list[str]) -> None:
+        self.class_name = class_name
+        self.candidate_modules = tuple(candidate_modules)
+        candidates = ", ".join(candidate_modules)
+        super().__init__(f"Legacy class '{class_name}' matches multiple loaded modules: {candidates}")
+
+
 class LibraryGitOperationContext(NamedTuple):
     """Context information for git operations on a library."""
 
@@ -3195,17 +3205,16 @@ class LibraryManager:
             if stable_namespace.rsplit(".", 1)[-1] != stem:
                 continue
             module = sys.modules.get(stable_namespace)
-            if module is not None and hasattr(module, class_name):
+            if module is None:
+                continue
+            candidate = getattr(module, class_name, None)
+            if getattr(candidate, "__module__", None) == module.__name__:
                 matches.append(module)
 
         if not matches:
             return None
         if len(matches) > 1:
-            details = (
-                f"Multiple loaded library modules match volatile module name '{module_name}' "
-                f"for class '{class_name}': {[m.__name__ for m in matches]}. Using '{matches[0].__name__}'."
-            )
-            logger.warning(details)
+            raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matches])
         return matches[0]
 
     def get_module_display_name(self, module_name: str) -> str:
