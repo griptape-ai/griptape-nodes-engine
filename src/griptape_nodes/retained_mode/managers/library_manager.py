@@ -3006,6 +3006,10 @@ class LibraryManager:
 
         Loading the same file again (hot reload) is not a collision and keeps its namespace.
 
+        The disambiguation suffix hashes the absolute file path, so it is stable per install
+        but not portable across machines; recovering pre-existing pickles for collided files
+        is out of scope (see #4475 for the deeper import-path coupling).
+
         Args:
             library_name: Name of the library
             file_path: Canonical path to the Python file being loaded
@@ -3038,6 +3042,10 @@ class LibraryManager:
         parent as an empty namespace package and wire it onto its own parent so the dotted
         import chain resolves. The real ``griptape_nodes`` package is left untouched.
 
+        Parents are retained on library unload deliberately: they are tiny, shared across
+        libraries, and tearing them down while a sibling library still uses them would break
+        that sibling's imports. Only leaf modules are removed on unload.
+
         Args:
             stable_namespace: Fully qualified stable namespace whose parents to create
         """
@@ -3057,16 +3065,22 @@ class LibraryManager:
                 if not hasattr(parent, child_name):
                     setattr(parent, child_name, sys.modules[package_name])
 
-    def _track_stable_module(self, stable_namespace: str, module: ModuleType, library_name: str) -> None:
+    def _track_stable_module(
+        self, stable_namespace: str, module: ModuleType, library_name: str, file_path: Path
+    ) -> None:
         """Record a loaded stable module so it can be torn down when its library unloads.
 
         Args:
             stable_namespace: The stable namespace the module was registered under
             module: The loaded module
             library_name: Name of the owning library
+            file_path: Canonical path the module was loaded from. Stored for collision
+                detection in _resolve_stable_namespace, which must compare against the exact
+                same canonical value it resolved with; re-deriving from module.__file__ could
+                drift (or be unset) and misclassify a hot reload as a collision.
         """
         self._library_to_stable_modules.setdefault(library_name, set()).add(stable_namespace)
-        self._stable_module_to_file[stable_namespace] = Path(module.__file__) if module.__file__ else Path()
+        self._stable_module_to_file[stable_namespace] = file_path
 
         # Wire the leaf module onto its parent package for attribute-based import navigation.
         parent_name, _, child_name = stable_namespace.rpartition(".")
@@ -3193,6 +3207,26 @@ class LibraryManager:
             logger.warning(details)
         return matches[0]
 
+    def get_module_display_name(self, module_name: str) -> str:
+        """Human-readable form of a library module reference, for user-facing messages.
+
+        Internal module names (volatile pickle references or stable namespaces) mean nothing
+        to an artist. This reduces them to the library-relative part so error messages can
+        point at the node file involved instead of an opaque token.
+
+        Args:
+            module_name: The module name to describe
+
+        Returns:
+            A shortened, readable name; the input unchanged if it matches no known format.
+        """
+        match = self._VOLATILE_DYNAMIC_MODULE_PATTERN.match(module_name)
+        if match is not None:
+            return match.group("file_token").removesuffix("_py")
+        if module_name.startswith(self.STABLE_NAMESPACE_PREFIX):
+            return module_name.removeprefix(self.STABLE_NAMESPACE_PREFIX)
+        return module_name
+
     @staticmethod
     def _get_root_cause_from_exception(exception: BaseException) -> BaseException:
         """Walk the exception chain to find the root cause.
@@ -3293,7 +3327,7 @@ class LibraryManager:
             msg = f"Module at '{file_path}' failed to {verb} with error: {err}"
             raise ImportError(msg) from err
 
-        self._track_stable_module(stable_namespace, module, library_name)
+        self._track_stable_module(stable_namespace, module, library_name, file_path)
         if is_reload:
             details = f"Hot reloaded module: {stable_namespace} from {file_path}"
             logger.debug(details)
