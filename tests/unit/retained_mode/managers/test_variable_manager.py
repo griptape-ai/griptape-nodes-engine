@@ -15,12 +15,16 @@ from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableResultSuccess,
     DeleteVariableRequest,
     DeleteVariableResultFailure,
+    DeleteVariableResultSuccess,
     GetVariableRequest,
     GetVariableResultFailure,
     GetVariableResultSuccess,
     GetVariablesRequest,
     GetVariablesResultFailure,
     GetVariablesResultSuccess,
+    GetVariableValueRequest,
+    GetVariableValueResultFailure,
+    GetVariableValueResultSuccess,
     HasVariableRequest,
     HasVariableResultSuccess,
     ListSubstitutablesRequest,
@@ -28,6 +32,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
     ListSubstitutablesResultSuccess,
     RenameVariableRequest,
     RenameVariableResultFailure,
+    RenameVariableResultSuccess,
     ResolveSubstitutionRequest,
     ResolveSubstitutionResultFailure,
     ResolveSubstitutionResultSuccess,
@@ -485,6 +490,68 @@ class TestReservedNames:
             CreateVariableRequest(name="workspace_dir", type="str", value="/global", is_global=True)
         )
         assert isinstance(result, CreateVariableResultSuccess)
+
+    def test_create_flow_var_shadowing_a_global_is_allowed(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """A flow var may share a name with a global (only reserved names are refused)."""
+        griptape_nodes.handle_request(
+            CreateVariableRequest(name="shared", type="str", value="from_global", is_global=True)
+        )
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(name="shared", type="str", value="from_flow", owning_flow=flow_name)
+        )
+        assert isinstance(result, CreateVariableResultSuccess)
+
+    def test_rename_to_same_name_is_noop_success(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """Renaming a variable to its current name is an idempotent success, not a self-collision crash."""
+        _add_variable(griptape_nodes, "keeper", "v1")
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(name="keeper", new_name="keeper", starting_flow=flow_name)
+        )
+        assert isinstance(result, RenameVariableResultSuccess)
+        # Value preserved.
+        after = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["keeper"]))
+        assert isinstance(after, GetVariablesResultSuccess)
+        assert after.variables == {"keeper": "v1"}
+
+    def test_rename_to_blank_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "keeper", "v1")
+        for blank in ("", "   "):
+            result = griptape_nodes.handle_request(
+                RenameVariableRequest(name="keeper", new_name=blank, starting_flow=flow_name)
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "empty name" in str(result.result_details)
+
+    @pytest.mark.usefixtures("flow_name")
+    def test_delete_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
+        """Delete routes by layer provenance — a global (owning_flow_name=None) leaves the global layer."""
+        griptape_nodes.handle_request(CreateVariableRequest(name="g_del", type="str", value="v", is_global=True))
+        result = griptape_nodes.handle_request(
+            DeleteVariableRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY)
+        )
+        assert isinstance(result, DeleteVariableResultSuccess)
+        after = griptape_nodes.handle_request(
+            GetVariableValueRequest(name="g_del", lookup_scope=VariableScope.GLOBAL_ONLY)
+        )
+        assert isinstance(after, GetVariableValueResultFailure)
+
+    @pytest.mark.usefixtures("flow_name")
+    def test_rename_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
+        """Rename routes by layer provenance — a global renames within the global layer."""
+        griptape_nodes.handle_request(CreateVariableRequest(name="g_old", type="str", value="v", is_global=True))
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(name="g_old", new_name="g_new", lookup_scope=VariableScope.GLOBAL_ONLY)
+        )
+        assert isinstance(result, RenameVariableResultSuccess)
+        new_val = griptape_nodes.handle_request(
+            GetVariableValueRequest(name="g_new", lookup_scope=VariableScope.GLOBAL_ONLY)
+        )
+        assert isinstance(new_val, GetVariableValueResultSuccess)
+        assert new_val.value == "v"
+        old_val = griptape_nodes.handle_request(
+            GetVariableValueRequest(name="g_old", lookup_scope=VariableScope.GLOBAL_ONLY)
+        )
+        assert isinstance(old_val, GetVariableValueResultFailure)
 
 
 class TestProjectVariableSerialization:

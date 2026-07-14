@@ -77,6 +77,9 @@ class VariableLayer:
         del self._variables[name]
 
     def rename(self, old: str, new: str) -> None:
+        # Renaming to the same name is a no-op — not a self-collision.
+        if old == new:
+            return
         if new in self._variables:
             msg = (
                 f"Attempted to rename variable '{old}' to '{new}' in this layer. "

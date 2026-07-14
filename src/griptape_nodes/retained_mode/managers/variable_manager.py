@@ -135,6 +135,29 @@ class VariablesManager:
             self._flow_layers[flow_name] = layer
         return layer
 
+    def _writable_storage_layer(
+        self, variable: FlowVariable, found_layer: VariableLayerKind | None
+    ) -> VariableLayer | None:
+        """Return the storage layer a resolved variable lives in, for delete/rename.
+
+        Routes by real layer provenance (found_layer), NOT by owning_flow_name — a project
+        variable also has owning_flow_name=None, so that field alone can't tell GLOBAL from
+        PROJECT. Callers must have already rejected PROJECT/READ_ONLY writes via _refuse_write,
+        so only FLOW and GLOBAL reach here; anything else returns None (nothing to mutate).
+
+        No PROJECT case: project storage is owned by ProjectManager (reached only via events,
+        and reads return snapshot copies), and there is no write-through path yet.
+        TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5142): when writable
+        project-definition variables land, route PROJECT writes through ProjectManager.
+        """
+        match found_layer:
+            case VariableLayerKind.GLOBAL:
+                return self._global_layer
+            case VariableLayerKind.FLOW:
+                return self._flow_layers.get(variable.owning_flow_name) if variable.owning_flow_name else None
+            case _:
+                return None
+
     def _get_starting_flow(self, starting_flow: str | None) -> str:
         """Get the starting flow name, using Context Manager if None."""
         if starting_flow is not None:
@@ -340,6 +363,9 @@ class VariablesManager:
           routing such a write by ``owning_flow_name`` would misfire into the global
           layer (KeyError) or silently mutate a throwaway snapshot, so it must be
           rejected at the boundary.
+          TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5142): once a
+          project write-through path exists, relax this to bounce only READ_ONLY project
+          entries so READ_WRITE bag variables become writable.
         - The variable is READ_ONLY.
         """
         layer = found_layer.value if found_layer is not None else "unknown"
@@ -556,19 +582,15 @@ class VariablesManager:
 
         variable = result.variable
 
-        # Remove from appropriate storage based on owning flow
-        if variable.owning_flow_name is None:
-            # Global variable
-            self._global_layer.delete(variable.name)
-        else:
-            # Flow-scoped variable
-            flow_layer = self._flow_layers.get(variable.owning_flow_name)
-            if flow_layer is not None and flow_layer.has(variable.name):
-                flow_layer.delete(variable.name)
+        # Route by real layer provenance (found_layer), not owning_flow_name — _refuse_write
+        # above already bounced PROJECT/READ_ONLY, so this is a FLOW or GLOBAL variable.
+        storage_layer = self._writable_storage_layer(variable, result.found_layer)
+        if storage_layer is not None and storage_layer.has(variable.name):
+            storage_layer.delete(variable.name)
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
-    def on_rename_variable_request(self, request: RenameVariableRequest) -> ResultPayload:
+    def on_rename_variable_request(self, request: RenameVariableRequest) -> ResultPayload:  # noqa: PLR0911
         """Rename a variable.
 
         Refuses renaming of READ_ONLY variables.
@@ -578,6 +600,12 @@ class VariablesManager:
         except ValueError as e:
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}'. Failed to determine starting flow: {e}"
+            )
+
+        # Fail fast on a blank new name, matching create's guard.
+        if not request.new_name or not request.new_name.strip():
+            return RenameVariableResultFailure(
+                result_details=f"Attempted to rename variable '{request.name}' to an empty name. Failed because a variable name is required."
             )
 
         result = self._find_variable_hierarchical(starting_flow, request.name, request.lookup_scope, request.project_id)
@@ -594,35 +622,32 @@ class VariablesManager:
         variable = result.variable
 
         # The new name may not be reserved by another layer (project builtins/directories,
-        # etc.) — same rule as create, so the two agree. Name-based, so it doesn't depend
-        # on whether the reserved value currently resolves.
-        if request.new_name in self._reserved_variable_names(project_id=request.project_id):
+        # etc.) — same rule as create, so the two agree. The renamed flow variable belongs to
+        # the current project, so the reserved set is the current project's (project_id=None),
+        # NOT request.project_id (which only selects which project a *read* consults). Name-based,
+        # so it doesn't depend on whether the reserved value currently resolves.
+        if request.new_name in self._reserved_variable_names(project_id=None):
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because that name is reserved."
             )
 
-        # And it may not collide with an existing user variable visible from this flow
-        # (flow chain → global). The project layer is excluded from this check because
-        # reserved names are already handled above and non-reserved project entries don't
-        # block a user rename.
-        existing = self._get_user_variables(starting_flow).get(request.new_name)
-        if existing is not None and existing.name != variable.name:
+        # And it may not collide with ANOTHER variable in its OWN layer — you can't have two
+        # variables with the same name in one flow (or two globals). Renaming to the current
+        # name is exempt (handled as an idempotent no-op by VariableLayer.rename). Shadowing an
+        # ancestor flow or a global is allowed (only reserved names, handled above, are
+        # off-limits), so the check is same-layer only, mirroring create's own-flow duplicate
+        # check. Route by real layer provenance (found_layer), not owning_flow_name — a project
+        # var also has owning_flow_name=None, though _refuse_write already bounced those.
+        storage_layer = self._writable_storage_layer(variable, result.found_layer)
+        if request.new_name != variable.name and storage_layer is not None and storage_layer.has(request.new_name):
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because a variable with that name already exists."
             )
 
-        # Update the variable name and storage key
+        # Update the variable name and storage key in the layer it lives in.
         old_name = variable.name
-
-        # Update in appropriate storage based on owning flow
-        if variable.owning_flow_name is None:
-            # Global variable
-            self._global_layer.rename(old_name, request.new_name)
-        else:
-            # Flow-scoped variable
-            flow_layer = self._flow_layers.get(variable.owning_flow_name)
-            if flow_layer is not None and flow_layer.has(old_name):
-                flow_layer.rename(old_name, request.new_name)
+        if storage_layer is not None and storage_layer.has(old_name):
+            storage_layer.rename(old_name, request.new_name)
 
         return RenameVariableResultSuccess(
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
