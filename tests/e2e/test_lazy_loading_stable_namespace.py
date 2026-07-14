@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -38,6 +39,8 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
+    UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
@@ -60,21 +63,43 @@ STABLE_NAMESPACE = "griptape_nodes.node_libraries.lazy_payload_library.lazy_payl
 PAYLOAD_TAG = "round-trip"
 
 
-def _materialize_library(target_dir: Path) -> Path:
+def _materialize_library(target_dir: Path, *, library_name: str | None = None) -> Path:
     """Copy the on-disk fixture into ``target_dir`` and stamp the current engine version.
 
     Rewrites the fixture's ``engine_version`` field to the engine's running version so
     ``IncompatibleEngineVersionCheck`` never marks the library UNUSABLE on a version bump.
+    ``library_name`` overrides the schema's name so tests that manage their own library
+    lifecycle don't collide with other tests' registrations in the shared engine singleton.
     """
     from griptape_nodes.utils.version_utils import engine_version
 
     target_dir.mkdir(parents=True, exist_ok=True)
     schema = json.loads(FIXTURE_LIBRARY_JSON_TEMPLATE.read_text())
     schema["metadata"]["engine_version"] = engine_version
+    if library_name is not None:
+        schema["name"] = library_name
     library_json = target_dir / "griptape_nodes_library.json"
     library_json.write_text(json.dumps(schema, indent=2))
     (target_dir / FIXTURE_NODE_FILE.name).write_text(FIXTURE_NODE_FILE.read_text())
     return library_json
+
+
+def _purge_stable_namespace_modules() -> None:
+    """Drop all stable-namespace modules from sys.modules.
+
+    Tests in this module share the engine singleton (and therefore sys.modules), so each
+    scenario purges before relying on "the namespace has not been imported yet".
+    """
+    for module_name in list(sys.modules):
+        if module_name == "griptape_nodes.node_libraries" or module_name.startswith("griptape_nodes.node_libraries."):
+            del sys.modules[module_name]
+
+
+def _unload_library_if_registered(library_name: str) -> None:
+    """Unload a library from the shared engine singleton, tolerating it not being registered."""
+    GriptapeNodes.handle_request(
+        UnloadLibraryFromRegistryRequest(library_name=library_name, failure_log_level=logging.DEBUG)
+    )
 
 
 def _write_isolated_config(config_root: Path, *, workspace: Path, library_path: Path) -> None:
@@ -107,25 +132,28 @@ def _import_stable_namespace() -> ModuleType:
     return importlib.import_module(STABLE_NAMESPACE)
 
 
-def _generate_payload_workflow_source(library_json: Path) -> str:
+def _generate_payload_workflow_source(library_json: Path, *, lazy_save: bool) -> str:
     """Build a flow holding a LazyPayload parameter value and serialize it to a Python module.
 
-    Mirrors the engine's save path: register the library (lazily, per this process's config
-    default), create a flow, drop a node into it, set its ``payload`` parameter to an object
-    defined by the library module, serialize, and generate the workflow file content.
+    Mirrors the engine's save path: register the library, create a flow, drop a node into it,
+    set its ``payload`` parameter to an object defined by the library module, serialize, and
+    generate the workflow file content. ``lazy_save`` pins whether the saving engine loads
+    nodes lazily or eagerly, so both save-time worlds can be round-tripped into a lazy loader.
     """
     GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    _unload_library_if_registered(LIBRARY_NAME)
+    _purge_stable_namespace_modules()
 
-    # Pin lazy loading on for this registration regardless of the developer's ambient config,
-    # so the in-process stable-namespace import below always goes through the deferred path.
-    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=True):
+    # Pin the loading mode for this registration regardless of the developer's ambient config.
+    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=lazy_save):
         register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
-    # The library registered lazily, so no node module has loaded yet. Importing the stable
-    # namespace here must work regardless (it is what saved workflows execute), and it is the
+    # Under a lazy save no node module has loaded yet, so importing the stable namespace here
+    # must go through the deferred path (it is what saved workflows execute), and it is the
     # only way to get at LazyPayload without resolving a node class first.
-    assert STABLE_NAMESPACE not in sys.modules, "Sanity: lazy registration must not import the node module"
+    if lazy_save:
+        assert STABLE_NAMESPACE not in sys.modules, "Sanity: lazy registration must not import the node module"
     module = _import_stable_namespace()
     payload = module.LazyPayload(PAYLOAD_TAG)
 
@@ -220,12 +248,21 @@ if __name__ == "__main__":
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"Lazy Payload Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
 )
-def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "lazy_save",
+    [
+        pytest.param(True, id="saved-by-lazy-engine"),
+        pytest.param(False, id="saved-by-eager-engine"),
+    ],
+)
+def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path, *, lazy_save: bool) -> None:
     """A saved workflow carrying a library-defined value must open with lazy loading enabled.
 
     Regression test for the lazy-node-loading rollback: opening any workflow failed with
     ``No module named 'griptape_nodes.node_libraries'`` because the stable namespaces its
     imports and pickles reference were only present in ``sys.modules`` after an eager load.
+    The eager-save case is the literal field failure: workflows saved by earlier (eager)
+    engines must open after updating to an engine that loads nodes lazily.
     """
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -233,7 +270,7 @@ def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path) -> None:
     library_json = _materialize_library(tmp_path / "library")
     _write_isolated_config(config_root, workspace=workspace, library_path=library_json)
 
-    workflow_source = _generate_payload_workflow_source(library_json)
+    workflow_source = _generate_payload_workflow_source(library_json, lazy_save=lazy_save)
     runnable_source = _wrap_with_runtime_assertions(workflow_source)
     assert f"from {STABLE_NAMESPACE} import LazyPayload" in workflow_source, (
         "The generator must emit the deferred stable-namespace import for the pickled payload;"
@@ -266,3 +303,57 @@ def test_saved_workflow_opens_under_lazy_node_loading(tmp_path: Path) -> None:
     assert "type=LazyPayloadNode" in result.stdout, diagnostic
     assert "type=ErrorProxyNode" not in result.stdout, diagnostic
     assert f"PAYLOAD type=LazyPayload tag={PAYLOAD_TAG}" in result.stdout, diagnostic
+
+
+@pytest.mark.skipif(
+    not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
+    reason=f"Lazy Payload Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
+)
+def test_stable_namespace_import_tracks_library_lifecycle(tmp_path: Path) -> None:
+    """Stable-namespace importability must follow the library's register/unload/re-register lifecycle.
+
+    Drives the public request surface only, so it pins the behavioral contract that must
+    survive internal reworks of module loading (e.g. executing node files directly under
+    their stable namespace): under lazy loading, registering a library makes its namespaces
+    importable, unloading revokes them, and re-registering after a source edit serves the
+    fresh code rather than a stale cached module.
+    """
+    library_name = "Lazy Lifecycle Library"
+    stable_namespace = "griptape_nodes.node_libraries.lazy_lifecycle_library.lazy_payload_node"
+    library_json = _materialize_library(tmp_path / "library", library_name=library_name)
+    node_file = library_json.parent / FIXTURE_NODE_FILE.name
+
+    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    _unload_library_if_registered(library_name)
+    _purge_stable_namespace_modules()
+
+    node_file.write_text(FIXTURE_NODE_FILE.read_text() + '\nLIFECYCLE_MARKER = "initial"\n')
+
+    # Register: the namespace becomes importable without any node class having resolved.
+    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=True):
+        register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
+    assert stable_namespace not in sys.modules, "Sanity: lazy registration must not import the node module"
+
+    module = importlib.import_module(stable_namespace)
+    assert module.LIFECYCLE_MARKER == "initial"
+
+    # Unload: the namespace must stop resolving, both from sys.modules and via fresh import.
+    unload_result = GriptapeNodes.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
+    assert isinstance(unload_result, UnloadLibraryFromRegistryResultSuccess), unload_result
+    assert stable_namespace not in sys.modules, "Unload must remove the stable namespace from sys.modules"
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module(stable_namespace)
+
+    # Re-register after a source edit: the import must serve the fresh code, not a stale module.
+    node_file.write_text(FIXTURE_NODE_FILE.read_text() + '\nLIFECYCLE_MARKER = "reloaded"\n')
+    with patch.object(LibraryManager, "_should_lazy_load_nodes", return_value=True):
+        reregister_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
+    assert isinstance(reregister_result, RegisterLibraryFromFileResultSuccess), reregister_result
+
+    reloaded_module = importlib.import_module(stable_namespace)
+    assert reloaded_module.LIFECYCLE_MARKER == "reloaded"
+
+    # Leave the shared singleton the way we found it.
+    _unload_library_if_registered(library_name)
+    _purge_stable_namespace_modules()
