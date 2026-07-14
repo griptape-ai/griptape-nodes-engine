@@ -10033,28 +10033,24 @@ class TestProjectVariableEvents:
         assert "workspace_dir" in names
         assert "project_dir" in names
 
-    def test_list_variables_never_invokes_value(self) -> None:
-        """Even if some variables would raise on .value, metadata listing succeeds."""
+    def test_list_variables_never_resolves_values(self) -> None:
+        """Listing returns metadata only — it must not resolve any value.
+
+        The ProjectManager here is built with a bare Mock config/context, so resolving
+        a builtin like workspace_dir would produce junk or raise. Listing succeeding and
+        returning the builtin names proves it never touched values.
+        """
         from griptape_nodes.retained_mode.events.project_events import (
             ListProjectVariablesRequest,
             ListProjectVariablesResultSuccess,
         )
 
         pm = self._pm()
-        # Inject a computed variable that raises on read; listing must not touch it.
-        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable
-
-        def blow_up() -> str:
-            msg = "should never be called during metadata list"
-            raise RuntimeError(msg)
-
-        info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
-        info.variable_layer.set(ComputedFlowVariable(name="landmine", type="str", resolver=blow_up))
-
         result = pm.on_list_project_variables_request(ListProjectVariablesRequest())
         assert isinstance(result, ListProjectVariablesResultSuccess)
-        assert "landmine" in {v.name for v in result.variables}
+        names = {v.name for v in result.variables}
+        assert "workspace_dir" in names
+        assert "workflow_dir" in names
 
     def test_list_variables_unknown_project_fails(self) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
@@ -10089,24 +10085,26 @@ class TestProjectVariableEvents:
         result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="not_defined_in_any_project"))
         assert isinstance(result, GetProjectVariableResultFailure)
 
-    def test_get_variable_resolver_raises_returns_failure(self) -> None:
+    def test_get_variable_resolution_error_returns_failure(self) -> None:
+        """A builtin/directory whose value can't be computed becomes a per-request Failure.
+
+        workspace_dir is a defined project variable (so it passes the existence check),
+        but resolving it raises when the underlying context isn't ready — the handler
+        turns that into a GetProjectVariableResultFailure carrying the reason.
+        """
         from griptape_nodes.retained_mode.events.project_events import (
             GetProjectVariableRequest,
             GetProjectVariableResultFailure,
         )
-        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable
 
         pm = self._pm()
 
-        def blow_up() -> str:
+        def blow_up(name: str, project_info: object) -> str:  # noqa: ARG001
             msg = "context not ready"
             raise RuntimeError(msg)
 
-        info = pm._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY]
-        info.variable_layer.set(ComputedFlowVariable(name="volatile", type="str", resolver=blow_up))
-
-        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="volatile"))
+        with patch.object(pm, "_resolve_project_variable", side_effect=blow_up):
+            result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
         assert isinstance(result, GetProjectVariableResultFailure)
         assert "context not ready" in str(result.result_details)
 
@@ -10123,26 +10121,19 @@ class TestProjectVariableEvents:
         assert isinstance(result, GetProjectVariableResultFailure)
 
     def test_get_variable_success_returns_plain_flow_variable(self) -> None:
-        """Regression: Success must package a plain FlowVariable, not ComputedFlowVariable.
-
-        Live-resolving objects cannot cross the request boundary — cattrs unstructure
-        during broadcast invokes the resolver, which either crashes (if it raises) or
-        silently snapshots (dropping live semantics on the wire).
-        """
+        """Regression: Success packages a plain, serializable FlowVariable carrying a stored value."""
         from griptape_nodes.retained_mode.events.project_events import (
             GetProjectVariableRequest,
             GetProjectVariableResultSuccess,
         )
-        from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable, FlowVariable
+        from griptape_nodes.retained_mode.variable_types import FlowVariable
 
         pm = self._pm()
         pm._config_manager.workspace_path = Path("/synthetic/ws")
         result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
         assert isinstance(result, GetProjectVariableResultSuccess)
-        # Must be a *plain* FlowVariable, not a ComputedFlowVariable subclass.
+        # Must be a plain FlowVariable carrying a stored (snapshot) value.
         assert type(result.variable) is FlowVariable
-        assert not isinstance(result.variable, ComputedFlowVariable)
-        # And the snapshot value is preserved.
         assert result.variable.value == "/synthetic/ws"
 
     def test_get_variable_success_serializes_cleanly(self) -> None:

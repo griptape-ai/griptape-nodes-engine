@@ -145,7 +145,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.variable_types import ComputedFlowVariable, FlowVariable, VariableLayer
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -375,8 +375,10 @@ class ProjectInfo:
     parsed_situation_schemas: dict[str, ParsedMacro]  # situation_name -> ParsedMacro
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
 
-    # The project's variable layer, populated by ProjectManager on load / reload.
-    # Not yet consulted by VariablesManager resolution — reserved for the next step.
+    # User-defined per-project variables. Builtins (workspace_dir, etc.) and template
+    # directories are computed separately (see _resolve_project_variable_value) and take
+    # precedence over this bag; a bag entry whose name collides with one is shadowed.
+    # Starts empty — no population source is wired yet.
     variable_layer: VariableLayer = field(default_factory=VariableLayer)
 
 
@@ -760,7 +762,6 @@ class ProjectManager:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
-        self._populate_project_variable_layer(project_info)
 
         # Store in new consolidated dict
         self._successfully_loaded_project_templates[project_id] = project_info
@@ -3539,50 +3540,67 @@ class ProjectManager:
                 logger.debug("Skipping directory variable %r: %s", name, e)
         return variables
 
-    def _populate_project_variable_layer(self, project_info: ProjectInfo) -> None:
-        """Wire the project's variable layer with resolvers, not stored values.
+    def _project_variable_names(self, project_info: ProjectInfo) -> list[str]:
+        """Return every variable name the project layer defines.
 
-        Called once at project load. All entries are ComputedFlowVariable and thus
-        READ_ONLY — their .value property invokes the resolver on every access, so
-        callers always see live values (workflow_dir, workflow_name, etc. reflect
-        the current context) without any cache-invalidation machinery.
-
-        Every declared name is registered even if its resolver would currently raise;
-        callers reading .value may hit exceptions when the underlying context isn't
-        ready (e.g. {workflow_dir} before the workflow is saved). Use
-        GetProjectVariableRequest to catch resolution failures at the request boundary.
+        Union of BUILTIN_VARIABLES (workspace_dir, workflow_name, etc.), the project
+        template's declared directories, and the user-defined bag. Metadata only — no
+        values resolved. Deduped: a bag entry whose name collides with a builtin or
+        directory is shadowed by the computed value and appears once.
         """
-        project_info.variable_layer.clear()
+        names = list(BUILTIN_VARIABLES)
+        names.extend(project_info.template.directories.keys())
+        computed = set(names)
+        names.extend(v.name for v in project_info.variable_layer.list() if v.name not in computed)
+        return names
 
-        # Builtins
-        for name in BUILTIN_VARIABLES:
-            project_info.variable_layer.set(
-                ComputedFlowVariable(
-                    name=name,
-                    type="str",
-                    resolver=lambda name=name, project_info=project_info: self._get_builtin_variable_value(
-                        name, project_info
-                    ),
-                )
-            )
+    def _resolve_project_variable(self, name: str, project_info: ProjectInfo) -> FlowVariable:
+        """Resolve a project variable to a fully-formed FlowVariable.
 
-        # Template directories
-        directory_resolver = self._build_variable_resolver(project_info.template, project_info)
-        for name in project_info.template.directories:
-            project_info.variable_layer.set(
-                ComputedFlowVariable(
-                    name=name,
-                    type="str",
-                    resolver=lambda name=name, r=directory_resolver: r.resolve_directory(name),
-                )
+        Resolution order: builtin → template directory → user bag. Builtins and
+        directories are computed on demand (context-sensitive — workflow_dir depends
+        on the current workflow, workspace_dir on the config layer) and are always
+        READ_ONLY. Bag entries are returned as a snapshot copy preserving their stored
+        type and permission.
+
+        Raises RuntimeError / NotImplementedError / ValueError when a computed value's
+        context isn't ready, or ValueError when the name is undefined — callers turn
+        those into per-request Failures.
+        """
+        if name in BUILTIN_VARIABLES:
+            value = self._get_builtin_variable_value(name, project_info)
+            return FlowVariable(
+                name=name, owning_flow_name=None, type="str", value=value, permission=VariablePermission.READ_ONLY
             )
+        if name in project_info.template.directories:
+            resolver = self._build_variable_resolver(project_info.template, project_info)
+            return FlowVariable(
+                name=name,
+                owning_flow_name=None,
+                type="str",
+                value=resolver.resolve_directory(name),
+                permission=VariablePermission.READ_ONLY,
+            )
+        bag_variable = project_info.variable_layer.get(name)
+        if bag_variable is not None:
+            # Snapshot copy so callers can't mutate the stored bag entry through the response.
+            return FlowVariable(
+                name=bag_variable.name,
+                owning_flow_name=bag_variable.owning_flow_name,
+                type=bag_variable.type,
+                value=bag_variable.value,
+                permission=bag_variable.permission,
+            )
+        msg = f"Unknown project variable '{name}'"
+        raise ValueError(msg)
 
     def on_list_project_variables_request(
         self, request: ListProjectVariablesRequest
     ) -> ListProjectVariablesResultSuccess | ListProjectVariablesResultFailure:
-        """List metadata for every variable in a project's variable layer.
+        """List metadata for every variable the project defines.
 
-        No .value access — some entries may raise on read; callers use
+        No values are resolved — some entries would raise depending on live context
+        (e.g. {workflow_dir} before the workflow is saved). Call
         GetProjectVariableRequest per name to safely resolve values.
         """
         project_id = request.project_id if request.project_id is not None else self._current_project_id
@@ -3593,8 +3611,8 @@ class ProjectManager:
             )
 
         details = [
-            VariableDetails(name=var.name, owning_flow_name=None, type=var.type)
-            for var in project_info.variable_layer.list()
+            VariableDetails(name=name, owning_flow_name=None, type="str")
+            for name in self._project_variable_names(project_info)
         ]
         return ListProjectVariablesResultSuccess(
             variables=details,
@@ -3620,8 +3638,7 @@ class ProjectManager:
                 )
             )
 
-        variable = project_info.variable_layer.get(request.name)
-        if variable is None:
+        if request.name not in self._project_variable_names(project_info):
             return GetProjectVariableResultFailure(
                 result_details=(
                     f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
@@ -3629,14 +3646,8 @@ class ProjectManager:
                 )
             )
 
-        # Resolve .value now and package a plain FlowVariable so ComputedFlowVariable
-        # never crosses the request boundary. Serialization (broadcast to UI, worker
-        # RPC) would otherwise invoke the resolver during cattrs unstructure — which
-        # either drops resolver semantics silently or crashes the broadcast if the
-        # resolver raises. Making resolution a per-request event turns those into
-        # explicit Failure responses instead.
         try:
-            resolved_value = variable.value
+            variable = self._resolve_project_variable(request.name, project_info)
         except (RuntimeError, NotImplementedError, ValueError) as e:
             return GetProjectVariableResultFailure(
                 result_details=(
@@ -3646,13 +3657,7 @@ class ProjectManager:
             )
 
         return GetProjectVariableResultSuccess(
-            variable=FlowVariable(
-                name=variable.name,
-                owning_flow_name=variable.owning_flow_name,
-                type=variable.type,
-                value=resolved_value,
-                permission=variable.permission,
-            ),
+            variable=variable,
             result_details=f"Successfully retrieved project variable '{request.name}'.",
         )
 
@@ -3968,7 +3973,6 @@ class ProjectManager:
             parsed_situation_schemas=situation_schemas,
             parsed_directory_schemas=directory_schemas,
         )
-        self._populate_project_variable_layer(project_info)
 
         # Store in new consolidated dict
         self._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info

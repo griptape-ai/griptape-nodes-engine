@@ -1,4 +1,3 @@
-from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -34,6 +33,18 @@ class VariablePermission(StrEnum):
     READ_WRITE = "read_write"
 
 
+class VariableLayerKind(StrEnum):
+    """Which tier a variable actually lives in.
+
+    Distinct from VariableScope (a *search strategy*): this names the layer a lookup
+    resolved a variable *from*, recorded at the point of discovery.
+    """
+
+    FLOW = "flow"
+    PROJECT = "project"
+    GLOBAL = "global"
+
+
 @dataclass
 class FlowVariable:
     name: str
@@ -43,41 +54,9 @@ class FlowVariable:
     permission: VariablePermission = VariablePermission.READ_WRITE
 
 
-class ComputedFlowVariable(FlowVariable):
-    """A variable whose value is recomputed on every read.
-
-    Used for values that depend on live runtime context — workflow_dir,
-    workflow_name, template.directories macros. The resolver is invoked
-    every time `.value` is accessed, so callers always see current values
-    without any cache-invalidation machinery.
-
-    Always READ_ONLY. Writing raises.
-    """
-
-    def __init__(self, name: str, type: str, resolver: Callable[[], Any]) -> None:  # noqa: A002 — matches parent FlowVariable's `type` field
-        # Set the resolver FIRST so the property has something to invoke if something
-        # ever reads `.value` mid-init. Then set the plain fields directly, bypassing
-        # dataclass __init__ which would run `self.value = None` and trip our setter.
-        self._resolver = resolver
-        self.name = name
-        self.owning_flow_name = None
-        self.type = type
-        self.permission = VariablePermission.READ_ONLY
-
-    @property
-    def value(self) -> Any:
-        """Invoke the resolver. May raise if the underlying context isn't ready."""
-        return self._resolver()
-
-    @value.setter
-    def value(self, _new: Any) -> None:
-        msg = f"Attempted to write to computed variable '{self.name}'. Failed due to it being READ_ONLY."
-        raise ValueError(msg)
-
-
 @dataclass
 class VariableLayer:
-    """Storage for all variables in one layer (a flow, the globals, or a project)."""
+    """Storage for all variables in one layer (a flow or the globals)."""
 
     _variables: dict[str, FlowVariable] = field(default_factory=dict)
 

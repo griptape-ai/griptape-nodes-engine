@@ -37,7 +37,6 @@ from griptape_nodes.retained_mode.events.variable_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.variable_types import (
-    ComputedFlowVariable,
     FlowVariable,
     VariablePermission,
     VariableScope,
@@ -50,12 +49,11 @@ _LIST_PROJECT_VAR_NAMES_PATCH = (
 
 
 def _macro(name: str, value: Any) -> FlowVariable:
-    """Build a stand-in for a project macro that resolves to `value`.
+    """Build a stand-in for a resolved project variable (builtin or directory).
 
-    Returns a plain FlowVariable (not ComputedFlowVariable) to match the invariant that
-    the GetProjectVariableRequest handler unwraps before returning — ComputedFlowVariable
-    never crosses the request boundary. Tests that patch `_get_project_variable` are
-    exercising post-unwrap state.
+    Returns a plain, READ_ONLY FlowVariable — the shape the GetProjectVariableRequest
+    handler produces after resolving a value. Tests patch `_get_project_variable` to
+    return these.
     """
     return FlowVariable(
         name=name,
@@ -374,6 +372,9 @@ class TestVariablePermission:
                 SetVariableValueRequest(name="workspace_dir", value="/new", starting_flow=flow_name)
             )
         assert isinstance(result, SetVariableValueResultFailure)
+        # The message must name the layer the variable was actually resolved from —
+        # 'project', recorded at discovery, not inferred from the search scope.
+        assert "read-only project layer" in str(result.result_details)
 
     def test_delete_project_variable_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/proj"}):
@@ -403,45 +404,18 @@ class TestVariablePermission:
         assert after.variables == {"SHOT": "sc001"}
 
 
-class TestComputedFlowVariable:
-    """ComputedFlowVariable invokes its resolver on every read; writing raises."""
-
-    def test_value_invokes_resolver_each_call(self) -> None:
-        calls = {"n": 0}
-
-        def resolver() -> str:
-            calls["n"] += 1
-            return f"call-{calls['n']}"
-
-        var = ComputedFlowVariable(name="foo", type="str", resolver=resolver)
-        expected_calls = 2
-        assert var.value == "call-1"
-        assert var.value == "call-2"
-        assert calls["n"] == expected_calls
-
-    def test_value_setter_raises(self) -> None:
-        var = ComputedFlowVariable(name="foo", type="str", resolver=lambda: "x")
-        with pytest.raises(ValueError, match="READ_ONLY"):
-            var.value = "y"
-
-    def test_permission_is_read_only(self) -> None:
-        var = ComputedFlowVariable(name="foo", type="str", resolver=lambda: "x")
-        assert var.permission is VariablePermission.READ_ONLY
-
-
 class TestProjectVariableSerialization:
-    """Regression: project-layer variables must not leak ComputedFlowVariable across the request boundary."""
+    """Regression: project-layer variables must cross the request boundary as plain, serializable FlowVariables."""
 
     def test_get_variable_from_project_returns_plain_flow_variable(
         self, griptape_nodes: GriptapeNodes, flow_name: str
     ) -> None:
-        """A HIERARCHICAL Get that resolves to the project layer returns a plain FlowVariable, not a ComputedFlowVariable."""
+        """A HIERARCHICAL Get that resolves to the project layer returns a plain, serializable FlowVariable."""
         with project_macros({"workspace_dir": "/proj"}):
             result = griptape_nodes.handle_request(GetVariableRequest(name="workspace_dir", starting_flow=flow_name))
         assert isinstance(result, GetVariableResultSuccess)
-        # Must be a *plain* FlowVariable — no live resolver attached.
+        # Must be a plain FlowVariable carrying a stored value — no live resolver.
         assert type(result.variable) is FlowVariable
-        assert not isinstance(result.variable, ComputedFlowVariable)
         assert result.variable.value == "/proj"
 
     def test_get_variable_from_project_serializes(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:

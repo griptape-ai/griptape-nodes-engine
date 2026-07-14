@@ -63,6 +63,7 @@ from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
     VariableLayer,
+    VariableLayerKind,
     VariablePermission,
     VariableScope,
 )
@@ -75,6 +76,9 @@ class VariableLookupResult(NamedTuple):
 
     variable: FlowVariable | None
     found_scope: VariableScope | None
+    # The layer the variable was actually resolved from, recorded at discovery.
+    # None when the variable wasn't found.
+    found_layer: VariableLayerKind | None = None
 
 
 class VariablesManager:
@@ -203,25 +207,34 @@ class VariablesManager:
             seen.add(name)
         return collected
 
-    def _find_variable_hierarchical(  # noqa: C901, PLR0911
+    def _find_variable_hierarchical(  # noqa: C901, PLR0911, PLR0912
         self, starting_flow: str, variable_name: str, lookup_scope: VariableScope, project_id: str | None
     ) -> VariableLookupResult:
         """Find a variable using the requested layering strategy."""
         match lookup_scope:
             case VariableScope.CURRENT_FLOW_ONLY:
                 variable = self._find_variable_in_flow(starting_flow, variable_name)
-                found_scope = VariableScope.CURRENT_FLOW_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.CURRENT_FLOW_ONLY, found_layer=VariableLayerKind.FLOW
+                )
 
             case VariableScope.PROJECT_ONLY:
                 variable = self._get_project_variable(variable_name, project_id)
-                found_scope = VariableScope.PROJECT_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
+                )
 
             case VariableScope.GLOBAL_ONLY:
                 variable = self._global_layer.get(variable_name)
-                found_scope = VariableScope.GLOBAL_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.GLOBAL_ONLY, found_layer=VariableLayerKind.GLOBAL
+                )
 
             case VariableScope.HIERARCHICAL:
                 # Flow chain → project layer → global.
@@ -233,30 +246,45 @@ class VariablesManager:
                             if flow_name == starting_flow
                             else VariableScope.HIERARCHICAL
                         )
-                        return VariableLookupResult(variable=variable, found_scope=found_scope)
+                        return VariableLookupResult(
+                            variable=variable, found_scope=found_scope, found_layer=VariableLayerKind.FLOW
+                        )
 
                 variable = self._get_project_variable(variable_name, project_id)
                 if variable is not None:
-                    return VariableLookupResult(variable=variable, found_scope=VariableScope.PROJECT_ONLY)
+                    return VariableLookupResult(
+                        variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
+                    )
 
                 variable = self._global_layer.get(variable_name)
-                found_scope = VariableScope.GLOBAL_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.GLOBAL_ONLY, found_layer=VariableLayerKind.GLOBAL
+                )
 
             case VariableScope.HIERARCHICAL_FROM_PROJECT:
                 variable = self._get_project_variable(variable_name, project_id)
                 if variable is not None:
-                    return VariableLookupResult(variable=variable, found_scope=VariableScope.PROJECT_ONLY)
+                    return VariableLookupResult(
+                        variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
+                    )
 
                 variable = self._global_layer.get(variable_name)
-                found_scope = VariableScope.GLOBAL_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.GLOBAL_ONLY, found_layer=VariableLayerKind.GLOBAL
+                )
 
             case VariableScope.ALL:
                 # ALL is primarily an enumeration scope. For single-name lookup, treat it as CURRENT_FLOW_ONLY.
                 variable = self._find_variable_in_flow(starting_flow, variable_name)
-                found_scope = VariableScope.CURRENT_FLOW_ONLY if variable else None
-                return VariableLookupResult(variable=variable, found_scope=found_scope)
+                if variable is None:
+                    return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
+                return VariableLookupResult(
+                    variable=variable, found_scope=VariableScope.CURRENT_FLOW_ONLY, found_layer=VariableLayerKind.FLOW
+                )
 
             case _:
                 msg = (
@@ -266,14 +294,13 @@ class VariablesManager:
                 raise ValueError(msg)
 
     @staticmethod
-    def _refuse_write_if_read_only(variable: FlowVariable, verb: str) -> str | None:
+    def _refuse_write_if_read_only(
+        variable: FlowVariable, verb: str, found_layer: VariableLayerKind | None
+    ) -> str | None:
         """If the variable is READ_ONLY, return an artist-comprehensible failure message. Else None."""
         if variable.permission is VariablePermission.READ_ONLY:
-            return (
-                f"Attempted to {verb} variable '{variable.name}'. Failed due to it being READ_ONLY — "
-                f"project builtins and directory macros can't be modified through this request; modify "
-                f"the project template via SaveProjectTemplateRequest instead."
-            )
+            layer = found_layer.value if found_layer is not None else "unknown"
+            return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
     def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:
@@ -384,7 +411,9 @@ class VariablesManager:
                 result_details=f"Attempted to set value for variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="set the value of")
+        refusal = self._refuse_write_if_read_only(
+            result.variable, verb="set the value of", found_layer=result.found_layer
+        )
         if refusal is not None:
             return SetVariableValueResultFailure(result_details=refusal)
 
@@ -431,7 +460,9 @@ class VariablesManager:
                 result_details=f"Attempted to set type for variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="set the type of")
+        refusal = self._refuse_write_if_read_only(
+            result.variable, verb="set the type of", found_layer=result.found_layer
+        )
         if refusal is not None:
             return SetVariableTypeResultFailure(result_details=refusal)
 
@@ -459,7 +490,7 @@ class VariablesManager:
                 result_details=f"Attempted to delete variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="delete")
+        refusal = self._refuse_write_if_read_only(result.variable, verb="delete", found_layer=result.found_layer)
         if refusal is not None:
             return DeleteVariableResultFailure(result_details=refusal)
 
@@ -496,7 +527,7 @@ class VariablesManager:
                 result_details=f"Attempted to rename variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write_if_read_only(result.variable, verb="rename")
+        refusal = self._refuse_write_if_read_only(result.variable, verb="rename", found_layer=result.found_layer)
         if refusal is not None:
             return RenameVariableResultFailure(result_details=refusal)
 
@@ -819,9 +850,7 @@ class VariablesManager:
         if read_only_hits:
             return SetVariablesResultFailure(
                 result_details=(
-                    f"Attempted to set variables {read_only_hits!r}. Failed due to at least one being "
-                    f"READ_ONLY — project builtins and directory macros can't be modified through this "
-                    f"request; modify the project template via SaveProjectTemplateRequest instead."
+                    f"Attempted to set variables {read_only_hits!r}. At least one was found in a read-only layer."
                 )
             )
 
