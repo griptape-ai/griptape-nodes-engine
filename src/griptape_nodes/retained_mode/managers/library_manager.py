@@ -3223,6 +3223,10 @@ class LibraryManager:
         match = self._VOLATILE_DYNAMIC_MODULE_PATTERN.match(module_name)
         if match is not None:
             return match.group("file_token").removesuffix("_py")
+
+        stable_namespace_root = self.STABLE_NAMESPACE_PREFIX.removesuffix(".")
+        if module_name == stable_namespace_root:
+            return "a node library"
         if module_name.startswith(self.STABLE_NAMESPACE_PREFIX):
             return module_name.removeprefix(self.STABLE_NAMESPACE_PREFIX)
         return module_name
