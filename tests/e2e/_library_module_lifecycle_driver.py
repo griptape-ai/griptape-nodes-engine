@@ -14,31 +14,69 @@ plain JSON object of diagnostics (always including ``"ok"``) to ``response.json`
 unhandled exception the response file still gets a best-effort ``{"ok": False, "error": ...}``
 payload and the process exits non-zero with the traceback on stderr, so the parent test gets a
 useful failure either way.
+
+All engine imports live at module scope: the parent test sets the isolated environment
+(``XDG_CONFIG_HOME`` and friends) on the child process before its interpreter starts, so
+import-time configuration reads are already isolated by the time this module loads.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import importlib
 import json
+import pickle
 import shutil
 import sys
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from PIL import Image
+from PIL.PngImagePlugin import PngInfo
+
+from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.events.artifact_events import (
+    RegisterArtifactProviderRequest,
+    RegisterArtifactProviderResultSuccess,
+)
+from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    ExtractFlowCommandsFromImageMetadataRequest,
+    ExtractFlowCommandsFromImageMetadataResultSuccess,
+)
+from griptape_nodes.retained_mode.events.library_events import (
+    RegisterLibraryFromFileRequest,
+    RegisterLibraryFromFileResultSuccess,
+    RegisterSandboxNodeFromSourceRequest,
+    RegisterSandboxNodeFromSourceResultFailure,
+    RegisterSandboxNodeFromSourceResultSuccess,
+    ReloadAllLibrariesRequest,
+    ReloadAllLibrariesResultSuccess,
+    UnloadLibraryFromRegistryRequest,
+    UnloadLibraryFromRegistryResultSuccess,
+)
+from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+from griptape_nodes.retained_mode.events.os_events import WriteFileRequest, WriteFileResultSuccess
+from griptape_nodes.retained_mode.events.parameter_events import (
+    GetParameterValueRequest,
+    GetParameterValueResultSuccess,
+    SetParameterValueRequest,
+)
+from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
+    ImageArtifactProvider,
+)
+
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 
 def _register_library(file_path: str) -> None:
-    from griptape_nodes.retained_mode.events.library_events import (
-        RegisterLibraryFromFileRequest,
-        RegisterLibraryFromFileResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=file_path))
     assert isinstance(result, RegisterLibraryFromFileResultSuccess), (
         f"Failed to register library from '{file_path}': {result.result_details}"
@@ -46,9 +84,6 @@ def _register_library(file_path: str) -> None:
 
 
 def _create_node(node_type: str, library_name: str, node_name: str, flow_name: str) -> str:
-    from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     result = GriptapeNodes.handle_request(
         CreateNodeRequest(
             node_type=node_type,
@@ -67,12 +102,6 @@ def _create_node(node_type: str, library_name: str, node_name: str, flow_name: s
 
 
 def _get_parameter_value(node_name: str, parameter_name: str) -> Any:
-    from griptape_nodes.retained_mode.events.parameter_events import (
-        GetParameterValueRequest,
-        GetParameterValueResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     result = GriptapeNodes.handle_request(GetParameterValueRequest(node_name=node_name, parameter_name=parameter_name))
     assert isinstance(result, GetParameterValueResultSuccess), (
         f"Failed to get parameter '{parameter_name}' on node '{node_name}': {result.result_details}"
@@ -81,22 +110,15 @@ def _get_parameter_value(node_name: str, parameter_name: str) -> Any:
 
 
 def _node_module_name(node_name: str) -> str:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     node = GriptapeNodes.NodeManager().get_node_by_name(node_name)
     return type(node).__module__
 
 
 def _push_workflow(workflow_name: str) -> None:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     GriptapeNodes.ContextManager().push_workflow(workflow_name=workflow_name)
 
 
 def _create_flow(flow_name: str) -> None:
-    from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     # ReloadAllLibrariesRequest tears down every active workflow context (via
     # ClearAllObjectStateRequest), so a command that creates a flow after reloading needs a
     # fresh workflow pushed first; CreateFlowRequest requires one to be active.
@@ -110,12 +132,6 @@ def _create_flow(flow_name: str) -> None:
 
 
 async def _reload_all_libraries() -> None:
-    from griptape_nodes.retained_mode.events.library_events import (
-        ReloadAllLibrariesRequest,
-        ReloadAllLibrariesResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
     assert isinstance(result, ReloadAllLibrariesResultSuccess), (
         f"ReloadAllLibrariesRequest failed: {result.result_details}"
@@ -129,20 +145,6 @@ def cmd_write_image(request: dict[str, Any]) -> dict[str, Any]:
     ArtifactManager, image artifact provider, and workflow metadata collector inject the
     flow commands exactly as they do for application-generated images.
     """
-    from PIL import Image
-
-    from griptape_nodes.retained_mode.events.artifact_events import (
-        RegisterArtifactProviderRequest,
-        RegisterArtifactProviderResultSuccess,
-    )
-    from griptape_nodes.retained_mode.events.os_events import WriteFileRequest, WriteFileResultSuccess
-    from griptape_nodes.retained_mode.events.parameter_events import SetParameterValueRequest
-    from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-    from griptape_nodes.retained_mode.managers.artifact_providers.image.image_artifact_provider import (
-        ImageArtifactProvider,
-    )
-
     _register_library(request["library_json"])
     provider_result = GriptapeNodes.handle_request(
         RegisterArtifactProviderRequest(provider_class=ImageArtifactProvider)
@@ -198,12 +200,6 @@ def cmd_read_image(request: dict[str, Any]) -> dict[str, Any]:
     (what ``workflow_metadata._serialize_flow`` always does), a flow must already be the current
     context for deserialization to land in.
     """
-    from griptape_nodes.retained_mode.events.flow_events import (
-        ExtractFlowCommandsFromImageMetadataRequest,
-        ExtractFlowCommandsFromImageMetadataResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     _register_library(request["library_json"])
 
     flow_name = "ReceivedFlow"
@@ -240,12 +236,6 @@ def cmd_legacy_image(request: dict[str, Any]) -> dict[str, Any]:
     ``_FlowCommandsUnpickler``/``LibraryManager.resolve_volatile_dynamic_class`` runs as an
     implementation detail of that request, never called directly.
     """
-    from griptape_nodes.retained_mode.events.flow_events import (
-        ExtractFlowCommandsFromImageMetadataRequest,
-        ExtractFlowCommandsFromImageMetadataResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     _register_library(request["library_json"])
 
     result = GriptapeNodes.handle_request(
@@ -306,13 +296,6 @@ def cmd_sandbox_lifecycle(request: dict[str, Any]) -> dict[str, Any]:
     Sandbox Library the same way a normal engine start would; everything after that runs
     through the public ``RegisterSandboxNodeFromSourceRequest``.
     """
-    from griptape_nodes.retained_mode.events.library_events import (
-        RegisterSandboxNodeFromSourceRequest,
-        RegisterSandboxNodeFromSourceResultFailure,
-        RegisterSandboxNodeFromSourceResultSuccess,
-    )
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     asyncio.run(_reload_all_libraries())
 
     class_name = request["class_name"]
@@ -333,8 +316,6 @@ def cmd_sandbox_lifecycle(request: dict[str, Any]) -> dict[str, Any]:
         return str(_get_parameter_value(created_name, "marker"))
 
     def _registered_class() -> type:
-        from griptape_nodes.node_library.library_registry import LibraryRegistry
-
         return LibraryRegistry.get_library("Sandbox Library").get_node_class(class_name)
 
     _create_flow("SandboxFlow")
@@ -400,23 +381,6 @@ def cmd_collision(request: dict[str, Any]) -> dict[str, Any]:
     disambiguation-suffixed name) must still resolve after the libraries reload in the
     opposite order and namespace ownership flips.
     """
-    import base64
-    import pickle
-
-    from PIL import Image
-    from PIL.PngImagePlugin import PngInfo
-
-    from griptape_nodes.retained_mode.events.flow_events import (
-        ExtractFlowCommandsFromImageMetadataRequest,
-        ExtractFlowCommandsFromImageMetadataResultSuccess,
-    )
-    from griptape_nodes.retained_mode.events.library_events import (
-        UnloadLibraryFromRegistryRequest,
-        UnloadLibraryFromRegistryResultSuccess,
-    )
-    from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
     library_json_a = request["library_json_a"]
     library_json_b = request["library_json_b"]
     image_path = Path(request["image_path"])

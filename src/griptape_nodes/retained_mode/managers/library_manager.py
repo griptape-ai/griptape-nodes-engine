@@ -7,6 +7,7 @@ import importlib.util
 import json
 import logging
 import os
+import pickle
 import platform
 import re
 import shutil
@@ -18,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
+from io import BytesIO
 from pathlib import Path
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar, cast
@@ -305,6 +307,73 @@ class AmbiguousLegacyModuleError(Exception):
         self.candidate_modules = tuple(candidate_modules)
         candidates = ", ".join(candidate_modules)
         super().__init__(f"Legacy class '{class_name}' matches multiple loaded modules: {candidates}")
+
+
+class LibraryAwareUnpickler(pickle.Unpickler):
+    """Unpickler that recovers library class references standard resolution cannot.
+
+    Two kinds of module reference in engine pickles need remapping through the
+    LibraryManager:
+
+    - Volatile per-process names from older engines
+      (``gtn_dynamic_module_<file>_py_<hash>``), which cannot be imported in a later
+      process.
+    - Stable namespaces whose ownership depends on load order because two node files
+      collide on the same base namespace; the name recorded by the writing process may
+      belong to the other file (or not exist) in this one.
+
+    References to anything other than a library module resolve exactly as
+    ``pickle.Unpickler`` would.
+    """
+
+    def find_class(self, module: str, name: str) -> Any:
+        """Resolve a pickled class reference, recovering library module references.
+
+        Args:
+            module: The module name recorded in the pickle
+            name: The (possibly dotted) qualified class name recorded in the pickle
+
+        Returns:
+            The resolved class.
+
+        Raises:
+            AmbiguousLegacyModuleError: If more than one loaded library module defines the
+                referenced class.
+        """
+        library_manager = GriptapeNodes.LibraryManager()
+        # Stable-namespace references resolve through collision-aware lookup first: when two
+        # node files collide on a base namespace, which file owns the plain name depends on
+        # load order, so a plain lookup could silently return the other file's class. The
+        # resolver finds the single loaded module that defines the class regardless of which
+        # namespace it currently owns, and raises AmbiguousLegacyModuleError instead of
+        # guessing when more than one collided module defines it.
+        if library_manager.is_dynamic_module(module):
+            resolved_class = library_manager.resolve_collided_stable_class(module, name)
+            if resolved_class is not None:
+                return resolved_class
+        try:
+            return super().find_class(module, name)
+        except ModuleNotFoundError:
+            resolved_class = library_manager.resolve_volatile_dynamic_class(module, name)
+            if resolved_class is None:
+                raise
+            return resolved_class
+
+
+def loads_with_library_recovery(data: bytes) -> Any:
+    """Unpickle engine data, recovering library class references when needed.
+
+    Drop-in replacement for ``pickle.loads`` for payloads that may embed classes defined
+    in library node files (pickled parameter values, flow commands, serialized node
+    commands).
+
+    Args:
+        data: The pickled payload
+
+    Returns:
+        The unpickled object.
+    """
+    return LibraryAwareUnpickler(BytesIO(data)).load()
 
 
 class LibraryGitOperationContext(NamedTuple):

@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from griptape_nodes.retained_mode.managers.library_manager import AmbiguousLegacyModuleError, LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import (
+    AmbiguousLegacyModuleError,
+    LibraryManager,
+    loads_with_library_recovery,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -416,6 +420,31 @@ class TestCollidedStableNamespaceResolution:
 
         assert resolved_a is module_a2.AlphaBehavior
         assert resolved_b is module_b2.BetaBehavior
+
+    def test_loads_with_library_recovery_survives_reverse_load_order(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """The pickle entry point used by generated workflows recovers collided references.
+
+        This is the same flip as above, driven through loads_with_library_recovery the way
+        a saved workflow's unique-values dict decodes its parameter values.
+        """
+        manager = griptape_nodes.LibraryManager()
+        first_file, second_file = self._write_colliding_files(tmp_path)
+
+        module_a = manager._load_module_from_file(first_file, "Collision Library")
+        module_b = manager._load_module_from_file(second_file, "Collision-Library")
+        pickled_a = pickle.dumps(module_a.AlphaBehavior.OVERWRITE)
+        pickled_b = pickle.dumps(module_b.BetaBehavior.PRESERVE)
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+        module_b2 = manager._load_module_from_file(second_file, "Collision-Library")
+        module_a2 = manager._load_module_from_file(first_file, "Collision Library")
+        assert module_b2.__name__ == module_a.__name__, "sanity: reverse order must flip base ownership"
+
+        assert loads_with_library_recovery(pickled_a) is module_a2.AlphaBehavior.OVERWRITE
+        assert loads_with_library_recovery(pickled_b) is module_b2.BetaBehavior.PRESERVE
 
     def test_raises_when_both_collided_files_define_the_class(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
