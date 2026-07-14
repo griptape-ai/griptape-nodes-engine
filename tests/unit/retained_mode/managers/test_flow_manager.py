@@ -799,3 +799,61 @@ class TestClassifyNodesForDag:
         assert categories.start_nodes == []
         assert categories.control_nodes == []
         assert categories.data_sink_nodes == []
+
+
+class TestExtractFlowCommandsSurvivesLibraryReload:
+    """Regression for the drag-image-after-restart failure reported against main.
+
+    An image's embedded flow commands are a plain pickle that can reference classes defined
+    in a library node module (e.g. an enum used as a parameter default). Those modules load
+    under a stable, deterministic namespace, so the pickled reference resolves after an
+    engine restart instead of raising ``No module named 'gtn_dynamic_module_..._<hash>'``.
+    """
+
+    _MODULE_SOURCE = (
+        "from enum import StrEnum\n\n\n"
+        "class CollisionBehavior(StrEnum):\n"
+        '    OVERWRITE = "Overwrite existing"\n'
+        '    PRESERVE = "Preserve existing"\n'
+    )
+
+    def _image_with_pickled_value(self, tmp_path: Path, value: object) -> str:
+        pickled = pickle.dumps(value)
+        # The embedded reference must be the stable namespace, not a volatile per-process
+        # name. This is what makes the payload portable across engine restarts; the old
+        # hash-suffixed dynamic name would fail to resolve in a fresh process.
+        assert b"griptape_nodes.node_libraries.repro_library.set_variables_from_data" in pickled
+        assert b"gtn_dynamic_module" not in pickled
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "embedded.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+        return str(image_path)
+
+    def test_unpickles_library_value_after_reload(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        import sys
+
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(self._MODULE_SOURCE)
+
+        manager = griptape_nodes.LibraryManager()
+        module = manager._load_module_from_file(module_file, library_name)
+
+        # An enum instance from the library module, like a node's parameter default value.
+        image_path = self._image_with_pickled_value(tmp_path, module.CollisionBehavior.OVERWRITE)
+
+        # Simulate an engine restart: drop the in-memory module, then reload the library.
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+        assert module.__name__ not in sys.modules
+        manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_path, deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands == "Overwrite existing"
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)

@@ -4549,27 +4549,22 @@ class WorkflowManager:
         global_modules_set = {"builtins", "__main__"}
 
         # Serialize the unique values as pickled strings.
-        # IMPORTANT: We patch dynamic module names to stable namespaces before pickling
-        # to ensure generated workflows can reliably import the required classes.
+        # Library node modules are executed under their stable namespace, so the class
+        # __module__ pickle records is already stable and portable. The patch step below is
+        # now a safety net that reconciles any stragglers (see _patch_and_pickle_object).
         unique_parameter_dict = {}
 
         for uuid, unique_parameter_value in unique_parameter_uuid_to_values.items():
-            # Dynamic Module Patching Strategy:
-            # When we pickle objects from dynamically loaded modules (like VideoUrlArtifact),
-            # pickle stores the class's __module__ attribute in the binary data. If we don't
-            # patch this, the pickle data would contain something like:
-            #   "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            #
-            # When the workflow runs later, Python tries to import this module name, which
-            # fails because dynamic modules don't exist in fresh Python processes.
-            #
-            # Our solution: Temporarily patch the class's __module__ to use the stable namespace
-            # before pickling, so the pickle data contains:
+            # Dynamic Module Strategy:
+            # When we pickle objects from library modules (like VideoUrlArtifact), pickle
+            # stores the class's __module__ attribute in the binary data. Library modules are
+            # loaded under a stable namespace such as:
             #   "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
             #
-            # This includes recursive patching for nested objects in containers (lists, tuples, dicts)
-
-            # Apply recursive dynamic module patching, pickle, then restore
+            # That namespace resolves in any process where the owning library is loaded, so
+            # the workflow can be reloaded (or the value unpickled from image metadata) after
+            # an engine restart. _patch_and_pickle_object walks the object tree and reconciles
+            # any object whose __module__ is not yet the stable namespace before pickling.
             unique_parameter_bytes = self._patch_and_pickle_object(unique_parameter_value)
 
             # Encode the bytes as a string using latin1
@@ -6344,32 +6339,26 @@ class WorkflowManager:
                 self._walk_object_tree(attr_value, process_class_fn, visited)
 
     def _patch_and_pickle_object(self, obj: Any) -> bytes:
-        """Patch dynamic module references to stable namespaces, pickle object, then restore.
+        """Reconcile any non-stable module references, pickle the object, then restore.
 
-        This solves the "pickle data was truncated" error that occurs when workflows containing
-        objects from dynamically loaded modules (like VideoUrlArtifact, ReferenceImageArtifact)
-        are serialized and later reloaded in a fresh Python process.
+        Library node modules are executed under a stable namespace (e.g.
+        "griptape_nodes.node_libraries.runwayml_library.image_to_video"), so the class
+        __module__ pickle records is normally already stable and portable. This method is a
+        safety net for objects whose __module__ has drifted from the stable namespace (for
+        instance, a class re-exported from another module): it walks the object tree and,
+        for any object still pointing at a library namespace under a non-canonical name,
+        temporarily rewrites __module__ / module_name to the stable namespace before
+        pickling, then restores the originals to avoid side effects.
 
-        The Problem:
-            Dynamic modules get names like "gtn_dynamic_module_image_to_video_py_123456789"
-            When pickle serializes objects, it embeds these module names in the binary data
-            When workflows run later, Python can't import these non-existent module names
-
-        The Solution:
-            1. Recursively find all objects from dynamic modules (even nested in containers)
-            2. Temporarily patch their __module__ and module_name to stable namespaces
-            3. Pickle with stable references like "griptape_nodes.node_libraries.runwayml_library.image_to_video"
-            4. Restore original names to avoid side effects
+        Keeping module references stable is what lets a workflow (or a value embedded in
+        saved image metadata) unpickle in a fresh Python process where the owning library
+        has been loaded.
 
         Args:
             obj: Object to patch and pickle (may contain nested structures)
 
         Returns:
             Pickled bytes with stable module references
-
-        Example:
-            Before: pickle contains "gtn_dynamic_module_image_to_video_py_123456789.VideoUrlArtifact"
-            After:  pickle contains "griptape_nodes.node_libraries.runwayml_library.image_to_video.VideoUrlArtifact"
         """
         patched_classes: list[tuple[type, str]] = []
         patched_instances: list[tuple[Any, str]] = []
