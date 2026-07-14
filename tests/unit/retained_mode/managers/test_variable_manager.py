@@ -11,6 +11,7 @@ from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, C
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
+    CreateVariableResultFailure,
     CreateVariableResultSuccess,
     DeleteVariableRequest,
     DeleteVariableResultFailure,
@@ -71,10 +72,10 @@ def project_macros(macros: dict[str, Any]) -> Iterator[None]:
     Usage: `with project_macros({"workspace_dir": "/x"}): ...`.
     """
 
-    def list_names(_self: object, _project_id: str | None = None) -> list[str]:
+    def list_names(_self: object, *, project_id: str | None = None) -> list[str]:  # noqa: ARG001
         return sorted(macros.keys())
 
-    def get_var(_self: object, name: str, _project_id: str | None = None) -> FlowVariable | None:
+    def get_var(_self: object, name: str, *, project_id: str | None = None) -> FlowVariable | None:  # noqa: ARG001
         if name not in macros:
             return None
         return _macro(name, macros[name])
@@ -131,12 +132,16 @@ class TestListSubstitutablesRequest:
         assert var.value == "sc001"
 
     def test_flow_var_shadows_macro_on_name_collision(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        """Precedence FLOW > PROJECT: a flow-scoped user var shadows a project macro of the same name."""
-        _add_variable(griptape_nodes, "workspace_dir", "/my/override")
-        with project_macros({"workspace_dir": "/workspace"}):
+        """Precedence FLOW > PROJECT: a flow-scoped user var shadows a project macro of the same name.
+
+        Uses a non-reserved project name (a builtin/directory name can't be taken by a
+        flow var — see TestReservedNames), so the shadow is one the API actually permits.
+        """
+        _add_variable(griptape_nodes, "custom_var", "/my/override")
+        with project_macros({"custom_var": "/project"}):
             result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
-        entries = [s for s in result.substitutables if s.name == "workspace_dir"]
+        entries = [s for s in result.substitutables if s.name == "custom_var"]
         assert len(entries) == 1
         assert entries[0].source == "variable"
         assert entries[0].read_only is False
@@ -250,12 +255,16 @@ class TestResolveSubstitutionRequest:
         assert result.variables["workspace_dir"] == "/workspace"
 
     def test_flow_var_wins_over_macro(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        """A flow-scoped user var shadows the project macro (new precedence: FLOW > PROJECT)."""
-        _add_variable(griptape_nodes, "workspace_dir", "/my/override")
-        with project_macros({"workspace_dir": "/workspace"}):
+        """A flow-scoped user var shadows the project macro (new precedence: FLOW > PROJECT).
+
+        Uses a non-reserved project name — a builtin/directory name can't be taken by a
+        flow var (see TestReservedNames).
+        """
+        _add_variable(griptape_nodes, "custom_var", "/my/override")
+        with project_macros({"custom_var": "/project"}):
             result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
-        assert result.variables["workspace_dir"] == "/my/override"
+        assert result.variables["custom_var"] == "/my/override"
 
     def test_macro_wins_over_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         """A project macro shadows a global user var (new precedence: PROJECT > GLOBAL)."""
@@ -305,12 +314,11 @@ class TestProjectLayerScopes:
         assert result.variable.value == "/proj"
 
     def test_project_only_ignores_flow_var(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "workspace_dir", "/from_flow")
-        with project_macros({"workspace_dir": "/from_project"}):
+        # Non-reserved name so the flow var can be created; PROJECT_ONLY still ignores it.
+        _add_variable(griptape_nodes, "custom_var", "/from_flow")
+        with project_macros({"custom_var": "/from_project"}):
             result = griptape_nodes.handle_request(
-                GetVariableRequest(
-                    name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY
-                )
+                GetVariableRequest(name="custom_var", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
             )
         assert isinstance(result, GetVariableResultSuccess)
         assert result.variable.value == "/from_project"
@@ -325,11 +333,12 @@ class TestProjectLayerScopes:
         assert isinstance(result, GetVariableResultFailure)
 
     def test_hierarchical_from_project_finds_project(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "workspace_dir", "/from_flow")
-        with project_macros({"workspace_dir": "/from_project"}):
+        # Non-reserved name so the flow var can be created; the FROM_PROJECT walk skips it.
+        _add_variable(griptape_nodes, "custom_var", "/from_flow")
+        with project_macros({"custom_var": "/from_project"}):
             result = griptape_nodes.handle_request(
                 GetVariableRequest(
-                    name="workspace_dir",
+                    name="custom_var",
                     starting_flow=flow_name,
                     lookup_scope=VariableScope.HIERARCHICAL_FROM_PROJECT,
                 )
@@ -408,6 +417,19 @@ class TestVariablePermission:
             )
         assert isinstance(result, RenameVariableResultFailure)
 
+    def test_rename_flow_var_to_reserved_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """Renaming a flow var to a reserved project name (workspace_dir) is refused.
+
+        Matches create's rule — a flow var may not take a reserved project builtin/directory
+        name — so the two agree. workspace_dir is reserved by the loaded system-defaults project.
+        """
+        _add_variable(griptape_nodes, "temp_name", "sc001")
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(name="temp_name", new_name="workspace_dir", starting_flow=flow_name)
+        )
+        assert isinstance(result, RenameVariableResultFailure)
+        assert "reserved" in str(result.result_details)
+
     def test_set_variables_batch_with_project_hit_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         _add_variable(griptape_nodes, "SHOT", "sc001")
         with project_macros({"workspace_dir": "/proj"}):
@@ -422,6 +444,47 @@ class TestVariablePermission:
         after = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
         assert isinstance(after, GetVariablesResultSuccess)
         assert after.variables == {"SHOT": "sc001"}
+
+
+class TestReservedNames:
+    """A flow variable may not be created or renamed to a reserved project name.
+
+    workspace_dir is a project builtin reserved by the loaded system-defaults project,
+    so these exercise the real ListProjectVariables(reserved=True) path — no patching.
+    """
+
+    def test_create_flow_var_with_reserved_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(name="workspace_dir", type="str", value="/hijack", owning_flow=flow_name)
+        )
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "reserved" in str(result.result_details)
+
+    def test_create_flow_var_with_unreserved_name_succeeds(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(name="not_a_builtin", type="str", value="ok", owning_flow=flow_name)
+        )
+        assert isinstance(result, CreateVariableResultSuccess)
+
+    def test_create_with_blank_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        for blank in ("", "   "):
+            result = griptape_nodes.handle_request(
+                CreateVariableRequest(name=blank, type="str", value="x", owning_flow=flow_name)
+            )
+            assert isinstance(result, CreateVariableResultFailure)
+            assert "empty name" in str(result.result_details)
+
+    @pytest.mark.usefixtures("flow_name")
+    def test_create_global_with_reserved_name_is_allowed(self, griptape_nodes: GriptapeNodes) -> None:
+        """Global is not gated on reserved names (only FLOW create/rename is).
+
+        Depends on the flow_name fixture for clean engine state + a current project, but
+        doesn't need the flow value itself (globals aren't flow-scoped).
+        """
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(name="workspace_dir", type="str", value="/global", is_global=True)
+        )
+        assert isinstance(result, CreateVariableResultSuccess)
 
 
 class TestProjectVariableSerialization:

@@ -380,6 +380,10 @@ class VariableDetails:
     name: str
     owning_flow_name: str | None  # None for global variables
     type: str
+    # True for project builtins/directories, whose names are reserved: a flow variable
+    # may not be created or renamed to a reserved name. False for flow/global variables
+    # and user-defined project-bag entries.
+    reserved: bool = False
 
 
 @dataclass
@@ -550,22 +554,23 @@ class GetVariablesRequest(RequestPayload):
     DO NOT use this at execution time when you need the full substitution
     context — use ResolveSubstitutionRequest for that.
 
+    Resolution is fixed: user-defined variables visible from ``starting_flow``,
+    walking the flow chain then global. The project layer is deliberately excluded
+    (it isn't user-defined), so there is no lookup_scope or project_id to vary — a
+    project-scoped read goes through ResolveSubstitutionRequest / GetVariableRequest,
+    which do take those.
+
     When ``names`` is non-empty, looks up each name individually and fails
     (all-or-nothing) if any name is not found. When ``names`` is empty,
-    returns every variable in scope.
+    returns every user variable in scope.
 
     Args:
         names: Specific variable names to retrieve. Empty means "all in scope".
-        lookup_scope: Variable lookup strategy (default: hierarchical search through starting flow,
-            ancestor flows, project layer, then global)
         starting_flow: Starting flow name (None for current flow in the Context Manager)
-        project_id: Which project's variable layer to consult (None = current project)
     """
 
     names: list[str] = field(default_factory=list)
-    lookup_scope: VariableScope = VariableScope.HIERARCHICAL
     starting_flow: str | None = None
-    project_id: str | None = None
 
 
 @dataclass

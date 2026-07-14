@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -3520,26 +3519,6 @@ class ProjectManager:
             result_details=f"Successfully mapped absolute path to '{mapped_path}'",
         )
 
-    def get_project_substitution_variables(self, project_info: ProjectInfo) -> dict[str, str | int]:
-        """Return all project-level variables available for {VAR} substitution.
-
-        Collects builtin variables (workspace_dir, workflow_name, etc.) and
-        project template directories (inputs, outputs, etc.). Variables that
-        cannot be resolved in the current context (e.g. workflow_dir before a
-        workflow is saved) are silently omitted.
-        """
-        resolver = self._build_variable_resolver(project_info.template, project_info)
-        variables: dict[str, str | int] = {}
-        for name in BUILTIN_VARIABLES:
-            with contextlib.suppress(RuntimeError, NotImplementedError):
-                variables[name] = resolver._get_builtin(name)
-        for name in project_info.template.directories:
-            try:
-                variables[name] = resolver.resolve_directory(name)
-            except (RuntimeError, NotImplementedError) as e:
-                logger.debug("Skipping directory variable %r: %s", name, e)
-        return variables
-
     def _project_variable_names(self, project_info: ProjectInfo) -> list[str]:
         """Return every variable name the project layer defines.
 
@@ -3558,14 +3537,17 @@ class ProjectManager:
         """Return metadata for every project variable, with the correct type per source.
 
         Builtins and template directories resolve to path/string values, so they report
-        ``type="str"``. User-bag entries carry their own stored ``type`` (e.g. int, JSON),
-        so we surface that rather than hardcoding. No values are resolved. ``owning_flow_name``
-        is ``None`` for all project entries — they are not flow-owned.
+        ``type="str"`` and are ``reserved=True`` — their names can't be shadowed by a user
+        flow variable. User-bag entries carry their own stored ``type`` (e.g. int, JSON) and
+        are not reserved. No values are resolved. ``owning_flow_name`` is ``None`` for all
+        project entries — they are not flow-owned.
         """
         computed = set(BUILTIN_VARIABLES) | set(project_info.template.directories.keys())
-        details = [VariableDetails(name=name, owning_flow_name=None, type="str") for name in sorted(computed)]
+        details = [
+            VariableDetails(name=name, owning_flow_name=None, type="str", reserved=True) for name in sorted(computed)
+        ]
         details.extend(
-            VariableDetails(name=v.name, owning_flow_name=None, type=v.type)
+            VariableDetails(name=v.name, owning_flow_name=None, type=v.type, reserved=False)
             for v in project_info.variable_layer.list()
             if v.name not in computed
         )

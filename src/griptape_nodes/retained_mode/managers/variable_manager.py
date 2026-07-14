@@ -181,39 +181,60 @@ class VariablesManager:
             return None
         return layer.get(variable_name)
 
-    def _get_project_variable(self, name: str, project_id: str | None) -> FlowVariable | None:
+    def _get_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable | None:
         """Fetch a single project-layer variable via ProjectManager.
 
-        Returns None if the project isn't loaded, the name isn't defined in that
-        project, or the variable's resolver raised. Callers who need to distinguish
-        those cases should issue GetProjectVariableRequest directly.
+        ``project_id=None`` means the current project. Returns None if the project
+        isn't loaded, the name isn't defined in that project, or the variable's resolver
+        raised. Callers who need to distinguish those cases should issue
+        GetProjectVariableRequest directly.
         """
         result = GriptapeNodes.handle_request(GetProjectVariableRequest(name=name, project_id=project_id))
         if not isinstance(result, GetProjectVariableResultSuccess):
             return None
         return result.variable
 
-    def _list_project_variable_names(self, project_id: str | None) -> list[str]:
-        """List every variable name defined in a project's variable layer (metadata only)."""
+    def _list_project_variable_names(self, *, project_id: str | None) -> list[str]:
+        """List every variable name defined in a project's variable layer (metadata only).
+
+        ``project_id=None`` means the current project.
+        """
         result = GriptapeNodes.handle_request(ListProjectVariablesRequest(project_id=project_id))
         if not isinstance(result, ListProjectVariablesResultSuccess):
             return []
         return [v.name for v in result.variables]
 
-    def _collect_resolvable_project_variables(self, project_id: str | None, seen: set[str]) -> list[ResolvedVariable]:
+    def _reserved_variable_names(self, *, project_id: str | None) -> set[str]:
+        """Return names a flow variable may not be created or renamed to.
+
+        ``project_id=None`` means the current project. A "reserved" name is one another
+        layer owns and does not permit a user flow variable to shadow. Today the project
+        layer reserves its builtins/directories; the concept is layer-agnostic, so if
+        global (or another layer) later reserves names they surface here too without
+        changing callers. Name-based and deterministic — no value resolution — so gating
+        a write never depends on whether a reserved value can resolve in the current context.
+        """
+        result = GriptapeNodes.handle_request(ListProjectVariablesRequest(project_id=project_id))
+        if not isinstance(result, ListProjectVariablesResultSuccess):
+            return set()
+        return {v.name for v in result.variables if v.reserved}
+
+    def _collect_resolvable_project_variables(
+        self, seen: set[str], *, project_id: str | None
+    ) -> list[ResolvedVariable]:
         """List project variables via events, resolving each name and skipping resolution failures.
 
         Mutates `seen` to include each collected name so downstream layers can shadow correctly.
-        Preserves the pre-layering silent-skip behavior of get_project_substitution_variables
-        for bulk enumeration: variables whose resolver raises today (e.g. workflow_dir before
-        the workflow is saved) are omitted from the returned list. Each entry carries
-        VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
+        Silent-skip for bulk enumeration: variables whose value can't resolve in the current
+        context (e.g. workflow_dir before the workflow is saved) are omitted from the returned
+        list rather than raising. Each entry carries VariableLayerKind.PROJECT so callers can
+        distinguish it from a same-named global.
         """
         collected: list[ResolvedVariable] = []
-        for name in self._list_project_variable_names(project_id):
+        for name in self._list_project_variable_names(project_id=project_id):
             if name in seen:
                 continue
-            variable = self._get_project_variable(name, project_id)
+            variable = self._get_project_variable(name, project_id=project_id)
             if variable is None:
                 continue
             collected.append(ResolvedVariable(variable=variable, layer=VariableLayerKind.PROJECT))
@@ -234,7 +255,7 @@ class VariablesManager:
                 )
 
             case VariableScope.PROJECT_ONLY:
-                variable = self._get_project_variable(variable_name, project_id)
+                variable = self._get_project_variable(variable_name, project_id=project_id)
                 if variable is None:
                     return VariableLookupResult(variable=None, found_scope=None, found_layer=None)
                 return VariableLookupResult(
@@ -263,7 +284,7 @@ class VariablesManager:
                             variable=variable, found_scope=found_scope, found_layer=VariableLayerKind.FLOW
                         )
 
-                variable = self._get_project_variable(variable_name, project_id)
+                variable = self._get_project_variable(variable_name, project_id=project_id)
                 if variable is not None:
                     return VariableLookupResult(
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
@@ -277,7 +298,7 @@ class VariablesManager:
                 )
 
             case VariableScope.HIERARCHICAL_FROM_PROJECT:
-                variable = self._get_project_variable(variable_name, project_id)
+                variable = self._get_project_variable(variable_name, project_id=project_id)
                 if variable is not None:
                     return VariableLookupResult(
                         variable=variable, found_scope=VariableScope.PROJECT_ONLY, found_layer=VariableLayerKind.PROJECT
@@ -331,8 +352,14 @@ class VariablesManager:
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
-    def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:
+    def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a new variable."""
+        # Fail fast on a blank name before any layer/collision logic.
+        if not request.name or not request.name.strip():
+            return CreateVariableResultFailure(
+                result_details="Attempted to create a variable with an empty name. Failed because a variable name is required."
+            )
+
         if request.is_global:
             # Check for name collision in global variables
             if self._global_layer.has(request.name):
@@ -357,6 +384,15 @@ class VariablesManager:
         except ValueError as e:
             return CreateVariableResultFailure(
                 result_details=f"Attempted to create variable '{request.name}'. Failed to determine target flow: {e}"
+            )
+
+        # A flow variable may not take a reserved name (one another layer owns and won't
+        # let a user variable shadow — e.g. project builtins/directories). Resolution
+        # precedence would otherwise let the flow var mask the reserved value, so we reject
+        # the collision at write time.
+        if request.name in self._reserved_variable_names(project_id=None):  # None = current project
+            return CreateVariableResultFailure(
+                result_details=f"Attempted to create a variable named '{request.name}' in flow '{target_flow}'. Failed because that name is reserved."
             )
 
         flow_layer = self._get_or_create_flow_layer(target_flow)
@@ -557,11 +593,20 @@ class VariablesManager:
 
         variable = result.variable
 
-        # Check for name collision with new name in the same scope
-        new_name_result = self._find_variable_hierarchical(
-            starting_flow, request.new_name, request.lookup_scope, request.project_id
-        )
-        if new_name_result.variable and new_name_result.variable.name != variable.name:
+        # The new name may not be reserved by another layer (project builtins/directories,
+        # etc.) — same rule as create, so the two agree. Name-based, so it doesn't depend
+        # on whether the reserved value currently resolves.
+        if request.new_name in self._reserved_variable_names(project_id=request.project_id):
+            return RenameVariableResultFailure(
+                result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because that name is reserved."
+            )
+
+        # And it may not collide with an existing user variable visible from this flow
+        # (flow chain → global). The project layer is excluded from this check because
+        # reserved names are already handled above and non-reserved project entries don't
+        # block a user rename.
+        existing = self._get_user_variables(starting_flow).get(request.new_name)
+        if existing is not None and existing.name != variable.name:
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because a variable with that name already exists."
             )
@@ -615,7 +660,7 @@ class VariablesManager:
 
             case VariableScope.PROJECT_ONLY:
                 # Just the project layer (entries tagged PROJECT inside the helper).
-                return self._collect_resolvable_project_variables(project_id, set())
+                return self._collect_resolvable_project_variables(set(), project_id=project_id)
 
             case VariableScope.GLOBAL_ONLY:
                 # Just the global layer.
@@ -631,7 +676,7 @@ class VariablesManager:
                 # entries and fills `seen`; then we add only the globals not shadowed,
                 # tagged GLOBAL because they come from self._global_layer.
                 seen: set[str] = set()
-                result = self._collect_resolvable_project_variables(project_id, seen)
+                result = self._collect_resolvable_project_variables(seen, project_id=project_id)
                 result.extend(
                     ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL)
                     for v in self._global_layer.list()
@@ -670,7 +715,7 @@ class VariablesManager:
                     seen_names.add(var.name)
 
         # Project layer (shadows global, shadowed by flow)
-        variables.extend(self._collect_resolvable_project_variables(project_id, seen_names))
+        variables.extend(self._collect_resolvable_project_variables(seen_names, project_id=project_id))
 
         # Global layer (lowest priority)
         variables.extend(
@@ -694,7 +739,7 @@ class VariablesManager:
             variables.extend(ResolvedVariable(variable=v, layer=VariableLayerKind.FLOW) for v in flow_layer.list())
 
         # Project layer entries — silent-skip resolution failures for enumeration.
-        variables.extend(self._collect_resolvable_project_variables(project_id, set()))
+        variables.extend(self._collect_resolvable_project_variables(set(), project_id=project_id))
 
         variables.extend(
             ResolvedVariable(variable=v, layer=VariableLayerKind.GLOBAL) for v in self._global_layer.list()
@@ -769,12 +814,12 @@ class VariablesManager:
                 continue
             # Layer provenance is recorded at collection time, so a project builtin and a
             # same-named user global are distinguished by layer, not by name-matching.
-            source = (
-                SubstitutableSource.MACRO
-                if resolved_variable.layer is VariableLayerKind.PROJECT
-                else SubstitutableSource.VARIABLE
-            )
-            read_only = variable.permission is VariablePermission.READ_ONLY
+            from_project = resolved_variable.layer is VariableLayerKind.PROJECT
+            source = SubstitutableSource.MACRO if from_project else SubstitutableSource.VARIABLE
+            # Project-layer entries have no write-through path via this API (_refuse_write
+            # bounces every PROJECT-layer write), so they are read-only to the picker
+            # regardless of a bag entry's stored permission. Other layers honor permission.
+            read_only = from_project or variable.permission is VariablePermission.READ_ONLY
             substitutables.append(
                 Substitutable(name=variable.name, value=filtered[variable.name], source=source, read_only=read_only)
             )
