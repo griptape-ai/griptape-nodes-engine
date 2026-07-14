@@ -232,6 +232,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
+    LIBRARY_LAZY_NODE_LOADING_KEY,
     LIBRARY_MINIMUM_RELEASE_AGE_KEY,
     REQUIRES_ENGINE_KEY,
     WORKER_HEARTBEAT_STARTUP_GRACE_KEY,
@@ -1774,7 +1775,32 @@ class LibraryManager:
         # In that case we still return a success payload with the library-level metadata and a
         # WARNING entry in result_details, so callers can present the node at all instead of
         # getting an opaque failure for every such node type.
-        node_class = library.get_node_class(request.node_type)
+        # Resolving the class imports the node's module (lazy registration defers this to
+        # first use). A broken module raises here; return the library-level metadata with a
+        # WARNING rather than an opaque failure, matching the probe-failure path below.
+        try:
+            node_class = library.get_node_class(request.node_type)
+        except (ImportError, AttributeError, TypeError) as err:
+            import_error = f"{type(err).__name__}: {err}"
+            return DescribeNodeTypeResultSuccess(
+                library=library_name,
+                node_type=request.node_type,
+                metadata=node_metadata,
+                parameters=[],
+                result_details=ResultDetails(
+                    ResultDetail(
+                        level=logging.INFO,
+                        message=(
+                            f"Described node type '{request.node_type}' in Library '{library_name}' "
+                            "with library metadata only."
+                        ),
+                    ),
+                    ResultDetail(
+                        level=logging.WARNING,
+                        message=f"Node module failed to import: {import_error}",
+                    ),
+                ),
+            )
         probe_name = f"__describe_node_type_probe__{request.node_type}"
         try:
             # Wrap in ``LibraryRegistry.constructing_node()`` so the
@@ -2319,13 +2345,14 @@ class LibraryManager:
                             library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
                             self._library_file_path_to_info[file_path] = library_info
                         else:
-                            # Attempt to load nodes from the library (modifies library_info in place)
+                            # Attempt to load nodes from the library (modifies library_info in place).
                             await asyncio.to_thread(
                                 self._attempt_load_nodes_from_library,
                                 library_data=library_data,
                                 library=library,
                                 base_dir=base_dir,
                                 library_info=library_info,
+                                lazy_loading=self._should_lazy_load_nodes(),
                             )
                             self._library_file_path_to_info[file_path] = library_info
 
@@ -3229,41 +3256,72 @@ class LibraryManager:
 
         return module
 
-    def _load_class_from_file(self, file_path: Path | str, class_name: str, library_name: str) -> type[BaseNode]:
-        """Dynamically load a class from a Python file with support for hot reloading.
-
-        Args:
-            file_path: Path to the Python file
-            class_name: Name of the class to load
-            library_name: Name of the library
-
-        Returns:
-            The loaded class
+    @staticmethod
+    def _get_node_class_from_module(module: ModuleType, class_name: str, file_path: Path | str) -> type[BaseNode]:
+        """Extract and validate a BaseNode subclass from an already-imported module.
 
         Raises:
-            ImportError: If the module cannot be imported
             AttributeError: If the class doesn't exist in the module
-            TypeError: If the loaded class isn't a BaseNode-derived class
+            TypeError: If the named object isn't a BaseNode-derived class
         """
-        try:
-            module = self._load_module_from_file(file_path, library_name)
-        except ImportError as err:
-            msg = f"Attempted to load class '{class_name}'. Error: {err}"
-            raise ImportError(msg) from err
-
-        # Get the class
         try:
             node_class = getattr(module, class_name)
         except AttributeError as err:
             msg = f"Class '{class_name}' not found in module '{file_path}'"
             raise AttributeError(msg) from err
 
-        # Verify it's a BaseNode subclass
         if not issubclass(node_class, BaseNode):
             msg = f"'{class_name}' must inherit from BaseNode"
             raise TypeError(msg)
 
         return node_class
+
+    def _make_memoized_module_loader(self, node_file_path: Path, library_name: str) -> Callable[[], ModuleType]:
+        """Return a loader that imports a file's module at most once, caching the result.
+
+        ``_load_module_from_file`` re-executes a module that is already in ``sys.modules`` (its
+        hot-reload path). Without memoization, resolving several node classes that share one file
+        would re-run that file's top-level code once per class and bind the classes to different
+        module objects. Memoizing per file makes the module import (and its top-level side
+        effects) happen exactly once per library load, whether its classes are resolved eagerly in
+        a burst or lazily at scattered points in the session. A fresh cache is created per
+        ``_attempt_load_nodes_from_library`` call, so a reload still re-imports the file once.
+        """
+        cache: dict[str, ModuleType] = {}
+
+        def load_module() -> ModuleType:
+            module = cache.get("module")
+            if module is None:
+                module = self._load_module_from_file(node_file_path, library_name)
+                cache["module"] = module
+            return module
+
+        return load_module
+
+    def _make_node_class_loader(
+        self,
+        node_file_path: Path,
+        class_name: str,
+        library_name: str,
+        module_loaders: dict[Path, Callable[[], ModuleType]],
+    ) -> Callable[[], type[BaseNode]]:
+        """Return a zero-argument loader that imports and returns a node class on demand.
+
+        Node classes that share a file reuse a single memoized module loader from
+        ``module_loaders`` (keyed by resolved file path), so the file's module is imported once
+        even when its classes are resolved at different times. Binds its arguments as method
+        parameters (not loop variables), so the closure is safe to build inside a per-node loop.
+        """
+        module_loader = module_loaders.get(node_file_path)
+        if module_loader is None:
+            module_loader = self._make_memoized_module_loader(node_file_path, library_name)
+            module_loaders[node_file_path] = module_loader
+
+        def load() -> type[BaseNode]:
+            module = module_loader()
+            return self._get_node_class_from_module(module, class_name, node_file_path)
+
+        return load
 
     async def _load_and_track_library(self, lib_path: str, index: int, total: int) -> None:
         """Load a single library and emit the corresponding progress event."""
@@ -4229,12 +4287,110 @@ class LibraryManager:
 
         return advanced_library_instance
 
+    def _should_lazy_load_nodes(self) -> bool:
+        """Return whether node modules should be imported lazily for this process.
+
+        Lazy loading is the default (fast startup); set ``library.lazy_node_loading`` to False
+        to load eagerly so node import errors surface at startup while authoring. A worker always
+        loads eagerly regardless of the setting: it imports every node anyway to serialize schemas
+        back to the orchestrator, and eager load lets it report import problems.
+        """
+        if self._is_worker:
+            return False
+        return bool(GriptapeNodes.ConfigManager().get_config_value(LIBRARY_LAZY_NODE_LOADING_KEY, default=True))
+
+    def _register_node_eager(
+        self,
+        node_definition: NodeDefinition,
+        node_file_path: Path,
+        library: Library,
+        library_info: LibraryInfo,
+        module_loaders: dict[Path, Callable[[], ModuleType]],
+    ) -> bool:
+        """Import a node's module now and register its class, recording any load problem.
+
+        Returns True if the node type was registered, False if its module failed to import
+        (a problem is appended to ``library_info`` in that case).
+        """
+        library_name = library.get_library_data().name
+        try:
+            node_class = self._make_node_class_loader(
+                node_file_path, node_definition.class_name, library_name, module_loaders
+            )()
+        except ImportError as err:
+            root_cause = self._get_root_cause_from_exception(err)
+            library_info.problems.append(
+                NodeModuleImportProblem(
+                    class_name=node_definition.class_name,
+                    file_path=str(node_file_path),
+                    error_message=str(err),
+                    root_cause=str(root_cause),
+                )
+            )
+            logger.error(
+                "Attempted to load node '%s' from '%s'. Failed because module could not be imported: %s",
+                node_definition.class_name,
+                node_file_path,
+                err,
+            )
+            return False
+        except AttributeError:
+            library_info.problems.append(
+                NodeClassNotFoundProblem(class_name=node_definition.class_name, file_path=str(node_file_path))
+            )
+            logger.error(
+                "Attempted to load node '%s' from '%s'. Failed because class not found in module",
+                node_definition.class_name,
+                node_file_path,
+            )
+            return False
+        except TypeError:
+            library_info.problems.append(
+                NodeClassNotBaseNodeProblem(class_name=node_definition.class_name, file_path=str(node_file_path))
+            )
+            logger.error(
+                "Attempted to load node '%s' from '%s'. Failed because class doesn't inherit from BaseNode",
+                node_definition.class_name,
+                node_file_path,
+            )
+            return False
+
+        library_problem = library.register_new_node_type(node_class, metadata=node_definition.metadata)
+        if library_problem is not None:
+            library_info.problems.append(library_problem)
+        return True
+
+    def _register_node_lazy(
+        self,
+        node_definition: NodeDefinition,
+        node_file_path: Path,
+        library: Library,
+        library_info: LibraryInfo,
+        module_loaders: dict[Path, Callable[[], ModuleType]],
+    ) -> bool:
+        """Register a node type with a deferred loader; its module imports on first use.
+
+        Always returns True: registration itself does not import the module, so an import
+        error cannot be detected here (it surfaces when the node is first used).
+        """
+        loader = self._make_node_class_loader(
+            node_file_path, node_definition.class_name, library.get_library_data().name, module_loaders
+        )
+        library_problem = library.register_lazy_node_type(
+            node_definition.class_name, metadata=node_definition.metadata, loader=loader
+        )
+        if library_problem is not None:
+            library_info.problems.append(library_problem)
+        return True
+
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
         library_data: LibrarySchema,
         library: Library,
         base_dir: Path,
         library_info: LibraryInfo,
+        *,
+        lazy_loading: bool = False,
     ) -> None:
         """Load nodes from library and update library_info in place.
 
@@ -4243,6 +4399,9 @@ class LibraryManager:
             library: Library instance to register nodes with
             base_dir: Base directory for resolving relative paths
             library_info: LibraryInfo to update with problems and fitness
+            lazy_loading: When False (default), each node's module is imported now so import
+                errors surface here as library problems. When True, node types are registered
+                with a deferred loader and their modules are imported on first use instead.
         """
         any_nodes_loaded_successfully = False
 
@@ -4279,49 +4438,31 @@ class LibraryManager:
                 )
                 logger.error(details)
 
-        # Process each node in the metadata
+        # Process each node in the metadata. Lazy loading (the default) registers each type with
+        # a deferred loader and imports the module on first use, keeping startup from paying the
+        # import cost (often heavy deps like torch/diffusers) of node modules that are never used;
+        # the tradeoff is that an import error is not reported until the node is first used (the
+        # CreateNode handler then substitutes an Error Proxy). Eager loading (library.lazy_node_loading
+        # = False, and always for the sandbox library) instead imports each node's module now so a
+        # broken node surfaces as a library problem at startup, before it is placed on a canvas.
+        # module_loaders memoizes each file's module import so classes sharing a file (whether
+        # resolved eagerly here or lazily later) import it once rather than re-executing per class.
+        module_loaders: dict[Path, Callable[[], ModuleType]] = {}
         for node_definition in library_data.nodes:
             # Resolve relative path to absolute path
             node_file_path = resolve_workspace_path(Path(node_definition.file_path), base_dir)
 
-            try:
-                # Dynamically load the module containing the node class
-                node_class = self._load_class_from_file(node_file_path, node_definition.class_name, library_data.name)
-            except ImportError as err:
-                root_cause = self._get_root_cause_from_exception(err)
-                library_info.problems.append(
-                    NodeModuleImportProblem(
-                        class_name=node_definition.class_name,
-                        file_path=str(node_file_path),
-                        error_message=str(err),
-                        root_cause=str(root_cause),
-                    )
+            if lazy_loading:
+                node_registered = self._register_node_lazy(
+                    node_definition, node_file_path, library, library_info, module_loaders
                 )
-                details = f"Attempted to load node '{node_definition.class_name}' from '{node_file_path}'. Failed because module could not be imported: {err}"
-                logger.error(details)
-                continue  # SKIP IT
-            except AttributeError:
-                library_info.problems.append(
-                    NodeClassNotFoundProblem(class_name=node_definition.class_name, file_path=str(node_file_path))
+            else:
+                node_registered = self._register_node_eager(
+                    node_definition, node_file_path, library, library_info, module_loaders
                 )
-                details = f"Attempted to load node '{node_definition.class_name}' from '{node_file_path}'. Failed because class not found in module"
-                logger.error(details)
-                continue  # SKIP IT
-            except TypeError:
-                library_info.problems.append(
-                    NodeClassNotBaseNodeProblem(class_name=node_definition.class_name, file_path=str(node_file_path))
-                )
-                details = f"Attempted to load node '{node_definition.class_name}' from '{node_file_path}'. Failed because class doesn't inherit from BaseNode"
-                logger.error(details)
-                continue  # SKIP IT
 
-            # Register the node type with the library
-            library_problem = library.register_new_node_type(node_class, metadata=node_definition.metadata)
-            if library_problem is not None:
-                library_info.problems.append(library_problem)
-
-            # If we got here, at least one node came in.
-            any_nodes_loaded_successfully = True
+            if node_registered:
+                any_nodes_loaded_successfully = True
 
         # Register widgets and check for duplicates
         if library_data.widgets:
@@ -4655,13 +4796,16 @@ class LibraryManager:
         library_info.problems.extend(problems)
 
         # Load nodes into the library (modifies library_info in place)
-        # Note: library_info is passed as parameter from lifecycle handler
+        # Note: library_info is passed as parameter from lifecycle handler.
+        # Sandbox nodes always load eagerly (not gated on library.lazy_node_loading): they are
+        # being actively authored, so import errors should surface immediately, not on first use.
         await asyncio.to_thread(
             self._attempt_load_nodes_from_library,
             library_data=library_data,
             library=library,
             base_dir=sandbox_library_dir,
             library_info=library_info,
+            lazy_loading=False,
         )
 
     def _find_files_in_dir(self, directory: Path, extension: str) -> list[Path]:
