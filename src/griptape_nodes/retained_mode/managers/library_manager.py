@@ -3526,6 +3526,25 @@ class LibraryManager:
         )
         self._ensure_parent_packages(stable_namespace)
 
+        # A second library whose sanitized name and canonical file resolve to an already
+        # loaded namespace becomes a co-owner of the existing module rather than triggering a
+        # re-execution: replacing the module object here would strand the first library's
+        # registry on a stale class generation, breaking pickling of its values. Re-execution
+        # is reserved for genuine hot reloads, i.e. a library that already owns the namespace
+        # loading its file again.
+        existing_record = self._stable_module_to_file.get(stable_namespace)
+        existing_module = sys.modules.get(stable_namespace)
+        if (
+            existing_record is not None
+            and existing_module is not None
+            and existing_record.canonical_path == module_file.canonical_path
+            and stable_namespace not in self._library_to_stable_modules.get(library_name, set())
+        ):
+            self._track_stable_module(stable_namespace, existing_module, library_name, module_file)
+            details = f"Library '{library_name}' now shares already-loaded module: {stable_namespace}"
+            logger.debug(details)
+            return existing_module
+
         spec = importlib.util.spec_from_file_location(stable_namespace, module_file.canonical_path)
         if spec is None or spec.loader is None:
             msg = f"Could not load module specification from {file_path}"

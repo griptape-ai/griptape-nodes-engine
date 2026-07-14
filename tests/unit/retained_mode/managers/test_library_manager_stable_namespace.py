@@ -267,26 +267,30 @@ class TestStableNamespaceLoading:
         """Two libraries resolving to the same module must not unload it out from under each other.
 
         'My Test Library' and 'My-Test Library' sanitize to the same namespace segment; when
-        both point at the same file, they share one stable module. Unloading the first
-        library must keep the module importable for the second; only the final unload
-        removes it.
+        both point at the same file, they share one stable module. The second library must
+        reuse the first's module object (re-executing would strand the first library's
+        registry on a stale class generation), unloading the first library must keep the
+        module importable for the second, and only the final unload removes it.
         """
         manager = griptape_nodes.LibraryManager()
         file_path = _write_module(tmp_path, "collision_behavior.py")
 
         module_first = manager._load_module_from_file(file_path, "My Test Library")
         module_second = manager._load_module_from_file(file_path, "My-Test Library")
-        assert module_second.__name__ == module_first.__name__, "sanity: both libraries must share the namespace"
-        namespace = module_second.__name__
-
-        manager._unregister_all_stable_module_aliases_for_library("My Test Library")
-
-        assert namespace in sys.modules, "the module must survive while another library still owns it"
-        assert manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_42", "Behavior") is (
-            sys.modules[namespace].Behavior
-        )
+        assert module_second is module_first, "a co-owning library must reuse the loaded module, not re-execute it"
+        namespace = module_first.__name__
+        pickled = pickle.dumps(module_first.Behavior.OVERWRITE)
 
         manager._unregister_all_stable_module_aliases_for_library("My-Test Library")
+
+        assert namespace in sys.modules, "the module must survive while another library still owns it"
+        assert sys.modules[namespace] is module_first, "the surviving owner must keep its exact module generation"
+        assert pickle.loads(pickled) is module_first.Behavior.OVERWRITE  # noqa: S301
+        assert manager.resolve_volatile_dynamic_class("gtn_dynamic_module_collision_behavior_py_42", "Behavior") is (
+            module_first.Behavior
+        )
+
+        manager._unregister_all_stable_module_aliases_for_library("My Test Library")
 
         assert namespace not in sys.modules, "the final owner's unload must remove the module"
 
