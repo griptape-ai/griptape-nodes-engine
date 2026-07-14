@@ -185,6 +185,27 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 
+class _FlowCommandsUnpickler(pickle.Unpickler):
+    """Unpickler for flow commands embedded in saved image metadata.
+
+    Images saved by engines that executed library node files under volatile, per-process
+    module names embed pickles referencing names like
+    ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``, which cannot be
+    imported in a later process. When standard resolution fails, this asks the
+    LibraryManager to map the volatile name to the module now loaded under its stable
+    namespace so those images remain loadable.
+    """
+
+    def find_class(self, module: str, name: str) -> Any:
+        try:
+            return super().find_class(module, name)
+        except ModuleNotFoundError:
+            resolved_module = GriptapeNodes.LibraryManager().resolve_volatile_dynamic_module(module, name)
+            if resolved_module is None:
+                raise
+            return getattr(resolved_module, name)
+
+
 class DagExecutionType(StrEnum):
     START_NODE = "start_node"
     CONTROL_NODE = "control_node"
@@ -4077,7 +4098,7 @@ class FlowManager:
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
 
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
+    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, PLR0912, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
@@ -4160,9 +4181,20 @@ class FlowManager:
 
         # Unpickle SerializedFlowCommands
         try:
-            # Pickle is safe here: we're deserializing workflow data from images saved by this application
-            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands
-            serialized_flow_commands = pickle.loads(pickled_data)  # noqa: S301
+            # Pickle is safe here: we're deserializing workflow data from images saved by this application.
+            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands.
+            # _FlowCommandsUnpickler additionally remaps volatile module names from images saved
+            # by engines that predate stable-namespace module loading.
+            serialized_flow_commands = _FlowCommandsUnpickler(BytesIO(pickled_data)).load()
+        except ModuleNotFoundError as e:
+            return ExtractFlowCommandsFromImageMetadataResultFailure(
+                result_details=(
+                    f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because it "
+                    f"uses node types from a library that isn't loaded ({e.name}). Install or enable the "
+                    "library it came from, then try again."
+                ),
+                file_path=file_url_or_path,
+            )
         except Exception as e:
             return ExtractFlowCommandsFromImageMetadataResultFailure(
                 result_details=f"Failed to unpickle flow commands: {e}",

@@ -857,3 +857,74 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         assert result.serialized_flow_commands == "Overwrite existing"
 
         manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_unpickles_image_saved_with_volatile_module_name(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """An image saved by an engine that used volatile module names still loads.
+
+        This is the exact reported scenario: the embedded pickle references
+        ``gtn_dynamic_module_set_variables_from_data_py_<hash>``, which does not exist in this
+        process. The unpickler remaps it to the module loaded under its stable namespace.
+        """
+        import sys
+        import types
+
+        volatile_name = "gtn_dynamic_module_set_variables_from_data_py_4816193767510271467"
+
+        # Recreate what the old loader produced, pickle a value from it, then drop the module
+        # (a fresh engine process never has this hash).
+        volatile_module = types.ModuleType(volatile_name)
+        exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.CollisionBehavior.OVERWRITE)
+        del sys.modules[volatile_name]
+        assert volatile_name.encode() in pickled
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "old_engine_image.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        # The current engine has the library loaded under the stable namespace.
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(self._MODULE_SOURCE)
+        manager = griptape_nodes.LibraryManager()
+        loaded = manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands == "Overwrite existing"
+        assert result.serialized_flow_commands is loaded.CollisionBehavior.OVERWRITE
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_missing_library_yields_artist_readable_error(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """When no loaded library can satisfy the reference, the error names the module."""
+        import sys
+        import types
+
+        volatile_name = "gtn_dynamic_module_not_installed_anywhere_py_123456789"
+        volatile_module = types.ModuleType(volatile_name)
+        exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.CollisionBehavior.OVERWRITE)
+        del sys.modules[volatile_name]
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "orphaned.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        assert "library that isn't loaded" in str(result.result_details)

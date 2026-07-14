@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -3139,6 +3140,58 @@ class LibraryManager:
             False
         """
         return module_name.startswith(self.STABLE_NAMESPACE_PREFIX)
+
+    # Module-name format used by engines that executed library node files under a volatile,
+    # per-process name: "gtn_dynamic_module_<file name with '.' -> '_'>_<hash(str(path))>".
+    # Python randomizes hash() of strings per process, so these names never resolve in a
+    # later process. Pickles written by those engines (e.g. flow commands embedded in saved
+    # image metadata) still reference them, so we translate on read.
+    _VOLATILE_DYNAMIC_MODULE_PATTERN = re.compile(r"^gtn_dynamic_module_(?P<file_token>.+?)_(?P<path_hash>-?\d+)$")
+
+    def resolve_volatile_dynamic_module(self, module_name: str, class_name: str) -> ModuleType | None:
+        """Resolve a volatile dynamic module name from an old pickle to a loaded stable module.
+
+        Older engines executed library node files under per-process module names like
+        ``gtn_dynamic_module_set_variables_from_data_py_4816193767510271467``. Values pickled
+        back then (for instance, flow commands embedded in a saved image) still reference
+        those names. This maps such a name back to the module now loaded under its stable
+        namespace by matching the file stem and requiring the referenced class to exist.
+
+        Args:
+            module_name: The module name recorded in the pickle
+            class_name: The class the pickle wants from that module
+
+        Returns:
+            The loaded stable module that defines ``class_name``, or None if the name is not
+            a volatile dynamic module name or no loaded module matches.
+        """
+        match = self._VOLATILE_DYNAMIC_MODULE_PATTERN.match(module_name)
+        if match is None:
+            return None
+
+        # "set_variables_from_data_py" -> "set_variables_from_data". The volatile format
+        # replaced '.' with '_' in the full file name; stable namespaces use the stem with
+        # '-' replaced by '_'.
+        file_token = match.group("file_token")
+        stem = file_token.removesuffix("_py").replace("-", "_")
+
+        matches: list[ModuleType] = []
+        for stable_namespace in sorted(self._stable_module_to_file):
+            if stable_namespace.rsplit(".", 1)[-1] != stem:
+                continue
+            module = sys.modules.get(stable_namespace)
+            if module is not None and hasattr(module, class_name):
+                matches.append(module)
+
+        if not matches:
+            return None
+        if len(matches) > 1:
+            details = (
+                f"Multiple loaded library modules match volatile module name '{module_name}' "
+                f"for class '{class_name}': {[m.__name__ for m in matches]}. Using '{matches[0].__name__}'."
+            )
+            logger.warning(details)
+        return matches[0]
 
     @staticmethod
     def _get_root_cause_from_exception(exception: BaseException) -> BaseException:

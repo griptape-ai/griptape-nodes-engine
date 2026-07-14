@@ -185,3 +185,52 @@ class TestStableNamespaceLoading:
         assert manager.is_dynamic_module("griptape.artifacts") is False
         assert manager.get_stable_namespace_for_dynamic_module(stable) == stable
         assert manager.get_stable_namespace_for_dynamic_module("griptape.artifacts") is None
+
+
+@pytest.mark.usefixtures("restore_sys_modules")
+class TestVolatileDynamicModuleResolution:
+    """Mapping old volatile pickle module names back to loaded stable modules."""
+
+    def test_resolves_to_loaded_stable_module(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision_behavior.py")
+        module = manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_volatile_dynamic_module(
+            "gtn_dynamic_module_collision_behavior_py_-8859640815979518826", "Behavior"
+        )
+
+        assert resolved is module
+
+    def test_returns_none_for_non_volatile_name(self, griptape_nodes: GriptapeNodes) -> None:
+        manager = griptape_nodes.LibraryManager()
+
+        assert manager.resolve_volatile_dynamic_module("griptape.artifacts", "TextArtifact") is None
+
+    def test_returns_none_when_class_missing(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision_behavior.py")
+        manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_volatile_dynamic_module(
+            "gtn_dynamic_module_collision_behavior_py_123", "NoSuchClass"
+        )
+
+        assert resolved is None
+
+    def test_returns_none_when_no_module_loaded(self, griptape_nodes: GriptapeNodes) -> None:
+        manager = griptape_nodes.LibraryManager()
+
+        resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_never_loaded_py_42", "Behavior")
+
+        assert resolved is None
+
+    def test_resolves_hyphenated_file_name(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """Volatile names kept hyphens ('.'->'_' only); stable stems use '_'. Both must match."""
+        manager = griptape_nodes.LibraryManager()
+        file_path = _write_module(tmp_path, "collision-behavior.py")
+        module = manager._load_module_from_file(file_path, "My Test Library")
+
+        resolved = manager.resolve_volatile_dynamic_module("gtn_dynamic_module_collision-behavior_py_99", "Behavior")
+
+        assert resolved is module
