@@ -23,7 +23,6 @@ WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
-LIBRARY_LAZY_NODE_LOADING_KEY = "library.lazy_node_loading"
 
 
 class Category(BaseModel):
@@ -297,19 +296,6 @@ class LibrarySettings(BaseModel):
             "Controls automatic installation of library dependencies declared in library manifests. "
             "'always' downloads and installs them on registration. "
             "'never' skips installation and marks the library as degraded if required dependencies are missing."
-        ),
-    )
-    lazy_node_loading: bool = Field(
-        default=True,
-        description=(
-            "When True (the default), a node's Python module is imported lazily the first time a node "
-            "of that type is created (or the type is otherwise resolved, such as when introspected) "
-            "rather than at startup, which speeds up engine startup for libraries with many or heavy "
-            "nodes. The tradeoff is that a broken node's import error is not reported until that type is "
-            "first created. When False, the engine imports every node's Python module at startup, so an "
-            "import error surfaces immediately as a library problem, before the node is placed on a "
-            "canvas; set this while authoring nodes if you want that check. Nodes in the sandbox library "
-            "are always loaded eagerly regardless of this setting."
         ),
     )
     minimum_release_age: float = Field(
