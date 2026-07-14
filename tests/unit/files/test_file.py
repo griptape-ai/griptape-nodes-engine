@@ -33,6 +33,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
+CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
 
 
 class TestFileConstructor:
@@ -860,10 +861,14 @@ class TestFileDestinationWrite:
         request = mock_handle.call_args.args[0]
         assert request.encoding == "latin-1"
 
-    def test_resolve_returns_path_string(self) -> None:
-        dest = FileDestination("workspace/output.png")
+    def test_resolve_anchors_relative_path_to_workspace(self) -> None:
+        dest = FileDestination("output.png")
 
-        assert dest.resolve() == "workspace/output.png"
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = Path("/workspace")
+            resolved = dest.resolve()
+
+        assert Path(resolved) == Path("/workspace/output.png")
 
 
 class TestFileDestinationAsync:
@@ -1109,6 +1114,14 @@ class TestFileResolve:
     def test_resolve_plain_string(self) -> None:
         f = File("/absolute/path/image.png")
         assert Path(f.resolve()) == Path("/absolute/path/image.png")
+
+    def test_resolve_anchors_relative_path_to_workspace(self) -> None:
+        """A workspace-relative path resolves against the workspace, not the process CWD."""
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = Path("/workspace")
+            result = File("outputs/images/result.png").resolve()
+
+        assert Path(result) == Path("/workspace/outputs/images/result.png")
 
     def test_resolve_macro_path_calls_handle_request(self) -> None:
         resolve_result = GetPathForMacroResultSuccess(
