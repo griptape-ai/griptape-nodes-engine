@@ -33,6 +33,7 @@ from griptape_nodes.retained_mode.events.project_events import (
 
 HANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.handle_request"
 AHANDLE_REQUEST_PATH = "griptape_nodes.files.file.GriptapeNodes.ahandle_request"
+CONFIG_MANAGER_PATH = "griptape_nodes.files.file.GriptapeNodes.ConfigManager"
 
 
 class TestFileConstructor:
@@ -804,7 +805,7 @@ class TestFileDestinationWrite:
         with patch(HANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
             result = dest.write_bytes(b"\x89PNG")
 
-        assert Path(result.resolve()) == Path("/workspace/output_1.png")
+        assert Path(result.location) == Path("/workspace/output_1.png")
         request = mock_handle.call_args.args[0]
         assert request.existing_file_policy == ExistingFilePolicy.CREATE_NEW
 
@@ -843,7 +844,7 @@ class TestFileDestinationWrite:
         with patch(HANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
             result = dest.write_text("hello")
 
-        assert Path(result.resolve()) == Path("/workspace/output.txt")
+        assert Path(result.location) == Path("/workspace/output.txt")
         request = mock_handle.call_args.args[0]
         assert request.existing_file_policy == ExistingFilePolicy.FAIL
 
@@ -860,10 +861,14 @@ class TestFileDestinationWrite:
         request = mock_handle.call_args.args[0]
         assert request.encoding == "latin-1"
 
-    def test_resolve_returns_path_string(self) -> None:
-        dest = FileDestination("workspace/output.png")
+    def test_resolve_anchors_relative_path_to_workspace(self, tmp_path: Path) -> None:
+        dest = FileDestination("output.png")
 
-        assert dest.resolve() == "workspace/output.png"
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            resolved = dest.resolve()
+
+        assert Path(resolved) == tmp_path / "output.png"
 
 
 class TestFileDestinationAsync:
@@ -880,7 +885,7 @@ class TestFileDestinationAsync:
         with patch(AHANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
             result = await dest.awrite_bytes(b"\x89PNG")
 
-        assert Path(result.resolve()) == Path("/workspace/output_1.png")
+        assert Path(result.location) == Path("/workspace/output_1.png")
         request = mock_handle.call_args.args[0]
         assert request.existing_file_policy == ExistingFilePolicy.CREATE_NEW
 
@@ -905,7 +910,7 @@ class TestFileDestinationAsync:
         with patch(AHANDLE_REQUEST_PATH, return_value=success_result) as mock_handle:
             result = await dest.awrite_text("hello")
 
-        assert Path(result.resolve()) == Path("/workspace/output.txt")
+        assert Path(result.location) == Path("/workspace/output.txt")
         request = mock_handle.call_args.args[0]
         assert request.existing_file_policy == ExistingFilePolicy.FAIL
 
@@ -1106,9 +1111,21 @@ class TestFileDestinationName:
 class TestFileResolve:
     """Tests for File.resolve() method."""
 
-    def test_resolve_plain_string(self) -> None:
-        f = File("/absolute/path/image.png")
-        assert Path(f.resolve()) == Path("/absolute/path/image.png")
+    def test_resolve_absolute_path_passes_through(self, tmp_path: Path) -> None:
+        abs_path = tmp_path / "absolute" / "image.png"
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File(str(abs_path)).resolve()
+
+        assert Path(result) == abs_path
+
+    def test_resolve_anchors_relative_path_to_workspace(self, tmp_path: Path) -> None:
+        """A workspace-relative path resolves against the workspace, not the process CWD."""
+        with patch(CONFIG_MANAGER_PATH) as mock_config_manager:
+            mock_config_manager.return_value.workspace_path = tmp_path
+            result = File("outputs/images/result.png").resolve()
+
+        assert Path(result) == tmp_path / "outputs" / "images" / "result.png"
 
     def test_resolve_macro_path_calls_handle_request(self) -> None:
         resolve_result = GetPathForMacroResultSuccess(
