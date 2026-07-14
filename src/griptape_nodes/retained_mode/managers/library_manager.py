@@ -3037,8 +3037,11 @@ class LibraryManager:
         if existing_file is None or existing_file == file_path:
             return base_namespace
 
-        # Genuine collision between two distinct files: disambiguate the newcomer.
-        suffix = hashlib.sha1(str(file_path).encode("utf-8")).hexdigest()[:8]  # noqa: S324
+        # Genuine collision between two distinct files: disambiguate the newcomer. The digest
+        # only needs to be a stable, low-collision suffix for a module name (not security), so
+        # the algorithm choice is irrelevant; sha256 with usedforsecurity=False keeps static
+        # analysis quiet about weak hashing.
+        suffix = hashlib.sha256(str(file_path).encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
         disambiguated = f"{base_namespace}_{suffix}"
         if self._stable_module_to_file.get(disambiguated) == file_path:
             return disambiguated
