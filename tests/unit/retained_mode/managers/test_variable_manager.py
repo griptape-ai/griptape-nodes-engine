@@ -523,6 +523,23 @@ class TestReservedNames:
             assert "empty name" in str(result.result_details)
 
     @pytest.mark.usefixtures("flow_name")
+    def test_rename_reserved_named_global_to_itself_is_noop_success(self, griptape_nodes: GriptapeNodes) -> None:
+        """A global named like a reserved builtin (globals aren't reserved-gated) can be renamed to itself.
+
+        Exercises the idempotent short-circuit that runs BEFORE the reserved-name gate — without it,
+        a no-op rename of a reserved-named variable would surface a spurious 'that name is reserved' failure.
+        """
+        griptape_nodes.handle_request(
+            CreateVariableRequest(name="workspace_dir", type="str", value="/g", is_global=True)
+        )
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(
+                name="workspace_dir", new_name="workspace_dir", lookup_scope=VariableScope.GLOBAL_ONLY
+            )
+        )
+        assert isinstance(result, RenameVariableResultSuccess)
+
+    @pytest.mark.usefixtures("flow_name")
     def test_delete_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
         """Delete routes by layer provenance — a global (owning_flow_name=None) leaves the global layer."""
         griptape_nodes.handle_request(CreateVariableRequest(name="g_del", type="str", value="v", is_global=True))

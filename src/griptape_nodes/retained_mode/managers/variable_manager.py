@@ -585,8 +585,14 @@ class VariablesManager:
         # Route by real layer provenance (found_layer), not owning_flow_name — _refuse_write
         # above already bounced PROJECT/READ_ONLY, so this is a FLOW or GLOBAL variable.
         storage_layer = self._writable_storage_layer(variable, result.found_layer)
-        if storage_layer is not None and storage_layer.has(variable.name):
-            storage_layer.delete(variable.name)
+        if storage_layer is None or not storage_layer.has(variable.name):
+            # Unreachable: a resolved FLOW/GLOBAL variable always maps to a storage layer that
+            # contains it. Guard anyway so a broken invariant fails loudly instead of returning a
+            # "successfully deleted" lie.
+            return DeleteVariableResultFailure(
+                result_details=f"Attempted to delete variable '{request.name}'. Failed due to an internal error: the resolved variable is not present in its storage layer."
+            )
+        storage_layer.delete(variable.name)
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
@@ -621,6 +627,14 @@ class VariablesManager:
 
         variable = result.variable
 
+        # Renaming to the current name is an idempotent no-op success — short-circuit before the
+        # reserved/collision checks so a pure no-op can never surface a Failure (e.g. if the name
+        # later entered the project's reserved set).
+        if request.new_name == variable.name:
+            return RenameVariableResultSuccess(
+                result_details=f"Variable '{variable.name}' already has that name; nothing to rename."
+            )
+
         # The new name may not be reserved by another layer (project builtins/directories,
         # etc.) — same rule as create, so the two agree. The renamed flow variable belongs to
         # the current project, so the reserved set is the current project's (project_id=None),
@@ -632,22 +646,27 @@ class VariablesManager:
             )
 
         # And it may not collide with ANOTHER variable in its OWN layer — you can't have two
-        # variables with the same name in one flow (or two globals). Renaming to the current
-        # name is exempt (handled as an idempotent no-op by VariableLayer.rename). Shadowing an
-        # ancestor flow or a global is allowed (only reserved names, handled above, are
-        # off-limits), so the check is same-layer only, mirroring create's own-flow duplicate
-        # check. Route by real layer provenance (found_layer), not owning_flow_name — a project
-        # var also has owning_flow_name=None, though _refuse_write already bounced those.
+        # variables with the same name in one flow (or two globals). Shadowing an ancestor flow
+        # or a global is allowed (only reserved names, handled above, are off-limits), so the
+        # check is same-layer only, mirroring create's own-flow duplicate check. Route by real
+        # layer provenance (found_layer), not owning_flow_name — a project var also has
+        # owning_flow_name=None, though _refuse_write already bounced those.
         storage_layer = self._writable_storage_layer(variable, result.found_layer)
-        if request.new_name != variable.name and storage_layer is not None and storage_layer.has(request.new_name):
+        if storage_layer is None:
+            # Unreachable: _refuse_write bounced PROJECT/READ_ONLY, so a FLOW/GLOBAL variable
+            # always maps to a storage layer. Guard anyway so a broken invariant fails loudly
+            # instead of returning a "successfully renamed" lie.
+            return RenameVariableResultFailure(
+                result_details=f"Attempted to rename variable '{request.name}'. Failed due to an internal error: no writable storage layer for the resolved variable."
+            )
+        if storage_layer.has(request.new_name):
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because a variable with that name already exists."
             )
 
         # Update the variable name and storage key in the layer it lives in.
         old_name = variable.name
-        if storage_layer is not None and storage_layer.has(old_name):
-            storage_layer.rename(old_name, request.new_name)
+        storage_layer.rename(old_name, request.new_name)
 
         return RenameVariableResultSuccess(
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
