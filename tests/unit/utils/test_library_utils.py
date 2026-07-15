@@ -14,6 +14,7 @@ from griptape_nodes.retained_mode.managers.settings import LibraryDownload, Libr
 from griptape_nodes.utils.git_utils import GitCloneError, LibraryJsonCheckout
 from griptape_nodes.utils.library_utils import (
     clone_and_get_library_version,
+    extract_library_path,
     filter_old_xdg_library_paths,
     is_monorepo,
     normalize_library_downloads,
@@ -317,3 +318,36 @@ class TestNormalizeLibraryDownloads:
 
         assert entries == []
         assert any("libraries_to_download" in message for message in caplog.messages)
+
+
+class TestExtractLibraryPath:
+    """Test extract_library_path function."""
+
+    def test_bare_string_returns_itself(self) -> None:
+        assert extract_library_path("lib.json") == "lib.json"
+
+    def test_dict_entry_returns_path(self) -> None:
+        assert extract_library_path({"path": "lib.json", "enabled": True}) == "lib.json"
+
+    def test_library_registration_returns_path(self) -> None:
+        registration = LibraryRegistration(path="lib.json")
+
+        assert extract_library_path(registration) == "lib.json"
+
+    def test_dict_without_path_returns_empty_string(self) -> None:
+        assert extract_library_path({"enabled": True}) == ""
+
+    def test_dict_with_non_string_path_returns_empty_string(self) -> None:
+        assert extract_library_path({"path": 123}) == ""
+
+    def test_unexpected_type_returns_empty_string(self) -> None:
+        assert extract_library_path(123) == ""
+
+    def test_mixed_list_joins_without_error(self) -> None:
+        # Regression: the init status line previously joined libraries_to_register
+        # raw and crashed on object-form (dict) entries with a TypeError.
+        entries = ["lib_a.json", {"path": "lib_b.json", "enabled": True}, "lib_c.json"]
+
+        register_paths = [path for entry in entries if (path := extract_library_path(entry))]
+
+        assert ", ".join(register_paths) == "lib_a.json, lib_b.json, lib_c.json"

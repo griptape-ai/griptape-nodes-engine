@@ -24,7 +24,11 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY, LIBRARIES_TO_REGISTER_KEY
 from griptape_nodes.utils.git_utils import extract_repo_name_from_url
-from griptape_nodes.utils.library_utils import filter_old_xdg_library_paths, normalize_library_downloads
+from griptape_nodes.utils.library_utils import (
+    extract_library_path,
+    filter_old_xdg_library_paths,
+    normalize_library_downloads,
+)
 
 config_manager = GriptapeNodes.ConfigManager()
 secrets_manager = GriptapeNodes.SecretsManager()
@@ -247,9 +251,10 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
             download.git_url for download in normalize_library_downloads(libraries_config.libraries_to_download)
         ]
         console.print(f"[bold green]Libraries to download: {', '.join(download_git_urls)}[/bold green]")
-        console.print(
-            f"[bold green]Libraries to register: {', '.join(libraries_config.libraries_to_register)}[/bold green]"
-        )
+        register_paths = [
+            path for entry in libraries_config.libraries_to_register if (path := extract_library_path(entry))
+        ]
+        console.print(f"[bold green]Libraries to register: {', '.join(register_paths)}[/bold green]")
 
     return register_advanced_library
 
@@ -506,7 +511,7 @@ class LibrariesConfig(NamedTuple):
     """Configuration for library lists."""
 
     libraries_to_download: list[Any]
-    libraries_to_register: list[str]
+    libraries_to_register: list[Any]
 
 
 def _download_entry_repo_name(entry: Any) -> str | None:
