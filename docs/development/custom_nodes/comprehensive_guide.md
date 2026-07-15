@@ -612,6 +612,43 @@ for tool in tools:
 **Important behavior note:** `get_parameter_list_value()` flattens nested iterables and **drops falsey items**
 (e.g. `0`, `False`, `""`, empty dicts/lists). If you need to preserve falsey values, use `get_parameter_value()` and handle flattening yourself.
 
+**A `ParameterList` starts empty — its value is derived from child parameters, not stored on the container.**
+Adding the `ParameterList` to a node creates *zero* item slots. The list's value is
+computed by collecting each child `Parameter`'s value in order (`handle_container_parameter`),
+so an empty list has no children and setting a value on the container itself does nothing.
+The create-list nodes (`CreateImageList`, `CreateList`, `CreateTextList`, etc.) rely on this:
+`BaseCreateListNode.__init__` declares an empty `items` list, and children are added later —
+either by the UI/engine when a connection is dragged in, or explicitly in code.
+
+To seed items programmatically (at construction or build time), call
+`add_child_parameter()` on the list — it takes **no arguments** (type, modes, traits, and
+`ui_options` are cloned from the container) and returns the new child, whose `name` is an
+auto-generated UUID string (`<list>_ParameterListUniqueParamID_<hex>`), **never** an index
+like `items_0`. Set the value by that generated name:
+
+```python
+self.items_list = ParameterList(
+    name="items",
+    input_types=["ImageUrlArtifact"],
+    allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
+)
+self.add_parameter(self.items_list)
+
+# Add a slot RIGHT AWAY, then set its value by the generated child name:
+child = self.items_list.add_child_parameter()
+self.set_parameter_value(child.name, some_image_artifact)
+
+# Convenience helpers:
+self.items_list.append_child_parameter(display_name="Image 1")   # add one, label it
+self.items_list.ensure_length(3, display_name_prefix="Image")    # grow/shrink to N slots
+```
+
+Do **not** hand-build a child by adding a plain `Parameter` with `parent_container_name` set
+yourself — going through `add_child_parameter()` / the list's `add_child()` is what enforces
+`max_items` and marks the node unresolved. Over the MCP / retained-mode API, the equivalent
+is `AddParameterToNodeRequest(parent_container_name="<list>")`, which returns the generated
+child name to target with `SetParameterValueRequest` / `CreateConnectionRequest`.
+
 ### Common Parameter Patterns
 
 #### Search Input with Placeholder
