@@ -7,9 +7,10 @@ from unittest.mock import MagicMock, patch
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues, aprocess_scope
 from griptape_nodes.retained_mode.events.variable_events import (
-    ResolveSubstitutionRequest,
-    ResolveSubstitutionResultSuccess,
+    ListVariablesRequest,
+    ListVariablesResultSuccess,
 )
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind
 
 from .mocks import MockNode
 
@@ -63,9 +64,7 @@ def _mock_gn(
     mock_gn = MagicMock()
     mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
     mock_gn.handle_request.side_effect = lambda req: (
-        ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
-        if isinstance(req, ResolveSubstitutionRequest)
-        else MagicMock()
+        _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
     )
 
     incoming_index = {"mock_node": dict.fromkeys(connected_params, True)} if connected_params else {}
@@ -75,6 +74,19 @@ def _mock_gn(
     mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = substitution_enabled
 
     return patch(_GN_PATCH, mock_gn)
+
+
+def _list_variables_result(variables: dict) -> ListVariablesResultSuccess:
+    """Build the ListVariablesResultSuccess a real hierarchical walk would return for `variables`."""
+    flow_vars = [
+        FlowVariable(name=name, owning_flow_name="test_flow", type="str", value=value)
+        for name, value in variables.items()
+    ]
+    return ListVariablesResultSuccess(
+        variables=flow_vars,
+        layers=[VariableLayerKind.FLOW] * len(flow_vars),
+        result_details="ok",
+    )
 
 
 def _display_value_from_event(captured: list) -> object:
@@ -105,9 +117,7 @@ def _run_tracked_set(
         mock_gn = MagicMock()
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
         mock_gn.handle_request.side_effect = lambda req: (
-            ResolveSubstitutionResultSuccess(variables=variables, result_details="ok")
-            if isinstance(req, ResolveSubstitutionRequest)
-            else MagicMock()
+            _list_variables_result(variables) if isinstance(req, ListVariablesRequest) else MagicMock()
         )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
         mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True

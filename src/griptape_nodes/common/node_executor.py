@@ -96,8 +96,8 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     SetParameterValueResultSuccess,
 )
 from griptape_nodes.retained_mode.events.variable_events import (
-    ResolveSubstitutionRequest,
-    ResolveSubstitutionResultSuccess,
+    ListVariablesRequest,
+    ListVariablesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import (
     DeleteWorkflowRequest,
@@ -312,12 +312,12 @@ class NodeExecutor:
         except KeyError:
             return {}
         var_result = GriptapeNodes.handle_request(
-            ResolveSubstitutionRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
         )
-        if not isinstance(var_result, ResolveSubstitutionResultSuccess):
+        if not isinstance(var_result, ListVariablesResultSuccess):
             logger.debug("Variable substitution skipped for node %s: %s", node_name, var_result.result_details)
             return {}
-        return VariableResolver._filter_for_substitution(var_result.variables)
+        return VariableResolver._filter_for_substitution({v.name: v.value for v in var_result.variables})
 
     @staticmethod
     def _format_node_failure_message(node_name: str, result: Any, exc: BaseException | None) -> str:

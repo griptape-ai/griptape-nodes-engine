@@ -438,6 +438,16 @@ class VariablesManager:
                 result_details="Attempted to create a variable with an empty name. Failed because a variable name is required."
             )
 
+        # Reserved means reserved in EVERY scope: a name another layer owns (project
+        # builtins/directories) may not be taken by a flow OR global variable. Even though
+        # resolution precedence would shadow a same-named global anyway, allowing the create
+        # would strand a variable the user can see in no resolved view — so reject it at
+        # write time, uniformly. Rename applies the same rule to its new_name.
+        if request.name in self._reserved_variable_names(project_id=None):  # None = current project
+            return CreateVariableResultFailure(
+                result_details=f"Attempted to create a variable named '{request.name}'. Failed because that name is reserved."
+            )
+
         if request.is_global:
             # Check for name collision in global variables
             if self._global_layer.has(request.name):
@@ -462,15 +472,6 @@ class VariablesManager:
         except ValueError as e:
             return CreateVariableResultFailure(
                 result_details=f"Attempted to create variable '{request.name}'. Failed to determine target flow: {e}"
-            )
-
-        # A flow variable may not take a reserved name (one another layer owns and won't
-        # let a user variable shadow — e.g. project builtins/directories). Resolution
-        # precedence would otherwise let the flow var mask the reserved value, so we reject
-        # the collision at write time.
-        if request.name in self._reserved_variable_names(project_id=None):  # None = current project
-            return CreateVariableResultFailure(
-                result_details=f"Attempted to create a variable named '{request.name}' in flow '{target_flow}'. Failed because that name is reserved."
             )
 
         flow_layer = self._get_or_create_flow_layer(target_flow)
@@ -688,10 +689,11 @@ class VariablesManager:
             )
 
         # The new name may not be reserved by another layer (project builtins/directories,
-        # etc.) — same rule as create, so the two agree. The renamed flow variable belongs to
-        # the current project, so the reserved set is the current project's (project_id=None),
-        # NOT request.project_id (which only selects which project a *read* consults). Name-based,
-        # so it doesn't depend on whether the reserved value currently resolves.
+        # etc.) — same rule as create, in every scope: flow and global renames both refuse a
+        # reserved target. The renamed variable belongs to the current project, so the reserved
+        # set is the current project's (project_id=None), NOT request.project_id (which only
+        # selects which project a *read* consults). Name-based, so it doesn't depend on whether
+        # the reserved value currently resolves.
         if request.new_name in self._reserved_variable_names(project_id=None):
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because that name is reserved."
@@ -843,28 +845,6 @@ class VariablesManager:
 
         return variables
 
-    def _get_user_variables(self, starting_flow: str) -> dict[str, FlowVariable]:
-        """Return user-defined variables visible from ``starting_flow`` (flow chain → global).
-
-        The project layer is deliberately excluded — this is the "user variables only"
-        view. Flow variables shadow global variables of the same name (innermost flow
-        wins), matching HIERARCHICAL flow shadowing, but the project layer never
-        participates, so it can't shadow a same-named user global.
-        """
-        resolved: dict[str, FlowVariable] = {}
-        # Innermost flow first; setdefault keeps the first seen, so a child flow's
-        # variable shadows a same-named ancestor's.
-        for flow_name in self._get_flow_hierarchy(starting_flow):
-            flow_layer = self._flow_layers.get(flow_name)
-            if flow_layer is None:
-                continue
-            for var in flow_layer.list():
-                resolved.setdefault(var.name, var)
-        # Global is lowest priority: only fills names no flow already claimed.
-        for var in self._global_layer.list():
-            resolved.setdefault(var.name, var)
-        return resolved
-
     def on_list_variables_request(self, request: ListVariablesRequest) -> ResultPayload:
         """List all variables in the specified scope."""
         try:
@@ -886,11 +866,14 @@ class VariablesManager:
         )
 
     def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:
-        """List all values available for {VAR} substitution, unified across sources.
+        """DEPRECATED shim: list all values available for {VAR} substitution.
 
-        Uses layered resolution — the same walk that ResolveSubstitutionRequest uses —
-        so the picker and the resolver always agree on precedence. Each entry's
-        source and read_only flag come from the variable's permission and type.
+        Kept wire-identical for GUI versions that still send ListSubstitutablesRequest;
+        new callers use ListVariablesRequest and derive source/read_only from layers +
+        permission. Uses the same layered walk as ListVariables, so shim and successor
+        always agree on precedence.
+        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete after
+        the GUI migrates (griptape-ai/griptape-vsl-gui#2668).
         """
         # Lazy import to avoid circular dependency between retained_mode and exe_types.
         from griptape_nodes.exe_types.variable_resolver import VariableResolver
@@ -930,12 +913,20 @@ class VariablesManager:
         )
 
     def on_get_variables_request(self, request: GetVariablesRequest) -> ResultPayload:
-        """Get user-defined variable values visible from the starting flow.
+        """Probe specific names in scope; report which resolved and which didn't.
 
-        Returns only user-defined workflow variables — the project layer is excluded
-        entirely (not merely filtered out afterward), so a user global that shares a
-        name with a project builtin is still returned rather than being shadowed by it.
+        The named companion to ListVariables: same layered walk (lookup_scope /
+        project_id), but driven by the caller's name list. A miss is data, not a
+        failure — Success carries both the resolved dict and the unresolved names.
         """
+        if not request.names:
+            return GetVariablesResultFailure(
+                result_details=(
+                    "Attempted to get variables with an empty name list. "
+                    "Failed because at least one name is required — to enumerate all variables, use ListVariablesRequest."
+                )
+            )
+
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
         except ValueError as e:
@@ -943,38 +934,28 @@ class VariablesManager:
                 result_details=f"Attempted to get variables. Failed to determine starting flow: {e}"
             )
 
-        # User-defined view: flow chain → global, no project layer. Building the set from
-        # the non-project layers means the project layer never occupies a name slot, so
-        # it can't shadow a same-named user global.
-        user_variables = self._get_user_variables(starting_flow)
+        resolved: dict[str, Any] = {}
+        unresolved: list[str] = []
+        for name in request.names:
+            lookup = self._find_variable_hierarchical(starting_flow, name, request.lookup_scope, request.project_id)
+            if lookup.variable is None:
+                unresolved.append(name)
+            else:
+                resolved[name] = lookup.variable.value
 
-        if request.names:
-            result: dict[str, Any] = {}
-            missing: list[str] = []
-            for name in request.names:
-                if name in user_variables:
-                    result[name] = user_variables[name].value
-                else:
-                    missing.append(name)
-            if missing:
-                return GetVariablesResultFailure(
-                    result_details=f"Attempted to get variables. Failed because variables not found: {missing!r}"
-                )
-            return GetVariablesResultSuccess(
-                variables=result, result_details=f"Successfully retrieved {len(result)} variable(s)."
-            )
-
-        all_vars = {name: variable.value for name, variable in user_variables.items()}
         return GetVariablesResultSuccess(
-            variables=all_vars, result_details=f"Successfully retrieved {len(all_vars)} variable(s)."
+            variables=resolved,
+            unresolved=unresolved,
+            result_details=f"Probed {len(request.names)} variable name(s): {len(resolved)} resolved, {len(unresolved)} unresolved.",
         )
 
     def on_resolve_substitution_request(self, request: ResolveSubstitutionRequest) -> ResultPayload:
-        """Resolve every {VAR}-substitutable value visible from the starting flow.
+        """DEPRECATED shim: resolve every {VAR}-substitutable value visible from the starting flow.
 
-        Layered resolution: for HIERARCHICAL the walk is flow → project → global,
-        with closer layers shadowing farther ones. Callers pass PROJECT_ONLY /
-        HIERARCHICAL_FROM_PROJECT / etc. via lookup_scope to override the walk.
+        No engine-internal callers remain — kept wire-identical for out-of-tree scripts.
+        New callers use ListVariablesRequest (same layered walk) and build the dict from
+        the result's variables.
+        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
         """
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)
@@ -1011,11 +992,13 @@ class VariablesManager:
         )
 
     def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
-        """Set multiple variable values atomically (all-or-nothing).
+        """DEPRECATED shim: set multiple variable values atomically (all-or-nothing).
 
+        No known senders — kept wire-identical for out-of-tree scripts.
         Refuses the whole batch if any variable isn't writable through this API
         (READ_ONLY, or resolved from the project layer) — callers see the constraint
         with no partial writes.
+        TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
         """
         try:
             starting_flow = self._get_starting_flow(request.starting_flow)

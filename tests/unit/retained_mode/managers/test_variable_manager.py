@@ -156,14 +156,19 @@ class TestListSubstitutablesRequest:
         assert entries[0].value == "/my/override"
 
     def test_macro_shadows_global_on_name_collision(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        """Precedence PROJECT > GLOBAL: a project macro shadows a global user var of the same name."""
+        """Precedence PROJECT > GLOBAL: a project macro shadows a global user var of the same name.
+
+        Uses a non-reserved name — reserved names (real builtins like workspace_dir) can't be
+        taken by a global at all (see TestReservedNames), so the collision must be staged with
+        a name only the patched project layer claims.
+        """
         griptape_nodes.handle_request(
-            CreateVariableRequest(name="workspace_dir", type="str", value="/my/override", is_global=True)
+            CreateVariableRequest(name="custom_var", type="str", value="/my/override", is_global=True)
         )
-        with project_macros({"workspace_dir": "/workspace"}):
+        with project_macros({"custom_var": "/workspace"}):
             result = griptape_nodes.handle_request(ListSubstitutablesRequest(starting_flow=flow_name))
         assert isinstance(result, ListSubstitutablesResultSuccess)
-        entries = [s for s in result.substitutables if s.name == "workspace_dir"]
+        entries = [s for s in result.substitutables if s.name == "custom_var"]
         assert len(entries) == 1
         assert entries[0].source == "macro"
         assert entries[0].read_only is True
@@ -195,59 +200,55 @@ class TestListSubstitutablesRequest:
 
 
 class TestGetVariablesRequest:
-    """GetVariablesRequest returns user-defined variables only — no project macros."""
+    """GetVariablesRequest probes specific names in scope; misses are data, not failures."""
 
-    def test_returns_user_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        _add_variable(griptape_nodes, "SHOT", "sc001")
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
-        assert isinstance(result, GetVariablesResultSuccess)
-        assert result.variables == {"SHOT": "sc001"}
-
-    def test_does_not_include_project_macros(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        with project_macros({"workspace_dir": "/workspace"}):
-            result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
-        assert isinstance(result, GetVariablesResultSuccess)
-        assert "workspace_dir" not in result.variables
-
-    def test_global_colliding_with_project_name_is_still_returned(
-        self, griptape_nodes: GriptapeNodes, flow_name: str
-    ) -> None:
-        """A user global sharing a name with a project builtin must not be shadowed out.
-
-        The project layer is excluded from this view entirely, so the user's own global
-        value is returned rather than being masked by (and filtered away with) the
-        same-named project builtin.
-        """
-        griptape_nodes.handle_request(
-            CreateVariableRequest(name="workspace_dir", type="str", value="/user/global", is_global=True)
-        )
-        with project_macros({"workspace_dir": "/project/builtin"}):
-            bulk = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
-            named = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["workspace_dir"]))
-        assert isinstance(bulk, GetVariablesResultSuccess)
-        assert bulk.variables.get("workspace_dir") == "/user/global"
-        assert isinstance(named, GetVariablesResultSuccess)
-        assert named.variables == {"workspace_dir": "/user/global"}
-
-    def test_named_lookup_returns_requested_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_probe_resolves_requested_names(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         _add_variable(griptape_nodes, "SHOT", "sc001")
         _add_variable(griptape_nodes, "SHOW", "myshow")
         result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT"]))
         assert isinstance(result, GetVariablesResultSuccess)
         assert result.variables == {"SHOT": "sc001"}
+        assert result.unresolved == []
 
-    def test_named_lookup_fails_if_any_name_missing(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+    def test_probe_reports_misses_as_unresolved_not_failure(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """The ParsedMacro use case: probe required+optional names, decide from unresolved."""
         _add_variable(griptape_nodes, "SHOT", "sc001")
         result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name, names=["SHOT", "MISSING"]))
-        assert isinstance(result, GetVariablesResultFailure)
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert result.variables == {"SHOT": "sc001"}
+        assert result.unresolved == ["MISSING"]
 
-    def test_returns_empty_when_no_vars(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+    def test_probe_walks_project_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """The probe uses the full layered walk — project entries resolve (unlike the old user-only view)."""
+        with project_macros({"workspace_dir": "/workspace"}):
+            result = griptape_nodes.handle_request(
+                GetVariablesRequest(starting_flow=flow_name, names=["workspace_dir"])
+            )
+        assert isinstance(result, GetVariablesResultSuccess)
+        assert result.variables == {"workspace_dir": "/workspace"}
+
+    def test_probe_honors_lookup_scope(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """GLOBAL_ONLY probe skips flow layers: the flow var is a miss, not a hit."""
+        _add_variable(griptape_nodes, "flow_only", "from_flow")
+        with project_macros({}):
+            result = griptape_nodes.handle_request(
+                GetVariablesRequest(
+                    starting_flow=flow_name, names=["flow_only"], lookup_scope=VariableScope.GLOBAL_ONLY
+                )
+            )
         assert isinstance(result, GetVariablesResultSuccess)
         assert result.variables == {}
+        assert result.unresolved == ["flow_only"]
+
+    def test_empty_names_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow=flow_name))
+        assert isinstance(result, GetVariablesResultFailure)
+        assert "ListVariablesRequest" in str(result.result_details)
 
     def test_returns_failure_for_unknown_flow(self, griptape_nodes: GriptapeNodes) -> None:
-        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow="does_not_exist"))
+        result = griptape_nodes.handle_request(GetVariablesRequest(starting_flow="does_not_exist", names=["x"]))
         assert isinstance(result, GetVariablesResultFailure)
 
 
@@ -275,14 +276,18 @@ class TestResolveSubstitutionRequest:
         assert result.variables["custom_var"] == "/my/override"
 
     def test_macro_wins_over_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
-        """A project macro shadows a global user var (new precedence: PROJECT > GLOBAL)."""
+        """A project macro shadows a global user var (precedence: PROJECT > GLOBAL).
+
+        Non-reserved name: reserved names can't be taken by a global at all, so the
+        collision is staged with a name only the patched project layer claims.
+        """
         griptape_nodes.handle_request(
-            CreateVariableRequest(name="workspace_dir", type="str", value="/my/override", is_global=True)
+            CreateVariableRequest(name="custom_var", type="str", value="/my/override", is_global=True)
         )
-        with project_macros({"workspace_dir": "/workspace"}):
+        with project_macros({"custom_var": "/workspace"}):
             result = griptape_nodes.handle_request(ResolveSubstitutionRequest(starting_flow=flow_name))
         assert isinstance(result, ResolveSubstitutionResultSuccess)
-        assert result.variables["workspace_dir"] == "/workspace"
+        assert result.variables["custom_var"] == "/workspace"
 
     def test_named_lookup_finds_macro(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         with project_macros({"workspace_dir": "/workspace"}):
@@ -534,8 +539,8 @@ class TestReservedNames:
             assert "empty name" in str(result.result_details)
 
     @pytest.mark.usefixtures("flow_name")
-    def test_create_global_with_reserved_name_is_allowed(self, griptape_nodes: GriptapeNodes) -> None:
-        """Global is not gated on reserved names (only FLOW create/rename is).
+    def test_create_global_with_reserved_name_fails(self, griptape_nodes: GriptapeNodes) -> None:
+        """Reserved means reserved in EVERY scope: a global may not take a reserved name either.
 
         Depends on the flow_name fixture for clean engine state + a current project, but
         doesn't need the flow value itself (globals aren't flow-scoped).
@@ -543,7 +548,8 @@ class TestReservedNames:
         result = griptape_nodes.handle_request(
             CreateVariableRequest(name="workspace_dir", type="str", value="/global", is_global=True)
         )
-        assert isinstance(result, CreateVariableResultSuccess)
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "reserved" in str(result.result_details)
 
     def test_create_flow_var_shadowing_a_global_is_allowed(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         """A flow var may share a name with a global (only reserved names are refused)."""
@@ -578,13 +584,17 @@ class TestReservedNames:
 
     @pytest.mark.usefixtures("flow_name")
     def test_rename_reserved_named_global_to_itself_is_noop_success(self, griptape_nodes: GriptapeNodes) -> None:
-        """A global named like a reserved builtin (globals aren't reserved-gated) can be renamed to itself.
+        """A pre-existing global whose name is reserved can still be renamed to itself.
 
-        Exercises the idempotent short-circuit that runs BEFORE the reserved-name gate — without it,
-        a no-op rename of a reserved-named variable would surface a spurious 'that name is reserved' failure.
+        Creating a reserved-named global is refused now, but variables from workflows saved
+        before the name was reserved (or before the gate existed) can still be loaded — so the
+        variable is injected directly into the global layer, bypassing the create gate.
+        Exercises the idempotent short-circuit that runs BEFORE the reserved-name gate — without
+        it, a no-op rename of a reserved-named variable would surface a spurious 'that name is
+        reserved' failure.
         """
-        griptape_nodes.handle_request(
-            CreateVariableRequest(name="workspace_dir", type="str", value="/g", is_global=True)
+        griptape_nodes.VariablesManager()._global_layer.set(
+            FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/g")
         )
         result = griptape_nodes.handle_request(
             RenameVariableRequest(
