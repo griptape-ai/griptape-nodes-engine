@@ -876,10 +876,13 @@ class VariablesManager:
 
         resolved = self._get_variables_by_scope(starting_flow, request.lookup_scope, request.project_id)
 
-        # Sort by name for consistent output
-        variables = sorted((r.variable for r in resolved), key=lambda v: v.name)
+        # Sort by name for consistent output. Sort the (variable, layer) pairs together
+        # so the parallel layers list stays aligned with variables.
+        resolved.sort(key=lambda r: r.variable.name)
+        variables = [r.variable for r in resolved]
+        layers = [r.layer for r in resolved]
         return ListVariablesResultSuccess(
-            variables=variables, result_details=f"Successfully listed {len(variables)} variables."
+            variables=variables, layers=layers, result_details=f"Successfully listed {len(variables)} variables."
         )
 
     def on_list_substitutables_request(self, request: ListSubstitutablesRequest) -> ResultPayload:

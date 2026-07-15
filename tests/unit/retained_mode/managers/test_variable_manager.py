@@ -30,6 +30,8 @@ from griptape_nodes.retained_mode.events.variable_events import (
     ListSubstitutablesRequest,
     ListSubstitutablesResultFailure,
     ListSubstitutablesResultSuccess,
+    ListVariablesRequest,
+    ListVariablesResultSuccess,
     RenameVariableRequest,
     RenameVariableResultFailure,
     RenameVariableResultSuccess,
@@ -44,6 +46,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
+    VariableLayerKind,
     VariablePermission,
     VariableScope,
 )
@@ -395,6 +398,57 @@ class TestProjectLayerScopes:
         assert isinstance(result, HasVariableResultSuccess)
         assert result.exists is True
         assert result.found_scope is VariableScope.PROJECT_ONLY
+
+
+class TestListVariablesLayerProvenance:
+    """ListVariablesResultSuccess.layers is parallel to variables and names each entry's layer."""
+
+    def test_hierarchical_tags_each_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "flow_var", "f")
+        griptape_nodes.handle_request(CreateVariableRequest(name="global_var", type="str", value="g", is_global=True))
+        with project_macros({"workspace_dir": "/proj"}):
+            result = griptape_nodes.handle_request(
+                ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            )
+        assert isinstance(result, ListVariablesResultSuccess)
+        assert len(result.layers) == len(result.variables)
+        layer_by_name = {v.name: layer for v, layer in zip(result.variables, result.layers, strict=True)}
+        assert layer_by_name["flow_var"] is VariableLayerKind.FLOW
+        assert layer_by_name["workspace_dir"] is VariableLayerKind.PROJECT
+        assert layer_by_name["global_var"] is VariableLayerKind.GLOBAL
+
+    def test_shadowing_reports_winning_layer(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        # Same name in flow and global — hierarchical resolution keeps the flow one,
+        # and the layers field must say FLOW for it.
+        _add_variable(griptape_nodes, "shadowed", "from_flow")
+        griptape_nodes.handle_request(
+            CreateVariableRequest(name="shadowed", type="str", value="from_global", is_global=True)
+        )
+        with project_macros({}):
+            result = griptape_nodes.handle_request(
+                ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.HIERARCHICAL)
+            )
+        assert isinstance(result, ListVariablesResultSuccess)
+        entries = [(v, layer) for v, layer in zip(result.variables, result.layers, strict=True) if v.name == "shadowed"]
+        assert len(entries) == 1
+        variable, layer = entries[0]
+        assert variable.value == "from_flow"
+        assert layer is VariableLayerKind.FLOW
+
+    def test_all_scope_keeps_alignment_across_duplicates(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        # ALL returns every layer's entry without shadowing; the parallel lists must
+        # stay aligned even when the same name appears twice.
+        _add_variable(griptape_nodes, "dup", "from_flow")
+        griptape_nodes.handle_request(
+            CreateVariableRequest(name="dup", type="str", value="from_global", is_global=True)
+        )
+        with project_macros({}):
+            result = griptape_nodes.handle_request(
+                ListVariablesRequest(starting_flow=flow_name, lookup_scope=VariableScope.ALL)
+            )
+        assert isinstance(result, ListVariablesResultSuccess)
+        pairs = {(v.value, layer) for v, layer in zip(result.variables, result.layers, strict=True) if v.name == "dup"}
+        assert pairs == {("from_flow", VariableLayerKind.FLOW), ("from_global", VariableLayerKind.GLOBAL)}
 
 
 class TestVariablePermission:

@@ -10,7 +10,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableScope
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayerKind, VariableScope
 
 
 # Variable Events
@@ -342,9 +342,15 @@ class ListVariablesRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class ListVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Variables listed successfully."""
+    """Variables listed successfully.
+
+    ``layers`` is parallel to ``variables``: layers[i] names the layer variables[i]
+    was resolved from (flow / project / global). Kept as a separate defaulted field
+    so the shipped ``variables`` shape is unchanged (wire-additive).
+    """
 
     variables: list[FlowVariable]
+    layers: list[VariableLayerKind] = field(default_factory=list)
 
 
 @dataclass
