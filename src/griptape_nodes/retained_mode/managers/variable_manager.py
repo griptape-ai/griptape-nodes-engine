@@ -818,12 +818,14 @@ class VariablesManager:
             )
 
         # The new name may not be reserved by another layer (project builtins/directories,
-        # etc.) — same rule as create, in every scope: flow and global renames both refuse a
-        # reserved target. The renamed variable belongs to the current project, so the reserved
-        # set is the current project's (project_id=None), NOT request.project_id (which only
-        # selects which project a *read* consults). Name-based, so it doesn't depend on whether
-        # the reserved value currently resolves.
-        if request.new_name in self._reserved_variable_names(project_id=None):
+        # etc.) — same rule as create, in every scope. The reserved set must come from the
+        # project the variable actually BELONGS to: a flow/global variable belongs to the
+        # current project (project_id=None), but a PROJECT-layer variable lives in
+        # request.project_id's layer — renaming it to a name that project computes would
+        # strand a permanently-shadowed stored entry on disk. Name-based, so it doesn't
+        # depend on whether the reserved value currently resolves.
+        reserved_project_id = request.project_id if result.found_layer is VariableLayerKind.PROJECT else None
+        if request.new_name in self._reserved_variable_names(project_id=reserved_project_id):
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}' to '{request.new_name}'. Failed because that name is reserved."
             )

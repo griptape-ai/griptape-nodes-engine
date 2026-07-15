@@ -10817,6 +10817,120 @@ variables:
         finally:
             self._unload(project_id)
 
+    def test_rename_project_variable_to_existing_stored_name_refused(self, tmp_path: Path) -> None:
+        """Renaming one stored project variable onto another is a same-layer collision."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="frame_start",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "already exists" in str(result.result_details)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc042"
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_to_own_projects_reserved_name_refused(self, tmp_path: Path) -> None:
+        """The reserved gate uses the variable's OWN project, not the current one.
+
+        The loaded project defines {outputs} as a directory (a computed, reserved name in
+        THAT project). Renaming its stored variable to 'outputs' must be refused even
+        though the engine's current project may not reserve that name — otherwise the
+        renamed entry would persist permanently shadowed.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            # workspace_dir is a builtin — computed (reserved) in every project including this one.
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="workspace_dir",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "reserved" in str(result.result_details)
+        finally:
+            self._unload(project_id)
+
+    def test_delete_inherited_variable_tombstones_and_survives_reload(self, tmp_path: Path) -> None:
+        """Deleting a PARENT-inherited variable emits a null tombstone that survives reload.
+
+        Child-declared deletions just omit the entry; inherited deletions must write
+        `name: null` so the parent's value doesn't resurrect on the next load.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.variable_events import (
+            DeleteVariableRequest,
+            DeleteVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        # Parent declares the variable; child inherits it.
+        parent_yml = tmp_path / "parent.yml"
+        parent_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+            + "\nvariables:\n  studio_code:\n    value: mtl\n"
+        )
+        parent_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=parent_yml))
+        assert isinstance(parent_load, LoadProjectTemplateResultSuccess)
+
+        child_yml = tmp_path / "child.yml"
+        child_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE) + "\nparent_project_path: ./parent.yml\n"
+        )
+        child_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+        assert isinstance(child_load, LoadProjectTemplateResultSuccess)
+        child_id = child_load.project_id
+
+        try:
+            # Inherited into the child's stored layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert values.get("studio_code") == "mtl"
+
+            result = GriptapeNodes.handle_request(
+                DeleteVariableRequest(name="studio_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=child_id)
+            )
+            assert isinstance(result, DeleteVariableResultSuccess)
+            # Tombstone written (null entry), not just omitted. The dumper quotes keys.
+            assert '"studio_code": null' in child_yml.read_text()
+
+            # Reload from disk: the parent value must NOT resurrect.
+            self._unload(child_id)
+            reload_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+            assert isinstance(reload_result, LoadProjectTemplateResultSuccess)
+            child_id = reload_result.project_id
+            values_after = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert "studio_code" not in values_after
+        finally:
+            self._unload(child_id)
+            self._unload(parent_load.project_id)
+
     def test_hypothetical_read_of_stored_variable(self, tmp_path: Path) -> None:
         """A loaded-but-not-current project's stored variables are readable via project_id."""
         from griptape_nodes.retained_mode.events.variable_events import (
