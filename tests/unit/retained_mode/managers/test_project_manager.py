@@ -10323,10 +10323,13 @@ class TestProjectVariableResolution:
         from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
 
         pm = self._pm()
-        pm._config_manager.workspace_path = Path("/synthetic/ws")
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
         variable = pm.resolve_project_variable("workspace_dir", project_id=None)
         assert type(variable) is FlowVariable
-        assert variable.value == "/synthetic/ws"
+        # Production stringifies the Path, so compare via str(Path) — on Windows the
+        # separators come back as backslashes.
+        assert variable.value == str(synthetic_ws)
         assert variable.permission is VariablePermission.READ_ONLY
 
     def test_resolve_unknown_name_raises_value_error(self) -> None:
@@ -10358,11 +10361,13 @@ class TestProjectVariableResolution:
         from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 
         pm = self._pm()
-        pm._config_manager.workspace_path = Path("/synthetic/ws")
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
         variable = pm.resolve_project_variable("workspace_dir", project_id=None)
         serialized = safe_unstructure(variable)
         assert serialized["name"] == "workspace_dir"
-        assert serialized["value"] == "/synthetic/ws"
+        # Compare via str(Path): Windows stringifies with backslash separators.
+        assert serialized["value"] == str(synthetic_ws)
 
 
 class TestWritableProjectVariables:
