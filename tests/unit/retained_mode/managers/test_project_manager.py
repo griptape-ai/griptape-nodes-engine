@@ -10944,6 +10944,64 @@ variables:
             self._unload(child_id)
             self._unload(parent_load.project_id)
 
+    def test_persist_with_no_backing_file_returns_error(self) -> None:
+        """A project with no file path (e.g. system defaults) reports it can't persist."""
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = GriptapeNodes.ProjectManager()
+        error = pm.persist_project_variables(SYSTEM_DEFAULTS_KEY)
+        assert error is not None
+        assert "no backing file" in error
+
+        # And an unloaded project reports that too.
+        error = pm.persist_project_variables("never_loaded_project")
+        assert error is not None
+        assert "not loaded" in error
+
+    def test_persist_failure_logs_warning_but_write_succeeds(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The eager-persist contract: a disk failure logs a warning; the acknowledged in-memory write stands."""
+        import logging
+
+        from griptape_nodes.files.file import FileWriteError
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.managers.project_manager.File.write_text",
+                    side_effect=FileWriteError(FileIOFailureReason.DISK_FULL, "disk full"),
+                ),
+                caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+            ):
+                result = GriptapeNodes.handle_request(
+                    SetVariableValueRequest(
+                        name="shot_code",
+                        value="sc999",
+                        lookup_scope=VariableScope.PROJECT_ONLY,
+                        project_id=project_id,
+                    )
+                )
+            # The in-memory write is acknowledged despite the persist failure...
+            assert isinstance(result, SetVariableValueResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc999"
+            # ...and the failure is surfaced in the log, naming the project.
+            assert any("not persisted" in record.message for record in caplog.records)
+            # The file kept its pre-write content.
+            assert "sc999" not in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
     def test_hypothetical_read_of_stored_variable(self, tmp_path: Path) -> None:
         """A loaded-but-not-current project's stored variables are readable via project_id."""
         from griptape_nodes.retained_mode.events.variable_events import (
