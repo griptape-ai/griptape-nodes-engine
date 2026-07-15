@@ -21,8 +21,6 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
-from griptape_nodes.retained_mode.events.variable_events import VariableDetails
-from griptape_nodes.retained_mode.variable_types import FlowVariable
 
 if TYPE_CHECKING:
     # Circular import: project_events -> project_manager -> file.py -> os_events -> project_events
@@ -1009,66 +1007,3 @@ class UpgradeProjectSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
     - already at the latest major
     - save/write failure
     """
-
-
-@dataclass
-@PayloadRegistry.register
-class ListProjectVariablesRequest(RequestPayload):
-    """Return metadata for every variable in a project's variable layer.
-
-    Metadata-only — values are not resolved because computed values (builtins
-    like {workflow_dir}, template directory macros) may raise depending on
-    live runtime context. Use for autocomplete, UI listing. Call
-    GetProjectVariableRequest per name to safely read values.
-
-    Args:
-        project_id: Which project (None = current).
-    """
-
-    project_id: str | None = None
-
-
-@dataclass
-@PayloadRegistry.register
-class ListProjectVariablesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Successfully listed project variables (metadata only, no resolved values)."""
-
-    variables: list[VariableDetails]
-
-
-@dataclass
-@PayloadRegistry.register
-class ListProjectVariablesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Project not loaded or no current project available."""
-
-
-@dataclass
-@PayloadRegistry.register
-class GetProjectVariableRequest(RequestPayload):
-    """Return a single project variable, resolving its value.
-
-    Failure distinguishes 'not defined in this project' from 'defined but
-    resolution raised' (e.g. {workflow_dir} before the workflow is saved)
-    via result_details.
-
-    Args:
-        name: Variable name.
-        project_id: Which project (None = current).
-    """
-
-    name: str
-    project_id: str | None = None
-
-
-@dataclass
-@PayloadRegistry.register
-class GetProjectVariableResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    """Project variable resolved successfully."""
-
-    variable: FlowVariable
-
-
-@dataclass
-@PayloadRegistry.register
-class GetProjectVariableResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Variable not defined, project not loaded, or resolution raised."""

@@ -10012,142 +10012,72 @@ class TestProjectManagerGetProjectChain:
         assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
 
 
-class TestProjectVariableEvents:
-    """ListProjectVariablesRequest and GetProjectVariableRequest handlers."""
+class TestProjectVariableResolution:
+    """ProjectManager's computed-variable surface: resolve_project_variable + project_computed_names."""
 
     @staticmethod
     def _pm() -> ProjectManager:
         return ProjectManager(Mock(), Mock(), Mock())
 
-    def test_list_variables_returns_metadata_for_current_project(self) -> None:
-        from griptape_nodes.retained_mode.events.project_events import (
-            ListProjectVariablesRequest,
-            ListProjectVariablesResultSuccess,
-        )
-
+    def test_computed_names_include_builtins_for_current_project(self) -> None:
         pm = self._pm()
-        result = pm.on_list_project_variables_request(ListProjectVariablesRequest())
-        assert isinstance(result, ListProjectVariablesResultSuccess)
-        # System defaults' variable layer at least holds the builtins.
-        names = {v.name for v in result.variables}
+        names = pm.project_computed_names(project_id=None)
         assert "workspace_dir" in names
         assert "project_dir" in names
-
-    def test_list_variables_never_resolves_values(self) -> None:
-        """Listing returns metadata only — it must not resolve any value.
-
-        The ProjectManager here is built with a bare Mock config/context, so resolving
-        a builtin like workspace_dir would produce junk or raise. Listing succeeding and
-        returning the builtin names proves it never touched values.
-        """
-        from griptape_nodes.retained_mode.events.project_events import (
-            ListProjectVariablesRequest,
-            ListProjectVariablesResultSuccess,
-        )
-
-        pm = self._pm()
-        result = pm.on_list_project_variables_request(ListProjectVariablesRequest())
-        assert isinstance(result, ListProjectVariablesResultSuccess)
-        names = {v.name for v in result.variables}
-        assert "workspace_dir" in names
         assert "workflow_dir" in names
 
-    def test_list_variables_unknown_project_fails(self) -> None:
-        from griptape_nodes.retained_mode.events.project_events import (
-            ListProjectVariablesRequest,
-            ListProjectVariablesResultFailure,
-        )
+    def test_computed_names_unknown_project_is_empty(self) -> None:
+        pm = self._pm()
+        assert pm.project_computed_names(project_id="not_loaded") == set()
+
+    def test_resolve_project_id_none_maps_to_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
         pm = self._pm()
-        result = pm.on_list_project_variables_request(ListProjectVariablesRequest(project_id="not_loaded"))
-        assert isinstance(result, ListProjectVariablesResultFailure)
+        assert pm.resolve_project_id(None) == SYSTEM_DEFAULTS_KEY
+        assert pm.resolve_project_id("not_loaded") is None
 
-    def test_get_variable_resolves_available_builtin(self) -> None:
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultSuccess,
-        )
+    def test_resolve_builtin_returns_plain_snapshot(self) -> None:
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
 
         pm = self._pm()
-        # workspace_dir resolves off self._config_manager.workspace_path — set it via Mock.
         pm._config_manager.workspace_path = Path("/synthetic/ws")
-        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
-        assert isinstance(result, GetProjectVariableResultSuccess)
-        assert result.variable.value == "/synthetic/ws"
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        assert type(variable) is FlowVariable
+        assert variable.value == "/synthetic/ws"
+        assert variable.permission is VariablePermission.READ_ONLY
 
-    def test_get_variable_missing_name_fails(self) -> None:
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultFailure,
-        )
-
+    def test_resolve_unknown_name_raises_value_error(self) -> None:
         pm = self._pm()
-        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="not_defined_in_any_project"))
-        assert isinstance(result, GetProjectVariableResultFailure)
+        with pytest.raises(ValueError, match="Unknown computed project variable"):
+            pm.resolve_project_variable("not_defined_anywhere", project_id=None)
 
-    def test_get_variable_resolution_error_returns_failure(self) -> None:
-        """A builtin/directory whose value can't be computed becomes a per-request Failure.
+    def test_resolve_unknown_project_raises_value_error(self) -> None:
+        pm = self._pm()
+        with pytest.raises(ValueError, match="not loaded"):
+            pm.resolve_project_variable("workspace_dir", project_id="not_loaded")
 
-        workspace_dir is a defined project variable (so it passes the existence check),
-        but resolving it raises when the underlying context isn't ready — the handler
-        turns that into a GetProjectVariableResultFailure carrying the reason.
-        """
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultFailure,
-        )
-
+    def test_resolve_context_not_ready_propagates(self) -> None:
+        """A builtin whose live context isn't ready raises for the caller to handle."""
         pm = self._pm()
 
         def blow_up(name: str, project_info: object) -> str:  # noqa: ARG001
             msg = "context not ready"
             raise RuntimeError(msg)
 
-        with patch.object(pm, "_resolve_project_variable", side_effect=blow_up):
-            result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
-        assert isinstance(result, GetProjectVariableResultFailure)
-        assert "context not ready" in str(result.result_details)
+        with (
+            patch.object(pm, "_get_builtin_variable_value", side_effect=blow_up),
+            pytest.raises(RuntimeError, match="context not ready"),
+        ):
+            pm.resolve_project_variable("workflow_dir", project_id=None)
 
-    def test_get_variable_unknown_project_fails(self) -> None:
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultFailure,
-        )
-
-        pm = self._pm()
-        result = pm.on_get_project_variable_request(
-            GetProjectVariableRequest(name="workspace_dir", project_id="not_loaded")
-        )
-        assert isinstance(result, GetProjectVariableResultFailure)
-
-    def test_get_variable_success_returns_plain_flow_variable(self) -> None:
-        """Regression: Success packages a plain, serializable FlowVariable carrying a stored value."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultSuccess,
-        )
-        from griptape_nodes.retained_mode.variable_types import FlowVariable
-
-        pm = self._pm()
-        pm._config_manager.workspace_path = Path("/synthetic/ws")
-        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
-        assert isinstance(result, GetProjectVariableResultSuccess)
-        # Must be a plain FlowVariable carrying a stored (snapshot) value.
-        assert type(result.variable) is FlowVariable
-        assert result.variable.value == "/synthetic/ws"
-
-    def test_get_variable_success_serializes_cleanly(self) -> None:
-        """Regression: the Success response must survive cattrs unstructure without invoking any resolver."""
+    def test_resolved_snapshot_serializes_cleanly(self) -> None:
+        """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
         from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
-        from griptape_nodes.retained_mode.events.project_events import (
-            GetProjectVariableRequest,
-            GetProjectVariableResultSuccess,
-        )
 
         pm = self._pm()
         pm._config_manager.workspace_path = Path("/synthetic/ws")
-        result = pm.on_get_project_variable_request(GetProjectVariableRequest(name="workspace_dir"))
-        assert isinstance(result, GetProjectVariableResultSuccess)
-        serialized = safe_unstructure(result)
-        assert serialized["variable"]["name"] == "workspace_dir"
-        assert serialized["variable"]["value"] == "/synthetic/ws"
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        serialized = safe_unstructure(variable)
+        assert serialized["name"] == "workspace_dir"
+        assert serialized["value"] == "/synthetic/ws"

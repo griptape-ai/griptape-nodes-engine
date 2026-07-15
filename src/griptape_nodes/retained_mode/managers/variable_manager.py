@@ -1,13 +1,8 @@
 import logging
 from typing import Any, NamedTuple
 
+from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
-from griptape_nodes.retained_mode.events.project_events import (
-    GetProjectVariableRequest,
-    GetProjectVariableResultSuccess,
-    ListProjectVariablesRequest,
-    ListProjectVariablesResultSuccess,
-)
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
     CreateVariableResultFailure,
@@ -101,6 +96,11 @@ class VariablesManager:
         self._flow_layers: dict[str, VariableLayer] = {}
         # Storage for global variables: single VariableLayer.
         self._global_layer: VariableLayer = VariableLayer()
+        # Stored (user-defined) project variables: project_id -> layer. Populated by
+        # ProjectManager pushing set_project_variables() when a template with variables
+        # loads; an absent entry behaves as an empty layer. Computed project names
+        # (builtins + directories) are NOT stored here — pulled from ProjectManager on demand.
+        self._project_layers: dict[str, VariableLayer] = {}
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(CreateVariableRequest, self.on_create_variable_request)
             event_manager.assign_manager_to_request_type(GetVariableRequest, self.on_get_variable_request)
@@ -123,7 +123,11 @@ class VariablesManager:
             event_manager.assign_manager_to_request_type(SetVariablesRequest, self.on_set_variables_request)
 
     def clear_object_state(self) -> None:
-        """Clear all flow and global variables. Project layers are owned by ProjectManager."""
+        """Clear all flow and global variables.
+
+        Project variable layers are deliberately NOT cleared: they track project
+        lifecycle (template load/unregister), not workflow state.
+        """
         self._flow_layers.clear()
         self._global_layer.clear()
 
@@ -204,54 +208,102 @@ class VariablesManager:
             return None
         return layer.get(variable_name)
 
-    def _get_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable | None:
-        """Fetch a single project-layer variable via ProjectManager.
+    def set_project_variables(self, project_id: str, layer: VariableLayer) -> None:
+        """Install a project's stored-variable layer.
 
-        ``project_id=None`` means the current project. Returns None if the project
-        isn't loaded, the name isn't defined in that project, or the variable's resolver
-        raised. Callers who need to distinguish those cases should issue
-        GetProjectVariableRequest directly.
+        Called by ProjectManager when a template that declares variables loads or reloads.
+        Computed names (builtins/directories) are NOT part of this layer — they're pulled
+        fresh from ProjectManager on demand, so there is no manifest to keep in sync.
         """
-        result = GriptapeNodes.handle_request(GetProjectVariableRequest(name=name, project_id=project_id))
-        if not isinstance(result, GetProjectVariableResultSuccess):
+        self._project_layers[project_id] = layer
+
+    def remove_project_variables(self, project_id: str) -> None:
+        """Drop a project's stored-variable layer (template unregistered)."""
+        self._project_layers.pop(project_id, None)
+
+    def _effective_project_id(self, project_id: str | None) -> str | None:
+        """Resolve None → current project id; returns None when no project is available."""
+        return GriptapeNodes.ProjectManager().resolve_project_id(project_id)
+
+    def _get_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable | None:
+        """Resolve a single project-layer variable (computed namespace first, then stored layer).
+
+        ``project_id=None`` means the current project. Computed values (builtins/directories)
+        are resolved fresh via ProjectManager; a computed value whose context isn't ready
+        (e.g. {workflow_dir} before the workflow is saved) yields None, matching the
+        silent-skip contract — the name exists, so the stored layer is NOT consulted as a
+        fallback. Stored hits return a snapshot copy so callers can't mutate stored state through a
+        response payload.
+        """
+        effective = self._effective_project_id(project_id)
+        if effective is None:
             return None
-        return result.variable
+
+        try:
+            return GriptapeNodes.ProjectManager().resolve_project_variable(name, project_id=effective)
+        except ValueError:
+            # Not a computed name — fall through to the stored project layer.
+            pass
+        except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
+            # Computed name exists but its context isn't ready (e.g. {workflow_dir} before the
+            # workflow is saved, or a directory macro that can't resolve). Silent-skip, no
+            # stored-layer fallback — the name is defined, just unavailable right now.
+            logger.debug("Computed project variable %r unavailable: %s", name, e)
+            return None
+
+        project_layer = self._project_layers.get(effective)
+        if project_layer is None:
+            return None
+        stored = project_layer.get(name)
+        if stored is None:
+            return None
+        return FlowVariable(
+            name=stored.name,
+            owning_flow_name=stored.owning_flow_name,
+            type=stored.type,
+            value=stored.value,
+            permission=stored.permission,
+        )
 
     def _list_project_variable_names(self, *, project_id: str | None) -> list[str]:
-        """List every variable name defined in a project's variable layer (metadata only).
+        """List every variable name a project defines (computed + stored layer), deduped.
 
-        ``project_id=None`` means the current project.
+        ``project_id=None`` means the current project. Computed names shadow same-named
+        stored entries, matching resolution order.
         """
-        result = GriptapeNodes.handle_request(ListProjectVariablesRequest(project_id=project_id))
-        if not isinstance(result, ListProjectVariablesResultSuccess):
+        effective = self._effective_project_id(project_id)
+        if effective is None:
             return []
-        return [v.name for v in result.variables]
+        computed = GriptapeNodes.ProjectManager().project_computed_names(project_id=effective)
+        names = sorted(computed)
+        project_layer = self._project_layers.get(effective)
+        if project_layer is not None:
+            names.extend(v.name for v in project_layer.list() if v.name not in computed)
+        return names
 
-    def _reserved_variable_names(self, *, project_id: str | None) -> set[str]:
+    def _reserved_variable_names(self, *, project_id: str | None) -> frozenset[str]:
         """Return names a flow variable may not be created or renamed to.
 
         ``project_id=None`` means the current project. A "reserved" name is one another
-        layer owns and does not permit a user flow variable to shadow. Today the project
-        layer reserves its builtins/directories; the concept is layer-agnostic, so if
-        global (or another layer) later reserves names they surface here too without
-        changing callers. Name-based and deterministic — no value resolution — so gating
-        a write never depends on whether a reserved value can resolve in the current context.
+        layer owns and does not permit a user flow variable to shadow — today, the project's
+        computed names (builtins + template directories). Stored project entries are not
+        reserved. Name-based and deterministic — no value resolution — so gating a write
+        never depends on whether a reserved value can resolve in the current context.
         """
-        result = GriptapeNodes.handle_request(ListProjectVariablesRequest(project_id=project_id))
-        if not isinstance(result, ListProjectVariablesResultSuccess):
-            return set()
-        return {v.name for v in result.variables if v.reserved}
+        effective = self._effective_project_id(project_id)
+        if effective is None:
+            return frozenset()
+        return GriptapeNodes.ProjectManager().project_computed_names(project_id=effective)
 
     def _collect_resolvable_project_variables(
         self, seen: set[str], *, project_id: str | None
     ) -> list[ResolvedVariable]:
-        """List project variables via events, resolving each name and skipping resolution failures.
+        """Enumerate project variables, resolving each name and skipping resolution failures.
 
         Mutates `seen` to include each collected name so downstream layers can shadow correctly.
-        Silent-skip for bulk enumeration: variables whose value can't resolve in the current
-        context (e.g. workflow_dir before the workflow is saved) are omitted from the returned
-        list rather than raising. Each entry carries VariableLayerKind.PROJECT so callers can
-        distinguish it from a same-named global.
+        Silent-skip for bulk enumeration: computed values whose context isn't ready (e.g.
+        workflow_dir before the workflow is saved) are omitted rather than raising. Each entry
+        carries VariableLayerKind.PROJECT so callers can distinguish it from a same-named global.
         """
         collected: list[ResolvedVariable] = []
         for name in self._list_project_variable_names(project_id=project_id):
@@ -358,14 +410,14 @@ class VariablesManager:
 
         - The resolved variable lives in the PROJECT layer. The Variables API has no
           write-through path to a project's variables — they're owned by the project
-          (template builtins/directories, or the project's own bag) and mutated through
+          (template builtins/directories, or the project's stored variables) and mutated through
           the project, not here. This holds regardless of the entry's stored permission:
           routing such a write by ``owning_flow_name`` would misfire into the global
           layer (KeyError) or silently mutate a throwaway snapshot, so it must be
           rejected at the boundary.
           TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5142): once a
           project write-through path exists, relax this to bounce only READ_ONLY project
-          entries so READ_WRITE bag variables become writable.
+          entries so READ_WRITE stored project variables become writable.
         - The variable is READ_ONLY.
         """
         layer = found_layer.value if found_layer is not None else "unknown"
@@ -862,7 +914,7 @@ class VariablesManager:
             source = SubstitutableSource.MACRO if from_project else SubstitutableSource.VARIABLE
             # Project-layer entries have no write-through path via this API (_refuse_write
             # bounces every PROJECT-layer write), so they are read-only to the picker
-            # regardless of a bag entry's stored permission. Other layers honor permission.
+            # regardless of a stored entry's permission. Other layers honor permission.
             read_only = from_project or variable.permission is VariablePermission.READ_ONLY
             substitutables.append(
                 Substitutable(name=variable.name, value=filtered[variable.name], source=source, read_only=read_only)

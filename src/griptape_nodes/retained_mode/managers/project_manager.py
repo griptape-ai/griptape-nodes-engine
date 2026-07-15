@@ -79,9 +79,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetProjectTemplateRequest,
     GetProjectTemplateResultFailure,
     GetProjectTemplateResultSuccess,
-    GetProjectVariableRequest,
-    GetProjectVariableResultFailure,
-    GetProjectVariableResultSuccess,
     GetSituationRequest,
     GetSituationResultFailure,
     GetSituationResultSuccess,
@@ -93,9 +90,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     ImportProjectResultSuccess,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
-    ListProjectVariablesRequest,
-    ListProjectVariablesResultFailure,
-    ListProjectVariablesResultSuccess,
     LoadProjectTemplateRequest,
     LoadProjectTemplateResultFailure,
     LoadProjectTemplateResultSuccess,
@@ -123,7 +117,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
-from griptape_nodes.retained_mode.events.variable_events import VariableDetails
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
@@ -144,7 +137,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -374,11 +367,13 @@ class ProjectInfo:
     parsed_situation_schemas: dict[str, ParsedMacro]  # situation_name -> ParsedMacro
     parsed_directory_schemas: dict[str, ParsedMacro]  # directory_name -> ParsedMacro
 
-    # User-defined per-project variables. Builtins (workspace_dir, etc.) and template
-    # directories are computed separately (see _resolve_project_variable_value) and take
-    # precedence over this bag; a bag entry whose name collides with one is shadowed.
-    # Starts empty — no population source is wired yet.
-    variable_layer: VariableLayer = field(default_factory=VariableLayer)
+    # Computed variable names (builtins + template directories), derived once at
+    # construction. Names are stable per template load; values stay volatile and are
+    # resolved on demand (see resolve_project_variable).
+    computed_variable_names: frozenset[str] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.computed_variable_names = BUILTIN_VARIABLES | frozenset(self.template.directories.keys())
 
 
 @dataclass(frozen=True)
@@ -597,10 +592,6 @@ class ProjectManager:
             PreviewImportProjectRequest, self.on_preview_import_project_request
         )
         event_manager.assign_manager_to_request_type(ImportProjectRequest, self.on_import_project_request)
-        event_manager.assign_manager_to_request_type(
-            ListProjectVariablesRequest, self.on_list_project_variables_request
-        )
-        event_manager.assign_manager_to_request_type(GetProjectVariableRequest, self.on_get_project_variable_request)
 
         # Register app initialization listener
         event_manager.add_listener_to_app_event(
@@ -2584,6 +2575,7 @@ class ProjectManager:
         for loaded_id, loaded_info in list(self._successfully_loaded_project_templates.items()):
             if loaded_info.project_file_path == canonical_path:
                 self._successfully_loaded_project_templates.pop(loaded_id, None)
+                GriptapeNodes.VariablesManager().remove_project_variables(loaded_id)
         self._registered_template_status.pop(canonical_path, None)
 
         return SaveProjectTemplateResultSuccess(
@@ -2908,8 +2900,9 @@ class ProjectManager:
             )
 
         # Remove from in-memory caches: the registry is id-keyed, the status map
-        # is path-keyed.
+        # is path-keyed. Drop the project's stored-variable bag with it.
         self._successfully_loaded_project_templates.pop(project_id, None)
+        GriptapeNodes.VariablesManager().remove_project_variables(project_id)
         if file_path is not None:
             self._registered_template_status.pop(file_path, None)
 
@@ -3519,53 +3512,53 @@ class ProjectManager:
             result_details=f"Successfully mapped absolute path to '{mapped_path}'",
         )
 
-    def _project_variable_names(self, project_info: ProjectInfo) -> list[str]:
-        """Return every variable name the project layer defines.
+    def resolve_project_id(self, project_id: str | None) -> str | None:
+        """Return the effective loaded-project id for a request-style project_id.
 
-        Union of BUILTIN_VARIABLES (workspace_dir, workflow_name, etc.), the project
-        template's declared directories, and the user-defined bag. Metadata only — no
-        values resolved. Deduped: a bag entry whose name collides with a builtin or
-        directory is shadowed by the computed value and appears once.
+        ``None`` means the current project. Returns None when the effective id does not
+        correspond to a loaded project, so callers can treat "unknown project" and "no
+        project" uniformly.
         """
-        names = list(BUILTIN_VARIABLES)
-        names.extend(project_info.template.directories.keys())
-        computed = set(names)
-        names.extend(v.name for v in project_info.variable_layer.list() if v.name not in computed)
-        return names
+        effective = project_id if project_id is not None else self._current_project_id
+        if effective not in self._successfully_loaded_project_templates:
+            return None
+        return effective
 
-    def _project_variable_details(self, project_info: ProjectInfo) -> list[VariableDetails]:
-        """Return metadata for every project variable, with the correct type per source.
+    def project_computed_names(self, *, project_id: str | None) -> frozenset[str]:
+        """Return the computed variable names a project defines (builtins + template directories).
 
-        Builtins and template directories resolve to path/string values, so they report
-        ``type="str"`` and are ``reserved=True`` — their names can't be shadowed by a user
-        flow variable. User-bag entries carry their own stored ``type`` (e.g. int, JSON) and
-        are not reserved. No values are resolved. ``owning_flow_name`` is ``None`` for all
-        project entries — they are not flow-owned.
+        These names form the project's computed namespace: values are derived from live
+        context on demand (never stored), and every computed name is reserved — a user flow
+        variable may not shadow one. ``project_id=None`` means the current project; an
+        unknown project yields an empty set. The set is cached on ProjectInfo at template
+        load — names are stable per load even though values are volatile.
         """
-        computed = set(BUILTIN_VARIABLES) | set(project_info.template.directories.keys())
-        details = [
-            VariableDetails(name=name, owning_flow_name=None, type="str", reserved=True) for name in sorted(computed)
-        ]
-        details.extend(
-            VariableDetails(name=v.name, owning_flow_name=None, type=v.type, reserved=False)
-            for v in project_info.variable_layer.list()
-            if v.name not in computed
-        )
-        return details
+        effective = self.resolve_project_id(project_id)
+        if effective is None:
+            return frozenset()
+        project_info = self._successfully_loaded_project_templates[effective]
+        return project_info.computed_variable_names
 
-    def _resolve_project_variable(self, name: str, project_info: ProjectInfo) -> FlowVariable:
-        """Resolve a project variable to a fully-formed FlowVariable.
+    def resolve_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable:
+        """Resolve a computed project variable (builtin or template directory) to a snapshot FlowVariable.
 
-        Resolution order: builtin → template directory → user bag. Builtins and
-        directories are computed on demand (context-sensitive — workflow_dir depends
-        on the current workflow, workspace_dir on the config layer) and are always
-        READ_ONLY. Bag entries are returned as a snapshot copy preserving their stored
-        type and permission.
+        Computed values are derived on every call — context-sensitive (workflow_dir tracks
+        the current workflow, workspace_dir the config layer) — and are always READ_ONLY.
+        The returned FlowVariable is a plain snapshot safe to serialize.
 
-        Raises RuntimeError / NotImplementedError / ValueError when a computed value's
-        context isn't ready, or ValueError when the name is undefined — callers turn
-        those into per-request Failures.
+        Stored (user-defined) project variables are NOT resolved here; those live in
+        VariablesManager's project bags. This method covers only the computed namespace.
+
+        Raises ValueError when the project isn't loaded or the name isn't a computed name;
+        RuntimeError / NotImplementedError when the value's context isn't ready (e.g.
+        {workflow_dir} before the workflow is saved).
         """
+        effective = self.resolve_project_id(project_id)
+        if effective is None:
+            msg = f"Project '{project_id}' is not loaded"
+            raise ValueError(msg)
+        project_info = self._successfully_loaded_project_templates[effective]
+
         if name in BUILTIN_VARIABLES:
             value = self._get_builtin_variable_value(name, project_info)
             return FlowVariable(
@@ -3580,82 +3573,8 @@ class ProjectManager:
                 value=resolver.resolve_directory(name),
                 permission=VariablePermission.READ_ONLY,
             )
-        bag_variable = project_info.variable_layer.get(name)
-        if bag_variable is not None:
-            # Snapshot copy so callers can't mutate the stored bag entry through the response.
-            return FlowVariable(
-                name=bag_variable.name,
-                owning_flow_name=bag_variable.owning_flow_name,
-                type=bag_variable.type,
-                value=bag_variable.value,
-                permission=bag_variable.permission,
-            )
-        msg = f"Unknown project variable '{name}'"
+        msg = f"Unknown computed project variable '{name}'"
         raise ValueError(msg)
-
-    def on_list_project_variables_request(
-        self, request: ListProjectVariablesRequest
-    ) -> ListProjectVariablesResultSuccess | ListProjectVariablesResultFailure:
-        """List metadata for every variable the project defines.
-
-        No values are resolved — some entries would raise depending on live context
-        (e.g. {workflow_dir} before the workflow is saved). Call
-        GetProjectVariableRequest per name to safely resolve values.
-        """
-        project_id = request.project_id if request.project_id is not None else self._current_project_id
-        project_info = self._successfully_loaded_project_templates.get(project_id)
-        if project_info is None:
-            return ListProjectVariablesResultFailure(
-                result_details=f"Attempted to list variables for project '{project_id}'. Failed because the project is not loaded."
-            )
-
-        details = self._project_variable_details(project_info)
-        return ListProjectVariablesResultSuccess(
-            variables=details,
-            result_details=f"Successfully listed {len(details)} project variable(s).",
-        )
-
-    def on_get_project_variable_request(
-        self, request: GetProjectVariableRequest
-    ) -> GetProjectVariableResultSuccess | GetProjectVariableResultFailure:
-        """Return a single project variable, resolving its value.
-
-        Failure covers three cases: project not loaded, name not defined in this
-        project, and defined-but-resolution-raised (e.g. {workflow_dir} before
-        the workflow is saved). The result_details string distinguishes them.
-        """
-        project_id = request.project_id if request.project_id is not None else self._current_project_id
-        project_info = self._successfully_loaded_project_templates.get(project_id)
-        if project_info is None:
-            return GetProjectVariableResultFailure(
-                result_details=(
-                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
-                    f"Failed because the project is not loaded."
-                )
-            )
-
-        if request.name not in self._project_variable_names(project_info):
-            return GetProjectVariableResultFailure(
-                result_details=(
-                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
-                    f"Failed because no variable with that name is defined in this project."
-                )
-            )
-
-        try:
-            variable = self._resolve_project_variable(request.name, project_info)
-        except (RuntimeError, NotImplementedError, ValueError) as e:
-            return GetProjectVariableResultFailure(
-                result_details=(
-                    f"Attempted to get project variable '{request.name}' from project '{project_id}'. "
-                    f"Failed while resolving its value: {e}"
-                )
-            )
-
-        return GetProjectVariableResultSuccess(
-            variable=variable,
-            result_details=f"Successfully retrieved project variable '{request.name}'.",
-        )
 
     # Helper methods (private)
 
