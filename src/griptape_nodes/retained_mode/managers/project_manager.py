@@ -3118,19 +3118,24 @@ class ProjectManager:
                 )
         conflicting_variables.update(builtin_resolution.conflicts)
 
-        # Stored project variables satisfy names too — state analysis must agree with
-        # on_get_path_for_macro_request, which fills them into the resolution bag
-        # (below caller-supplied, above project env). Same substitutable-type filter.
-        stored_substitutable_names = set(
-            _substitutable_stored_values(
-                GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
-            )
-        )
-
         # A referenced name is satisfied if ANY source can fill it: directory, caller,
         # available builtin, or stored project variable.
         available_builtins = BUILTIN_VARIABLES - set(builtin_resolution.unavailable)
-        satisfiable_names = directory_names | user_provided_names | available_builtins | stored_substitutable_names
+        satisfiable_names = directory_names | user_provided_names | available_builtins
+
+        # Stored project variables satisfy names too — state analysis must agree with
+        # on_get_path_for_macro_request, which fills them into the resolution bag
+        # (below caller-supplied, above project env). Same substitutable-type filter,
+        # same laziness: only consult VariablesManager when a referenced name is not
+        # already satisfiable from this project's own sources.
+        referenced_unsatisfied = {vi.name for vi in all_variables if vi.name not in satisfiable_names}
+        if referenced_unsatisfied:
+            stored_substitutable_names = set(
+                _substitutable_stored_values(
+                    GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
+                )
+            )
+            satisfiable_names |= stored_substitutable_names
 
         for var_info in all_variables:
             var_name = var_info.name
