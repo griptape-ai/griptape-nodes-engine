@@ -60,9 +60,8 @@ _LIST_PROJECT_VAR_NAMES_PATCH = (
 def _macro(name: str, value: Any) -> FlowVariable:
     """Build a stand-in for a resolved project variable (builtin or directory).
 
-    Returns a plain, READ_ONLY FlowVariable — the shape the GetProjectVariableRequest
-    handler produces after resolving a value. Tests patch `_get_project_variable` to
-    return these.
+    Returns a plain, READ_ONLY FlowVariable — the shape ProjectManager.resolve_project_variable
+    produces after resolving a value. Tests patch `_get_project_variable` to return these.
     """
     return FlowVariable(
         name=name,
@@ -511,10 +510,10 @@ class TestVariablePermission:
 
 
 class TestReservedNames:
-    """A flow variable may not be created or renamed to a reserved project name.
+    """No variable in any scope may be created or renamed to a reserved project name.
 
     workspace_dir is a project builtin reserved by the loaded system-defaults project,
-    so these exercise the real ListProjectVariables(reserved=True) path — no patching.
+    so these exercise the real ProjectManager.project_computed_names path — no patching.
     """
 
     def test_create_flow_var_with_reserved_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:

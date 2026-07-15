@@ -239,17 +239,20 @@ class VariablesManager:
         if effective is None:
             return None
 
-        try:
-            return GriptapeNodes.ProjectManager().resolve_project_variable(name, project_id=effective)
-        except ValueError:
-            # Not a computed name — fall through to the stored project layer.
-            pass
-        except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
-            # Computed name exists but its context isn't ready (e.g. {workflow_dir} before the
-            # workflow is saved, or a directory macro that can't resolve). Silent-skip, no
-            # stored-layer fallback — the name is defined, just unavailable right now.
-            logger.debug("Computed project variable %r unavailable: %s", name, e)
-            return None
+        # Membership decides the branch — not exception type. Calling resolve on a
+        # non-computed name and catching ValueError would conflate "unknown name" with any
+        # other ValueError the resolution might raise, silently violating the
+        # computed-shadows-stored contract once stored entries exist.
+        project_manager = GriptapeNodes.ProjectManager()
+        if name in project_manager.project_computed_names(project_id=effective):
+            try:
+                return project_manager.resolve_project_variable(name, project_id=effective)
+            except (RuntimeError, NotImplementedError, MacroResolutionError) as e:
+                # Computed name exists but its context isn't ready (e.g. {workflow_dir} before
+                # the workflow is saved, or a directory macro that can't resolve). Silent-skip,
+                # no stored-layer fallback — the name is defined, just unavailable right now.
+                logger.debug("Computed project variable %r unavailable: %s", name, e)
+                return None
 
         project_layer = self._project_layers.get(effective)
         if project_layer is None:
