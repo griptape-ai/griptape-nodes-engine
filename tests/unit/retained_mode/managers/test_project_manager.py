@@ -10846,10 +10846,10 @@ variables:
     def test_rename_project_variable_to_own_projects_reserved_name_refused(self, tmp_path: Path) -> None:
         """The reserved gate uses the variable's OWN project, not the current one.
 
-        The loaded project defines {outputs} as a directory (a computed, reserved name in
-        THAT project). Renaming its stored variable to 'outputs' must be refused even
-        though the engine's current project may not reserve that name — otherwise the
-        renamed entry would persist permanently shadowed.
+        The loaded project declares a `dailies` directory — a computed (reserved) name in
+        THAT project only. The current project (system defaults) has no such directory, so
+        a gate that consulted the current project's reserved set (the pre-fix behavior)
+        would let this rename through, stranding a permanently-shadowed stored entry.
         """
         from griptape_nodes.retained_mode.events.variable_events import (
             RenameVariableRequest,
@@ -10858,13 +10858,21 @@ variables:
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.variable_types import VariableScope
 
-        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        extra_yaml = (
+            self.VARIABLES_YAML
+            + '\ndirectories:\n  dailies:\n    path_macro: "{workspace_dir}/dailies"\n    description: "Dailies"\n'
+        )
+        project_id = self._write_and_load(tmp_path, extra_yaml)
         try:
-            # workspace_dir is a builtin — computed (reserved) in every project including this one.
+            # Sanity: the discriminator is real — reserved in the loaded project, not in the current one.
+            pm = GriptapeNodes.ProjectManager()
+            assert "dailies" in pm.project_computed_names(project_id=project_id)
+            assert "dailies" not in pm.project_computed_names(project_id=None)
+
             result = GriptapeNodes.handle_request(
                 RenameVariableRequest(
                     name="shot_code",
-                    new_name="workspace_dir",
+                    new_name="dailies",
                     lookup_scope=VariableScope.PROJECT_ONLY,
                     project_id=project_id,
                 )
