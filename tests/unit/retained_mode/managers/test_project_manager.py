@@ -23,10 +23,17 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
     AttemptMatchPathAgainstMacroRequest,
+    AttemptMatchPathAgainstMacroResultFailure,
     AttemptMatchPathAgainstMacroResultSuccess,
+    GetAllSituationsForProjectRequest,
+    GetAllSituationsForProjectResultFailure,
+    GetAllSituationsForProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultFailure,
+    GetSituationResultSuccess,
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
@@ -10010,6 +10017,281 @@ class TestProjectManagerGetProjectChain:
         # __init__ registers system defaults and points the current id at them.
         chain = pm.get_project_chain()
         assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
+
+
+class TestHypotheticalMacroResolution:
+    """project_id on macro requests: 'how WOULD this macro resolve if I were on project Y?'."""
+
+    @staticmethod
+    def _pm_with_two_projects() -> ProjectManager:
+        """Build a ProjectManager with a current project X and a loaded-but-not-current project Y.
+
+        Both define an {outputs} directory anchored at {project_dir}, so the same macro
+        resolves to different paths depending on which project context is selected.
+        """
+        from griptape_nodes.common.project_templates import (
+            DirectoryDefinition,
+            ProjectTemplate,
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_config.get_config_value.return_value = "staticfiles"
+        pm = ProjectManager(Mock(), mock_config, Mock())
+
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+
+        for project_name, base_dir in (("project_x", Path("/projects/x")), ("project_y", Path("/projects/y"))):
+            template = ProjectTemplate(
+                project_template_schema_version="0.1.0",
+                name=project_name,
+                directories={
+                    "outputs": DirectoryDefinition(name="outputs", path_macro="{project_dir}/outputs"),
+                },
+                situations={
+                    "save_output": SituationTemplate(
+                        name="save_output",
+                        macro=f"{{outputs}}/{project_name}_{{file_name}}",
+                        policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+                    ),
+                },
+                environment={},
+            )
+            validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+            project_id = str(base_dir / "project.yml")
+            pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+                project_id=project_id,
+                project_file_path=base_dir / "project.yml",
+                project_base_dir=base_dir,
+                template=template,
+                validation=validation,
+                parsed_situation_schemas=pm._parse_situation_macros(template.situations, validation),
+                parsed_directory_schemas=pm._parse_directory_macros(template.directories, validation),
+            )
+
+        pm._current_project_id = str(Path("/projects/x") / "project.yml")
+        return pm
+
+    def test_path_resolves_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id=project_y)
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/y/outputs/img.png")
+
+    def test_path_project_id_none_uses_current(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/x/outputs/img.png")
+
+    def test_path_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_state_analysis_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(
+                parsed_macro=ParsedMacro("{outputs}/{file_name}"), variables={}, project_id=project_y
+            )
+        )
+        assert isinstance(result, GetStateForMacroResultSuccess)
+        assert "outputs" in result.satisfied_variables
+        assert "file_name" in result.missing_required_variables
+        assert not result.can_resolve
+
+    def test_state_analysis_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetStateForMacroResultFailure)
+
+    def test_match_auto_resolve_builtins_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id=project_y,
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        assert result.extracted_variables is not None
+        assert result.extracted_variables["file_name"] == "render.exr"
+
+    def test_match_auto_resolve_unknown_project_id_fails(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id="not_loaded",
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+
+    def test_stored_project_variable_fills_macro(self) -> None:
+        """A stored project variable participates in path resolution (below caller, above env)."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"), variables={})
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc042/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_caller_supplied_value_beats_stored_project_variable(self) -> None:
+        """Precedence: caller-supplied > stored project variable."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"),
+                    variables={"shot_code": "sc999"},
+                )
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc999/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_get_situation_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id=project_y))
+        assert isinstance(result, GetSituationResultSuccess)
+        # Each project's situation macro embeds its own name — proves the selected
+        # project's template answered, not the current one.
+        assert "project_y" in result.situation.macro
+
+    def test_get_situation_project_id_none_uses_current(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output"))
+        assert isinstance(result, GetSituationResultSuccess)
+        assert "project_x" in result.situation.macro
+
+    def test_get_situation_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id="not_loaded"))
+        assert isinstance(result, GetSituationResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_get_all_situations_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_all_situations_for_project_request(GetAllSituationsForProjectRequest(project_id=project_y))
+        assert isinstance(result, GetAllSituationsForProjectResultSuccess)
+        assert "project_y" in result.situations["save_output"]
+
+    def test_get_all_situations_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_all_situations_for_project_request(
+            GetAllSituationsForProjectRequest(project_id="not_loaded")
+        )
+        assert isinstance(result, GetAllSituationsForProjectResultFailure)
+
+    def test_map_absolute_path_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/y/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path == "{outputs}/render.exr"
+
+    def test_map_absolute_path_outside_hypothetical_project_returns_none(self) -> None:
+        """A path inside CURRENT project X is outside hypothetical project Y — mapped_path None."""
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/x/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path is None
+
+    def test_state_analysis_counts_stored_project_variable_satisfied(self) -> None:
+        """State analysis agrees with path resolution about stored project variables."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_state_for_macro_request(
+                GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}"), variables={})
+            )
+            assert isinstance(result, GetStateForMacroResultSuccess)
+            assert "shot_code" in result.satisfied_variables
+            assert result.can_resolve
+        finally:
+            variables_manager.remove_project_variables(project_x)
 
 
 class TestProjectVariableResolution:

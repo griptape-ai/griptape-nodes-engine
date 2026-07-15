@@ -221,6 +221,18 @@ class VariablesManager:
         """Drop a project's stored-variable layer (template unregistered)."""
         self._project_layers.pop(project_id, None)
 
+    def stored_project_variable_values(self, project_id: str) -> dict[str, Any]:
+        """Snapshot name → value for a project's STORED variables (no computed names).
+
+        Read seam for ProjectManager's macro bag-assembly: stored project variables
+        participate in {VAR} resolution below caller-supplied values and above project
+        env. Values are returned as-is; the macro layer filters for substitutable types.
+        """
+        project_layer = self._project_layers.get(project_id)
+        if project_layer is None:
+            return {}
+        return {variable.name: variable.value for variable in project_layer.list()}
+
     def _effective_project_id(self, project_id: str | None) -> str | None:
         """Resolve None → current project id; returns None when no project is available."""
         return GriptapeNodes.ProjectManager().resolve_project_id(project_id)

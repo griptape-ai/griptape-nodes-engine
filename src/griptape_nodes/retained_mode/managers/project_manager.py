@@ -215,6 +215,30 @@ BUILTIN_VARIABLES = frozenset(var.name for var in _BUILTIN_VARIABLE_DEFINITIONS)
 DERIVED_VARIABLE_NAMES = frozenset(rule.name for rule in DERIVATION_RULES)
 
 
+def _project_selection_failure(project_id: str | None) -> str:
+    """Explain why project_info_for_request returned None, in request terms.
+
+    ``None`` failed means the *current* project isn't usable; an explicit id failed
+    means that id isn't loaded. Callers embed this in their Failure result_details.
+    """
+    if project_id is None:
+        return "no current project is set or its template is not loaded"
+    return f"project '{project_id}' is not loaded"
+
+
+def _substitutable_stored_values(stored_values: dict[str, Any]) -> dict[str, str | int]:
+    """Filter stored project variables to values that can fill a {VAR} token (str/int, not bool).
+
+    Shared by macro path resolution and state analysis so both agree on which stored
+    entries count as satisfiable.
+    """
+    return {
+        name: value
+        for name, value in stored_values.items()
+        if isinstance(value, (str, int)) and not isinstance(value, bool)
+    }
+
+
 @dataclass
 class _ProjectVariableResolver:
     """Recursive resolver for project directory path_macros and environment values.
@@ -1142,20 +1166,18 @@ class ProjectManager:
         Returns the full SituationTemplate including macro and policy.
 
         Flow:
-        1. Get current project
-        2. Get template from successful_templates
+        1. Select the project (request.project_id; None = current)
+        2. Get template from the selected project
         3. Get situation from template
         4. Return complete SituationTemplate
         """
-        current_project_request = GetCurrentProjectRequest()
-        current_project_result = self.on_get_current_project_request(current_project_request)
-
-        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+        project_info = self.project_info_for_request(request.project_id)
+        if project_info is None:
             return GetSituationResultFailure(
-                result_details=f"Attempted to get situation '{request.situation_name}'. Failed because no current project is set or template not loaded",
+                result_details=f"Attempted to get situation '{request.situation_name}'. Failed because {_project_selection_failure(request.project_id)}",
             )
 
-        template = current_project_result.project_info.template
+        template = project_info.template
 
         situation = template.situations.get(request.situation_name)
         if situation is None:
@@ -1174,7 +1196,7 @@ class ProjectManager:
         """Resolve ANY macro schema with variables to final Path.
 
         Flow:
-        1. Get current project
+        1. Select the project (request.project_id; None = current)
         2. Apply derivation rules to inject derived variables (e.g. file_extension_directory)
         3. Get variables from ParsedMacro.get_variables()
         4. For each variable:
@@ -1186,16 +1208,13 @@ class ProjectManager:
         6. Resolve macro with complete variable bag
         7. Return resolved Path
         """
-        current_project_request = GetCurrentProjectRequest()
-        current_project_result = self.on_get_current_project_request(current_project_request)
-
-        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+        project_info = self.project_info_for_request(request.project_id)
+        if project_info is None:
             return GetPathForMacroResultFailure(
                 failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
-                result_details="Attempted to resolve macro path. Failed because no current project is set or template not loaded",
+                result_details=f"Attempted to resolve macro path. Failed because {_project_selection_failure(request.project_id)}",
             )
 
-        project_info = current_project_result.project_info
         template = project_info.template
 
         # Apply derivation rules centrally so every caller of GetPathForMacroRequest
@@ -1280,6 +1299,20 @@ class ProjectManager:
                 conflicting_variables=env_collisions,
                 result_details=f"Attempted to resolve macro path. Failed because project environment variables collide with directory or builtin names: {', '.join(sorted(env_collisions))}",
             )
+        # Stored project variables (user-defined, from the project definition) fill
+        # referenced names not already claimed. Precedence (high to low): builtins >
+        # directories > caller-supplied > stored project variables > project env >
+        # shell env. Computed names can't appear here (creation reserves them), so no
+        # collision pass is needed — an earlier claim in the bag simply wins. Only
+        # consulted when a referenced name is still unclaimed.
+        unclaimed_names = {v.name for v in variable_infos if v.name not in resolution_bag}
+        if unclaimed_names:
+            stored_substitutable = _substitutable_stored_values(
+                GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
+            )
+            for var_name in unclaimed_names & set(stored_substitutable):
+                resolution_bag[var_name] = stored_substitutable[var_name]
+
         env_needed = {v.name for v in variable_infos if v.name not in resolution_bag and v.name in project_env}
         for var_name in env_needed:
             try:
@@ -2952,8 +2985,9 @@ class ProjectManager:
 
         Flow:
         1. Seed the variable bag with the caller's ``known_variables``.
-        2. If ``auto_resolve_builtins`` is set, inject project-derived builtins
-           via ``_resolve_builtins_into_bag``. The shared helper enforces the
+        2. If ``auto_resolve_builtins`` is set, inject builtins derived from the
+           selected project (request.project_id; None = current) via
+           ``_resolve_builtins_into_bag``. The shared helper enforces the
            "no silent override of builtins" policy: a caller who supplied a
            conflicting value for a builtin gets a hard failure.
         3. Call ParsedMacro.extract_variables() with the merged bag.
@@ -2962,12 +2996,22 @@ class ProjectManager:
         """
         merged_known_variables: MacroVariables = dict(request.known_variables)
         if request.auto_resolve_builtins:
-            current_project_result = self.on_get_current_project_request(GetCurrentProjectRequest())
-            if isinstance(current_project_result, GetCurrentProjectResultSuccess):
+            project_info = self.project_info_for_request(request.project_id)
+            if project_info is None and request.project_id is not None:
+                # The caller asked to resolve builtins against a SPECIFIC project that
+                # isn't loaded — silently matching without them would lie. No current
+                # project (project_id=None) keeps the shipped silent-skip behavior below.
+                return AttemptMatchPathAgainstMacroResultFailure(
+                    result_details=(
+                        f"Attempted to match path '{request.file_path}' against macro "
+                        f"'{request.parsed_macro.template}'. Failed because {_project_selection_failure(request.project_id)}"
+                    ),
+                )
+            if project_info is not None:
                 resolution = self._resolve_builtins_into_bag(
                     merged_known_variables,
                     BUILTIN_VARIABLES,
-                    current_project_result.project_info,
+                    project_info,
                 )
                 if resolution.conflicts:
                     return AttemptMatchPathAgainstMacroResultFailure(
@@ -3028,8 +3072,8 @@ class ProjectManager:
         """Analyze a macro and return comprehensive state information.
 
         Flow:
-        1. Get current project via GetCurrentProjectRequest
-        2. Get template from current project
+        1. Select the project (request.project_id; None = current)
+        2. Get template from the selected project
         3. For each variable, determine if it's:
            - A directory (from template)
            - User-provided (from request)
@@ -3040,15 +3084,12 @@ class ProjectManager:
         5. Calculate what's satisfied vs missing
         6. Determine if resolution would succeed
         """
-        current_project_request = GetCurrentProjectRequest()
-        current_project_result = self.on_get_current_project_request(current_project_request)
-
-        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+        project_info = self.project_info_for_request(request.project_id)
+        if project_info is None:
             return GetStateForMacroResultFailure(
-                result_details="Attempted to analyze macro state. Failed because no current project is set or template not loaded",
+                result_details=f"Attempted to analyze macro state. Failed because {_project_selection_failure(request.project_id)}",
             )
 
-        project_info = current_project_result.project_info
         template = project_info.template
 
         all_variables = request.parsed_macro.get_variables()
@@ -3077,21 +3118,29 @@ class ProjectManager:
                 )
         conflicting_variables.update(builtin_resolution.conflicts)
 
+        # Stored project variables satisfy names too — state analysis must agree with
+        # on_get_path_for_macro_request, which fills them into the resolution bag
+        # (below caller-supplied, above project env). Same substitutable-type filter.
+        stored_substitutable_names = set(
+            _substitutable_stored_values(
+                GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
+            )
+        )
+
+        # A referenced name is satisfied if ANY source can fill it: directory, caller,
+        # available builtin, or stored project variable.
+        available_builtins = BUILTIN_VARIABLES - set(builtin_resolution.unavailable)
+        satisfiable_names = directory_names | user_provided_names | available_builtins | stored_substitutable_names
+
         for var_info in all_variables:
             var_name = var_info.name
 
-            if var_name in directory_names:
-                satisfied_variables.add(var_name)
-                if var_name in user_provided_names:
-                    conflicting_variables.add(var_name)
+            if var_name in directory_names and var_name in user_provided_names:
+                conflicting_variables.add(var_name)
 
-            if var_name in user_provided_names:
+            if var_name in satisfiable_names:
                 satisfied_variables.add(var_name)
-
-            if var_name in BUILTIN_VARIABLES and var_name not in builtin_resolution.unavailable:
-                satisfied_variables.add(var_name)
-
-            if var_info.is_required and var_name not in satisfied_variables:
+            elif var_info.is_required:
                 missing_required_variables.add(var_name)
 
         can_resolve = len(missing_required_variables) == 0 and len(conflicting_variables) == 0
@@ -3438,18 +3487,16 @@ class ProjectManager:
         self._initialization_complete = True
 
     def on_get_all_situations_for_project_request(
-        self, _request: GetAllSituationsForProjectRequest
+        self, request: GetAllSituationsForProjectRequest
     ) -> GetAllSituationsForProjectResultSuccess | GetAllSituationsForProjectResultFailure:
-        """Get all situation names and schemas from current project template."""
-        current_project_request = GetCurrentProjectRequest()
-        current_project_result = self.on_get_current_project_request(current_project_request)
-
-        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+        """Get all situation names and schemas from the selected project template (None = current)."""
+        project_info = self.project_info_for_request(request.project_id)
+        if project_info is None:
             return GetAllSituationsForProjectResultFailure(
-                result_details="Attempted to get all situations. Failed because no current project is set or template not loaded"
+                result_details=f"Attempted to get all situations. Failed because {_project_selection_failure(request.project_id)}"
             )
 
-        template = current_project_result.project_info.template
+        template = project_info.template
         situations = {situation_name: situation.macro for situation_name, situation in template.situations.items()}
         descriptions = {
             situation_name: (situation.description or "") for situation_name, situation in template.situations.items()
@@ -3479,15 +3526,11 @@ class ProjectManager:
             Failure if operation cannot be performed
         """
         # Check prerequisites - return Failure if missing
-        current_project_request = GetCurrentProjectRequest()
-        current_project_result = self.on_get_current_project_request(current_project_request)
-
-        if not isinstance(current_project_result, GetCurrentProjectResultSuccess):
+        project_info = self.project_info_for_request(request.project_id)
+        if project_info is None:
             return AttemptMapAbsolutePathToProjectResultFailure(
-                result_details="Attempted to map absolute path. Failed because no current project is set"
+                result_details=f"Attempted to map absolute path. Failed because {_project_selection_failure(request.project_id)}"
             )
-
-        project_info = current_project_result.project_info
 
         # Try to map the path
         try:
@@ -3523,6 +3566,19 @@ class ProjectManager:
         if effective not in self._successfully_loaded_project_templates:
             return None
         return effective
+
+    def project_info_for_request(self, project_id: str | None) -> ProjectInfo | None:
+        """Return the ProjectInfo a request-style project_id selects, or None.
+
+        ``None`` means the current project; an explicit id selects any loaded project
+        (the basis for hypothetical resolution: "how would this resolve on project Y?").
+        Returns None when the effective project isn't loaded — callers translate that
+        into their own Failure payloads.
+        """
+        effective = self.resolve_project_id(project_id)
+        if effective is None:
+            return None
+        return self._successfully_loaded_project_templates[effective]
 
     def project_computed_names(self, *, project_id: str | None) -> frozenset[str]:
         """Return the computed variable names a project defines (builtins + template directories).
