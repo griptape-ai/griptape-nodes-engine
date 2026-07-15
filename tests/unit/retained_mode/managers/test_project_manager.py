@@ -10963,8 +10963,6 @@ variables:
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         """The eager-persist contract: a disk failure logs a warning; the acknowledged in-memory write stands."""
-        import logging
-
         from griptape_nodes.files.file import FileWriteError
         from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
         from griptape_nodes.retained_mode.events.variable_events import (
