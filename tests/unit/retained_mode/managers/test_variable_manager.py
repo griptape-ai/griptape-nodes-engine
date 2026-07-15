@@ -46,6 +46,7 @@ from griptape_nodes.retained_mode.events.variable_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
+    VariableLayer,
     VariableLayerKind,
     VariablePermission,
     VariableScope,
@@ -632,6 +633,73 @@ class TestReservedNames:
             GetVariableValueRequest(name="g_old", lookup_scope=VariableScope.GLOBAL_ONLY)
         )
         assert isinstance(old_val, GetVariableValueResultFailure)
+
+
+class TestGetProjectVariableRealBody:
+    """Exercise the REAL _get_project_variable body — no project_macros mock.
+
+    Every other project-layer test patches _get_project_variable out, so the
+    membership-gated dispatch, the narrowed context-not-ready except tuple, and
+    the stored-layer fall-through + snapshot copy need direct coverage here
+    (they go live for real when #5142 wires set_project_variables at load).
+    """
+
+    def test_computed_name_resolves_via_real_dispatch(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """A real builtin resolves through membership check → resolve_project_variable."""
+        result = griptape_nodes.handle_request(
+            GetVariableRequest(name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
+        )
+        assert isinstance(result, GetVariableResultSuccess)
+        assert result.variable.permission is VariablePermission.READ_ONLY
+        assert result.variable.value  # resolved from live config; exact value is environment-specific
+
+    def test_computed_name_with_unready_context_silent_skips(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """A computed name whose resolver raises context-not-ready yields not-found — no crash, no stored fallback."""
+        variables_manager = griptape_nodes.VariablesManager()
+        project_id = griptape_nodes.ProjectManager().resolve_project_id(None)
+        assert project_id is not None
+        # Stage a same-named stored entry to prove the silent-skip does NOT fall through to it.
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="workspace_dir", owning_flow_name=None, type="str", value="/stored"))
+        variables_manager.set_project_variables(project_id, stored_layer)
+        try:
+            with patch.object(
+                type(griptape_nodes.ProjectManager()),
+                "resolve_project_variable",
+                side_effect=RuntimeError("context not ready"),
+            ):
+                result = griptape_nodes.handle_request(
+                    GetVariableRequest(
+                        name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY
+                    )
+                )
+            assert isinstance(result, GetVariableResultFailure)
+        finally:
+            variables_manager.remove_project_variables(project_id)
+
+    def test_non_computed_name_falls_through_to_stored_snapshot(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """A stored-only name skips resolve entirely and returns a snapshot copy, not the stored object."""
+        variables_manager = griptape_nodes.VariablesManager()
+        project_id = griptape_nodes.ProjectManager().resolve_project_id(None)
+        assert project_id is not None
+        stored = FlowVariable(name="team_prefix", owning_flow_name=None, type="str", value="vfx")
+        stored_layer = VariableLayer()
+        stored_layer.set(stored)
+        variables_manager.set_project_variables(project_id, stored_layer)
+        try:
+            result = griptape_nodes.handle_request(
+                GetVariableRequest(name="team_prefix", starting_flow=flow_name, lookup_scope=VariableScope.PROJECT_ONLY)
+            )
+            assert isinstance(result, GetVariableResultSuccess)
+            assert result.variable.value == "vfx"
+            # Snapshot copy: mutating the response must not touch stored state.
+            assert result.variable is not stored
+        finally:
+            variables_manager.remove_project_variables(project_id)
 
 
 class TestProjectVariableSerialization:
