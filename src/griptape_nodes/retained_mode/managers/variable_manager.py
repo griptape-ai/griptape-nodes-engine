@@ -88,6 +88,36 @@ class ResolvedVariable(NamedTuple):
     layer: VariableLayerKind
 
 
+def _project_value_mismatch(declared_type: str, value: Any) -> str | None:
+    """Explain why a value can't be stored in a project variable of the declared type, else None.
+
+    Project variables persist through ProjectVariableDef, whose strict schema allows only
+    str or int values that agree with the declared type (bool is excluded — it's an int
+    subclass but not a substitutable value). Writes are gated here at the boundary so a
+    mismatch is refused before mutating, never discovered at persist time.
+    """
+    if declared_type == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            return f"the variable's type is 'int' but the value {value!r} is {type(value).__name__}."
+        return None
+    if declared_type == "str":
+        if not isinstance(value, str):
+            return f"the variable's type is 'str' but the value {value!r} is {type(value).__name__}."
+        return None
+    return f"the variable's type is '{declared_type}', but project variables only support 'str' or 'int'."
+
+
+def _project_type_mismatch(new_type: str, current_value: Any) -> str | None:
+    """Explain why a project variable can't take the new declared type, else None.
+
+    Same boundary gate as _project_value_mismatch, for SetVariableType: the new type must
+    be one project variables support AND agree with the value already stored.
+    """
+    if new_type not in ("str", "int"):
+        return f"project variables only support type 'str' or 'int', not '{new_type}'."
+    return _project_value_mismatch(new_type, current_value)
+
+
 class VariablesManager:
     """Manager for variables with scoped access control."""
 
@@ -627,6 +657,14 @@ class VariablesManager:
                 return SetVariableValueResultFailure(
                     result_details=f"Attempted to set the value of variable '{request.name}'. Failed due to an internal error: the resolved project variable is not present in its stored layer."
                 )
+            # Project variables persist through a strict schema (str|int, matching the
+            # declared type) — a mismatched value must be refused here, BEFORE mutating,
+            # or persistence would fail on an already-acknowledged write.
+            value_error = _project_value_mismatch(stored.type, request.value)
+            if value_error is not None:
+                return SetVariableValueResultFailure(
+                    result_details=f"Attempted to set the value of project variable '{request.name}'. Failed because {value_error}"
+                )
             stored.value = request.value
             self._persist_project_variables(project_id=request.project_id)
         else:
@@ -683,6 +721,13 @@ class VariablesManager:
             if stored is None:
                 return SetVariableTypeResultFailure(
                     result_details=f"Attempted to set the type of variable '{request.name}'. Failed due to an internal error: the resolved project variable is not present in its stored layer."
+                )
+            # Gate before mutating: the new type must be one project variables support
+            # and agree with the stored value, or persistence would fail after the fact.
+            type_error = _project_type_mismatch(request.type, stored.value)
+            if type_error is not None:
+                return SetVariableTypeResultFailure(
+                    result_details=f"Attempted to set the type of project variable '{request.name}'. Failed because {type_error}"
                 )
             stored.type = request.type
             self._persist_project_variables(project_id=request.project_id)

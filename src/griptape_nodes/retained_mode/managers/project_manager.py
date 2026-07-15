@@ -2635,7 +2635,7 @@ class ProjectManager:
 
         return default_template_for_version(template.project_template_schema_version)
 
-    def persist_project_variables(self, project_id: str) -> str | None:
+    def persist_project_variables(self, project_id: str) -> str | None:  # noqa: PLR0911 — each failure gate returns its own error string
         """Write a project's current stored variables back to its project.yml (#5142).
 
         Called by VariablesManager after a successful runtime write to a stored project
@@ -2655,16 +2655,24 @@ class ProjectManager:
         if project_info.project_file_path is None:
             return f"project '{project_id}' has no backing file to persist to"
 
+        # Rebuild template.variables from the live layer. VariablesManager gates every
+        # project-variable write against the strict schema (str/int, value agrees with
+        # declared type), so validation here cannot fail for writes made through the API —
+        # but persist must never raise past an already-acknowledged write, so guard anyway
+        # and report which entry is unpersistable instead of crashing (or coercing).
         stored_variables = GriptapeNodes.VariablesManager().stored_project_variables(project_id)
-        project_info.template.variables = {
-            variable.name: ProjectVariableDef(
-                name=variable.name,
-                value=variable.value,
-                type="int" if variable.type == "int" else "str",
-                permission=variable.permission,
-            )
-            for variable in stored_variables
-        }
+        rebuilt: dict[str, ProjectVariableDef] = {}
+        for variable in stored_variables:
+            try:
+                rebuilt[variable.name] = ProjectVariableDef(
+                    name=variable.name,
+                    value=variable.value,
+                    type=variable.type,  # type: ignore[arg-type] — gated at the write boundary; ValidationError caught below
+                    permission=variable.permission,
+                )
+            except ValidationError as e:
+                return f"variable '{variable.name}' cannot be persisted: {e}"
+        project_info.template.variables = rebuilt
 
         try:
             base_template = self._overlay_base_for_template(project_info.template, project_info.project_file_path)

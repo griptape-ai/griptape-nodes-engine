@@ -10703,6 +10703,89 @@ variables:
         finally:
             self._unload(project_id)
 
+    def test_type_mismatched_value_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Writing a str to an int-typed project variable fails cleanly — no crash, no mutation, no file change.
+
+        The write boundary gates value-vs-declared-type agreement BEFORE mutating, because
+        persistence goes through ProjectVariableDef's strict schema: an unguarded mismatch
+        would raise at persist time, after the in-memory write was already acknowledged.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            file_before = (tmp_path / "project_template.yml").read_text()
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="frame_start",
+                    value="not_a_number",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultFailure)
+            assert "'int'" in str(result.result_details)
+            # Layer and file both untouched.
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["frame_start"] == self.FRAME_START
+            assert (tmp_path / "project_template.yml").read_text() == file_before
+        finally:
+            self._unload(project_id)
+
+    def test_unsupported_type_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Setting a project variable's type to something outside str/int fails cleanly."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="JSON",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+            assert "only support" in str(result.result_details)
+            stored = {v.name: v for v in GriptapeNodes.VariablesManager().stored_project_variables(project_id)}
+            assert stored["shot_code"].type == "str"
+        finally:
+            self._unload(project_id)
+
+    def test_type_change_disagreeing_with_value_refused_cleanly(self, tmp_path: Path) -> None:
+        """Re-typing shot_code (value 'sc042') to int fails: the stored value wouldn't agree."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="int",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+        finally:
+            self._unload(project_id)
+
     def test_deprecated_batch_set_refuses_project_variable(self, tmp_path: Path) -> None:
         """The frozen SetVariables shim refuses even a READ_WRITE project variable.
 
