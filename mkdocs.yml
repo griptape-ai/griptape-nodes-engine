@@ -123,6 +123,7 @@ plugins:
           - guides/projects/macros.md: Macros
           - guides/projects/situations.md: Situations
           - guides/projects/environment.md: Environment and built-in variables
+          - guides/projects/variables.md: Project variables
           - guides/projects/file_extension_directories.md: File extension directories
           - guides/projects/sequences.md: Numbered file sequences (patterns and policies)
           - guides/projects/version_pinning.md: Pinning engine and library versions
@@ -266,6 +267,7 @@ nav:
           - Macros: guides/projects/macros.md
           - Situations: guides/projects/situations.md
           - Environment & Builtin Variables: guides/projects/environment.md
+          - Project Variables: guides/projects/variables.md
           - File Extension Directories: guides/projects/file_extension_directories.md
           - Sequences: guides/projects/sequences.md
           - Version Pinning: guides/projects/version_pinning.md

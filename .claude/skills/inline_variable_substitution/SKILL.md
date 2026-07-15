@@ -9,18 +9,89 @@ This document describes how the inline `{VAR}` substitution system works in the 
 
 ## Overview
 
-Users write `{VAR_NAME}` tokens inside node parameter values. At node execution time, the engine resolves each token against the user-defined workflow variables in scope. The template is always preserved in the UI; only the value flowing to downstream nodes and workers is substituted.
+Users write `{VAR_NAME}` tokens inside node parameter values. At node execution time, the engine resolves each token against the variables visible in scope. The template is always preserved in the UI; only the value flowing to downstream nodes and workers is substituted.
+
+Variables live in three layers, resolved hierarchically with closer layers shadowing farther ones:
+
+```
+FLOW (starting flow → ancestor flows)   ← highest priority
+PROJECT (computed names + stored project variables)
+GLOBAL                                  ← lowest priority
+```
+
+## The stored/computed split (core architecture)
+
+**Stored variables** are plain data owned by `VariablesManager`:
+- **Flow layers** — `dict[flow_name, VariableLayer]`, user variables created via `CreateVariableRequest`
+- **Global layer** — one `VariableLayer`, `is_global=True` creates
+- **Project layers** — `dict[project_id, VariableLayer]`, populated from a project.yml `variables:` section at template load (`ProjectManager._install_project_variables` → `VariablesManager.set_project_variables`)
+
+**Computed values** are NOT stored anywhere — they're a namespace owned by `ProjectManager`, resolved fresh from live context on every read:
+- **Builtins**: `{workspace_dir}` (engine config), `{workflow_name}` / `{workflow_dir}` (live workflow context), `{project_dir}`, `{static_files_dir}`
+- **Template directories**: any `directories:` entry in project.yml (e.g. `{outputs}`)
+
+Why the split: per-object callbacks die at serialization, and eager values go stale (`{workflow_dir}` tracks the open workflow). So stored variables serialize as plain `FlowVariable` data, while computed values are pulled per-read via two narrow public methods on `ProjectManager`:
+- `resolve_project_variable(name, *, project_id) -> FlowVariable` — READ_ONLY snapshot, raises on context-not-ready
+- `project_computed_names(*, project_id) -> frozenset[str]` — the names, cached on `ProjectInfo` at load (names are stable per load; values are volatile)
+
+Within the PROJECT tier, **computed wins over stored**: a stored project variable named like a builtin is unreachable (template load warns about the collision).
+
+## Reserved names
+
+A computed name (builtin or directory) is **reserved in every scope**: `CreateVariableRequest` and `RenameVariableRequest` refuse to create/rename ANY variable (flow or global) to a reserved name of the relevant project. For PROJECT-layer renames the reserved set comes from the variable's *own* project (`request.project_id`), not the current one. Stored project variables are NOT reserved.
+
+## Writable project variables (project.yml `variables:`)
+
+```yaml
+variables:
+  shot_code:
+    value: sc042              # type defaults to "str", permission to read_write
+  frame_start:
+    value: 1001
+    type: int                 # str | int only; strict — no bool/float coercion
+  facility:
+    value: mtl
+    permission: read_only
+```
+
+- Schema: `ProjectVariableDef` (`common/project_templates/variable.py`), strict value types, declared-type/value agreement enforced.
+- Parent/child merge: per-entry atomic; `name: null` tombstones an inherited entry.
+- READ_WRITE entries accept runtime writes (`SetVariableValueRequest` etc.); writes are gated against the schema (str/int, value agrees with declared type) BEFORE mutating, then **eagerly persisted** back to project.yml via `ProjectManager.persist_project_variables` (direct file write — deliberately not through `SaveProjectTemplateRequest`, whose cache invalidation would evict the layer just written).
+- PROJECT-tier *reads* return snapshot copies; the write paths re-fetch the live stored object (`_stored_project_variable_for_write`) so a permitted write mutates real state.
+- Stored project variables also participate in **macro path resolution** (`GetPathForMacroRequest`) at precedence: builtins > directories > caller-supplied > stored project vars > project env > shell env.
 
 ## Key files
 
 | File | Role |
 |------|------|
+| `src/griptape_nodes/retained_mode/variable_types.py` | `FlowVariable`, `VariableLayer` (storage primitive), `VariableScope` (search strategy), `VariableLayerKind` (provenance), `VariablePermission` |
+| `src/griptape_nodes/retained_mode/managers/variable_manager.py` | All stored layers; hierarchical search with provenance; write gating (`_refuse_write` — permission-based); project write-through + persist calls |
+| `src/griptape_nodes/retained_mode/managers/project_manager.py` | Computed namespace (`resolve_project_variable`, `project_computed_names`); `_install_project_variables` at load; `persist_project_variables`; macro handlers with `project_id` |
+| `src/griptape_nodes/common/project_templates/variable.py` | `ProjectVariableDef` schema for project.yml `variables:` |
 | `src/griptape_nodes/exe_types/variable_resolver.py` | Core substitution logic: regex detection, recursive string/dict/list walking, `aprocess_scope()` ContextVar cache |
 | `src/griptape_nodes/common/node_executor.py` | Resolves variables on the orchestrator before dispatching `ExecuteNodeRequest`; passes them in `request.variables` |
 | `src/griptape_nodes/retained_mode/managers/node_manager.py` | On the worker side, `on_execute_node_request` enters `aprocess_scope(request.variables)` before calling `aprocess()` |
-| `src/griptape_nodes/retained_mode/managers/variable_manager.py` | Handles `SetVariableValueRequest` / `SetVariablesRequest` and calls `_unresolve_nodes_referencing_variables()` for dirty tracking |
 | `src/griptape_nodes/exe_types/node_types.py` | `BaseNode.validate_before_workflow_run()` marks nodes with `{VAR}` in parameters as UNRESOLVED before each run |
-| `src/griptape_nodes/retained_mode/events/variable_events.py` | Three "get variables" events: `GetVariablesRequest` (user vars only), `ResolveSubstitutionRequest` (user vars + project macros, for execution), `ListSubstitutablesRequest` / `Substitutable` (for frontend pickers). See the block comment above these classes for the full decision guide. |
+| `src/griptape_nodes/retained_mode/events/variable_events.py` | The request surface (see decision table below) |
+
+## Choosing the right variable request
+
+| Event | Returns | Use when |
+|---|---|---|
+| `ListVariablesRequest` | `variables: list[FlowVariable]` + parallel `layers: list[VariableLayerKind]` | **The enumeration surface.** Execution-time `{VAR}` context AND frontend pickers — derive grouping from `layers[i]` (`project` → macro-ish) and read_only from `permission` |
+| `GetVariablesRequest` | `variables: dict` (hits) + `unresolved: list[str]` (misses) | **Named probe**: "of THESE names, which resolve and to what?" A miss is data, not a failure. Ideal for `ParsedMacro.get_variables()` dry-runs. `names` required |
+| `GetVariableRequest` / `GetVariableValueRequest` / `HasVariableRequest` | single variable / value / bool | Point lookups. The standard library's variable nodes speak these |
+
+All read requests take `lookup_scope: VariableScope` (default HIERARCHICAL; also PROJECT_ONLY, GLOBAL_ONLY, HIERARCHICAL_FROM_PROJECT, CURRENT_FLOW_ONLY, ALL) and `project_id: str | None` (None = current project; an explicit id enables **hypothetical resolution** — "how would this resolve if I were on project Y?").
+
+**DEPRECATED — do not add callers** (deletion tracked in engine issue #5143; GUI migration in griptape-vsl-gui#2668):
+- `ResolveSubstitutionRequest` — superseded by `ListVariablesRequest` (build the dict from `result.variables`)
+- `ListSubstitutablesRequest` / `Substitutable` — superseded by `ListVariablesRequest` + `layers`
+- `SetVariablesRequest` — batch write, zero senders; frozen at pre-#5142 behavior (refuses PROJECT-layer entries)
+
+## Hypothetical resolution (`project_id`)
+
+Six project requests take `project_id: str | None = None`: `GetPathForMacroRequest`, `GetStateForMacroRequest`, `AttemptMatchPathAgainstMacroRequest`, `GetSituationRequest`, `GetAllSituationsForProjectRequest`, `AttemptMapAbsolutePathToProjectRequest` — plus every variable read. `None` = current project; a loaded-but-not-current id answers "how WOULD this resolve on that project?" Caveat: `workflow_name`/`workflow_dir` always come from the *live* workflow context and `workspace_dir` from engine config, regardless of `project_id` — the hypothetical swaps the project, not the open workflow.
 
 ## Data flow
 
@@ -28,7 +99,7 @@ Users write `{VAR_NAME}` tokens inside node parameter values. At node execution 
 CreateVariable / SetVariableValue
         │
         ▼
-VariableManager stores FlowVariable
+VariablesManager stores FlowVariable (project writes → gate → persist to project.yml)
         │
         ▼  (dirty tracking)
 _unresolve_nodes_referencing_variables()
@@ -42,8 +113,9 @@ BaseNode.validate_before_workflow_run()
         │
         ▼
 NodeExecutor._resolve_variables_for_node(node_name)
-  → ResolveSubstitutionRequest(starting_flow=..., lookup_scope=HIERARCHICAL)
-  → VariableResolver._filter_for_substitution(variables)
+  → ListVariablesRequest(starting_flow=..., lookup_scope=HIERARCHICAL)
+  → {v.name: v.value for v in result.variables}
+  → VariableResolver._filter_for_substitution(...)  # str/int only, no bool
   → returns dict[str, str | int]
         │
         ▼
@@ -58,6 +130,8 @@ BaseNode.aprocess()
   → get_parameter_value() calls VariableResolver.substitute()
   → TrackedParameterOutputValues.__setitem__ calls _resolve_variables_in_value()
 ```
+
+During the hierarchical walk, the PROJECT tier resolves computed names fresh (`resolve_project_variable`); a computed value whose context isn't ready (e.g. `{workflow_dir}` before the workflow is saved) is silently skipped with **no stored-layer fallback** — the name exists, it's just unavailable.
 
 ## Display preservation
 
@@ -81,7 +155,7 @@ Workers receive transient nodes that are never registered in `ObjectManager`. Th
 - `get_node_parent_flow_by_name()` raises `KeyError` on workers
 - The lazy "fetch variables from the engine" path fails silently
 
-**Fix**: orchestrators resolve variables before dispatching. `_resolve_variables_for_node` runs on the orchestrator (where the node IS in `ObjectManager`) and passes the resolved dict into `ExecuteNodeRequest.variables`. Workers receive a fully populated dict; they never need to fetch.
+**Fix**: orchestrators resolve variables before dispatching. `_resolve_variables_for_node` runs on the orchestrator (where the node IS in `ObjectManager`) and passes the resolved dict into `ExecuteNodeRequest.variables`. Workers receive a fully populated dict; they never need to fetch. (`ListVariablesRequest` is also in `worker_routing.FORWARDED_REQUEST_TYPES` for the fallback path.)
 
 Critical: `aprocess_scope(request.variables)` — **not** `aprocess_scope(request.variables or None)`. An empty dict (`{}`) means "substitution enabled, no variables defined." `or None` converts that to `None`, which re-triggers the broken lazy fetch path.
 
@@ -92,51 +166,3 @@ Nodes are marked UNRESOLVED (so they re-run) when:
 2. Before each flow run → `validate_before_workflow_run()` catches any nodes that became resolved between edits
 
 Runtime re-queuing is not possible: the flow engine populates the execution queue before execution starts; marking a node UNRESOLVED mid-run has no effect on the current run. The pre-run hook is the reliable interception point.
-
-## `ResolveSubstitutionRequest` behavior
-
-- `names=[]` (default): returns all variables in scope — never errors, even if scope is empty
-- `names=["FOO", "BAR"]`: per-name hierarchical lookup, all-or-nothing — fails if any name is not found (mirrors `SetVariablesRequest` semantics)
-
-## Choosing the right "get variables" event
-
-Three events exist — pick exactly one:
-
-| Event | Returns | Use when |
-|---|---|---|
-| `GetVariablesRequest` | `dict` of user-defined vars only | Variable panel, GetVariable node, any caller that works with variables the user explicitly created |
-| `ResolveSubstitutionRequest` | `dict` of user vars + project macros merged | Execution time — seeding a node run with the full `{VAR}` substitution context |
-| `ListSubstitutablesRequest` | `list[Substitutable]` with metadata | Frontend pickers and autocomplete; carries `source` (`SubstitutableSource.VARIABLE` / `SubstitutableSource.MACRO`) and `read_only` so the UI can render them differently |
-
-`ListVariablesRequest` (separate, not in the table above) returns `list[FlowVariable]` typed objects for the variable manager panel where users create/edit variables.
-
-The `SubstitutableSource` StrEnum values compare equal to their string equivalents (`"variable"`, `"macro"`), so existing JSON serialization round-trips without changes. Future sources (files, env vars, etc.) add members to the enum without changing the response shape.
-
-## Project macro variables
-
-In addition to user-defined workflow variables, the substitution context also includes:
-
-**Builtins** (always available when a project is loaded):
-- `{workspace_dir}` — workspace directory path
-- `{workflow_name}` — current workflow name
-- `{workflow_dir}` — directory containing the saved workflow file (omitted if workflow not yet saved)
-- `{static_files_dir}` — static files directory
-- `{project_dir}` — project directory
-
-**Project template directories** — any custom directories defined in the project config (e.g., `{inputs}`, `{outputs}`)
-
-User-defined workflow variables take priority over all project-level variables.
-
-**How it works**: `NodeExecutor._resolve_variables_for_node` dispatches `ResolveSubstitutionRequest`. Inside `VariablesManager.on_resolve_substitution_request`, `_get_project_macro_variables()` calls `GetCurrentProjectRequest` then `ProjectManager.get_project_substitution_variables(project_info)` — which uses `_build_variable_resolver` and iterates over `BUILTIN_VARIABLES` and `template.directories`, silently skipping anything that can't be resolved. The merge and final filter happen across the two layers:
-
-```python
-# Inside VariablesManager.on_resolve_substitution_request:
-project_vars = self._get_project_macro_variables()
-workflow_vars = {v.name: v.value for v in self._get_variables_by_scope(...)}
-all_vars = {**project_vars, **workflow_vars}  # workflow vars win
-return ResolveSubstitutionResultSuccess(variables=all_vars)
-
-# Inside NodeExecutor._resolve_variables_for_node:
-var_result = GriptapeNodes.handle_request(ResolveSubstitutionRequest(...))
-return VariableResolver._filter_for_substitution(var_result.variables)
-```
