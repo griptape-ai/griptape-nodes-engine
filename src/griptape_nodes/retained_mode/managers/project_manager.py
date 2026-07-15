@@ -34,6 +34,7 @@ from griptape_nodes.common.project_templates import (
     ProjectValidationInfo,
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
+    ProjectVariableDef,
     SituationTemplate,
     default_template_for_version,
     load_partial_project_template,
@@ -137,7 +138,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     read_manifest,
     rename_project_template,
 )
-from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
+from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -733,6 +734,20 @@ class ProjectManager:
         situation_schemas = self._parse_situation_macros(template.situations, validation)
         directory_schemas = self._parse_directory_macros(template.directories, validation)
 
+        # A declared variable that collides with a computed name (builtin or directory)
+        # is legal but shadowed: computed wins within the PROJECT tier, so the stored
+        # value is unreachable until the collision is removed. Warn, don't fail.
+        computed_names = BUILTIN_VARIABLES | set(template.directories.keys())
+        for var_name in template.variables:
+            if var_name in computed_names:
+                validation.add_warning(
+                    field_path=f"variables.{var_name}",
+                    message=(
+                        f"Variable '{var_name}' collides with a builtin or directory name. "
+                        f"The builtin/directory value wins; this variable will never resolve."
+                    ),
+                )
+
         # Now check if validation is usable after collecting all errors
         if not validation.is_usable():
             self._registered_template_status[project_file_path] = validation
@@ -779,6 +794,12 @@ class ProjectManager:
 
         # Store in new consolidated dict
         self._successfully_loaded_project_templates[project_id] = project_info
+
+        # Install the template's declared variables as the project's stored layer.
+        # Load/reload replaces the whole layer (the template is the source of truth
+        # at load time); runtime writes to READ_WRITE entries mutate the layer and
+        # persist back through the save-overlay path.
+        self._install_project_variables(project_id, template)
 
         # Track validation status for all load attempts (for UI display)
         self._registered_template_status[project_file_path] = validation
@@ -2504,7 +2525,7 @@ class ProjectManager:
             result_details=f"Successfully retrieved current project. ID: {self._current_project_id}",
         )
 
-    def on_save_project_template_request(  # noqa: C901, PLR0911
+    def on_save_project_template_request(
         self, request: SaveProjectTemplateRequest
     ) -> SaveProjectTemplateResultSuccess | SaveProjectTemplateResultFailure:
         """Save user customizations to project.yml.
@@ -2534,56 +2555,13 @@ class ProjectManager:
         if template.id is None:
             template.id = str(canonical_path)
 
-        # Step 2: Choose the diff base. When the child declares a parent, the overlay
-        # must diff against the parent's fully-merged template so values inherited
-        # from the parent don't redundantly appear in the child's YAML. The parent
-        # must already be in the registry; if not, fail loudly rather than silently
-        # diffing against system defaults (which would emit inherited values into
-        # the child's overlay).
-        #
-        # Precedence mirrors load: an explicit parent_project_id (portable) wins
-        # and is looked up directly in the registry; otherwise the legacy
-        # parent_project_path is resolved by filesystem path. Per-platform path
-        # mappings are reduced to the active platform's value first; a mapping
-        # with no matching key and no `default` falls back to system defaults
-        # (no parent on this OS).
-        base_template: ProjectTemplate = default_template_for_version(template.project_template_schema_version)
-        if template.parent_project_id is not None:
-            parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
-            if parent_info is None:
-                return SaveProjectTemplateResultFailure(
-                    result_details=(
-                        f"Attempted to save project template to '{request.project_path}'. "
-                        f"Failed because parent project id '{template.parent_project_id}' is not loaded. "
-                        f"Load the parent before saving the child."
-                    ),
-                )
-            base_template = parent_info.template
-        else:
-            selected_parent = select_project_path(template.parent_project_path)
-            if selected_parent is not None:
-                parent_id = self._resolve_parent_path_for_lookup(
-                    selected_parent,
-                    anchor=request.project_path,
-                )
-                if parent_id is None:
-                    return SaveProjectTemplateResultFailure(
-                        result_details=(
-                            f"Attempted to save project template to '{request.project_path}'. "
-                            f"Failed because parent_project_path '{selected_parent}' "
-                            f"is relative and no anchor could be resolved."
-                        ),
-                    )
-                parent_info = self._successfully_loaded_project_templates.get(parent_id)
-                if parent_info is None:
-                    return SaveProjectTemplateResultFailure(
-                        result_details=(
-                            f"Attempted to save project template to '{request.project_path}'. "
-                            f"Failed because parent project '{selected_parent}' "
-                            f"(resolved to '{parent_id}') is not loaded. Load the parent before saving the child."
-                        ),
-                    )
-                base_template = parent_info.template
+        # Step 2: Choose the diff base (shared with persist_project_variables).
+        try:
+            base_template = self._overlay_base_for_template(template, request.project_path)
+        except ValueError as e:
+            return SaveProjectTemplateResultFailure(
+                result_details=f"Attempted to save project template to '{request.project_path}'. Failed because {e}",
+            )
 
         # Step 3: Serialize to YAML
         try:
@@ -2614,6 +2592,96 @@ class ProjectManager:
         return SaveProjectTemplateResultSuccess(
             result_details=f"Successfully saved project template to '{request.project_path}'",
         )
+
+    def _overlay_base_for_template(self, template: ProjectTemplate, project_path: Path) -> ProjectTemplate:
+        """Choose the diff base for saving a template as an overlay.
+
+        When the template declares a parent, the overlay must diff against the parent's
+        fully-merged template so inherited values don't redundantly appear in the child's
+        YAML. The parent must already be in the registry; if not, raise ValueError rather
+        than silently diffing against system defaults (which would emit inherited values
+        into the child's overlay).
+
+        Precedence mirrors load: an explicit parent_project_id (portable) wins and is
+        looked up directly in the registry; otherwise the legacy parent_project_path is
+        resolved by filesystem path. Per-platform path mappings are reduced to the active
+        platform's value first; a mapping with no matching key and no `default` falls back
+        to system defaults (no parent on this OS).
+        """
+        if template.parent_project_id is not None:
+            parent_info = self._successfully_loaded_project_templates.get(template.parent_project_id)
+            if parent_info is None:
+                msg = (
+                    f"parent project id '{template.parent_project_id}' is not loaded. "
+                    f"Load the parent before saving the child."
+                )
+                raise ValueError(msg)
+            return parent_info.template
+
+        selected_parent = select_project_path(template.parent_project_path)
+        if selected_parent is not None:
+            parent_id = self._resolve_parent_path_for_lookup(selected_parent, anchor=project_path)
+            if parent_id is None:
+                msg = f"parent_project_path '{selected_parent}' is relative and no anchor could be resolved."
+                raise ValueError(msg)
+            parent_info = self._successfully_loaded_project_templates.get(parent_id)
+            if parent_info is None:
+                msg = (
+                    f"parent project '{selected_parent}' (resolved to '{parent_id}') is not loaded. "
+                    f"Load the parent before saving the child."
+                )
+                raise ValueError(msg)
+            return parent_info.template
+
+        return default_template_for_version(template.project_template_schema_version)
+
+    def persist_project_variables(self, project_id: str) -> str | None:
+        """Write a project's current stored variables back to its project.yml (#5142).
+
+        Called by VariablesManager after a successful runtime write to a stored project
+        variable. Rebuilds template.variables from the live stored layer (value, type,
+        permission per entry), serializes the template as an overlay against its parent
+        base, and writes the file directly — deliberately NOT via
+        on_save_project_template_request, whose cache invalidation would evict this
+        project and discard the very stored layer that was just written.
+
+        Returns an error string on failure (caller logs it), None on success. In-file
+        projects only: a project with no file path (e.g. system defaults) returns an
+        error since there is nowhere to persist.
+        """
+        project_info = self._successfully_loaded_project_templates.get(project_id)
+        if project_info is None:
+            return f"project '{project_id}' is not loaded"
+        if project_info.project_file_path is None:
+            return f"project '{project_id}' has no backing file to persist to"
+
+        stored_variables = GriptapeNodes.VariablesManager().stored_project_variables(project_id)
+        project_info.template.variables = {
+            variable.name: ProjectVariableDef(
+                name=variable.name,
+                value=variable.value,
+                type="int" if variable.type == "int" else "str",
+                permission=variable.permission,
+            )
+            for variable in stored_variables
+        }
+
+        try:
+            base_template = self._overlay_base_for_template(project_info.template, project_info.project_file_path)
+        except ValueError as e:
+            return str(e)
+
+        try:
+            yaml_content = project_info.template.to_overlay_yaml(base_template)
+        except Exception as e:  # mirror on_save_project_template_request's broad serialization guard
+            return f"YAML serialization failed: {e}"
+
+        try:
+            File(str(project_info.project_file_path)).write_text(yaml_content)
+        except FileWriteError as e:
+            return f"file write failed: {e}"
+
+        return None
 
     async def on_upgrade_project_schema_request(  # noqa: PLR0911
         self, request: UpgradeProjectSchemaRequest
@@ -3599,6 +3667,27 @@ class ProjectManager:
             return frozenset()
         project_info = self._successfully_loaded_project_templates[effective]
         return project_info.computed_variable_names
+
+    def _install_project_variables(self, project_id: str, template: ProjectTemplate) -> None:
+        """Install a template's declared variables as the project's stored layer in VariablesManager.
+
+        Called on load and reload — the layer is replaced wholesale, so a reload picks up
+        template edits and drops entries the template no longer declares. Names that collide
+        with computed names (builtins/directories) are installed but shadowed at resolution
+        (computed wins within the PROJECT tier); template validation already warns on them.
+        """
+        layer = VariableLayer()
+        for var_name, var_def in template.variables.items():
+            layer.set(
+                FlowVariable(
+                    name=var_name,
+                    owning_flow_name=None,
+                    type=var_def.type,
+                    value=var_def.value,
+                    permission=var_def.permission,
+                )
+            )
+        GriptapeNodes.VariablesManager().set_project_variables(project_id, layer)
 
     def resolve_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable:
         """Resolve a computed project variable (builtin or template directory) to a snapshot FlowVariable.

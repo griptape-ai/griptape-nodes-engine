@@ -28,6 +28,7 @@ FIELD_SITUATIONS = "situations"
 FIELD_DIRECTORIES = "directories"
 FIELD_PROJECT_TEMPLATE_SCHEMA_VERSION = "project_template_schema_version"
 FIELD_ENVIRONMENT = "environment"
+FIELD_VARIABLES = "variables"
 FIELD_FILE_EXTENSION_DIRECTORIES = "file_extension_directories"
 FIELD_DESCRIPTION = "description"
 FIELD_PARENT_PROJECT_PATH = "parent_project_path"
@@ -92,9 +93,13 @@ class ProjectOverlayData(NamedTuple):
     parent_project_id: str | None = None
     workspace_dir: str | PerPlatformProjectPath | None = None
     libraries_dir: str | PerPlatformProjectPath | None = None
+    # variable_name -> raw dict. Defaulted (unlike situations/directories) so overlay
+    # construction sites that predate the variables feature keep working unchanged.
+    variables: dict[str, dict[str, Any]] = {}  # noqa: RUF012 — read-only; loader always passes explicitly
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
+    removed_variables: frozenset[str] = frozenset()
     removed_file_extension_directories: frozenset[str] = frozenset()
     clears_description: bool = False
     clears_parent_project_path: bool = False
@@ -163,7 +168,22 @@ def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
     return YAMLParseResult(data=data, line_info=line_info)
 
 
-def load_project_template_from_yaml(  # noqa: C901
+def _inject_names_from_keys(data: dict[str, Any], section_field: str) -> None:
+    """Copy each dict key into its entry's `name` field for a named-item section.
+
+    YAML expresses named items as `section: {key: {...}}`; the pydantic models
+    carry the key as an explicit `name` field, injected here before validation.
+    Non-dict sections/entries are left for validation to report.
+    """
+    section = data.get(section_field)
+    if not isinstance(section, dict):
+        return
+    for item_name, item_data in section.items():
+        if isinstance(item_data, dict):
+            item_data[FIELD_NAME] = item_name
+
+
+def load_project_template_from_yaml(
     yaml_text: str,
     validation_info: ProjectValidationInfo,
 ) -> ProjectTemplate | None:
@@ -201,16 +221,10 @@ def load_project_template_from_yaml(  # noqa: C901
     data = result.data
     line_info = result.line_info
 
-    # Add names to situations and directories before validation
-    if FIELD_SITUATIONS in data and isinstance(data[FIELD_SITUATIONS], dict):
-        for sit_name, sit_data in data[FIELD_SITUATIONS].items():
-            if isinstance(sit_data, dict):
-                sit_data[FIELD_NAME] = sit_name
-
-    if FIELD_DIRECTORIES in data and isinstance(data[FIELD_DIRECTORIES], dict):
-        for dir_name, dir_data in data[FIELD_DIRECTORIES].items():
-            if isinstance(dir_data, dict):
-                dir_data[FIELD_NAME] = dir_name
+    # Add names to named-item sections before validation (models carry their
+    # dict key as a `name` field).
+    for section_field in (FIELD_SITUATIONS, FIELD_DIRECTORIES, FIELD_VARIABLES):
+        _inject_names_from_keys(data, section_field)
 
     try:
         template = ProjectTemplate.model_validate(data)
@@ -357,6 +371,20 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         environment_raw = {}
 
     environment, removed_environment = _split_tombstones(environment_raw)
+
+    # Optional field: variables (default to empty dict). Values are raw dicts here;
+    # per-entry pydantic validation (ProjectVariableDef) happens during merge, mirroring
+    # situations/directories.
+    variables_raw = data.get(FIELD_VARIABLES, {})
+    if not isinstance(variables_raw, dict):
+        validation_info.add_error(
+            field_path=FIELD_VARIABLES,
+            message=f"Must be dict, got {type(variables_raw).__name__}",
+            line_number=line_info.get_line(FIELD_VARIABLES),
+        )
+        variables_raw = {}
+
+    variables, removed_variables = _split_tombstones(variables_raw)
 
     # Optional field: file_extension_directories (default to empty dict)
     file_extension_directories_raw = data.get(FIELD_FILE_EXTENSION_DIRECTORIES, {})
@@ -518,9 +546,11 @@ def load_partial_project_template(  # noqa: C901, PLR0912, PLR0915
         parent_project_id=parent_project_id,
         workspace_dir=workspace_dir,
         libraries_dir=libraries_dir,
+        variables=variables,
         removed_situations=frozenset(removed_situations),
         removed_directories=frozenset(removed_directories),
         removed_environment=frozenset(removed_environment),
+        removed_variables=frozenset(removed_variables),
         removed_file_extension_directories=frozenset(removed_file_extension_directories),
         clears_description=clears_description,
         clears_parent_project_path=clears_parent_project_path,

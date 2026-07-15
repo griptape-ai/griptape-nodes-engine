@@ -32,6 +32,7 @@ from griptape_nodes.common.project_templates.validation import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
 )
+from griptape_nodes.common.project_templates.variable import ProjectVariableDef
 
 __all__ = [
     "DEFAULT_PROJECT_TEMPLATE",
@@ -49,6 +50,7 @@ __all__ = [
     "ProjectValidationProblem",
     "ProjectValidationProblemSeverity",
     "ProjectValidationStatus",
+    "ProjectVariableDef",
     "SituationFilePolicy",
     "SituationPolicy",
     "SituationTemplate",

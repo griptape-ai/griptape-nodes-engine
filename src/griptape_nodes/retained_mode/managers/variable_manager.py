@@ -140,25 +140,30 @@ class VariablesManager:
         return layer
 
     def _writable_storage_layer(
-        self, variable: FlowVariable, found_layer: VariableLayerKind | None
+        self, variable: FlowVariable, found_layer: VariableLayerKind | None, *, project_id: str | None = None
     ) -> VariableLayer | None:
         """Return the storage layer a resolved variable lives in, for delete/rename.
 
         Routes by real layer provenance (found_layer), NOT by owning_flow_name — a project
         variable also has owning_flow_name=None, so that field alone can't tell GLOBAL from
-        PROJECT. Callers must have already rejected PROJECT/READ_ONLY writes via _refuse_write,
-        so only FLOW and GLOBAL reach here; anything else returns None (nothing to mutate).
+        PROJECT. Callers must have already rejected READ_ONLY writes via _refuse_write.
 
-        No PROJECT case: project storage is owned by ProjectManager (reached only via events,
-        and reads return snapshot copies), and there is no write-through path yet.
-        TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5142): when writable
-        project-definition variables land, route PROJECT writes through ProjectManager.
+        PROJECT resolves to the project's stored layer (#5142): a variable that reached
+        here through the PROJECT tier and passed the permission gate is necessarily a
+        stored entry (computed builtins/directories are READ_ONLY and were refused).
+        ``project_id=None`` means the current project. Callers that mutate a project
+        layer must follow up with _persist_project_layer so the change reaches disk.
         """
         match found_layer:
             case VariableLayerKind.GLOBAL:
                 return self._global_layer
             case VariableLayerKind.FLOW:
                 return self._flow_layers.get(variable.owning_flow_name) if variable.owning_flow_name else None
+            case VariableLayerKind.PROJECT:
+                effective = self._effective_project_id(project_id)
+                if effective is None:
+                    return None
+                return self._project_layers.get(effective)
             case _:
                 return None
 
@@ -233,6 +238,18 @@ class VariablesManager:
             return {}
         return {variable.name: variable.value for variable in project_layer.list()}
 
+    def stored_project_variables(self, project_id: str) -> list[FlowVariable]:
+        """Snapshot copies of a project's STORED variables, full objects (no computed names).
+
+        Read seam for ProjectManager.persist_project_variables: after a runtime write to
+        a project variable, ProjectManager rebuilds template.variables from this list and
+        saves. Snapshots, so persistence can never mutate stored state through the list.
+        """
+        project_layer = self._project_layers.get(project_id)
+        if project_layer is None:
+            return []
+        return [self._snapshot_variable(variable) for variable in project_layer.list()]
+
     def _effective_project_id(self, project_id: str | None) -> str | None:
         """Resolve None → current project id; returns None when no project is available."""
         return GriptapeNodes.ProjectManager().resolve_project_id(project_id)
@@ -272,13 +289,50 @@ class VariablesManager:
         stored = project_layer.get(name)
         if stored is None:
             return None
+        return self._snapshot_variable(stored)
+
+    @staticmethod
+    def _snapshot_variable(variable: FlowVariable) -> FlowVariable:
+        """Copy a stored variable so callers can't mutate stored state through a response payload."""
         return FlowVariable(
-            name=stored.name,
-            owning_flow_name=stored.owning_flow_name,
-            type=stored.type,
-            value=stored.value,
-            permission=stored.permission,
+            name=variable.name,
+            owning_flow_name=variable.owning_flow_name,
+            type=variable.type,
+            value=variable.value,
+            permission=variable.permission,
         )
+
+    def _stored_project_variable_for_write(self, name: str, *, project_id: str | None) -> FlowVariable | None:
+        """Return the LIVE stored project variable for a write-through mutation (#5142).
+
+        Unlike _get_project_variable (which snapshots for reads), this returns the real
+        stored object so a permitted write mutates project state. Computed names never
+        reach here: they resolve as READ_ONLY snapshots and _refuse_write bounces them.
+        ``project_id=None`` means the current project. None when the name isn't stored.
+        """
+        effective = self._effective_project_id(project_id)
+        if effective is None:
+            return None
+        project_layer = self._project_layers.get(effective)
+        if project_layer is None:
+            return None
+        return project_layer.get(name)
+
+    def _persist_project_variables(self, *, project_id: str | None) -> None:
+        """Ask ProjectManager to write the project's stored variables back to project.yml (#5142).
+
+        Eager save: every successful runtime write to a project variable persists
+        immediately, so a crash can't lose an acknowledged write. Persistence failure
+        is logged, not raised — the in-memory write already succeeded and callers have
+        their Success result; the next save retries the whole layer (it rebuilds
+        template.variables from current stored state, not from a delta).
+        """
+        effective = self._effective_project_id(project_id)
+        if effective is None:
+            return
+        error = GriptapeNodes.ProjectManager().persist_project_variables(effective)
+        if error is not None:
+            logger.warning("Project variable change for project '%s' not persisted: %s", effective, error)
 
     def _list_project_variable_names(self, *, project_id: str | None) -> list[str]:
         """List every variable name a project defines (computed + stored layer), deduped.
@@ -421,27 +475,19 @@ class VariablesManager:
     def _refuse_write(variable: FlowVariable, verb: str, found_layer: VariableLayerKind | None) -> str | None:
         """Return a failure message if this variable can't be written through this API, else None.
 
-        Two independent reasons a write is refused:
-
-        - The resolved variable lives in the PROJECT layer. The Variables API has no
-          write-through path to a project's variables — they're owned by the project
-          (template builtins/directories, or the project's stored variables) and mutated through
-          the project, not here. This holds regardless of the entry's stored permission:
-          routing such a write by ``owning_flow_name`` would misfire into the global
-          layer (KeyError) or silently mutate a throwaway snapshot, so it must be
-          rejected at the boundary.
-          TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5142): once a
-          project write-through path exists, relax this to bounce only READ_ONLY project
-          entries so READ_WRITE stored project variables become writable.
-        - The variable is READ_ONLY.
+        Permission-based (#5142): the only refusal is READ_ONLY. Project-layer entries are
+        writable when their stored permission allows it — computed values (builtins and
+        template directories) resolve as READ_ONLY snapshots, so they're refused here
+        without a special layer case, while a READ_WRITE stored project variable passes
+        and writes through to the project's stored layer (and persists to project.yml).
         """
-        layer = found_layer.value if found_layer is not None else "unknown"
-        if found_layer is VariableLayerKind.PROJECT:
-            return (
-                f"Attempted to {verb} variable '{variable.name}'. Found in the {layer} layer, which is not "
-                f"writable through this request — modify the project to change its variables."
-            )
         if variable.permission is VariablePermission.READ_ONLY:
+            layer = found_layer.value if found_layer is not None else "unknown"
+            if found_layer is VariableLayerKind.PROJECT:
+                return (
+                    f"Attempted to {verb} variable '{variable.name}'. Found in the {layer} layer, where it is "
+                    f"read-only — modify the project to change it."
+                )
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
@@ -573,7 +619,18 @@ class VariablesManager:
         if refusal is not None:
             return SetVariableValueResultFailure(result_details=refusal)
 
-        result.variable.value = request.value
+        # PROJECT-tier reads return snapshots — writing result.variable would silently
+        # mutate a throwaway copy. Fetch the real stored object, mutate it, persist.
+        if result.found_layer is VariableLayerKind.PROJECT:
+            stored = self._stored_project_variable_for_write(request.name, project_id=request.project_id)
+            if stored is None:
+                return SetVariableValueResultFailure(
+                    result_details=f"Attempted to set the value of variable '{request.name}'. Failed due to an internal error: the resolved project variable is not present in its stored layer."
+                )
+            stored.value = request.value
+            self._persist_project_variables(project_id=request.project_id)
+        else:
+            result.variable.value = request.value
         self._unresolve_nodes_referencing_variables([request.name])
         return SetVariableValueResultSuccess(result_details=f"Successfully set value for variable '{request.name}'.")
 
@@ -620,7 +677,17 @@ class VariablesManager:
         if refusal is not None:
             return SetVariableTypeResultFailure(result_details=refusal)
 
-        result.variable.type = request.type
+        # PROJECT-tier reads return snapshots — write through to the real stored object.
+        if result.found_layer is VariableLayerKind.PROJECT:
+            stored = self._stored_project_variable_for_write(request.name, project_id=request.project_id)
+            if stored is None:
+                return SetVariableTypeResultFailure(
+                    result_details=f"Attempted to set the type of variable '{request.name}'. Failed due to an internal error: the resolved project variable is not present in its stored layer."
+                )
+            stored.type = request.type
+            self._persist_project_variables(project_id=request.project_id)
+        else:
+            result.variable.type = request.type
         return SetVariableTypeResultSuccess(
             result_details=f"Successfully set type for variable '{request.name}' to '{request.type}'."
         )
@@ -651,16 +718,18 @@ class VariablesManager:
         variable = result.variable
 
         # Route by real layer provenance (found_layer), not owning_flow_name — _refuse_write
-        # above already bounced PROJECT/READ_ONLY, so this is a FLOW or GLOBAL variable.
-        storage_layer = self._writable_storage_layer(variable, result.found_layer)
+        # above already bounced READ_ONLY, so this is a FLOW, GLOBAL, or writable PROJECT variable.
+        storage_layer = self._writable_storage_layer(variable, result.found_layer, project_id=request.project_id)
         if storage_layer is None or not storage_layer.has(variable.name):
-            # Unreachable: a resolved FLOW/GLOBAL variable always maps to a storage layer that
+            # Unreachable: a resolved writable variable always maps to a storage layer that
             # contains it. Guard anyway so a broken invariant fails loudly instead of returning a
             # "successfully deleted" lie.
             return DeleteVariableResultFailure(
                 result_details=f"Attempted to delete variable '{request.name}'. Failed due to an internal error: the resolved variable is not present in its storage layer."
             )
         storage_layer.delete(variable.name)
+        if result.found_layer is VariableLayerKind.PROJECT:
+            self._persist_project_variables(project_id=request.project_id)
 
         return DeleteVariableResultSuccess(result_details=f"Successfully deleted variable '{request.name}'.")
 
@@ -719,12 +788,12 @@ class VariablesManager:
         # or a global is allowed (only reserved names, handled above, are off-limits), so the
         # check is same-layer only, mirroring create's own-flow duplicate check. Route by real
         # layer provenance (found_layer), not owning_flow_name — a project var also has
-        # owning_flow_name=None, though _refuse_write already bounced those.
-        storage_layer = self._writable_storage_layer(variable, result.found_layer)
+        # owning_flow_name=None.
+        storage_layer = self._writable_storage_layer(variable, result.found_layer, project_id=request.project_id)
         if storage_layer is None:
-            # Unreachable: _refuse_write bounced PROJECT/READ_ONLY, so a FLOW/GLOBAL variable
-            # always maps to a storage layer. Guard anyway so a broken invariant fails loudly
-            # instead of returning a "successfully renamed" lie.
+            # Unreachable: _refuse_write bounced READ_ONLY, so a writable variable always maps
+            # to a storage layer. Guard anyway so a broken invariant fails loudly instead of
+            # returning a "successfully renamed" lie.
             return RenameVariableResultFailure(
                 result_details=f"Attempted to rename variable '{request.name}'. Failed due to an internal error: no writable storage layer for the resolved variable."
             )
@@ -736,6 +805,8 @@ class VariablesManager:
         # Update the variable name and storage key in the layer it lives in.
         old_name = variable.name
         storage_layer.rename(old_name, request.new_name)
+        if result.found_layer is VariableLayerKind.PROJECT:
+            self._persist_project_variables(project_id=request.project_id)
 
         return RenameVariableResultSuccess(
             result_details=f"Successfully renamed variable '{old_name}' to '{request.new_name}'."
@@ -913,10 +984,10 @@ class VariablesManager:
             # same-named user global are distinguished by layer, not by name-matching.
             from_project = resolved_variable.layer is VariableLayerKind.PROJECT
             source = SubstitutableSource.MACRO if from_project else SubstitutableSource.VARIABLE
-            # Project-layer entries have no write-through path via this API (_refuse_write
-            # bounces every PROJECT-layer write), so they are read-only to the picker
-            # regardless of a stored entry's permission. Other layers honor permission.
-            read_only = from_project or variable.permission is VariablePermission.READ_ONLY
+            # Permission is the writability truth (#5142 write-through): computed project
+            # values resolve READ_ONLY so shipped behavior is unchanged, while a READ_WRITE
+            # stored project variable is honestly editable in the picker.
+            read_only = variable.permission is VariablePermission.READ_ONLY
             substitutables.append(
                 Substitutable(name=variable.name, value=filtered[variable.name], source=source, read_only=read_only)
             )
@@ -1009,10 +1080,10 @@ class VariablesManager:
     def on_set_variables_request(self, request: SetVariablesRequest) -> ResultPayload:
         """DEPRECATED shim: set multiple variable values atomically (all-or-nothing).
 
-        No known senders — kept wire-identical for out-of-tree scripts.
-        Refuses the whole batch if any variable isn't writable through this API
-        (READ_ONLY, or resolved from the project layer) — callers see the constraint
-        with no partial writes.
+        No known senders — kept frozen at its pre-#5142 behavior for out-of-tree scripts:
+        PROJECT-layer entries are refused regardless of stored permission (this shim never
+        gained the project write-through; use SetVariableValueRequest for that). Refuses
+        the whole batch if any variable isn't writable — no partial writes.
         TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): delete.
         """
         try:
@@ -1031,9 +1102,10 @@ class VariablesManager:
             if lookup.variable is None:
                 missing.append(name)
                 continue
-            # Same writability gate as the single-value path: rejects READ_ONLY and
-            # project-layer variables (which have no write-through path via this API).
-            if self._refuse_write(lookup.variable, verb="set", found_layer=lookup.found_layer) is not None:
+            # Frozen shim gate: READ_ONLY refused (like the live paths), and PROJECT-layer
+            # entries refused wholesale — deprecated code doesn't grow the write-through.
+            is_project = lookup.found_layer is VariableLayerKind.PROJECT
+            if is_project or self._refuse_write(lookup.variable, verb="set", found_layer=lookup.found_layer):
                 not_writable.append(name)
                 continue
             found[name] = lookup.variable
@@ -1042,7 +1114,8 @@ class VariablesManager:
             return SetVariablesResultFailure(
                 result_details=(
                     f"Attempted to set variables {not_writable!r}. At least one is not writable through "
-                    f"this request (read-only, or owned by the project layer)."
+                    f"this deprecated request (read-only, or owned by the project layer — use "
+                    f"SetVariableValueRequest for project variables)."
                 )
             )
 
