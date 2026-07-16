@@ -164,6 +164,7 @@ plugins:
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
         Enterprise:
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
+          - enterprise/using_the_admin_server.md: Activate the desktop app with a license through the Admin Server
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
         Node reference:
@@ -457,3 +458,4 @@ nav:
       - Configuration Reference: reference/configuration_reference.md
   - Enterprise:
       - Admin Server: enterprise/admin_server.md
+      - Using the Admin Server: enterprise/using_the_admin_server.md
