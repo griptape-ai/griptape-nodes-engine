@@ -17,7 +17,7 @@ class InitConfig:
     workspace_directory: str | None = None
     api_key: str | None = None
     storage_backend: str | None = None
-    register_advanced_library: bool | None = None
+    register_diffusers_library: bool | None = None
     register_griptape_cloud_library: bool | None = None
     config_values: dict[str, Any] | None = None
     secret_values: dict[str, str] | None = None
@@ -45,9 +45,9 @@ GT_CLOUD_BASE_URL = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
 ENV_WORKSPACE_DIRECTORY = os.getenv("GTN_WORKSPACE_DIRECTORY")
 ENV_API_KEY = os.getenv("GTN_API_KEY")
 ENV_STORAGE_BACKEND = os.getenv("GTN_STORAGE_BACKEND")
-ENV_REGISTER_ADVANCED_LIBRARY = (
-    os.getenv("GTN_REGISTER_ADVANCED_LIBRARY", "false").lower() == "true"
-    if os.getenv("GTN_REGISTER_ADVANCED_LIBRARY") is not None
+ENV_REGISTER_DIFFUSERS_LIBRARY = (
+    os.getenv("GTN_REGISTER_DIFFUSERS_LIBRARY", "false").lower() == "true"
+    if os.getenv("GTN_REGISTER_DIFFUSERS_LIBRARY") is not None
     else None
 )
 ENV_LIBRARIES_SYNC = (
