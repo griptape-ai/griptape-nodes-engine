@@ -171,6 +171,7 @@ plugins:
           - libraries/advanced_media/index.md: Advanced Media Library overview
           - libraries/opencolorio/*.md
           - libraries/openexr/*.md
+          - libraries/nuke/*.md
           - libraries/diffusers/*.md
 
 extra_css:
@@ -486,6 +487,11 @@ nav:
           - Display EXR Part: libraries/openexr/display_exr_part.md
           - Display EXR Channel: libraries/openexr/display_exr_channel.md
           - Save EXR: libraries/openexr/save_exr.md
+      - Nuke:
+          - Overview: libraries/nuke/index.md
+          - Nuke Start Flow: libraries/nuke/nuke_start_flow.md
+          - Nuke End Flow: libraries/nuke/nuke_end_flow.md
+          - Nuke Script: libraries/nuke/nuke_script.md
   - Development:
       - Scripting: development/retained_mode.md
       - Custom Nodes:
