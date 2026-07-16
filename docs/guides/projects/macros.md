@@ -82,7 +82,7 @@ Mirror of the [separator format](#separator-format), but the text is **prepended
   file_name_base="render", version not provided             →  render.png
 ```
 
-The load-bearing pattern: pair with a [sequence slot](#sequence-slot-) to get a version suffix that comes and goes with the sequence:
+The load-bearing pattern: pair with a [sequence slot](#sequence-slot) to get a version suffix that comes and goes with the sequence:
 
 ```
 render{###?:^_v}.png
