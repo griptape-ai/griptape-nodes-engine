@@ -482,7 +482,7 @@ def _prompt_for_diffusers_library(*, default_prompt_for_diffusers_library: bool 
         default_prompt_for_diffusers_library = False
     explainer = """[bold cyan]Diffusers Library[/bold cyan]
     Would you like to install the Griptape Nodes Diffusers Library?
-    This node library makes diffusion nodes for advanced media generation and manipulation available.
+    This node library makes media generation and manipulation with Diffusers available.
     For example, nodes are available for Flux AI image generation, or to leverage CUDA for GPU-accelerated image generation.
     CAVEAT: Installing this library requires additional dependencies to download and install, which can take several minutes.
     The Griptape Nodes Diffusers Library can be added later by following instructions here: [bold blue][link=https://docs.griptapenodes.com]https://docs.griptapenodes.com[/link][/bold blue].
