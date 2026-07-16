@@ -210,7 +210,6 @@ theme:
   features:
     - content.code.copy
     - navigation.tabs
-    - navigation.expand
     - navigation.top
     - navigation.tabs.sticky
     - navigation.sections
@@ -445,20 +444,6 @@ nav:
               - Save Video: nodes/video/save_video.md
               - Split Video: nodes/video/split_video.md
               - Video Color Match: nodes/video/video_color_match.md
-      - Advanced Media Library:
-          - Overview: libraries/advanced_media/index.md
-          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
-          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
-      - OpenColorIO:
-          - Overview: libraries/opencolorio/index.md
-          - Load OCIO Config: libraries/opencolorio/load_ocio_config.md
-          - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
-      - OpenEXR:
-          - Overview: libraries/openexr/index.md
-          - Load EXR: libraries/openexr/load_exr.md
-          - Display EXR Part: libraries/openexr/display_exr_part.md
-          - Display EXR Channel: libraries/openexr/display_exr_channel.md
-          - Save EXR: libraries/openexr/save_exr.md
       - Diffusers:
           - Overview: libraries/diffusers/index.md
           - Pipeline:
@@ -487,6 +472,20 @@ nav:
               - Decode HDR Latents: libraries/diffusers/decode_hdr_latents.md
           - IO:
               - Save Latent Tensor: libraries/diffusers/save_latent_tensor.md
+      - Advanced Media Library:
+          - Overview: libraries/advanced_media/index.md
+          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
+          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
+      - OpenColorIO:
+          - Overview: libraries/opencolorio/index.md
+          - Load OCIO Config: libraries/opencolorio/load_ocio_config.md
+          - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
+      - OpenEXR:
+          - Overview: libraries/openexr/index.md
+          - Load EXR: libraries/openexr/load_exr.md
+          - Display EXR Part: libraries/openexr/display_exr_part.md
+          - Display EXR Channel: libraries/openexr/display_exr_channel.md
+          - Save EXR: libraries/openexr/save_exr.md
   - Development:
       - Scripting: development/retained_mode.md
       - Custom Nodes:
