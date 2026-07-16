@@ -14,7 +14,6 @@ plugins:
       redirect_maps:
         configuration.md: guides/configuration.md
         configuration_reference.md: reference/configuration_reference.md
-        libraries.md: guides/libraries.md
         command_line_interface.md: reference/command_line_interface.md
         retained_mode.md: development/retained_mode.md
         publishing/index.md: guides/publishing.md
@@ -166,8 +165,13 @@ plugins:
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
-        Node reference:
+        Node libraries:
+          - libraries/index.md: Overview of node libraries (installed by default and installable)
           - nodes/*.md
+          - libraries/advanced_media/index.md: Advanced Media Library overview
+          - libraries/opencolorio/*.md
+          - libraries/openexr/*.md
+          - libraries/diffusers/*.md
 
 extra_css:
   - assets/css/extra.css
@@ -295,24 +299,12 @@ nav:
           - OpenAI API Keys: guides/integrations/openai.md
           - Grok API Keys: guides/integrations/grok.md
           - Hugging Face Models: guides/integrations/hugging_face.md
-  - Development:
-      - Scripting: development/retained_mode.md
-      - Custom Nodes:
-          - Overview: development/custom_nodes/index.md
-          - Getting Started: development/custom_nodes/getting_started.md
-          - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
-          - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
-          - Strict Mode Reference: development/custom_nodes/strict_mode.md
-          - Example Control Node: development/custom_nodes/example_control_node.py
-      - For Agents: for_agents.md
-  - Reference:
-      - Nodes:
+  - Libraries:
+      - Overview: libraries/index.md
+      - Standard Library:
           - Overview: nodes/overview.md
           - 3D:
               - Load 3D: nodes/three_d/load_gltf.md
-          - Advanced Media Library:
-              - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
-              - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
           - Agents:
               - Agent: nodes/agents/create_agent.md
           - Audio:
@@ -453,6 +445,59 @@ nav:
               - Save Video: nodes/video/save_video.md
               - Split Video: nodes/video/split_video.md
               - Video Color Match: nodes/video/video_color_match.md
+      - Advanced Media Library:
+          - Overview: libraries/advanced_media/index.md
+          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
+          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
+      - OpenColorIO:
+          - Overview: libraries/opencolorio/index.md
+          - Load OCIO Config: libraries/opencolorio/load_ocio_config.md
+          - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
+      - OpenEXR:
+          - Overview: libraries/openexr/index.md
+          - Load EXR: libraries/openexr/load_exr.md
+          - Display EXR Part: libraries/openexr/display_exr_part.md
+          - Display EXR Channel: libraries/openexr/display_exr_channel.md
+          - Save EXR: libraries/openexr/save_exr.md
+      - Diffusers:
+          - Overview: libraries/diffusers/index.md
+          - Pipeline:
+              - Modular Diffusion Pipeline Builder: libraries/diffusers/pipeline_builder.md
+              - ControlNet Pipeline: libraries/diffusers/controlnet_pipeline.md
+              - Load LoRA: libraries/diffusers/load_lora.md
+              - LoRA Pipeline: libraries/diffusers/lora_pipeline.md
+          - Create:
+              - Create Noise Latents: libraries/diffusers/create_noise_latents.md
+              - Create Empty Latents: libraries/diffusers/empty_latents.md
+          - Processing:
+              - Generate Media Latents: libraries/diffusers/generate_media_latents.md
+              - Latent Upsampler: libraries/diffusers/latent_upsampler.md
+          - Transform:
+              - Add Latents: libraries/diffusers/add_latents.md
+              - Subtract Latents: libraries/diffusers/subtract_latents.md
+              - Multiply Latents: libraries/diffusers/multiply_latents.md
+              - Latents Composite Mask: libraries/diffusers/latents_composite_mask.md
+          - Conditioning:
+              - Configure ControlNet: libraries/diffusers/configure_controlnet.md
+              - Media Generation Conditioning: libraries/diffusers/media_gen_conditioning.md
+          - Encode / Decode:
+              - Encode Media Latent: libraries/diffusers/encode_media_latent.md
+              - Encode Masked Media Latent: libraries/diffusers/encode_masked_media_latent.md
+              - Decode Media Latent: libraries/diffusers/decode_media_latent.md
+              - Decode HDR Latents: libraries/diffusers/decode_hdr_latents.md
+          - IO:
+              - Save Latent Tensor: libraries/diffusers/save_latent_tensor.md
+  - Development:
+      - Scripting: development/retained_mode.md
+      - Custom Nodes:
+          - Overview: development/custom_nodes/index.md
+          - Getting Started: development/custom_nodes/getting_started.md
+          - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
+          - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
+          - Strict Mode Reference: development/custom_nodes/strict_mode.md
+          - Example Control Node: development/custom_nodes/example_control_node.py
+      - For Agents: for_agents.md
+  - Reference:
       - Command Line Interface: reference/command_line_interface.md
       - Configuration Reference: reference/configuration_reference.md
   - Enterprise:
