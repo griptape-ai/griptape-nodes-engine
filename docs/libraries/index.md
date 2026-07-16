@@ -20,6 +20,12 @@ dependency isolation, and Shared/Isolated modes work, see the
 | [OpenEXR](openexr/index.md)                       | 4     | Load, inspect, display, and save OpenEXR files for VFX and HDR image workflows                                         | None (optionally pairs with OpenColorIO)                  |
 | [Diffusers](diffusers/index.md)                   | 19    | Modular 🧨 Diffusers pipelines — build media generation workflows from individual, connectable diffusion stages        | GPU (CUDA or MPS)                                         |
 
+This is not an exhaustive list — many more first-party and community
+libraries are available in the
+[Griptape Nodes directory](https://github.com/griptape-ai/griptape-nodes-directory).
+You can also browse them from the editor via the **Browse Community
+Libraries** button in the **Add Library** modal.
+
 ## Installing a library
 
 The Standard Library is registered automatically, and the Advanced Media
