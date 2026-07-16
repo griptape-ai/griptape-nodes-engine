@@ -48,7 +48,7 @@ def init_command(  # noqa: PLR0913
         bool | None,
         typer.Option(
             "--register-diffusers-library/--no-register-diffusers-library",
-            help="Install the Griptape Modular Diffusion Nodes Library.",
+            help="Install the Griptape Nodes Diffusers Library.",
         ),
     ] = None,
     register_griptape_cloud_library: Annotated[
@@ -481,11 +481,11 @@ def _prompt_for_diffusers_library(*, default_prompt_for_diffusers_library: bool 
     if default_prompt_for_diffusers_library is None:
         default_prompt_for_diffusers_library = False
     explainer = """[bold cyan]Diffusers Library[/bold cyan]
-    Would you like to install the Griptape Modular Diffusion Nodes Library?
-    This node library makes modular diffusion nodes for advanced media generation and manipulation available.
+    Would you like to install the Griptape Nodes Diffusers Library?
+    This node library makes diffusion nodes for advanced media generation and manipulation available.
     For example, nodes are available for Flux AI image generation, or to leverage CUDA for GPU-accelerated image generation.
     CAVEAT: Installing this library requires additional dependencies to download and install, which can take several minutes.
-    The Griptape Modular Diffusion Nodes Library can be added later by following instructions here: [bold blue][link=https://docs.griptapenodes.com]https://docs.griptapenodes.com[/link][/bold blue].
+    The Griptape Nodes Diffusers Library can be added later by following instructions here: [bold blue][link=https://docs.griptapenodes.com]https://docs.griptapenodes.com[/link][/bold blue].
     """
     console.print(Panel(explainer, expand=False))
 
