@@ -32,7 +32,7 @@ version in the lightbox — to get a context menu with:
     thumbnail, the one shown in the workflow browser. This updates the
     workflow's saved metadata immediately.
 
-<!-- screenshot: right-click context menu open on an image node, showing Copy image / Copy image URL / Save image / Make thumbnail -->
+<!-- screenshot (#5166): right-click context menu open on an image node, showing Copy image / Copy image URL / Save image / Make thumbnail -->
 
 ## Comparing two images with a slider
 
@@ -45,7 +45,7 @@ comparison area to slide the divider.
 Hover to reveal an expand button that opens the same comparison
 full-screen, with each side labeled by its filename. Escape closes it.
 
-<!-- screenshot: image compare slider mid-drag, divider partway across the frame -->
+<!-- screenshot (#5166): image compare slider mid-drag, divider partway across the frame -->
 
 ## Cropping an image
 
@@ -65,7 +65,7 @@ overlay to resize the crop region, or use:
 a new image file — the node itself is responsible for applying the
 crop when it runs. **Cancel** discards your changes.
 
-<!-- screenshot: crop modal with drag handles on an image and the aspect-ratio preset buttons visible in the sidebar -->
+<!-- screenshot (#5166): crop modal with drag handles on an image and the aspect-ratio preset buttons visible in the sidebar -->
 
 ## Painting a mask
 
@@ -93,7 +93,7 @@ paired with a separate mask, painting edits that mask instead and
 saves it as its own grayscale file, keeping the source image
 untouched.
 
-<!-- screenshot: Paint Mask editor with a brush stroke mid-paint and the Invert/Reset/Flood Fill buttons visible in the sidebar -->
+<!-- screenshot (#5166): Paint Mask editor with a brush stroke mid-paint and the Invert/Reset/Flood Fill buttons visible in the sidebar -->
 
 ## Image Bash: compositing images and paint layers
 
@@ -124,7 +124,7 @@ Default brush and canvas settings live in the editor's Settings panel
 — search for "ImageBash" to find the card. Changing a default there
 only affects new sessions of the tool going forward.
 
-<!-- screenshot: Image Bash open with several image layers and a brush layer in the sidebar, transform handles visible on the selected layer -->
+<!-- screenshot (#5166): Image Bash open with several image layers and a brush layer in the sidebar, transform handles visible on the selected layer -->
 
 ## Playing and comparing video
 
@@ -149,7 +149,7 @@ with a switch to choose which side's audio track plays.
 
 Right-click a video for **Copy video URL** and **Save video**.
 
-<!-- screenshot: video player with the frame timeline and markers visible, one marker being dragged -->
+<!-- screenshot (#5166): video player with the frame timeline and markers visible, one marker being dragged -->
 
 ## Playing audio
 
@@ -189,7 +189,7 @@ Hover the viewer and click the expand icon to open the same model
 full-screen, with slow auto-rotation while it's open. Escape or the
 close button exits.
 
-<!-- screenshot: 3D model viewer with an orbited glTF model and the expand icon visible on hover -->
+<!-- screenshot (#5166): 3D model viewer with an orbited glTF model and the expand icon visible on hover -->
 
 ## Viewing Gaussian splats
 
@@ -222,4 +222,4 @@ workflow) to all of them at once. Images without embedded metadata are
 always added as plain image nodes, regardless of which option you
 pick.
 
-<!-- screenshot: the "Workflow found in image" dialog with "Add Nodes from Workflow" selected and the node/library lists expanded -->
+<!-- screenshot (#5166): the "Workflow found in image" dialog with "Add Nodes from Workflow" selected and the node/library lists expanded -->

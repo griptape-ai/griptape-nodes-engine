@@ -5,7 +5,7 @@ others come from a library you haven't installed yet. Both are managed from
 the editor's **Manage** menu, in the **Model Management** and **Library
 Management** windows. This page covers both.
 
-<!-- screenshot: the Manage menu open, showing Model Management and Library Management items -->
+<!-- screenshot (#5166): the Manage menu open, showing Model Management and Library Management items -->
 
 For the concepts behind libraries — how installs are isolated from each
 other, Shared vs. Isolated execution, and what to do when something goes
@@ -17,7 +17,7 @@ management windows themselves.
 Open **Manage → Model Management** to search for, download, and clean up
 models.
 
-<!-- screenshot: the Model Management window with the search box, filter chips, and a couple of installed models listed -->
+<!-- screenshot (#5166): the Model Management window with the search box, filter chips, and a couple of installed models listed -->
 
 ### Searching for a model
 
@@ -57,7 +57,7 @@ Click the trash icon on an entry that's still downloading to cancel it. A
 **Cancel Download** confirmation appears first — **Keep Downloading** backs
 out, **Cancel Download** stops it and removes the partial download record.
 
-<!-- screenshot: the Cancel Download confirmation dialog -->
+<!-- screenshot (#5166): the Cancel Download confirmation dialog -->
 
 ### Deleting a model
 
@@ -68,7 +68,7 @@ removes the files from local storage, and any workflow that depends on that
 model will fail until you either re-download it or point the workflow at a
 different one.
 
-<!-- screenshot: the Delete Model confirmation dialog -->
+<!-- screenshot (#5166): the Delete Model confirmation dialog -->
 
 ### Gated models need a token
 
@@ -90,7 +90,7 @@ gated model.
 Open **Manage → Library Management** to install, update, and remove
 libraries.
 
-<!-- screenshot: the Library Management window with the filter bar and a few installed libraries listed -->
+<!-- screenshot (#5166): the Library Management window with the filter bar and a few installed libraries listed -->
 
 The filter bar at the top lets you search installed libraries by name and
 narrow the list with the **All / Updates / Errors** chips — **Errors** is
@@ -108,7 +108,7 @@ Click **Add Library** to open the **Add Library** dialog. Paste a Git URL —
 for example a GitHub repository hosting a community library — and click
 **Install**.
 
-<!-- screenshot: the Add Library dialog with a Git URL entered and Advanced Options expanded -->
+<!-- screenshot (#5166): the Add Library dialog with a Git URL entered and Advanced Options expanded -->
 
 The editor first inspects the repository and shows you a confirmation with
 the library's name, description, version, and node count before actually

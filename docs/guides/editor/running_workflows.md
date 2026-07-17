@@ -11,7 +11,7 @@ The **Run Workflow** button, in the center of the header, runs every node
 in the current workflow from the start. It's disabled while a workflow is
 already running, and while no workflow is open.
 
-<!-- screenshot: the header's run button group (Run Workflow, Run To Selected, Run From Selected, Cancel Run) -->
+<!-- screenshot (#5166): the header's run button group (Run Workflow, Run To Selected, Run From Selected, Cancel Run) -->
 
 | Shortcut                        | Action       |
 | ------------------------------- | ------------ |
@@ -75,7 +75,7 @@ The **Execution Log** panel (right sidebar) collects everything the engine
 logs while your workflow runs — engine messages as well as anything a node
 itself logs, tagged with the node's name when available.
 
-<!-- screenshot: the Execution Log panel showing a mix of INFO/WARNING/ERROR entries with node badges -->
+<!-- screenshot (#5166): the Execution Log panel showing a mix of INFO/WARNING/ERROR entries with node badges -->
 
 What you can do from the panel:
 
@@ -105,7 +105,7 @@ and its source. Click an entry to see the full error in a modal. **Clear
 All** empties the list; the small × next to an individual entry removes
 just that one.
 
-<!-- screenshot: the Error History dropdown open, showing a couple of recorded errors -->
+<!-- screenshot (#5166): the Error History dropdown open, showing a couple of recorded errors -->
 
 ## Saving
 
@@ -130,7 +130,7 @@ save shows a **Cannot Save While Flow is Running** dialog explaining that
 you need to cancel or wait for the run to finish first, with a shortcut
 button to cancel the flow right from the dialog.
 
-<!-- screenshot: the Cannot Save While Flow is Running dialog -->
+<!-- screenshot (#5166): the Cannot Save While Flow is Running dialog -->
 
 A **Saving workflow…** overlay appears briefly at the bottom of the screen
 while a save is in progress.
@@ -156,7 +156,7 @@ saves applies here too, just silently instead of via a dialog.
 understanding *why* the engine is evaluating your workflow the way it is,
 rather than just *whether* a node succeeded.
 
-<!-- screenshot: a node with its Developer Mode panel expanded, showing upstream dependency chips -->
+<!-- screenshot (#5166): a node with its Developer Mode panel expanded, showing upstream dependency chips -->
 
 With it enabled, every node gets a collapsible **Developer Mode** strip
 that lists its upstream data dependencies — the nodes actually feeding it

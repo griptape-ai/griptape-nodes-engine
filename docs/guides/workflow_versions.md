@@ -13,7 +13,7 @@ name: saving `my_workflow.py` this way produces `my_workflow_v001.py`, then
 `my_workflow_v002.py`, and so on. The version number always advances; it
 never overwrites an existing version file.
 
-<!-- screenshot: the File menu open with Save As New Version highlighted -->
+<!-- screenshot (#5166): the File menu open with Save As New Version highlighted -->
 
 ## When to use it
 

@@ -12,7 +12,7 @@ task instead, the [Where to go next](#where-to-go-next) section links
 to focused guides for nodes, groups, running workflows, media editors,
 and library management.
 
-<!-- screenshot: full editor window with the canvas, header, left sidebar, and right sidebar all visible and labeled -->
+<!-- screenshot (#5166): full editor window with the canvas, header, left sidebar, and right sidebar all visible and labeled -->
 
 ## The canvas
 
@@ -44,7 +44,7 @@ you can do with a node once it's placed, and
 [Keyboard Shortcuts](keyboard_shortcuts.md) for the full list of
 canvas shortcuts.
 
-<!-- screenshot: canvas with a few connected nodes, the minimap visible in a corner, and the bottom-left controls cluster -->
+<!-- screenshot (#5166): canvas with a few connected nodes, the minimap visible in a corner, and the bottom-left controls cluster -->
 
 ## The header
 
@@ -76,7 +76,7 @@ On the **right**, an engine picker (for switching which running engine
 the editor talks to), an error history dropdown, and a **Publish
 Workflow** button that opens the publish dialog.
 
-<!-- screenshot: header close-up showing the workflow name with unsaved indicator, the run button cluster, and the right-side engine picker -->
+<!-- screenshot (#5166): header close-up showing the workflow name with unsaved indicator, the run button cluster, and the right-side engine picker -->
 
 ## The menu bar
 
@@ -126,7 +126,7 @@ Settings** (copies the settings file's path to your clipboard),
 **Show Settings Folder** (opens it in Finder/Explorer/your file
 manager), and **Reset Settings to Default**.
 
-<!-- screenshot: the menu bar with the File menu open, showing its items and shortcuts -->
+<!-- screenshot (#5166): the menu bar with the File menu open, showing its items and shortcuts -->
 
 ## The left sidebar
 
@@ -149,7 +149,7 @@ workflow. Click the sidebar-toggle button in the header (or its
 shortcut) to collapse the sidebar down to a narrow icon rail, or close
 it entirely.
 
-<!-- screenshot: left sidebar expanded, showing the Favorites section, search box, and the Nodes tab's category tree -->
+<!-- screenshot (#5166): left sidebar expanded, showing the Favorites section, search box, and the Nodes tab's category tree -->
 
 ## The right sidebar
 
@@ -176,7 +176,7 @@ The four panels:
 If the sidebar is closed, a floating button near the top-right corner
 of the canvas reopens it.
 
-<!-- screenshot: right sidebar showing the panel tabs (Chat, Code, Logs, Properties) with the panel-visibility dropdown open -->
+<!-- screenshot (#5166): right sidebar showing the panel tabs (Chat, Code, Logs, Properties) with the panel-visibility dropdown open -->
 
 ## Where to go next
 

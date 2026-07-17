@@ -22,7 +22,7 @@ default for `Cmd/Ctrl+G`** at the bottom before picking a type to skip the
 picker next time. Until you've set a default, `Cmd/Ctrl+G` opens the picker
 too.
 
-<!-- screenshot: the group type picker open, showing the built-in group types with the "make default" checkbox -->
+<!-- screenshot (#5166): the group type picker open, showing the built-in group types with the "make default" checkbox -->
 
 A new group is sized to wrap whatever was selected when you created it, with
 a bit of padding. Dropping a node onto an existing group's body adds it to
@@ -98,7 +98,7 @@ in) or right edge (things flowing out). You don't create these by hand: drag
 a connection from an inside node's handle to an outside node (or vice versa)
 and the wall parameter appears automatically, wired straight through.
 
-<!-- screenshot: an expanded subflow group showing wall parameters lined up on its left and right edges -->
+<!-- screenshot (#5166): an expanded subflow group showing wall parameters lined up on its left and right edges -->
 
 Behind the scenes each wall parameter is a proxy: the engine deletes the
 direct connection, adds a matching parameter on the group, and reconnects
@@ -153,7 +153,7 @@ when the group is selected), alongside the same collapse and duplicate
 controls every group has. Running a group resolves it — and, transitively,
 whatever it depends on upstream — the same way running any single node does.
 
-<!-- screenshot: a selected subflow group with its toolbar showing the Run Group button -->
+<!-- screenshot (#5166): a selected subflow group with its toolbar showing the Run Group button -->
 
 A subflow group also carries an **Execution Environment** setting (group
 settings popover), which chooses where its nodes actually run. It defaults

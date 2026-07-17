@@ -36,7 +36,7 @@ directories, [Situations](projects/situations.md) for the save rule each
 kind of file follows, and [Project](projects/index.md) for how to
 customize all of it.
 
-<!-- screenshot: the default project's folder layout in a file manager, with inputs and outputs visible -->
+<!-- screenshot (#5166): the default project's folder layout in a file manager, with inputs and outputs visible -->
 
 ## How the editor previews and downloads files
 
@@ -71,7 +71,7 @@ when the file's extension is recognized; if a file with the same name is
 already there, the new upload gets a numbered suffix (`photo_001.png`)
 instead of overwriting it.
 
-<!-- screenshot: dragging a file onto a node's file parameter, showing the drop target highlighted -->
+<!-- screenshot (#5166): dragging a file onto a node's file parameter, showing the drop target highlighted -->
 
 Under the hood this is a two-step handoff rather than the browser talking
 to your filesystem directly: the editor asks the engine for an upload URL,

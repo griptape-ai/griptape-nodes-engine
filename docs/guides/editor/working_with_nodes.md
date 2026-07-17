@@ -23,7 +23,7 @@ tag, or browse the category tree. A **Favorites** section (star a node to add
 it) and a **Recent** section (your last few added node types) sit above the
 category list when you have either.
 
-<!-- screenshot: the Add Node menu open at the cursor, showing search results and category tree -->
+<!-- screenshot (#5166): the Add Node menu open at the cursor, showing search results and category tree -->
 
 You can also drag a node type from the **Nodes** tab in the left sidebar
 straight onto the canvas.
@@ -41,7 +41,7 @@ actions that apply to all of them at once — Copy, Duplicate, Lock, Reset,
 Delete, and Create Group, depending on what's configured in **Settings →
 Editor → Button Customization**.
 
-<!-- screenshot: two or more selected nodes with the floating multi-node toolbar visible above them -->
+<!-- screenshot (#5166): two or more selected nodes with the floating multi-node toolbar visible above them -->
 
 The arrow keys move the selection to the nearest node in that direction,
 which is a fast way to step through a chain of connected nodes without
@@ -64,7 +64,7 @@ which takes a single base name and applies it across the whole selection:
 the first node gets the base name exactly, and the rest get `Base_1`,
 `Base_2`, and so on.
 
-<!-- screenshot: the Rename nodes dialog with a base name typed in and the preview text showing Base, Base_1, Base_2 -->
+<!-- screenshot (#5166): the Rename nodes dialog with a base name typed in and the preview text showing Base, Base_1, Base_2 -->
 
 ## Duplicating, copying, and pasting
 
@@ -129,7 +129,7 @@ dot node right at that spot — the original connection is split into two,
 routed through the new dot node, with no change to the data that flows
 through it.
 
-<!-- screenshot: a connection with a dot node inserted partway along its path -->
+<!-- screenshot (#5166): a connection with a dot node inserted partway along its path -->
 
 Deleting a dot node reconnects its two neighbors directly, so removing one
 never breaks the flow.
@@ -154,7 +154,7 @@ Open the right sidebar that hosts it with `Cmd/Ctrl+B`, from the
 right-click menu's **Property Panel** entry, or from a node's header button if
 you've added it there.
 
-<!-- screenshot: the Properties panel showing a selected node's parameters -->
+<!-- screenshot (#5166): the Properties panel showing a selected node's parameters -->
 
 Editing a value in the Properties panel and editing the same parameter's
 inline row on the node update the same underlying value.
@@ -181,7 +181,7 @@ Depending on the type you pick, more options appear — a multiline/Markdown
 toggle for text, a slider with min/max/step for numbers, or a fixed set of
 choices (with optional icons, subtitles, and a search box) for a dropdown.
 
-<!-- screenshot: the Add New Parameter dialog with the type dropdown open -->
+<!-- screenshot (#5166): the Add New Parameter dialog with the type dropdown open -->
 
 ### Configuring an existing custom parameter
 

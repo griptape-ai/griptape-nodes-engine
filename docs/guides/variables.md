@@ -35,7 +35,7 @@ new value the next time it runs.
 The **Variables** category in the node library has a small family of nodes
 for creating and managing variables:
 
-<!-- screenshot: the Variables category in the node library panel, showing Create Variable, Set Variable, Get Variable, Has Variable, Set Variables from Data, and Set Variable Substitution -->
+<!-- screenshot (#5166): the Variables category in the node library panel, showing Create Variable, Set Variable, Get Variable, Has Variable, Set Variables from Data, and Set Variable Substitution -->
 
 - **Create Variable** — creates a variable with a name, type, and initial
     value, or updates it if a variable with that name already exists in the
@@ -56,7 +56,7 @@ for creating and managing variables:
 - **Has Variable** — checks whether a variable exists, so you can branch on
     it (for example, only create a variable the first time a flow runs).
 
-<!-- screenshot: a Create Variable node configured with variable_name "project_name" and a text value wired into its value input -->
+<!-- screenshot (#5166): a Create Variable node configured with variable_name "project_name" and a text value wired into its value input -->
 
 **Create Variable** and **Set Variable** always create the variable in the
 node's own flow (flow-scoped, described below) — there's currently no node
@@ -138,7 +138,7 @@ Type `{` inside any text parameter that supports it and the editor pops up
 a variable picker listing every variable and project macro currently in
 scope, grouped by source:
 
-<!-- screenshot: a text parameter field with the { picker open, showing grouped variables and project macros -->
+<!-- screenshot (#5166): a text parameter field with the { picker open, showing grouped variables and project macros -->
 
 Pick one, or just type the name and close the brace yourself —
 `{project_name}` — and its value is substituted in at execution time. If
@@ -219,7 +219,7 @@ several prompt fields.
     you typed), with the second one rendering `autumn-campaign` where the
     slug spec applies.
 
-<!-- screenshot: the finished flow with a Create Variable node feeding project_name into two prompt fields that show the resolved {project_name} text -->
+<!-- screenshot (#5166): the finished flow with a Create Variable node feeding project_name into two prompt fields that show the resolved {project_name} text -->
 
 To change the project for a new run, edit the value on the **Create
 Variable** node (or wire a different source into it) — every field
