@@ -134,6 +134,10 @@ plugins:
           - guides/projects/sequences.md: Numbered file sequences (patterns and policies)
           - guides/projects/version_pinning.md: Pinning engine and library versions
           - guides/projects/customization.md: Customization guide
+        Workflows:
+          - guides/variables.md: Workflow variables — scopes, variable nodes, and inline {name} substitution
+          - guides/assets.md: Where generated files go, storage backends, and uploads
+          - guides/workflow_versions.md: Save As New Version and versioned workflow files
         Publishing:
           - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
@@ -292,7 +296,11 @@ nav:
           - Sequences: guides/projects/sequences.md
           - Version Pinning: guides/projects/version_pinning.md
           - Customization Guide: guides/projects/customization.md
-      - Publishing Workflows: guides/publishing.md
+      - Workflows:
+          - Variables: guides/variables.md
+          - Assets & Outputs: guides/assets.md
+          - Workflow Versions: guides/workflow_versions.md
+          - Publishing: guides/publishing.md
       - MCP:
           - Overview: guides/mcp/index.md
           - Getting Started: guides/mcp/getting_started.md
