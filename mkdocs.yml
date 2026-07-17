@@ -61,7 +61,8 @@ plugins:
         guides/agent/sending_messages.md: guides/agent/index.md
         developing_nodes/index.md: development/custom_nodes/index.md
         developing_nodes/getting_started.md: development/custom_nodes/getting_started.md
-        developing_nodes/comprehensive_guide.md: development/custom_nodes/comprehensive_guide.md
+        developing_nodes/comprehensive_guide.md: development/custom_nodes/index.md
+        development/custom_nodes/comprehensive_guide.md: development/custom_nodes/index.md
         developing_nodes/node_isolation_with_workers.md: development/custom_nodes/node_isolation_with_workers.md
         developing_nodes/strict_mode.md: development/custom_nodes/strict_mode.md
         projects/index.md: guides/projects/index.md
@@ -166,8 +167,14 @@ plugins:
         Custom nodes:
           - development/custom_nodes/index.md: Developing custom nodes overview
           - development/custom_nodes/getting_started.md: Beginner-friendly intro to node development
-          - development/custom_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - development/custom_nodes/parameters.md: Parameter attributes, traits, helper classes, containers, and advanced parameter patterns
           - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
+          - development/custom_nodes/execution_and_lifecycle.md: Lifecycle callbacks and asynchronous API integration patterns
+          - development/custom_nodes/project_system.md: Saving files from nodes through the project system (situations, macros, ProjectFileParameter)
+          - development/custom_nodes/error_handling.md: Best practices for secrets, imports, validation, error handling, and logging
+          - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
+          - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
+          - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
@@ -523,8 +530,14 @@ nav:
       - Custom Nodes:
           - Overview: development/custom_nodes/index.md
           - Getting Started: development/custom_nodes/getting_started.md
-          - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
+          - Parameters: development/custom_nodes/parameters.md
           - Parameter UI Reference: development/custom_nodes/parameter_ui_reference.md
+          - Execution and Lifecycle: development/custom_nodes/execution_and_lifecycle.md
+          - Project System: development/custom_nodes/project_system.md
+          - Best Practices and Error Handling: development/custom_nodes/error_handling.md
+          - Authoring Libraries: development/custom_nodes/authoring_libraries.md
+          - Custom Widgets: development/custom_nodes/custom_widgets.md
+          - Patterns and Examples: development/custom_nodes/examples.md
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py

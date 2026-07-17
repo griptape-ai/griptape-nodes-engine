@@ -5,7 +5,7 @@
     This guide is available as post-processed markdown for AI coding assistants. The site exposes a full machine-readable surface; see [For Agents](../../for_agents.md) for the index.
 
     - **Getting Started** (this page): [Markdown](https://docs.griptapenodes.com/en/stable/development/custom_nodes/getting_started/index.md)
-    - **Comprehensive Guide**: [Markdown](https://docs.griptapenodes.com/en/stable/development/custom_nodes/comprehensive_guide/index.md)
+    - **Overview**: [Markdown](https://docs.griptapenodes.com/en/stable/development/custom_nodes/index.md)
     - **Example Code**: [View Python Example](https://raw.githubusercontent.com/griptape-ai/griptape-nodes/main/docs/development/custom_nodes/example_control_node.py)
 
     **Usage:** Point your AI assistant to these URLs with instructions like:
@@ -14,7 +14,7 @@
 This page is for developers who are **new to the Griptape Nodes ecosystem** and want to build custom nodes with confidence.
 
 It’s a beginner-friendly “front door” to the deeper, exhaustive technical material in the
-[Comprehensive Node Development Guide](comprehensive_guide.md).
+rest of this section — see the [Overview](index.md) for the full map of reference pages.
 
 ## What you’ll build (mentally) before you write code
 
@@ -129,8 +129,8 @@ These helpers are useful because they:
 - often support `accept_any=True` to convert values safely
 - expose several UI options as Python properties for runtime updates
 
-If you need a quick reference, see the **Parameter helper constructs** section in the
-[Comprehensive Node Development Guide](comprehensive_guide.md).
+If you need a quick reference, see the
+[Parameter helper constructs](parameters.md#parameter-helper-constructs-parameterstring-parameterint) section of the Parameters reference.
 
 ### Containers: `ParameterList` and `ParameterDictionary`
 
@@ -201,5 +201,5 @@ When a node needs an API key or other secret:
 
 ## Next steps
 
-- Read the deeper technical guide: [Comprehensive Node Development Guide](comprehensive_guide.md)
+- Read the deeper technical references: [Parameters](parameters.md), [Execution and Lifecycle](execution_and_lifecycle.md), and the rest of the pages in this section
 - Browse a few nodes in the standard library and copy patterns that match your use case

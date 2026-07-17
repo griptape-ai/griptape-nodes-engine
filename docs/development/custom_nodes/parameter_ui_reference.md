@@ -6,7 +6,7 @@ This page maps what you declare on a `Parameter` in Python to what the editor re
 1. **`ui_options`** tweaks that widget: hide it, stretch it full-width, make a text field multiline, add a webcam capture button.
 1. **Traits** bundle UI and behavior together: `Slider` renders a slider *and* validates the range, `Options` renders a dropdown *and* constrains the value to its choices. Under the hood, a trait writes its own keys into `ui_options` — traits are the supported way to get those keys right.
 
-Prefer the [parameter helper classes](comprehensive_guide.md#parameter-helper-constructs-parameterstring-parameterint) (`ParameterString`, `ParameterImage`, ...) and traits when one exists for what you want; reach for raw `ui_options` keys only for the presentation tweaks listed here.
+Prefer the [parameter helper classes](parameters.md#parameter-helper-constructs-parameterstring-parameterint) (`ParameterString`, `ParameterImage`, ...) and traits when one exists for what you want; reach for raw `ui_options` keys only for the presentation tweaks listed here.
 
 !!! warning "Undocumented keys are internal"
 
@@ -113,7 +113,7 @@ For a bounded slider, use the `Slider` trait rather than writing `ui_options["sl
 | `collapsed` | Start the list collapsed.                       |
 | `columns`   | Lay items out in a grid with this many columns. |
 
-`ParameterList` sets the common list options for you — see [ParameterList Pattern](comprehensive_guide.md#parameterlist-pattern).
+`ParameterList` sets the common list options for you — see [ParameterList Pattern](parameters.md#parameterlist-pattern).
 
 ## Traits
 
@@ -132,4 +132,4 @@ Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `t
 | `CompareImagesTrait` | `dict`                    | Validates the two-image dict shape used by the comparison slider (pair with `ui_options["compare"]`). | —                                                        |
 | `Widget`             | any                       | Replaces the built-in widget with a custom widget shipped by a library.                               | `widget`, `library`                                      |
 
-See the [Traits section of the Comprehensive Guide](comprehensive_guide.md#traits) for constructor signatures and examples.
+See the [Traits section of the Parameters reference](parameters.md#traits) for constructor signatures and examples.
