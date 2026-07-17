@@ -4978,7 +4978,6 @@ class TestProjectManagerProjectWorkspaces:
     @pytest.mark.asyncio
     async def test_activation_child_falls_to_global_when_no_ancestor_workspace(self, tmp_path: Path) -> None:
         """No false positive: a child whose (unloaded) parent declares no workspace uses the global default."""
-        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         pm, mock_config, _parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
@@ -4989,7 +4988,9 @@ class TestProjectManagerProjectWorkspaces:
 
         await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
 
-        mock_config.set_workspace_override.assert_called_once_with(Path(str(_canon(Path("/global/ws")))))
+        # Branch 5 pins the RAW configured workspace_directory (canonicalization happens inside the
+        # real set_workspace_override, which is mocked here), so assert the unmodified config value.
+        mock_config.set_workspace_override.assert_called_once_with(Path("/global/ws"))
 
     @pytest.mark.asyncio
     async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
