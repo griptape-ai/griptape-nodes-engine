@@ -63,6 +63,20 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Prefer the named helpers over composing primitives** - `sanitize_path_string`, `expand_path`, `resolve_path_safely`, and `normalize_path_for_platform` are building blocks. If you find yourself chaining them, use one of the two canonicalize helpers instead so behavior stays consistent across call sites.
 
+## Documentation
+
+**Update docs with user-facing changes** - When a change affects what users see or do, update the documentation in the same PR. Common mappings:
+
+- New or changed CLI commands/flags → `docs/reference/command_line_interface.md`
+- New or changed settings → `docs/reference/configuration_reference.md` (and `docs/guides/configuration.md` if it needs explanation)
+- New user-facing features or request event families → the relevant page under `docs/guides/`, or a new page
+- Editor-facing behavior changes (shortcuts, menus, panels) → `docs/guides/editor/`
+- Deprecated or renamed nodes → `MIGRATION.md` and the node's doc page
+
+**Wire new pages into mkdocs.yml twice** - A new docs page must be added to both the `nav` section and the `llmstxt` plugin sections in `mkdocs.yml`. Verify with `uv run mkdocs build --strict`.
+
+**Write for artists** - Docs follow the same rule as error messages: understandable by artists, not just engineers. Use exact UI labels, menu paths, and shortcuts. Match the voice of existing pages such as `docs/guides/libraries.md`.
+
 ## Architecture
 
 **Singleton managers** - `GriptapeNodes` is a singleton holding 25+ managers (e.g., `FlowManager`, `NodeManager`), each accessed via `GriptapeNodes.ManagerName()` classmethods.
