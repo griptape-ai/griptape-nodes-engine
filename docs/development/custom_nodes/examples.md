@@ -285,32 +285,15 @@ class MyIterativeNode(BaseIterativeStartNode):
 
 ## Modern UI/UX Patterns
 
-### Advanced UI Options
+### UI Options
 
-```python
-ui_options={
-    "hide_property": True,      # Hide from property panel
-    "pulse_on_run": True,       # Visual feedback during execution
-    "expander": True,           # Collapsible parameter groups
-    "is_full_width": True,      # Full-width display
-    "multiline": True,          # Multi-line text input
-    "placeholder_text": "...",  # Input placeholder
-    "display_name": "...",      # Custom display name
-    "markdown": True,           # Markdown rendering
-    "compare": True,            # Comparison mode
-    "clickable_file_browser": True,  # File browser integration
-    "hide": True,               # ⭐ CORRECT: Completely hide parameter
-    "collapsed": True,          # Start parameter groups collapsed
-    "edit_mask": True,          # Enable mask editing for images
-}
-```
+The supported `ui_options` keys, the widget each parameter type renders, and the traits that manage them are documented authoritatively in the [Parameter UI Reference](parameter_ui_reference.md). Keys not listed there are editor-internal and may change without notice.
 
 #### Hidden Parameters Best Practice
 
 Use `"hide": True` to hide parameters from the UI (for advanced/expert settings):
 
 ```python
-# ✅ CORRECT: Hidden parameter with slider
 num_images_param = Parameter(
     name="num_images",
     input_types=["int"],
@@ -320,15 +303,14 @@ num_images_param = Parameter(
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
     ui_options={
         "display_name": "Number of Images",
-        "hide": True  # ⭐ CORRECT pattern
+        "hide": True,
     },
 )
 num_images_param.add_trait(Slider(min_val=1, max_val=9))
 self.add_parameter(num_images_param)
-
-# ⚠️ LEGACY: "hidden": True exists but is rare (3 instances vs 47)
-ui_options={"hidden": True}  # Less common, prefer "hide": True
 ```
+
+A legacy `"hidden": True` key also exists in a few older nodes; prefer `"hide": True`.
 
 **Common Use Cases for Hidden Parameters:**
 

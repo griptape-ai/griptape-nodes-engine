@@ -1,70 +1,18 @@
 # Working with the Project System
 
-The **project system** is Griptape Nodes' centralized file management framework that handles file organization, naming, and saving across all workflows. It eliminates hard-coded file paths and provides a consistent, configurable approach to file operations.
+The **project system** is Griptape Nodes' centralized file management framework that handles file organization, naming, and saving across all workflows. It eliminates hard-coded file paths and provides a consistent, configurable approach to file operations. This page covers the node-developer side: how a node saves files through the project system.
 
-## Overview
+## Concepts
 
-Before the project system, nodes used `StaticFilesManager.save_static_file()` with UUID-based filenames scattered across various locations. The project system replaces this with:
+The concepts behind the project system — the workspace, project templates, situations, macros, directories, and environment variables — are documented in the [Project system guides](../../guides/projects/index.md):
 
-- **Centralized configuration**: File organization rules defined in `griptape-nodes-project.yml`
-- **Named situations**: Semantic contexts for file operations (e.g., "save_node_output", "copy_external_file")
-- **Template-based paths**: Dynamic path generation using macros like `{outputs}/{node_name}_{file_name_base}.{file_extension}`
-- **Consistent behavior**: All nodes automatically follow the same file layout
+- [Overview](../../guides/projects/index.md) — how the pieces fit together
+- [Situations](../../guides/projects/situations.md) — named file-saving scenarios, collision policies, and the full table of default situations
+- [Macros](../../guides/projects/macros.md) — the template syntax used to build file paths
+- [Directories](../../guides/projects/directories.md) — logical name-to-path mappings referenced in macros
+- [Customization Guide](../../guides/projects/customization.md) — how users override paths and situations via `griptape-nodes-project.yml`
 
-## Key Components
-
-### Workspace
-
-The root directory containing all project work. Configured in Griptape Nodes settings, it serves as the base for relative path resolution.
-
-```
-workspace/
-├── griptape-nodes-project.yml    # Optional customizations
-├── my_workflow/
-│   ├── inputs/
-│   ├── outputs/
-│   ├── temp/
-│   └── .griptape-nodes-previews/
-```
-
-### Situations
-
-Named scenarios that define:
-
-1. **Where** files are saved (via macro templates)
-1. **How** to handle collisions (create_new, overwrite, fail)
-1. **Fallback** behavior if saving fails
-
-Common situations include:
-
-| Situation            | Purpose                | Default Macro Pattern                                                   |
-| -------------------- | ---------------------- | ----------------------------------------------------------------------- |
-| `save_node_output`   | Generated node outputs | `{outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}` |
-| `copy_external_file` | External file imports  | `{inputs}/{node_name?:_}{parameter_name?:_}{file_name_base}...`         |
-| `download_url`       | Downloaded files       | `{inputs}/{sanitized_url}`                                              |
-| `save_preview`       | Thumbnail generation   | `{previews}/{source_relative_path?:/}...`                               |
-
-### Macros
-
-Template strings in situations and directories that generate concrete file paths dynamically. Examples:
-
-- `{outputs}` - resolves to the outputs directory path
-- `{node_name}` - current node's name
-- `{file_name_base}` - filename without extension
-- `{file_extension}` - file extension
-- `{_index?:03}` - auto-incrementing counter (3-digit format)
-
-### Directories
-
-Logical name-to-path mappings that can be referenced in macros:
-
-```yaml
-directories:
-  outputs:
-    path_macro: "outputs"
-  custom_renders:
-    path_macro: "my_custom_path/{workflow_name}"
-```
+The short version for node authors: a **situation** names a file-saving scenario (e.g. `save_node_output`), its **macro** template (e.g. `{outputs}/{node_name?:_}{file_name_base}{_index?:03}.{file_extension}`) generates the concrete path, and users can customize all of it without any changes to your node's code.
 
 ## Using the Project System in Nodes
 
@@ -211,27 +159,9 @@ def new_save_video(video_bytes: bytes) -> VideoUrlArtifact:
 - **`save_preview`**: For generating thumbnail or preview images
 - **`save_static_file`**: For static assets that don't change between runs
 
-## Advanced Configuration
+See [Situations](../../guides/projects/situations.md#default-situations) for the full table of default situations, their macros, and collision policies.
 
-Users can customize the project system by creating a `griptape-nodes-project.yml` file in their workspace:
-
-```yaml
-project_template_schema_version: "0.1.0"
-name: "My Custom Project"
-
-directories:
-  outputs:
-    path_macro: "final_outputs/{workflow_name}"
-
-situations:
-  save_node_output:
-    macro: "{outputs}/{node_name}_{file_name_base}_{_index:04}.{file_extension}"
-    policy:
-      on_collision: create_new
-      create_dirs: true
-```
-
-Your nodes automatically respect these customizations without any code changes.
+Users can override any of these (paths, macros, collision policies) through their project's `griptape-nodes-project.yml` — see the [Customization Guide](../../guides/projects/customization.md). Your nodes automatically respect these customizations without any code changes.
 
 ## Best Practices
 
