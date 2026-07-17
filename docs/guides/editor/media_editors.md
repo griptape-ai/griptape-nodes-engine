@@ -202,7 +202,8 @@ exits.
 ## Loading a workflow from an image
 
 Griptape Nodes can embed a workflow's node graph inside the PNG it
-exports as a thumbnail. Drop one of those PNGs onto the canvas, and if
+exports as a thumbnail. Drop one of those PNG files onto the canvas, and
+if
 the editor detects embedded workflow metadata, it asks what you want
 to do with it instead of just adding an image node:
 
@@ -214,7 +215,7 @@ to do with it instead of just adding an image node:
     library, and dependency lists in the dialog to preview what will be
     added before you commit.
 
-Drop several PNGs at once and you get a batch version of the same
+Drop several PNG files at once and you get a batch version of the same
 dialog: it tells you how many of the dropped images carry workflow
 metadata and applies your choice (add as images, or add nodes from
 workflow) to all of them at once. Images without embedded metadata are
