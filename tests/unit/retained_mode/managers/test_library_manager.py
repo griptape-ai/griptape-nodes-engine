@@ -2585,7 +2585,7 @@ class TestPreviewProjectProvisioning:
         `libraries_root` is what resolve_libraries_root_for_project_id returns: None (the default)
         makes the preview fall back to the merged config's workspace-relative libraries dir.
         """
-        mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = dirs
+        mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs = AsyncMock(return_value=dirs)
         mock_gn.ProjectManager.return_value.resolve_libraries_root_for_project_id = AsyncMock(
             return_value=libraries_root
         )
@@ -2610,7 +2610,7 @@ class TestPreviewProjectProvisioning:
 
         library_manager = griptape_nodes.LibraryManager()
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.return_value = None
+            mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs = AsyncMock(return_value=None)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id="/nope/project.yml")
             )

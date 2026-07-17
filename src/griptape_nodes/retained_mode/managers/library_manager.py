@@ -3424,7 +3424,7 @@ class LibraryManager:
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
-            dirs = GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
+            dirs = await GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(
                     result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
