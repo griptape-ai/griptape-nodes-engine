@@ -98,6 +98,14 @@ plugins:
           - tutorials/02_coordinating_agents/index.md
           - tutorials/03_compare_prompts/index.md
           - tutorials/04_photography_team/index.md
+        Editor:
+          - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
+          - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
+          - guides/editor/working_with_nodes.md: Adding, selecting, wiring, and editing nodes on the canvas
+          - guides/editor/node_groups.md: Groups, subflows, and iterative group types (ForEach, For Loop, Retry)
+          - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
+          - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
+          - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
@@ -245,6 +253,14 @@ nav:
       - FAQ: faq.md
       - Glossary: glossary.md
   - Guides:
+      - Editor:
+          - Overview: guides/editor/index.md
+          - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md
+          - Working with Nodes: guides/editor/working_with_nodes.md
+          - Node Groups: guides/editor/node_groups.md
+          - Running Workflows: guides/editor/running_workflows.md
+          - Media Viewers & Editors: guides/editor/media_editors.md
+          - Managing Models & Libraries: guides/editor/managing_models_and_libraries.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
