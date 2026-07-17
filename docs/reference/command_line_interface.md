@@ -1,6 +1,6 @@
 # Griptape Nodes Command Line Interface (CLI)
 
-If you're new to command-line interfaces (CLIs), a CLI is a text-based way to interact with software by typing commands instead of clicking buttons in a UI. Griptape Nodes provides a CLI with the the `griptape-nodes` (or `gtn`) command. This enables you to interact with Griptape Nodes in the terminal.
+If you're new to command-line interfaces (CLIs), a CLI is a text-based way to interact with software by typing commands instead of clicking buttons in a UI. Griptape Nodes provides a CLI with the `griptape-nodes` (or `gtn`) command. This enables you to interact with Griptape Nodes in the terminal.
 
 `griptape-nodes` (or its shorthand alias `gtn`) is a command-line tool specifically designed to launch and manage the Griptape Nodes Engine installation on your computer. This tool handles tasks like initializing your workspace, managing configuration settings, and starting the engine that powers the web-based Griptape Nodes editor. The actual creation and editing of workflows happens in the web interface that opens when you run the engine.
 

@@ -4,7 +4,7 @@ Whenever a parameter carries an image, video, audio clip, 3D model, or
 Gaussian splat, the editor swaps in a viewer built for that media type
 instead of a plain text field. Some of these viewers are also editors —
 you can paint a mask, crop a frame, or composite layers without leaving
-the canvas. This page is a tour of each one: what surfaces it, how you
+the canvas. This page is a tour of each one: where it appears, how you
 open it, and what you can do once it's open.
 
 Which viewer you get, and which of the extra buttons appear on top of
@@ -101,9 +101,9 @@ Image Bash is the editor's layered compositing tool. Some image
 parameters carry a pencil icon that opens it directly; it's also
 reachable from parameters that store their state as structured layer
 data, via an **Edit** button that opens the same tool. Griptape's own
-nodes that pass images through Image Bash (rather than editing a
-single image) use it for building up a shot from multiple source
-images and painted layers rather than editing one image in place.
+nodes that pass images through Image Bash use it to build up a shot
+from multiple source images and painted layers, rather than to edit
+one image in place.
 
 Inside, each layer is either an **image layer** (one of your source
 images, which you can move, scale, and rotate with the on-canvas

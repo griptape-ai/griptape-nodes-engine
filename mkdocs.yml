@@ -136,9 +136,8 @@ plugins:
           - guides/projects/customization.md: Customization guide
         Workflows:
           - guides/variables.md: Workflow variables — scopes, variable nodes, and inline {name} substitution
-          - guides/assets.md: Where generated files go, storage backends, and uploads
+          - guides/assets.md: Where generated files go, previews and downloads, and uploads
           - guides/workflow_versions.md: Save As New Version and versioned workflow files
-        Publishing:
           - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
           - guides/mcp/index.md: MCP integration overview
@@ -263,8 +262,8 @@ nav:
           - Working with Nodes: guides/editor/working_with_nodes.md
           - Node Groups: guides/editor/node_groups.md
           - Running Workflows: guides/editor/running_workflows.md
-          - Media Viewers & Editors: guides/editor/media_editors.md
-          - Managing Models & Libraries: guides/editor/managing_models_and_libraries.md
+          - Media Viewers and Editors: guides/editor/media_editors.md
+          - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md

@@ -17,19 +17,18 @@ never overwrites an existing version file.
 
 ## When to use it
 
-Reach for Save As New Version when you want a checkpoint you can go back to
+Use Save As New Version when you want a checkpoint you can go back to
 without losing your current progress — before a risky restructuring, before
 handing a workflow off, or just to keep a trail of snapshots as you iterate.
-Because each version is its own file, opening an older version and opening
-the newest one are both just "open a file"; nothing about picking a version
-is special.
+Because each version is its own file, going back to an older version is
+just a matter of opening that file.
 
 ## How it differs from Save and Save As
 
 - **Save** overwrites the file you currently have open. No new file is
     created.
 - **Save As** writes a new, separate file under a name *you* choose, and
-    switches you to editing it. It's a one-time fork with an arbitrary name.
+    switches you to editing it: a one-time copy.
 - **Save As New Version** writes a new file too, but the name is chosen for
     you (the next number in the sequence) and it's meant to be repeated —
     each subsequent save from that file keeps incrementing the same

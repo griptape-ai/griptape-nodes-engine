@@ -1,9 +1,8 @@
 # Keyboard Shortcuts
 
 A reference for every shortcut in the editor, grouped by what you're
-trying to do. Where macOS and Windows/Linux use different modifier
-keys, both are listed; where a shortcut is the same key on every
-platform, it appears once.
+trying to do. macOS and Windows/Linux shortcuts are listed in separate
+columns where the modifier keys differ.
 
 !!! note "Typing is never interrupted"
 

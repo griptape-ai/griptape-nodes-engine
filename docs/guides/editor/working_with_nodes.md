@@ -111,7 +111,7 @@ the Add Node menu pre-wired to that handle, which is a quick way to add the
 
 The editor only lets you complete a connection between compatible types — as
 you drag, incompatible handles elsewhere on the canvas dim out so you can see
-at a glance where the connection can land. Most parameters accept more than
+where the connection can land. Most parameters accept more than
 one type (an image input that also accepts a URL string, for example), and
 the specific accepted types are baked into each parameter by its node.
 
@@ -150,14 +150,14 @@ Selecting a node opens its parameters in the **Properties** panel (right
 sidebar) alongside the parameter rows shown inline on the node itself — the
 same values, just in a dedicated, always-visible place that's easier to work
 in when a node has a lot of parameters or you've collapsed the node itself.
-Open it explicitly with `Cmd/Ctrl+B`, from the right-click menu's **Property
-Panel** entry, or from a node's header button if you've added it there.
+Open the right sidebar that hosts it with `Cmd/Ctrl+B`, from the
+right-click menu's **Property Panel** entry, or from a node's header button if
+you've added it there.
 
 <!-- screenshot: the Properties panel showing a selected node's parameters -->
 
 Editing a value in the Properties panel and editing the same parameter's
-inline row on the node update the same underlying value — there's no
-distinction between the two beyond where you happen to be looking.
+inline row on the node update the same underlying value.
 
 ### Adding a custom parameter
 
@@ -204,6 +204,6 @@ every row immediately.
 
     **Ignore Hide Connected (Display Nodes)** and **Ignore Hide Connected
     (Save Nodes)**, next to the main toggle in Node Settings, exempt any
-    parameter whose name contains "display" or "save" — handy for nodes
+    parameter whose name contains "display" or "save" — useful for nodes
     where you want to keep an eye on an output path or preview even while
     its input is wired up.

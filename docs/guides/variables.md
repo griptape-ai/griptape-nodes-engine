@@ -19,13 +19,13 @@ to show up — including inline inside text fields, using `{variable_name}`.
 
 ## When to use a variable
 
-Say three prompt fields across your workflow all need the same client name,
-or a batch of image nodes should all write to the same subject name. Wiring
+Say three prompt fields across your workflow all need the same client name.
+Wiring
 a connection from one source node to every field that needs it works, but
 it clutters the canvas and breaks if you ever want to type the value
 directly into a field instead of dragging a wire.
 
-A variable solves this without a single connection: set it once, then
+A variable solves this without any connections: set it once, then
 reference `{project_name}` inside as many text parameters as you like.
 Change the variable's value and every field that references it picks up the
 new value the next time it runs.
@@ -93,9 +93,8 @@ in the top-level flow, and every sub-flow nested inside it can read
 everything inside it — the parent's value is untouched and reappears once
 you leave the nested flow.
 
-A shorter way to think about it: a variable defined closer to where you're
-reading it always wins over one defined farther away, and flow-scoped
-variables always win over global ones.
+A shorter way to think about it: the definition closest to where you're
+reading wins, and flow-scoped variables win over global ones.
 
 ## Variable types
 
@@ -145,7 +144,7 @@ Pick one, or just type the name and close the brace yourself —
 `{project_name}` — and its value is substituted in at execution time. If
 the name doesn't resolve to anything in scope, the token is left in the
 text untouched (or, for an optional token, silently dropped — see below),
-so a typo doesn't manufacture a confusing value out of nowhere.
+so a typo doesn't silently produce a wrong value.
 
 You can turn this behavior off per workflow with the **Set Variable
 Substitution** node if you specifically want `{literal text like this}` to
@@ -196,8 +195,8 @@ above cover the common cases.
 
 ## Worked example: a project name across several prompts
 
-Say a workflow generates concept art and needs the same project name
-sprinkled through several prompt fields.
+Say a workflow generates concept art and needs the same project name in
+several prompt fields.
 
 1. Drop a **Create Variable** node near the top of the flow. Set
     `variable_name` to `project_name`, type `Autumn Campaign` directly into
@@ -225,4 +224,4 @@ sprinkled through several prompt fields.
 To change the project for a new run, edit the value on the **Create
 Variable** node (or wire a different source into it) — every field
 referencing `{project_name}` updates the next time the flow executes,
-without touching a single connection.
+without rewiring anything.

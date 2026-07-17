@@ -85,8 +85,9 @@ child nodes to the group's **Succeeded** control input, and the failure path
 to **Failed**. If **Failed** fires and attempts remain (**Max Iterations**,
 default 3), the whole group re-runs; if **Succeeded** fires, or attempts run
 out, execution continues downstream with **was_successful** reporting which
-happened. A **Raise on failure** toggle turns an exhausted retry budget into
-a hard workflow error instead of a quiet `false`.
+happened. A **Raise on failure** toggle stops the
+workflow with an error when the retry budget runs out, instead of
+continuing with **was_successful** set to `false`.
 
 ## Wiring connections across the group boundary
 

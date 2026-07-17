@@ -36,7 +36,7 @@ hidden) shows the whole graph at a glance and lets you jump around by
 clicking or dragging inside it. The controls cluster in the
 bottom-left gives you zoom in/out/fit-view buttons and a **Toggle
 Clean Mode** button that hides the decorative Griptape logo watermark
-— handy when you're taking a screenshot of your own workflow.
+— useful when you're taking a screenshot of your own workflow.
 
 Double-clicking empty canvas opens the **Add Node** menu at your
 cursor. See [Working with Nodes](working_with_nodes.md) for everything
@@ -156,9 +156,9 @@ it entirely.
 The right sidebar holds a set of tabbed panels, titled **Sidebar
 Panels**. A dropdown next to its close button (the icon with three
 dots) lets you show or hide any panel — each entry shows an eye icon
-so you can see at a glance which panels are currently visible. Hiding
-a panel here doesn't lose anything; it just gets a tab back the next
-time you re-enable it.
+so you can see which panels are currently visible. Hiding
+a panel here doesn't discard anything; its tab returns the next time
+you re-enable it.
 
 The four panels:
 
@@ -188,8 +188,8 @@ of the canvas reopens it.
     graph.
 - [Running Workflows](running_workflows.md) — the difference between
     running a workflow, running to a node, and running from a node.
-- [Media Editors](media_editors.md) — the built-in editors for images,
-    video, and other media parameters.
+- [Media Viewers and Editors](media_editors.md) — the built-in
+    viewers and editors for images, video, and other media parameters.
 - [Managing Models and Libraries](managing_models_and_libraries.md) —
     the Model Management and Library Management surfaces in more
     depth.
