@@ -1,5 +1,9 @@
 # Frequently Asked Questions
 
+!!! tip
+
+    Chasing a specific problem or error? See [Troubleshooting](troubleshooting.md) for commonly encountered issues and how to recover from them.
+
 ## Where is my workspace (where do my files save)?
 
 Files such as saved workflows, etc., are saved in a the Workspace Directory.

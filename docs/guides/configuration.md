@@ -6,6 +6,18 @@ When running Griptape Nodes engine on your own machine, you are provided with ut
 
 > Looking for a specific setting? The [Configuration Reference](../reference/configuration_reference.md) lists every setting with its type, default, environment variable, and description, grouped by category.
 
+## Editing Settings in the Editor
+
+The recommended way to change settings is the **Configuration Editor** built into the editor:
+
+1. Open the **Settings** menu in the editor's header and choose **All Settings**. The same submenu also has direct entries (such as **Engine Settings** or **Library Settings**) that open the Configuration Editor on that category.
+1. Pick a category in the left sidebar — **Editor Settings**, **Engine Settings**, **File System**, **Libraries**, **Library Settings**, **MCP Servers**, **API Keys & Secrets** — or use the search box at the top to filter settings by name.
+1. Change the value. The Configuration Editor writes it to your configuration files for you.
+
+Some settings only take effect after the engine restarts — `static_server_base_url` is one example (see [Static File Server Configuration](#static-file-server-configuration)).
+
+The rest of this page describes what's underneath: the files and environment variables the Configuration Editor writes to, and how they're merged. Edit those directly only when you're automating setup, running headless, or sharing configuration with a team.
+
 ## Configuration Loading
 
 Griptape Nodes employs a specific search order to load settings from environment variables and configuration files. Understanding this process is key to managing your setup.
