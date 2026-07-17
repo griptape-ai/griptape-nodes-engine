@@ -98,6 +98,14 @@ plugins:
           - tutorials/02_coordinating_agents/index.md
           - tutorials/03_compare_prompts/index.md
           - tutorials/04_photography_team/index.md
+        Editor:
+          - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
+          - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
+          - guides/editor/working_with_nodes.md: Adding, selecting, wiring, and editing nodes on the canvas
+          - guides/editor/node_groups.md: Groups, subflows, and iterative group types (ForEach, For Loop, Retry)
+          - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
+          - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
+          - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
@@ -126,7 +134,10 @@ plugins:
           - guides/projects/sequences.md: Numbered file sequences (patterns and policies)
           - guides/projects/version_pinning.md: Pinning engine and library versions
           - guides/projects/customization.md: Customization guide
-        Publishing:
+        Workflows:
+          - guides/variables.md: Workflow variables — scopes, variable nodes, and inline {name} substitution
+          - guides/assets.md: Where generated files go, previews and downloads, and uploads
+          - guides/workflow_versions.md: Save As New Version and versioned workflow files
           - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
           - guides/mcp/index.md: MCP integration overview
@@ -156,6 +167,7 @@ plugins:
           - development/custom_nodes/index.md: Developing custom nodes overview
           - development/custom_nodes/getting_started.md: Beginner-friendly intro to node development
           - development/custom_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
@@ -245,6 +257,14 @@ nav:
       - FAQ: faq.md
       - Glossary: glossary.md
   - Guides:
+      - Editor:
+          - Overview: guides/editor/index.md
+          - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md
+          - Working with Nodes: guides/editor/working_with_nodes.md
+          - Node Groups: guides/editor/node_groups.md
+          - Running Workflows: guides/editor/running_workflows.md
+          - Media Viewers and Editors: guides/editor/media_editors.md
+          - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
@@ -276,7 +296,11 @@ nav:
           - Sequences: guides/projects/sequences.md
           - Version Pinning: guides/projects/version_pinning.md
           - Customization Guide: guides/projects/customization.md
-      - Publishing Workflows: guides/publishing.md
+      - Workflows:
+          - Variables: guides/variables.md
+          - Assets & Outputs: guides/assets.md
+          - Workflow Versions: guides/workflow_versions.md
+          - Publishing: guides/publishing.md
       - MCP:
           - Overview: guides/mcp/index.md
           - Getting Started: guides/mcp/getting_started.md
@@ -500,6 +524,7 @@ nav:
           - Overview: development/custom_nodes/index.md
           - Getting Started: development/custom_nodes/getting_started.md
           - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
+          - Parameter UI Reference: development/custom_nodes/parameter_ui_reference.md
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py

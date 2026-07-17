@@ -159,6 +159,8 @@ Add functionality via `add_trait()`:
 - **ColorPicker**: `ColorPicker(format="hex")`
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
 
+For the full list of traits, the widgets they render, and the `ui_options` keys they manage, see the [Parameter UI Reference](parameter_ui_reference.md).
+
 ### Parameter helper constructs (`ParameterString`, `ParameterInt`, ...)
 
 Griptape Nodes includes a set of convenience Parameter subclasses under `griptape_nodes.exe_types.param_types.*`.
