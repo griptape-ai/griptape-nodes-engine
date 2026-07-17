@@ -167,6 +167,7 @@ plugins:
           - development/custom_nodes/index.md: Developing custom nodes overview
           - development/custom_nodes/getting_started.md: Beginner-friendly intro to node development
           - development/custom_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
@@ -523,6 +524,7 @@ nav:
           - Overview: development/custom_nodes/index.md
           - Getting Started: development/custom_nodes/getting_started.md
           - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
+          - Parameter UI Reference: development/custom_nodes/parameter_ui_reference.md
           - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
           - Strict Mode Reference: development/custom_nodes/strict_mode.md
           - Example Control Node: development/custom_nodes/example_control_node.py

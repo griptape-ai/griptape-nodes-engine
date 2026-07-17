@@ -19,7 +19,9 @@ Which viewer you get is decided by the parameter's type:
 
 The comparison sliders (image and video) aren't separate types — a node
 opts a parameter into comparison display when it exposes two media
-values through one parameter.
+values through one parameter. (Node authors: the full type-to-widget
+mapping lives in the
+[Parameter UI Reference](../../development/custom_nodes/parameter_ui_reference.md).)
 
 Which of the extra buttons appear on top of a viewer
 (crop, mask, capture, and so on) depends on options a node author set on
