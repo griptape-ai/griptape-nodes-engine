@@ -377,32 +377,72 @@ bound the wait; if the timeout fires, `StartFlowRequest` returns a failure but t
 flow keeps running in the engine until it finishes or errors. A subsequent
 `StartFlowRequest` will fail with "Flow is already running" until it does.
 
+### ParameterList inputs start empty — add a child slot before setting or connecting
+
+A `ParameterList` parameter (e.g. `items` on `CreateImageList` and the other
+create-list nodes, or `input_images` on image-generation nodes) does **not** come
+with any item slots. Its value is *derived* by collecting each child parameter's
+value in order, so with zero children the list is empty no matter what you do to the
+container. You cannot populate it by setting a value on the container parameter
+directly, and there are no index-style child names (`items_0`, `items[0]`) to target.
+
+To put one item into a `ParameterList`, add a child slot first, then act on the
+**name the engine hands back**:
+
+```
+1. griptape_nodes_AddParameterToNodeRequest(
+       node_name="CreateImageList_1", parent_container_name="items")
+   → the engine creates a child slot and returns it in `parameter_name`, e.g.
+     "items_ParameterListUniqueParamID_3f2a...". Do NOT pass parameter_name / type /
+     tooltip here — for the container case they're ignored; the slot is cloned from
+     the list. Do NOT invent the name; read it from the response.
+
+2. griptape_nodes_SetParameterValueRequest(
+       node_name="CreateImageList_1", parameter_name="<name from step 1>", value=...)
+   — or —
+   griptape_nodes_CreateConnectionRequest(
+       source_node_name="...", source_parameter_name="...",
+       target_node_name="CreateImageList_1", target_parameter_name="<name from step 1>")
+```
+
+Repeat step 1 for each item you want (once per slot). `parent_container_name` is
+required — without it the request creates a plain sibling parameter on the node
+instead of a list child.
+
+**Batching caveat:** the child's name only exists *after* the add, so the
+`AddParameterToNodeRequest` must be in an **earlier round trip** than the
+`SetParameterValue` / `CreateConnection` that references it. It cannot be collapsed
+into the same `EventRequestBatch` as the calls that use its returned name — do the
+adds in one batch, read the names out of the result array, then do the sets/connects
+in the next batch.
+
 ## Tool Cheat Sheet
 
-| Goal                                                            | Tool                                                                                                                                                      |
-| --------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bootstrap a workflow + flow from cold                           | `EnsureWorkflowAndFlowRequest`                                                                                                                            |
-| Fan N requests out in one round trip                            | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                |
-| Discover libraries / node types                                 | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest`, `ListCategoriesInLibraryRequest`                                                       |
-| Inspect a node type's parameters                                | `DescribeNodeTypeRequest`                                                                                                                                 |
-| Create a node                                                   | `CreateNodeRequest`                                                                                                                                       |
-| Wire a single edge                                              | `CreateConnectionRequest`                                                                                                                                 |
-| Lay out the canvas after a multi-node build                     | `AutoLayoutFlowRequest`                                                                                                                                   |
-| Move a single node to an explicit position                      | `SetNodeMetadataRequest` (set `metadata.position`)                                                                                                        |
-| Set a parameter value                                           | `SetParameterValueRequest`                                                                                                                                |
-| Read a parameter value                                          | `GetParameterValueRequest`                                                                                                                                |
-| Inspect a parameter's schema/details on a live node             | `GetParameterDetailsRequest`, `ListParametersOnNodeRequest`                                                                                               |
-| Run synchronously                                               | `StartFlowRequest(wait_for_completion=True, completion_timeout_ms=...)`                                                                                   |
-| Run from a specific node                                        | `StartFlowFromNodeRequest`                                                                                                                                |
-| Resolve a single node without firing the control flow           | `ResolveNodeRequest`                                                                                                                                      |
-| Execute a single node directly                                  | `ExecuteNodeRequest`                                                                                                                                      |
-| Rename a node or flow                                           | `RenameObjectRequest(allow_next_closest_name_available=True)`                                                                                             |
-| Lock or unlock a node                                           | `SetLockNodeStateRequest`                                                                                                                                 |
-| Reset a node's parameters to defaults                           | `ResetNodeToDefaultsRequest`                                                                                                                              |
-| Inspect state                                                   | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest` |
-| Find nodes by Python class (e.g. StartFlow, Agent)              | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                          |
-| Register a sandbox node type from Python source already on disk | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                           |
-| Reset everything                                                | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                   |
+| Goal                                                               | Tool                                                                                                                                                                       |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bootstrap a workflow + flow from cold                              | `EnsureWorkflowAndFlowRequest`                                                                                                                                             |
+| Fan N requests out in one round trip                               | `EventRequestBatch` (synthetic; pre-name nodes that later slots reference)                                                                                                 |
+| Discover libraries / node types                                    | `ListRegisteredLibrariesRequest`, `ListNodeTypesInLibraryRequest`, `ListCategoriesInLibraryRequest`                                                                        |
+| Inspect a node type's parameters                                   | `DescribeNodeTypeRequest`                                                                                                                                                  |
+| Create a node                                                      | `CreateNodeRequest`                                                                                                                                                        |
+| Wire a single edge                                                 | `CreateConnectionRequest`                                                                                                                                                  |
+| Lay out the canvas after a multi-node build                        | `AutoLayoutFlowRequest`                                                                                                                                                    |
+| Move a single node to an explicit position                         | `SetNodeMetadataRequest` (set `metadata.position`)                                                                                                                         |
+| Set a parameter value                                              | `SetParameterValueRequest`                                                                                                                                                 |
+| Add an item slot to a ParameterList (e.g. `items`, `input_images`) | `AddParameterToNodeRequest(parent_container_name="<list>")` — returns the generated child name; set/connect against THAT name, not the container or an index (see Gotchas) |
+| Read a parameter value                                             | `GetParameterValueRequest`                                                                                                                                                 |
+| Inspect a parameter's schema/details on a live node                | `GetParameterDetailsRequest`, `ListParametersOnNodeRequest`                                                                                                                |
+| Run synchronously                                                  | `StartFlowRequest(wait_for_completion=True, completion_timeout_ms=...)`                                                                                                    |
+| Run from a specific node                                           | `StartFlowFromNodeRequest`                                                                                                                                                 |
+| Resolve a single node without firing the control flow              | `ResolveNodeRequest`                                                                                                                                                       |
+| Execute a single node directly                                     | `ExecuteNodeRequest`                                                                                                                                                       |
+| Rename a node or flow                                              | `RenameObjectRequest(allow_next_closest_name_available=True)`                                                                                                              |
+| Lock or unlock a node                                              | `SetLockNodeStateRequest`                                                                                                                                                  |
+| Reset a node's parameters to defaults                              | `ResetNodeToDefaultsRequest`                                                                                                                                               |
+| Inspect state                                                      | `ListNodesInFlowRequest`, `ListConnectionsForNodeRequest`, `GetNodeResolutionStateRequest`, `GetNodeMetadataRequest`, `GetConnectionsForParameterRequest`                  |
+| Find nodes by Python class (e.g. StartFlow, Agent)                 | `ListNodesInFlowRequest(node_types=["StartFlow", "Agent"])` — returns only nodes whose class name matches; omit to get all nodes                                           |
+| Register a sandbox node type from Python source already on disk    | `RegisterSandboxNodeFromSourceRequest` (see Custom nodes below)                                                                                                            |
+| Reset everything                                                   | `ClearAllObjectStateRequest(i_know_what_im_doing=True)`                                                                                                                    |
 
 ## Custom nodes
 
