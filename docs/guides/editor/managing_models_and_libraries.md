@@ -1,7 +1,8 @@
 # Managing Models and Libraries
 
-Some nodes need a machine learning model on disk before they can run;
-others come from a library you haven't installed yet. Both are managed from
+Some nodes run AI models locally and need the model files on disk before
+they can run; others come from a library you haven't installed yet. Both
+are managed from
 the editor's **Manage** menu, in the **Model Management** and **Library
 Management** windows. This page covers both.
 
@@ -16,6 +17,10 @@ management windows themselves.
 
 Open **Manage → Model Management** to search for, download, and clean up
 models.
+
+Everything this window does is also available from the terminal via
+`gtn models` (search, download, list, delete, and download status) — see
+the [CLI reference](../../reference/command_line_interface.md#models).
 
 <!-- screenshot (#5166): the Model Management window with the search box, filter chips, and a couple of installed models listed -->
 
@@ -88,7 +93,9 @@ gated model.
 ## Library Management
 
 Open **Manage → Library Management** to install, update, and remove
-libraries.
+libraries. From the terminal, `gtn libraries download <git-url>` and
+`gtn libraries sync` cover installing and updating — see the
+[CLI reference](../../reference/command_line_interface.md#libraries).
 
 <!-- screenshot (#5166): the Library Management window with the filter bar and a few installed libraries listed -->
 

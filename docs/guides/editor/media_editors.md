@@ -7,8 +7,23 @@ you can paint a mask, crop a frame, or composite layers without leaving
 the canvas. This page is a tour of each one: where it appears, how you
 open it, and what you can do once it's open.
 
-Which viewer you get, and which of the extra buttons appear on top of
-it, depends on options a node author set on that parameter. You don't
+Which viewer you get is decided by the parameter's type:
+
+| Parameter type                         | Viewer                                                        |
+| -------------------------------------- | ------------------------------------------------------------- |
+| `ImageArtifact` / `ImageUrlArtifact`   | [Image viewer](#viewing-an-image-and-its-right-click-actions) |
+| `VideoArtifact` / `VideoUrlArtifact`   | [Video player](#playing-and-comparing-video)                  |
+| `AudioArtifact` / `AudioUrlArtifact`   | [Audio player](#playing-audio)                                |
+| `ThreeDArtifact` / `ThreeDUrlArtifact` | [3D model viewer](#viewing-3d-models)                         |
+| `SplatArtifact` / `SplatUrlArtifact`   | [Gaussian splat viewer](#viewing-gaussian-splats)             |
+
+The comparison sliders (image and video) aren't separate types — a node
+opts a parameter into comparison display when it exposes two media
+values through one parameter.
+
+Which of the extra buttons appear on top of a viewer
+(crop, mask, capture, and so on) depends on options a node author set on
+that parameter. You don't
 configure this yourself — it's baked into the node — but it explains
 why the same image parameter might show a crop icon on one node and a
 mask icon on another.
