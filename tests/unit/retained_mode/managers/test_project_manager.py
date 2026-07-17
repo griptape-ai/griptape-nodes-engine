@@ -4756,23 +4756,32 @@ class TestProjectManagerProjectWorkspaces:
     async def test_activation_sets_libraries_root_override_from_inherited_parent(self, tmp_path: Path) -> None:
         """Activating a child pins the libraries root to the parent's dir (the sharing seam).
 
-        End-to-end wiring test for _activate_project's libraries block: activation must call
-        decide_libraries_root (which walks the parent chain) and push the result into
+        End-to-end wiring test for _activate_project's libraries block: activation must walk the
+        parent chain (from disk, via _decide_libraries_root_from_disk) and push the result into
         set_libraries_root_override, so resolved_libraries_root() then returns the shared tree. The
         child declares no libraries_dir of its own; the parent declares "./libraries", so the child
         inherits the PARENT's dir. Guards against the override being dropped, ordered wrongly relative
         to clear_project_layers, or fed the wrong value -- none of which the isolated
-        decide_libraries_root tests would catch.
+        libraries-root tests would catch.
+
+        Inheritance is resolved from the on-disk YAML (not the loaded template) so a child's shared
+        libraries tree does not depend on whether the parent is loaded; the parent here is present on
+        disk / projects_to_register but is deliberately NOT seeded into the live registry, exercising
+        the registry-independent path that fixes #5149.
         """
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
-        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateResultFailure,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectInfo
 
-        parent_file = tmp_path / "parent" / "project.yml"
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
         parent_file.parent.mkdir()
         parent_file.touch()
-        child_file = tmp_path / "parent" / "child" / "project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
         child_file.parent.mkdir()
         child_file.touch()
 
@@ -4780,38 +4789,207 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
-        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
-        # griptape_nodes_config.json, so it must return a real dict (not a Mock) for the child's
-        # branch-4 workspace inheritance. The child inherits the parent's workspace here (neither
-        # declares workspace_dir), which is orthogonal to the libraries_dir seam under test.
-        mock_config.read_config_file.return_value = {}
 
-        # Parent declares libraries_dir "./libraries"; child inherits (declares none).
-        parent_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "P", "libraries_dir": "./libraries"})
+        def get_config_value(key: str, *_args: object, default: object = None, **_kwargs: object) -> object:
+            if key == "project_workspaces":
+                return {}
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_file), str(child_file)]
+            return default
+
+        mock_config.get_config_value.side_effect = get_config_value
+        mock_config.workspace_path = tmp_path
+        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
+        # griptape_nodes_config.json, so it must return a real dict (not a Mock).
+        mock_config.read_config_file.return_value = {}
+        mock_config.read_env_config.return_value = {}
+
+        # Model the on-disk overlays the disk walk reads: parent declares libraries_dir, child
+        # declares only its parent link. _read_overlay and the registered-path scan are stubbed
+        # so the walk resolves the parent from "disk" without a real ReadFileRequest.
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        path_to_overlay = {
+            _canon(parent_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="P", libraries_dir="./libraries"
+            ),
+            _canon(child_file): TestResolveWorkspaceDirForProjectId._make_overlay(project_id="C", parent_id="P"),
+        }
+
+        async def fake_read_overlay(project_file_path: Path, *, record_status: bool = True) -> object:  # noqa: ARG001
+            overlay = path_to_overlay.get(_canon(project_file_path))
+            if overlay is None:
+                return LoadProjectTemplateResultFailure(validation=validation, result_details="not found")
+            return validation, overlay
+
+        # Only the CHILD is loaded into the live registry; the parent is resolved from disk.
         child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "C", "parent_project_id": "P"})
         pm = self._make_project_manager_with_project(child_file, mock_config)
-        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        # Re-key the child's registry entry to its opaque id (parent link resolves by id), and add parent.
+        pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
+        pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
         del pm._successfully_loaded_project_templates[str(child_file)]
-        for pid, f, tmpl in [("P", parent_file, parent_template), ("C", child_file, child_template)]:
-            pm._successfully_loaded_project_templates[pid] = ProjectInfo(
-                project_id=pid,
-                project_file_path=f,
-                project_base_dir=f.parent,
-                template=tmpl,
-                validation=validation,
-                parsed_situation_schemas=pm._parse_situation_macros(tmpl.situations, validation),
-                parsed_directory_schemas=pm._parse_directory_macros(tmpl.directories, validation),
-            )
+        pm._successfully_loaded_project_templates["C"] = ProjectInfo(
+            project_id="C",
+            project_file_path=child_file,
+            project_base_dir=child_file.parent,
+            template=child_template,
+            validation=validation,
+            parsed_situation_schemas=pm._parse_situation_macros(child_template.situations, validation),
+            parsed_directory_schemas=pm._parse_directory_macros(child_template.directories, validation),
+        )
 
         await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
 
         # The override is set to the PARENT's libraries dir, resolved against the parent -- not the
-        # child's own dir, and not None (which would fall back to the workspace-relative default).
+        # child's own dir, and not None (which would fall back to the workspace-relative default) --
+        # even though the parent is NOT in the live registry.
         mock_config.set_libraries_root_override.assert_called_once_with(
             Path(str(canonicalize_for_identity(parent_file.parent / "libraries")))
         )
+
+    @staticmethod
+    def _build_child_pm_with_unloaded_parent(  # noqa: PLR0913
+        tmp_path: Path,
+        *,
+        parent_overlay_kwargs: dict[str, Any],
+        child_overlay_kwargs: dict[str, Any] | None = None,
+        project_workspaces: dict[str, str] | None = None,
+        configured_root: str | None = None,
+        child_adjacent_config: dict | None = None,
+    ) -> "tuple[ProjectManager, Mock, Path, Path]":
+        """Build a pm whose child is loaded but whose parent lives only on disk (#5149 setup).
+
+        Models the frozen-worker registry: the child is in the live registry, the parent is
+        readable from disk / projects_to_register but NOT loaded. Returns (pm, mock_config,
+        parent_file, child_file). The disk walk's _read_overlay and registered-path scan are
+        stubbed, so the parent resolves without a real ReadFileRequest.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectInfo
+
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        parent_file.parent.mkdir(parents=True)
+        parent_file.touch()
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        child_file.parent.mkdir(parents=True)
+        child_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = child_adjacent_config or {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+
+        def get_config_value(
+            key: str, *_args: object, default: object = None, config_source: str = "", **_kw: object
+        ) -> object:
+            if key == "project_workspaces":
+                return project_workspaces or {}
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_file), str(child_file)]
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            return default
+
+        mock_config.get_config_value.side_effect = get_config_value
+        mock_config.workspace_path = tmp_path
+        mock_config.read_config_file.return_value = {}
+        mock_config.read_env_config.return_value = {}
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        path_to_overlay = {
+            _canon(parent_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="P", **parent_overlay_kwargs
+            ),
+            _canon(child_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="C", parent_id="P", **(child_overlay_kwargs or {})
+            ),
+        }
+
+        async def fake_read_overlay(project_file_path: Path, *, record_status: bool = True) -> object:  # noqa: ARG001
+            overlay = path_to_overlay.get(_canon(project_file_path))
+            if overlay is None:
+                return LoadProjectTemplateResultFailure(validation=validation, result_details="not found")
+            return validation, overlay
+
+        child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={"id": "C", "parent_project_id": "P", **(child_overlay_kwargs or {})}
+        )
+        mock_event_manager = Mock()
+        pm = ProjectManager(mock_event_manager, mock_config, Mock())
+        pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
+        pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
+        pm._successfully_loaded_project_templates["C"] = ProjectInfo(
+            project_id="C",
+            project_file_path=child_file,
+            project_base_dir=child_file.parent,
+            template=child_template,
+            validation=validation,
+            parsed_situation_schemas=pm._parse_situation_macros(child_template.situations, validation),
+            parsed_directory_schemas=pm._parse_directory_macros(child_template.directories, validation),
+        )
+        return pm, mock_config, parent_file, child_file
+
+    @pytest.mark.asyncio
+    async def test_activation_child_inherits_unloaded_parent_workspace(self, tmp_path: Path) -> None:
+        """#5149 regression: a child inherits its parent's workspace even when the parent is NOT loaded.
+
+        The parent declares workspace_dir "./" (its own dir). With the parent absent from the live
+        registry (the frozen-worker state), the old live branch-4 walk missed it and the child fell
+        to the global default. The disk walk resolves the parent from projects_to_register, so
+        set_workspace_override is called with the PARENT's dir regardless of load state.
+        """
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={"workspace_dir": "./"},
+            configured_root="/global/ws",
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        mock_config.set_workspace_override.assert_called_once_with(Path(str(_canon(parent_file.parent))))
+
+    @pytest.mark.asyncio
+    async def test_activation_child_adjacent_workspace_beats_parent_and_is_unpinned(self, tmp_path: Path) -> None:
+        """A child's OWN adjacent workspace_directory (branch 3) wins over parent inheritance and is unpinned.
+
+        Branch 3 must be preserved by the disk path: when the child declares its own
+        workspace_directory, no override is applied (apply_override=False) so the workspace config
+        layer can re-point workspace_path, and the parent chain is never consulted.
+        """
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, _parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={"workspace_dir": "./"},
+            configured_root="/global/ws",
+            child_adjacent_config={"workspace_directory": "/child/explicit/ws"},
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        # Branch 3 is unpinned: no override is layered on top of the adjacent workspace_directory.
+        mock_config.set_workspace_override.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_activation_child_falls_to_global_when_no_ancestor_workspace(self, tmp_path: Path) -> None:
+        """No false positive: a child whose (unloaded) parent declares no workspace uses the global default."""
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, _parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={},
+            configured_root="/global/ws",
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        mock_config.set_workspace_override.assert_called_once_with(Path(str(_canon(Path("/global/ws")))))
 
     @pytest.mark.asyncio
     async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
