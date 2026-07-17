@@ -236,5 +236,5 @@ For a node that does this correctly, look at `SelectFromProject` in the
 (`griptape_nodes_library/files/select_from_project.py`) — it declares its
 `selected_path` as a static-file dependency, which is exactly why routing a file
 through it guarantees the file is bundled. The
-[Comprehensive Guide](../development/custom_nodes/comprehensive_guide.md) covers node
+[custom node development docs](../development/custom_nodes/index.md) cover node
 development in general.
