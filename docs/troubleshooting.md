@@ -7,7 +7,9 @@ This page collects the issues and states people run into most often, along with 
 **Symptoms**
 
 - Load Image, Save Image, or a media preview node shows an empty area instead of the image.
+
 - The file clearly exists on disk (for example in `{outputs}/images/...`), but the editor won't display it.
+
 - Uploading a new image fails with an error like:
 
     ```
