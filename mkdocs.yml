@@ -90,6 +90,7 @@ plugins:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install the engine
           - faq.md: Frequently asked questions
+          - troubleshooting.md: Fixes for commonly encountered issues and states
           - glossary.md: Terms and definitions used throughout the docs
           - for_agents.md: Hosted machine-readable docs surface (this page)
         Tutorials:
@@ -262,6 +263,7 @@ nav:
           - 4. Compare Prompts: tutorials/03_compare_prompts/index.md
           - 5. Build a Photography Team: tutorials/04_photography_team/index.md
       - FAQ: faq.md
+      - Troubleshooting: troubleshooting.md
       - Glossary: glossary.md
   - Guides:
       - Editor:
