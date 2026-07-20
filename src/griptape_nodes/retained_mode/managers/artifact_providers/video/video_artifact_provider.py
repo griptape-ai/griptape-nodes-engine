@@ -288,7 +288,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
             ffprobe_path = resolve_ffmpeg_binaries().ffprobe
         except Exception as exc:
             logger.error(
-                "Attempted to locate the ffprobe binary for '%s'. Failed because: %s",
+                "Could not locate an ffprobe binary to read video metadata for '%s': %s",
                 source_path,
                 exc,
             )

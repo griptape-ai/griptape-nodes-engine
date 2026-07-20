@@ -173,8 +173,9 @@ GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 - A video node (for example an image-to-video generation node, or any node that reads or previews a video) fails, and the engine logs an error like:
 
     ```
-    Attempted to get ffprobe binary via static-ffmpeg for '.../temp/....mp4'.
-    Failed to fetch platform executables: 404 Client Error: Not Found for url:
+    Could not locate an ffprobe binary to read video metadata for '.../temp/....mp4':
+    Attempted to download ffmpeg via static-ffmpeg because no ffmpeg/ffprobe was found
+    on PATH or in settings. Failed because: 404 Client Error: Not Found for url:
     https://media.githubusercontent.com/media/.../darwin_arm64.zip
     ```
 

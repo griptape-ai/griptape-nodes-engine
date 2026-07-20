@@ -165,6 +165,13 @@ class TestResolveFromConfig:
         with pytest.raises(FileNotFoundError, match="ffmpeg_path"):
             _resolve("/nope/ffmpeg", None)
 
+    def test_invalid_configured_ffprobe_path_names_ffprobe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A bad ffprobe path names ffprobe (not ffmpeg) in the error, from the shared validator."""
+        monkeypatch.setattr(ffmpeg_utils.shutil, "which", _fake_which({}))
+
+        with pytest.raises(FileNotFoundError, match=r"ffprobe binary.*ffprobe_path"):
+            _resolve(None, "/nope/ffprobe")
+
 
 class TestResolvePublicApi:
     """The public entry point reads settings and delegates to the resolver."""

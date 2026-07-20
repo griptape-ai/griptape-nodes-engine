@@ -78,8 +78,8 @@ def _resolve_ffmpeg_binaries(
             binary is found and the static-ffmpeg download fails.
     """
     # FAILURE CASE: a configured path is set but does not point at an executable.
-    ffmpeg = _resolve_configured_binary(configured_ffmpeg, ffmpeg_key)
-    ffprobe = _resolve_configured_binary(configured_ffprobe, ffprobe_key)
+    ffmpeg = _resolve_configured_binary(configured_ffmpeg, "ffmpeg", ffmpeg_key)
+    ffprobe = _resolve_configured_binary(configured_ffprobe, "ffprobe", ffprobe_key)
 
     # Prefer a system binary on PATH for anything not pinned in settings.
     if ffmpeg is None:
@@ -107,7 +107,7 @@ def _resolve_ffmpeg_binaries(
     return FFmpegBinaries(ffmpeg=ffmpeg, ffprobe=ffprobe)
 
 
-def _resolve_configured_binary(configured_path: str | None, config_key: str) -> str | None:
+def _resolve_configured_binary(configured_path: str | None, binary_name: str, config_key: str) -> str | None:
     """Return the executable for an explicitly configured path, or None if unset.
 
     Raises:
@@ -121,7 +121,7 @@ def _resolve_configured_binary(configured_path: str | None, config_key: str) -> 
     # FAILURE CASE: configured but not an executable file.
     if resolved is None:
         msg = (
-            f"Attempted to locate an ffmpeg binary at the configured path '{configured_path}' "
+            f"Attempted to locate the {binary_name} binary at the configured path '{configured_path}' "
             f"(setting '{config_key}'). Failed because it is not an executable file. Point the setting at a "
             "valid executable, or clear it to auto-detect one on PATH."
         )

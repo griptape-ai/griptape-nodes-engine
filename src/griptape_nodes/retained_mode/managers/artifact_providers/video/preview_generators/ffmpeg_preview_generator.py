@@ -105,14 +105,11 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             FileNotFoundError: If ffmpeg is not installed or source file not found
             OSError: If preview generation fails
         """
-        # FAILURE CASE: ffmpeg not available
+        # FAILURE CASE: ffmpeg not available.
         # Run in a thread because the first call may download and extract the ffmpeg binary,
         # which would otherwise block the event loop long enough to disconnect WebSocket clients.
-        try:
-            ffmpeg_path = (await to_thread(resolve_ffmpeg_binaries)).ffmpeg
-        except Exception as e:
-            msg = f"Attempted to locate the ffmpeg binary. Failed because: {e}"
-            raise FileNotFoundError(msg) from e
+        # resolve_ffmpeg_binaries raises FileNotFoundError with an actionable, self-contained message.
+        ffmpeg_path = (await to_thread(resolve_ffmpeg_binaries)).ffmpeg
 
         # FAILURE CASE: source file does not exist
         source_path = anyio.Path(self.source_file_location)
