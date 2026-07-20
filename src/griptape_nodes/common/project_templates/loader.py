@@ -8,6 +8,7 @@ proper long path handling on Windows and consistent error handling.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
@@ -18,6 +19,8 @@ from ruamel.yaml.error import YAMLError
 from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from griptape_nodes.common.project_templates.project import ProjectTemplate
     from griptape_nodes.common.project_templates.validation import ProjectValidationInfo
 
@@ -95,7 +98,9 @@ class ProjectOverlayData(NamedTuple):
     libraries_dir: str | PerPlatformProjectPath | None = None
     # variable_name -> raw dict. Defaulted (unlike situations/directories) so overlay
     # construction sites that predate the variables feature keep working unchanged.
-    variables: dict[str, dict[str, Any]] = {}  # noqa: RUF012 — read-only; loader always passes explicitly
+    # MappingProxyType keeps the default immutable — a shared plain-dict default would
+    # alias one dict across every default-constructed instance.
+    variables: Mapping[str, dict[str, Any]] = MappingProxyType({})
     removed_situations: frozenset[str] = frozenset()
     removed_directories: frozenset[str] = frozenset()
     removed_environment: frozenset[str] = frozenset()
