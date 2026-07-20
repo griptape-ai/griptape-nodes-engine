@@ -499,11 +499,11 @@ wheels = [
 
 [[package]]
 name = "fileseq"
-version = "3.2.0"
+version = "3.3.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/69/6b/193ce3cf5d097b03be9b4965ecd952b60e183758a41f44f9d44530b54dc6/fileseq-3.2.0.tar.gz", hash = "sha256:afe858d6d312ff3e4df147c0fc16cfca7c412b37d1be0624f87285accd368dca", size = 2167970, upload-time = "2026-04-19T04:05:16.436Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ca/9f/211f4c1a07706dfd8ac92c64b17f2531891613019508bc5a59300a40ea56/fileseq-3.3.0.tar.gz", hash = "sha256:e4b2d44c218863fb913fbe8abd6adce5f7c3b88be42f016270b2c9525094bda0", size = 2176275, upload-time = "2026-07-05T03:35:33.156Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/25/d9/af7357aabd5b69bf3696567c5d08a1aa6ac08ba2662a94181d75cec919ec/fileseq-3.2.0-py3-none-any.whl", hash = "sha256:8ae0dc525742b3f86d4261fa2e03b2ed1622f93a72c87db5cb788f9f0ee8d1d1", size = 202127, upload-time = "2026-04-19T04:05:14.589Z" },
+    { url = "https://files.pythonhosted.org/packages/f3/18/b429fd820c432a65ab3ae176cd32ddc29d0de532dfa762e5a71563ef848c/fileseq-3.3.0-py3-none-any.whl", hash = "sha256:433e84b410381405e7fc06c559847e0cb05dd5f267fbc41ab06b491ecfddbdac", size = 205858, upload-time = "2026-07-05T03:35:31.752Z" },
 ]
 
 [[package]]
