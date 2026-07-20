@@ -459,6 +459,70 @@ class TestListVariablesLayerProvenance:
         assert pairs == {("from_flow", VariableLayerKind.FLOW), ("from_global", VariableLayerKind.GLOBAL)}
 
 
+class TestProjectValueTypeGates:
+    """The module-level write gates that protect project-variable persistence (#5142)."""
+
+    def test_value_mismatch_helper_truth_table(self) -> None:
+        from griptape_nodes.retained_mode.managers.variable_manager import (
+            _project_type_mismatch,
+            _project_value_mismatch,
+        )
+
+        # int type: ints pass (including falsy 0), bools and strs refused.
+        assert _project_value_mismatch("int", 0) is None
+        assert _project_value_mismatch("int", True) is not None
+        assert _project_value_mismatch("int", "42") is not None
+        # str type: strs pass (including empty), non-strs refused.
+        assert _project_value_mismatch("str", "") is None
+        assert _project_value_mismatch("str", 7) is not None
+        # A stored type outside str/int refuses every value with a clear message.
+        unknown = _project_value_mismatch("JSON", "anything")
+        assert unknown is not None
+        assert "only support" in unknown
+        # Type changes: unsupported target and value-disagreement both refused.
+        assert _project_type_mismatch("float", 1) is not None
+        assert _project_type_mismatch("int", "sc042") is not None
+        assert _project_type_mismatch("int", 42) is None
+
+
+class TestVariableLayerPrimitive:
+    """VariableLayer's own guards, independent of the request handlers that preempt them."""
+
+    def test_rename_collision_raises(self) -> None:
+        layer = VariableLayer()
+        layer.set(FlowVariable(name="a", owning_flow_name=None, type="str", value="1"))
+        layer.set(FlowVariable(name="b", owning_flow_name=None, type="str", value="2"))
+        with pytest.raises(ValueError, match="already existing in the same layer"):
+            layer.rename("a", "b")
+        # Both entries intact after the refused rename.
+        a_var = layer.get("a")
+        b_var = layer.get("b")
+        assert a_var is not None
+        assert a_var.value == "1"
+        assert b_var is not None
+        assert b_var.value == "2"
+
+
+class TestAllScopePointLookup:
+    """ALL is an enumeration scope; a single-name lookup under it degrades to CURRENT_FLOW_ONLY."""
+
+    def test_get_variable_with_all_scope_finds_flow_var(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        _add_variable(griptape_nodes, "flow_var", "v")
+        result = griptape_nodes.handle_request(
+            GetVariableRequest(name="flow_var", starting_flow=flow_name, lookup_scope=VariableScope.ALL)
+        )
+        assert isinstance(result, GetVariableResultSuccess)
+        assert result.variable.value == "v"
+
+    def test_get_variable_with_all_scope_misses_global(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """ALL point-lookup only consults the starting flow — a global is not found."""
+        griptape_nodes.handle_request(CreateVariableRequest(name="only_global", type="str", value="g", is_global=True))
+        result = griptape_nodes.handle_request(
+            GetVariableRequest(name="only_global", starting_flow=flow_name, lookup_scope=VariableScope.ALL)
+        )
+        assert isinstance(result, GetVariableResultFailure)
+
+
 class TestVariablePermission:
     """READ_ONLY variables refuse writes uniformly."""
 
