@@ -822,19 +822,20 @@ class VariablesManager:
                 result_details=f"Attempted to rename variable '{request.name}'. Failed because no such variable could be found."
             )
 
-        refusal = self._refuse_write(result.variable, verb="rename", found_layer=result.found_layer)
-        if refusal is not None:
-            return RenameVariableResultFailure(result_details=refusal)
-
         variable = result.variable
 
-        # Renaming to the current name is an idempotent no-op success — short-circuit before the
-        # reserved/collision checks so a pure no-op can never surface a Failure (e.g. if the name
-        # later entered the project's reserved set).
+        # Renaming to the current name is an idempotent no-op success — short-circuit before
+        # EVERY gate (read-only refusal, reserved names, collisions), so a pure no-op can never
+        # surface a Failure: nothing is mutated, so nothing needs permission. Covers a
+        # rename-to-self on a READ_ONLY builtin as well as on a reserved-named legacy variable.
         if request.new_name == variable.name:
             return RenameVariableResultSuccess(
                 result_details=f"Variable '{variable.name}' already has that name; nothing to rename."
             )
+
+        refusal = self._refuse_write(variable, verb="rename", found_layer=result.found_layer)
+        if refusal is not None:
+            return RenameVariableResultFailure(result_details=refusal)
 
         # The new name may not be reserved by another layer (project builtins/directories,
         # etc.) — same rule as create, in every scope. The reserved set must come from the
