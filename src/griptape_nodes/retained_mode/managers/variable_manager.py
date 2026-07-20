@@ -1214,7 +1214,17 @@ class VariablesManager:
             )
 
         variable = result.variable
-        details = VariableDetails(name=variable.name, owning_flow_name=variable.owning_flow_name, type=variable.type)
+        # A variable is reserved when its name is in the computed namespace of the project
+        # the lookup consulted (builtins + directories) AND it actually resolved from the
+        # PROJECT layer — a flow/global variable that merely shadows nothing is not reserved,
+        # and a stored project variable's name is not reserved either (computed shadows it,
+        # so a name that resolved as stored is by definition not computed).
+        reserved = result.found_layer is VariableLayerKind.PROJECT and variable.name in self._reserved_variable_names(
+            project_id=request.project_id
+        )
+        details = VariableDetails(
+            name=variable.name, owning_flow_name=variable.owning_flow_name, type=variable.type, reserved=reserved
+        )
         return GetVariableDetailsResultSuccess(
             details=details, result_details=f"Successfully retrieved details for variable '{request.name}'."
         )
