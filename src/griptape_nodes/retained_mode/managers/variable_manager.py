@@ -521,8 +521,20 @@ class VariablesManager:
             return f"Attempted to {verb} variable '{variable.name}'. Found in the read-only {layer} layer."
         return None
 
-    def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:  # noqa: PLR0911
-        """Create a new variable."""
+    def on_create_variable_request(self, request: CreateVariableRequest) -> ResultPayload:
+        """Create a new variable.
+
+        Load-replay (initial_setup=True) failures are logged before returning: workflow
+        load re-executes captured creates and discards the results, so without the log a
+        failed recreate would be silent data loss from the user's point of view.
+        """
+        result = self._create_variable(request)
+        if request.initial_setup and isinstance(result, CreateVariableResultFailure):
+            logger.warning("Workflow load could not recreate variable '%s': %s", request.name, result.result_details)
+        return result
+
+    def _create_variable(self, request: CreateVariableRequest) -> ResultPayload:  # noqa: PLR0911
+        """Validate and store a new variable (the body of on_create_variable_request)."""
         # Fail fast on a blank name before any layer/collision logic.
         if not request.name or not request.name.strip():
             return CreateVariableResultFailure(
@@ -534,7 +546,14 @@ class VariablesManager:
         # resolution precedence would shadow a same-named global anyway, allowing the create
         # would strand a variable the user can see in no resolved view — so reject it at
         # write time, uniformly. Rename applies the same rule to its new_name.
-        if request.name in self._reserved_variable_names(project_id=None):  # None = current project
+        #
+        # Load-replay exemption (initial_setup): workflow load re-executes captured
+        # CreateVariableRequests and DISCARDS their results, so refusing here would
+        # silently drop a variable a saved workflow legitimately owns (saved before the
+        # name became reserved, or against a project without that directory). Recreate
+        # it — resolution shadows it exactly as pre-reservation behavior did — and let
+        # any later LIVE create/rename hit the gate. Same idiom as node/flow replay.
+        if not request.initial_setup and request.name in self._reserved_variable_names(project_id=None):
             return CreateVariableResultFailure(
                 result_details=f"Attempted to create a variable named '{request.name}'. Failed because that name is reserved."
             )
