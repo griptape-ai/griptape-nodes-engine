@@ -166,6 +166,46 @@ If the logs don't show enough detail, raise the engine's log level: open the Con
 GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 ```
 
+## A video node fails to download ffmpeg
+
+**Symptoms**
+
+- A video node (for example an image-to-video generation node, or any node that reads or previews a video) fails, and the engine logs an error like:
+
+    ```
+    Attempted to get ffprobe binary via static-ffmpeg for '.../temp/....mp4'.
+    Failed to fetch platform executables: 404 Client Error: Not Found for url:
+    https://media.githubusercontent.com/media/.../darwin_arm64.zip
+    ```
+
+- The download URL looks valid, and retrying sometimes works.
+
+**Cause**
+
+When the engine can't find ffmpeg and ffprobe another way, it downloads a bundled build from GitHub the first time a video node runs. That download host occasionally returns a `404` or times out under rate limiting, a network blip, or a corporate VPN, firewall, or DNS filter that blocks it. When the download can't complete, the video node fails.
+
+**Fix**
+
+1. **Run the node again.** These download failures are usually transient and clear on a second attempt.
+
+1. **Install ffmpeg yourself and let the engine use it.** The engine prefers an ffmpeg/ffprobe already on your system `PATH` over downloading one, so a normal install removes the download entirely:
+
+    - **macOS**: `brew install ffmpeg`
+    - **Linux (Debian/Ubuntu)**: `sudo apt install ffmpeg`
+    - **Windows**: install from [ffmpeg.org](https://ffmpeg.org/download.html) and add it to your `PATH`.
+
+    Restart the engine after installing so the new `PATH` is picked up.
+
+1. **Point the engine at a specific binary.** If ffmpeg isn't on your `PATH` (or you want to pin an exact build), set the `ffmpeg_path` and `ffprobe_path` settings to the full paths of the executables. Open the Configuration Editor (**Settings → All Settings**), search for "ffmpeg", and fill them in. When running headless, set them through the environment instead:
+
+    ```bash
+    GTN_CONFIG_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg GTN_CONFIG_FFPROBE_PATH=/opt/homebrew/bin/ffprobe gtn
+    ```
+
+!!! note "On a locked-down network?"
+
+    If the machine can't reach `media.githubusercontent.com` at all, installing ffmpeg locally (steps 2 or 3) is the reliable fix. It skips the download completely.
+
 ## Related error-specific entries
 
 A few specific error messages are documented in the FAQ:

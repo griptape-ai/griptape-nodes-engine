@@ -23,6 +23,8 @@ WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
+FFMPEG_PATH_KEY = "ffmpeg_path"
+FFPROBE_PATH_KEY = "ffprobe_path"
 
 
 class Category(BaseModel):
@@ -48,6 +50,7 @@ STATIC_SERVER = Category(name="Static Server", description="Static file server c
 ARTIFACTS = Category(name="Artifacts", description="Settings for artifact providers and preview generation")
 AGENT = Category(name="Agent", description="Agent behavior and system prompt")
 LIBRARIES = Category(name="Libraries", description="Settings for library management and dependency installation")
+FFMPEG = Category(name="FFmpeg", description="Locations of the ffmpeg and ffprobe binaries used for video processing")
 
 
 def Field(category: str | Category = "General", **kwargs) -> Any:
@@ -480,6 +483,26 @@ class Settings(BaseModel):
         category=ARTIFACTS,
         default_factory=dict,
         description="Control how previews are generated for images and other media files",
+    )
+    ffmpeg_path: str | None = Field(
+        category=FFMPEG,
+        default=None,
+        description=(
+            "Absolute path to an ffmpeg executable to use for video processing. When unset, the engine uses an "
+            "ffmpeg found on the system PATH, and otherwise downloads a bundled build via static-ffmpeg on first "
+            "use. Set this to force a specific binary, for example on a machine with no network access to "
+            "download one."
+        ),
+    )
+    ffprobe_path: str | None = Field(
+        category=FFMPEG,
+        default=None,
+        description=(
+            "Absolute path to an ffprobe executable to use for reading video metadata. When unset, the engine "
+            "uses an ffprobe found on the system PATH, and otherwise downloads a bundled build via static-ffmpeg "
+            "on first use. Set this to force a specific binary, for example on a machine with no network access "
+            "to download one."
+        ),
     )
     project_file: str | None = Field(
         category=PROJECTS,

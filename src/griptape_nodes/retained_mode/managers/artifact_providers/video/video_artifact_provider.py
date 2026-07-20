@@ -8,8 +8,6 @@ import subprocess
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from static_ffmpeg import run as static_ffmpeg_run
-
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
@@ -24,6 +22,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointFailure,
     CheckpointSubjectType,
 )
+from griptape_nodes.utils.ffmpeg_utils import resolve_ffmpeg_binaries
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
@@ -49,7 +48,9 @@ class VideoArtifactProvider(BaseArtifactProvider):
     """Provider for video artifacts.
 
     Uses ffmpeg/ffprobe for metadata extraction and preview generation.
-    ffmpeg must be available on the system PATH.
+    Binaries are resolved via griptape_nodes.utils.ffmpeg_utils: an explicit
+    ffmpeg_path/ffprobe_path setting, then the system PATH, then a static-ffmpeg
+    download as a last resort.
     """
 
     # Minimum bytes needed for the magic-byte sniffer below. ISO BMFF brand
@@ -284,10 +285,10 @@ class VideoArtifactProvider(BaseArtifactProvider):
         to ERROR+.
         """
         try:
-            _ffmpeg_path, ffprobe_path = static_ffmpeg_run.get_or_fetch_platform_executables_else_raise()
+            ffprobe_path = resolve_ffmpeg_binaries().ffprobe
         except Exception as exc:
             logger.error(
-                "Attempted to get ffprobe binary via static-ffmpeg for '%s'. Failed to fetch platform executables: %s",
+                "Attempted to locate the ffprobe binary for '%s'. Failed because: %s",
                 source_path,
                 exc,
             )

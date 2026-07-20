@@ -8,7 +8,6 @@ from typing import Any
 
 import anyio
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
-from static_ffmpeg import run as static_ffmpeg_run
 
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
     BaseArtifactPreviewGenerator,
@@ -18,6 +17,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     Field,
 )
 from griptape_nodes.utils.async_utils import subprocess_run, to_thread
+from griptape_nodes.utils.ffmpeg_utils import resolve_ffmpeg_binaries
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -106,12 +106,12 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             OSError: If preview generation fails
         """
         # FAILURE CASE: ffmpeg not available
-        # Run in a thread because the first call downloads and extracts the ffmpeg binary,
+        # Run in a thread because the first call may download and extract the ffmpeg binary,
         # which would otherwise block the event loop long enough to disconnect WebSocket clients.
         try:
-            ffmpeg_path, _ffprobe_path = await to_thread(static_ffmpeg_run.get_or_fetch_platform_executables_else_raise)
+            ffmpeg_path = (await to_thread(resolve_ffmpeg_binaries)).ffmpeg
         except Exception as e:
-            msg = f"Attempted to get ffmpeg binary via static-ffmpeg. Failed because: {e}"
+            msg = f"Attempted to locate the ffmpeg binary. Failed because: {e}"
             raise FileNotFoundError(msg) from e
 
         # FAILURE CASE: source file does not exist
