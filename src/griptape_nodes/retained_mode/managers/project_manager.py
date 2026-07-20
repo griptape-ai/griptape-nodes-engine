@@ -1523,7 +1523,7 @@ class ProjectManager:
             secrets_manager=self._secrets_manager,
         )
 
-    def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
+    async def resolve_provisioning_config_dirs(self, project_id: str) -> _ProvisioningConfigDirs | None:
         """Resolve the project-adjacent and workspace dirs for a provisioning preview.
 
         Looks up `project_id` verbatim as the registry key, the same way
@@ -1532,8 +1532,10 @@ class ProjectManager:
         path against the CWD and miss the registry. Legacy projects whose id is a
         canonical path string were already canonicalized at load time, so a verbatim
         lookup still hits. Finds the loaded file-backed project, then decides its
-        workspace dir + override bit read-only via decide_workspace. Returns None when
-        the project is not loaded or has no backing file, mirroring
+        workspace dir + override bit via _decide_workspace_from_disk -- the SAME disk
+        resolver activation uses -- so the previewed workspace cannot diverge from what
+        activation applies even when an ancestor is registered but not loaded. Returns
+        None when the project is not loaded or has no backing file, mirroring
         get_loaded_project_dir's "nothing to preview" contract. Mutates no config state.
         """
         project_info = self._successfully_loaded_project_templates.get(project_id)
@@ -1549,8 +1551,9 @@ class ProjectManager:
         template_workspace_dir = self._resolve_template_workspace_dir(
             project_info.template.workspace_dir, project_file_path
         )
-        decision = self.decide_workspace(
-            project_file_path, project_config, env_config, template_workspace_dir=template_workspace_dir
+        id_index = await self._build_unloaded_id_index()
+        decision = await self._decide_workspace_from_disk(
+            project_file_path, project_config, env_config, template_workspace_dir, id_index
         )
         return _ProvisioningConfigDirs(
             project_dir=project_dir,
@@ -1602,15 +1605,61 @@ class ProjectManager:
             _, own_overlay = own_overlay_load
             template_workspace_dir = self._resolve_template_workspace_dir(own_overlay.workspace_dir, project_file_path)
 
+        decision = await self._decide_workspace_from_disk(
+            project_file_path, project_config, env_config, template_workspace_dir, id_index
+        )
+        return self._resolve_workspace_dir(decision.workspace_dir)
+
+    async def _decide_workspace_from_disk(
+        self,
+        project_file_path: Path,
+        project_config: dict,
+        env_config: dict,
+        template_workspace_dir: str | None,
+        id_index: dict[str, Path],
+    ) -> WorkspaceDecision:
+        """Decide a project's workspace dir + override bit, resolving branch 4 from disk.
+
+        The disk-walking analogue of decide_workspace: branches 0-3 (the explicit, non-inherited
+        sources) and branch 5 (global default) are computed by the SAME
+        _decide_workspace_pre/post_inheritance helpers the live path uses, so they cannot drift.
+        Only branch 4 (parent-chain inheritance) differs: it walks the chain offline via
+        _inherit_workspace_from_parents_offline rather than the live registry, so a child's
+        inherited workspace is identical whether or not its parent is loaded. The offline
+        id-index is seeded from the live registry first, so this is a strict superset of the
+        live walk and produces the same result when the whole chain is loaded.
+
+        Returns the full WorkspaceDecision (path + apply_override) BEFORE the final
+        expand/resolve, so callers apply set_workspace_override or _resolve_workspace_dir as
+        they already do.
+        """
         pre_inheritance = self._decide_workspace_pre_inheritance(
             project_file_path, project_config, env_config, template_workspace_dir
         )
         if pre_inheritance is not None:
-            return self._resolve_workspace_dir(pre_inheritance.workspace_dir)
+            return pre_inheritance
 
         inherited = await self._inherit_workspace_from_parents_offline(project_file_path, id_index)
-        decision = self._decide_workspace_post_inheritance(project_file_path, inherited)
-        return self._resolve_workspace_dir(decision.workspace_dir)
+        return self._decide_workspace_post_inheritance(project_file_path, inherited)
+
+    async def _decide_libraries_root_from_disk(
+        self, project_file_path: Path, template_libraries_dir: str | None, id_index: dict[str, Path]
+    ) -> Path | None:
+        """Decide a project's libraries root, resolving parent inheritance from disk.
+
+        Disk-walking analogue of decide_libraries_root: branch 0 (own libraries_dir, passed in
+        already resolved) is unchanged, and branch 1 (nearest ancestor's libraries_dir) walks the
+        chain offline via _inherit_libraries_dir_from_parents_offline rather than the live registry,
+        so a child's shared libraries/ tree is identical whether or not its parent is loaded. Returns
+        None when no libraries_dir is declared anywhere in the chain (caller falls back to the
+        workspace-relative default).
+        """
+        if template_libraries_dir is not None:
+            return Path(template_libraries_dir)
+        inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
+        if inherited is not None:
+            return Path(inherited)
+        return None
 
     def _resolve_workspace_dir(self, workspace_dir: Path) -> Path:
         """Expand and resolve a decided workspace dir the way ConfigManager.set_workspace_override does."""
@@ -2402,35 +2451,7 @@ class ProjectManager:
             project_dir = project_file_path.parent
             self._config_manager.load_project_config(project_dir)
 
-            # Decide the workspace dir + override bit once (shared with the provisioning
-            # preview via decide_workspace, so the two cannot drift). apply_override is
-            # True for the project_workspaces mapping, parent-chain inheritance, and
-            # global-default branches; for an env/project-adjacent workspace_directory it is
-            # False, so the override stays unset and the workspace config layer can re-point
-            # workspace_path.
-            template_workspace_dir = self._resolve_template_workspace_dir(
-                project_info.template.workspace_dir, project_file_path
-            )
-            decision = self.decide_workspace(
-                project_file_path,
-                self._config_manager.project_config,
-                self._config_manager.env_config,
-                template_workspace_dir=template_workspace_dir,
-            )
-            if decision.apply_override:
-                self._config_manager.set_workspace_override(decision.workspace_dir)
-
-            # Decide the libraries root independently of the workspace (a project may point
-            # workspace_dir away from its own dir yet still share a parent's libraries). None
-            # means no explicit libraries_dir anywhere in the chain, so the override stays
-            # cleared and resolved_libraries_root() falls back to the workspace-relative
-            # default. Set before the post-change snapshot below so a sharing-vs-not switch
-            # is reflected in library_config_changed.
-            template_libraries_dir = self._resolve_template_libraries_dir(
-                project_info.template.libraries_dir, project_file_path
-            )
-            libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
-            self._config_manager.set_libraries_root_override(libraries_root)
+            await self._apply_workspace_and_libraries_layers(project_info, project_file_path)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
@@ -2490,6 +2511,59 @@ class ProjectManager:
                 return _ProjectActivationOutcome(failure=failure, workspace_changed=workspace_changed)
 
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
+
+    async def _apply_workspace_and_libraries_layers(self, project_info: ProjectInfo, project_file_path: Path) -> None:
+        """Resolve and apply a project's workspace override + libraries-root override during activation.
+
+        Branch 4 (workspace) and branch 1 (libraries) inherit from the parent chain, which is the ONLY
+        part of the decision that can vary with what is currently loaded. A project that declares a
+        parent resolves that inheritance ALWAYS from disk (never the live registry), so a child's
+        inherited workspace/libraries are identical whether or not its parent happens to be loaded;
+        this shares _decide_workspace_from_disk with the provisioning preview so the two cannot drift.
+        A parentless project has no inheritance to resolve, so it takes the sync decide_workspace /
+        decide_libraries_root path and pays no disk I/O.
+
+        apply_override is preserved verbatim: True for the project_workspaces mapping, parent-chain
+        inheritance, and global-default branches; False for an env/project-adjacent workspace_directory
+        (so the override stays unset and the workspace config layer can re-point workspace_path). A None
+        libraries root clears the override so a stale one from a previously-active sharing project is
+        dropped and resolved_libraries_root() falls back to the workspace-relative default.
+        """
+        template_workspace_dir = self._resolve_template_workspace_dir(
+            project_info.template.workspace_dir, project_file_path
+        )
+        template_libraries_dir = self._resolve_template_libraries_dir(
+            project_info.template.libraries_dir, project_file_path
+        )
+
+        declares_parent = (
+            project_info.template.parent_project_id is not None
+            or select_project_path(project_info.template.parent_project_path) is not None
+        )
+        if declares_parent:
+            id_index = await self._build_unloaded_id_index()
+            decision = await self._decide_workspace_from_disk(
+                project_file_path,
+                self._config_manager.project_config,
+                self._config_manager.env_config,
+                template_workspace_dir,
+                id_index,
+            )
+            libraries_root = await self._decide_libraries_root_from_disk(
+                project_file_path, template_libraries_dir, id_index
+            )
+        else:
+            decision = self.decide_workspace(
+                project_file_path,
+                self._config_manager.project_config,
+                self._config_manager.env_config,
+                template_workspace_dir=template_workspace_dir,
+            )
+            libraries_root = self.decide_libraries_root(project_file_path, template_libraries_dir)
+
+        if decision.apply_override:
+            self._config_manager.set_workspace_override(decision.workspace_dir)
+        self._config_manager.set_libraries_root_override(libraries_root)
 
     async def ensure_project_loaded(self, project_id: ProjectID) -> bool:
         """Ensure a project id is present in the in-memory registry, re-deriving if absent.

@@ -145,7 +145,7 @@ Used when a workflow is saved with the versioned-save intent. Every save produce
 
 The version-bump is **macro-driven**: when a versioned save runs, the engine reverse-matches the previous save's path against this situation's macro and extracts every variable the macro defines, including the bound padded slot. The next save reuses those variables verbatim, and the collision walk advances the padded index past any existing files. Because nothing about the version suffix is hardcoded, customizing the macro (e.g. swapping `_v{_index:03}` for `.{_index:04}`) still works — the new pattern becomes the contract for both forward saves and reverse-matches.
 
-> **Tip:** Custom projects can switch the auto-index slot to the more explicit `_v{###}` syntax (see [Sequence slot (`{###}`)](macros.md#sequence-slot-)). It behaves identically to `{_index:03}` for the default 3-digit case and overflows naturally past `999` instead of staying zero-padded.
+> **Tip:** Custom projects can switch the auto-index slot to the more explicit `_v{###}` syntax (see [Sequence slot (`{###}`)](macros.md#sequence-slot)). It behaves identically to `{_index:03}` for the default 3-digit case and overflows naturally past `999` instead of staying zero-padded.
 
 This situation is selected at the API layer by passing `create_versioned=True` on `SaveWorkflowRequest`; the UI exposes it as a separate menu item (e.g. "Save New Version"). See [Macros — Numeric padding](macros.md#numeric-padding) for the auto-index contract.
 

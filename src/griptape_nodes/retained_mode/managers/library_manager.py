@@ -3424,7 +3424,7 @@ class LibraryManager:
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
-            dirs = GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
+            dirs = await GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(
                     result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
@@ -4479,13 +4479,13 @@ class LibraryManager:
                 # probe attempt.
                 self._report_parameter_behavior_losses(probe)
 
-            # Drop the class only when a correctness-class rule fired.
-            # Severity is a logging concern; correctness is the lifecycle
-            # signal ("this class is broken enough to exclude from the
-            # schema"). Gating on severity would also drop the class for
-            # any future ergonomics rule whose worker_escalation flag is
+            # Drop the class only when a rule flagged drops_class_from_schema
+            # fired. Severity is a logging concern; drops_class_from_schema is
+            # the lifecycle signal ("this class is broken enough to exclude
+            # from the schema"). Gating on severity would also drop the class
+            # for any future ergonomics rule whose worker_escalation flag is
             # left at the True default.
-            blocking_rule_ids = {rid for rid, r in RULES.items() if r.correctness}
+            blocking_rule_ids = {rid for rid, r in RULES.items() if r.drops_class_from_schema}
             if any(v.rule_id in blocking_rule_ids for v in scope.violations):
                 continue
 

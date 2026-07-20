@@ -5837,17 +5837,7 @@ class WorkflowManager:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        # For now, use the first created flow as the main imported flow
-        # This handles nested workflows correctly since sub-flows are expected
-        created_flow_name = next(iter(new_flows))
-
-        if len(new_flows) > 1:
-            logger.debug(
-                "Multiple flows created during import of '%s'. Main flow: %s, Sub-flows: %s",
-                request.workflow_name,
-                created_flow_name,
-                [flow for flow in new_flows if flow != created_flow_name],
-            )
+        created_flow_name = self._select_top_level_imported_flow(new_flows, flow_name, request.workflow_name)
 
         # Apply imported flow metadata if provided
         if request.imported_flow_metadata:
@@ -5870,6 +5860,45 @@ class WorkflowManager:
         return ImportWorkflowAsReferencedSubFlowResultSuccess(
             created_flow_name=created_flow_name, result_details=details
         )
+
+    @staticmethod
+    def _select_top_level_imported_flow(new_flows: set[str], parent_flow_name: str, workflow_name: str) -> str:
+        """Select the top-level flow among those created by importing a referenced workflow.
+
+        A workflow that contains node groups (ForEach, etc.) imports as more than one flow: its
+        top-level flow plus each group's body flow. The caller wants the top-level flow (the one
+        holding the Start/End nodes). It is the new flow whose parent is the import target.
+
+        Args:
+            new_flows: Names of the flows created during the import.
+            parent_flow_name: The flow the workflow was imported into (the import target).
+            workflow_name: Name of the imported workflow, for diagnostics.
+
+        Returns:
+            The name of the top-level imported flow.
+        """
+        flow_manager = GriptapeNodes.FlowManager()
+        top_level_flows = [flow for flow in new_flows if flow_manager.get_parent_flow(flow) == parent_flow_name]
+
+        if len(top_level_flows) == 1:
+            return top_level_flows[0]
+
+        # Not exactly one flow parented to the target -- unexpected for a well-formed single-workflow
+        # import. Fall back to a deterministic (sorted) choice rather than hash-ordered set iteration,
+        # and log for diagnosis.
+        candidates = top_level_flows or list(new_flows)
+        selected = sorted(candidates)[0]
+        logger.warning(
+            "Import of '%s' created %d flow(s) with %d parented to target '%s'; expected exactly one "
+            "top-level flow. Using '%s'. All new flows: %s",
+            workflow_name,
+            len(new_flows),
+            len(top_level_flows),
+            parent_flow_name,
+            selected,
+            sorted(new_flows),
+        )
+        return selected
 
     def on_branch_workflow_request(self, request: BranchWorkflowRequest) -> ResultPayload:  # noqa: PLR0911
         """Create a branch (copy) of an existing workflow with branch tracking."""
