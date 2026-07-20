@@ -1,6 +1,7 @@
 """Tests for VariablesManager request handlers."""
 
 import contextlib
+import logging
 from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
@@ -16,6 +17,8 @@ from griptape_nodes.retained_mode.events.variable_events import (
     DeleteVariableRequest,
     DeleteVariableResultFailure,
     DeleteVariableResultSuccess,
+    GetVariableDetailsRequest,
+    GetVariableDetailsResultSuccess,
     GetVariableRequest,
     GetVariableResultFailure,
     GetVariableResultSuccess,
@@ -530,6 +533,71 @@ class TestReservedNames:
         )
         assert isinstance(result, CreateVariableResultSuccess)
 
+    def test_initial_setup_replay_bypasses_reserved_gate(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """Workflow load-replay (initial_setup=True) recreates a reserved-named variable.
+
+        Load re-executes captured CreateVariableRequests and DISCARDS the results, so a
+        refusal here would silently drop a variable the saved workflow legitimately owns
+        (saved before the name was reserved). The recreated flow variable is shadowed by
+        the project's computed value in resolution — exactly the pre-reservation behavior.
+        """
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(
+                name="workspace_dir",
+                type="str",
+                value="/from_saved_workflow",
+                owning_flow=flow_name,
+                initial_setup=True,
+            )
+        )
+        assert isinstance(result, CreateVariableResultSuccess)
+        # Stored in the flow layer (CURRENT_FLOW_ONLY sees it)...
+        stored = griptape_nodes.handle_request(
+            GetVariableRequest(
+                name="workspace_dir", starting_flow=flow_name, lookup_scope=VariableScope.CURRENT_FLOW_ONLY
+            )
+        )
+        assert isinstance(stored, GetVariableResultSuccess)
+        assert stored.variable.value == "/from_saved_workflow"
+
+    @pytest.mark.usefixtures("flow_name")
+    def test_initial_setup_replay_of_global_bypasses_reserved_gate(self, griptape_nodes: GriptapeNodes) -> None:
+        """Same replay exemption for globals — is_global=True round-trips through save/load too."""
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(
+                name="workspace_dir", type="str", value="/global_from_save", is_global=True, initial_setup=True
+            )
+        )
+        assert isinstance(result, CreateVariableResultSuccess)
+
+    def test_live_create_still_refused_after_replay_exemption(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """The exemption is replay-only: the same request WITHOUT initial_setup stays refused."""
+        result = griptape_nodes.handle_request(
+            CreateVariableRequest(name="workspace_dir", type="str", value="/hijack", owning_flow=flow_name)
+        )
+        assert isinstance(result, CreateVariableResultFailure)
+        assert "reserved" in str(result.result_details)
+
+    def test_replay_failure_is_logged_not_silent(
+        self, griptape_nodes: GriptapeNodes, flow_name: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A replayed create that fails for a NON-reserved reason logs a warning.
+
+        Load discards results, so the log is the only signal a saved variable didn't
+        come back (e.g. duplicate name in the same flow).
+        """
+        _add_variable(griptape_nodes, "dup_var", "first")
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = griptape_nodes.handle_request(
+                CreateVariableRequest(
+                    name="dup_var", type="str", value="second", owning_flow=flow_name, initial_setup=True
+                )
+            )
+        assert isinstance(result, CreateVariableResultFailure)
+        assert any("could not recreate variable 'dup_var'" in r.message for r in caplog.records)
+
     def test_create_with_blank_name_fails(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
         for blank in ("", "   "):
             result = griptape_nodes.handle_request(
@@ -602,6 +670,53 @@ class TestReservedNames:
             )
         )
         assert isinstance(result, RenameVariableResultSuccess)
+
+    def test_rename_read_only_variable_to_itself_is_noop_success(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """Rename-to-self succeeds even on a READ_ONLY variable — nothing is mutated.
+
+        The no-op short-circuit runs before the read-only refusal (and every other gate):
+        a resolved project builtin like workspace_dir is READ_ONLY, and renaming it to its
+        own name must be an idempotent success, not a 'read-only' Failure.
+        """
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(
+                name="workspace_dir",
+                new_name="workspace_dir",
+                starting_flow=flow_name,
+                lookup_scope=VariableScope.PROJECT_ONLY,
+            )
+        )
+        assert isinstance(result, RenameVariableResultSuccess)
+
+    def test_rename_read_only_variable_to_new_name_still_refused(
+        self, griptape_nodes: GriptapeNodes, flow_name: str
+    ) -> None:
+        """The no-op reorder must not weaken the real gate: an ACTUAL rename of READ_ONLY still fails."""
+        result = griptape_nodes.handle_request(
+            RenameVariableRequest(
+                name="workspace_dir",
+                new_name="my_workspace",
+                starting_flow=flow_name,
+                lookup_scope=VariableScope.PROJECT_ONLY,
+            )
+        )
+        assert isinstance(result, RenameVariableResultFailure)
+        assert "read-only" in str(result.result_details)
+
+    def test_variable_details_reports_reserved_for_builtin(self, griptape_nodes: GriptapeNodes, flow_name: str) -> None:
+        """GetVariableDetails populates reserved: True for a resolved computed name, False for a user variable."""
+        builtin_details = griptape_nodes.handle_request(
+            GetVariableDetailsRequest(name="workspace_dir", starting_flow=flow_name)
+        )
+        assert isinstance(builtin_details, GetVariableDetailsResultSuccess)
+        assert builtin_details.details.reserved is True
+
+        _add_variable(griptape_nodes, "my_var", "v")
+        user_details = griptape_nodes.handle_request(GetVariableDetailsRequest(name="my_var", starting_flow=flow_name))
+        assert isinstance(user_details, GetVariableDetailsResultSuccess)
+        assert user_details.details.reserved is False
 
     @pytest.mark.usefixtures("flow_name")
     def test_delete_global_variable_routes_to_global_layer(self, griptape_nodes: GriptapeNodes) -> None:
