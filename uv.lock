@@ -1817,16 +1817,16 @@ email = [
 
 [[package]]
 name = "pydantic-ai-skills"
-version = "1.1.0"
+version = "1.2.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "pydantic-ai-slim" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/7c/0c/ee3e5bd2d003170f96f2fe5d1ec3f4525930183378841fb1b9147c5129cc/pydantic_ai_skills-1.1.0.tar.gz", hash = "sha256:66f85a63088a30863a3363a36830beedf60c32517473663c3da6557f1a838006", size = 9028209, upload-time = "2026-06-27T18:48:29.181Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5e/90/5f20728badc7d17ca0e81f24dc35a96c02f008323dce393d0e70a8465144/pydantic_ai_skills-1.2.0.tar.gz", hash = "sha256:e52f7e8243343dfa94206aae11cd142120edb8990fc392b1d8af32f99b6d351e", size = 9031839, upload-time = "2026-07-15T02:37:26.37Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8a/6c/406ce642127956ac3068bc12e0f64d876af53688ca6992ca5aa077926c3d/pydantic_ai_skills-1.1.0-py3-none-any.whl", hash = "sha256:72a0d9099f4562c96ed7f882f6b3e77589cd5e7d4c6d48c550904931ca56df1d", size = 62211, upload-time = "2026-06-27T18:48:27.272Z" },
+    { url = "https://files.pythonhosted.org/packages/a5/74/143ca60dd9bfa11ce0349ee58bbdd646798c8bdc031588d67a8bea96797d/pydantic_ai_skills-1.2.0-py3-none-any.whl", hash = "sha256:7ff4eb4b307deb6ef3bf31a6d9493c1e3a8e9b866a13b866a9ea4606bd914206", size = 63883, upload-time = "2026-07-15T02:37:24.117Z" },
 ]
 
 [[package]]
