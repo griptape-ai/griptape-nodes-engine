@@ -88,7 +88,7 @@ plugins:
       sections:
         Get started:
           - index.md: Top-level introduction to Griptape Nodes
-          - installation.md: Install the engine
+          - installation.md: Install Griptape Nodes via the Desktop app (recommended), a manual engine install, or license activation
           - faq.md: Frequently asked questions
           - troubleshooting.md: Fixes for commonly encountered issues and states
           - glossary.md: Terms and definitions used throughout the docs
