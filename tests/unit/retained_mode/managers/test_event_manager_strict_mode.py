@@ -5,7 +5,10 @@ EventManager.handle_request / ahandle_request consult
 flag is set (a node ``__init__`` is currently running on the calling
 task) and a strict-mode scope is open, the manager records a
 ``reentrant-bus-in-init`` violation against the active scope. The
-detector is correctness-class: severity is ERROR on both sides.
+detector is an ergonomics rule (``correctness=False``,
+``worker_escalation=True``): severity is WARNING on the orchestrator and
+ERROR on the worker. It still drops the class from the worker schema
+during library load via ``drops_class_from_schema``.
 
 Outside of node construction, dispatch must not record a violation.
 Outside of any strict-mode scope, ``STRICT_MODE.report`` is a no-op so
@@ -135,8 +138,8 @@ class TestReentrantBusInInit:
         assert result.succeeded()
 
     @pytest.mark.asyncio
-    async def test_severity_is_error_on_orchestrator(self) -> None:
-        """Correctness rules fail on both sides; orchestrator scope still gets ERROR."""
+    async def test_severity_is_warning_on_orchestrator(self) -> None:
+        """Ergonomics rule: the orchestrator scope warns rather than failing."""
         event_manager = _make_event_manager_with_probe_handler()
 
         token = _constructing_node.set(True)
@@ -148,6 +151,25 @@ class TestReentrantBusInInit:
                 is_worker=False,
             ) as scope:
                 await event_manager.ahandle_request(_ProbeRequest(marker="m5"))
+        finally:
+            _constructing_node.reset(token)
+
+        assert scope.violations[0].severity is StrictModeSeverity.WARNING
+
+    @pytest.mark.asyncio
+    async def test_severity_is_error_on_worker(self) -> None:
+        """Worker escalation: the same rule fails on the worker side."""
+        event_manager = _make_event_manager_with_probe_handler()
+
+        token = _constructing_node.set(True)
+        try:
+            with STRICT_MODE.open_scope(
+                kind=StrictModeScopeKind.RUNTIME_EXECUTE,
+                subject="node-1",
+                library_name="libA",
+                is_worker=True,
+            ) as scope:
+                await event_manager.ahandle_request(_ProbeRequest(marker="m6"))
         finally:
             _constructing_node.reset(token)
 

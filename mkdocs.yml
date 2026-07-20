@@ -14,7 +14,6 @@ plugins:
       redirect_maps:
         configuration.md: guides/configuration.md
         configuration_reference.md: reference/configuration_reference.md
-        libraries.md: guides/libraries.md
         command_line_interface.md: reference/command_line_interface.md
         retained_mode.md: development/retained_mode.md
         publishing/index.md: guides/publishing.md
@@ -62,7 +61,8 @@ plugins:
         guides/agent/sending_messages.md: guides/agent/index.md
         developing_nodes/index.md: development/custom_nodes/index.md
         developing_nodes/getting_started.md: development/custom_nodes/getting_started.md
-        developing_nodes/comprehensive_guide.md: development/custom_nodes/comprehensive_guide.md
+        developing_nodes/comprehensive_guide.md: development/custom_nodes/index.md
+        development/custom_nodes/comprehensive_guide.md: development/custom_nodes/index.md
         developing_nodes/node_isolation_with_workers.md: development/custom_nodes/node_isolation_with_workers.md
         developing_nodes/strict_mode.md: development/custom_nodes/strict_mode.md
         projects/index.md: guides/projects/index.md
@@ -90,6 +90,7 @@ plugins:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install the engine
           - faq.md: Frequently asked questions
+          - troubleshooting.md: Fixes for commonly encountered issues and states
           - glossary.md: Terms and definitions used throughout the docs
           - for_agents.md: Hosted machine-readable docs surface (this page)
         Tutorials:
@@ -99,6 +100,14 @@ plugins:
           - tutorials/02_coordinating_agents/index.md
           - tutorials/03_compare_prompts/index.md
           - tutorials/04_photography_team/index.md
+        Editor:
+          - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
+          - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
+          - guides/editor/working_with_nodes.md: Adding, selecting, wiring, and editing nodes on the canvas
+          - guides/editor/node_groups.md: Groups, subflows, and iterative group types (ForEach, For Loop, Retry)
+          - guides/editor/running_workflows.md: Running, stopping, logs, error history, and saving
+          - guides/editor/media_editors.md: Built-in viewers and editors for images, video, audio, 3D, and splats
+          - guides/editor/managing_models_and_libraries.md: Model Management and Library Management windows
         Agent:
           - guides/agent/index.md: Built-in AI assistant with direct workflow access via the Griptape MCP server
           - guides/agent/threads.md: Conversation threads and local storage locations
@@ -127,7 +136,10 @@ plugins:
           - guides/projects/sequences.md: Numbered file sequences (patterns and policies)
           - guides/projects/version_pinning.md: Pinning engine and library versions
           - guides/projects/customization.md: Customization guide
-        Publishing:
+        Workflows:
+          - guides/variables.md: Workflow variables — scopes, variable nodes, and inline {name} substitution
+          - guides/assets.md: Where generated files go, previews and downloads, and uploads
+          - guides/workflow_versions.md: Save As New Version and versioned workflow files
           - guides/publishing.md: Publishing a workflow — lifecycle, dependency bundling, and static-file workarounds
         MCP integration:
           - guides/mcp/index.md: MCP integration overview
@@ -156,18 +168,33 @@ plugins:
         Custom nodes:
           - development/custom_nodes/index.md: Developing custom nodes overview
           - development/custom_nodes/getting_started.md: Beginner-friendly intro to node development
-          - development/custom_nodes/comprehensive_guide.md: Exhaustive node development reference
+          - development/custom_nodes/parameters.md: Parameter attributes, traits, helper classes, containers, and advanced parameter patterns
+          - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
+          - development/custom_nodes/execution_and_lifecycle.md: Lifecycle callbacks and asynchronous API integration patterns
+          - development/custom_nodes/project_system.md: Saving files from nodes through the project system (situations, macros, ProjectFileParameter)
+          - development/custom_nodes/error_handling.md: Best practices for secrets, imports, validation, error handling, and logging
+          - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
+          - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
+          - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material
           - development/custom_nodes/node_isolation_with_workers.md: Running a library isolated in a worker subprocess for dependency isolation
           - development/custom_nodes/strict_mode.md: Strict-mode rules that identify isolation incompatibilities
         Reference:
           - reference/command_line_interface.md: gtn CLI reference
           - reference/configuration_reference.md: Every engine setting with type, default, and env var
         Enterprise:
+          - enterprise/admin_dashboard.md: Manage license keys, access groups, and permission templates from the editor's admin interface
           - enterprise/admin_server.md: Run a single in-network proxy so app instances avoid public internet access
+          - enterprise/using_the_admin_server.md: Activate the desktop app with a license through the Admin Server
         Agent skills:
           - skills/griptape-nodes-workflows/SKILL.md: Build, run, and inspect workflows through the engine's MCP server
-        Node reference:
+        Node libraries:
+          - libraries/index.md: Overview of node libraries (installed by default and installable)
           - nodes/*.md
+          - libraries/advanced_media/index.md: Advanced Media Library overview
+          - libraries/opencolorio/*.md
+          - libraries/openexr/*.md
+          - libraries/nuke/*.md
+          - libraries/diffusers/*.md
 
 extra_css:
   - assets/css/extra.css
@@ -206,7 +233,6 @@ theme:
   features:
     - content.code.copy
     - navigation.tabs
-    - navigation.expand
     - navigation.top
     - navigation.tabs.sticky
     - navigation.sections
@@ -237,8 +263,17 @@ nav:
           - 4. Compare Prompts: tutorials/03_compare_prompts/index.md
           - 5. Build a Photography Team: tutorials/04_photography_team/index.md
       - FAQ: faq.md
+      - Troubleshooting: troubleshooting.md
       - Glossary: glossary.md
   - Guides:
+      - Editor:
+          - Overview: guides/editor/index.md
+          - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md
+          - Working with Nodes: guides/editor/working_with_nodes.md
+          - Node Groups: guides/editor/node_groups.md
+          - Running Workflows: guides/editor/running_workflows.md
+          - Media Viewers and Editors: guides/editor/media_editors.md
+          - Managing Models and Libraries: guides/editor/managing_models_and_libraries.md
       - Agent:
           - Overview: guides/agent/index.md
           - Threads: guides/agent/threads.md
@@ -270,7 +305,11 @@ nav:
           - Sequences: guides/projects/sequences.md
           - Version Pinning: guides/projects/version_pinning.md
           - Customization Guide: guides/projects/customization.md
-      - Publishing Workflows: guides/publishing.md
+      - Workflows:
+          - Variables: guides/variables.md
+          - Assets & Outputs: guides/assets.md
+          - Workflow Versions: guides/workflow_versions.md
+          - Publishing: guides/publishing.md
       - MCP:
           - Overview: guides/mcp/index.md
           - Getting Started: guides/mcp/getting_started.md
@@ -295,24 +334,12 @@ nav:
           - OpenAI API Keys: guides/integrations/openai.md
           - Grok API Keys: guides/integrations/grok.md
           - Hugging Face Models: guides/integrations/hugging_face.md
-  - Development:
-      - Scripting: development/retained_mode.md
-      - Custom Nodes:
-          - Overview: development/custom_nodes/index.md
-          - Getting Started: development/custom_nodes/getting_started.md
-          - Comprehensive Guide: development/custom_nodes/comprehensive_guide.md
-          - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
-          - Strict Mode Reference: development/custom_nodes/strict_mode.md
-          - Example Control Node: development/custom_nodes/example_control_node.py
-      - For Agents: for_agents.md
-  - Reference:
-      - Nodes:
+  - Libraries:
+      - Overview: libraries/index.md
+      - Standard Library:
           - Overview: nodes/overview.md
           - 3D:
               - Load 3D: nodes/three_d/load_gltf.md
-          - Advanced Media Library:
-              - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
-              - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
           - Agents:
               - Agent: nodes/agents/create_agent.md
           - Audio:
@@ -453,7 +480,74 @@ nav:
               - Save Video: nodes/video/save_video.md
               - Split Video: nodes/video/split_video.md
               - Video Color Match: nodes/video/video_color_match.md
+      - Diffusers:
+          - Overview: libraries/diffusers/index.md
+          - Pipeline:
+              - Modular Diffusion Pipeline Builder: libraries/diffusers/pipeline_builder.md
+              - ControlNet Pipeline: libraries/diffusers/controlnet_pipeline.md
+              - Load LoRA: libraries/diffusers/load_lora.md
+              - LoRA Pipeline: libraries/diffusers/lora_pipeline.md
+          - Create:
+              - Create Noise Latents: libraries/diffusers/create_noise_latents.md
+              - Create Empty Latents: libraries/diffusers/empty_latents.md
+          - Processing:
+              - Generate Media Latents: libraries/diffusers/generate_media_latents.md
+              - Latent Upsampler: libraries/diffusers/latent_upsampler.md
+          - Transform:
+              - Add Latents: libraries/diffusers/add_latents.md
+              - Subtract Latents: libraries/diffusers/subtract_latents.md
+              - Multiply Latents: libraries/diffusers/multiply_latents.md
+              - Latents Composite Mask: libraries/diffusers/latents_composite_mask.md
+          - Conditioning:
+              - Configure ControlNet: libraries/diffusers/configure_controlnet.md
+              - Media Generation Conditioning: libraries/diffusers/media_gen_conditioning.md
+          - Encode / Decode:
+              - Encode Media Latent: libraries/diffusers/encode_media_latent.md
+              - Encode Masked Media Latent: libraries/diffusers/encode_masked_media_latent.md
+              - Decode Media Latent: libraries/diffusers/decode_media_latent.md
+              - Decode HDR Latents: libraries/diffusers/decode_hdr_latents.md
+          - IO:
+              - Save Latent Tensor: libraries/diffusers/save_latent_tensor.md
+      - Advanced Media Library:
+          - Overview: libraries/advanced_media/index.md
+          - Diffusion Pipelines: nodes/advanced_media_library/diffusion_pipelines.md
+          - YOLOv8 Face Detection: nodes/advanced_media_library/yolov8_face_detection.md
+      - OpenColorIO:
+          - Overview: libraries/opencolorio/index.md
+          - Load OCIO Config: libraries/opencolorio/load_ocio_config.md
+          - OCIO Color Parameters: libraries/opencolorio/ocio_color_parameters.md
+      - OpenEXR:
+          - Overview: libraries/openexr/index.md
+          - Load EXR: libraries/openexr/load_exr.md
+          - Display EXR Part: libraries/openexr/display_exr_part.md
+          - Display EXR Channel: libraries/openexr/display_exr_channel.md
+          - Save EXR: libraries/openexr/save_exr.md
+      - Nuke:
+          - Overview: libraries/nuke/index.md
+          - Nuke Start Flow: libraries/nuke/nuke_start_flow.md
+          - Nuke End Flow: libraries/nuke/nuke_end_flow.md
+          - Nuke Script: libraries/nuke/nuke_script.md
+  - Development:
+      - Scripting: development/retained_mode.md
+      - Custom Nodes:
+          - Overview: development/custom_nodes/index.md
+          - Getting Started: development/custom_nodes/getting_started.md
+          - Parameters: development/custom_nodes/parameters.md
+          - Parameter UI Reference: development/custom_nodes/parameter_ui_reference.md
+          - Execution and Lifecycle: development/custom_nodes/execution_and_lifecycle.md
+          - Project System: development/custom_nodes/project_system.md
+          - Best Practices and Error Handling: development/custom_nodes/error_handling.md
+          - Authoring Libraries: development/custom_nodes/authoring_libraries.md
+          - Custom Widgets: development/custom_nodes/custom_widgets.md
+          - Patterns and Examples: development/custom_nodes/examples.md
+          - Node Isolation with Workers: development/custom_nodes/node_isolation_with_workers.md
+          - Strict Mode Reference: development/custom_nodes/strict_mode.md
+          - Example Control Node: development/custom_nodes/example_control_node.py
+      - For Agents: for_agents.md
+  - Reference:
       - Command Line Interface: reference/command_line_interface.md
       - Configuration Reference: reference/configuration_reference.md
   - Enterprise:
+      - Admin Dashboard: enterprise/admin_dashboard.md
       - Admin Server: enterprise/admin_server.md
+      - Using the Admin Server: enterprise/using_the_admin_server.md

@@ -2,6 +2,10 @@
 
 A macro is a template string that generates a file path by substituting named variables. Macros are used in situation templates and directory definitions.
 
+!!! note
+
+    This page is about **file-path macros** used by the project system. For named values you create and read inside a workflow — including `{name}` substitution in text parameters — see [Workflow Variables](../variables.md).
+
 Before diving into the full syntax, here are two examples that show what macros look like in practice:
 
 ```
@@ -82,7 +86,7 @@ Mirror of the [separator format](#separator-format), but the text is **prepended
   file_name_base="render", version not provided             →  render.png
 ```
 
-The load-bearing pattern: pair with a [sequence slot](#sequence-slot-) to get a version suffix that comes and goes with the sequence:
+The load-bearing pattern: pair with a [sequence slot](#sequence-slot) to get a version suffix that comes and goes with the sequence:
 
 ```
 render{###?:^_v}.png

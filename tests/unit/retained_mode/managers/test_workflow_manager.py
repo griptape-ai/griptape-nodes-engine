@@ -1,10 +1,11 @@
 import ast
 import asyncio
+import logging
 import re
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple
-from unittest.mock import AsyncMock, MagicMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, call, create_autospec, patch
 
 import anyio
 import pytest
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import NodeDependencies
-from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.node_library.workflow_registry import Workflow, WorkflowMetadata, WorkflowRegistry, WorkflowShape
 from griptape_nodes.retained_mode.events.base_events import ResultDetails
 from griptape_nodes.retained_mode.events.flow_events import SerializedFlowCommands
 from griptape_nodes.retained_mode.events.workflow_events import (
@@ -32,6 +33,8 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetWorkflowMetadataRequest,
     GetWorkflowMetadataResultFailure,
     GetWorkflowMetadataResultSuccess,
+    ImportWorkflowAsReferencedSubFlowRequest,
+    ImportWorkflowAsReferencedSubFlowResultSuccess,
     ImportWorkflowRequest,
     ImportWorkflowResultFailure,
     ImportWorkflowResultSuccess,
@@ -53,6 +56,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowStatus,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
+from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 
 
@@ -4072,3 +4078,107 @@ class TestScrubForAstConstant:
         ast.parse(content)
         assert "'traits': []" in content
         assert "'display_name': 'Custom Voice ID'" in content
+
+
+class TestSelectTopLevelImportedFlow:
+    """WorkflowManager._select_top_level_imported_flow picks the top-level imported flow."""
+
+    def _flow_manager_with_parents(self, monkeypatch: pytest.MonkeyPatch, parents: dict[str, str]) -> None:
+        """Stub GriptapeNodes.FlowManager().get_parent_flow via the given name->parent mapping."""
+        flow_manager = Mock(spec=FlowManager)
+        flow_manager.get_parent_flow.side_effect = lambda flow: parents[flow]
+        monkeypatch.setattr(GriptapeNodes, "FlowManager", lambda: flow_manager)
+
+    def test_selects_flow_parented_to_import_target(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        # Top-level flow is parented to the target; the group's body flow is parented to the top-level.
+        self._flow_manager_with_parents(monkeypatch, {"ControlFlow_2": "ParentFlow", "Group_subflow": "ControlFlow_2"})
+
+        selected = workflow_manager._select_top_level_imported_flow(
+            {"ControlFlow_2", "Group_subflow"}, "ParentFlow", "grouped_inner_workflow"
+        )
+
+        assert selected == "ControlFlow_2"
+
+    def test_falls_back_deterministically_when_none_parented_to_target(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        self._flow_manager_with_parents(monkeypatch, {"Zeta_flow": "Other", "Alpha_flow": "Other"})
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            selected = workflow_manager._select_top_level_imported_flow({"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf")
+
+        # No flow parented to the target: deterministic sorted fallback, never hash-ordered.
+        assert selected == "Alpha_flow"
+        assert any(
+            record.levelno == logging.WARNING and "expected exactly one top-level flow" in record.getMessage()
+            for record in caplog.records
+        ), f"expected a fallback warning, got: {[r.getMessage() for r in caplog.records]}"
+
+    def test_falls_back_deterministically_when_multiple_parented_to_target(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+        self._flow_manager_with_parents(monkeypatch, {"Zeta_flow": "ParentFlow", "Alpha_flow": "ParentFlow"})
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            selected = workflow_manager._select_top_level_imported_flow({"Zeta_flow", "Alpha_flow"}, "ParentFlow", "wf")
+
+        # More than one candidate parented to the target: deterministic sorted fallback.
+        assert selected == "Alpha_flow"
+        assert any(
+            record.levelno == logging.WARNING and "expected exactly one top-level flow" in record.getMessage()
+            for record in caplog.records
+        ), f"expected a fallback warning, got: {[r.getMessage() for r in caplog.records]}"
+
+
+class TestExecuteWorkflowImport:
+    """WorkflowManager._execute_workflow_import tests."""
+
+    @pytest.mark.asyncio
+    async def test_returns_top_level_imported_flow(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        request = ImportWorkflowAsReferencedSubFlowRequest(
+            workflow_name="wf", flow_name="ParentFlow", imported_flow_metadata=None, track_as_referenced=False
+        )
+        workflow = Mock(spec=Workflow)
+        workflow.file_path = "workflows/wf.py"
+
+        # The import creates two new flows (a top-level flow + a group's body flow). The dict
+        # values are never inspected -- only the keys form the new-flows set.
+        object_manager = Mock(spec=ObjectManager)
+        object_manager.get_filtered_subset.side_effect = [
+            {"ParentFlow": object()},
+            {"ParentFlow": object(), "ControlFlow_2": object(), "Group_subflow": object()},
+        ]
+        monkeypatch.setattr(GriptapeNodes, "ObjectManager", lambda: object_manager)
+
+        # ContextManager().flow(...) is used purely as a context manager wrapping the import.
+        context_manager = MagicMock(spec=ContextManager)
+        monkeypatch.setattr(GriptapeNodes, "ContextManager", lambda: context_manager)
+
+        monkeypatch.setattr(
+            workflow_manager,
+            "run_workflow",
+            AsyncMock(
+                return_value=WorkflowManager.WorkflowExecutionResult(execution_successful=True, execution_details="ok")
+            ),
+        )
+
+        # Spy the selection helper (its own logic is covered by TestSelectTopLevelImportedFlow).
+        select_mock = create_autospec(workflow_manager._select_top_level_imported_flow, return_value="ControlFlow_2")
+        monkeypatch.setattr(workflow_manager, "_select_top_level_imported_flow", select_mock)
+
+        result = await workflow_manager._execute_workflow_import(request, workflow, "ParentFlow")
+
+        # It selects via the helper (passing the new-flows set, target flow, and workflow name)...
+        select_mock.assert_called_once_with({"ControlFlow_2", "Group_subflow"}, "ParentFlow", "wf")
+        # ...and returns exactly what the helper chose.
+        assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
+        assert result.created_flow_name == "ControlFlow_2"
