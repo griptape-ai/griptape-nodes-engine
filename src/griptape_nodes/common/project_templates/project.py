@@ -17,6 +17,7 @@ from griptape_nodes.common.project_templates.validation import (
     ProjectOverrideCategory,
     ProjectValidationInfo,
 )
+from griptape_nodes.common.project_templates.variable import ProjectVariableDef
 
 if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
@@ -118,6 +119,16 @@ class ProjectTemplate(BaseModel):
         description="Directory definitions (logical_name -> definition)",
     )
     environment: dict[str, str] = Field(default_factory=dict, description="Custom environment variables")
+    variables: dict[str, ProjectVariableDef] = Field(
+        default_factory=dict,
+        description=(
+            "User-defined project variables (variable_name -> definition). At template load these "
+            "populate the project's stored variable layer, where they participate in hierarchical "
+            "variable lookup (flow > project > global) and {VAR} macro resolution. Unlike builtins "
+            "and directories, these names are not reserved, and read_write entries are writable at "
+            "runtime (writes persist back to this file as an overlay)."
+        ),
+    )
     file_extension_directories: dict[str, str] = Field(
         default_factory=dict,
         description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable. This variable is only available inside situation macros (the filename layer, resolved per-file at write time), not in directory or environment path_macros.",
@@ -210,6 +221,10 @@ class ProjectTemplate(BaseModel):
         environment_overlay = self._diff_environment(self_dump["environment"], base_dump["environment"])
         if environment_overlay:
             output["environment"] = environment_overlay
+
+        variables_overlay = self._diff_named_items(self_dump.get("variables", {}), base_dump.get("variables", {}))
+        if variables_overlay:
+            output["variables"] = variables_overlay
 
         file_extension_directories_overlay = self._diff_environment(
             self_dump.get("file_extension_directories", {}),
@@ -490,6 +505,45 @@ class ProjectTemplate(BaseModel):
                 action=action,
             )
 
+        # Merge variables (per-entry atomic like situations/directories: an overlay
+        # entry replaces the base entry wholesale; null tombstones drop inherited
+        # entries). Entries are pydantic-validated here — a bad entry becomes a
+        # validation error, not a crash, and is skipped from the merged result.
+        merged_variables: dict[str, ProjectVariableDef] = {}
+        for var_name, base_var in base.variables.items():
+            if var_name in overlay.removed_variables:
+                validation_info.add_override(
+                    category=ProjectOverrideCategory.VARIABLE,
+                    name=var_name,
+                    action=ProjectOverrideAction.REMOVED,
+                )
+                continue
+            if var_name not in overlay.variables:
+                merged_variables[var_name] = base_var
+        for var_name, var_data in overlay.variables.items():
+            if var_name in overlay.removed_variables:
+                continue
+            var_data_with_name = {"name": var_name, **var_data}
+            try:
+                merged_variables[var_name] = ProjectVariableDef.model_validate(var_data_with_name)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = f"variables.{var_name}.{error_field_path}"
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=overlay.line_info.get_line(full_field_path)
+                        or overlay.line_info.get_line(f"variables.{var_name}"),
+                    )
+                continue
+            action = ProjectOverrideAction.MODIFIED if var_name in base.variables else ProjectOverrideAction.ADDED
+            validation_info.add_override(
+                category=ProjectOverrideCategory.VARIABLE,
+                name=var_name,
+                action=action,
+            )
+
         # Merge file_extension_directories (same semantics as environment: per-key
         # overwrite, null tombstones drop inherited entries).
         merged_file_extension_directories = {**base.file_extension_directories}
@@ -564,6 +618,7 @@ class ProjectTemplate(BaseModel):
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,
+            variables=merged_variables,
             file_extension_directories=merged_file_extension_directories,
             description=merged_description,
         )
