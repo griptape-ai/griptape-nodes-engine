@@ -81,6 +81,15 @@ Settings for artifact providers and preview generation
 | ----------- | ------ | ------- | ------------------------------ | ------------------------------------------------------------------- |
 | `artifacts` | object | `{}`    | n/a (nested; edit config file) | Control how previews are generated for images and other media files |
 
+## FFmpeg
+
+Locations of the ffmpeg and ffprobe binaries used for video processing
+
+| Setting        | Type   | Default | Environment variable      | Description                                                                                                                                                                                                                                                                                                              |
+| -------------- | ------ | ------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ffmpeg_path`  | string | `null`  | `GTN_CONFIG_FFMPEG_PATH`  | Absolute path to an ffmpeg executable to use for video processing. When unset, the engine uses an ffmpeg found on the system PATH, and otherwise downloads a bundled build via static-ffmpeg on first use. Set this to force a specific binary, for example on a machine with no network access to download one.         |
+| `ffprobe_path` | string | `null`  | `GTN_CONFIG_FFPROBE_PATH` | Absolute path to an ffprobe executable to use for reading video metadata. When unset, the engine uses an ffprobe found on the system PATH, and otherwise downloads a bundled build via static-ffmpeg on first use. Set this to force a specific binary, for example on a machine with no network access to download one. |
+
 ## Projects
 
 Project template configurations and registrations

@@ -250,3 +250,34 @@ Now when workflows generate media:
 - Local access: Works via the tunnel URL
 - External services: Can fetch media via the ngrok URL
 - CORS: Automatically configured for the tunnel URL
+
+## FFmpeg Configuration
+
+Video nodes use **ffmpeg** and **ffprobe** to read video files (dimensions, codec, duration) and to generate the browser-playable previews you see in the editor. The engine finds these two binaries automatically, in this order:
+
+1. **The `ffmpeg_path` and `ffprobe_path` settings**, if you set them to a specific executable.
+1. **Your system `PATH`** — an ffmpeg installed with Homebrew, apt, or a manual install is used as-is.
+1. **A bundled build**, downloaded from GitHub on first use if the first two turn up nothing.
+
+Because a binary already on your `PATH` is preferred over the download, installing ffmpeg yourself (for example `brew install ffmpeg` on macOS or `sudo apt install ffmpeg` on Linux) means the engine never has to fetch one over the network.
+
+### When to Set These Settings
+
+Leave `ffmpeg_path` and `ffprobe_path` empty for most setups — auto-detection handles them. Set them when you want to:
+
+- **Run without network access**: on an air-gapped or firewalled machine that cannot reach GitHub to download the bundled build, point the settings at a locally installed ffmpeg so no download is attempted.
+- **Pin a specific build**: force the engine to use one exact ffmpeg/ffprobe rather than whichever one happens to be first on `PATH`.
+
+If you set a path that does not point at a runnable executable, the video node fails with a message naming the setting, so a typo is easy to spot.
+
+### How to Configure
+
+Open the Configuration Editor (**Settings → All Settings**), search for "ffmpeg", and set `ffmpeg_path` and `ffprobe_path` to the full paths of the executables. Both are top-level settings, so you can also set them from the environment when running headless:
+
+```bash
+GTN_CONFIG_FFMPEG_PATH=/opt/homebrew/bin/ffmpeg GTN_CONFIG_FFPROBE_PATH=/opt/homebrew/bin/ffprobe gtn
+```
+
+Restart the engine after changing either setting for it to take effect.
+
+If a video node fails while trying to download ffmpeg, see [A video node fails to download ffmpeg](../troubleshooting.md#a-video-node-fails-to-download-ffmpeg).

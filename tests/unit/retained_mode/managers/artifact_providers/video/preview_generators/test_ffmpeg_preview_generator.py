@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from pydantic import ValidationError
@@ -200,6 +201,31 @@ class TestFFmpegPreviewGeneratorClassMethods:
         # Verify defaults
         assert model_fields["max_width"].default == 1024  # noqa: PLR2004
         assert model_fields["max_height"].default == 1024  # noqa: PLR2004
+
+
+class TestFFmpegPreviewGeneratorBinaryResolution:
+    """Binary-resolution failures surface from preview generation."""
+
+    @pytest.mark.asyncio
+    async def test_resolver_failure_propagates_unwrapped(self, dummy_source_path: str, temp_output_dir: str) -> None:
+        """A resolver FileNotFoundError propagates verbatim, not re-wrapped in a second message."""
+        generator = FFmpegPreviewGenerator(
+            source_file_location=dummy_source_path,
+            preview_format="mp4",
+            destination_preview_directory=temp_output_dir,
+            destination_preview_file_name="output.mp4",
+            params={"max_width": 100, "max_height": 100},
+        )
+
+        target = (
+            "griptape_nodes.retained_mode.managers.artifact_providers.video.preview_generators"
+            ".ffmpeg_preview_generator.resolve_ffmpeg_binaries"
+        )
+        with (
+            patch(target, side_effect=FileNotFoundError("boom")),
+            pytest.raises(FileNotFoundError, match=r"^boom$"),
+        ):
+            await generator.attempt_generate_preview()
 
 
 @pytest.mark.skipif(not FFMPEG_AVAILABLE, reason="ffmpeg not installed")
