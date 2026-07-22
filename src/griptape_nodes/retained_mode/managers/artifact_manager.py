@@ -23,6 +23,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GeneratePreviewRequest,
     GeneratePreviewResultFailure,
     GeneratePreviewResultSuccess,
+    GetArtifactMetadataRequest,
+    GetArtifactMetadataResultFailure,
+    GetArtifactMetadataResultSuccess,
     GetArtifactProviderDetailsRequest,
     GetArtifactProviderDetailsResultFailure,
     GetArtifactProviderDetailsResultSuccess,
@@ -214,6 +217,9 @@ class ArtifactManager:
             )
             event_manager.assign_manager_to_request_type(
                 CheckArtifactReadPermissionRequest, self.on_check_artifact_read_permission_request
+            )
+            event_manager.assign_manager_to_request_type(
+                GetArtifactMetadataRequest, self.on_handle_get_artifact_metadata_request
             )
 
             event_manager.add_listener_to_app_event(
@@ -930,6 +936,41 @@ class ArtifactManager:
         return CheckArtifactReadPermissionResultSuccess(
             denial=denial,
             result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
+        )
+
+    async def on_handle_get_artifact_metadata_request(
+        self, request: GetArtifactMetadataRequest
+    ) -> GetArtifactMetadataResultSuccess | GetArtifactMetadataResultFailure:
+        """Handle a metadata request by dispatching to the provider that claims the extension.
+
+        Mirrors the provider-resolution logic used elsewhere in this manager
+        (e.g. prepare_content_for_write, check_read_permission): no provider for
+        the extension is not an error, it's Success with artifact_metadata=None.
+        """
+        if not request.source_path:
+            return GetArtifactMetadataResultFailure(
+                result_details="Attempted to get artifact metadata. Failed because no source path was provided."
+            )
+
+        source_path = request.source_path
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return GetArtifactMetadataResultSuccess(
+                result_details=f"No file extension for '{source_path}'; skipping metadata extraction.",
+                artifact_metadata=None,
+            )
+
+        provider_classes = self._registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            return GetArtifactMetadataResultSuccess(
+                result_details=f"No artifact provider registered for format '{extension}'.",
+                artifact_metadata=None,
+            )
+
+        metadata = await to_thread(provider_classes[0].get_artifact_metadata, source_path)
+        return GetArtifactMetadataResultSuccess(
+            result_details=f"Retrieved artifact metadata for '{source_path}'.",
+            artifact_metadata=metadata.model_dump() if metadata else None,
         )
 
     def on_handle_list_artifact_providers_request(

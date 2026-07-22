@@ -426,3 +426,42 @@ class CheckArtifactReadPermissionResultSuccess(WorkflowNotAlteredMixin, ResultPa
 @PayloadRegistry.register
 class CheckArtifactReadPermissionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """The read-permission request itself was malformed (e.g. empty source path)."""
+
+
+@dataclass
+@PayloadRegistry.register
+class GetArtifactMetadataRequest(RequestPayload):
+    """Get provider-extracted metadata for a source file, without generating a preview.
+
+    Routed to the artifact provider that claims the source's extension. A missing
+    provider or unrecognized extension is not an error -- the handler returns
+    Success with artifact_metadata=None so callers don't need to special-case
+    formats no provider handles.
+
+    Args:
+        source_path: Absolute path to the source file.
+
+    Results: GetArtifactMetadataResultSuccess | GetArtifactMetadataResultFailure
+    """
+
+    source_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class GetArtifactMetadataResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Artifact metadata retrieved (possibly None).
+
+    Attributes:
+        artifact_metadata: Provider-extracted metadata from the source file (e.g. image
+            dimensions, video codec). None if no provider handles the extension or the
+            provider could not extract metadata.
+    """
+
+    artifact_metadata: dict[str, Any] | None = field(default=None)
+
+
+@dataclass
+@PayloadRegistry.register
+class GetArtifactMetadataResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Failed to get artifact metadata (e.g. malformed request)."""

@@ -2,7 +2,6 @@ import base64
 import binascii
 import logging
 import threading
-from asyncio import to_thread
 from pathlib import Path
 from typing import NamedTuple
 
@@ -16,6 +15,8 @@ from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriv
 from griptape_nodes.files.path_utils import FilenameParts
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
+    GetArtifactMetadataRequest,
+    GetArtifactMetadataResultSuccess,
     GetPreviewForArtifactRequest,
     GetPreviewForArtifactResultSuccess,
     PreviewGenerationPolicy,
@@ -205,31 +206,20 @@ class StaticFilesManager:
         logger.debug("Serving preview for %s -> %s", file_path, preview_path)
         return preview_path, result.artifact_metadata
 
-    async def _extract_metadata_only(self, file_path: Path) -> tuple[Path, dict | None]:
+    async def _extract_metadata_only(self, file_path: Path) -> dict | None:
         """Extract artifact metadata without generating a preview.
-
-        Returns (original_file_path, artifact_metadata_dict or None).
-        Falls back to (file_path, None) if no provider supports the format or extraction fails.
 
         Args:
             file_path: Path to the original file.
 
         Returns:
-            Tuple of (original file path, extracted metadata dict or None).
+            Extracted metadata dict, or None if no provider supports the format or extraction fails.
         """
-        extension = file_path.suffix.lstrip(".").lower()
-        if not extension:
-            return file_path, None
-
-        registry = GriptapeNodes.ArtifactManager()._registry
-        provider_classes = registry.get_provider_classes_by_format(extension)
-        if not provider_classes:
-            logger.debug("Skipping metadata extraction for unsupported file format: %s", file_path)
-            return file_path, None
-
-        provider_class = provider_classes[0]
-        metadata = await to_thread(provider_class.get_artifact_metadata, str(file_path))
-        return file_path, metadata.model_dump() if metadata else None
+        result = await GriptapeNodes.ahandle_request(GetArtifactMetadataRequest(source_path=str(file_path)))
+        if not isinstance(result, GetArtifactMetadataResultSuccess):
+            logger.debug("Metadata extraction failed for %s: %s", file_path, result.result_details)
+            return None
+        return result.artifact_metadata
 
     def on_handle_create_static_file_request(
         self,
@@ -354,11 +344,7 @@ class StaticFilesManager:
             Tuple of (path to serve, artifact metadata or None).
         """
         if metadata_only:
-            try:
-                _, artifact_metadata = await self._extract_metadata_only(file_path)
-            except Exception as e:
-                logger.warning("Metadata extraction failed for %s: %s", file_path, e)
-                artifact_metadata = None
+            artifact_metadata = await self._extract_metadata_only(file_path)
             return file_path, artifact_metadata
         if not preview:
             logger.debug("Serving full image for %s", file_path)

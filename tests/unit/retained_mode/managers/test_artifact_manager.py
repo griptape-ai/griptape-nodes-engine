@@ -628,6 +628,137 @@ class TestCheckArtifactReadPermissionHandler:
         assert "probe reads" in str(result.result_details)
 
 
+class TestGetArtifactMetadataHandler:
+    """The request-based artifact metadata extraction.
+
+    Library code (e.g. StaticFilesManager) sends this instead of reaching into
+    ArtifactManager's private registry directly, so provider resolution stays
+    centralized here.
+    """
+
+    @pytest.mark.asyncio
+    async def test_empty_path_returns_failure(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultFailure,
+        )
+
+        manager = ArtifactManager()
+        result = await manager.on_handle_get_artifact_metadata_request(GetArtifactMetadataRequest(source_path=""))
+
+        assert isinstance(result, GetArtifactMetadataResultFailure)
+        assert "no source path" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_no_extension_returns_success_with_no_metadata(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultSuccess,
+        )
+
+        manager = ArtifactManager()
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(source_path="/x/no_extension")
+        )
+
+        assert isinstance(result, GetArtifactMetadataResultSuccess)
+        assert result.artifact_metadata is None
+
+    @pytest.mark.asyncio
+    async def test_no_provider_returns_success_with_no_metadata(self) -> None:
+        # Unregistered extension: not an error, just nothing to extract.
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultSuccess,
+        )
+
+        manager = ArtifactManager()
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(source_path="/x/y.unregistered")
+        )
+
+        assert isinstance(result, GetArtifactMetadataResultSuccess)
+        assert result.artifact_metadata is None
+
+    @pytest.mark.asyncio
+    async def test_registered_provider_metadata_is_model_dumped(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        class _Metadata(BaseArtifactMetadata):
+            width: int
+            height: int
+
+        class _MetaProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Meta"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"meta"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return _Metadata(width=1920, height=1080)
+
+        manager = ArtifactManager()
+        register_result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_MetaProvider)
+        )
+        assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
+
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(source_path="/x/y.meta")
+        )
+
+        assert isinstance(result, GetArtifactMetadataResultSuccess)
+        assert result.artifact_metadata == {"width": 1920, "height": 1080}
+
+    @pytest.mark.asyncio
+    async def test_provider_returning_none_yields_none_metadata(self) -> None:
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
+            BaseArtifactMetadata,
+            BaseArtifactProvider,
+        )
+
+        class _EmptyProvider(BaseArtifactProvider):
+            @classmethod
+            def get_friendly_name(cls) -> str:
+                return "Empty"
+
+            @classmethod
+            def get_supported_formats(cls) -> set[str]:
+                return {"empty"}
+
+            @classmethod
+            def get_artifact_metadata(cls, source_path: str) -> BaseArtifactMetadata | None:  # noqa: ARG003
+                return None
+
+        manager = ArtifactManager()
+        register_result = manager.on_handle_register_artifact_provider_request(
+            RegisterArtifactProviderRequest(provider_class=_EmptyProvider)
+        )
+        assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
+
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(source_path="/x/y.empty")
+        )
+
+        assert isinstance(result, GetArtifactMetadataResultSuccess)
+        assert result.artifact_metadata is None
+
+
 class TestGeneratePreview:
     """Tests for preview generation functionality."""
 
