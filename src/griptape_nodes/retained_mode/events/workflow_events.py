@@ -342,8 +342,9 @@ class SaveWorkflowRequest(RequestPayload):
         pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
+        allow_overwrite: When False and file_name would overwrite a different registered workflow, the save fails with WORKFLOW_CONFLICT. When True (default), proceed with overwrite. This flag only protects against overwriting OTHER workflows; saving over the current workflow always succeeds.
 
-    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
+    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error or workflow conflict)
     """
 
     file_name: str | None = None
@@ -351,6 +352,7 @@ class SaveWorkflowRequest(RequestPayload):
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
     create_versioned: bool = False
+    allow_overwrite: bool = True
 
 
 @dataclass
@@ -405,7 +407,9 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow save failed. Common causes: file system error, permission denied, invalid path."""
+    """Workflow save failed. Common causes: file system error, permission denied, invalid path, workflow conflict."""
+
+    failure_reason: str | None = None
 
 
 @dataclass

@@ -2303,12 +2303,41 @@ class WorkflowManager:
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
 
-    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
+    async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
         context_manager = GriptapeNodes.ContextManager()
         current_workflow_name = (
             context_manager.get_current_workflow_name() if context_manager.has_current_workflow() else None
         )
+
+        logger.info(
+            "[OVERWRITE PROTECTION] SaveWorkflowRequest: allow_overwrite=%s, file_name=%s, current_workflow=%s",
+            request.allow_overwrite,
+            request.file_name,
+            current_workflow_name,
+        )
+
+        # Check for workflow conflicts BEFORE determining save target, using the originally requested filename.
+        # This prevents situations where the situation policy auto-creates a unique name and bypasses the check.
+        if not request.allow_overwrite and request.file_name is not None:
+            # Derive the registry key from the requested filename directly
+            requested_registry_key = derive_registry_key(f"{request.file_name}.py")
+            logger.info(
+                "[OVERWRITE PROTECTION] Checking for conflict: requested_registry_key=%s",
+                requested_registry_key,
+            )
+            conflict_check = self._check_workflow_conflict(
+                registry_key=requested_registry_key,
+                current_workflow_name=current_workflow_name,
+            )
+            if conflict_check is not None:
+                logger.warning("[OVERWRITE PROTECTION] CONFLICT DETECTED: %s", conflict_check)
+                return SaveWorkflowResultFailure(
+                    result_details=conflict_check,
+                    failure_reason=FileIOFailureReason.WORKFLOW_CONFLICT,
+                )
+            logger.info("[OVERWRITE PROTECTION] No conflict detected, proceeding with save")
+
         try:
             save_target = self._determine_save_target(
                 requested_file_name=request.file_name,
@@ -2324,6 +2353,13 @@ class WorkflowManager:
         creation_date = save_target.creation_date
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
+
+        logger.debug(
+            "Save workflow post-target: scenario=%s, registry_key=%s, relative_file_path=%s",
+            save_target.scenario.value,
+            registry_key,
+            relative_file_path,
+        )
 
         # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
         # (in-place overwrite) wrapped in a ProjectFileDestination. All other
@@ -2494,6 +2530,52 @@ class WorkflowManager:
         description: str | None
         image: str | None
         is_template: bool | None
+
+    def _check_workflow_conflict(
+        self,
+        registry_key: str,
+        current_workflow_name: str | None,
+    ) -> str | None:
+        """Check if saving would overwrite a different registered workflow.
+
+        Args:
+            registry_key: The registry key that would be used for the save
+            current_workflow_name: The current workflow in context (if any)
+
+        Returns:
+            Error message string if there's a conflict, None if save can proceed
+        """
+        has_workflow = WorkflowRegistry.has_workflow_with_name(registry_key)
+        logger.info(
+            "[OVERWRITE PROTECTION] Conflict check: registry_key=%s, current_workflow=%s, has_workflow=%s",
+            registry_key,
+            current_workflow_name,
+            has_workflow,
+        )
+
+        if not has_workflow:
+            logger.info("[OVERWRITE PROTECTION] No existing workflow found, allowing save")
+            return None
+
+        # Saving over the current workflow (same key) is always allowed
+        if current_workflow_name == registry_key:
+            logger.info("[OVERWRITE PROTECTION] Saving over current workflow (same key), allowing save")
+            return None
+
+        # Found a different registered workflow with this key - this is a conflict!
+        conflicting_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
+        conflict_path = conflicting_workflow.file_path or registry_key
+
+        logger.warning(
+            "[OVERWRITE PROTECTION] BLOCKING SAVE: registry_key=%s would overwrite existing workflow at '%s'",
+            registry_key,
+            conflict_path,
+        )
+
+        return (
+            f"Attempted to save workflow. Would overwrite existing workflow '{conflict_path}'. "
+            f"To overwrite, retry the save with allow_overwrite=True."
+        )
 
     def _get_existing_metadata(self, file_name: str) -> _ExistingMetadata:
         """Return metadata for an existing workflow, or all-None if not present."""

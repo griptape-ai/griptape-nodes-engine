@@ -58,6 +58,9 @@ class FileIOFailureReason(StrEnum):
     IO_ERROR = "io_error"  # Generic I/O error
     UNKNOWN = "unknown"  # Unexpected error
 
+    # Workflow conflicts
+    WORKFLOW_CONFLICT = "workflow_conflict"  # Would overwrite a different registered workflow
+
     # Recycle bin errors
     RECYCLE_BIN_UNAVAILABLE = "recycle_bin_unavailable"  # Recycle bin unavailable and behavior was RECYCLE_BIN_ONLY
 
