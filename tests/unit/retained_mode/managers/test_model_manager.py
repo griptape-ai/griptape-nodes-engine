@@ -430,9 +430,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
 
         def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
             if "GPT Image" in (checkpoint.attributes.get("model_families") or []):
-                return CheckpointDenial(
-                    failures=(CheckpointFailure(detail="GPT Image family is not in your plan."),)
-                )
+                return CheckpointDenial(failures=(CheckpointFailure(detail="GPT Image family is not in your plan."),))
             return None
 
         griptape_nodes.EventManager().add_authorization_hook(deny)
