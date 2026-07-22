@@ -23,10 +23,17 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
     AttemptMatchPathAgainstMacroRequest,
+    AttemptMatchPathAgainstMacroResultFailure,
     AttemptMatchPathAgainstMacroResultSuccess,
+    GetAllSituationsForProjectRequest,
+    GetAllSituationsForProjectResultFailure,
+    GetAllSituationsForProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultFailure,
+    GetSituationResultSuccess,
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
@@ -10189,3 +10196,1005 @@ class TestProjectManagerGetProjectChain:
         # __init__ registers system defaults and points the current id at them.
         chain = pm.get_project_chain()
         assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
+
+
+class TestHypotheticalMacroResolution:
+    """project_id on macro requests: 'how WOULD this macro resolve if I were on project Y?'."""
+
+    @staticmethod
+    def _pm_with_two_projects() -> ProjectManager:
+        """Build a ProjectManager with a current project X and a loaded-but-not-current project Y.
+
+        Both define an {outputs} directory anchored at {project_dir}, so the same macro
+        resolves to different paths depending on which project context is selected.
+        """
+        from griptape_nodes.common.project_templates import (
+            DirectoryDefinition,
+            ProjectTemplate,
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_config.get_config_value.return_value = "staticfiles"
+        pm = ProjectManager(Mock(), mock_config, Mock())
+
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+
+        for project_name, base_dir in (("project_x", Path("/projects/x")), ("project_y", Path("/projects/y"))):
+            template = ProjectTemplate(
+                project_template_schema_version="0.1.0",
+                name=project_name,
+                directories={
+                    "outputs": DirectoryDefinition(name="outputs", path_macro="{project_dir}/outputs"),
+                },
+                situations={
+                    "save_output": SituationTemplate(
+                        name="save_output",
+                        macro=f"{{outputs}}/{project_name}_{{file_name}}",
+                        policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+                    ),
+                },
+                environment={},
+            )
+            validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+            project_id = str(base_dir / "project.yml")
+            pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+                project_id=project_id,
+                project_file_path=base_dir / "project.yml",
+                project_base_dir=base_dir,
+                template=template,
+                validation=validation,
+                parsed_situation_schemas=pm._parse_situation_macros(template.situations, validation),
+                parsed_directory_schemas=pm._parse_directory_macros(template.directories, validation),
+            )
+
+        pm._current_project_id = str(Path("/projects/x") / "project.yml")
+        return pm
+
+    def test_path_resolves_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id=project_y)
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/y/outputs/img.png")
+
+    def test_path_project_id_none_uses_current(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/x/outputs/img.png")
+
+    def test_path_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_state_analysis_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(
+                parsed_macro=ParsedMacro("{outputs}/{file_name}"), variables={}, project_id=project_y
+            )
+        )
+        assert isinstance(result, GetStateForMacroResultSuccess)
+        assert "outputs" in result.satisfied_variables
+        assert "file_name" in result.missing_required_variables
+        assert not result.can_resolve
+
+    def test_state_analysis_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetStateForMacroResultFailure)
+
+    def test_match_auto_resolve_builtins_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id=project_y,
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        assert result.extracted_variables is not None
+        assert result.extracted_variables["file_name"] == "render.exr"
+
+    def test_match_auto_resolve_unknown_project_id_fails(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id="not_loaded",
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+
+    def test_stored_project_variable_fills_macro(self) -> None:
+        """A stored project variable participates in path resolution (below caller, above env)."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"), variables={})
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc042/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_caller_supplied_value_beats_stored_project_variable(self) -> None:
+        """Precedence: caller-supplied > stored project variable."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"),
+                    variables={"shot_code": "sc999"},
+                )
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc999/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_get_situation_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id=project_y))
+        assert isinstance(result, GetSituationResultSuccess)
+        # Each project's situation macro embeds its own name — proves the selected
+        # project's template answered, not the current one.
+        assert "project_y" in result.situation.macro
+
+    def test_get_situation_project_id_none_uses_current(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output"))
+        assert isinstance(result, GetSituationResultSuccess)
+        assert "project_x" in result.situation.macro
+
+    def test_get_situation_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id="not_loaded"))
+        assert isinstance(result, GetSituationResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_get_all_situations_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_all_situations_for_project_request(GetAllSituationsForProjectRequest(project_id=project_y))
+        assert isinstance(result, GetAllSituationsForProjectResultSuccess)
+        assert "project_y" in result.situations["save_output"]
+
+    def test_get_all_situations_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_all_situations_for_project_request(
+            GetAllSituationsForProjectRequest(project_id="not_loaded")
+        )
+        assert isinstance(result, GetAllSituationsForProjectResultFailure)
+
+    def test_map_absolute_path_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/y/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path == "{outputs}/render.exr"
+
+    def test_map_absolute_path_outside_hypothetical_project_returns_none(self) -> None:
+        """A path inside CURRENT project X is outside hypothetical project Y — mapped_path None."""
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/x/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path is None
+
+    def test_state_analysis_counts_stored_project_variable_satisfied(self) -> None:
+        """State analysis agrees with path resolution about stored project variables."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_state_for_macro_request(
+                GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}"), variables={})
+            )
+            assert isinstance(result, GetStateForMacroResultSuccess)
+            assert "shot_code" in result.satisfied_variables
+            assert result.can_resolve
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+
+class TestProjectVariableResolution:
+    """ProjectManager's computed-variable surface: resolve_project_variable + project_computed_names."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    def test_computed_names_include_builtins_for_current_project(self) -> None:
+        pm = self._pm()
+        names = pm.project_computed_names(project_id=None)
+        assert "workspace_dir" in names
+        assert "project_dir" in names
+        assert "workflow_dir" in names
+
+    def test_computed_names_unknown_project_is_empty(self) -> None:
+        pm = self._pm()
+        assert pm.project_computed_names(project_id="not_loaded") == set()
+
+    def test_resolve_project_id_none_maps_to_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = self._pm()
+        assert pm.resolve_project_id(None) == SYSTEM_DEFAULTS_KEY
+        assert pm.resolve_project_id("not_loaded") is None
+
+    def test_resolve_builtin_returns_plain_snapshot(self) -> None:
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
+
+        pm = self._pm()
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        assert type(variable) is FlowVariable
+        # Production stringifies the Path, so compare via str(Path) — on Windows the
+        # separators come back as backslashes.
+        assert variable.value == str(synthetic_ws)
+        assert variable.permission is VariablePermission.READ_ONLY
+
+    def test_resolve_unknown_name_raises_value_error(self) -> None:
+        pm = self._pm()
+        with pytest.raises(ValueError, match="Unknown computed project variable"):
+            pm.resolve_project_variable("not_defined_anywhere", project_id=None)
+
+    def test_resolve_unknown_project_raises_value_error(self) -> None:
+        pm = self._pm()
+        with pytest.raises(ValueError, match="not loaded"):
+            pm.resolve_project_variable("workspace_dir", project_id="not_loaded")
+
+    def test_resolve_context_not_ready_propagates(self) -> None:
+        """A builtin whose live context isn't ready raises for the caller to handle."""
+        pm = self._pm()
+
+        def blow_up(name: str, project_info: object) -> str:  # noqa: ARG001
+            msg = "context not ready"
+            raise RuntimeError(msg)
+
+        with (
+            patch.object(pm, "_get_builtin_variable_value", side_effect=blow_up),
+            pytest.raises(RuntimeError, match="context not ready"),
+        ):
+            pm.resolve_project_variable("workflow_dir", project_id=None)
+
+    def test_resolved_snapshot_serializes_cleanly(self) -> None:
+        """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
+        from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+
+        pm = self._pm()
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        serialized = safe_unstructure(variable)
+        assert serialized["name"] == "workspace_dir"
+        # Compare via str(Path): Windows stringifies with backslash separators.
+        assert serialized["value"] == str(synthetic_ws)
+
+
+class TestWritableProjectVariables:
+    """#5142: project.yml `variables:` — schema, load-install, merge, write-through, persistence."""
+
+    # The int-typed test variable's value, shared by the YAML fixture and assertions.
+    FRAME_START = 1001
+
+    @pytest.fixture(autouse=True)
+    def _flow_context(self) -> "Any":
+        """Bootstrap a workflow + flow: variable requests resolve a starting flow before scope logic."""
+        from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        gn = GriptapeNodes()
+        gn.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        gn.ContextManager().push_workflow("p4_test_wf")
+        result = gn.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="p4_test_flow", set_as_new_context=True)
+        )
+        assert isinstance(result, CreateFlowResultSuccess)
+        yield
+        gn.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    VARIABLES_YAML = """
+variables:
+  shot_code:
+    value: sc042
+  frame_start:
+    value: 1001
+    type: int
+  facility:
+    value: mtl
+    permission: read_only
+"""
+
+    @staticmethod
+    def _write_and_load(tmp_path: Path, extra_yaml: str) -> str:
+        """Write a minimal project.yml with the given extra section, load it, return project_id."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_yml = tmp_path / "project_template.yml"
+        base_yaml = DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        project_yml.write_text(base_yaml + extra_yaml)
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        return load_result.project_id
+
+    @staticmethod
+    def _unload(project_id: str) -> None:
+        from griptape_nodes.retained_mode.events.project_events import UnregisterProjectTemplateRequest
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        GriptapeNodes.handle_request(UnregisterProjectTemplateRequest(project_id=project_id))
+
+    def test_schema_parses_value_type_permission(self) -> None:
+        from griptape_nodes.common.project_templates import ProjectVariableDef
+        from griptape_nodes.retained_mode.variable_types import VariablePermission
+
+        var = ProjectVariableDef(
+            name="frame_start", value=self.FRAME_START, type="int", permission=VariablePermission.READ_ONLY
+        )
+        assert var.value == self.FRAME_START
+        assert var.type == "int"
+        assert var.permission is VariablePermission.READ_ONLY
+        # Defaults: type str, permission read_write.
+        var2 = ProjectVariableDef(name="shot", value="sc042")
+        assert var2.type == "str"
+        assert var2.permission is VariablePermission.READ_WRITE
+
+    def test_schema_rejects_bool_and_type_mismatch(self) -> None:
+        from pydantic import ValidationError
+
+        from griptape_nodes.common.project_templates import ProjectVariableDef
+
+        # Strict value types: a YAML bool is neither a StrictStr nor a StrictInt
+        # (bool is excluded from strict int), so it fails both union branches.
+        with pytest.raises(ValidationError):
+            ProjectVariableDef(name="flag", value=True)
+        with pytest.raises(ValidationError, match="declares type 'int'"):
+            ProjectVariableDef(name="shot", value="sc042", type="int")
+
+    def test_load_installs_stored_layer(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariablePermission
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            variables_manager = GriptapeNodes.VariablesManager()
+            values = variables_manager.stored_project_variable_values(project_id)
+            assert values == {"shot_code": "sc042", "frame_start": self.FRAME_START, "facility": "mtl"}
+            stored = {v.name: v for v in variables_manager.stored_project_variables(project_id)}
+            assert stored["frame_start"].type == "int"
+            assert stored["facility"].permission is VariablePermission.READ_ONLY
+            assert stored["shot_code"].permission is VariablePermission.READ_WRITE
+        finally:
+            self._unload(project_id)
+
+    def test_unload_removes_stored_layer(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        self._unload(project_id)
+        assert GriptapeNodes.VariablesManager().stored_project_variable_values(project_id) == {}
+
+    def test_collision_with_computed_name_warns_and_is_shadowed(self, tmp_path: Path) -> None:
+        """A variable named like a builtin loads with a warning; resolution returns the builtin."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_yml = tmp_path / "project_template.yml"
+        base_yaml = DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        project_yml.write_text(base_yaml + "\nvariables:\n  workspace_dir:\n    value: /hijack\n")
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        try:
+            warnings = [p for p in load_result.validation.problems if "workspace_dir" in p.message]
+            assert warnings, "expected a collision warning for workspace_dir"
+            # Resolution: computed wins — the stored /hijack value is unreachable.
+            pm = GriptapeNodes.ProjectManager()
+            resolved = pm.resolve_project_variable("workspace_dir", project_id=load_result.project_id)
+            assert resolved.value != "/hijack"
+        finally:
+            self._unload(load_result.project_id)
+
+    def test_parent_child_merge_overlay_and_tombstone(self) -> None:
+        """Child overlay: replaces one entry, tombstones another, inherits the rest."""
+        from griptape_nodes.common.project_templates import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+            load_partial_project_template,
+        )
+        from griptape_nodes.common.project_templates.project import ProjectTemplate
+
+        base_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: parent
+variables:
+  shot_code:
+    value: sc042
+  facility:
+    value: mtl
+  frame_start:
+    value: 1001
+    type: int
+"""
+        child_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: child
+variables:
+  shot_code:
+    value: sc099
+  facility: null
+"""
+        base_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        base_overlay = load_partial_project_template(base_yaml, base_validation)
+        assert base_overlay is not None
+        base = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, base_overlay, base_validation)
+
+        child_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        child_overlay = load_partial_project_template(child_yaml, child_validation)
+        assert child_overlay is not None
+        merged = ProjectTemplate.merge(base, child_overlay, child_validation)
+
+        assert merged.variables["shot_code"].value == "sc099"  # overridden
+        assert "facility" not in merged.variables  # tombstoned
+        assert merged.variables["frame_start"].value == self.FRAME_START  # inherited
+
+    def test_merge_invalid_entry_is_validation_error_not_crash(self) -> None:
+        from griptape_nodes.common.project_templates import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+            load_partial_project_template,
+        )
+        from griptape_nodes.common.project_templates.project import ProjectTemplate
+
+        bad_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: bad
+variables:
+  flag:
+    value: true
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(bad_yaml, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
+        assert "flag" not in merged.variables
+        assert any("flag" in p.field_path for p in validation.problems)
+
+    def test_set_value_writes_through_and_persists(self, tmp_path: Path) -> None:
+        """SetVariableValue on a READ_WRITE project variable mutates the layer AND the file."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="shot_code",
+                    value="sc777",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultSuccess)
+            # Layer updated:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc777"
+            # File updated (eager persistence):
+            assert "sc777" in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_read_only_project_variable_refuses_write(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="facility",
+                    value="nyc",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultFailure)
+            assert "read-only" in str(result.result_details)
+            # Unchanged in the layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["facility"] == "mtl"
+        finally:
+            self._unload(project_id)
+
+    def test_persisted_write_survives_reload(self, tmp_path: Path) -> None:
+        """Write → unload → reload from disk: the new value comes back."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        result = GriptapeNodes.handle_request(
+            SetVariableValueRequest(
+                name="shot_code", value="sc777", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id
+            )
+        )
+        assert isinstance(result, SetVariableValueResultSuccess)
+        self._unload(project_id)
+
+        reloaded_id = self._write_and_load_existing(tmp_path)
+        try:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(reloaded_id)
+            assert values["shot_code"] == "sc777"
+            # Untouched entries also survive the persist→reload round-trip.
+            assert values["frame_start"] == self.FRAME_START
+        finally:
+            self._unload(reloaded_id)
+
+    @staticmethod
+    def _write_and_load_existing(tmp_path: Path) -> str:
+        """Load the already-written project.yml (no rewrite)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        load_result = GriptapeNodes.handle_request(
+            LoadProjectTemplateRequest(project_path=tmp_path / "project_template.yml")
+        )
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        return load_result.project_id
+
+    def test_delete_project_variable_writes_through_and_persists(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            DeleteVariableRequest,
+            DeleteVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                DeleteVariableRequest(name="shot_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id)
+            )
+            assert isinstance(result, DeleteVariableResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert "shot_code" not in values
+            assert "shot_code" not in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_writes_through_and_persists(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="shot_id",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert "shot_code" not in values
+            assert values["shot_id"] == "sc042"
+            assert "shot_id" in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_type_mismatched_value_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Writing a str to an int-typed project variable fails cleanly — no crash, no mutation, no file change.
+
+        The write boundary gates value-vs-declared-type agreement BEFORE mutating, because
+        persistence goes through ProjectVariableDef's strict schema: an unguarded mismatch
+        would raise at persist time, after the in-memory write was already acknowledged.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            file_before = (tmp_path / "project_template.yml").read_text()
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="frame_start",
+                    value="not_a_number",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultFailure)
+            assert "'int'" in str(result.result_details)
+            # Layer and file both untouched.
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["frame_start"] == self.FRAME_START
+            assert (tmp_path / "project_template.yml").read_text() == file_before
+        finally:
+            self._unload(project_id)
+
+    def test_unsupported_type_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Setting a project variable's type to something outside str/int fails cleanly."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="JSON",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+            assert "only support" in str(result.result_details)
+            stored = {v.name: v for v in GriptapeNodes.VariablesManager().stored_project_variables(project_id)}
+            assert stored["shot_code"].type == "str"
+        finally:
+            self._unload(project_id)
+
+    def test_type_change_disagreeing_with_value_refused_cleanly(self, tmp_path: Path) -> None:
+        """Re-typing shot_code (value 'sc042') to int fails: the stored value wouldn't agree."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="int",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+        finally:
+            self._unload(project_id)
+
+    def test_deprecated_batch_set_refuses_project_variable(self, tmp_path: Path) -> None:
+        """The frozen SetVariables shim refuses even a READ_WRITE project variable.
+
+        Deliberate divergence from SetVariableValueRequest (which writes through): the
+        shim is deprecated with zero senders and keeps its pre-#5142 behavior, so #5143
+        can delete it without unwinding a project write path.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariablesRequest,
+            SetVariablesResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariablesRequest(
+                    variables={"shot_code": "sc777"},
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariablesResultFailure)
+            assert "SetVariableValueRequest" in str(result.result_details)
+            # Untouched in the layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc042"
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_to_existing_stored_name_refused(self, tmp_path: Path) -> None:
+        """Renaming one stored project variable onto another is a same-layer collision."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="frame_start",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "already exists" in str(result.result_details)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc042"
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_to_own_projects_reserved_name_refused(self, tmp_path: Path) -> None:
+        """The reserved gate uses the variable's OWN project, not the current one.
+
+        The loaded project declares a `dailies` directory — a computed (reserved) name in
+        THAT project only. The current project (system defaults) has no such directory, so
+        a gate that consulted the current project's reserved set (the pre-fix behavior)
+        would let this rename through, stranding a permanently-shadowed stored entry.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        extra_yaml = (
+            self.VARIABLES_YAML
+            + '\ndirectories:\n  dailies:\n    path_macro: "{workspace_dir}/dailies"\n    description: "Dailies"\n'
+        )
+        project_id = self._write_and_load(tmp_path, extra_yaml)
+        try:
+            # Sanity: the discriminator is real — reserved in the loaded project, not in the current one.
+            pm = GriptapeNodes.ProjectManager()
+            assert "dailies" in pm.project_computed_names(project_id=project_id)
+            assert "dailies" not in pm.project_computed_names(project_id=None)
+
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="dailies",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "reserved" in str(result.result_details)
+        finally:
+            self._unload(project_id)
+
+    def test_delete_inherited_variable_tombstones_and_survives_reload(self, tmp_path: Path) -> None:
+        """Deleting a PARENT-inherited variable emits a null tombstone that survives reload.
+
+        Child-declared deletions just omit the entry; inherited deletions must write
+        `name: null` so the parent's value doesn't resurrect on the next load.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.variable_events import (
+            DeleteVariableRequest,
+            DeleteVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        # Parent declares the variable; child inherits it.
+        parent_yml = tmp_path / "parent.yml"
+        parent_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+            + "\nvariables:\n  studio_code:\n    value: mtl\n"
+        )
+        parent_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=parent_yml))
+        assert isinstance(parent_load, LoadProjectTemplateResultSuccess)
+
+        child_yml = tmp_path / "child.yml"
+        child_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE) + "\nparent_project_path: ./parent.yml\n"
+        )
+        child_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+        assert isinstance(child_load, LoadProjectTemplateResultSuccess)
+        child_id = child_load.project_id
+
+        try:
+            # Inherited into the child's stored layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert values.get("studio_code") == "mtl"
+
+            result = GriptapeNodes.handle_request(
+                DeleteVariableRequest(name="studio_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=child_id)
+            )
+            assert isinstance(result, DeleteVariableResultSuccess)
+            # Tombstone written (null entry), not just omitted. The dumper quotes keys.
+            assert '"studio_code": null' in child_yml.read_text()
+
+            # Reload from disk: the parent value must NOT resurrect.
+            self._unload(child_id)
+            reload_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+            assert isinstance(reload_result, LoadProjectTemplateResultSuccess)
+            child_id = reload_result.project_id
+            values_after = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert "studio_code" not in values_after
+        finally:
+            self._unload(child_id)
+            self._unload(parent_load.project_id)
+
+    def test_persist_with_no_backing_file_returns_error(self) -> None:
+        """A project with no file path (e.g. system defaults) reports it can't persist."""
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = GriptapeNodes.ProjectManager()
+        error = pm.persist_project_variables(SYSTEM_DEFAULTS_KEY)
+        assert error is not None
+        assert "no backing file" in error
+
+        # And an unloaded project reports that too.
+        error = pm.persist_project_variables("never_loaded_project")
+        assert error is not None
+        assert "not loaded" in error
+
+    def test_persist_failure_logs_warning_but_write_succeeds(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The eager-persist contract: a disk failure logs a warning; the acknowledged in-memory write stands."""
+        from griptape_nodes.files.file import FileWriteError
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.managers.project_manager.File.write_text",
+                    side_effect=FileWriteError(FileIOFailureReason.DISK_FULL, "disk full"),
+                ),
+                caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+            ):
+                result = GriptapeNodes.handle_request(
+                    SetVariableValueRequest(
+                        name="shot_code",
+                        value="sc999",
+                        lookup_scope=VariableScope.PROJECT_ONLY,
+                        project_id=project_id,
+                    )
+                )
+            # The in-memory write is acknowledged despite the persist failure...
+            assert isinstance(result, SetVariableValueResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc999"
+            # ...and the failure is surfaced in the log, naming the project.
+            assert any("not persisted" in record.message for record in caplog.records)
+            # The file kept its pre-write content.
+            assert "sc999" not in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_hypothetical_read_of_stored_variable(self, tmp_path: Path) -> None:
+        """A loaded-but-not-current project's stored variables are readable via project_id."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            GetVariableRequest,
+            GetVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            # Current project stays whatever it was — read the OTHER project by id.
+            result = GriptapeNodes.handle_request(
+                GetVariableRequest(name="shot_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id)
+            )
+            assert isinstance(result, GetVariableResultSuccess)
+            assert result.variable.value == "sc042"
+        finally:
+            self._unload(project_id)

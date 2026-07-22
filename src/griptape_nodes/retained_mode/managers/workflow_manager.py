@@ -963,9 +963,13 @@ class WorkflowManager:
             )
             return RunWorkflowFromRegistryResultFailure(result_details=details)
 
-        # Update current context for workflow.
+        # Update current context for workflow. The editor always keeps a workflow in the
+        # Current Context (a blank canvas is itself an "unsaved:" workflow), so replacing an
+        # existing context is the steady state, not an anomaly. When the caller passes
+        # run_with_clean_slate=True, replacement is the explicitly requested behavior, so
+        # only warn when clobbering the context was NOT asked for.
         context_warning = None
-        if GriptapeNodes.ContextManager().has_current_workflow():
+        if not request.run_with_clean_slate and GriptapeNodes.ContextManager().has_current_workflow():
             context_warning = f"Started a new workflow '{request.workflow_name}' but a workflow '{GriptapeNodes.ContextManager().get_current_workflow_name()}' was already in the Current Context. Replacing the old with the new."
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.

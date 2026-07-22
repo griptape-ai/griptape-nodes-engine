@@ -25,7 +25,8 @@ workspace
   └── project template
         ├── situations    (where and how to save files in each scenario)
         ├── directories   (logical name → relative path mappings)
-        └── environment   (custom key-value variables)
+        ├── variables     (project-owned variables, usable in nodes and macros)
+        └── environment   (custom key-value pairs for macro composition)
 ```
 
 **Workspace** is the root directory for all work in this project. It is configured in your settings.
@@ -35,6 +36,8 @@ workspace
 **Situations** are named scenarios for when a file is read or written. Each has a macro template that determines the file path and a policy that determines what happens when a file already exists.
 
 **Directories** are logical name-to-path mappings. Each directory has a short name (like `outputs`) that you use as a variable in macros. That name maps to a real path on disk — by default `outputs` maps to an `outputs` subfolder. Directory paths can be relative or absolute, and can themselves contain macro variables or environment variable references.
+
+**Variables** are project-owned named values (strings or integers) that participate in `{VAR}` substitution in node parameters and macros. They can be marked writable so artists can change them at runtime, with changes saved back to the project file.
 
 **Environment** is a bag of custom key-value pairs that can be referenced in macros.
 
@@ -51,5 +54,6 @@ workspace
 - [Directories](directories.md) — logical name-to-path mappings
 - [Situations](situations.md) — named file-saving scenarios with policies
 - [Environment & Builtin Variables](environment.md) — custom variables and system-provided values
+- [Project Variables](variables.md) — project-owned variables with types, permissions, and runtime writes
 - [File Extension Directories](file_extension_directories.md) — route files to folders by extension
 - [Customization Guide](customization.md) — practical examples for common customizations

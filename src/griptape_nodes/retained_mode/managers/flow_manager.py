@@ -3444,30 +3444,47 @@ class FlowManager:
     ) -> set[str]:
         """Return the names of variables owned by ``flow_name`` that are claimed by a declared reference.
 
+        This pass serializes *flow-owned* variables into the workflow script. References with
+        other scopes persist through separate stories (globals are a deferred follow-up;
+        project layer entries live in the project template, not the workflow) and are skipped
+        here with a debug log.
+
         Resolution rules per reference scope:
           - CURRENT_FLOW_ONLY: claims ``ref.name`` only if a variable with that name exists in ``flow_name``.
           - HIERARCHICAL: uses ``GetVariableRequest`` to resolve; claims ``ref.name`` only if the resolved
             variable is owned by ``flow_name`` (ancestor-owned variables get claimed by the ancestor's
             own serialization pass).
-          - GLOBAL_ONLY / ALL: out of scope for this pass; skipped with a debug log. Globals are a
-            deferred follow-up.
+          - PROJECT_ONLY / HIERARCHICAL_FROM_PROJECT / GLOBAL_ONLY / ALL: not this pass's responsibility;
+            skipped with a debug log.
         """
         claimed_names: set[str] = set()
 
         for ref in variable_references:
-            if ref.scope is VariableScope.CURRENT_FLOW_ONLY:
-                if self._variable_is_owned_by(name=ref.name, flow_name=flow_name):
-                    claimed_names.add(ref.name)
-            elif ref.scope is VariableScope.HIERARCHICAL:
-                owning_flow = self._hierarchical_owning_flow_for(name=ref.name, starting_flow=flow_name)
-                if owning_flow == flow_name:
-                    claimed_names.add(ref.name)
-            else:
-                logger.debug(
-                    "Skipping variable reference '%s' with unsupported scope '%s' during serialization.",
-                    ref.name,
-                    ref.scope,
-                )
+            match ref.scope:
+                case VariableScope.CURRENT_FLOW_ONLY:
+                    if self._variable_is_owned_by(name=ref.name, flow_name=flow_name):
+                        claimed_names.add(ref.name)
+                case VariableScope.HIERARCHICAL:
+                    owning_flow = self._hierarchical_owning_flow_for(name=ref.name, starting_flow=flow_name)
+                    if owning_flow == flow_name:
+                        claimed_names.add(ref.name)
+                case (
+                    VariableScope.PROJECT_ONLY
+                    | VariableScope.HIERARCHICAL_FROM_PROJECT
+                    | VariableScope.GLOBAL_ONLY
+                    | VariableScope.ALL
+                ):
+                    logger.debug(
+                        "Skipping variable reference '%s' with scope '%s' during flow serialization.",
+                        ref.name,
+                        ref.scope,
+                    )
+                case _:
+                    msg = (
+                        f"Attempted to serialize variable reference '{ref.name}' during flow "
+                        f"serialization. Failed due to unknown scope '{ref.scope}'."
+                    )
+                    raise ValueError(msg)
 
         return claimed_names
 
