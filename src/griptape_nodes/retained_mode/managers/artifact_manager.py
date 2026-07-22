@@ -366,6 +366,17 @@ class ArtifactManager:
             return None
         return self._registry.get_or_create_provider_instance(provider_classes[0])
 
+    async def _get_artifact_metadata_dict(
+        self, provider_class: type[BaseArtifactProvider], source_path: str
+    ) -> dict[str, Any] | None:
+        """Extract a provider's artifact metadata and serialize it to a plain dict.
+
+        Run in a thread because e.g. video providers shell out to ffprobe
+        synchronously, which would otherwise block the event loop.
+        """
+        metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
+        return metadata.model_dump() if metadata else None
+
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
 
@@ -534,9 +545,6 @@ class ArtifactManager:
                 return GeneratePreviewResultFailure(result_details=error_details)
 
             # Step 1: Create metadata object
-            # Run in a thread because video providers shell out to ffprobe synchronously,
-            # which would otherwise block the event loop.
-            _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
             metadata = PreviewMetadata(
                 version=PreviewMetadata.LATEST_SCHEMA_VERSION,
                 source_macro_path=request.macro_path.parsed_macro.template,
@@ -545,7 +553,7 @@ class ArtifactManager:
                 preview_file_names=preview_file_names,
                 preview_generator_name=generator_name,
                 preview_generator_parameters=deepcopy(request.preview_generator_parameters),
-                artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                artifact_metadata=await self._get_artifact_metadata_dict(provider_class, source_path),
             )
 
             # Step 2: Serialize to JSON
@@ -734,11 +742,10 @@ class ArtifactManager:
                     generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
 
                     if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
-                        _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
                         return GetPreviewForArtifactResultSuccess(
                             result_details=f"Preview generated for '{source_path}'",
                             paths_to_preview=generate_result.paths_to_preview,
-                            artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                            artifact_metadata=await self._get_artifact_metadata_dict(provider_class, str(source_path)),
                         )
                     return GetPreviewForArtifactResultFailure(
                         result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {generate_result.result_details}"
@@ -888,11 +895,10 @@ class ArtifactManager:
             generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
 
             if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
-                _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
                 return GetPreviewForArtifactResultSuccess(
                     result_details=f"Preview regenerated for '{source_path}'",
                     paths_to_preview=generate_result.paths_to_preview,
-                    artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                    artifact_metadata=await self._get_artifact_metadata_dict(provider_class, str(source_path)),
                 )
             return GetPreviewForArtifactResultFailure(
                 result_details=f"Attempted to regenerate preview for '{source_path}'. Failed due to: {generate_result.result_details}"
@@ -974,10 +980,9 @@ class ArtifactManager:
                 artifact_metadata=None,
             )
 
-        metadata = await to_thread(provider_classes[0].get_artifact_metadata, source_path)
         return GetArtifactMetadataResultSuccess(
             result_details=f"Retrieved artifact metadata for '{source_path}'.",
-            artifact_metadata=metadata.model_dump() if metadata else None,
+            artifact_metadata=await self._get_artifact_metadata_dict(provider_classes[0], source_path),
         )
 
     def on_handle_list_artifact_providers_request(
