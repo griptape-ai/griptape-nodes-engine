@@ -136,6 +136,70 @@ Usually one of two things:
 1. Check the **Libraries** panel with the filter set to **Errors** for libraries that failed to install or load. See ["I installed the library but I don't see its nodes"](guides/libraries.md#i-installed-the-library-but-i-dont-see-its-nodes).
 1. Make sure your libraries are up to date. Open **Manage → Library Management**, expand the library, and click **Check for Updates**, then **Update** when one is offered. See [Updating a library](guides/editor/managing_models_and_libraries.md#updating-a-library). To update the engine itself, see the [FAQ](faq.md#how-do-i-update-griptape-nodes).
 
+## "failed to locate pyvenv.cfg" / the engine won't start
+
+**Symptoms**
+
+On launch, the engine fails to start with:
+
+```
+failed to locate pyvenv.cfg: The system cannot find the file specified.
+```
+
+**Cause**
+
+A previous uninstall didn't fully complete, leaving Griptape Nodes' virtual environment in a broken state.
+
+**Fix**
+
+1. Uninstall Griptape Nodes again to clear the broken install:
+
+    ```bash
+    griptape-nodes self uninstall
+    ```
+
+1. Reinstall by following the [installation](installation.md) instructions.
+
+## "Attempted to create a Flow with a parent 'None'" / usually harmless
+
+**Symptoms**
+
+You see this error, often while loading or building a workflow:
+
+```
+Attempted to create a Flow with a parent 'None', but no parent with that name could be found.
+```
+
+**Cause**
+
+A known, elusive bug. In almost all cases it's harmless and doesn't affect your work.
+
+**Fix**
+
+1. You can usually disregard it and keep working.
+1. If it's blocking you, restart the engine and it should clear up.
+1. If you can reproduce it, we'd be grateful if you'd [log a bug](https://github.com/griptape-ai/griptape-nodes/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) with any context about what led to it.
+
+## "ssl.SSLCertVerificationError" / the engine won't run
+
+**Symptoms**
+
+When you try to run Griptape Nodes, you see:
+
+```
+ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1000)
+```
+
+**Cause**
+
+The Python installation on your machine doesn't have access to verified SSL certificates.
+
+**Fix**
+
+1. Reinstall Python using the [python.org](https://www.python.org/downloads/) installer. Griptape Nodes requires Python 3.12.
+1. At the end of installation, choose to **Install Certificates**.
+    - If the installer doesn't offer it, run `/Applications/Python\ 3.12/Install\ Certificates.command`.
+
 ## Exporting engine logs
 
 When you report an issue (or dig into one yourself), the engine logs are usually the first thing to look at. Where to get them depends on how you run the engine.
@@ -165,11 +229,3 @@ If the logs don't show enough detail, raise the engine's log level: open the Con
 ```bash
 GTN_CONFIG_LOG_LEVEL=DEBUG gtn
 ```
-
-## Related error-specific entries
-
-A few specific error messages are documented in the FAQ:
-
-- [`failed to locate pyvenv.cfg`](faq.md#im-seeing-failed-to-locate-pyvenvcfg-the-system-cannot-find-the-file-specified-what-should-i-do)
-- [`Attempted to create a Flow with a parent 'None'`](faq.md#im-seeing-attempted-to-create-a-flow-with-a-parent-none-but-no-parent-with-that-name-could-be-found-what-should-i-do)
-- [`ssl.SSLCertVerificationError`](faq.md#im-receiving-an-error-when-trying-to-run-griptape-nodes-sslsslcertverificationerror-ssl-certificate_verify_failed-certificate-verify-failed-self-signed-certificate-in-certificate-chain-_sslc1000-what-should-i-do)
