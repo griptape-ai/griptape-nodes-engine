@@ -638,6 +638,16 @@ class TestMacroParserFindMatchesDetailed:
         mock.get_secret.return_value = None
         return mock
 
+    def test_find_matches_without_secrets_manager(self) -> None:
+        """Test reverse-matching works with no SecretsManager when values don't reference env vars."""
+        parsed = ParsedMacro("{inputs}/{file_name}")
+
+        result = parsed.find_matches_detailed("inputs/image.jpg", {"inputs": "inputs"})
+
+        assert result is not None
+        values = {var.name: value for var, value in result.items()}
+        assert values == {"inputs": "inputs", "file_name": "image.jpg"}
+
     def test_find_matches_static_only_exact_match(self, mock_secrets_manager: Any) -> None:
         """Test matching static-only template with exact match."""
         parsed = ParsedMacro("static/path/only")
@@ -834,6 +844,32 @@ class TestMacroResolverResolve:
         with pytest.raises(MacroResolutionError, match="Environment variable 'NONEXISTENT_VAR' not found"):
             parsed.resolve({"outputs": "$NONEXISTENT_VAR", "file_name": "image.jpg"}, mock_secrets)
 
+    def test_resolve_without_secrets_manager(self) -> None:
+        """Test resolving ordinary values works with no SecretsManager at all."""
+        parsed = ParsedMacro("Hello, {name}! You have {count:03} messages.")
+        result = parsed.resolve({"name": "Alice", "count": 7})
+
+        assert result == "Hello, Alice! You have 007 messages."
+
+    def test_resolve_without_secrets_manager_required_env_var_fails(self) -> None:
+        """Test required variable with a $-prefixed value fails as SECRETS_UNAVAILABLE without secrets access."""
+        from griptape_nodes.common.macro_parser import MacroResolutionError
+        from griptape_nodes.common.macro_parser.exceptions import MacroResolutionFailureReason
+
+        parsed = ParsedMacro("{outputs}/{file_name}")
+
+        with pytest.raises(MacroResolutionError, match="no secrets access is available") as exc_info:
+            parsed.resolve({"outputs": "$SECRET_DIR", "file_name": "image.jpg"})
+
+        assert exc_info.value.failure_reason == MacroResolutionFailureReason.SECRETS_UNAVAILABLE
+
+    def test_resolve_without_secrets_manager_optional_env_var_skipped(self) -> None:
+        """Test optional variable with a $-prefixed value is skipped without secrets access."""
+        parsed = ParsedMacro("{inputs}/{workflow_name?:_}{file_name}")
+        result = parsed.resolve({"inputs": "inputs", "workflow_name": "$SECRET_NAME", "file_name": "image.jpg"})
+
+        assert result == "inputs/image.jpg"
+
     def test_resolve_static_only_template(self, mock_secrets_manager: Any) -> None:
         """Test resolving template with only static text."""
         parsed = ParsedMacro("static/path/only")
@@ -951,8 +987,9 @@ class TestMacroFailureTypes:
         assert MacroResolutionFailureReason.DATE_FORMAT_NOT_IMPLEMENTED == "DATE_FORMAT_NOT_IMPLEMENTED"
         assert MacroResolutionFailureReason.MISSING_REQUIRED_VARIABLES == "MISSING_REQUIRED_VARIABLES"
         assert MacroResolutionFailureReason.ENVIRONMENT_VARIABLE_NOT_FOUND == "ENVIRONMENT_VARIABLE_NOT_FOUND"
+        assert MacroResolutionFailureReason.SECRETS_UNAVAILABLE == "SECRETS_UNAVAILABLE"
         assert MacroResolutionFailureReason.UNEXPECTED_SEGMENT_TYPE == "UNEXPECTED_SEGMENT_TYPE"
-        assert len(MacroResolutionFailureReason) == 6
+        assert len(MacroResolutionFailureReason) == 7
 
 
 class TestEnhancedExceptions:

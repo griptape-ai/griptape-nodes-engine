@@ -68,9 +68,14 @@ class ParsedMacro:
     def resolve(
         self,
         variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None = None,
     ) -> str:
-        """Fully resolve the macro template with variable values."""
+        """Fully resolve the macro template with variable values.
+
+        With secrets_manager=None, "$NAME" variable values are treated as
+        secret references the caller may not see: a required variable fails
+        with SECRETS_UNAVAILABLE; an optional one is skipped.
+        """
         # Partially resolve with known variables
         partial = partial_resolve(self.template, self.segments, variables, secrets_manager)
 
@@ -92,7 +97,7 @@ class ParsedMacro:
         self,
         path: str,
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None = None,
     ) -> bool:
         """Check if a path matches this template."""
         result = self.find_matches_detailed(path, known_variables, secrets_manager)
@@ -102,7 +107,7 @@ class ParsedMacro:
         self,
         path: str,
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None = None,
     ) -> MacroVariables | None:
         """Extract variable values from a path (plain string keys)."""
         detailed = self.find_matches_detailed(path, known_variables, secrets_manager)
@@ -115,7 +120,7 @@ class ParsedMacro:
         self,
         path: str,
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None = None,
     ) -> dict[VariableInfo, str | int] | None:
         """Extract variable values from a path with metadata (greedy match).
 
@@ -198,7 +203,9 @@ class ParsedMacro:
             known_variables: Dictionary of variables with known values. These will be
                             resolved before matching to reduce ambiguity. Pass empty
                             dict {} if no variables are known.
-            secrets_manager: SecretsManager instance for resolving env vars in known variables
+            secrets_manager: SecretsManager instance for resolving env vars in known
+                            variables. None disables secret access ("$NAME" values
+                            fail for required variables, skip for optional ones).
 
         Returns:
             Dictionary mapping VariableInfo to extracted values, or None if path doesn't
@@ -261,7 +268,7 @@ class ParsedMacro:
         optional_unbound: list[ParsedVariable],
         path: str,
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None,
     ) -> dict[VariableInfo, str | int] | None:
         """Attempt reverse-match with a specific emitted/omitted combination.
 
@@ -301,7 +308,7 @@ class ParsedMacro:
         self,
         emitted_ids: set[int],
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None,
     ) -> list[ParsedSegment]:
         """Materialize the segment list for one emitted/omitted attempt.
 
@@ -330,7 +337,7 @@ class ParsedMacro:
         extracted: dict[VariableInfo, str | int],
         path: str,
         known_variables: MacroVariables,
-        secrets_manager: SecretsManager,
+        secrets_manager: SecretsManager | None,
     ) -> bool:
         """Return True iff resolving the extracted+known bag reproduces ``path``.
 
