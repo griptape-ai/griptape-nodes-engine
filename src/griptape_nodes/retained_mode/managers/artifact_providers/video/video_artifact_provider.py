@@ -355,25 +355,33 @@ class VideoArtifactProvider(BaseArtifactProvider):
             logger.warning("Attempted to find video stream in '%s'. No video stream found.", source_path)
             return None
 
-        width = int(video_stream.get("width", 0))
-        height = int(video_stream.get("height", 0))
-        codec = video_stream.get("codec_name", "unknown")
+        # Malformed probe output (unexpected field types) or a source file that
+        # vanishes between the ffprobe call and stat() below are both treated as
+        # "metadata unavailable" rather than bubbling out of get_artifact_metadata --
+        # mirrors ImageArtifactProvider's contract of never raising.
+        try:
+            width = int(video_stream.get("width", 0))
+            height = int(video_stream.get("height", 0))
+            codec = video_stream.get("codec_name", "unknown")
 
-        # Parse frame rate from r_frame_rate (e.g., "30/1" or "24000/1001")
-        frame_rate = 0.0
-        r_frame_rate = video_stream.get("r_frame_rate", "0/1")
-        if "/" in r_frame_rate:
-            num, den = r_frame_rate.split("/")
-            if int(den) != 0:
-                frame_rate = int(num) / int(den)
+            # Parse frame rate from r_frame_rate (e.g., "30/1" or "24000/1001")
+            frame_rate = 0.0
+            r_frame_rate = video_stream.get("r_frame_rate", "0/1")
+            if "/" in r_frame_rate:
+                num, den = r_frame_rate.split("/")
+                if int(den) != 0:
+                    frame_rate = int(num) / int(den)
 
-        # Duration from stream or format level
-        duration_seconds = float(video_stream.get("duration", 0.0))
-        if duration_seconds == 0.0:
-            format_info = probe_data.get("format", {})
-            duration_seconds = float(format_info.get("duration", 0.0))
+            # Duration from stream or format level
+            duration_seconds = float(video_stream.get("duration", 0.0))
+            if duration_seconds == 0.0:
+                format_info = probe_data.get("format", {})
+                duration_seconds = float(format_info.get("duration", 0.0))
 
-        file_size = Path(source_path).stat().st_size
+            file_size = Path(source_path).stat().st_size
+        except Exception as exc:
+            logger.warning("Attempted to parse ffprobe output for '%s'. Failed due to: %s", source_path, exc)
+            return None
 
         return VideoArtifactMetadata(
             width=width,
