@@ -644,10 +644,28 @@ class TestGetArtifactMetadataHandler:
         )
 
         manager = ArtifactManager()
-        result = await manager.on_handle_get_artifact_metadata_request(GetArtifactMetadataRequest(source_path=""))
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro(""), {}))
+        )
 
         assert isinstance(result, GetArtifactMetadataResultFailure)
         assert "no source path" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_unresolved_macro_path_returns_failure(self) -> None:
+        # A macro template with a variable that's never bound must fail loudly,
+        # not silently probe a literal "{my_var}/file.mp4"-shaped path on disk.
+        from griptape_nodes.retained_mode.events.artifact_events import (
+            GetArtifactMetadataRequest,
+            GetArtifactMetadataResultFailure,
+        )
+
+        manager = ArtifactManager()
+        result = await manager.on_handle_get_artifact_metadata_request(
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro("{my_var}/file.mp4"), {}))
+        )
+
+        assert isinstance(result, GetArtifactMetadataResultFailure)
 
     @pytest.mark.asyncio
     async def test_no_extension_returns_success_with_no_metadata(self) -> None:
@@ -658,7 +676,7 @@ class TestGetArtifactMetadataHandler:
 
         manager = ArtifactManager()
         result = await manager.on_handle_get_artifact_metadata_request(
-            GetArtifactMetadataRequest(source_path="/x/no_extension")
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro("/x/no_extension"), {}))
         )
 
         assert isinstance(result, GetArtifactMetadataResultSuccess)
@@ -674,7 +692,7 @@ class TestGetArtifactMetadataHandler:
 
         manager = ArtifactManager()
         result = await manager.on_handle_get_artifact_metadata_request(
-            GetArtifactMetadataRequest(source_path="/x/y.unregistered")
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro("/x/y.unregistered"), {}))
         )
 
         assert isinstance(result, GetArtifactMetadataResultSuccess)
@@ -715,7 +733,7 @@ class TestGetArtifactMetadataHandler:
         assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
 
         result = await manager.on_handle_get_artifact_metadata_request(
-            GetArtifactMetadataRequest(source_path="/x/y.meta")
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro("/x/y.meta"), {}))
         )
 
         assert isinstance(result, GetArtifactMetadataResultSuccess)
@@ -752,7 +770,7 @@ class TestGetArtifactMetadataHandler:
         assert isinstance(register_result, RegisterArtifactProviderResultSuccess)
 
         result = await manager.on_handle_get_artifact_metadata_request(
-            GetArtifactMetadataRequest(source_path="/x/y.empty")
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro("/x/y.empty"), {}))
         )
 
         assert isinstance(result, GetArtifactMetadataResultSuccess)

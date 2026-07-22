@@ -215,7 +215,9 @@ class StaticFilesManager:
         Returns:
             Extracted metadata dict, or None if no provider supports the format or extraction fails.
         """
-        result = await GriptapeNodes.ahandle_request(GetArtifactMetadataRequest(source_path=str(file_path)))
+        result = await GriptapeNodes.ahandle_request(
+            GetArtifactMetadataRequest(macro_path=MacroPath(ParsedMacro(str(file_path)), {}))
+        )
         if not isinstance(result, GetArtifactMetadataResultSuccess):
             logger.debug("Metadata extraction failed for %s: %s", file_path, result.result_details)
             return None

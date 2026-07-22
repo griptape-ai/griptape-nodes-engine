@@ -433,18 +433,20 @@ class CheckArtifactReadPermissionResultFailure(WorkflowNotAlteredMixin, ResultPa
 class GetArtifactMetadataRequest(RequestPayload):
     """Get provider-extracted metadata for a source file, without generating a preview.
 
-    Routed to the artifact provider that claims the source's extension. A missing
-    provider or unrecognized extension is not an error -- the handler returns
-    Success with artifact_metadata=None so callers don't need to special-case
-    formats no provider handles.
+    Resolves macro_path (e.g. "{outputs}/file.mp4") before dispatching to the
+    provider that claims the resolved path's extension -- mirrors
+    GetPreviewForArtifactRequest so callers don't need to pre-resolve macros
+    themselves. A missing provider or unrecognized extension is not an error --
+    the handler returns Success with artifact_metadata=None so callers don't
+    need to special-case formats no provider handles.
 
     Args:
-        source_path: Absolute path to the source file.
+        macro_path: MacroPath with parsed macro and variables.
 
     Results: GetArtifactMetadataResultSuccess | GetArtifactMetadataResultFailure
     """
 
-    source_path: str
+    macro_path: MacroPath
 
 
 @dataclass

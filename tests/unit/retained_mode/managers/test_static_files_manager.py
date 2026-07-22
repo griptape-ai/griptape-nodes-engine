@@ -748,7 +748,8 @@ class TestStaticFilesManagerExtractMetadataOnly:
 
         assert metadata == expected
         request = mock_ahandle_request.call_args[0][0]
-        assert request.source_path == str(file_path)
+        assert request.macro_path.parsed_macro.template == str(file_path)
+        assert request.macro_path.variables == {}
 
     @pytest.mark.asyncio
     async def test_success_result_with_no_metadata_returns_none(

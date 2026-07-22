@@ -943,16 +943,23 @@ class ArtifactManager:
     ) -> GetArtifactMetadataResultSuccess | GetArtifactMetadataResultFailure:
         """Handle a metadata request by dispatching to the provider that claims the extension.
 
-        Mirrors the provider-resolution logic used elsewhere in this manager
-        (e.g. prepare_content_for_write, check_read_permission): no provider for
-        the extension is not an error, it's Success with artifact_metadata=None.
+        Resolves request.macro_path first (mirrors on_handle_get_preview_for_artifact_request)
+        so callers can pass an unresolved macro path (e.g. "{outputs}/file.mp4") directly
+        instead of having to resolve it themselves first. No provider for the resolved
+        extension is not an error, it's Success with artifact_metadata=None.
         """
-        if not request.source_path:
+        if not request.macro_path.parsed_macro.template:
             return GetArtifactMetadataResultFailure(
                 result_details="Attempted to get artifact metadata. Failed because no source path was provided."
             )
 
-        source_path = request.source_path
+        resolve_result = GriptapeNodes.handle_request(ResolveMacroPathRequest(macro_path=request.macro_path))
+        if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
+            return GetArtifactMetadataResultFailure(
+                result_details=f"Attempted to resolve source macro path. Failed due to: {resolve_result.result_details}"
+            )
+
+        source_path = resolve_result.resolved_path
         extension = Path(source_path).suffix.lstrip(".").lower()
         if not extension:
             return GetArtifactMetadataResultSuccess(
