@@ -42,8 +42,8 @@ _OPENAI_ARGS = {"stream": True}
 
 MODEL_CHOICES_ARGS = [
     # Anthropic
-    {"name": "claude-opus-4-8", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-sonnet-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
+    {"name": "claude-opus-4-8", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-haiku-4-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": False},
     # Google
     {"name": "gemini-3.1-pro", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
