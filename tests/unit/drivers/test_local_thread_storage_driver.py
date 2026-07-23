@@ -7,7 +7,10 @@ operations (rename, archive, delete, list).
 
 from __future__ import annotations
 
+import itertools
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
+from unittest.mock import patch
 
 import pytest
 from pydantic_ai.messages import ImageUrl, ModelMessage, ModelRequest, ModelResponse, TextPart, UserPromptPart
@@ -67,20 +70,36 @@ def test_image_url_in_user_prompt_round_trips(storage: LocalThreadStorageDriver)
 
 
 def test_list_threads_returns_message_counts_and_sorts(storage: LocalThreadStorageDriver) -> None:
-    """list_threads reports per-thread message counts and orders by recency."""
-    older_id, _ = storage.create_thread(title="older")
-    newer_id, _ = storage.create_thread(title="newer")
+    """list_threads reports per-thread message counts and orders by recency.
 
-    storage.save_history(older_id, [ModelRequest(parts=[UserPromptPart(content="Hi")])])
-    storage.save_history(
-        newer_id,
-        [
-            ModelRequest(parts=[UserPromptPart(content="Q1")]),
-            ModelResponse(parts=[TextPart(content="A1")]),
-        ],
-    )
+    The clock is stubbed so successive writes get strictly increasing timestamps.
+    This keeps the recency assertion deterministic on platforms with coarse
+    wall-clock resolution (e.g. Windows), where two real back-to-back writes can
+    otherwise land on the same tick and sort arbitrarily.
+    """
+    base = datetime(2024, 1, 1, tzinfo=UTC)
+    tick = itertools.count()
 
-    threads = storage.list_threads()
+    def increasing_now(_tz: object = None) -> datetime:
+        return base + timedelta(seconds=next(tick))
+
+    with patch("griptape_nodes.drivers.thread_storage.local_thread_storage_driver.datetime") as mock_datetime:
+        mock_datetime.now.side_effect = increasing_now
+
+        older_id, _ = storage.create_thread(title="older")
+        newer_id, _ = storage.create_thread(title="newer")
+
+        storage.save_history(older_id, [ModelRequest(parts=[UserPromptPart(content="Hi")])])
+        storage.save_history(
+            newer_id,
+            [
+                ModelRequest(parts=[UserPromptPart(content="Q1")]),
+                ModelResponse(parts=[TextPart(content="A1")]),
+            ],
+        )
+
+        threads = storage.list_threads()
+
     by_id = {t.thread_id: t for t in threads}
     assert by_id[older_id].message_count == 1
     assert by_id[newer_id].message_count == 2  # noqa: PLR2004
