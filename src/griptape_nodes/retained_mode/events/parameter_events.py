@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.retained_mode.events.base_events import (
+    BLOB_FIELD_METADATA_KEY,
     ExecutionPayload,
     RequestPayload,
     ResultPayloadFailure,
@@ -244,7 +245,7 @@ class SetParameterValueRequest(RequestPayload):
     """
 
     parameter_name: str
-    value: str | int | float | bool | dict | list | None
+    value: str | int | float | bool | dict | list | None = field(metadata={BLOB_FIELD_METADATA_KEY: True})
     # If node name is None, use the Current Context
     node_name: str | None = None
     data_type: str | None = None
@@ -268,7 +269,7 @@ class SetParameterValueResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess)
         data_type: The determined data type of the value
     """
 
-    finalized_value: Any
+    finalized_value: Any = field(metadata={BLOB_FIELD_METADATA_KEY: True})
     data_type: str
 
 
@@ -484,7 +485,7 @@ class GetParameterValueResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucce
     input_types: list[str]
     type: str
     output_type: str
-    value: Any
+    value: Any = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass
@@ -499,7 +500,7 @@ class OnParameterValueChanged(WorkflowAlteredMixin, ResultPayloadSuccess):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: Any = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass
@@ -570,7 +571,7 @@ class GetNodeElementDetailsRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class GetNodeElementDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
-    element_details: dict[str, Any]
+    element_details: dict[str, Any] = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass
@@ -583,7 +584,7 @@ class GetNodeElementDetailsResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 @dataclass
 @PayloadRegistry.register
 class AlterElementEvent(ExecutionPayload):
-    element_details: dict[str, Any]
+    element_details: dict[str, Any] = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass

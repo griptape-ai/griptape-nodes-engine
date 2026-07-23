@@ -77,9 +77,10 @@ Static file server configuration for serving media assets
 
 Settings for artifact providers and preview generation
 
-| Setting     | Type   | Default | Environment variable           | Description                                                         |
-| ----------- | ------ | ------- | ------------------------------ | ------------------------------------------------------------------- |
-| `artifacts` | object | `{}`    | n/a (nested; edit config file) | Control how previews are generated for images and other media files |
+| Setting                       | Type    | Default  | Environment variable                     | Description                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| ----------------------------- | ------- | -------- | ---------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `artifacts`                   | object  | `{}`     | n/a (nested; edit config file)           | Control how previews are generated for images and other media files                                                                                                                                                                                                                                                                                                                                                                |
+| `max_blob_artifact_b64_bytes` | integer | `262144` | `GTN_CONFIG_MAX_BLOB_ARTIFACT_B64_BYTES` | Size threshold for blob-backed artifact values (ImageArtifact, AudioArtifact, BlobArtifact) emitted to connected clients such as the editor. Compared against the base64-encoded value length. Values above the threshold are blanked (replaced with null) in everything broadcast over the wire. This does NOT affect values returned to in-engine callers, the saved workflow file, or the value stored in engine/runtime state. |
 
 ## Projects
 

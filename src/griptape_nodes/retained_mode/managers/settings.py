@@ -21,6 +21,8 @@ WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
+MAX_BLOB_ARTIFACT_B64_BYTES_KEY = "max_blob_artifact_b64_bytes"
+DEFAULT_MAX_BLOB_ARTIFACT_B64_BYTES = 262_144
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
 LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 
@@ -480,6 +482,17 @@ class Settings(BaseModel):
         category=ARTIFACTS,
         default_factory=dict,
         description="Control how previews are generated for images and other media files",
+    )
+    max_blob_artifact_b64_bytes: int = Field(
+        category=ARTIFACTS,
+        default=DEFAULT_MAX_BLOB_ARTIFACT_B64_BYTES,
+        description=(
+            "Size threshold for blob-backed artifact values (ImageArtifact, AudioArtifact, BlobArtifact) emitted to"
+            " connected clients such as the editor. Compared against the base64-encoded value length. Values above the"
+            " threshold are blanked (replaced with null) in everything broadcast over the wire."
+            " This does NOT affect values returned to in-engine callers, the saved workflow file, or the value stored"
+            " in engine/runtime state."
+        ),
     )
     project_file: str | None = Field(
         category=PROJECTS,

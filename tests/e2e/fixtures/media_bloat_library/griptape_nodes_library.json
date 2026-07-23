@@ -1,0 +1,36 @@
+{
+  "name": "Media Bloat Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library for the workflow-bloat regression tests (issue #5177): nodes that emit large inline binary parameter values.",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "InlineBytesImageNode",
+      "file_path": "media_bloat_nodes.py",
+      "metadata": {"category": "test", "description": "emits an ImageArtifact with an inline byte payload", "display_name": "Inline Bytes Image"}
+    },
+    {
+      "class_name": "InlineBytesAudioNode",
+      "file_path": "media_bloat_nodes.py",
+      "metadata": {"category": "test", "description": "emits an AudioArtifact with an inline byte payload", "display_name": "Inline Bytes Audio"}
+    }
+  ]
+}

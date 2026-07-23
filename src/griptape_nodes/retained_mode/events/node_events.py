@@ -8,6 +8,7 @@ from uuid import uuid4
 from griptape_nodes.exe_types.core_types import NodeMessagePayload
 from griptape_nodes.exe_types.node_types import NodeDependencies, NodeResolutionState
 from griptape_nodes.retained_mode.events.base_events import (
+    BLOB_FIELD_METADATA_KEY,
     RequestPayload,
     ResultPayloadFailure,
     ResultPayloadSuccess,
@@ -392,7 +393,7 @@ class GetAllNodeInfoResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess)
     node_resolution_state: str
     locked: bool
     connections: ListConnectionsForNodeResultSuccess
-    element_id_to_value: dict[str, ParameterInfoValue]
+    element_id_to_value: dict[str, ParameterInfoValue] = field(metadata={BLOB_FIELD_METADATA_KEY: True})
     root_node_element: dict[str, Any]
 
 
