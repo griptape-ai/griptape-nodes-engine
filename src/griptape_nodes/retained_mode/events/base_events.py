@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
@@ -19,7 +19,17 @@ from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, bui
 if TYPE_CHECKING:
     import builtins
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("griptape_nodes")
+
+# Dataclass-field metadata key marking a payload field that may carry a large
+# blob-backed artifact value (raw bytes -> base64). Serialization (EventResult.dict /
+# ExecutionEvent.dict) walks *only* tagged fields when blanking oversized blobs, i.e.
+# ``field(metadata={BLOB_FIELD_METADATA_KEY: True})``.
+BLOB_FIELD_METADATA_KEY = "may_contain_blob"
+
+# Serialized "type" strings of blob-backed griptape artifacts whose `.value` is
+# base64-encoded bytes. URL artifacts carry a small URL string and are never stripped.
+_BLOB_ARTIFACT_TYPE_NAMES = frozenset({"ImageArtifact", "AudioArtifact", "BlobArtifact"})
 
 
 def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
@@ -465,7 +475,6 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["request"] = safe_unstructure(self.request)
         result_dict = safe_unstructure(self.result)
         if self.request.fields is not None and self.result.succeeded():
             tree = build_path_tree(self.request.fields)
@@ -477,6 +486,12 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
                 if fw_field in result_dict:
                     filtered.setdefault(fw_field, result_dict[fw_field])
             result_dict = filtered
+
+        # Blank oversized blob-artifact values before this result goes over the wire.
+        request_dict = safe_unstructure(self.request)
+        _blank_oversized_tagged_blob_fields(self.request, request_dict)
+        result["request"] = request_dict
+        _blank_oversized_tagged_blob_fields(self.result, result_dict)
         result["result"] = result_dict
         if self.retained_mode:
             result["retained_mode"] = self.retained_mode
@@ -557,7 +572,11 @@ class ExecutionEvent[E: ExecutionPayload](BaseEvent):
     def dict(self, *args, **kwargs) -> dict[str, Any]:
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
-        result["payload"] = safe_unstructure(self.payload)
+        payload_dict = safe_unstructure(self.payload)
+        # Blank oversized blob-artifact values before this event goes over the wire (see
+        # EventResult.dict).
+        _blank_oversized_tagged_blob_fields(self.payload, payload_dict)
+        result["payload"] = payload_dict
         return result
 
     def get_request(self) -> E:
@@ -634,6 +653,91 @@ class ProgressEvent:
     value: Any = field()
     node_name: str = field()
     parameter_name: str = field()
+
+
+def _blank_oversized_tagged_blob_fields(payload: Payload, serialized: dict[str, Any]) -> None:
+    """Blank oversized BlobArtifacts in payload fields.
+
+    ``serialized`` is the safe_unstructure output of ``payload``. Only fields tagged
+    with ``field(metadata={BLOB_FIELD_METADATA_KEY: True})`` are walked, so nothing else
+    is touched; the threshold is read fresh so a runtime config change takes effect.
+    """
+    if not is_dataclass(payload) or isinstance(payload, type):
+        return
+    tagged = [f.name for f in dataclass_fields(payload) if f.metadata.get(BLOB_FIELD_METADATA_KEY)]
+    if not tagged:
+        return
+    max_b64_bytes = _max_blob_artifact_b64_bytes()
+    blanked: list[tuple[str, int]] = []
+    for field_name in tagged:
+        if field_name in serialized:
+            blanked.extend(_blank_oversized_blobs(serialized[field_name], max_b64_bytes))
+    if blanked:
+        # Best-effort node context: only payloads that carry a top-level ``node_name``
+        # others log without it -- acceptable given the volume.
+        node_name = getattr(payload, "node_name", None)
+        _warn_blanked(type(payload).__name__, node_name, blanked, max_b64_bytes)
+
+
+def _max_blob_artifact_b64_bytes() -> int:
+    """Configured max base64 length for blob-artifact values sent to clients."""
+    # Lazy imports: these modules import (transitively) this one, so top-level imports would cycle.
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.managers.settings import (
+        DEFAULT_MAX_BLOB_ARTIFACT_B64_BYTES,
+        MAX_BLOB_ARTIFACT_B64_BYTES_KEY,
+    )
+
+    # cast_type=int: env-var overrides (GTN_CONFIG_MAX_BLOB_ARTIFACT_B64_BYTES) arrive as strings.
+    return GriptapeNodes.ConfigManager().get_config_value(
+        MAX_BLOB_ARTIFACT_B64_BYTES_KEY, default=DEFAULT_MAX_BLOB_ARTIFACT_B64_BYTES, cast_type=int
+    )
+
+
+def _blank_oversized_blobs(obj: dict | list, max_b64_bytes: int) -> list[tuple[str, int]]:
+    """Blank oversized serialized blob-artifact values, in place.
+
+     A serialized artifact is a dict ``{"type": "ImageArtifact"|"AudioArtifact"|
+     "BlobArtifact", "value": <b64 str>}``; over the limit its ``value`` becomes None
+     (wrapper kept so clients render a placeholder rather than a broken artifact).
+
+    Return (type, b64_len) per blank
+    """
+    blanked: list[tuple[str, int]] = []
+    if isinstance(obj, dict):
+        value = obj.get("value")
+        type_name = obj.get("type")
+        if type_name in _BLOB_ARTIFACT_TYPE_NAMES and isinstance(value, str) and len(value) > max_b64_bytes:
+            obj["value"] = None
+            return [(type_name, len(value))]
+        for item in obj.values():
+            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes))
+    elif isinstance(obj, list):
+        for item in obj:
+            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes))
+    return blanked
+
+
+def _warn_blanked(
+    payload_type_name: str, node_name: str | None, blanked: list[tuple[str, int]], max_b64_bytes: int
+) -> None:
+    """Log that blob artifact(s) have been stripped from a payload.
+
+    ``node_name`` names the offending node when the payload exposes it (best-effort); when it is None
+    only the payload type is reported.
+    """
+    type_names = ", ".join(sorted({type_name for type_name, _ in blanked}))
+    largest_b64_bytes = max(b64_len for _, b64_len in blanked)
+    location = f"node '{node_name}' ({payload_type_name})" if node_name else payload_type_name
+    logger.warning(
+        "Stripped %d oversized blob artifacts (%s) on %s before transmission (largest %d base64 bytes > %d limit)."
+        " See max_blob_artifact_b64_bytes setting",
+        len(blanked),
+        type_names,
+        location,
+        largest_b64_bytes,
+        max_b64_bytes,
+    )
 
 
 # Register ResultDetail subclasses (e.g. StrictModeViolationDetail) with the

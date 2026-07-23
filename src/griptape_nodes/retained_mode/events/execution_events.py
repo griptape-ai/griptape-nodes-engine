@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 from typing import Any, Required, TypedDict
 
 from griptape_nodes.retained_mode.events.base_events import (
+    BLOB_FIELD_METADATA_KEY,
     ExecutionPayload,
     RequestPayload,
     ResultDetails,
@@ -390,7 +391,7 @@ class ParameterSpotlightEvent(ExecutionPayload):
 @PayloadRegistry.register
 class ControlFlowResolvedEvent(ExecutionPayload):
     end_node_name: str
-    parameter_output_values: dict
+    parameter_output_values: dict = field(metadata={BLOB_FIELD_METADATA_KEY: True})
     # Optional field for pickled parameter values - when present, parameter_output_values contains UUID references
     unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, bytes] | None = field(
         default=None
@@ -408,7 +409,7 @@ class ControlFlowCancelledEvent(ExecutionPayload):
 @PayloadRegistry.register
 class NodeResolvedEvent(ExecutionPayload):
     node_name: str
-    parameter_output_values: dict
+    parameter_output_values: dict = field(metadata={BLOB_FIELD_METADATA_KEY: True})
     node_type: str
     specific_library_name: str | None = None
 
@@ -419,7 +420,7 @@ class ParameterValueUpdateEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     data_type: str
-    value: Any
+    value: Any = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass
@@ -465,7 +466,7 @@ class GriptapeEvent(ExecutionPayload):
     node_name: str
     parameter_name: str
     type: str
-    value: Any
+    value: Any = field(metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 class NodeMetadata(TypedDict, total=False):
@@ -512,7 +513,7 @@ class ExecuteNodeRequest(RequestPayload):
     """
 
     node_name: str
-    parameter_values: dict[str, Any] = field(default_factory=dict)
+    parameter_values: dict[str, Any] = field(default_factory=dict, metadata={BLOB_FIELD_METADATA_KEY: True})
     node_metadata: NodeMetadata | None = None
     variables: dict[str, str | int] = field(default_factory=dict)
 
@@ -526,7 +527,7 @@ class ExecuteNodeResultSuccess(ResultPayloadSuccess):
         parameter_output_values: Output parameter values from the node.
     """
 
-    parameter_output_values: dict[str, Any] = field(default_factory=dict)
+    parameter_output_values: dict[str, Any] = field(default_factory=dict, metadata={BLOB_FIELD_METADATA_KEY: True})
 
 
 @dataclass
