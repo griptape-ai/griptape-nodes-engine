@@ -2520,6 +2520,7 @@ situations:
         parent-chain-aware loader, so inheritance resolves on boot.
         """
         from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
 
         self._setup_system_defaults(pm, str(tmp_path))
 
@@ -2554,9 +2555,11 @@ situations:
             "  SHOW: child\n"
         )
 
-        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+        def get_config_value_side_effect(key: str, **_: object) -> object:
             if key == "project_file":
                 return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
             if "project_workspaces" in key:
                 return {}
             return str(tmp_path)
