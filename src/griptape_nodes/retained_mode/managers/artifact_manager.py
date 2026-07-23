@@ -23,6 +23,9 @@ from griptape_nodes.retained_mode.events.artifact_events import (
     GeneratePreviewRequest,
     GeneratePreviewResultFailure,
     GeneratePreviewResultSuccess,
+    GetArtifactMetadataRequest,
+    GetArtifactMetadataResultFailure,
+    GetArtifactMetadataResultSuccess,
     GetArtifactProviderDetailsRequest,
     GetArtifactProviderDetailsResultFailure,
     GetArtifactProviderDetailsResultSuccess,
@@ -215,6 +218,9 @@ class ArtifactManager:
             event_manager.assign_manager_to_request_type(
                 CheckArtifactReadPermissionRequest, self.on_check_artifact_read_permission_request
             )
+            event_manager.assign_manager_to_request_type(
+                GetArtifactMetadataRequest, self.on_handle_get_artifact_metadata_request
+            )
 
             event_manager.add_listener_to_app_event(
                 AppInitializationComplete,
@@ -359,6 +365,17 @@ class ArtifactManager:
         if not provider_classes:
             return None
         return self._registry.get_or_create_provider_instance(provider_classes[0])
+
+    async def _get_artifact_metadata_dict(
+        self, provider_class: type[BaseArtifactProvider], source_path: str
+    ) -> dict[str, Any] | None:
+        """Extract a provider's artifact metadata and serialize it to a plain dict.
+
+        Run in a thread because e.g. video providers shell out to ffprobe
+        synchronously, which would otherwise block the event loop.
+        """
+        metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
+        return metadata.model_dump() if metadata else None
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
@@ -528,9 +545,6 @@ class ArtifactManager:
                 return GeneratePreviewResultFailure(result_details=error_details)
 
             # Step 1: Create metadata object
-            # Run in a thread because video providers shell out to ffprobe synchronously,
-            # which would otherwise block the event loop.
-            _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, source_path)
             metadata = PreviewMetadata(
                 version=PreviewMetadata.LATEST_SCHEMA_VERSION,
                 source_macro_path=request.macro_path.parsed_macro.template,
@@ -539,7 +553,7 @@ class ArtifactManager:
                 preview_file_names=preview_file_names,
                 preview_generator_name=generator_name,
                 preview_generator_parameters=deepcopy(request.preview_generator_parameters),
-                artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                artifact_metadata=await self._get_artifact_metadata_dict(provider_class, source_path),
             )
 
             # Step 2: Serialize to JSON
@@ -728,11 +742,10 @@ class ArtifactManager:
                     generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
 
                     if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
-                        _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
                         return GetPreviewForArtifactResultSuccess(
                             result_details=f"Preview generated for '{source_path}'",
                             paths_to_preview=generate_result.paths_to_preview,
-                            artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                            artifact_metadata=await self._get_artifact_metadata_dict(provider_class, str(source_path)),
                         )
                     return GetPreviewForArtifactResultFailure(
                         result_details=f"Attempted to generate preview for '{source_path}'. Failed due to: {generate_result.result_details}"
@@ -882,11 +895,10 @@ class ArtifactManager:
             generate_result = await self.on_handle_generate_preview_from_defaults_request(generate_request)
 
             if isinstance(generate_result, GeneratePreviewFromDefaultsResultSuccess):
-                _artifact_metadata = await to_thread(provider_class.get_artifact_metadata, str(source_path))
                 return GetPreviewForArtifactResultSuccess(
                     result_details=f"Preview regenerated for '{source_path}'",
                     paths_to_preview=generate_result.paths_to_preview,
-                    artifact_metadata=_artifact_metadata.model_dump() if _artifact_metadata else None,
+                    artifact_metadata=await self._get_artifact_metadata_dict(provider_class, str(source_path)),
                 )
             return GetPreviewForArtifactResultFailure(
                 result_details=f"Attempted to regenerate preview for '{source_path}'. Failed due to: {generate_result.result_details}"
@@ -930,6 +942,47 @@ class ArtifactManager:
         return CheckArtifactReadPermissionResultSuccess(
             denial=denial,
             result_details=f"Read denied for '{request.source_path}': {denial.reason()}",
+        )
+
+    async def on_handle_get_artifact_metadata_request(
+        self, request: GetArtifactMetadataRequest
+    ) -> GetArtifactMetadataResultSuccess | GetArtifactMetadataResultFailure:
+        """Handle a metadata request by dispatching to the provider that claims the extension.
+
+        Resolves request.macro_path first (mirrors on_handle_get_preview_for_artifact_request)
+        so callers can pass an unresolved macro path (e.g. "{outputs}/file.mp4") directly
+        instead of having to resolve it themselves first. No provider for the resolved
+        extension is not an error, it's Success with artifact_metadata=None.
+        """
+        if not request.macro_path.parsed_macro.template:
+            return GetArtifactMetadataResultFailure(
+                result_details="Attempted to get artifact metadata. Failed because no source path was provided."
+            )
+
+        resolve_result = GriptapeNodes.handle_request(ResolveMacroPathRequest(macro_path=request.macro_path))
+        if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
+            return GetArtifactMetadataResultFailure(
+                result_details=f"Attempted to resolve source macro path. Failed due to: {resolve_result.result_details}"
+            )
+
+        source_path = resolve_result.resolved_path
+        extension = Path(source_path).suffix.lstrip(".").lower()
+        if not extension:
+            return GetArtifactMetadataResultSuccess(
+                result_details=f"No file extension for '{source_path}'; skipping metadata extraction.",
+                artifact_metadata=None,
+            )
+
+        provider_classes = self._registry.get_provider_classes_by_format(extension)
+        if not provider_classes:
+            return GetArtifactMetadataResultSuccess(
+                result_details=f"No artifact provider registered for format '{extension}'.",
+                artifact_metadata=None,
+            )
+
+        return GetArtifactMetadataResultSuccess(
+            result_details=f"Retrieved artifact metadata for '{source_path}'.",
+            artifact_metadata=await self._get_artifact_metadata_dict(provider_classes[0], source_path),
         )
 
     def on_handle_list_artifact_providers_request(

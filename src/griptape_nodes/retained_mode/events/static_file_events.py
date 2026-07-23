@@ -146,6 +146,9 @@ class CreateStaticFileDownloadUrlFromPathRequest(RequestPayload):
             Ignored for non-macro paths.
         preview: If True, generates and returns preview(s) rather than the original file.
             Defaults to False.
+        metadata_only: If True, extracts and returns artifact_metadata for the original file
+            without generating a preview. The returned URL points to the original full-quality
+            file. Takes precedence over preview. Defaults to False.
 
     Results: CreateStaticFileDownloadUrlResultSuccess (with URL) | CreateStaticFileDownloadUrlResultFailure (URL creation error)
     """
@@ -153,6 +156,7 @@ class CreateStaticFileDownloadUrlFromPathRequest(RequestPayload):
     file_path: str
     macro_variables: MacroVariables = field(default_factory=dict)
     preview: bool = False
+    metadata_only: bool = False
 
 
 @dataclass
@@ -176,8 +180,9 @@ class CreateStaticFileDownloadUrlFromPathResultSuccess(CreateStaticFileDownloadU
 
     Args:
         artifact_metadata: Original properties extracted from the source file header.
-            Only populated when preview=True and the file is a local image.
-            Contains: width, height, format, channels, color_space, file_size.
+            Populated when preview=True or metadata_only=True and the file format has
+            a registered provider. Contains a subset of: width, height, format, channels,
+            color_space, file_size, duration_seconds, codec, frame_rate.
     """
 
     artifact_metadata: dict | None = None

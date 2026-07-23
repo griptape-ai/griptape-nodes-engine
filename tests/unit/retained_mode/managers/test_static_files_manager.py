@@ -1,7 +1,7 @@
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -619,6 +619,175 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
 
         assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
         assert "invalid macro syntax" in result.error
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_metadata_only_returns_original_url_with_metadata(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """Test that metadata_only=True returns the original URL with artifact_metadata populated."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        expected_metadata = {"width": 1920, "height": 1080, "codec": "h264", "frame_rate": 29.97}
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="file:///path/to/video.mp4", metadata_only=True)
+
+        with patch.object(
+            mock_static_files_manager,
+            "_extract_metadata_only",
+            new_callable=AsyncMock,
+            return_value=expected_metadata,
+        ):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.url == "http://signed-url.com"
+        assert result.artifact_metadata == expected_metadata
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_metadata_only_takes_precedence_over_preview(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """Test that metadata_only=True wins over preview=True: original URL is returned, not a preview."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(
+            file_path="file:///path/to/video.mp4", metadata_only=True, preview=True
+        )
+
+        mock_extract = AsyncMock(return_value={"codec": "h264"})
+        mock_generate = AsyncMock(return_value=(Path("/path/to/preview.mp4"), {"codec": "h264"}))
+
+        with (
+            patch.object(mock_static_files_manager, "_extract_metadata_only", mock_extract),
+            patch.object(mock_static_files_manager, "_generate_preview_if_needed", mock_generate),
+        ):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        mock_extract.assert_called_once()
+        mock_generate.assert_not_called()
+        # URL must be the original, not the preview
+        call_args = mock_static_files_manager.storage_driver.create_signed_download_url.call_args
+        assert call_args[0][0] == Path("/path/to/video.mp4")
+
+    @pytest.mark.asyncio
+    async def test_create_download_url_metadata_only_graceful_fallback_on_extraction_failure(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """Test that a failed metadata extraction still returns a valid URL with artifact_metadata=None."""
+        from griptape_nodes.retained_mode.events.static_file_events import (
+            CreateStaticFileDownloadUrlFromPathRequest,
+            CreateStaticFileDownloadUrlFromPathResultSuccess,
+        )
+
+        mock_static_files_manager.storage_driver.create_signed_download_url.return_value = "http://signed-url.com"
+        mock_static_files_manager.storage_driver.get_asset_url.return_value = "http://asset-url.com"
+
+        request = CreateStaticFileDownloadUrlFromPathRequest(file_path="file:///path/to/video.mp4", metadata_only=True)
+
+        with patch.object(
+            mock_static_files_manager,
+            "_extract_metadata_only",
+            new_callable=AsyncMock,
+            return_value=None,
+        ):
+            result = await mock_static_files_manager.on_handle_create_static_file_download_url_from_path_request(
+                request
+            )
+
+        assert isinstance(result, CreateStaticFileDownloadUrlFromPathResultSuccess)
+        assert result.url == "http://signed-url.com"
+        assert result.artifact_metadata is None
+
+
+class TestStaticFilesManagerExtractMetadataOnly:
+    """Test StaticFilesManager._extract_metadata_only() method."""
+
+    @pytest.fixture
+    def mock_static_files_manager(self) -> StaticFilesManager:
+        mock_config = Mock()
+        mock_config.get_config_value.return_value = "local"
+        mock_config.workspace_path = Path("/mock/workspace")
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
+            manager = StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+            manager.storage_driver = Mock()
+            return manager
+
+    @pytest.mark.asyncio
+    async def test_success_result_returns_metadata_dict(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """A GetArtifactMetadataResultSuccess with metadata is unwrapped and returned as-is."""
+        from griptape_nodes.retained_mode.events.artifact_events import GetArtifactMetadataResultSuccess
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        file_path = Path("/some/video.mp4")
+        expected = {"width": 1920, "height": 1080, "codec": "h264", "frame_rate": 29.97}
+
+        with patch.object(
+            GriptapeNodes,
+            "ahandle_request",
+            new_callable=AsyncMock,
+            return_value=GetArtifactMetadataResultSuccess(result_details="ok", artifact_metadata=expected),
+        ) as mock_ahandle_request:
+            metadata = await mock_static_files_manager._extract_metadata_only(file_path)
+
+        assert metadata == expected
+        request = mock_ahandle_request.call_args[0][0]
+        assert request.macro_path.parsed_macro.template == str(file_path)
+        assert request.macro_path.variables == {}
+
+    @pytest.mark.asyncio
+    async def test_success_result_with_no_metadata_returns_none(
+        self, mock_static_files_manager: StaticFilesManager
+    ) -> None:
+        """A GetArtifactMetadataResultSuccess with artifact_metadata=None (no provider, or extraction failed) yields None."""
+        from griptape_nodes.retained_mode.events.artifact_events import GetArtifactMetadataResultSuccess
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        file_path = Path("/some/document.txt")
+
+        with patch.object(
+            GriptapeNodes,
+            "ahandle_request",
+            new_callable=AsyncMock,
+            return_value=GetArtifactMetadataResultSuccess(result_details="no provider", artifact_metadata=None),
+        ):
+            metadata = await mock_static_files_manager._extract_metadata_only(file_path)
+
+        assert metadata is None
+
+    @pytest.mark.asyncio
+    async def test_failure_result_returns_none(self, mock_static_files_manager: StaticFilesManager) -> None:
+        """A GetArtifactMetadataResultFailure is treated as a graceful fallback to None."""
+        from griptape_nodes.retained_mode.events.artifact_events import GetArtifactMetadataResultFailure
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        file_path = Path("/some/video.mp4")
+
+        with patch.object(
+            GriptapeNodes,
+            "ahandle_request",
+            new_callable=AsyncMock,
+            return_value=GetArtifactMetadataResultFailure(result_details="malformed request"),
+        ):
+            metadata = await mock_static_files_manager._extract_metadata_only(file_path)
+
+        assert metadata is None
 
 
 class TestStaticFilesManagerResolveStaticFilePath:
