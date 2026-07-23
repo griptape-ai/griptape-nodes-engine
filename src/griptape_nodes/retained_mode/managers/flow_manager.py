@@ -3710,6 +3710,11 @@ class FlowManager:
                     details = f"Attempted to serialize Flow '{flow_name}', but no Flow with that name could be found."
                     return SerializeFlowToCommandsResultFailure(result_details=details)
 
+                # Skip transient child flows: they are runtime-only artifacts (e.g. a subflow a node
+                # imports at execution time) and must not be baked into the saved workflow.
+                if child_flow_obj.metadata.get("transient"):
+                    continue
+
                 # Check if this is a referenced workflow
                 if self.is_referenced_workflow(child_flow_obj):
                     # For referenced workflows, create a minimal SerializedFlowCommands with just the import command
