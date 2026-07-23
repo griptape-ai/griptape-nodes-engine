@@ -2019,7 +2019,7 @@ class TestWorkflowManager:
         workflow_manager = griptape_nodes.WorkflowManager()
         fake_class = type("FakeClass", (), {})
         fake_module = MagicMock()
-        fake_module.__name__ = "gtn_dynamic_module_foo_py_123"
+        fake_module.__name__ = "griptape_nodes.node_libraries.my_lib.foo"
 
         import_recorder = ImportRecorder()
         deferred_imports: dict[str, set[str]] = {}
@@ -2030,19 +2030,61 @@ class TestWorkflowManager:
                 return_value=fake_module,
             ),
             patch.object(griptape_nodes.LibraryManager(), "is_dynamic_module", return_value=True),
-            patch.object(
-                griptape_nodes.LibraryManager(),
-                "get_stable_namespace_for_dynamic_module",
-                return_value="my_lib.foo",
-            ),
         ):
             workflow_manager._collect_object_imports(fake_class(), import_recorder, set(), deferred_imports)
 
-        assert "my_lib.foo" in deferred_imports, "Dynamic library import must land in deferred_imports"
-        assert "FakeClass" in deferred_imports["my_lib.foo"]
-        assert "my_lib.foo" not in import_recorder.from_imports, (
-            "Dynamic library import must NOT be in import_recorder (would appear at module top level)"
+        assert fake_module.__name__ in deferred_imports, "Library import must land in deferred_imports"
+        assert "FakeClass" in deferred_imports[fake_module.__name__]
+        assert fake_module.__name__ not in import_recorder.from_imports, (
+            "Library import must NOT be in import_recorder (would appear at module top level)"
         )
+
+    def test_generate_unique_values_code_uses_library_recovery_loader(self, griptape_nodes: GriptapeNodes) -> None:
+        """Pickled parameter values must decode through loads_with_library_recovery.
+
+        Plain pickle.loads cannot recover references to library modules whose namespace
+        ownership changed because two node files collide and registered in a different
+        order than when the workflow was saved.
+        """
+        from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+        from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        import_recorder = ImportRecorder()
+        unique_values = {
+            SerializedNodeCommands.UniqueParameterValueUUID("11111111-1111-1111-1111-111111111111"): "some value"
+        }
+
+        module = workflow_manager._generate_unique_values_code(
+            unique_values,  # type: ignore[arg-type]
+            prefix="flow0",
+            import_recorder=import_recorder,
+        )
+
+        generated = ast.unparse(module)
+        assert "loads_with_library_recovery(" in generated
+        assert "pickle.loads(" not in generated
+        recovery_module = "griptape_nodes.retained_mode.managers.library_manager"
+        assert "loads_with_library_recovery" in import_recorder.from_imports.get(recovery_module, set())
+
+    def test_deferred_import_statements_tolerate_missing_modules(self, griptape_nodes: GriptapeNodes) -> None:
+        """Deferred library imports must not abort build_workflow when a namespace is absent.
+
+        A collision-suffixed namespace recorded at save time can legitimately not exist
+        after registration order flips; the import only warms the module, and unpickling
+        recovers the reference through loads_with_library_recovery.
+        """
+        workflow_manager = griptape_nodes.WorkflowManager()
+
+        stmts = workflow_manager._build_deferred_import_statements(
+            {"griptape_nodes.node_libraries.missing_lib.gone_abcd1234": {"GhostClass"}}
+        )
+
+        assert len(stmts) == 1
+        generated = ast.unparse(ast.Module(body=stmts, type_ignores=[]))
+        assert "from griptape_nodes.node_libraries.missing_lib.gone_abcd1234 import GhostClass" in generated
+        # Executing the guarded import against a namespace that does not exist must not raise.
+        exec(compile(ast.Module(body=stmts, type_ignores=[]), "<deferred_imports>", "exec"), {})  # noqa: S102
 
 
 class TestWorkflowVariablePersistence:

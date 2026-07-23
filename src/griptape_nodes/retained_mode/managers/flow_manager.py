@@ -4,7 +4,6 @@ import asyncio
 import base64
 import copy
 import logging
-import pickle
 from enum import StrEnum
 from io import BytesIO
 from pathlib import Path
@@ -173,6 +172,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.library_manager import (
+    AmbiguousLegacyModuleError,
+    loads_with_library_recovery,
+)
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
@@ -4094,7 +4097,7 @@ class FlowManager:
             ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=[])))
         )
 
-    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, C901
+    def on_extract_flow_commands_from_image_metadata(  # noqa: PLR0911, PLR0912, C901
         self, request: ExtractFlowCommandsFromImageMetadataRequest
     ) -> ResultPayload:
         """Extract flow commands from PNG image metadata.
@@ -4177,9 +4180,42 @@ class FlowManager:
 
         # Unpickle SerializedFlowCommands
         try:
-            # Pickle is safe here: we're deserializing workflow data from images saved by this application
-            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands
-            serialized_flow_commands = pickle.loads(pickled_data)  # noqa: S301
+            # Pickle is safe here: we're deserializing workflow data from images saved by this application.
+            # Converting to JSON would require significant serialization infrastructure for SerializedFlowCommands.
+            # loads_with_library_recovery additionally remaps volatile module names from images
+            # saved by engines that predate stable-namespace module loading, and collided
+            # stable namespaces whose ownership depends on library load order.
+            serialized_flow_commands = loads_with_library_recovery(pickled_data)
+        except AmbiguousLegacyModuleError as e:
+            display_candidates = [
+                GriptapeNodes.LibraryManager().get_module_display_name(module_name)
+                for module_name in e.candidate_modules
+            ]
+            candidates = ", ".join(f"'{candidate}'" for candidate in display_candidates)
+            return ExtractFlowCommandsFromImageMetadataResultFailure(
+                result_details=(
+                    f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because more than "
+                    f"one loaded node file provides '{e.class_name}' ({candidates}). Rename one of the conflicting "
+                    "node files, or disable a library that provides one of them, then try again."
+                ),
+                file_path=file_url_or_path,
+            )
+        except ModuleNotFoundError as e:
+            missing_module = e.name or "unknown"
+            display_name = GriptapeNodes.LibraryManager().get_module_display_name(missing_module)
+            logger.debug(
+                "Flow commands embedded in '%s' reference unresolvable module '%s'.",
+                file_url_or_path,
+                missing_module,
+            )
+            return ExtractFlowCommandsFromImageMetadataResultFailure(
+                result_details=(
+                    f"Attempted to load the workflow embedded in '{file_url_or_path}'. Failed because it "
+                    f"uses node types this engine doesn't have loaded (needs '{display_name}'). Install or "
+                    "enable the library it came from, then try again."
+                ),
+                file_path=file_url_or_path,
+            )
         except Exception as e:
             return ExtractFlowCommandsFromImageMetadataResultFailure(
                 result_details=f"Failed to unpickle flow commands: {e}",

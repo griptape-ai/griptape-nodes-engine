@@ -799,3 +799,324 @@ class TestClassifyNodesForDag:
         assert categories.start_nodes == []
         assert categories.control_nodes == []
         assert categories.data_sink_nodes == []
+
+
+class TestExtractFlowCommandsSurvivesLibraryReload:
+    """Regression for the drag-image-after-restart failure reported against main.
+
+    An image's embedded flow commands are a plain pickle that can reference classes defined
+    in a library node module (e.g. an enum used as a parameter default). Those modules load
+    under a stable, deterministic namespace, so the pickled reference resolves after an
+    engine restart instead of raising ``No module named 'gtn_dynamic_module_..._<hash>'``.
+    """
+
+    _MODULE_SOURCE = (
+        "from enum import StrEnum\n\n\n"
+        "class CollisionBehavior(StrEnum):\n"
+        '    OVERWRITE = "Overwrite existing"\n'
+        '    PRESERVE = "Preserve existing"\n'
+    )
+
+    def _image_with_pickled_value(self, tmp_path: Path, value: object) -> str:
+        pickled = pickle.dumps(value)
+        # The embedded reference must be the stable namespace, not a volatile per-process
+        # name. This is what makes the payload portable across engine restarts; the old
+        # hash-suffixed dynamic name would fail to resolve in a fresh process.
+        assert b"griptape_nodes.node_libraries.repro_library.set_variables_from_data" in pickled
+        assert b"gtn_dynamic_module" not in pickled
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "embedded.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+        return str(image_path)
+
+    def test_unpickles_library_value_after_reload(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        import sys
+
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(self._MODULE_SOURCE)
+
+        manager = griptape_nodes.LibraryManager()
+        module = manager._load_module_from_file(module_file, library_name)
+
+        # An enum instance from the library module, like a node's parameter default value.
+        image_path = self._image_with_pickled_value(tmp_path, module.CollisionBehavior.OVERWRITE)
+
+        # Simulate an engine restart: drop the in-memory module, then reload the library.
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+        assert module.__name__ not in sys.modules
+        manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=image_path, deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands == "Overwrite existing"
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_unpickles_image_saved_with_volatile_module_name(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """An image saved by an engine that used volatile module names still loads.
+
+        This is the exact reported scenario: the embedded pickle references
+        ``gtn_dynamic_module_set_variables_from_data_py_<hash>``, which does not exist in this
+        process. The unpickler remaps it to the module loaded under its stable namespace.
+        """
+        import sys
+        import types
+
+        volatile_name = "gtn_dynamic_module_set_variables_from_data_py_4816193767510271467"
+
+        # Recreate what the old loader produced, pickle a value from it, then drop the module
+        # (a fresh engine process never has this hash).
+        volatile_module = types.ModuleType(volatile_name)
+        exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.CollisionBehavior.OVERWRITE)
+        del sys.modules[volatile_name]
+        assert volatile_name.encode() in pickled
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "old_engine_image.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        # The current engine has the library loaded under the stable namespace.
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(self._MODULE_SOURCE)
+        manager = griptape_nodes.LibraryManager()
+        loaded = manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands == "Overwrite existing"
+        assert result.serialized_flow_commands is loaded.CollisionBehavior.OVERWRITE
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_unpickles_nested_class_saved_with_volatile_module_name(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A legacy pickle referencing a nested class (dotted qualified name) still loads.
+
+        Pickle protocol 4+ records nested classes as dotted names like
+        ``SetVariablesNode.CollisionBehavior``; legacy recovery must resolve each component
+        in sequence rather than a single getattr.
+        """
+        import sys
+        import types
+
+        nested_source = (
+            "from enum import StrEnum\n\n\n"
+            "class SetVariablesNode:\n"
+            "    class CollisionBehavior(StrEnum):\n"
+            '        OVERWRITE = "Overwrite existing"\n'
+            '        PRESERVE = "Preserve existing"\n'
+        )
+
+        volatile_name = "gtn_dynamic_module_set_variables_from_data_py_4816193767510271467"
+        volatile_module = types.ModuleType(volatile_name)
+        exec(nested_source, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.SetVariablesNode.CollisionBehavior.PRESERVE)
+        del sys.modules[volatile_name]
+        assert b"SetVariablesNode" in pickled, "sanity: the pickle must reference the nested qualified name"
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "nested_legacy.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        library_name = "Repro Library"
+        module_file = tmp_path / "set_variables_from_data.py"
+        module_file.write_text(nested_source)
+        manager = griptape_nodes.LibraryManager()
+        loaded = manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        assert result.serialized_flow_commands is loaded.SetVariablesNode.CollisionBehavior.PRESERVE
+
+        manager._unregister_all_stable_module_aliases_for_library(library_name)
+
+    def test_unpickles_collided_values_after_reverse_load_order(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Values pickled under both collided namespaces load after the ownership flips.
+
+        'Collision Library' and 'Collision-Library' sanitize to the same namespace segment,
+        so their same-stem node files collide on one base namespace. An image saved while A
+        owned the plain name embeds references to both the plain name (A's value) and the
+        suffixed name (B's value). Reloading in the opposite order flips ownership; both
+        references must still resolve to their original classes.
+        """
+        import sys
+
+        source_a = 'from enum import StrEnum\n\n\nclass AlphaBehavior(StrEnum):\n    OVERWRITE = "Overwrite existing"\n'
+        source_b = 'from enum import StrEnum\n\n\nclass BetaBehavior(StrEnum):\n    PRESERVE = "Preserve existing"\n'
+        file_a = tmp_path / "first" / "collide.py"
+        file_a.parent.mkdir()
+        file_a.write_text(source_a)
+        file_b = tmp_path / "second" / "collide.py"
+        file_b.parent.mkdir()
+        file_b.write_text(source_b)
+
+        manager = griptape_nodes.LibraryManager()
+        module_a = manager._load_module_from_file(file_a, "Collision Library")
+        module_b = manager._load_module_from_file(file_b, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the first collision"
+
+        pickled = pickle.dumps([module_a.AlphaBehavior.OVERWRITE, module_b.BetaBehavior.PRESERVE])
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "collided.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        # Simulate a fresh engine that registers the libraries in the opposite order.
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+        module_b2 = manager._load_module_from_file(file_b, "Collision-Library")
+        module_a2 = manager._load_module_from_file(file_a, "Collision Library")
+        assert module_b2.__name__ == module_a.__name__, "sanity: reverse order must flip base ownership"
+        assert module_b.__name__ not in sys.modules, "sanity: B's suffixed name must be gone after the flip"
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultSuccess)
+        recovered_values = result.serialized_flow_commands
+        assert isinstance(recovered_values, list)
+        recovered_alpha, recovered_beta = recovered_values
+        assert recovered_alpha is module_a2.AlphaBehavior.OVERWRITE
+        assert recovered_beta is module_b2.BetaBehavior.PRESERVE
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+
+    def test_collided_reference_both_files_define_class_fails_safely(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A plain-namespace reference both colliding files can satisfy must not silently guess.
+
+        With identical class names, the plain base namespace is genuinely ambiguous: the
+        writing process may have assigned it to either file depending on load order. Even
+        though a normal module lookup would succeed here, extraction must fail with the
+        artist-readable ambiguity error rather than return whichever file currently owns
+        the name.
+        """
+        file_a = tmp_path / "first" / "collide.py"
+        file_a.parent.mkdir()
+        file_a.write_text(self._MODULE_SOURCE)
+        file_b = tmp_path / "second" / "collide.py"
+        file_b.parent.mkdir()
+        file_b.write_text(self._MODULE_SOURCE)
+
+        manager = griptape_nodes.LibraryManager()
+        module_a = manager._load_module_from_file(file_a, "Collision Library")
+        module_b = manager._load_module_from_file(file_b, "Collision-Library")
+        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the collision"
+
+        pickled = pickle.dumps(module_a.CollisionBehavior.OVERWRITE)
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "ambiguous_collision.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        details = str(result.result_details)
+        assert "more than one loaded node file" in details
+        assert "collision_library.collide" in details
+
+        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
+        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
+
+    def test_ambiguous_legacy_module_yields_artist_readable_error(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Legacy references fail safely when multiple loaded libraries match."""
+        import sys
+        import types
+
+        volatile_name = "gtn_dynamic_module_set_variables_from_data_py_123456789"
+        volatile_module = types.ModuleType(volatile_name)
+        exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.CollisionBehavior.OVERWRITE)
+        del sys.modules[volatile_name]
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "ambiguous.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        manager = griptape_nodes.LibraryManager()
+        for directory, library_name in (("first", "First Library"), ("second", "Second Library")):
+            module_file = tmp_path / directory / "set_variables_from_data.py"
+            module_file.parent.mkdir()
+            module_file.write_text(self._MODULE_SOURCE)
+            manager._load_module_from_file(module_file, library_name)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        details = str(result.result_details)
+        assert "more than one loaded node file" in details
+        assert "first_library.set_variables_from_data" in details
+        assert "second_library.set_variables_from_data" in details
+        assert "gtn_dynamic_module" not in details
+
+        manager._unregister_all_stable_module_aliases_for_library("First Library")
+        manager._unregister_all_stable_module_aliases_for_library("Second Library")
+
+    def test_missing_library_yields_artist_readable_error(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """When no loaded library can satisfy the reference, the error names the module."""
+        import sys
+        import types
+
+        volatile_name = "gtn_dynamic_module_not_installed_anywhere_py_123456789"
+        volatile_module = types.ModuleType(volatile_name)
+        exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
+        sys.modules[volatile_name] = volatile_module
+        pickled = pickle.dumps(volatile_module.CollisionBehavior.OVERWRITE)
+        del sys.modules[volatile_name]
+
+        payload = base64.b64encode(pickled).decode("ascii")
+        image_path = tmp_path / "orphaned.png"
+        info = PngInfo()
+        info.add_text(FLOW_COMMANDS_KEY, payload)
+        Image.new("RGB", (4, 4), color="red").save(image_path, format="PNG", pnginfo=info)
+
+        flow_manager = griptape_nodes.FlowManager()
+        request = ExtractFlowCommandsFromImageMetadataRequest(file_url_or_path=str(image_path), deserialize=False)
+        result = flow_manager.on_extract_flow_commands_from_image_metadata(request)
+
+        assert isinstance(result, ExtractFlowCommandsFromImageMetadataResultFailure)
+        details = str(result.result_details)
+        assert "doesn't have loaded" in details
+        # The artist-facing message names the node file, not the internal volatile token.
+        assert "not_installed_anywhere" in details
+        assert "gtn_dynamic_module" not in details
