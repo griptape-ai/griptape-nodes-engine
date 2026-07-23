@@ -16,10 +16,15 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.events.flow_events import (
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -799,3 +804,54 @@ class TestClassifyNodesForDag:
         assert categories.start_nodes == []
         assert categories.control_nodes == []
         assert categories.data_sink_nodes == []
+
+
+@pytest.fixture
+def clean_object_state(griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    """Clear all object state around a test so leftover flows never bleed across tests.
+
+    Yield-based so the teardown clear runs even when the test body fails.
+    """
+    griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    try:
+        yield
+    finally:
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestSerializeFlowSkipsTransientChildFlows:
+    """A child flow flagged ``transient`` in its metadata is omitted from serialization.
+
+    Transient flows are runtime-only artifacts (e.g. a subflow a node imports at execution time);
+    they must not be baked into the saved workflow, so ``on_serialize_flow_to_commands`` skips them
+    while still serializing ordinary child flows.
+    """
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_transient_child_flow_is_not_serialized(self, griptape_nodes: GriptapeNodes) -> None:
+        griptape_nodes.ContextManager().push_workflow("transient_wf")
+
+        parent = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
+        )
+        assert isinstance(parent, CreateFlowResultSuccess)
+        keep = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_keep", set_as_new_context=False)
+        )
+        assert isinstance(keep, CreateFlowResultSuccess)
+        transient = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_transient", set_as_new_context=False)
+        )
+        assert isinstance(transient, CreateFlowResultSuccess)
+
+        flow_manager = griptape_nodes.FlowManager()
+        flow_manager.get_flow_by_name(transient.flow_name).metadata["transient"] = True
+
+        result = flow_manager.on_serialize_flow_to_commands(
+            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
+        )
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+
+        serialized_child_flows = {sub.flow_name for sub in result.serialized_flow_commands.sub_flows_commands}
+        assert keep.flow_name in serialized_child_flows
+        assert transient.flow_name not in serialized_child_flows
