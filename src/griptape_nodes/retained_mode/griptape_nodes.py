@@ -65,6 +65,7 @@ if TYPE_CHECKING:
         StaticFilesManager,
     )
     from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.user_manager import UserManager
     from griptape_nodes.retained_mode.managers.variable_manager import (
         VariablesManager,
@@ -108,6 +109,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
     _artifact_manager: ArtifactManager
     _manifest_manager: ManifestManager
     _worker_manager: WorkerManager
+    _undo_manager: UndoManager
 
     def __init__(self) -> None:  # noqa: PLR0915
         from griptape_nodes.retained_mode.managers.access_manager import AccessManager
@@ -139,6 +141,7 @@ class GriptapeNodes(metaclass=SingletonMeta):
             StaticFilesManager,
         )
         from griptape_nodes.retained_mode.managers.sync_manager import SyncManager
+        from griptape_nodes.retained_mode.managers.undo import UndoManager
         from griptape_nodes.retained_mode.managers.user_manager import UserManager
         from griptape_nodes.retained_mode.managers.variable_manager import (
             VariablesManager,
@@ -154,6 +157,8 @@ class GriptapeNodes(metaclass=SingletonMeta):
         # Initialize only if our managers haven't been created yet
         if not hasattr(self, "_event_manager"):
             self._event_manager = EventManager()
+            # Created early so its recorders can be registered by the domain managers below.
+            self._undo_manager = UndoManager(self._event_manager)
             self._resource_manager = ResourceManager(self._event_manager)
             self._config_manager = ConfigManager(self._event_manager)
             self._os_manager = OSManager(self._event_manager)
@@ -161,6 +166,9 @@ class GriptapeNodes(metaclass=SingletonMeta):
             self._object_manager = ObjectManager(self._event_manager)
             self._node_manager = NodeManager(self._event_manager)
             self._flow_manager = FlowManager(self._event_manager)
+            # Wire the domain managers' undo recorders now that both they and the UndoManager exist.
+            self._node_manager.register_undo_recorders(self._undo_manager)
+            self._flow_manager.register_undo_recorders(self._undo_manager)
             self._context_manager = ContextManager(self._event_manager)
             self._worker_manager = WorkerManager(griptape_nodes=self, event_manager=self._event_manager)
             self._library_manager = LibraryManager(self._event_manager, worker_manager=self._worker_manager)
@@ -384,6 +392,10 @@ class GriptapeNodes(metaclass=SingletonMeta):
     @classmethod
     def WorkerManager(cls) -> WorkerManager:
         return GriptapeNodes.get_instance()._worker_manager
+
+    @classmethod
+    def UndoManager(cls) -> UndoManager:
+        return GriptapeNodes.get_instance()._undo_manager
 
     @classmethod
     def clear_current_workflow_data(cls) -> None:  # noqa: C901

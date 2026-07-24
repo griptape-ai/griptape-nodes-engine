@@ -174,11 +174,16 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
+from griptape_nodes.retained_mode.managers.undo.recorders.flow import (
+    CreateConnectionRecorder,
+    DeleteConnectionRecorder,
+)
 from griptape_nodes.retained_mode.variable_types import VariableScope
 
 if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.undo import UndoManager
     from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowShapeNodes
     from griptape_nodes.retained_mode.variable_types import FlowVariable
 
@@ -314,6 +319,23 @@ class FlowManager:
         self._global_single_node_resolution = False
         self._global_dag_builder = DagBuilder()
         self._node_executor = NodeExecutor()
+
+    def register_undo_recorders(self, undo_manager: UndoManager) -> None:
+        """Register how connection requests are reversed for undo/redo.
+
+        The UndoManager owns the mechanism; the flow domain owns the knowledge of how to reverse
+        its own requests. Execution requests alter workflow state but are not undoable (undo is
+        about editing, not running), so they stay declared as the non-undoable floor. Called from
+        GriptapeNodes wiring after construction; isolated unit tests that build a FlowManager
+        directly simply skip it.
+        """
+        undo_manager.register_recorder(CreateConnectionRequest, CreateConnectionRecorder())
+        undo_manager.register_recorder(DeleteConnectionRequest, DeleteConnectionRecorder())
+        undo_manager.register_non_undoable(
+            StartFlowRequest,
+            CancelFlowRequest,
+            UnresolveFlowRequest,
+        )
 
     @property
     def global_single_node_resolution(self) -> bool:
