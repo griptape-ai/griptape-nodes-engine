@@ -614,11 +614,6 @@ class ExecuteDagState(State):
                         context.node_priority_queue.add_node(end_node_reference)
                         node_reference = end_node_reference
 
-            def on_task_done(task: asyncio.Task) -> None:
-                if task in context.task_to_node:
-                    node = context.task_to_node[task]
-                    node.node_state = NodeState.DONE
-
             # Execute the node asynchronously
             logger.debug(
                 "CREATING EXECUTION TASK for node '%s' - this should only happen once per node!",
@@ -629,10 +624,8 @@ class ExecuteDagState(State):
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
             node_task = asyncio.create_task(ExecuteDagState.execute_node(node_reference))
-            # Add a callback to set node to done when task has finished.
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
-            node_task.add_done_callback(on_task_done)
 
             # Send an event that this is a current data node:
 
@@ -677,6 +670,14 @@ class ExecuteDagState(State):
                     context.error_message = msg
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
+                # Task finished cleanly. Mark the node DONE here rather than in a
+                # task done-callback: a done-callback is scheduled via call_soon and
+                # can run *after* asyncio.wait() returns and the task has been popped
+                # from task_to_node, making the callback a no-op. The node would then
+                # never leave PROCESSING, pop_done_states would never advance it, and
+                # on_update would loop forever. Setting it inline keeps completion
+                # deterministic.
+                context.task_to_node[task].node_state = NodeState.DONE
                 context.task_to_node.pop(task)
 
         # Once a task has finished, loop back to the top.
