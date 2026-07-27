@@ -17,19 +17,12 @@ as RESOLVED, because its output value was not persisted.
 
 from __future__ import annotations
 
-import contextlib
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
-from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.retained_mode.events.connection_events import (
-    CreateConnectionRequest,
-    CreateConnectionResultSuccess,
-)
 from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
@@ -43,15 +36,14 @@ from griptape_nodes.retained_mode.events.library_events import (
     RegisterLibraryFromFileRequest,
     RegisterLibraryFromFileResultSuccess,
 )
-from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
-from griptape_nodes.retained_mode.events.object_events import (
-    ClearAllObjectStateRequest,
-    ClearAllObjectStateResultSuccess,
-)
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable
+
+# Timeout with thread dump.
+pytestmark = pytest.mark.timeout(300, method="thread")
 
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "nonserializable_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
@@ -59,63 +51,17 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "nonserializable_nodes.py"
 LIBRARY_NAME = "NonSerializable Library"
 
 
-def _materialize_library(target_dir: Path) -> Path:
-    from griptape_nodes.utils.version_utils import engine_version
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    schema = json.loads(FIXTURE_LIBRARY_JSON_TEMPLATE.read_text())
-    schema["metadata"]["engine_version"] = engine_version
-    library_json = target_dir / "griptape_nodes_library.json"
-    library_json.write_text(json.dumps(schema, indent=2))
-    (target_dir / FIXTURE_NODE_FILE.name).write_text(FIXTURE_NODE_FILE.read_text())
-    return library_json
-
-
-def _create_node(node_type: str, node_name: str, flow_name: str) -> str:
-    result = GriptapeNodes.handle_request(
-        CreateNodeRequest(
-            node_type=node_type,
-            specific_library_name=LIBRARY_NAME,
-            node_name=node_name,
-            override_parent_flow_name=flow_name,
-        )
-    )
-    assert isinstance(result, CreateNodeResultSuccess), result
-    return result.node_name
-
-
-def _connect(source_node: str, source_param: str, target_node: str, target_param: str) -> None:
-    result = GriptapeNodes.handle_request(
-        CreateConnectionRequest(
-            source_node_name=source_node,
-            source_parameter_name=source_param,
-            target_node_name=target_node,
-            target_parameter_name=target_param,
-        )
-    )
-    assert isinstance(result, CreateConnectionResultSuccess), result
-
-
-@pytest.fixture
-def _clean_engine_state() -> Iterator[None]:
-    """Keep the shared engine singleton clean despite running in-process."""
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    try:
-        yield
-    finally:
-        clear_result = GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-        assert isinstance(clear_result, ClearAllObjectStateResultSuccess), clear_result
-        with contextlib.suppress(KeyError):
-            LibraryRegistry.unregister_library(LIBRARY_NAME)
-
-
 @pytest.mark.skipif(
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"NonSerializable Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
 )
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("_clean_engine_state")
-async def test_serializable_false_output_reresolved_on_load(tmp_path: Path) -> None:
+async def test_serializable_false_output_reresolved_on_load(
+    tmp_path: Path,
+    materialize_library: Callable[..., Path],
+    create_node: Callable[..., str],
+    connect: Callable[..., None],
+) -> None:
     """A node with serializable=False output must not be re-resolved after save/load.
 
     Steps:
@@ -125,7 +71,9 @@ async def test_serializable_false_output_reresolved_on_load(tmp_path: Path) -> N
         4. Clear state, create a fresh flow, deserialize (load).
         5. Run the loaded flow — the consumer must get a recomputed Session, not None.
     """
-    library_json = _materialize_library(tmp_path / "library")
+    library_json = materialize_library(
+        tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE
+    )
     register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
@@ -137,9 +85,9 @@ async def test_serializable_false_output_reresolved_on_load(tmp_path: Path) -> N
     assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
     flow_name = flow_result.flow_name
 
-    _create_node("ProducerNode", "Producer", flow_name)
-    _create_node("ConsumerNode", "Consumer", flow_name)
-    _connect("Producer", "session", "Consumer", "session")
+    create_node("ProducerNode", "Producer", flow_name, library_name=LIBRARY_NAME)
+    create_node("ConsumerNode", "Consumer", flow_name, library_name=LIBRARY_NAME)
+    connect("Producer", "session", "Consumer", "session")
 
     # --- Step 2: Run the flow so both nodes become RESOLVED ---
     run_result = await GriptapeNodes.ahandle_request(

@@ -19,15 +19,12 @@ raises because it has no valid input.
 
 from __future__ import annotations
 
-import contextlib
-import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
 
 from griptape_nodes.exe_types.node_types import NodeResolutionState
-from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.execution_events import StartFlowRequest, StartFlowResultSuccess
 from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
 from griptape_nodes.retained_mode.events.library_events import (
@@ -36,8 +33,6 @@ from griptape_nodes.retained_mode.events.library_events import (
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.events.object_events import (
-    ClearAllObjectStateRequest,
-    ClearAllObjectStateResultSuccess,
     RenameObjectRequest,
     RenameObjectResultSuccess,
 )
@@ -45,7 +40,10 @@ from griptape_nodes.retained_mode.events.parameter_events import SetParameterVal
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable
+
+# Timeout with thread dump.
+pytestmark = pytest.mark.timeout(300, method="thread")
 
 FIXTURE_LIBRARY_DIR = Path(__file__).parent / "fixtures" / "subflow_library"
 FIXTURE_LIBRARY_JSON_TEMPLATE = FIXTURE_LIBRARY_DIR / "griptape_nodes_library.json"
@@ -55,37 +53,14 @@ FIXTURE_NODE_FILE = FIXTURE_LIBRARY_DIR / "subflow_echo_node.py"
 LIBRARY_NAME = "Subflow Group Metadata Collision Library"
 
 
-def _materialize_library(target_dir: Path) -> Path:
-    from griptape_nodes.utils.version_utils import engine_version
-
-    target_dir.mkdir(parents=True, exist_ok=True)
-    schema = json.loads(FIXTURE_LIBRARY_JSON_TEMPLATE.read_text())
-    schema["name"] = LIBRARY_NAME
-    schema["metadata"]["engine_version"] = engine_version
-    library_json = target_dir / "griptape_nodes_library.json"
-    library_json.write_text(json.dumps(schema, indent=2))
-    (target_dir / FIXTURE_NODE_FILE.name).write_text(FIXTURE_NODE_FILE.read_text())
-    return library_json
-
-
-@pytest.fixture
-def _clean_engine_state() -> Iterator[None]:
-    """Keep the shared engine singleton clean despite running in-process."""
-    GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    yield
-    clear_result = GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
-    assert isinstance(clear_result, ClearAllObjectStateResultSuccess), clear_result
-    with contextlib.suppress(KeyError):
-        LibraryRegistry.unregister_library(LIBRARY_NAME)
-
-
 @pytest.mark.skipif(
     not FIXTURE_LIBRARY_JSON_TEMPLATE.exists(),
     reason=f"Subflow Library fixture missing at {FIXTURE_LIBRARY_JSON_TEMPLATE}",
 )
 @pytest.mark.asyncio
-@pytest.mark.usefixtures("_clean_engine_state")
-async def test_running_first_group_does_not_execute_second_groups_member(tmp_path: Path) -> None:
+async def test_running_first_group_does_not_execute_second_groups_member(
+    tmp_path: Path, materialize_library: Callable[..., Path]
+) -> None:
     """Running the first group must execute ONLY its own member, not the second group's.
 
     Builds the collision trigger (group, rename, group-reusing-the-freed-name), where the
@@ -94,7 +69,9 @@ async def test_running_first_group_does_not_execute_second_groups_member(tmp_pat
     group's member, which raises ``Echo node must have text input``. After the fix each
     group owns its own subflow and running the first group succeeds.
     """
-    library_json = _materialize_library(tmp_path / "library")
+    library_json = materialize_library(
+        tmp_path / "library", template=FIXTURE_LIBRARY_JSON_TEMPLATE, node_file=FIXTURE_NODE_FILE, name=LIBRARY_NAME
+    )
     register_result = GriptapeNodes.handle_request(RegisterLibraryFromFileRequest(file_path=str(library_json)))
     assert isinstance(register_result, RegisterLibraryFromFileResultSuccess), register_result
 
