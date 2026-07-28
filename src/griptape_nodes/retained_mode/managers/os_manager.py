@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import ctypes
 import logging
 import mimetypes
@@ -3229,16 +3230,36 @@ class OSManager:
             else:
                 file_mode = mode
 
-            with portalocker.Lock(
-                normalized_path,
-                mode=file_mode,  # type: ignore[arg-type]
-                encoding=encoding if isinstance(content, str) else None,
-                timeout=0,  # Non-blocking
-                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
-            ) as fh:
-                fh.write(content)
-                fh.flush()
-                os.fsync(fh.fileno())
+            # portalocker opens the file BEFORE acquiring the lock, so under mode="x" the
+            # file is created first and any later failure (lock contention, a write/fsync
+            # error) leaves it behind — zero-byte on a lock failure, partial on a write
+            # failure. The CREATE_NEW collision loop treats a lock failure as "try the
+            # next candidate," so that litter accumulates one file per index and
+            # permanently poisons the candidate namespace.
+            #
+            # Cleaning up is safe precisely because mode="x" raises FileExistsError from
+            # open() BEFORE any locking: reaching here on any other exception proves this
+            # call created the file, so there is no pre-existing data to destroy. That
+            # proof does not hold for "w"/"a", hence the mode gate.
+            try:
+                with portalocker.Lock(
+                    normalized_path,
+                    mode=file_mode,  # type: ignore[arg-type]
+                    encoding=encoding if isinstance(content, str) else None,
+                    timeout=0,  # Non-blocking
+                    flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+                ) as fh:
+                    fh.write(content)
+                    fh.flush()
+                    os.fsync(fh.fileno())
+            except FileExistsError:
+                # Raised by open() before the file was created; nothing of ours to remove.
+                raise
+            except Exception:
+                if mode == "x":
+                    with contextlib.suppress(OSError):
+                        Path(normalized_path).unlink()
+                raise
 
             # Calculate bytes written
             if isinstance(content, bytes):
