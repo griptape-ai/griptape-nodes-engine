@@ -256,36 +256,29 @@ def sanitize_path_string(path: str | Path) -> str:
     # Remove shell escape characters (backslashes before special chars only)
     # Matches: space ' " ( ) { } [ ] & | ; < > $ ` ! * ? /
     # Does NOT match: \U \t \f etc in Windows paths like C:\Users
-    path_str = re.sub(r"\\([ '\"(){}[\]&|;<>$`!*?/])", r"\1", path_str)
+    #
+    # Skipped on Windows, where `\` is the directory separator rather than an escape
+    # character: stripping there turns `C:\outputs\!final\render.png` into
+    # `C:\outputs!final\render.png`, silently redirecting the path to a sibling of the
+    # intended directory whenever a component starts with a shell-special character.
+    # The escaping this undoes comes from POSIX shells and macOS Finder's "Copy as
+    # Pathname", so nothing on Windows produces it in the first place.
+    if not is_windows():
+        path_str = re.sub(r"\\([ '\"(){}[\]&|;<>$`!*?/])", r"\1", path_str)
 
-    path_str = clean_path_string(path_str)
+    # Remove newlines and carriage returns from anywhere in the path.
+    # These cause WinError 123 on Windows (merge_texts nodes can introduce them
+    # between path components).
+    path_str = path_str.replace("\n", "").replace("\r", "")
+
+    # Strip leading/trailing whitespace
+    path_str = path_str.strip()
 
     # Restore extended-length prefix if it was present
     if extended_length_prefix:
         path_str = extended_length_prefix + path_str
 
     return path_str
-
-
-def clean_path_string(path_str: str) -> str:
-    r"""Remove newlines, carriage returns, and surrounding whitespace from a path string.
-
-    Split out from :func:`sanitize_path_string` so callers holding an already-resolved
-    path can get this cleanup WITHOUT the shell-escape stripping. On Windows ``\\`` is
-    the directory separator, so de-escaping turns ``C:\\outputs\\!final\\render.png``
-    into ``C:\\outputs!final\\render.png`` — the separator is eaten whenever the next
-    component starts with a shell-special character. A resolved path can never contain
-    shell escapes, so applying that step to one is all risk and no benefit.
-
-    Args:
-        path_str: Path string to clean
-
-    Returns:
-        Path string with newlines/carriage returns removed and whitespace stripped
-    """
-    # Newlines cause WinError 123 on Windows (merge_texts nodes can introduce them
-    # between path components).
-    return path_str.replace("\n", "").replace("\r", "").strip()
 
 
 def strip_surrounding_quotes(path: str) -> str:
@@ -323,10 +316,9 @@ def normalize_path_for_platform(path: Path) -> str:
     """
     path_str = str(path.resolve())
 
-    # Clean only newlines/carriage returns/whitespace. NOT shell escapes: the input is an
-    # already-resolved Path, which cannot contain them, and stripping them would eat
-    # Windows directory separators before components like `!final` or `{batch}`.
-    path_str = clean_path_string(path_str)
+    # Clean path to remove newlines/carriage returns, shell escapes, and quotes
+    # This handles cases where merge_texts nodes accidentally add newlines between path components
+    path_str = sanitize_path_string(path_str)
 
     return _apply_windows_long_path_prefix(path_str)
 

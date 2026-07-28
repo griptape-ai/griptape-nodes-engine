@@ -65,6 +65,48 @@ class TestFilenameParts:
         assert parts.directory == Path()
 
 
+class TestSanitizePathStringWindowsSeparators:
+    r"""On Windows, ``\`` is a separator and must never be treated as a shell escape.
+
+    Stripping it turns ``C:\outputs\!final\render.png`` into
+    ``C:\outputs!final\render.png``, silently retargeting the path at a sibling of the
+    intended directory whenever a component starts with a shell-special character
+    (griptape-ai/internal#178). Nothing on Windows produces the escaping this undoes: it
+    comes from POSIX shells and macOS Finder's "Copy as Pathname".
+
+    These force the Windows branch via ``is_windows`` so they run on any dev machine,
+    rather than skipping everywhere except the Windows CI job.
+    """
+
+    @pytest.fixture
+    def on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+
+    @pytest.mark.parametrize(
+        "component",
+        ["!final", "[wip]", "{batch}", "$tmp", "(draft)", "&more", "*glob"],
+    )
+    def test_preserves_separator_before_special_component(self, on_windows: None, component: str) -> None:  # noqa: ARG002
+        """Every shell-special leading character must keep its preceding separator."""
+        path_str = f"C:\\outputs\\{component}\\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_still_removes_newlines_on_windows(self, on_windows: None) -> None:  # noqa: ARG002
+        """The newline cleanup (WinError 123) is the reason this runs on Windows at all."""
+        assert sanitize_path_string("C:\\Users\\file\n\n.txt") == "C:\\Users\\file.txt"
+
+    def test_still_strips_quotes_on_windows(self, on_windows: None) -> None:  # noqa: ARG002
+        """Quote stripping is platform-independent and must survive the gate."""
+        assert sanitize_path_string('"C:\\Users\\my file.txt"') == "C:\\Users\\my file.txt"
+
+    def test_strips_shell_escapes_off_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The POSIX/Finder behavior is unchanged: the gate only skips on Windows."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
+
+        assert sanitize_path_string(r"/Downloads/Dragon\'s\ Curse/x.jpg") == "/Downloads/Dragon's Curse/x.jpg"
+
+
 class TestSanitizePathString:
     """Tests for sanitize_path_string function."""
 
@@ -262,22 +304,6 @@ class TestNormalizePathForPlatform:
         # Check for actual newline and carriage return characters, not the string sequences
         assert "\n" not in result
         assert "\r" not in result
-
-    @pytest.mark.skipif(sys.platform.startswith("win"), reason="Backslash is a separator on Windows")
-    def test_preserves_backslash_in_filename(self, tmp_path: Path) -> None:
-        r"""A literal backslash in a POSIX filename must survive normalization.
-
-        The input is an already-resolved Path, so it cannot contain shell escapes.
-        Running the shell-escape stripper over it would collapse ``\!`` to ``!``,
-        producing a path that points at a different file.
-        """
-        test_file = tmp_path / "back\\!slash.txt"
-        test_file.write_bytes(b"content")
-
-        result = normalize_path_for_platform(test_file)
-
-        assert result == str(test_file)
-        assert "\\!" in result
 
     @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific separator test")
     def test_preserves_windows_separator_before_special_characters(self) -> None:

@@ -2195,7 +2195,7 @@ class TestFailedWriteLeavesNoLitter:
     def test_exhausting_every_candidate_leaves_directory_empty(
         self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The failure path itself must not litter — otherwise it poisons all later runs.
+        """The failure path itself must not litter, or it poisons all later runs.
 
         Without cleanup this leaves one zero-byte file per index, and because a zero-byte
         file is indistinguishable from a real output, every subsequent save fails
@@ -2253,6 +2253,27 @@ class TestFailedWriteLeavesNoLitter:
 
         assert isinstance(result, WriteFileResultFailure)
         assert not target.exists()
+
+    def test_cleanup_cannot_be_armed_against_a_non_exclusive_open(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """The exclusive-create flag is derived from ``mode``, so the two cannot disagree.
+
+        The whole safety proof is that ``O_EXCL`` makes a pre-existing file raise
+        FileExistsError before the cleanup is reachable. If a caller could pass ``mode="x"``
+        (cleanup on) alongside a non-exclusive open, a lock failure would delete a file it
+        never created.
+        """
+        target = outputs_dir / "precious.png"
+        target.write_bytes(b"REAL USER DATA")
+        self._fail_lock_times(monkeypatch, count=None)
+
+        # Even with every lock attempt rigged to fail, mode="x" over an existing file
+        # raises from open() first, so the cleanup is never reachable.
+        with pytest.raises(FileExistsError):
+            griptape_nodes.OSManager()._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
+
+        assert target.read_bytes() == b"REAL USER DATA"
 
     def test_overwrite_never_deletes_pre_existing_file(
         self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
