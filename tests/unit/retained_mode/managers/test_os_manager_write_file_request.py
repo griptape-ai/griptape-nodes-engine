@@ -16,6 +16,7 @@ import unicodedata
 from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
+from typing import IO
 from unittest.mock import patch
 
 import portalocker
@@ -2168,7 +2169,7 @@ class TestFailedWriteLeavesNoLitter:
         real_get_lock = portalocker.utils.Lock._get_lock
         attempts = {"n": 0}
 
-        def flaky_get_lock(self: portalocker.utils.Lock, fh: object) -> object:
+        def flaky_get_lock(self: portalocker.utils.Lock, fh: IO) -> IO:
             attempts["n"] += 1
             if count is None or attempts["n"] <= count:
                 msg = "simulated transient lock failure"
@@ -2177,9 +2178,7 @@ class TestFailedWriteLeavesNoLitter:
 
         monkeypatch.setattr(portalocker.utils.Lock, "_get_lock", flaky_get_lock)
 
-    def test_transient_lock_failures_leave_no_litter(
-        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_transient_lock_failures_leave_no_litter(self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Candidates abandoned to a lock failure are cleaned up, so the save still lands."""
         self._fail_lock_times(monkeypatch, count=3)
 

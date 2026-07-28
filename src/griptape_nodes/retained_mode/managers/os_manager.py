@@ -3230,36 +3230,7 @@ class OSManager:
             else:
                 file_mode = mode
 
-            # portalocker opens the file BEFORE acquiring the lock, so under mode="x" the
-            # file is created first and any later failure (lock contention, a write/fsync
-            # error) leaves it behind — zero-byte on a lock failure, partial on a write
-            # failure. The CREATE_NEW collision loop treats a lock failure as "try the
-            # next candidate," so that litter accumulates one file per index and
-            # permanently poisons the candidate namespace.
-            #
-            # Cleaning up is safe precisely because mode="x" raises FileExistsError from
-            # open() BEFORE any locking: reaching here on any other exception proves this
-            # call created the file, so there is no pre-existing data to destroy. That
-            # proof does not hold for "w"/"a", hence the mode gate.
-            try:
-                with portalocker.Lock(
-                    normalized_path,
-                    mode=file_mode,  # type: ignore[arg-type]
-                    encoding=encoding if isinstance(content, str) else None,
-                    timeout=0,  # Non-blocking
-                    flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
-                ) as fh:
-                    fh.write(content)
-                    fh.flush()
-                    os.fsync(fh.fileno())
-            except FileExistsError:
-                # Raised by open() before the file was created; nothing of ours to remove.
-                raise
-            except Exception:
-                if mode == "x":
-                    with contextlib.suppress(OSError):
-                        Path(normalized_path).unlink()
-                raise
+            self._write_locked_discarding_debris(normalized_path, content, encoding, file_mode=file_mode, mode=mode)
 
             # Calculate bytes written
             if isinstance(content, bytes):
@@ -3286,6 +3257,54 @@ class OSManager:
         except Exception as e:
             error_details = f"Unexpected error: {type(e).__name__}: {e}"
             logger.error(error_details)
+            raise
+
+    def _write_locked_discarding_debris(
+        self, normalized_path: str, content: str | bytes, encoding: str, *, file_mode: str, mode: str
+    ) -> None:
+        """Write under an exclusive lock, removing the file if the write fails.
+
+        portalocker opens the file before it acquires the lock, so under ``mode="x"`` the
+        file exists by the time a lock failure or a write/fsync error is raised. Leaving it
+        there is what breaks the CREATE_NEW collision loop: that loop treats a lock failure
+        as "try the next candidate," so debris accumulates one file per index until every
+        candidate slot is taken and all later saves fail with "could not find available
+        filename" (griptape-ai/internal#178).
+
+        Removing it is safe precisely because ``mode="x"`` raises ``FileExistsError`` from
+        ``open()`` before any locking happens. Reaching the cleanup on any other exception
+        therefore proves this call created the file, so there is no pre-existing data to
+        destroy. That proof does not hold for ``"w"``/``"a"``, where the file may predate us
+        and hold real content, hence the mode gate.
+
+        Args:
+            normalized_path: Platform-normalized path string to write to
+            content: Content to write (str or bytes)
+            encoding: Text encoding (ignored for bytes content)
+            file_mode: Mode passed to portalocker, including the binary flag (e.g. "xb")
+            mode: The caller's logical mode ("x", "w", or "a"), used to gate cleanup
+
+        Raises:
+            Exception: Whatever the write raised, after cleanup.
+        """
+        try:
+            with portalocker.Lock(
+                normalized_path,
+                mode=file_mode,  # type: ignore[arg-type]
+                encoding=encoding if isinstance(content, str) else None,
+                timeout=0,  # Non-blocking
+                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+            ) as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except FileExistsError:
+            # Raised by open() before the file was created; nothing of ours to remove.
+            raise
+        except Exception:
+            if mode == "x":
+                with contextlib.suppress(OSError):
+                    Path(normalized_path).unlink()
             raise
 
     def _copy_file(self, src_path: Path, dest_path: Path) -> int:

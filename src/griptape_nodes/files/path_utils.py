@@ -268,7 +268,7 @@ def sanitize_path_string(path: str | Path) -> str:
 
 
 def clean_path_string(path_str: str) -> str:
-    """Remove newlines, carriage returns, and surrounding whitespace from a path string.
+    r"""Remove newlines, carriage returns, and surrounding whitespace from a path string.
 
     Split out from :func:`sanitize_path_string` so callers holding an already-resolved
     path can get this cleanup WITHOUT the shell-escape stripping. On Windows ``\\`` is
