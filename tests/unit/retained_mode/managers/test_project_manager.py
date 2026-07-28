@@ -4759,6 +4759,29 @@ class TestResolveEffectiveLibrariesRootForProjectId(TestResolveLibrariesRootForP
 
         assert await pm.resolve_effective_libraries_root_for_project_id("does-not-exist") is None
 
+    @pytest.mark.asyncio
+    async def test_overlay_failure_falls_through_to_workspace_default(self, tmp_path: Path) -> None:
+        """A project whose overlay cannot be read still yields a WORKSPACE_DEFAULT path.
+
+        When _read_overlay fails (corrupted / missing YAML), _resolve_declared_libraries_root_offline
+        returns scan.resolution=None and scan.template_workspace_dir=None. The WORKSPACE_DEFAULT path
+        must then produce the correct fallback rather than crashing or returning None.
+        """
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [],
+            registered=[str(project_file)],
+            configured_root=str(tmp_path / "global-ws"),
+        )
+        result = await pm.resolve_effective_libraries_root_for_project_id(str(project_file))
+
+        assert result is not None
+        assert result.libraries_root == self._resolved(str(tmp_path / "global-ws" / "libraries"))
+        assert result.source is LibrariesRootSource.WORKSPACE_DEFAULT
+
 
 class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId):
     """on_resolve_project_libraries_request wraps the effective-root resolver as an event.

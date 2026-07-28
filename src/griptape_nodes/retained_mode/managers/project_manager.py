@@ -1899,8 +1899,9 @@ class ProjectManager:
         decision = await self._decide_workspace_from_disk_for_path(
             project_file_path, id_index, preloaded_workspace_dir=scan.template_workspace_dir
         )
+        resolved_workspace = self._resolve_workspace_dir(decision.workspace_dir)
         merged = self._config_manager.compute_project_provisioning_config(
-            project_file_path.parent, decision.workspace_dir, apply_override=decision.apply_override
+            project_file_path.parent, resolved_workspace, apply_override=decision.apply_override
         )
         return LibrariesRootResolution(
             libraries_root=self._config_manager.default_libraries_root(merged),
