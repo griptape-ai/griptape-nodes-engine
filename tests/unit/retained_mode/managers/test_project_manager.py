@@ -4159,6 +4159,41 @@ class TestResolveWorkspaceDirForProjectId:
         assert isinstance(probe, LoadProjectTemplateResultFailure)
         assert isinstance(recorded, LoadProjectTemplateResultFailure)
 
+    @pytest.mark.asyncio
+    async def test_unloaded_tilde_workspace_dir_expands_before_absoluteness_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workspace_dir starting with ~ is expanded to an absolute path, not joined with the project dir."""
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "workspace_dir": "~/shared-ws"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved(str(tmp_path / "home" / "shared-ws"))
+
+    @pytest.mark.asyncio
+    async def test_unloaded_env_var_workspace_dir_expands_before_absoluteness_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A workspace_dir like ${WS_DIR} expands the env var before the absoluteness check."""
+        ws_root = tmp_path / "studio" / "workspace"
+        monkeypatch.setenv("WS_DIR", str(ws_root))
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "workspace_dir": "${WS_DIR}"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved(str(ws_root))
+
 
 class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
     """`resolve_libraries_root_for_project_id` resolves an UNLOADED project's libraries root.

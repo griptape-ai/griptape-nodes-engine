@@ -3452,7 +3452,10 @@ class LibraryManager:
             libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
                 request.project_id
             )
-        libraries_path = libraries_root if libraries_root is not None else config_mgr.default_libraries_root(merged)
+        if libraries_root is not None:
+            libraries_path = libraries_root
+        else:
+            libraries_path = config_mgr.default_libraries_root(merged)
 
         actions = await asyncio.gather(
             *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
