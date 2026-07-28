@@ -447,6 +447,13 @@ class _BuiltinResolutionResult(NamedTuple):
     unavailable: dict[str, Exception]
 
 
+class _WorkspaceDirNotPreloaded:
+    """Sentinel: _decide_workspace_from_disk_for_path should read workspace_dir from the overlay."""
+
+
+_WORKSPACE_DIR_NOT_PRELOADED = _WorkspaceDirNotPreloaded()
+
+
 class WorkspaceDecision(NamedTuple):
     """The workspace dir a project resolves to, plus whether activation pins it.
 
@@ -1659,7 +1666,11 @@ class ProjectManager:
         return self._resolve_workspace_dir(decision.workspace_dir)
 
     async def _decide_workspace_from_disk_for_path(
-        self, project_file_path: Path, id_index: dict[str, Path]
+        self,
+        project_file_path: Path,
+        id_index: dict[str, Path],
+        *,
+        preloaded_workspace_dir: str | None | _WorkspaceDirNotPreloaded = _WORKSPACE_DIR_NOT_PRELOADED,
     ) -> WorkspaceDecision:
         """Decide an unloaded project's workspace dir + override bit from its file path alone.
 
@@ -1667,21 +1678,25 @@ class ProjectManager:
         own workspace_dir read from its on-disk overlay for branch 0) so a project absent from the live
         registry still honors a declared workspace.
 
-        Used by resolve_workspace_dir_for_project_id. NOT used by the libraries-root WORKSPACE_DEFAULT
-        fallback in resolve_effective_libraries_root_for_project_id: that caller bypasses this helper
-        and calls _decide_workspace_from_disk directly with the workspace_dir already extracted from the
-        overlay it read for libraries scanning, so it avoids reading the overlay a second time. If new
-        config sources are added here (e.g. a per-machine config file), mirror those additions in the
-        WORKSPACE_DEFAULT branch of resolve_effective_libraries_root_for_project_id.
+        `preloaded_workspace_dir` lets callers that have already read the overlay (e.g. the libraries
+        WORKSPACE_DEFAULT fallback) pass in the workspace_dir they extracted, skipping the overlay read
+        here. Pass the sentinel _WORKSPACE_DIR_NOT_PRELOADED (the default) to have this method read the
+        overlay itself. Both paths call the same _decide_workspace_from_disk, so new config sources
+        only need to be added in one place.
         """
         project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
 
-        template_workspace_dir: str | None = None
-        own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
-        if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
-            _, own_overlay = own_overlay_load
-            template_workspace_dir = self._resolve_template_workspace_dir(own_overlay.workspace_dir, project_file_path)
+        if isinstance(preloaded_workspace_dir, _WorkspaceDirNotPreloaded):
+            template_workspace_dir: str | None = None
+            own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
+            if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
+                _, own_overlay = own_overlay_load
+                template_workspace_dir = self._resolve_template_workspace_dir(
+                    own_overlay.workspace_dir, project_file_path
+                )
+        else:
+            template_workspace_dir = preloaded_workspace_dir
 
         return await self._decide_workspace_from_disk(
             project_file_path, project_config, env_config, template_workspace_dir, id_index
@@ -1879,14 +1894,10 @@ class ProjectManager:
         if scan.resolution is not None:
             return scan.resolution
 
-        # Overlay was already read by _resolve_declared_libraries_root_offline above; reuse
-        # template_workspace_dir from scan so _decide_workspace_from_disk does not read it again.
-        # This mirrors _decide_workspace_from_disk_for_path minus the overlay read — keep in sync
-        # with that helper if new config sources (e.g. per-machine config) are ever added there.
-        project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
-        env_config = self._config_manager.read_env_config()
-        decision = await self._decide_workspace_from_disk(
-            project_file_path, project_config, env_config, scan.template_workspace_dir, id_index
+        # Overlay was already read by _resolve_declared_libraries_root_offline; pass the workspace_dir
+        # it extracted so _decide_workspace_from_disk_for_path skips a second overlay read.
+        decision = await self._decide_workspace_from_disk_for_path(
+            project_file_path, id_index, preloaded_workspace_dir=scan.template_workspace_dir
         )
         merged = self._config_manager.compute_project_provisioning_config(
             project_file_path.parent, decision.workspace_dir, apply_override=decision.apply_override

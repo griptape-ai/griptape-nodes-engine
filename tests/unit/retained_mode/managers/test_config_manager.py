@@ -266,7 +266,9 @@ class TestConfigManager:
             isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
             manager = ConfigManager()
 
-            assert manager.default_libraries_root({"libraries_directory": str(absolute_libs)}) == absolute_libs
+            assert (
+                manager.default_libraries_root({"libraries_directory": str(absolute_libs)}) == absolute_libs.resolve()
+            )
 
     def test_resolved_libraries_root_v0_style_is_noop(self, isolate_user_config: Path) -> None:
         """A v0-style project pins its workspace TO the global workspace, so the fallback is unchanged.
