@@ -2347,7 +2347,9 @@ class OSManager:
         # writes, and only if the macro author opted in via `:NN` padding.
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
-            path_display = f"{macro_path.parsed_macro}"
+            # The readable template string, not the ParsedMacro dataclass repr — the repr
+            # dumps the whole segment tree into every error message below.
+            path_display = macro_path.parsed_macro.template
             # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
             # the failure is the signal the seed-and-retry logic below uses to pick which
             # slot to auto-allocate. Demote the log level so the probing miss doesn't
