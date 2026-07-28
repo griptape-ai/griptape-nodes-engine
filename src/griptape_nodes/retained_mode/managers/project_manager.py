@@ -479,8 +479,14 @@ class _DeclaredLibrariesScan(NamedTuple):
     """Result of scanning a project's own overlay and parent chain for a declared libraries_dir.
 
     `resolution` is the DECLARED or INHERITED libraries root when one is found, or None.
-    `template_workspace_dir` is the project's own workspace_dir extracted from the overlay
-    as a side effect of reading it, so the caller can reuse it without a second overlay read.
+
+    `template_workspace_dir` is intentionally bundled here even though it is not a libraries-scan
+    output: _resolve_declared_libraries_root_offline reads the project's overlay once to get
+    libraries_dir, and carries workspace_dir out as a side effect so
+    resolve_effective_libraries_root_for_project_id can pass it to _decide_workspace_from_disk
+    without triggering a second overlay read. Any refactor that introduces an early return in
+    _resolve_declared_libraries_root_offline before the workspace_dir extraction line must ensure
+    template_workspace_dir is still populated in the returned scan.
     """
 
     resolution: LibrariesRootResolution | None
@@ -1659,8 +1665,14 @@ class ProjectManager:
 
         Gathers _decide_workspace_from_disk's inputs (adjacent config, env config, and the project's
         own workspace_dir read from its on-disk overlay for branch 0) so a project absent from the live
-        registry still honors a declared workspace. Shared by the offline workspace resolver and the
-        libraries-root workspace-default fallback, so the workspace both compute against is the same.
+        registry still honors a declared workspace.
+
+        Used by resolve_workspace_dir_for_project_id. NOT used by the libraries-root WORKSPACE_DEFAULT
+        fallback in resolve_effective_libraries_root_for_project_id: that caller bypasses this helper
+        and calls _decide_workspace_from_disk directly with the workspace_dir already extracted from the
+        overlay it read for libraries scanning, so it avoids reading the overlay a second time. If new
+        config sources are added here (e.g. a per-machine config file), mirror those additions in the
+        WORKSPACE_DEFAULT branch of resolve_effective_libraries_root_for_project_id.
         """
         project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
@@ -1869,6 +1881,8 @@ class ProjectManager:
 
         # Overlay was already read by _resolve_declared_libraries_root_offline above; reuse
         # template_workspace_dir from scan so _decide_workspace_from_disk does not read it again.
+        # This mirrors _decide_workspace_from_disk_for_path minus the overlay read — keep in sync
+        # with that helper if new config sources (e.g. per-machine config) are ever added there.
         project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
         decision = await self._decide_workspace_from_disk(

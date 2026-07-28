@@ -4276,6 +4276,53 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
         assert result == self._canonical(project_file.parent / "libraries")
 
     @pytest.mark.asyncio
+    async def test_unloaded_tilde_libraries_dir_expands_before_absoluteness_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A libraries_dir starting with ~ is expanded to an absolute path, not joined with the project dir.
+
+        Regression test for the expand_path fix: before the fix, Path("~/libs").is_absolute() was
+        False, so "~/libs" got prepended with the project directory before canonicalization expanded
+        the tilde inside the wrong position.
+        """
+        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "~/shared-libs"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(tmp_path / "home" / "shared-libs")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_env_var_libraries_dir_expands_before_absoluteness_check(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A libraries_dir like ${LIBS_DIR} expands the env var before the absoluteness check.
+
+        Regression test for the expand_path fix: before the fix, Path("${LIBS_DIR}").is_absolute()
+        was False even when ${LIBS_DIR} expanded to an absolute path, so the project directory was
+        prepended, producing .../project_dir//abs/path which normalized to .../project_dir/abs/path.
+        """
+        libs_root = tmp_path / "studio" / "libraries"
+        monkeypatch.setenv("LIBS_DIR", str(libs_root))
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "${LIBS_DIR}"}],
+            registered=[str(project_file)],
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(libs_root)
+
+    @pytest.mark.asyncio
     async def test_unloaded_child_inherits_id_parent_libraries_dir(self, tmp_path: Path) -> None:
         """A child with no own libraries_dir inherits the parent's (branch 1), resolved against the PARENT dir.
 

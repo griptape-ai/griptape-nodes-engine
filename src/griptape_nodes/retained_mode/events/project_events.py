@@ -213,6 +213,12 @@ class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
     Args:
         workspace_dir: Absolute path string the project would use, or None when the id resolves to
             no readable project file (matches the resolver's "nothing to resolve" contract).
+
+    Note: an unknown project_id returns Success(workspace_dir=None) here, not a Failure. This
+    intentionally differs from ResolveProjectLibraries, which returns Failure for an unknown id.
+    The libraries resolver can always produce a real path (the workspace-relative default), so it
+    can distinguish "unknown id" (Failure) from "no declared path" (Success with a fallback value).
+    Aligning the two would require a breaking change to the workspace resolver.
     """
 
     workspace_dir: str | None = None
