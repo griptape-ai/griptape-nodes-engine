@@ -263,6 +263,34 @@ class TestNormalizePathForPlatform:
         assert "\n" not in result
         assert "\r" not in result
 
+    @pytest.mark.skipif(sys.platform.startswith("win"), reason="Backslash is a separator on Windows")
+    def test_preserves_backslash_in_filename(self, tmp_path: Path) -> None:
+        r"""A literal backslash in a POSIX filename must survive normalization.
+
+        The input is an already-resolved Path, so it cannot contain shell escapes.
+        Running the shell-escape stripper over it would collapse ``\!`` to ``!``,
+        producing a path that points at a different file.
+        """
+        test_file = tmp_path / "back\\!slash.txt"
+        test_file.write_bytes(b"content")
+
+        result = normalize_path_for_platform(test_file)
+
+        assert result == str(test_file)
+        assert "\\!" in result
+
+    @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific separator test")
+    def test_preserves_windows_separator_before_special_characters(self) -> None:
+        r"""Windows separators must survive even when the next component starts specially.
+
+        ``C:\outputs\!final\render.png`` must not become ``C:\outputs!final\render.png`` --
+        de-escaping would eat the separator and redirect the write to a sibling directory.
+        """
+        result = normalize_path_for_platform(Path(r"C:\outputs\!final\render.png"))
+
+        assert "\\!final" in result
+        assert "outputs!final" not in result
+
 
 class TestApplyWindowsLongPathPrefix:
     r"""Tests for _apply_windows_long_path_prefix.
