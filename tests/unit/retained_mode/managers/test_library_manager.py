@@ -52,6 +52,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryVenvInitResult
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
@@ -2748,8 +2749,11 @@ class TestPreviewProjectProvisioning:
         )
         # The live config's global workspace is where the stale version actually lives. If the probe
         # used the target/merged workspace instead, the plan would wrongly be a non-destructive INSTALL.
+        # default_libraries_root is the real implementation bound to this mock, so the fallback it
+        # applies is the production one and only its global-workspace input is stubbed.
         live_config = MagicMock()
         live_config.configured_global_workspace_path.return_value = global_ws
+        live_config.default_libraries_root.side_effect = ConfigManager.default_libraries_root.__get__(live_config)
         with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
             mock_gn.ConfigManager.return_value = live_config
             self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)

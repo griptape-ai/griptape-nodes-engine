@@ -41,6 +41,25 @@ class MacroPath(NamedTuple):
     variables: MacroVariables
 
 
+class LibrariesRootSource(StrEnum):
+    """Which layer supplied a project's resolved libraries root.
+
+    The path is the same shape in all three cases; the source is what a client needs to tell an
+    opted-into project-local libraries tree from the shared workspace one it would inherit anyway.
+
+    Values:
+        DECLARED — the project's own ``libraries_dir`` field.
+        INHERITED — the nearest ancestor's ``libraries_dir``, walked up the parent chain.
+        WORKSPACE_DEFAULT — nothing in the chain declares one, so ``libraries_directory`` resolved
+            against the global configured workspace. Editing this project's ``libraries_dir`` is what
+            moves it off the shared tree.
+    """
+
+    DECLARED = "DECLARED"
+    INHERITED = "INHERITED"
+    WORKSPACE_DEFAULT = "WORKSPACE_DEFAULT"
+
+
 class PathResolutionFailureReason(StrEnum):
     """Reason why path resolution from macro failed."""
 
@@ -211,7 +230,7 @@ class ResolveProjectLibrariesRequest(RequestPayload):
     Args:
         project_id: Opaque id of the project (the registry key). Consumers must not parse it.
 
-    Results: ResolveProjectLibrariesResultSuccess
+    Results: ResolveProjectLibrariesResultSuccess | ResolveProjectLibrariesResultFailure
     """
 
     project_id: ProjectID
@@ -223,13 +242,21 @@ class ResolveProjectLibrariesResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
     """Resolved libraries root for a project.
 
     Args:
-        libraries_root: Absolute path string of the project's own or inherited libraries_dir, or None
-            when nothing in the chain declares one (matching the resolver's contract) so the project
-            uses the workspace-relative `libraries_directory` default. None is also returned when the
-            id resolves to no readable project file.
+        libraries_root: Absolute path string libraries resolve under. Always a real path -- when
+            nothing in the project's chain declares a libraries_dir this is the workspace-relative
+            default it falls back to, not None.
+        source: Which layer supplied the path, so a client can distinguish an opted-into
+            project-local libraries tree from the shared workspace default.
     """
 
-    libraries_root: str | None = None
+    libraries_root: str
+    source: LibrariesRootSource
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectLibrariesResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The project id resolves to no readable project file, so there is no libraries root to report."""
 
 
 @dataclass

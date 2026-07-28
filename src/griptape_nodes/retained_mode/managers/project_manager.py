@@ -89,6 +89,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     ImportProjectRequest,
     ImportProjectResultFailure,
     ImportProjectResultSuccess,
+    LibrariesRootSource,
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
     LoadProjectTemplateRequest,
@@ -101,6 +102,7 @@ from griptape_nodes.retained_mode.events.project_events import (
     PreviewImportProjectResultSuccess,
     ProjectTemplateInfo,
     ResolveProjectLibrariesRequest,
+    ResolveProjectLibrariesResultFailure,
     ResolveProjectLibrariesResultSuccess,
     ResolveProjectWorkspaceRequest,
     ResolveProjectWorkspaceResultSuccess,
@@ -457,6 +459,19 @@ class WorkspaceDecision(NamedTuple):
 
     workspace_dir: Path
     apply_override: bool
+
+
+class LibrariesRootResolution(NamedTuple):
+    """The libraries root a project resolves to, plus which layer supplied it.
+
+    `libraries_root` is always a real path: for WORKSPACE_DEFAULT it is the workspace-relative
+    `libraries_directory` the project falls back to, not a null standing in for "undeclared".
+    `source` is what lets a consumer tell an opted-into project-local libraries tree from the shared
+    workspace one, which the path alone cannot express.
+    """
+
+    libraries_root: Path
+    source: LibrariesRootSource
 
 
 class _ProvisioningConfigDirs(NamedTuple):
@@ -1077,24 +1092,27 @@ class ProjectManager:
 
     async def on_resolve_project_libraries_request(
         self, request: ResolveProjectLibrariesRequest
-    ) -> ResolveProjectLibrariesResultSuccess:
+    ) -> ResolveProjectLibrariesResultSuccess | ResolveProjectLibrariesResultFailure:
         """Resolve the libraries root a project would use, without loading or activating it.
 
-        A None resolution is a success carrying libraries_root=None: nothing in the parent chain
-        declares a libraries_dir (so the project uses the workspace-relative `libraries_directory`
-        default), or the id maps to no readable project file. This matches
-        resolve_libraries_root_for_project_id's contract.
+        Always answers with a real path -- an undeclared libraries_dir resolves to the
+        workspace-relative default the project falls back to rather than a null, since that is the
+        common case and a client showing "where do this project's libraries live" needs an answer for
+        it. `source` distinguishes the three cases. An unresolvable project id is the one genuine
+        failure, so it is a Failure rather than sharing a null with the undeclared case.
         """
-        resolved = await self.resolve_libraries_root_for_project_id(request.project_id)
-        if resolved is None:
-            return ResolveProjectLibrariesResultSuccess(
-                libraries_root=None,
-                result_details=f"Resolved libraries root for '{request.project_id}': none declared, uses the workspace-relative default",
+        resolution = await self.resolve_effective_libraries_root_for_project_id(request.project_id)
+        if resolution is None:
+            return ResolveProjectLibrariesResultFailure(
+                result_details=f"Attempted to resolve the libraries root for project '{request.project_id}'. "
+                f"Failed because the id resolves to no readable project file",
             )
 
         return ResolveProjectLibrariesResultSuccess(
-            libraries_root=str(resolved),
-            result_details=f"Resolved libraries root for '{request.project_id}': {resolved}",
+            libraries_root=str(resolution.libraries_root),
+            source=resolution.source,
+            result_details=f"Resolved libraries root for '{request.project_id}': "
+            f"{resolution.libraries_root} (source: {resolution.source})",
         )
 
     def on_list_project_templates_request(
@@ -1614,28 +1632,35 @@ class ProjectManager:
         replay the unpinned branch-3 config-merge re-point the live config merge would apply.
         """
         id_index = await self._build_unloaded_id_index()
-        project_file_path = id_index.get(project_id)
+        project_file_path = self._resolve_project_id_to_file_path_offline(project_id, id_index)
         if project_file_path is None:
-            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
-            if not legacy_path_candidate.is_file():
-                return None
-            project_file_path = legacy_path_candidate
+            return None
 
+        decision = await self._decide_workspace_from_disk_for_path(project_file_path, id_index)
+        return self._resolve_workspace_dir(decision.workspace_dir)
+
+    async def _decide_workspace_from_disk_for_path(
+        self, project_file_path: Path, id_index: dict[str, Path]
+    ) -> WorkspaceDecision:
+        """Decide an unloaded project's workspace dir + override bit from its file path alone.
+
+        Gathers _decide_workspace_from_disk's inputs (adjacent config, env config, and the project's
+        own workspace_dir read from its on-disk overlay for branch 0) so a project absent from the live
+        registry still honors a declared workspace. Shared by the offline workspace resolver and the
+        libraries-root workspace-default fallback, so the workspace both compute against is the same.
+        """
         project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
 
-        # Read this project's own overlay (read-only, no status recording) to source its
-        # workspace_dir field for branch 0, so an unloaded project still honors a declared workspace.
         template_workspace_dir: str | None = None
         own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
         if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
             _, own_overlay = own_overlay_load
             template_workspace_dir = self._resolve_template_workspace_dir(own_overlay.workspace_dir, project_file_path)
 
-        decision = await self._decide_workspace_from_disk(
+        return await self._decide_workspace_from_disk(
             project_file_path, project_config, env_config, template_workspace_dir, id_index
         )
-        return self._resolve_workspace_dir(decision.workspace_dir)
 
     async def _decide_workspace_from_disk(
         self,
@@ -1786,34 +1811,96 @@ class ProjectManager:
         return parent_path_candidate
 
     async def resolve_libraries_root_for_project_id(self, project_id: str) -> Path | None:
-        """Resolve the libraries root a project would use WITHOUT loading it, or None for the default.
+        """Resolve a project's DECLARED libraries root WITHOUT loading it, or None for the default.
 
         Offline analogue of decide_libraries_root, used by the provisioning preview so the previewed
         SKIP/INSTALL/OVERWRITE plan matches what activation reconciles. The id is resolved to a file
-        path the same way resolve_workspace_dir_for_project_id does. Branch 0 reads this project's own
-        libraries_dir from its on-disk overlay; branch 1 walks the parent chain offline. Returns None
-        when no libraries_dir is declared anywhere in the chain, so the caller falls back to the
-        workspace-relative libraries directory.
+        path the same way resolve_workspace_dir_for_project_id does. Returns None when no libraries_dir
+        is declared anywhere in the chain, so the caller falls back to the workspace-relative libraries
+        directory with its own merged config. Callers that want the effective path in every case
+        (rather than applying that fallback themselves) want
+        resolve_effective_libraries_root_for_project_id.
         """
         id_index = await self._build_unloaded_id_index()
-        project_file_path = id_index.get(project_id)
+        project_file_path = self._resolve_project_id_to_file_path_offline(project_id, id_index)
         if project_file_path is None:
-            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
-            if not legacy_path_candidate.is_file():
-                return None
-            project_file_path = legacy_path_candidate
+            return None
 
+        declared = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
+        if declared is None:
+            return None
+        return declared.libraries_root
+
+    async def resolve_effective_libraries_root_for_project_id(self, project_id: str) -> LibrariesRootResolution | None:
+        """Resolve the libraries root a project WOULD use WITHOUT loading it, always as a real path.
+
+        Where resolve_libraries_root_for_project_id stops at the declared/inherited libraries_dir and
+        leaves the fallback to the caller, this applies that fallback too, so the result is the path
+        libraries actually resolve under in all three cases -- reported via `source` so a consumer can
+        tell a project-local libraries tree from the shared workspace one.
+
+        The WORKSPACE_DEFAULT path is NOT the live config's libraries root: `libraries_directory` is
+        read from the TARGET project's merged config layers (a layer may re-point it) and resolved
+        against the global configured workspace, mirroring the live
+        ConfigManager.resolved_libraries_root fallback. Returns None only when the id resolves to no
+        readable project file -- an unknown project, which is distinct from "declares nothing".
+        """
+        id_index = await self._build_unloaded_id_index()
+        project_file_path = self._resolve_project_id_to_file_path_offline(project_id, id_index)
+        if project_file_path is None:
+            return None
+
+        declared = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
+        if declared is not None:
+            return declared
+
+        decision = await self._decide_workspace_from_disk_for_path(project_file_path, id_index)
+        merged = self._config_manager.compute_project_provisioning_config(
+            project_file_path.parent, decision.workspace_dir, apply_override=decision.apply_override
+        )
+        return LibrariesRootResolution(
+            libraries_root=self._config_manager.default_libraries_root(merged),
+            source=LibrariesRootSource.WORKSPACE_DEFAULT,
+        )
+
+    async def _resolve_declared_libraries_root_offline(
+        self, project_file_path: Path, id_index: dict[str, Path]
+    ) -> LibrariesRootResolution | None:
+        """Resolve a project's own (branch 0) or nearest ancestor's (branch 1) libraries_dir from disk.
+
+        Branch 0 reads this project's own libraries_dir from its on-disk overlay; branch 1 walks the
+        parent chain offline. Returns None when neither declares one -- the caller decides whether to
+        report that as "no declaration" or to apply the workspace-relative fallback.
+        """
         own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
         if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
             _, own_overlay = own_overlay_load
             template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
             if template_libraries_dir is not None:
-                return Path(template_libraries_dir)
+                return LibrariesRootResolution(
+                    libraries_root=Path(template_libraries_dir), source=LibrariesRootSource.DECLARED
+                )
 
         inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
         if inherited is not None:
-            return Path(inherited)
+            return LibrariesRootResolution(libraries_root=Path(inherited), source=LibrariesRootSource.INHERITED)
         return None
+
+    def _resolve_project_id_to_file_path_offline(self, project_id: str, id_index: dict[str, Path]) -> Path | None:
+        """Map an opaque project id to its file path via the offline index, or None if unresolvable.
+
+        Shared by the offline workspace and libraries resolvers so they agree on which ids resolve. The
+        id is looked up verbatim (it is opaque and must not be canonicalized); a legacy id that is
+        itself a canonical project file path is accepted directly when it names a readable file.
+        """
+        indexed_path = id_index.get(project_id)
+        if indexed_path is not None:
+            return indexed_path
+
+        legacy_path_candidate = canonicalize_for_identity(Path(project_id))
+        if not legacy_path_candidate.is_file():
+            return None
+        return legacy_path_candidate
 
     async def _inherit_libraries_dir_from_parents_offline(
         self, project_file_path: Path, id_index: dict[str, Path]

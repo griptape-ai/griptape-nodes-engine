@@ -228,6 +228,18 @@ class ConfigManager:
         libraries_dir = self.get_config_value("libraries_directory", default="libraries")
         return resolve_workspace_path(Path(libraries_dir), self.configured_global_workspace_path())
 
+    def default_libraries_root(self, merged_config: dict) -> Path:
+        """Return the libraries root used when nothing in a project's chain declares a libraries_dir.
+
+        Offline analogue of resolved_libraries_root's unset-override fallback, for a merged config
+        computed for some project OTHER than the live one (see compute_project_provisioning_config).
+        `libraries_directory` is read from that project's own merged layers, because a layer may
+        re-point it; only the base dir is the GLOBAL configured workspace, matching
+        resolved_libraries_root so a resolution cannot diverge from what activation installs into.
+        """
+        libraries_dir = get_dot_value(merged_config, "libraries_directory", "libraries")
+        return resolve_workspace_path(Path(libraries_dir), self.configured_global_workspace_path())
+
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.
 

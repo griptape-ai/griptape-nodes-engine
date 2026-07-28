@@ -212,6 +212,62 @@ class TestConfigManager:
             assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
             assert manager.resolved_libraries_root() != (project_dir / "libraries").resolve()
 
+    def test_default_libraries_root_reads_libraries_directory_from_the_passed_merged_config(
+        self, isolate_user_config: Path
+    ) -> None:
+        """default_libraries_root takes libraries_directory from the merged config it is HANDED.
+
+        This is what lets a caller resolve some OTHER project's fallback: the live config's own
+        libraries_directory must not leak in, or every project would report the active one's answer.
+        The base dir stays the global workspace, matching resolved_libraries_root.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            global_ws = Path(temp_dir) / "global_ws"
+            global_ws.mkdir()
+            isolate_user_config.write_text(
+                json.dumps({"workspace_directory": str(global_ws), "libraries_directory": "live-libs"}),
+                encoding="utf-8",
+            )
+            manager = ConfigManager()
+
+            assert manager.resolved_libraries_root() == (global_ws / "live-libs").resolve()
+            assert (
+                manager.default_libraries_root({"libraries_directory": "other-project-libs"})
+                == (global_ws / "other-project-libs").resolve()
+            )
+
+    def test_default_libraries_root_ignores_active_workspace_override(self, isolate_user_config: Path) -> None:
+        """It resolves against the GLOBAL workspace, so it agrees with resolved_libraries_root's fallback.
+
+        Same regression guard as
+        test_resolved_libraries_root_fallback_ignores_active_workspace_override, for the offline
+        analogue: an active self-contained project's workspace pin must not relocate another project's
+        computed default, or a resolution would diverge from what activation installs into.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            global_ws = Path(temp_dir) / "global_ws"
+            global_ws.mkdir()
+            project_dir = Path(temp_dir) / "project"
+            project_dir.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
+            manager = ConfigManager()
+            manager.set_workspace_override(project_dir)
+
+            merged = {"libraries_directory": "libraries"}
+            assert manager.default_libraries_root(merged) == (global_ws / "libraries").resolve()
+            assert manager.default_libraries_root(merged) == manager.resolved_libraries_root()
+
+    def test_default_libraries_root_honors_an_absolute_libraries_directory(self, isolate_user_config: Path) -> None:
+        """An absolute libraries_directory is used verbatim, not joined onto the global workspace."""
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            global_ws = Path(temp_dir) / "global_ws"
+            global_ws.mkdir()
+            absolute_libs = Path(temp_dir) / "elsewhere" / "libs"
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(global_ws)}), encoding="utf-8")
+            manager = ConfigManager()
+
+            assert manager.default_libraries_root({"libraries_directory": str(absolute_libs)}) == absolute_libs
+
     def test_resolved_libraries_root_v0_style_is_noop(self, isolate_user_config: Path) -> None:
         """A v0-style project pins its workspace TO the global workspace, so the fallback is unchanged.
 
