@@ -37,8 +37,13 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
+    LibrariesRootSource,
     PathResolutionFailureReason,
+    ResolveProjectLibrariesRequest,
+    ResolveProjectLibrariesResultFailure,
+    ResolveProjectLibrariesResultSuccess,
 )
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
 
@@ -3653,29 +3658,6 @@ class TestResolveWorkspaceDirForProjectId:
         )
 
     @classmethod
-    def _wire_libraries_fallback_config(
-        cls, mock_config: Mock, dir_to_config: dict[Path, dict], *, global_workspace: str
-    ) -> None:
-        """Serve the two ConfigManager seams the libraries-root workspace-default fallback reads.
-
-        compute_project_provisioning_config is stubbed to the modeled adjacent config, standing in for
-        the full layer merge whose ordering config_manager's own tests cover. default_libraries_root is
-        the REAL implementation bound to this mock, so the fallback math itself (a per-project
-        libraries_directory resolved against the global workspace) is under test rather than stubbed.
-        """
-        from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
-
-        # Mirrors _resolve_configured_workspace_directory's precedence over the layers this harness
-        # models; the runtime per-project override is excluded, as in production.
-        mock_config.configured_global_workspace_path.return_value = cls._resolved(global_workspace)
-
-        def fake_compute_provisioning_config(project_dir: Path, workspace_dir: Path, *, apply_override: bool) -> dict:  # noqa: ARG001
-            return {"libraries_directory": "libraries", **dir_to_config.get(Path(project_dir), {})}
-
-        mock_config.compute_project_provisioning_config.side_effect = fake_compute_provisioning_config
-        mock_config.default_libraries_root.side_effect = ConfigManager.default_libraries_root.__get__(mock_config)
-
-    @classmethod
     def _build_pm(  # noqa: PLR0913
         cls,
         specs: list[dict[str, Any]],
@@ -3735,12 +3717,6 @@ class TestResolveWorkspaceDirForProjectId:
             return dir_to_config.get(Path(path).parent, {})
 
         mock_config.read_config_file.side_effect = fake_read_config_file
-
-        cls._wire_libraries_fallback_config(
-            mock_config,
-            dir_to_config,
-            global_workspace=env_workspace or configured_root or default_root or "/global/ws",
-        )
 
         path_to_overlay = {
             canonicalize_for_identity(Path(spec["file"])): cls._make_overlay(
@@ -4201,6 +4177,58 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
         """Canonicalize the way _resolve_template_libraries_dir returns its result."""
         return canonicalize_for_identity(path)
 
+    @classmethod
+    def _wire_libraries_fallback_config(
+        cls, mock_config: Any, dir_to_config: dict[Path, dict], *, global_workspace: str
+    ) -> None:
+        """Serve the two ConfigManager seams the libraries-root workspace-default fallback reads.
+
+        compute_project_provisioning_config is stubbed to the modeled adjacent config, standing in for
+        the full layer merge whose ordering config_manager's own tests cover. default_libraries_root is
+        the REAL implementation bound to this mock, so the fallback math itself (a per-project
+        libraries_directory resolved against the global workspace) is under test rather than stubbed.
+        `global_workspace` must be the CONFIGURED global workspace (configured_root / default_root),
+        not the env workspace override, to match what configured_global_workspace_path() reads.
+        """
+        mock_config.configured_global_workspace_path.return_value = cls._resolved(global_workspace)
+
+        def fake_compute_provisioning_config(project_dir: Path, workspace_dir: Path, *, apply_override: bool) -> dict:  # noqa: ARG001
+            return {"libraries_directory": "libraries", **dir_to_config.get(Path(project_dir), {})}
+
+        mock_config.compute_project_provisioning_config.side_effect = fake_compute_provisioning_config
+        mock_config.default_libraries_root.side_effect = ConfigManager.default_libraries_root.__get__(mock_config)
+
+    @classmethod
+    def _build_pm(  # noqa: PLR0913
+        cls,
+        specs: list[dict[str, Any]],
+        *,
+        registered: list[str] | None = None,
+        loaded: list[str] | None = None,
+        project_workspaces: dict[str, str] | None = None,
+        configured_root: str | None = None,
+        default_root: str | None = None,
+        env_workspace: str | None = None,
+    ) -> "ProjectManager":
+        pm = super()._build_pm(
+            specs,
+            registered=registered,
+            loaded=loaded,
+            project_workspaces=project_workspaces,
+            configured_root=configured_root,
+            default_root=default_root,
+            env_workspace=env_workspace,
+        )
+        dir_to_config: dict[Path, dict] = {
+            canonicalize_for_identity(Path(spec["file"])).parent: spec.get("config", {}) for spec in specs
+        }
+        cls._wire_libraries_fallback_config(
+            pm._config_manager,
+            dir_to_config,
+            global_workspace=configured_root or default_root or "/global/ws",
+        )
+        return pm
+
     @pytest.mark.asyncio
     async def test_unloaded_no_libraries_dir_returns_none(self, tmp_path: Path) -> None:
         """A parentless project with no libraries_dir returns None (caller uses the workspace default)."""
@@ -4555,8 +4583,6 @@ class TestResolveEffectiveLibrariesRootForProjectId(TestResolveLibrariesRootForP
     @pytest.mark.asyncio
     async def test_undeclared_falls_back_to_workspace_libraries_dir(self, tmp_path: Path) -> None:
         """Nothing declared resolves to libraries/ under the GLOBAL workspace, tagged WORKSPACE_DEFAULT."""
-        from griptape_nodes.retained_mode.events.project_events import LibrariesRootSource
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4579,8 +4605,6 @@ class TestResolveEffectiveLibrariesRootForProjectId(TestResolveLibrariesRootForP
         This is the case a plain get_config_value("libraries_directory") would get wrong: the answer
         for project C must come from C's merged layers even when some other project is active.
         """
-        from griptape_nodes.retained_mode.events.project_events import LibrariesRootSource
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4599,8 +4623,6 @@ class TestResolveEffectiveLibrariesRootForProjectId(TestResolveLibrariesRootForP
     @pytest.mark.asyncio
     async def test_declared_libraries_dir_is_tagged_declared(self, tmp_path: Path) -> None:
         """A project's own libraries_dir wins over the fallback and is tagged DECLARED."""
-        from griptape_nodes.retained_mode.events.project_events import LibrariesRootSource
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4620,8 +4642,6 @@ class TestResolveEffectiveLibrariesRootForProjectId(TestResolveLibrariesRootForP
     @pytest.mark.asyncio
     async def test_inherited_libraries_dir_is_tagged_inherited(self, tmp_path: Path) -> None:
         """An ancestor's libraries_dir wins over the fallback and is distinguished from DECLARED."""
-        from griptape_nodes.retained_mode.events.project_events import LibrariesRootSource
-
         parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
         child_file = tmp_path / "c" / "griptape-nodes-project.yml"
         for f in (parent_file, child_file):
@@ -4669,12 +4689,6 @@ class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId)
     @pytest.mark.asyncio
     async def test_undeclared_libraries_dir_returns_workspace_default_path(self, tmp_path: Path) -> None:
         """No libraries_dir anywhere in the chain still yields a path, tagged WORKSPACE_DEFAULT."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            LibrariesRootSource,
-            ResolveProjectLibrariesRequest,
-            ResolveProjectLibrariesResultSuccess,
-        )
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4693,12 +4707,6 @@ class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId)
     @pytest.mark.asyncio
     async def test_declared_libraries_dir_flows_through_handler(self, tmp_path: Path) -> None:
         """A declared libraries_dir (branch 0) is the resolved value the handler returns."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            LibrariesRootSource,
-            ResolveProjectLibrariesRequest,
-            ResolveProjectLibrariesResultSuccess,
-        )
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4718,12 +4726,6 @@ class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId)
     @pytest.mark.asyncio
     async def test_inherited_libraries_dir_flows_through_handler(self, tmp_path: Path) -> None:
         """A libraries_dir inherited from an ancestor (branch 1) is returned without loading the parent."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            LibrariesRootSource,
-            ResolveProjectLibrariesRequest,
-            ResolveProjectLibrariesResultSuccess,
-        )
-
         parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
         child_file = tmp_path / "c" / "griptape-nodes-project.yml"
         for f in (parent_file, child_file):
@@ -4747,11 +4749,6 @@ class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId)
     @pytest.mark.asyncio
     async def test_unresolvable_id_returns_failure(self, tmp_path: Path) -> None:
         """An unknown project id is a Failure, not a success sharing a null with the default case."""
-        from griptape_nodes.retained_mode.events.project_events import (
-            ResolveProjectLibrariesRequest,
-            ResolveProjectLibrariesResultFailure,
-        )
-
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()

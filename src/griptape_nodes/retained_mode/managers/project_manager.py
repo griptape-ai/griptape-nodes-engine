@@ -45,6 +45,7 @@ from griptape_nodes.files.derivation import DERIVATION_RULES, apply_derivation_r
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.files.path_utils import (
     canonicalize_for_identity,
+    expand_path,
     resolve_file_path,
     resolve_path_safely,
 )
@@ -472,6 +473,18 @@ class LibrariesRootResolution(NamedTuple):
 
     libraries_root: Path
     source: LibrariesRootSource
+
+
+class _DeclaredLibrariesScan(NamedTuple):
+    """Result of scanning a project's own overlay and parent chain for a declared libraries_dir.
+
+    `resolution` is the DECLARED or INHERITED libraries root when one is found, or None.
+    `template_workspace_dir` is the project's own workspace_dir extracted from the overlay
+    as a side effect of reading it, so the caller can reuse it without a second overlay read.
+    """
+
+    resolution: LibrariesRootResolution | None
+    template_workspace_dir: str | None
 
 
 class _ProvisioningConfigDirs(NamedTuple):
@@ -1826,10 +1839,10 @@ class ProjectManager:
         if project_file_path is None:
             return None
 
-        declared = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
-        if declared is None:
+        scan = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
+        if scan.resolution is None:
             return None
-        return declared.libraries_root
+        return scan.resolution.libraries_root
 
     async def resolve_effective_libraries_root_for_project_id(self, project_id: str) -> LibrariesRootResolution | None:
         """Resolve the libraries root a project WOULD use WITHOUT loading it, always as a real path.
@@ -1850,11 +1863,17 @@ class ProjectManager:
         if project_file_path is None:
             return None
 
-        declared = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
-        if declared is not None:
-            return declared
+        scan = await self._resolve_declared_libraries_root_offline(project_file_path, id_index)
+        if scan.resolution is not None:
+            return scan.resolution
 
-        decision = await self._decide_workspace_from_disk_for_path(project_file_path, id_index)
+        # Overlay was already read by _resolve_declared_libraries_root_offline above; reuse
+        # template_workspace_dir from scan so _decide_workspace_from_disk does not read it again.
+        project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
+        env_config = self._config_manager.read_env_config()
+        decision = await self._decide_workspace_from_disk(
+            project_file_path, project_config, env_config, scan.template_workspace_dir, id_index
+        )
         merged = self._config_manager.compute_project_provisioning_config(
             project_file_path.parent, decision.workspace_dir, apply_override=decision.apply_override
         )
@@ -1865,26 +1884,38 @@ class ProjectManager:
 
     async def _resolve_declared_libraries_root_offline(
         self, project_file_path: Path, id_index: dict[str, Path]
-    ) -> LibrariesRootResolution | None:
+    ) -> _DeclaredLibrariesScan:
         """Resolve a project's own (branch 0) or nearest ancestor's (branch 1) libraries_dir from disk.
 
         Branch 0 reads this project's own libraries_dir from its on-disk overlay; branch 1 walks the
-        parent chain offline. Returns None when neither declares one -- the caller decides whether to
-        report that as "no declaration" or to apply the workspace-relative fallback.
+        parent chain offline. Returns None resolution when neither declares one -- the caller decides
+        whether to report that as "no declaration" or to apply the workspace-relative fallback.
+        `template_workspace_dir` is extracted from the same overlay read as a side effect so the caller
+        can pass it to _decide_workspace_from_disk without reading the overlay a second time.
         """
+        template_workspace_dir: str | None = None
         own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
         if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
             _, own_overlay = own_overlay_load
+            template_workspace_dir = self._resolve_template_workspace_dir(own_overlay.workspace_dir, project_file_path)
             template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
             if template_libraries_dir is not None:
-                return LibrariesRootResolution(
-                    libraries_root=Path(template_libraries_dir), source=LibrariesRootSource.DECLARED
+                return _DeclaredLibrariesScan(
+                    resolution=LibrariesRootResolution(
+                        libraries_root=Path(template_libraries_dir), source=LibrariesRootSource.DECLARED
+                    ),
+                    template_workspace_dir=template_workspace_dir,
                 )
 
         inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
         if inherited is not None:
-            return LibrariesRootResolution(libraries_root=Path(inherited), source=LibrariesRootSource.INHERITED)
-        return None
+            return _DeclaredLibrariesScan(
+                resolution=LibrariesRootResolution(
+                    libraries_root=Path(inherited), source=LibrariesRootSource.INHERITED
+                ),
+                template_workspace_dir=template_workspace_dir,
+            )
+        return _DeclaredLibrariesScan(resolution=None, template_workspace_dir=template_workspace_dir)
 
     def _resolve_project_id_to_file_path_offline(self, project_id: str, id_index: dict[str, Path]) -> Path | None:
         """Map an opaque project id to its file path via the offline index, or None if unresolvable.
@@ -2054,7 +2085,7 @@ class ProjectManager:
         selected = select_project_path(raw)
         if selected is None:
             return None
-        candidate = Path(selected)
+        candidate = expand_path(selected)
         if not candidate.is_absolute():
             candidate = project_file_path.parent / candidate
         return str(canonicalize_for_identity(candidate))
@@ -2229,7 +2260,7 @@ class ProjectManager:
         selected = select_project_path(raw)
         if selected is None:
             return None
-        candidate = Path(selected)
+        candidate = expand_path(selected)
         if not candidate.is_absolute():
             candidate = project_file_path.parent / candidate
         return str(canonicalize_for_identity(candidate))
