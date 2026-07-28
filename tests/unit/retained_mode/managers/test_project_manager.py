@@ -4513,6 +4513,106 @@ class TestOnResolveProjectWorkspaceRequest(TestResolveWorkspaceDirForProjectId):
         assert result.workspace_dir is None
 
 
+class TestOnResolveProjectLibrariesRequest(TestResolveLibrariesRootForProjectId):
+    """on_resolve_project_libraries_request wraps resolve_libraries_root_for_project_id as an event.
+
+    Reuses the disk/config modeling from TestResolveLibrariesRootForProjectId so the handler is tested
+    against the real resolver, not a stub.
+    """
+
+    @pytest.mark.asyncio
+    async def test_undeclared_libraries_dir_returns_success_with_none(self, tmp_path: Path) -> None:
+        """No libraries_dir anywhere in the chain is a success carrying None (the workspace default)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectLibrariesRequest,
+            ResolveProjectLibrariesResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}}],
+            registered=[str(project_file)],
+        )
+        result = await pm.on_resolve_project_libraries_request(ResolveProjectLibrariesRequest(project_id="C"))
+
+        assert isinstance(result, ResolveProjectLibrariesResultSuccess)
+        assert result.libraries_root is None
+
+    @pytest.mark.asyncio
+    async def test_declared_libraries_dir_flows_through_handler(self, tmp_path: Path) -> None:
+        """A declared libraries_dir (branch 0) is the resolved value the handler returns."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectLibrariesRequest,
+            ResolveProjectLibrariesResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        declared = tmp_path / "declared-libs"
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": str(declared)}],
+            registered=[str(project_file)],
+        )
+        result = await pm.on_resolve_project_libraries_request(ResolveProjectLibrariesRequest(project_id="C"))
+
+        assert isinstance(result, ResolveProjectLibrariesResultSuccess)
+        assert result.libraries_root == str(self._canonical(declared))
+
+    @pytest.mark.asyncio
+    async def test_inherited_libraries_dir_flows_through_handler(self, tmp_path: Path) -> None:
+        """A libraries_dir inherited from an ancestor (branch 1) is returned without loading the parent."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectLibrariesRequest,
+            ResolveProjectLibrariesResultSuccess,
+        )
+
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "libraries_dir": "./shared-libs"},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(parent_file), str(child_file)],
+        )
+        result = await pm.on_resolve_project_libraries_request(ResolveProjectLibrariesRequest(project_id="C"))
+
+        assert isinstance(result, ResolveProjectLibrariesResultSuccess)
+        assert result.libraries_root == str(self._canonical(parent_file.parent / "shared-libs"))
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_id_returns_success_with_none(self, tmp_path: Path) -> None:
+        """An id that maps to no readable file is a success carrying libraries_root=None (no hint)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ResolveProjectLibrariesRequest,
+            ResolveProjectLibrariesResultSuccess,
+        )
+
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}}],
+            registered=[str(project_file)],
+        )
+        result = await pm.on_resolve_project_libraries_request(
+            ResolveProjectLibrariesRequest(project_id="does-not-exist")
+        )
+
+        assert isinstance(result, ResolveProjectLibrariesResultSuccess)
+        assert result.libraries_root is None
+
+
 class TestProjectManagerProjectWorkspaces:
     """Test ProjectManager project_workspaces lookup in on_set_current_project_request."""
 

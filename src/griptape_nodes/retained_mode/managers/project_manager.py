@@ -100,6 +100,8 @@ from griptape_nodes.retained_mode.events.project_events import (
     PreviewImportProjectResultFailure,
     PreviewImportProjectResultSuccess,
     ProjectTemplateInfo,
+    ResolveProjectLibrariesRequest,
+    ResolveProjectLibrariesResultSuccess,
     ResolveProjectWorkspaceRequest,
     ResolveProjectWorkspaceResultSuccess,
     SaveProjectTemplateRequest,
@@ -581,6 +583,9 @@ class ProjectManager:
         event_manager.assign_manager_to_request_type(GetProjectTemplateRequest, self.on_get_project_template_request)
         event_manager.assign_manager_to_request_type(
             ResolveProjectWorkspaceRequest, self.on_resolve_project_workspace_request
+        )
+        event_manager.assign_manager_to_request_type(
+            ResolveProjectLibrariesRequest, self.on_resolve_project_libraries_request
         )
         event_manager.assign_manager_to_request_type(
             ListProjectTemplatesRequest, self.on_list_project_templates_request
@@ -1068,6 +1073,28 @@ class ProjectManager:
         return ResolveProjectWorkspaceResultSuccess(
             workspace_dir=str(resolved) if resolved is not None else None,
             result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
+        )
+
+    async def on_resolve_project_libraries_request(
+        self, request: ResolveProjectLibrariesRequest
+    ) -> ResolveProjectLibrariesResultSuccess:
+        """Resolve the libraries root a project would use, without loading or activating it.
+
+        A None resolution is a success carrying libraries_root=None: nothing in the parent chain
+        declares a libraries_dir (so the project uses the workspace-relative `libraries_directory`
+        default), or the id maps to no readable project file. This matches
+        resolve_libraries_root_for_project_id's contract.
+        """
+        resolved = await self.resolve_libraries_root_for_project_id(request.project_id)
+        if resolved is None:
+            return ResolveProjectLibrariesResultSuccess(
+                libraries_root=None,
+                result_details=f"Resolved libraries root for '{request.project_id}': none declared, uses the workspace-relative default",
+            )
+
+        return ResolveProjectLibrariesResultSuccess(
+            libraries_root=str(resolved),
+            result_details=f"Resolved libraries root for '{request.project_id}': {resolved}",
         )
 
     def on_list_project_templates_request(

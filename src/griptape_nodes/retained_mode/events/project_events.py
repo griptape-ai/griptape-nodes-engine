@@ -200,6 +200,39 @@ class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
 
 
 @dataclass
+@PayloadRegistry.register
+class ResolveProjectLibrariesRequest(RequestPayload):
+    """Resolve the libraries root a project would use, WITHOUT loading/activating it.
+
+    Use when: Showing a project's effective libraries root in the detail view, where the project may
+    declare its own libraries_dir, inherit one from an ancestor, or fall back to the
+    workspace-relative default.
+
+    Args:
+        project_id: Opaque id of the project (the registry key). Consumers must not parse it.
+
+    Results: ResolveProjectLibrariesResultSuccess
+    """
+
+    project_id: ProjectID
+
+
+@dataclass
+@PayloadRegistry.register
+class ResolveProjectLibrariesResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Resolved libraries root for a project.
+
+    Args:
+        libraries_root: Absolute path string of the project's own or inherited libraries_dir, or None
+            when nothing in the chain declares one (matching the resolver's contract) so the project
+            uses the workspace-relative `libraries_directory` default. None is also returned when the
+            id resolves to no readable project file.
+    """
+
+    libraries_root: str | None = None
+
+
+@dataclass
 class ProjectTemplateInfo:
     """Information about a loaded or failed project template.
 
