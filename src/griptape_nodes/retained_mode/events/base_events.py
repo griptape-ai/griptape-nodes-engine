@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, is_dataclass
 from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
+from griptape.artifacts import BlobArtifact
 from pydantic import BaseModel, ConfigDict, Field
 
 from griptape_nodes.retained_mode.events.event_converter import (
@@ -26,10 +27,6 @@ logger = logging.getLogger(__name__)
 # ExecutionEvent.dict) walks *only* tagged fields when blanking oversized blobs, i.e.
 # ``field(metadata={BLOB_FIELD_METADATA_KEY: True})``.
 BLOB_FIELD_METADATA_KEY = "may_contain_blob"
-
-# Serialized "type" strings of blob-backed griptape artifacts whose `.value` is
-# base64-encoded bytes. URL artifacts carry a small URL string and are never stripped.
-_BLOB_ARTIFACT_TYPE_NAMES = frozenset({"ImageArtifact", "AudioArtifact", "BlobArtifact"})
 
 
 def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
@@ -668,10 +665,11 @@ def _blank_oversized_tagged_blob_fields(payload: Payload, serialized: dict[str, 
     if not tagged:
         return
     max_b64_bytes = _max_blob_artifact_b64_bytes()
+    type_names = _blob_artifact_type_names()
     blanked: list[tuple[str, int]] = []
     for field_name in tagged:
         if field_name in serialized:
-            blanked.extend(_blank_oversized_blobs(serialized[field_name], max_b64_bytes))
+            blanked.extend(_blank_oversized_blobs(serialized[field_name], max_b64_bytes, type_names))
     if blanked:
         # Best-effort node context: only payloads that carry a top-level ``node_name``
         # others log without it -- acceptable given the volume.
@@ -694,12 +692,37 @@ def _max_blob_artifact_b64_bytes() -> int:
     )
 
 
-def _blank_oversized_blobs(obj: dict | list, max_b64_bytes: int) -> list[tuple[str, int]]:
+def _blob_artifact_type_names() -> frozenset[str]:
+    """Names of BlobArtifact and every currently-loaded subclass.
+
+    Computed from the live class tree (rather than a maintained static list) so a
+    bytes-backed artifact type from any library -- first- or third-party, loaded
+    before or after this module -- is covered automatically. Matches by class name
+    because the serialized artifact dict (``obj.to_dict()``, see SerializableMixin)
+    carries only ``type``, not the class itself. Callers should compute this once per
+    top-level walk and thread it through, not call it per node (see _blank_oversized_blobs).
+    """
+    names = {BlobArtifact.__name__}
+    stack = [BlobArtifact]
+    while stack:
+        cls = stack.pop()
+        for sub in cls.__subclasses__():
+            if sub.__name__ not in names:
+                names.add(sub.__name__)
+                stack.append(sub)
+    return frozenset(names)
+
+
+def _blank_oversized_blobs(obj: dict | list, max_b64_bytes: int, type_names: frozenset[str]) -> list[tuple[str, int]]:
     """Blank oversized serialized blob-artifact values, in place.
 
      A serialized artifact is a dict ``{"type": "ImageArtifact"|"AudioArtifact"|
-     "BlobArtifact", "value": <b64 str>}``; over the limit its ``value`` becomes None
-     (wrapper kept so clients render a placeholder rather than a broken artifact).
+     "BlobArtifact"|..., "value": <b64 str>}`` where ``type`` names BlobArtifact or
+     one of its subclasses; over the limit its ``value`` becomes None.
+
+    ``type_names`` (from ``_blob_artifact_type_names()``) is resolved once by the
+    top-level caller and threaded through the recursion, so the class-tree walk runs
+    once per payload rather than once per node.
 
     Return (type, b64_len) per blank
     """
@@ -707,14 +730,14 @@ def _blank_oversized_blobs(obj: dict | list, max_b64_bytes: int) -> list[tuple[s
     if isinstance(obj, dict):
         value = obj.get("value")
         type_name = obj.get("type")
-        if type_name in _BLOB_ARTIFACT_TYPE_NAMES and isinstance(value, str) and len(value) > max_b64_bytes:
+        if type_name in type_names and isinstance(value, str) and len(value) > max_b64_bytes:
             obj["value"] = None
             return [(type_name, len(value))]
         for item in obj.values():
-            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes))
+            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes, type_names))
     elif isinstance(obj, list):
         for item in obj:
-            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes))
+            blanked.extend(_blank_oversized_blobs(item, max_b64_bytes, type_names))
     return blanked
 
 

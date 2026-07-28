@@ -12,7 +12,6 @@ import pytest
 from griptape.artifacts import AudioArtifact, BlobArtifact, ImageArtifact
 
 from griptape_nodes.retained_mode.events.base_events import (
-    _BLOB_ARTIFACT_TYPE_NAMES,
     BLOB_FIELD_METADATA_KEY,
     EventResultFailure,
     EventResultSuccess,
@@ -24,6 +23,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     StrictModeViolationDetail,
     _blank_oversized_blobs,
     _blank_oversized_tagged_blob_fields,
+    _blob_artifact_type_names,
     _max_blob_artifact_b64_bytes,
     _warn_blanked,
 )
@@ -397,9 +397,9 @@ class TestBlankOversizedBlobs:
     """The in-place walker over a freshly-serialized structure."""
 
     def test_over_threshold_blanked_in_place(self) -> None:
-        for type_name in _BLOB_ARTIFACT_TYPE_NAMES:
+        for type_name in _blob_artifact_type_names():
             artifact = {"type": type_name, "value": "A" * 200, "format": "png"}
-            blanked = _blank_oversized_blobs(artifact, max_b64_bytes=100)
+            blanked = _blank_oversized_blobs(artifact, max_b64_bytes=100, type_names=_blob_artifact_type_names())
             assert blanked == [(type_name, 200)]
             assert artifact["value"] is None
             assert artifact["type"] == type_name  # wrapper + metadata kept
@@ -407,21 +407,49 @@ class TestBlankOversizedBlobs:
 
     def test_under_threshold_preserved(self) -> None:
         artifact = _blob_artifact(50)
-        assert _blank_oversized_blobs(artifact, max_b64_bytes=100) == []
+        assert _blank_oversized_blobs(artifact, max_b64_bytes=100, type_names=_blob_artifact_type_names()) == []
         assert artifact["value"] == "A" * 50
+
+    def test_future_blob_artifact_subclass_is_covered(self) -> None:
+        """A brand-new BlobArtifact subclass (e.g. from a third-party library) is caught automatically."""
+
+        class _FutureArtifact(BlobArtifact):
+            pass
+
+        assert _FutureArtifact.__name__ in _blob_artifact_type_names()
+
+        artifact = {"type": "_FutureArtifact", "value": "A" * 200}
+        blanked = _blank_oversized_blobs(artifact, max_b64_bytes=100, type_names=_blob_artifact_type_names())
+
+        assert blanked == [("_FutureArtifact", 200)]
+        assert artifact["value"] is None
+
+    def test_blob_artifact_grandchild_subclass_is_covered(self) -> None:
+        """A grandchild of BlobArtifact is caught automatically."""
+
+        class _GrandchildArtifact(ImageArtifact):
+            pass
+
+        assert _GrandchildArtifact.__name__ in _blob_artifact_type_names()
+
+        artifact = {"type": "_GrandchildArtifact", "value": "A" * 200}
+        blanked = _blank_oversized_blobs(artifact, max_b64_bytes=100, type_names=_blob_artifact_type_names())
+
+        assert blanked == [("_GrandchildArtifact", 200)]
+        assert artifact["value"] is None
 
     def test_non_blob_and_plain_string_untouched(self) -> None:
         url = {"type": "ImageUrlArtifact", "value": "http://x/" + "a" * 500}
         text = {"type": "TextArtifact", "value": "z" * 500}
         plain = {"some_field": "x" * 1000}
         for obj in (url, text, plain):
-            assert _blank_oversized_blobs(obj, max_b64_bytes=100) == []
+            assert _blank_oversized_blobs(obj, max_b64_bytes=100, type_names=_blob_artifact_type_names()) == []
         assert url["value"].startswith("http://")
         assert text["value"] == "z" * 500
 
     def test_nested_dicts_and_lists_walked(self) -> None:
         payload = {"e1": _blob_artifact(300), "e2": _blob_artifact(10), "nested": {"deep": [_blob_artifact(300)]}}
-        blanked = _blank_oversized_blobs(payload, max_b64_bytes=100)
+        blanked = _blank_oversized_blobs(payload, max_b64_bytes=100, type_names=_blob_artifact_type_names())
         assert sorted(blanked) == [("ImageArtifact", 300), ("ImageArtifact", 300)]
         assert payload["e1"]["value"] is None
         assert payload["e2"]["value"] == "A" * 10
@@ -429,7 +457,7 @@ class TestBlankOversizedBlobs:
 
     def test_non_string_value_ignored(self) -> None:
         artifact = {"type": "ImageArtifact", "value": None}
-        assert _blank_oversized_blobs(artifact, max_b64_bytes=100) == []
+        assert _blank_oversized_blobs(artifact, max_b64_bytes=100, type_names=_blob_artifact_type_names()) == []
 
 
 class TestStripTaggedBlobFields:
@@ -614,7 +642,7 @@ class TestEveryTaggedFieldBlanksWhenSerialized:
         # All three blob-backed artifact types serialize to the {type, value: <b64>} shape the walker blanks.
         serialized = safe_unstructure(artifact)
 
-        blanked = _blank_oversized_blobs(serialized, max_b64_bytes=4)
+        blanked = _blank_oversized_blobs(serialized, max_b64_bytes=4, type_names=_blob_artifact_type_names())
 
         assert blanked
         assert serialized["value"] is None
@@ -626,7 +654,7 @@ class TestEveryTaggedFieldBlanksWhenSerialized:
         )
         serialized = safe_unstructure(payload)
 
-        blanked = _blank_oversized_blobs(serialized["value"], max_b64_bytes=4)
+        blanked = _blank_oversized_blobs(serialized["value"], max_b64_bytes=4, type_names=_blob_artifact_type_names())
 
         assert len(blanked) == 2  # noqa: PLR2004
         assert _surviving_blob_str_values(serialized["value"]) == []
@@ -685,7 +713,7 @@ def _surviving_blob_str_values(serialized: Any) -> list[str]:
     """All base64 string values still present under a blob-artifact dict (should be empty after blanking)."""
     found: list[str] = []
     if isinstance(serialized, dict):
-        if serialized.get("type") in _BLOB_ARTIFACT_TYPE_NAMES and isinstance(serialized.get("value"), str):
+        if serialized.get("type") in _blob_artifact_type_names() and isinstance(serialized.get("value"), str):
             found.append(serialized["value"])
         for child in serialized.values():
             found.extend(_surviving_blob_str_values(child))
