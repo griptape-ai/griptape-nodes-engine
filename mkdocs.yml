@@ -3,7 +3,6 @@ site_url: https://docs.griptapenodes.com/
 
 plugins:
   - search
-  - mermaid2
   - mkdocstrings:
       handlers:
         python:
@@ -246,7 +245,7 @@ markdown_extensions:
       custom_fences:
         - name: mermaid
           class: mermaid
-          format: !!python/name:mermaid2.fence_mermaid_custom
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - tables
   - md_in_html
   - toc:
