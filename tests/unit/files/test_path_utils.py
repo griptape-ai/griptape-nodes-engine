@@ -66,45 +66,65 @@ class TestFilenameParts:
 
 
 class TestSanitizePathStringWindowsSeparators:
-    r"""On Windows, ``\`` is a separator and must never be treated as a shell escape.
+    r"""On a backslash-separated path, ``\`` is a separator, not a shell escape.
 
-    Stripping it turns ``C:\outputs\!final\render.png`` into
+    Stripping it wholesale turns ``C:\outputs\!final\render.png`` into
     ``C:\outputs!final\render.png``, silently retargeting the path at a sibling of the
     intended directory whenever a component starts with a shell-special character
-    (griptape-ai/internal#178). Nothing on Windows produces the escaping this undoes: it
-    comes from POSIX shells and macOS Finder's "Copy as Pathname".
+    (griptape-ai/internal#178).
 
-    These force the Windows branch via ``is_windows`` so they run on any dev machine,
-    rather than skipping everywhere except the Windows CI job.
+    The discriminator is the path's SHAPE, not ``sys.platform`` -- a path can be authored
+    on one OS and consumed on another -- so every case here runs on every platform. No
+    ``skipif``, no patched ``is_windows``: a regression fails on the developer's machine
+    rather than waiting for the Windows CI job.
+
+    ``\ `` is the one escape still honored on a Windows-shaped path, because a Windows
+    path component cannot begin with a space, so ``\ `` is unambiguous.
     """
-
-    @pytest.fixture
-    def on_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
 
     @pytest.mark.parametrize(
         "component",
-        ["!final", "[wip]", "{batch}", "$tmp", "(draft)", "&more", "*glob"],
+        ["!final", "[wip]", "{batch}", "$tmp", "(draft)", "&more", "*glob", ";semi", "'quote"],
     )
-    def test_preserves_separator_before_special_component(self, on_windows: None, component: str) -> None:  # noqa: ARG002
+    def test_preserves_separator_before_special_component(self, component: str) -> None:
         """Every shell-special leading character must keep its preceding separator."""
         path_str = f"C:\\outputs\\{component}\\render.png"
 
         assert sanitize_path_string(path_str) == path_str
 
-    def test_still_removes_newlines_on_windows(self, on_windows: None) -> None:  # noqa: ARG002
-        """The newline cleanup (WinError 123) is the reason this runs on Windows at all."""
+    def test_preserves_separator_on_unc_path(self) -> None:
+        r"""UNC roots (``\\server\share``) are backslash-separated too."""
+        path_str = r"\\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_still_unescapes_spaces_on_windows_path(self) -> None:
+        r"""``\ `` remains an escape: a Windows component cannot start with a space.
+
+        LocalFileDriver relies on this to read a Finder/shell-escaped path whose
+        directory happens to be a real Windows temp dir.
+        """
+        assert sanitize_path_string(r"C:\dir\test\ file.txt") == r"C:\dir\test file.txt"
+
+    def test_still_removes_newlines_on_windows_path(self) -> None:
+        """The newline cleanup (WinError 123) applies regardless of shape."""
         assert sanitize_path_string("C:\\Users\\file\n\n.txt") == "C:\\Users\\file.txt"
 
-    def test_still_strips_quotes_on_windows(self, on_windows: None) -> None:  # noqa: ARG002
-        """Quote stripping is platform-independent and must survive the gate."""
+    def test_still_strips_quotes_on_windows_path(self) -> None:
+        """Quote stripping is shape-independent."""
         assert sanitize_path_string('"C:\\Users\\my file.txt"') == "C:\\Users\\my file.txt"
 
-    def test_strips_shell_escapes_off_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The POSIX/Finder behavior is unchanged: the gate only skips on Windows."""
-        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: False)
-
+    def test_posix_shaped_path_keeps_full_unescaping(self) -> None:
+        """A POSIX-shaped path has no separator ambiguity, so every escape is stripped."""
         assert sanitize_path_string(r"/Downloads/Dragon\'s\ Curse/x.jpg") == "/Downloads/Dragon's Curse/x.jpg"
+
+    def test_relative_backslash_path_keeps_full_unescaping(self) -> None:
+        r"""Only a drive/UNC root marks a Windows path; a bare relative string does not.
+
+        A relative POSIX filename may legitimately contain an escaped backslash, and it
+        must not be misread as a Windows path.
+        """
+        assert sanitize_path_string(r"sub/dir\ name/file.txt") == "sub/dir name/file.txt"
 
 
 class TestSanitizePathString:
