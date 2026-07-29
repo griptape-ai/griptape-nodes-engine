@@ -31,17 +31,20 @@ class TestDeriveRegistryKey:
     def test_dot_prefix_normalized(self) -> None:
         assert derive_registry_key("./my_workflow.py") == "my_workflow"
 
-    @pytest.mark.parametrize(
-        ("input_path", "expected"),
-        [
-            ("my_workflow.py", "my_workflow"),
-            ("subdir/my_workflow.py", "subdir/my_workflow"),
-            ("a/b/deep_workflow.py", "a/b/deep_workflow"),
-            ("windows\\path\\workflow.py", "windows/path/workflow"),
-        ],
-    )
-    def test_known_inputs(self, input_path: str, expected: str) -> None:
-        assert derive_registry_key(input_path) == expected
+    def test_known_inputs(self) -> None:
+        """Test derive_registry_key with known inputs, accounting for platform-specific case normalization."""
+        # These cases work the same on all platforms (already lowercase)
+        assert derive_registry_key("my_workflow.py") == "my_workflow"
+        assert derive_registry_key("subdir/my_workflow.py") == "subdir/my_workflow"
+        assert derive_registry_key("a/b/deep_workflow.py") == "a/b/deep_workflow"
+
+        # Backslash normalization: case handling varies by platform
+        if platform.system() == "Linux":
+            # Case-sensitive filesystem: preserve case
+            assert derive_registry_key("windows\\path\\workflow.py") == "windows/path/workflow"
+        else:
+            # Case-insensitive filesystem (macOS/Windows): lowercase
+            assert derive_registry_key("windows\\path\\workflow.py") == "windows/path/workflow"
 
     @pytest.mark.skipif(platform.system() == "Linux", reason="Case normalization only on case-insensitive filesystems")
     def test_case_normalization_on_case_insensitive_filesystem(self) -> None:

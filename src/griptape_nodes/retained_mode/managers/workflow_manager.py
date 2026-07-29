@@ -2327,8 +2327,11 @@ class WorkflowManager:
         registry_key = derive_registry_key(relative_file_path)
 
         # Check for workflow conflicts AFTER determining the actual save target.
-        # Skip conflict checks for scenarios that intentionally generate unique names
-        # (SAVE_FROM_TEMPLATE always creates new copies, CREATE_VERSIONED bumps versions).
+        # Skip conflict checks for scenarios that intentionally generate unique names:
+        # - SAVE_FROM_TEMPLATE always creates new copies via _generate_unique_filename
+        # - CREATE_VERSIONED always bumps versions via the versioned macro's padding
+        # FIRST_SAVE, SAVE_AS, and OVERWRITE_EXISTING all need conflict checks because
+        # they use user-provided names or situation macros that may collide.
         should_check_conflict = save_target.scenario not in {
             WorkflowManager.SaveWorkflowScenario.SAVE_FROM_TEMPLATE,
             WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED,
@@ -2340,9 +2343,12 @@ class WorkflowManager:
             )
             if conflicting_workflow is not None:
                 conflict_path = conflicting_workflow.file_path or registry_key
+                # Get current workflow's display name for artist-comprehensible error message
+                current_display_name = file_name  # The resolved name from _determine_save_target
                 details = (
-                    f"Attempted to save workflow. Would overwrite existing workflow '{conflict_path}'. "
-                    f"To overwrite, retry the save with allow_overwrite=True."
+                    f"Attempted to save workflow '{current_display_name}'. "
+                    f"Would overwrite different workflow at '{conflict_path}'. "
+                    f"To replace the other workflow, save again with allow_overwrite enabled."
                 )
                 return SaveWorkflowResultFailure(
                     result_details=details,
@@ -2547,7 +2553,9 @@ class WorkflowManager:
         if not has_workflow:
             return None
 
-        # Saving over the current workflow (same key) is always allowed
+        # Saving over the current workflow (same key) is always allowed.
+        # current_workflow_name is guaranteed to be a normalized registry key because
+        # ContextManager.set_workflow_context derives it via derive_registry_key.
         if current_workflow_name == registry_key:
             return None
 

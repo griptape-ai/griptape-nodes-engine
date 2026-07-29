@@ -105,7 +105,9 @@ def derive_registry_key(file_path: str) -> str:
     normalized = file_path.replace("\\", "/")
     key = str(PurePosixPath(normalized).with_suffix(""))
     # Lowercase on case-insensitive filesystems to prevent collisions
-    # (e.g., "MyFlow" and "myflow" refer to the same file on macOS/Windows)
+    # (e.g., "MyFlow" and "myflow" refer to the same file on macOS/Windows).
+    # Platform approximation: assumes default filesystem (APFS/HFS+ on macOS, NTFS on Windows).
+    # Does not detect case-sensitive APFS on macOS or case-insensitive ext4 on Linux (both rare).
     if is_windows() or is_mac():
         return key.lower()
     return key
