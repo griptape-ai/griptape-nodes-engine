@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
@@ -26,6 +27,7 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, ModelManager
 
@@ -287,6 +289,206 @@ class TestOnHandleDeclareModelInvocationRequest:
         )
         assert isinstance(denied, DeclareModelInvocationResultFailure)
         assert "Denied by the license policy." in str(denied.result_details)
+
+
+_CATALOG_LIBRARY_NAME = "model-manager-invocation-test-library"
+
+
+class _ProbeModelNode(BaseNode):
+    """Concrete node whose declared catalog models drive invocation enrichment."""
+
+    def __init__(self, name: str, metadata=None) -> None:  # noqa: ANN001
+        super().__init__(name=name, metadata=metadata)
+
+
+class TestDeclareModelInvocationCatalogEnrichment:
+    """`_model_checkpoint_attributes` enriches the InvokeModel checkpoint.
+
+    The declared stable catalog key resolves against the declaring node's catalog
+    models into the same `provider_id` / `model_families` facts the OfferModel
+    (dropdown) and InstantiateNode checkpoints carry, so a provider- or
+    family-scoped policy gates an invocation the way it gates the picker.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    @staticmethod
+    def _catalog():  # noqa: ANN205
+        from griptape_nodes.node_library.library_declarations import (
+            KeySupport,
+            Model,
+            ModelCatalogLibraryProperty,
+            ModelProvider,
+        )
+
+        return ModelCatalogLibraryProperty(
+            providers={
+                "openai": ModelProvider(
+                    display_name="OpenAI",
+                    models={
+                        "gtc_gpt_image_1_mini": Model(
+                            display_name="GPT Image 1 Mini",
+                            family="GPT Image",
+                            provider_model_id="gpt-image-1-mini",
+                            key_support=KeySupport.SUPPORTS_CUSTOMER_KEY_OR_GRIPTAPE_KEY,
+                        ),
+                    },
+                )
+            }
+        )
+
+    def _register_node(self, node_name: str) -> None:
+        """Register a library + probe node type, then a node instance the handler can resolve."""
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=_CATALOG_LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="t",
+                description="d",
+                library_version="1.0.0",
+                engine_version="1.0.0",
+                tags=[],
+                declarations=[self._catalog()],
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _ProbeModelNode,
+            NodeMetadata(
+                category="t",
+                description="d",
+                display_name="Probe",
+                declarations=[ModelUsageNodeProperty(model_ids=["gtc_gpt_image_1_mini"])],
+            ),
+        )
+        node = _ProbeModelNode(
+            name=node_name,
+            metadata={"library": _CATALOG_LIBRARY_NAME, "node_type": _ProbeModelNode.__name__},
+        )
+        GriptapeNodes.ObjectManager().add_object_by_name(node_name, node)
+
+    def test_checkpoint_carries_family_and_provider_for_declared_model(
+        self,
+        griptape_nodes: GriptapeNodes,
+    ) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        self._register_node("Probe_1")
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(capture)
+        manager = ModelManager.__new__(ModelManager)
+
+        result = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultSuccess)
+        # The InvokeModel checkpoint now carries the provider and family the
+        # declared catalog key resolves to, not just the bare id.
+        assert seen["attributes"] == {
+            "id": "gtc_gpt_image_1_mini",
+            "provider_id": "openai",
+            "model_families": ["GPT Image"],
+        }
+
+    def test_family_scoped_hook_blocks_the_invocation(self, griptape_nodes: GriptapeNodes) -> None:
+        # Mirrors a license policy that forbids a family via the attribute form
+        # `resource.model_families.contains(...)`: with the family now on the
+        # InvokeModel checkpoint, that forbid fires at invocation time, not only
+        # on the dropdown query.
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+
+        self._register_node("Probe_1")
+
+        def deny(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if "GPT Image" in (checkpoint.attributes.get("model_families") or []):
+                return CheckpointDenial(failures=(CheckpointFailure(detail="GPT Image family is not in your plan."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny)
+        manager = ModelManager.__new__(ModelManager)
+
+        result = manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
+        )
+
+        assert isinstance(result, DeclareModelInvocationResultFailure)
+        assert "GPT Image family is not in your plan." in str(result.result_details)
+
+    def test_key_absent_from_node_models_falls_back_to_bare_id(self, griptape_nodes: GriptapeNodes) -> None:
+        # A key the node does not declare cannot be enriched; the checkpoint
+        # carries only the bare id, so a family/provider rule cannot match but a
+        # bare-id rule still can.
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        self._register_node("Probe_1")
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(capture)
+        manager = ModelManager.__new__(ModelManager)
+
+        manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1")
+        )
+
+        assert seen["attributes"] == {"id": "gtc_not_declared"}
+
+    def test_missing_node_name_falls_back_to_bare_id(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointDenial,
+        )
+
+        seen: dict[str, object] = {}
+
+        def capture(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen["attributes"] = dict(checkpoint.attributes)
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(capture)
+        manager = ModelManager.__new__(ModelManager)
+
+        manager.on_handle_declare_model_invocation_request(
+            DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini")
+        )
+
+        # No node to resolve against -- only the bare id, as before.
+        assert seen["attributes"] == {"id": "gtc_gpt_image_1_mini"}
 
 
 # ---------------------------------------------------------------------------

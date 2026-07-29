@@ -260,6 +260,28 @@ class DeleteWorkflowResultFailure(ResultPayloadFailure):
     """Workflow deletion failed. Common causes: workflow not found, deletion not allowed, registry error."""
 
 
+class RenameDisplayNameBehavior(StrEnum):
+    """Controls what happens to ``WorkflowMetadata.name`` (the human-facing display name) on rename.
+
+    Rename is always a file-name operation; the display name is independent metadata. This enum
+    lets callers decide whether the rename should touch it.
+
+    Values:
+        MATCH_FILE_NAME: Overwrite the display name with the (unsanitized) requested new name.
+            Historical behavior and the default so on-the-wire parity with existing callers is
+            preserved.
+        PRESERVE_EXISTING: Leave the current display name untouched. Opt-in; the file moves but
+            ``metadata.name`` stays put. Use this to fix the "renaming a workflow silently rewrites
+            its display name" corruption path (engine #4992).
+        OVERRIDE: Set the display name to the caller-supplied ``display_name`` value, independent
+            of the file name. Requires ``display_name`` to be non-empty.
+    """
+
+    PRESERVE_EXISTING = "preserve_existing"
+    MATCH_FILE_NAME = "match_file_name"
+    OVERRIDE = "override"
+
+
 @dataclass
 @PayloadRegistry.register
 class RenameWorkflowRequest(RequestPayload):
@@ -270,13 +292,22 @@ class RenameWorkflowRequest(RequestPayload):
 
     Args:
         workflow_name: Current name of the workflow
-        requested_name: New name for the workflow
+        requested_name: New name for the workflow (drives the on-disk filename)
+        display_name_behavior: How to treat ``WorkflowMetadata.name`` on rename. Defaults to
+            ``MATCH_FILE_NAME`` to preserve historical wire behavior — callers who want the
+            display name preserved on rename must opt in with ``PRESERVE_EXISTING``. See
+            :class:`RenameDisplayNameBehavior`.
+        display_name: New display name. Required (non-empty) when ``display_name_behavior`` is
+            ``OVERRIDE``. MUST be ``None`` for the other behaviors — supplying it there is
+            rejected up front to catch callers who set it thinking it will take effect.
 
     Results: RenameWorkflowResultSuccess | RenameWorkflowResultFailure (workflow not found, name conflict)
     """
 
     workflow_name: str
     requested_name: str
+    display_name_behavior: RenameDisplayNameBehavior = RenameDisplayNameBehavior.MATCH_FILE_NAME
+    display_name: str | None = None
 
 
 @dataclass
@@ -523,13 +554,35 @@ class GetPublishOptionsResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailu
 
 @dataclass
 class PublishWorkflowRegisteredEventData:
-    """Data specific to registering a PublishWorkflowRequest event handler."""
+    """Data specific to registering a PublishWorkflowRequest event handler.
+
+    Args:
+        start_flow_node_type: Node type used as the start of the published flow.
+        start_flow_node_library_name: Library that provides the start node type.
+        end_flow_node_type: Node type used as the end of the published flow.
+        end_flow_node_library_name: Library that provides the end node type.
+        get_publish_options: Optional callable returning custom publish options for this target.
+        display_name: Optional human-readable name for the publishing target. When set, the GUI
+            should show this in the publish menu/dialog instead of the raw library name. When None,
+            the frontend falls back to the library name, preserving today's behavior.
+        description: Optional short description of the publishing target. When set, the GUI may show
+            it alongside the target in the publish menu/dialog (e.g. as a subtitle or tooltip). When
+            None, no description is shown, preserving today's behavior.
+        icon: Optional icon identifier for the publishing target. When set, the GUI may render it
+            next to the target in the publish menu/dropdown. The value is either a Lucide icon name
+            (e.g. "rocket") or a path/URL to an image the frontend renders as-is (e.g.
+            "logos/my-target.svg" or "https://example.com/logo.png") — not raw image data. When
+            None, the GUI uses its default/no icon, preserving today's behavior.
+    """
 
     start_flow_node_type: str
     start_flow_node_library_name: str
     end_flow_node_type: str
     end_flow_node_library_name: str
     get_publish_options: Callable[["GetPublishOptionsRequest"], GetPublishOptionsResultSuccess] | None = None
+    display_name: str | None = None
+    description: str | None = None
+    icon: str | None = None
 
 
 @dataclass

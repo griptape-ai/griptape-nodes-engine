@@ -11,6 +11,7 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
+from griptape_nodes.files.path_utils import parse_file_uri, resolve_file_path
 from griptape_nodes.retained_mode.events.os_events import (
     ExistingFilePolicy,
     FileIOFailureReason,
@@ -173,6 +174,29 @@ async def _aresolve_file_path(file_path: str | MacroPath) -> str:
     return await _aresolve_macro_path(file_path)
 
 
+def _resolve_plain_path(path_str: str) -> str:
+    """Resolve a plain (non-macro) path string to an absolute path.
+
+    Relative paths are anchored to the current workspace directory, matching how
+    OSManager resolves ReadFileRequest/WriteFileRequest paths. This keeps
+    resolve() reporting the same on-disk location the read/write pipeline
+    targets, instead of a bare relative path that a caller would resolve against
+    the process working directory. Absolute paths, ``~``/environment-variable
+    paths, and ``file://`` URIs are absolutized in place.
+
+    Args:
+        path_str: A plain path string containing no macro variables.
+
+    Returns:
+        An absolute path string.
+    """
+    local_path = parse_file_uri(path_str)
+    if local_path is not None:
+        path_str = local_path
+    workspace_path = GriptapeNodes.ConfigManager().workspace_path
+    return str(resolve_file_path(path_str, workspace_path))
+
+
 # Pairs of suffixes that should be treated as equivalent when comparing a
 # user-supplied filename extension against the canonical extension reported
 # by ArtifactManager.sniff_extension. Keys and values are lowercase, no
@@ -247,7 +271,10 @@ class File:
         """Resolve and return the absolute path string for this file.
 
         Useful when a caller needs the path for writing (not reading). Macro
-        variables in the path are resolved against the current project at call time.
+        variables in the path are resolved against the current project at call
+        time; plain relative paths are anchored to the workspace directory (the
+        same base the read/write pipeline uses), so the returned path is always
+        absolute.
 
         Returns:
             Absolute path string.
@@ -255,7 +282,9 @@ class File:
         Raises:
             FileLoadError: If macro resolution fails (e.g. no project loaded).
         """
-        return _resolve_file_path(self._file_path)
+        if isinstance(self._file_path, MacroPath):
+            return _resolve_macro_path(self._file_path)
+        return _resolve_plain_path(self._file_path)
 
     @property
     def location(self) -> str:

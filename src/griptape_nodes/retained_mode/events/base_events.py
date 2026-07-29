@@ -4,6 +4,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from dataclasses import fields as dataclass_fields
 from typing import TYPE_CHECKING, Any, ClassVar, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -13,9 +14,12 @@ from griptape_nodes.retained_mode.events.event_converter import (
     register_polymorphic_dataclass,
     safe_unstructure,
 )
+from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
 
 if TYPE_CHECKING:
     import builtins
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_payload_type(event_data: dict[str, Any], type_key: str) -> type:
@@ -143,17 +147,40 @@ class RequestPayload(Payload, ABC):
         failure_log_level: If set, override the log level for failure results.
                           Use logging.DEBUG (10) or logging.INFO (20) to suppress error toasts.
                           Default: None (use handler's default, typically ERROR).
-
         broadcast_result: Whether handle_request should queue the result event for broadcast
                           (e.g. to connected WebSocket clients). Defaults to True. Request types
                           whose results are large or only relevant to the direct caller can
                           default this to False on the subclass to avoid unnecessary serialization
                           and transmission. Can also be set per-instance at construction time.
+        fields: **Wire-only** dot-path filter applied to the broadcast JSON before it is sent
+                over the WebSocket. Has no effect on in-process/retained-mode callers, which
+                always receive the full result object. Like broadcast_result and failure_log_level,
+                this is a transport-layer concern, not part of the request logic.
+
+                Syntax:
+                  - ``None`` (default) — return all fields.
+                  - ``[]`` (empty list) — return only framework fields (result_details,
+                    altered_workflow_state). Useful to trigger side effects without caring
+                    about the result payload.
+                  - ``["a", "a.b.c"]`` — dot-paths select nested fields. An empty list
+                    entry keeps the whole value; a more-specific sibling narrows it.
+                    Prefix-wins: if both ``"workflows"`` and ``"workflows.name"`` are
+                    listed, the full ``workflows`` value is kept.
+                  - ``"*"`` wildcard — for ``dict[str, SomeObject]`` where keys are
+                    arbitrary (e.g. file paths). ``"workflows.*.name"`` plucks ``name``
+                    from each value without knowing the keys in advance. Prefer ``"*"``
+                    over a concrete key for such maps: naming a specific key warns
+                    "not found" whenever that key is legitimately absent.
+
+                Framework fields (result_details, altered_workflow_state) are always
+                included regardless of what fields specifies. Filtering is skipped
+                entirely on failure results.
     """
 
     broadcast_result: bool = True
     request_id: str | None = None
     failure_log_level: int | None = None
+    fields: list[str] | None = None
 
 
 # Result payload base class with abstract succeeded/failed methods, and indicator whether the current workflow was altered.
@@ -325,7 +352,6 @@ class BaseEvent(BaseModel, ABC):
 
     def json(self, **kwargs) -> str:
         """Serialize to JSON string."""
-        logger = logging.getLogger(__name__)
 
         def _default(obj: Any) -> str:
             logger.debug(
@@ -419,6 +445,9 @@ class EventRequestBatch(BaseEvent):
         return cls(requests=requests, **event_data)
 
 
+_RESULT_FRAMEWORK_FIELDS = frozenset(f.name for f in dataclass_fields(ResultPayload))
+
+
 class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
     """Abstract base class for result events."""
 
@@ -437,7 +466,18 @@ class EventResult[P: RequestPayload, R: ResultPayload](BaseEvent, ABC):
         """Override dict to handle payload serialization."""
         result = super().dict(*args, **kwargs)
         result["request"] = safe_unstructure(self.request)
-        result["result"] = safe_unstructure(self.result)
+        result_dict = safe_unstructure(self.result)
+        if self.request.fields is not None and self.result.succeeded():
+            tree = build_path_tree(self.request.fields)
+            filtered = apply_path_tree(result_dict, tree)
+            # Re-add framework fields unconditionally — callers always need result_details
+            # and altered_workflow_state to handle the response, regardless of what they put
+            # in fields. setdefault avoids overwriting if the caller explicitly requested them.
+            for fw_field in _RESULT_FRAMEWORK_FIELDS:
+                if fw_field in result_dict:
+                    filtered.setdefault(fw_field, result_dict[fw_field])
+            result_dict = filtered
+        result["result"] = result_dict
         if self.retained_mode:
             result["retained_mode"] = self.retained_mode
         return result

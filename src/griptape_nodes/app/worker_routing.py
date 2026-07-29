@@ -83,6 +83,8 @@ from griptape_nodes.retained_mode.events.secrets_events import (
 )
 from griptape_nodes.retained_mode.events.variable_events import (
     GetVariablesRequest,
+    ListVariablesRequest,
+    ResolveSubstitutionRequest,
     SetVariablesRequest,
 )
 from griptape_nodes.retained_mode.managers.event_manager import ResultContext
@@ -134,6 +136,9 @@ FORWARDED_REQUEST_TYPES: frozenset[type[RequestPayload]] = frozenset(
         DeleteSecretValueRequest,
         # variable_events
         GetVariablesRequest,
+        ListVariablesRequest,
+        # DEPRECATED: forwarded only while the shims live. TODO(https://github.com/griptape-ai/griptape-nodes/issues/5143): remove with the shims.
+        ResolveSubstitutionRequest,
         SetVariablesRequest,
     }
 )

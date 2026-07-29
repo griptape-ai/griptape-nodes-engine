@@ -65,19 +65,46 @@ class PublicArtifactUrlParameter:
     def _get_bucket_id(cls, base_url: str, api_key: str, timeout: float | None = None) -> str:
         bucket_id: str | None = cls._get_secret_value(cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
-        if bucket_id is not None:
+        # A blank/whitespace-only secret is treated the same as an unset one: it can't
+        # point at a real bucket and, left alone, produces confusing downstream 404s from
+        # request URLs like `/api/buckets//assets/...`. Validate a configured ID with a
+        # direct GET rather than scanning `list_buckets` -- that endpoint is paginated, so
+        # a valid bucket beyond the first page would otherwise be flagged as invalid.
+        if bucket_id is not None and bucket_id.strip():
+            if not GriptapeCloudStorageDriver.bucket_exists(
+                bucket_id,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            ):
+                msg = (
+                    f"The {cls.BUCKET_ID_NAME} secret is configured to an invalid bucket ID "
+                    f"('{bucket_id}'). No Griptape Cloud storage bucket with that ID exists. "
+                    f"Update the {cls.BUCKET_ID_NAME} secret to a valid bucket ID, or clear it "
+                    "to auto-select a bucket."
+                )
+                raise RuntimeError(msg)
             return bucket_id
 
-        buckets = GriptapeCloudStorageDriver.list_buckets(
+        # Unset or blank secret: fall back to the organization's default bucket. That
+        # bucket is guaranteed to exist and cannot be deleted, so it's a stable fallback --
+        # unlike auto-selecting the first entry of the paginated `list_buckets` result.
+        default_bucket_id = GriptapeCloudStorageDriver.get_default_bucket_id(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout,
         )
-        if len(buckets) == 0:
-            msg = "No Griptape Cloud storage buckets found!"
+        if not default_bucket_id:
+            msg = (
+                f"The {cls.BUCKET_ID_NAME} secret is configured to a blank bucket ID "
+                "and no Griptape Cloud organization default bucket is available to fall back to. "
+                f"Set the {cls.BUCKET_ID_NAME} secret to a valid bucket ID."
+                if bucket_id is not None
+                else "No Griptape Cloud storage buckets found!"
+            )
             raise RuntimeError(msg)
 
-        return buckets[0]["bucket_id"]
+        return default_bucket_id
 
     @classmethod
     def _get_config_value(cls, key: str, default: Any | None = None) -> Any | None:

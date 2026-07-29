@@ -12,6 +12,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.events.project_events import MacroPath
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
 
 class ArtifactFailureReason(StrEnum):
@@ -377,3 +378,51 @@ class GetArtifactSchemasResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
 @PayloadRegistry.register
 class GetArtifactSchemasResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     """Failed to retrieve artifact schemas."""
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckArtifactReadPermissionRequest(RequestPayload):
+    """Ask whether a file may be read under the current authorization policy.
+
+    Routed to the artifact provider that claims the source's extension; that
+    provider inspects the file and asks the authorization hook chain (via the
+    same mechanism used for writes and models). Callers use this before
+    handing a file to a subprocess (ffmpeg, image tools) or loading it into
+    memory, so a denial surfaces before any expensive or side-effecting work.
+
+    A missing provider or unrecognized extension is not an error -- the
+    handler returns ``Success`` with ``denial=None`` (allow) so callers can
+    proceed without special-casing formats no provider gates.
+
+    Args:
+        source_path: Absolute path to the source file.
+
+    Results: ``CheckArtifactReadPermissionResultSuccess`` (allowed or denied,
+        with the denial payload included on denial) |
+        ``CheckArtifactReadPermissionResultFailure`` (only for genuinely
+        malformed requests, e.g. an empty path).
+    """
+
+    source_path: str
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckArtifactReadPermissionResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Read-permission verdict for one file.
+
+    Attributes:
+        denial: ``None`` when the read is permitted; a ``CheckpointDenial``
+            (from ``griptape_nodes.retained_mode.managers.authorization_checkpoint``)
+            carrying the policy failure otherwise. Callers surface
+            ``denial.reason()`` in their own error UI on denial.
+    """
+
+    denial: CheckpointDenial | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class CheckArtifactReadPermissionResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """The read-permission request itself was malformed (e.g. empty source path)."""

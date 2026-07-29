@@ -576,3 +576,244 @@ class TestAccessManager:
         assert result.verdicts[0].model_id == "not_in_catalog"
         assert result.verdicts[0].provider_model_id is None
         assert seen_attributes == [{"id": "not_in_catalog"}]
+
+
+class TestCodecAccess:
+    """`QueryCodecAccessRequest` mirrors `QueryModelAccessRequest` for codec dropdowns.
+
+    Direction (`"read"` / `"write"`) picks the checkpoint action so a codec
+    that is legal to read but not legal to encode gets different verdicts
+    for the same codec name. An unknown direction is a caller bug and is
+    surfaced via a Failure result, not silently defaulted.
+    """
+
+    def test_read_direction_uses_read_video_codec_action(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultSuccess,
+        )
+
+        seen_actions: list[str] = []
+
+        def record(checkpoint: object) -> None:
+            seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
+
+        griptape_nodes.EventManager().add_authorization_hook(record)
+        try:
+            result = GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(candidate_codecs=["h264"], direction=CodecAccessDirection.READ)
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(record)
+
+        assert isinstance(result, QueryCodecAccessResultSuccess)
+        assert seen_actions == ["ReadVideoCodec"]
+
+    def test_write_direction_uses_write_video_codec_action(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultSuccess,
+        )
+
+        seen_actions: list[str] = []
+
+        def record(checkpoint: object) -> None:
+            seen_actions.append(checkpoint.action)  # type: ignore[attr-defined]
+
+        griptape_nodes.EventManager().add_authorization_hook(record)
+        try:
+            result = GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE)
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(record)
+
+        assert isinstance(result, QueryCodecAccessResultSuccess)
+        assert seen_actions == ["WriteVideoCodec"]
+
+    def test_unknown_direction_returns_failure(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        # Exercises the runtime `case _:` guard for wire-side stray values --
+        # ``direction`` is a StrEnum so pyright catches Python-side typos, but
+        # a request deserialized from the WS boundary can still carry any
+        # string. The handler must surface a clean Failure result rather than
+        # crash on the unhandled case. ``# type: ignore`` is intentional here.
+        from griptape_nodes.retained_mode.events.access_events import (
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultFailure,
+        )
+
+        result = GriptapeNodes.handle_request(
+            QueryCodecAccessRequest(candidate_codecs=["h264"], direction="rewrite")  # type: ignore[arg-type]
+        )
+
+        assert isinstance(result, QueryCodecAccessResultFailure)
+        details = str(result.result_details)
+        assert "'rewrite'" in details or "rewrite" in details
+        assert "read" in details.lower()
+        assert "write" in details.lower()
+
+    def test_container_format_threaded_through_checkpoint_attributes(self, griptape_nodes: GriptapeNodes) -> None:
+        # A policy that only cares about codec+container pairing (e.g. hevc in
+        # mp4 is denied but hevc in mkv is allowed) needs the container to
+        # appear on the checkpoint attributes; the request field carries it.
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultSuccess,
+        )
+
+        seen_attributes: list[dict[str, Any]] = []
+
+        def record(checkpoint: object) -> None:
+            seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
+
+        griptape_nodes.EventManager().add_authorization_hook(record)
+        try:
+            result = GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(
+                    candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE, container_format="mp4"
+                )
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(record)
+
+        assert isinstance(result, QueryCodecAccessResultSuccess)
+        assert seen_attributes == [{"id": "hevc", "container_format": "mp4"}]
+
+    def test_container_format_omitted_when_none(self, griptape_nodes: GriptapeNodes) -> None:
+        # When the caller doesn't scope the query to a container, the attribute
+        # is not populated -- a policy that requires the pairing key still
+        # denies deterministically (missing key), not on a synthesized default.
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+        )
+
+        seen_attributes: list[dict[str, Any]] = []
+
+        def record(checkpoint: object) -> None:
+            seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
+
+        griptape_nodes.EventManager().add_authorization_hook(record)
+        try:
+            GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(candidate_codecs=["h264"], direction=CodecAccessDirection.READ)
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(record)
+
+        assert seen_attributes == [{"id": "h264"}]
+
+    def test_denied_verdict_carries_denial(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_hevc(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "hevc":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="HEVC write is not in your plan."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_hevc)
+        try:
+            result = GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(
+                    candidate_codecs=["h264", "hevc", "vp9"],
+                    direction=CodecAccessDirection.WRITE,
+                    container_format="mp4",
+                )
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc)
+
+        assert isinstance(result, QueryCodecAccessResultSuccess)
+        assert [v.codec for v in result.verdicts] == ["h264", "hevc", "vp9"]
+        assert [v.denial is None for v in result.verdicts] == [True, False, True]
+        # Each verdict carries the container it was queried with, so callers
+        # rendering a per-container dropdown don't have to re-associate.
+        assert all(v.container_format == "mp4" for v in result.verdicts)
+
+    def test_id_attribute_parity_between_query_and_enforcement(
+        self, griptape_nodes: GriptapeNodes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A single hook keying on attributes["id"] must deny both paths for the same codec.
+
+        Regression for the fall-open bug caught in the initial PR review: the
+        enforcement checkpoint originally set only ``CONTAINER_FORMAT`` on
+        ``attributes`` while the query path set ``ID``. A hook written to the
+        model-access convention (`attributes["id"]`) would deny the dropdown
+        but silently allow the actual read/write. Both paths must now surface
+        identical facts to the hook chain.
+        """
+        from griptape_nodes.retained_mode.events.access_events import (
+            CodecAccessDirection,
+            QueryCodecAccessRequest,
+            QueryCodecAccessResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.artifact_providers.video.video_artifact_provider import (
+            VideoArtifactProvider,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        # Hook keys on attributes["id"], the same convention used by every
+        # model-access hook and by our own test-hook examples.
+        seen_attributes: list[dict[str, Any]] = []
+
+        def deny_hevc_by_id(checkpoint: object) -> CheckpointDenial | None:
+            seen_attributes.append(dict(checkpoint.attributes))  # type: ignore[attr-defined]
+            if checkpoint.attributes.get("id") == "hevc":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="hevc is not licensed."),))
+            return None
+
+        # --- Query path: QueryCodecAccessRequest ---
+        griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
+        try:
+            query_result = GriptapeNodes.handle_request(
+                QueryCodecAccessRequest(
+                    candidate_codecs=["hevc"], direction=CodecAccessDirection.WRITE, container_format="mp4"
+                )
+            )
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
+
+        assert isinstance(query_result, QueryCodecAccessResultSuccess)
+        assert query_result.verdicts[0].denial is not None
+        query_attrs = seen_attributes[-1]
+
+        # --- Enforcement path: VideoArtifactProvider.check_write_format_from_path ---
+        # Monkeypatch ffprobe so we can inject a canned codec without shelling
+        # out. The read-side path is functionally identical (both go through
+        # ``_evaluate_codec_checkpoint``), so exercising the write side is
+        # sufficient to prove the enforcement checkpoint carries ``id``.
+        canned_probe = {"streams": [{"codec_type": "video", "codec_name": "hevc"}]}
+        monkeypatch.setattr(VideoArtifactProvider, "_run_ffprobe", classmethod(lambda cls, source_path: canned_probe))  # noqa: ARG005
+
+        provider = VideoArtifactProvider(registry=None)  # type: ignore[arg-type]
+
+        seen_attributes.clear()
+        griptape_nodes.EventManager().add_authorization_hook(deny_hevc_by_id)
+        try:
+            # OSManager stages before calling this; a stand-in path is fine
+            # since ffprobe is mocked.
+            enforcement_denial = provider.check_write_format_from_path("/tmp/staged.mp4", "mp4")  # noqa: S108
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_hevc_by_id)
+
+        # The critical assertion: the enforcement path denies for the SAME
+        # hook shape that the query path denies for.
+        assert enforcement_denial is not None
+        enforcement_attrs = seen_attributes[-1]
+
+        # Both paths must present the codec via attributes["id"] so any hook
+        # written to the model-access convention behaves identically on both.
+        assert query_attrs.get("id") == "hevc"
+        assert enforcement_attrs.get("id") == "hevc"
+        # Enforcement also carries the container it inferred from the sniff;
+        # query carries the container the caller supplied.
+        assert query_attrs.get("container_format") == "mp4"
+        assert enforcement_attrs.get("container_format") == "mp4"

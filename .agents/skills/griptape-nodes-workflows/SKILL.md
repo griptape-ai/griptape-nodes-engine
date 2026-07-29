@@ -419,7 +419,7 @@ flow keeps running in the engine until it finishes or errors. A subsequent
 
 ## Custom nodes
 
-If the task involves writing a new node type via `RegisterSandboxNodeFromSourceRequest`, read [`docs/developing_nodes/comprehensive_guide.md`](../../developing_nodes/comprehensive_guide.md) **before** drafting source. The guide documents the engine-side conventions a sandbox class must follow:
+If the task involves writing a new node type via `RegisterSandboxNodeFromSourceRequest`, read the [node development overview](../../docs/development/custom_nodes/index.md), [parameters reference](../../docs/development/custom_nodes/parameters.md), and [execution and lifecycle guide](../../docs/development/custom_nodes/execution_and_lifecycle.md) **before** drafting source. These pages document the engine-side conventions a sandbox class must follow:
 
 - `BaseNode` subclassing and the `process` / `aprocess` contract
 - `Parameter` declaration, modes (`mode_allowed_input` / `..._property` / `..._output`), traits
@@ -434,7 +434,7 @@ agent is responsible for placing the `.py` file under
 e.g. pi's `write`) before issuing the request. The imported source then runs inside
 the engine process with no isolation, so matching the conventions up front is faster
 than iterating on registration failures. For pure workflow-driving tasks (build →
-wire → run → read) the guide is overkill — stick to this skill.
+wire → run → read) the guides are overkill — stick to this skill.
 
 ## Example: One-Shot Haiku Pipeline
 

@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
 
 from griptape_nodes.retained_mode.events.base_events import (
     RequestPayload,
@@ -8,6 +9,19 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+
+
+class CodecAccessDirection(StrEnum):
+    """Direction a ``QueryCodecAccessRequest`` is asking about.
+
+    Values are the wire strings clients send. Using ``StrEnum`` means
+    parameter values coming back from the WS boundary as plain strings
+    (``"read"`` / ``"write"``) match without an explicit ``.value`` lookup,
+    while the type still catches typos on the Python side.
+    """
+
+    READ = "read"
+    WRITE = "write"
 
 
 @dataclass(frozen=True)
@@ -162,3 +176,65 @@ class QueryModelAccessForCatalogResultSuccess(WorkflowNotAlteredMixin, ResultPay
     """
 
     verdicts: list[ModelAccessVerdict] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CodecAccessVerdict:
+    """The per-codec authorization verdict for one candidate.
+
+    ``codec`` is the codec name the engine evaluated (e.g. ``"h264"``, ``"hevc"``).
+    ``container_format`` is the container the caller was pairing the codec with
+    (e.g. ``"mp4"``), passed through verbatim from the request; ``None`` when the
+    caller did not attribute one. ``denial`` is ``None`` when the codec/container
+    pair is allowed, or a ``CheckpointDenial`` carrying the failure tuple.
+    """
+
+    codec: str
+    container_format: str | None
+    denial: CheckpointDenial | None
+
+
+@dataclass
+@PayloadRegistry.register
+class QueryCodecAccessRequest(RequestPayload):
+    """'Are these codecs allowed for this direction?': the codec analogue of QueryModelAccess.
+
+    Use to filter a node's codec dropdown against the same policy that gates
+    the actual file I/O. Each candidate codec is evaluated with a
+    ``READ_VIDEO_CODEC`` or ``WRITE_VIDEO_CODEC`` checkpoint; the checkpoint
+    carries ``ID`` (the codec name) and, when supplied, ``CONTAINER_FORMAT``.
+
+    Args:
+        candidate_codecs: Codec names to evaluate, in input order.
+        direction: ``"read"`` or ``"write"``, deciding which checkpoint action
+            fires per candidate.
+        container_format: Optional container the codecs are being paired with
+            (e.g. ``"mp4"``). Passed through as the ``CONTAINER_FORMAT``
+            attribute so a policy can gate on the pairing rather than the
+            codec alone.
+
+    Results: ``QueryCodecAccessResultSuccess`` (one verdict per candidate, in
+        input order).
+    """
+
+    candidate_codecs: list[str] = field(default_factory=list)
+    direction: CodecAccessDirection = CodecAccessDirection.READ
+    container_format: str | None = None
+
+
+@dataclass
+@PayloadRegistry.register
+class QueryCodecAccessResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """One verdict per candidate codec, in input order. Length equals the request's candidate count.
+
+    Args:
+        verdicts: Ordered list of per-codec verdicts.
+    """
+
+    verdicts: list[CodecAccessVerdict] = field(default_factory=list)
+
+
+@dataclass
+@PayloadRegistry.register
+class QueryCodecAccessResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Codec access query failed. Common cause: unknown ``direction`` value."""

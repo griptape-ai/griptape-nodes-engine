@@ -1448,13 +1448,13 @@ class BaseNode(ABC):
         variables = VariableResolver.get_variables_if_enabled(self.name)
         if variables is None:
             return value
-        return VariableResolver.resolve_value(value, variables)
+        return VariableResolver.resolve_value(value, variables, self.name)
 
     def _resolve_variables_in_string(self, text: str) -> str:
         variables = VariableResolver.get_variables_if_enabled(self.name)
         if variables is None:
             return text
-        return VariableResolver.resolve_string(text, variables)
+        return VariableResolver.resolve_string(text, variables, self.name)
 
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.

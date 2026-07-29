@@ -1,6 +1,6 @@
 """Generate the configuration reference doc from the Settings model.
 
-Renders docs/configuration_reference.md from Settings.model_json_schema() so the
+Renders docs/reference/configuration_reference.md from Settings.model_json_schema() so the
 per-setting reference (type, default, env var, description) cannot drift from the
 code. Run via `make docs/settings-reference`; `make docs` runs it before building.
 
@@ -18,7 +18,7 @@ import mdformat
 
 from griptape_nodes.retained_mode.managers.settings import Settings
 
-OUTPUT_PATH = Path(__file__).resolve().parent.parent / "docs" / "configuration_reference.md"
+OUTPUT_PATH = Path(__file__).resolve().parent.parent / "docs" / "reference" / "configuration_reference.md"
 
 BANNER = (
     "<!-- GENERATED FILE - DO NOT EDIT BY HAND.\n"
@@ -172,7 +172,7 @@ def _render_markdown(rows: list[SettingRow]) -> str:
     lines = [BANNER, "# Configuration Reference", ""]
     lines.append(
         "Every Griptape Nodes engine setting, grouped by category. Each setting can be placed in any "
-        "`griptape_nodes_config.json` file (see [Engine Configuration](configuration.md) for the load "
+        "`griptape_nodes_config.json` file (see [Engine Configuration](../guides/configuration.md) for the load "
         "order). Settings with a `GTN_CONFIG_*` env var can also be overridden from the environment; "
         "nested settings must be edited in a config file."
     )

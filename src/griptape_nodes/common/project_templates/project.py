@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 from typing import TYPE_CHECKING, ClassVar
 
+import semver
 from pydantic import BaseModel, Field, ValidationError
 from ruamel.yaml import YAML
 
@@ -16,6 +17,7 @@ from griptape_nodes.common.project_templates.validation import (
     ProjectOverrideCategory,
     ProjectValidationInfo,
 )
+from griptape_nodes.common.project_templates.variable import ProjectVariableDef
 
 if TYPE_CHECKING:
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
@@ -43,7 +45,7 @@ def build_project_yaml() -> YAML:
 class ProjectTemplate(BaseModel):
     """Complete project template loaded from project.yml."""
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.5.2"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "1.0.0"
 
     project_template_schema_version: str = Field(description="Schema version for the project template")
     name: str = Field(description="Name of the project")
@@ -117,6 +119,16 @@ class ProjectTemplate(BaseModel):
         description="Directory definitions (logical_name -> definition)",
     )
     environment: dict[str, str] = Field(default_factory=dict, description="Custom environment variables")
+    variables: dict[str, ProjectVariableDef] = Field(
+        default_factory=dict,
+        description=(
+            "User-defined project variables (variable_name -> definition). At template load these "
+            "populate the project's stored variable layer, where they participate in hierarchical "
+            "variable lookup (flow > project > global) and {VAR} macro resolution. Unlike builtins "
+            "and directories, these names are not reserved, and read_write entries are writable at "
+            "runtime (writes persist back to this file as an overlay)."
+        ),
+    )
     file_extension_directories: dict[str, str] = Field(
         default_factory=dict,
         description="Mapping of file extension (without leading dot) to a macro (plain name or `{...}` template) used to populate the {file_extension_directory} macro variable. This variable is only available inside situation macros (the filename layer, resolved per-file at write time), not in directory or environment path_macros.",
@@ -149,7 +161,7 @@ class ProjectTemplate(BaseModel):
         base_dump = base.model_dump(mode="json")
 
         output: dict = {
-            "project_template_schema_version": self_dump["project_template_schema_version"],
+            "project_template_schema_version": self._version_to_write(self_dump["project_template_schema_version"]),
             "name": self_dump["name"],
         }
 
@@ -176,15 +188,26 @@ class ProjectTemplate(BaseModel):
         elif self_dump.get("parent_project_path") != base_dump.get("parent_project_path"):
             output["parent_project_path"] = self_dump.get("parent_project_path")
 
-        # workspace_dir: emit only when it diverges from base. The stored value is the
-        # raw string or per-platform mapping (never absolutized), so a relative path
-        # round-trips verbatim. An explicit null tombstones an inherited value.
-        if self_dump.get("workspace_dir") != base_dump.get("workspace_dir"):
+        # workspace_dir / libraries_dir are OWN-NODE fields: merge() takes them from the overlay
+        # alone and never inherits them from the base (see merged_workspace_dir/merged_libraries_dir),
+        # so they must NOT be diffed against the base like the merge-inherited fields below. Diffing
+        # would drop a child value that happens to equal the parent's (e.g. a child workspace_dir "./"
+        # matching the parent's "./"). Because these fields don't merge-inherit, that dropped value is
+        # NOT re-supplied from the base at merge time -- the child ends up with no own value and must
+        # fall through the resolution ladder instead of keeping its intended "./". The ladder DOES
+        # inherit an ancestor's value up the parent chain, but relative to the ANCESTOR's directory
+        # (decide_workspace branch 4 / decide_libraries_root branch 1), so silently substituting that
+        # for a child's own "./" would resolve to the ancestor's folder rather than the child's -- a
+        # different location. Emitting the child's own value keeps it self-scoped as intended.
+        # Emit whenever a value is set (like `id` above); a None value is omitted. For an OMITTED
+        # value, the ladder resolves up the chain to the nearest ancestor that declares one
+        # (decide_libraries_root branch 1 / decide_workspace branch 4). The stored value is the raw
+        # string or per-platform mapping
+        # (never absolutized), so a relative path round-trips verbatim.
+        if self_dump.get("workspace_dir") is not None:
             output["workspace_dir"] = self_dump.get("workspace_dir")
 
-        # libraries_dir: same semantics as workspace_dir. Raw string/mapping stored
-        # verbatim; emitted only when it diverges from base; explicit null tombstones.
-        if self_dump.get("libraries_dir") != base_dump.get("libraries_dir"):
+        if self_dump.get("libraries_dir") is not None:
             output["libraries_dir"] = self_dump.get("libraries_dir")
 
         situations_overlay = self._diff_named_items(self_dump["situations"], base_dump["situations"])
@@ -198,6 +221,10 @@ class ProjectTemplate(BaseModel):
         environment_overlay = self._diff_environment(self_dump["environment"], base_dump["environment"])
         if environment_overlay:
             output["environment"] = environment_overlay
+
+        variables_overlay = self._diff_named_items(self_dump.get("variables", {}), base_dump.get("variables", {}))
+        if variables_overlay:
+            output["variables"] = variables_overlay
 
         file_extension_directories_overlay = self._diff_environment(
             self_dump.get("file_extension_directories", {}),
@@ -222,6 +249,36 @@ class ProjectTemplate(BaseModel):
         removed = {key: None for key in base_env if key not in self_env}
         return {**changed, **removed}
 
+    @classmethod
+    def _version_to_write(cls, loaded_version: str) -> str:
+        """Decide the schema version to stamp on save, per the version-fork policy.
+
+        A save advances the version to the latest within the SAME major (minor/patch bumps
+        are additive, so the label can roll forward freely), but never crosses a major: a v0
+        project rolls up to the latest 0.x, never to 1.x, because the next major carries a
+        different defaults baseline that could relocate the project. Crossing a major is an
+        explicit, opt-in upgrade handled elsewhere. The bump is one-directional: a version
+        already at or beyond the latest-for-its-major is left untouched (never downgraded).
+        """
+        # Lazy import: default_project_template imports ProjectTemplate, so importing it at
+        # module scope here is a circular dependency. The per-major latest lives there because
+        # it is the version each per-major default template declares.
+        from griptape_nodes.common.project_templates.default_project_template import latest_version_for_major
+
+        latest_in_major = latest_version_for_major(loaded_version)
+        if latest_in_major is None:
+            return loaded_version
+        # latest_in_major came from a registered template (always valid semver); guard the
+        # comparison so a loaded version that is not full semver is left untouched rather than
+        # raising on the save path (the version is user-controlled).
+        try:
+            loaded_is_behind = semver.VersionInfo.parse(latest_in_major) > semver.VersionInfo.parse(loaded_version)
+        except ValueError:
+            return loaded_version
+        if loaded_is_behind:
+            return latest_in_major
+        return loaded_version
+
     def to_yaml(self) -> str:
         """Export the complete, fully-resolved project template as YAML.
 
@@ -230,7 +287,9 @@ class ProjectTemplate(BaseModel):
         (e.g., Griptape Cloud bundles) that receive the project on its own
         and have no DEFAULT_PROJECT_TEMPLATE to layer an overlay on top of.
         """
-        return self._dump_yaml(self.model_dump(mode="json", exclude_none=True))
+        data = self.model_dump(mode="json", exclude_none=True)
+        data["project_template_schema_version"] = self._version_to_write(data["project_template_schema_version"])
+        return self._dump_yaml(data)
 
     @staticmethod
     def _dump_yaml(data: dict) -> str:
@@ -446,6 +505,45 @@ class ProjectTemplate(BaseModel):
                 action=action,
             )
 
+        # Merge variables (per-entry atomic like situations/directories: an overlay
+        # entry replaces the base entry wholesale; null tombstones drop inherited
+        # entries). Entries are pydantic-validated here — a bad entry becomes a
+        # validation error, not a crash, and is skipped from the merged result.
+        merged_variables: dict[str, ProjectVariableDef] = {}
+        for var_name, base_var in base.variables.items():
+            if var_name in overlay.removed_variables:
+                validation_info.add_override(
+                    category=ProjectOverrideCategory.VARIABLE,
+                    name=var_name,
+                    action=ProjectOverrideAction.REMOVED,
+                )
+                continue
+            if var_name not in overlay.variables:
+                merged_variables[var_name] = base_var
+        for var_name, var_data in overlay.variables.items():
+            if var_name in overlay.removed_variables:
+                continue
+            var_data_with_name = {"name": var_name, **var_data}
+            try:
+                merged_variables[var_name] = ProjectVariableDef.model_validate(var_data_with_name)
+            except ValidationError as e:
+                for error in e.errors():
+                    error_field_path = ".".join(str(loc) for loc in error["loc"])
+                    full_field_path = f"variables.{var_name}.{error_field_path}"
+                    validation_info.add_error(
+                        field_path=full_field_path,
+                        message=error["msg"],
+                        line_number=overlay.line_info.get_line(full_field_path)
+                        or overlay.line_info.get_line(f"variables.{var_name}"),
+                    )
+                continue
+            action = ProjectOverrideAction.MODIFIED if var_name in base.variables else ProjectOverrideAction.ADDED
+            validation_info.add_override(
+                category=ProjectOverrideCategory.VARIABLE,
+                name=var_name,
+                action=action,
+            )
+
         # Merge file_extension_directories (same semantics as environment: per-key
         # overwrite, null tombstones drop inherited entries).
         merged_file_extension_directories = {**base.file_extension_directories}
@@ -520,6 +618,7 @@ class ProjectTemplate(BaseModel):
             situations=merged_situations,
             directories=merged_directories,
             environment=merged_environment,
+            variables=merged_variables,
             file_extension_directories=merged_file_extension_directories,
             description=merged_description,
         )

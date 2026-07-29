@@ -37,6 +37,8 @@ class CheckpointAction(StrEnum):
     OFFER_MODEL = "OfferModel"
     LOAD_PROJECT = "LoadProject"
     ACTIVATE_PROJECT = "ActivateProject"
+    READ_VIDEO_CODEC = "ReadVideoCodec"
+    WRITE_VIDEO_CODEC = "WriteVideoCodec"
 
 
 class CheckpointSubjectType(StrEnum):
@@ -46,6 +48,7 @@ class CheckpointSubjectType(StrEnum):
     NODE_TYPE = "NodeType"
     MODEL = "Model"
     PROJECT = "Project"
+    VIDEO_CODEC = "VideoCodec"
 
 
 class CheckpointAttribute(StrEnum):
@@ -72,6 +75,7 @@ class CheckpointAttribute(StrEnum):
     PROVIDER_IDS = "provider_ids"
     MODEL_FAMILIES = "model_families"
     NODE_TYPE = "node_type"
+    CONTAINER_FORMAT = "container_format"
 
 
 @dataclass(frozen=True)

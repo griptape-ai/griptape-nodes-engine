@@ -373,6 +373,15 @@ class ExecuteDagState(State):
             node_reference (DagOrchestrator.DagNode): The node to collect values for.
         """
         current_node = node_reference.node_reference
+
+        # A locked node is frozen: it is skipped for execution and keeps its existing output
+        # values so downstream nodes consume those frozen outputs. Pushing an upstream value into
+        # it would be rejected by the SetParameterValueRequest handler and escalated into a fatal
+        # error, so halt propagation into the locked node quietly instead. Mirrors the
+        # editor/manual set-parameter path, which already skips locked destination nodes.
+        if current_node.lock:
+            return
+
         connections = GriptapeNodes.FlowManager().get_connections()
 
         for parameter in current_node.parameters:

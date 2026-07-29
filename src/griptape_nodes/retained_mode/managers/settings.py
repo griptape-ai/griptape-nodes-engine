@@ -22,6 +22,7 @@ WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY = "library.dependency_install_behavior"
+LIBRARY_MINIMUM_RELEASE_AGE_KEY = "library.minimum_release_age"
 
 
 class Category(BaseModel):
@@ -295,6 +296,21 @@ class LibrarySettings(BaseModel):
             "Controls automatic installation of library dependencies declared in library manifests. "
             "'always' downloads and installs them on registration. "
             "'never' skips installation and marks the library as degraded if required dependencies are missing."
+        ),
+    )
+    minimum_release_age: float = Field(
+        default=0.0,
+        description=(
+            "Minimum age, in hours, of the target release before a library update is applied. When 0 (the "
+            "default), updates apply as soon as they are available. When greater than 0, an update is "
+            "withheld until the commit it would move to is at least this many hours old, guarding against "
+            "automatically adopting a freshly-pushed release before there is time to catch and yank a bad "
+            "one. If the target commit's age cannot be determined (e.g. the remote timestamp is unreadable), "
+            "the update is allowed (fail-open) and a warning is logged, so a metadata hiccup never "
+            "permanently blocks updates. Age is measured from the target commit's git committer timestamp, "
+            "which is not necessarily when the release was published: rebased, cherry-picked, backdated "
+            "(GIT_COMMITTER_DATE), or force-moved tags can report an age that differs from the actual publish "
+            "time."
         ),
     )
 

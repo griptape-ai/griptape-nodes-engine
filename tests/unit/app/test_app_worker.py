@@ -462,6 +462,32 @@ class TestSpawnWorker:
         mock_exec.assert_called_once_with(*args, env=ANY)
         assert worker_manager._managed_worker_processes["My Library"] is mock_proc
 
+    @pytest.mark.asyncio
+    async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:
+        # The worker must learn its parent orchestrator's id so it can report it in its
+        # discovery heartbeat (orchestrator_engine_id), which the GUI uses to nest workers.
+        worker_manager._griptape_nodes.EngineIdentityManager().active_engine_id = _ENGINE  # type: ignore[union-attr]
+
+        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert env["GTN_ORCHESTRATOR_ENGINE_ID"] == _ENGINE
+        # The worker still gets its own fresh engine id, distinct from the orchestrator's.
+        assert env["GTN_ENGINE_ID"] != _ENGINE
+
+    @pytest.mark.asyncio
+    async def test_spawn_env_omits_orchestrator_id_when_unknown(self, worker_manager: WorkerManager) -> None:
+        # Defensive: never put a None into the subprocess env dict. If the orchestrator has
+        # no id yet, the key is simply absent (worker heartbeats as an orchestrator).
+        worker_manager._griptape_nodes.EngineIdentityManager().active_engine_id = None  # type: ignore[union-attr]
+
+        with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
+            await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
+
+        env = mock_exec.call_args.kwargs["env"]
+        assert "GTN_ORCHESTRATOR_ENGINE_ID" not in env
+
 
 class TestResetWorkers:
     @pytest.mark.asyncio

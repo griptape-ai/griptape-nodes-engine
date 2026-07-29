@@ -327,7 +327,15 @@ class WorkerManager:
         # would bake the orchestrator's current-project env vars into the worker's restore
         # baseline, leaving the worker unable to unset them on a later project switch.
         base_environ = self._griptape_nodes.ProjectManager().get_pre_project_environ()
-        proc = await asyncio.create_subprocess_exec(*args, env={**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
+        # Stamp the spawning orchestrator's id so the worker can report it in its discovery
+        # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
+        # The orchestrator always has an id by the time it spawns a worker; guard the None
+        # case anyway so a subprocess env value is never None.
+        orchestrator_engine_id = self._griptape_nodes.EngineIdentityManager().active_engine_id
+        if orchestrator_engine_id is not None:
+            worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
+        proc = await asyncio.create_subprocess_exec(*args, env=worker_environ)
         # Record the loop that owns this subprocess so termination can hop back to it.
         # All spawns run on the engine event-queue loop, so this is idempotent.
         self._spawn_loop = asyncio.get_running_loop()

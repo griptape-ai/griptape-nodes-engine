@@ -88,15 +88,49 @@ class ListCapableLibraryEventHandlersRequest(RequestPayload):
 
 
 @dataclass
+class LibraryEventHandlerDetails:
+    """Presentation metadata for a single capable library event handler.
+
+    Carries the optional, human-facing fields a library may register alongside its
+    handler so a frontend can render the handler in a menu/dropdown without falling
+    back to the raw library name. All presentation fields are optional; when they are
+    None the frontend should preserve today's behavior (render the library name, no
+    description, no icon).
+
+    Args:
+        library_name: Name of the library that registered the handler. Matches the
+            corresponding entry in ListCapableLibraryEventHandlersResultSuccess.handlers.
+        display_name: Optional human-readable name for the handler (e.g. a publishing
+            target). None means fall back to library_name.
+        description: Optional short description shown alongside the handler. None means
+            no description.
+        icon: Optional icon identifier — a Lucide icon name or a path/URL to an image
+            the frontend renders as-is (not raw image data). None means no icon.
+    """
+
+    library_name: str
+    display_name: str | None = None
+    description: str | None = None
+    icon: str | None = None
+
+
+@dataclass
 @PayloadRegistry.register
 class ListCapableLibraryEventHandlersResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Event handlers listed successfully.
 
     Args:
-        handlers: List of library names capable of handling the event type
+        handlers: List of library names capable of handling the event type.
+        handler_details: Per-handler presentation metadata, one entry per library in
+            ``handlers`` (same order). Present so a frontend can render richer menu
+            entries (display name, description, icon) for handlers whose registration
+            supplied them. Handlers that registered no presentation metadata still get
+            an entry with only ``library_name`` populated, so existing consumers that
+            read only ``handlers`` are unaffected.
     """
 
     handlers: list[str]
+    handler_details: list[LibraryEventHandlerDetails] = field(default_factory=list)
 
 
 @dataclass
@@ -951,6 +985,13 @@ class CheckLibraryUpdateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
         git_ref: The current git reference (branch, tag, or commit)
         local_commit: The local HEAD commit SHA (None if not a git repository)
         remote_commit: The remote HEAD commit SHA (None if not available)
+        update_gated_by_age: True when an update exists but is withheld because the target commit
+            is younger than the configured minimum release age (library.minimum_release_age). When
+            True, has_update is also True.
+        target_commit_age_hours: Age in hours of the target commit at check time, or None when
+            unknown (e.g. no update available or the commit timestamp could not be read).
+        minimum_release_age_hours: The configured minimum release age in hours, or None when the
+            gate is disabled (library.minimum_release_age is 0).
     """
 
     has_update: bool
@@ -960,6 +1001,9 @@ class CheckLibraryUpdateResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSucc
     git_ref: str | None
     local_commit: str | None
     remote_commit: str | None
+    update_gated_by_age: bool = False
+    target_commit_age_hours: float | None = None
+    minimum_release_age_hours: float | None = None
 
 
 @dataclass
@@ -1016,10 +1060,14 @@ class UpdateLibraryResultFailure(ResultPayloadFailure):
             the absolute path of that directory. Provided as a structured field so clients do not
             have to parse it out of the human-readable error message (which is unreliable for paths
             containing ``:``, e.g. Windows drive letters).
+        age_gated: True when the update was withheld because the target commit is younger than the
+            configured minimum release age (library.minimum_release_age). This is not a hard error;
+            the update will succeed once the target commit is old enough.
     """
 
     retryable: bool = False
     existing_path: str | None = None
+    age_gated: bool = False
 
 
 @dataclass
@@ -1206,6 +1254,8 @@ class SyncLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         libraries_downloaded: Number of libraries that were downloaded from git URLs
         libraries_checked: Number of libraries checked for updates
         libraries_updated: Number of libraries that were updated
+        libraries_deferred: Number of libraries with an available update that was withheld by the
+            age gate and therefore not applied this sync
         update_summary: Dict mapping library names to their update info (old_version -> new_version, or status for downloads)
     """
 
@@ -1213,6 +1263,7 @@ class SyncLibrariesResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
     libraries_checked: int
     libraries_updated: int
     update_summary: dict[str, dict[str, str]]
+    libraries_deferred: int = 0
 
 
 @dataclass

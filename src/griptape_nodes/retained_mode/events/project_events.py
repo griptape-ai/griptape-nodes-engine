@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 
 # Runtime import (not TYPE_CHECKING): the Path-typed request fields below rely on
@@ -278,15 +278,18 @@ class GetSituationRequest(RequestPayload):
     Returns the complete SituationTemplate including macro and policy.
 
     Use when: Need situation macro and/or policy for file operations.
-    Uses the current project for context.
 
     Args:
         situation_name: Name of the situation template (e.g., "save_node_output")
+        project_id: Which project's template to read. None means the current project.
+            Passing a loaded-but-not-current project id supports hypothetical
+            resolution ("what does this situation look like on project Y?").
 
     Results: GetSituationResultSuccess | GetSituationResultFailure
     """
 
     situation_name: str
+    project_id: str | None = None
 
 
 @dataclass
@@ -315,8 +318,7 @@ class GetPathForMacroRequest(RequestPayload):
 
     Use when: Resolving paths, saving files. Works with any macro string, not tied to situations.
 
-    Uses the current project for context. Caller must parse the macro string
-    into a ParsedMacro before creating this request.
+    Caller must parse the macro string into a ParsedMacro before creating this request.
 
     Args:
         parsed_macro: The parsed macro to resolve
@@ -326,6 +328,11 @@ class GetPathForMacroRequest(RequestPayload):
             write-path contract. Preview / display callers should pass
             ``RENDER_SEQUENCE_PATTERN`` so the slot renders as its source
             pattern instead of failing. See ``UnresolvedSequenceSlotBehavior``.
+        project_id: Which project's context (directories, env, project_dir) to resolve
+            against. None means the current project. Passing a loaded-but-not-current
+            project id answers "how WOULD this macro resolve on that project?" —
+            workflow_name/workflow_dir still come from the live workflow context, and
+            workspace_dir from the engine config, regardless of project_id.
 
     Results: GetPathForMacroResultSuccess | GetPathForMacroResultFailure
     """
@@ -333,6 +340,7 @@ class GetPathForMacroRequest(RequestPayload):
     parsed_macro: ParsedMacro
     variables: MacroVariables
     unresolved_sequence_slot_behavior: UnresolvedSequenceSlotBehavior = UnresolvedSequenceSlotBehavior.FAIL
+    project_id: str | None = None
 
 
 @dataclass
@@ -516,8 +524,7 @@ class AttemptMatchPathAgainstMacroRequest(RequestPayload):
     Use when: Validating paths, extracting info from file paths,
     identifying which schema produced a file.
 
-    Uses the current project for context. Caller must parse the macro string
-    into a ParsedMacro before creating this request.
+    Caller must parse the macro string into a ParsedMacro before creating this request.
 
     Pattern non-matches are returned as success with match_failure populated.
     Only true system errors (missing SecretsManager, etc.) return failure.
@@ -526,6 +533,15 @@ class AttemptMatchPathAgainstMacroRequest(RequestPayload):
         parsed_macro: Parsed macro template to match against
         file_path: Path string to test
         known_variables: Variables we already know
+        auto_resolve_builtins: If True, the handler resolves every builtin variable
+            (workspace_dir, workflow_dir, ...) from the selected project and merges
+            them under ``known_variables`` (caller wins on collision). Use when
+            reverse-matching a path against a macro that depends on directory
+            anchors and the caller doesn't already have those values in hand.
+            Default False preserves strict-match semantics.
+        project_id: Which project's context to auto-resolve builtins against. None
+            means the current project. Only consulted when auto_resolve_builtins is
+            True — a strict match uses the caller's known_variables verbatim.
 
     Results: AttemptMatchPathAgainstMacroResultSuccess | AttemptMatchPathAgainstMacroResultFailure
     """
@@ -533,6 +549,8 @@ class AttemptMatchPathAgainstMacroRequest(RequestPayload):
     parsed_macro: ParsedMacro
     file_path: str
     known_variables: MacroVariables
+    auto_resolve_builtins: bool = False
+    project_id: str | None = None
 
 
 @dataclass
@@ -563,18 +581,21 @@ class GetStateForMacroRequest(RequestPayload):
     Use when: Building UI forms, real-time validation, checking if resolution
     would succeed before actually resolving.
 
-    Uses the current project for context. Caller must parse the macro string
-    into a ParsedMacro before creating this request.
+    Caller must parse the macro string into a ParsedMacro before creating this request.
 
     Args:
         parsed_macro: The parsed macro to analyze
         variables: Currently provided variable values
+        project_id: Which project's context (directories, builtins) to analyze
+            against. None means the current project. Passing a loaded-but-not-current
+            project id answers "COULD this macro resolve on that project?"
 
     Results: GetStateForMacroResultSuccess | GetStateForMacroResultFailure
     """
 
     parsed_macro: ParsedMacro
     variables: MacroVariables
+    project_id: str | None = None
 
 
 @dataclass
@@ -626,6 +647,9 @@ class AttemptMapAbsolutePathToProjectRequest(RequestPayload):
 
     Args:
         absolute_path: The absolute filesystem path to check
+        project_id: Which project's directories to map against. None means the
+            current project. Passing a loaded-but-not-current project id supports
+            hypothetical mapping ("would this path be inside project Y?").
 
     Results: AttemptMapAbsolutePathToProjectResultSuccess | AttemptMapAbsolutePathToProjectResultFailure
 
@@ -644,6 +668,7 @@ class AttemptMapAbsolutePathToProjectRequest(RequestPayload):
     """
 
     absolute_path: Path
+    project_id: str | None = None
 
 
 @dataclass
@@ -730,7 +755,15 @@ class UnregisterProjectTemplateResultFailure(WorkflowNotAlteredMixin, ResultPayl
 @dataclass
 @PayloadRegistry.register
 class GetAllSituationsForProjectRequest(RequestPayload):
-    """Get all situation names and schemas from current project template."""
+    """Get all situation names and schemas from a project template.
+
+    Args:
+        project_id: Which project's template to read. None means the current project.
+            Passing a loaded-but-not-current project id supports hypothetical
+            resolution ("what situations does project Y define?").
+    """
+
+    project_id: str | None = None
 
 
 @dataclass
@@ -738,7 +771,10 @@ class GetAllSituationsForProjectRequest(RequestPayload):
 class GetAllSituationsForProjectResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
     """Success result containing all situations."""
 
-    situations: dict[str, str]
+    situations: dict[str, str]  # name -> macro
+    # name -> description. Optional and defaulted so existing callers that don't
+    # read descriptions are unaffected; consumers that want richer dropdowns can opt in.
+    descriptions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -939,4 +975,61 @@ class ImportProjectResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
     - archive missing / not a zip / manifest absent / incompatible schema
     - target project file already exists and overwrite_existing is False
     - extraction or re-registration failed
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaRequest(RequestPayload):
+    """Electively upgrade a loaded project to the latest schema MAJOR version.
+
+    A within-major version advance happens automatically on save; crossing a MAJOR
+    (e.g. 0.x -> 1.0.0) does not, because the new major carries a different defaults
+    baseline that can change where the project resolves its workspace, libraries, and
+    file destinations. This request performs that crossing explicitly: it re-reads the
+    project's explicit overrides (its own overlay, not the materialized old-major
+    defaults), restamps to the latest version, and re-merges onto the new-major base, so
+    the project ADOPTS the new-major defaults for everything it did not explicitly override.
+
+    BREAKING: this is opt-in and may change the project's effective layout. Only the
+    project's explicit overrides are preserved; previously-default values are dropped so
+    they pick up the new-major defaults (it does not pin old behavior).
+
+    Use when: the user explicitly chooses to upgrade an outdated project.
+
+    Args:
+        project_id: Opaque id of the loaded project template to upgrade.
+
+    Results: UpgradeProjectSchemaResultSuccess | UpgradeProjectSchemaResultFailure
+    """
+
+    project_id: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Project upgraded to the latest schema major.
+
+    Args:
+        project_id: The upgraded project's id.
+        previous_schema_version: The schema version before the upgrade.
+        new_schema_version: The schema version written (the latest).
+    """
+
+    project_id: str
+    previous_schema_version: str
+    new_schema_version: str
+
+
+@dataclass
+@PayloadRegistry.register
+class UpgradeProjectSchemaResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    """Project schema upgrade failed.
+
+    Common causes:
+    - project_id not loaded
+    - project has no backing file (e.g. system defaults)
+    - already at the latest major
+    - save/write failure
     """

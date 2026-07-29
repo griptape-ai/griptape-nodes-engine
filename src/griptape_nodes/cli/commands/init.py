@@ -24,7 +24,11 @@ from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import Griptap
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import LIBRARIES_TO_DOWNLOAD_KEY, LIBRARIES_TO_REGISTER_KEY
 from griptape_nodes.utils.git_utils import extract_repo_name_from_url
-from griptape_nodes.utils.library_utils import filter_old_xdg_library_paths, normalize_library_downloads
+from griptape_nodes.utils.library_utils import (
+    extract_library_path,
+    filter_old_xdg_library_paths,
+    normalize_library_downloads,
+)
 
 config_manager = GriptapeNodes.ConfigManager()
 secrets_manager = GriptapeNodes.SecretsManager()
@@ -40,11 +44,11 @@ def init_command(  # noqa: PLR0913
     bucket_name: Annotated[
         str | None, typer.Option(help="Name for the bucket (existing or new) when using 'gtc' storage backend.")
     ] = None,
-    register_advanced_library: Annotated[
+    register_diffusers_library: Annotated[
         bool | None,
         typer.Option(
-            "--register-advanced-library/--no-register-advanced-library",
-            help="Install the Griptape Nodes Advanced Image Library.",
+            "--register-diffusers-library/--no-register-diffusers-library",
+            help="Install the Griptape Nodes Diffusers Library.",
         ),
     ] = None,
     register_griptape_cloud_library: Annotated[
@@ -85,7 +89,7 @@ def init_command(  # noqa: PLR0913
             workspace_directory=workspace_directory,
             api_key=api_key,
             storage_backend=storage_backend,
-            register_advanced_library=register_advanced_library,
+            register_diffusers_library=register_diffusers_library,
             register_griptape_cloud_library=register_griptape_cloud_library,
             config_values=config_values,
             secret_values=secret_values,
@@ -219,20 +223,20 @@ def _handle_hf_token_config(config: InitConfig) -> str | None:
 
 def _handle_additional_library_config(config: InitConfig) -> bool | None:
     """Handle additional library configuration step."""
-    register_advanced_library = config.register_advanced_library
+    register_diffusers_library = config.register_diffusers_library
     register_griptape_cloud_library = config.register_griptape_cloud_library
 
     if config.interactive:
-        register_advanced_library = _prompt_for_advanced_media_library(
-            default_prompt_for_advanced_media_library=register_advanced_library
+        register_diffusers_library = _prompt_for_diffusers_library(
+            default_prompt_for_diffusers_library=register_diffusers_library
         )
         register_griptape_cloud_library = _prompt_for_griptape_cloud_library(
             default_prompt_for_griptape_cloud_library=register_griptape_cloud_library
         )
 
-    if register_advanced_library is not None or register_griptape_cloud_library is not None:
+    if register_diffusers_library is not None or register_griptape_cloud_library is not None:
         libraries_config = _build_libraries_list(
-            register_advanced_library=register_advanced_library,
+            register_diffusers_library=register_diffusers_library,
             register_griptape_cloud_library=register_griptape_cloud_library,
         )
         config_manager.set_config_value(
@@ -247,11 +251,12 @@ def _handle_additional_library_config(config: InitConfig) -> bool | None:
             download.git_url for download in normalize_library_downloads(libraries_config.libraries_to_download)
         ]
         console.print(f"[bold green]Libraries to download: {', '.join(download_git_urls)}[/bold green]")
-        console.print(
-            f"[bold green]Libraries to register: {', '.join(libraries_config.libraries_to_register)}[/bold green]"
-        )
+        register_paths = [
+            path for entry in libraries_config.libraries_to_register if (path := extract_library_path(entry))
+        ]
+        console.print(f"[bold green]Libraries to register: {', '.join(register_paths)}[/bold green]")
 
-    return register_advanced_library
+    return register_diffusers_library
 
 
 def _handle_arbitrary_configs(config: InitConfig) -> None:
@@ -471,20 +476,20 @@ def _get_or_create_bucket_id(bucket_name: str) -> str:
     return _create_new_bucket(bucket_name)
 
 
-def _prompt_for_advanced_media_library(*, default_prompt_for_advanced_media_library: bool | None = None) -> bool:
-    """Prompts the user whether to register the advanced media library."""
-    if default_prompt_for_advanced_media_library is None:
-        default_prompt_for_advanced_media_library = False
-    explainer = """[bold cyan]Advanced Media Library[/bold cyan]
-    Would you like to install the Griptape Nodes Advanced Media Library?
-    This node library makes advanced media generation and manipulation nodes available.
-    For example, nodes are available for Flux AI image upscaling, or to leverage CUDA for GPU-accelerated image generation.
+def _prompt_for_diffusers_library(*, default_prompt_for_diffusers_library: bool | None = None) -> bool:
+    """Prompts the user whether to register the Diffusers library."""
+    if default_prompt_for_diffusers_library is None:
+        default_prompt_for_diffusers_library = False
+    explainer = """[bold cyan]Diffusers Library[/bold cyan]
+    Would you like to install the Griptape Nodes Diffusers Library?
+    This node library makes media generation and manipulation with Diffusers available.
+    For example, nodes are available for Flux AI image generation, or to leverage CUDA for GPU-accelerated image generation.
     CAVEAT: Installing this library requires additional dependencies to download and install, which can take several minutes.
-    The Griptape Nodes Advanced Media Library can be added later by following instructions here: [bold blue][link=https://docs.griptapenodes.com]https://docs.griptapenodes.com[/link][/bold blue].
+    The Griptape Nodes Diffusers Library can be added later by following instructions here: [bold blue][link=https://docs.griptapenodes.com]https://docs.griptapenodes.com[/link][/bold blue].
     """
     console.print(Panel(explainer, expand=False))
 
-    return Confirm.ask("Register Advanced Media Library?", default=default_prompt_for_advanced_media_library)
+    return Confirm.ask("Register Diffusers Library?", default=default_prompt_for_diffusers_library)
 
 
 def _prompt_for_griptape_cloud_library(*, default_prompt_for_griptape_cloud_library: bool | None = None) -> bool:
@@ -506,7 +511,7 @@ class LibrariesConfig(NamedTuple):
     """Configuration for library lists."""
 
     libraries_to_download: list[Any]
-    libraries_to_register: list[str]
+    libraries_to_register: list[Any]
 
 
 def _download_entry_repo_name(entry: Any) -> str | None:
@@ -518,7 +523,7 @@ def _download_entry_repo_name(entry: Any) -> str | None:
 
 
 def _build_libraries_list(
-    *, register_advanced_library: bool | None = False, register_griptape_cloud_library: bool | None = False
+    *, register_diffusers_library: bool | None = False, register_griptape_cloud_library: bool | None = False
 ) -> LibrariesConfig:
     """Builds the lists of libraries to download and register based on library settings."""
     # Get current configuration for both lists
@@ -554,14 +559,14 @@ def _build_libraries_list(
     if default_identifier not in current_download_identifiers:
         new_downloads.append(default_library)
 
-    # Advanced media library
-    advanced_media_library = "https://github.com/griptape-ai/griptape-nodes-library-advanced-media@stable"
-    advanced_identifier = extract_repo_name_from_url(advanced_media_library)
-    if register_advanced_library:
-        if advanced_identifier not in current_download_identifiers:
-            new_downloads.append(advanced_media_library)
+    # Diffusers library
+    diffusers_library = "https://github.com/griptape-ai/griptape-nodes-library-diffusers@stable"
+    diffusers_identifier = extract_repo_name_from_url(diffusers_library)
+    if register_diffusers_library:
+        if diffusers_identifier not in current_download_identifiers:
+            new_downloads.append(diffusers_library)
     else:
-        libraries_to_remove = [lib for lib in new_downloads if _download_entry_repo_name(lib) == advanced_identifier]
+        libraries_to_remove = [lib for lib in new_downloads if _download_entry_repo_name(lib) == diffusers_identifier]
         for lib in libraries_to_remove:
             new_downloads.remove(lib)
 

@@ -51,7 +51,7 @@ Instance methods come first because they can call anything. Class methods come n
 
 **Use specific, narrow exception blocks** - Catch only the specific exception types that can be raised. Keep try blocks as small as possible — wrap only the exact lines that raise. Never use bare `except:` or catch `Exception` unless explicitly required.
 
-**Include context in error messages** - Use the format: "Attempted to do X. Failed with data Y because of Z." Include `{self.name}` when available. Include relevant parameter names and operation context.
+**Write artist-comprehensible, user-facing error messages** - User-facing error messages must be understandable by artists, not just engineers. Avoid stack-trace jargon, internal type names, and implementation details. Use the format: "Attempted to do X to Y. Failed due to Z." Include `{self.name}` when available. Include relevant parameter names and operation context.
 
 ## Path Handling
 
@@ -62,6 +62,20 @@ Instance methods come first because they can call anything. Class methods come n
 **Use `canonicalize_for_io` for OS-level I/O** - Reach for `canonicalize_for_io(path)` only when handing a path directly to the OS (inside a handler or driver, or calling `open()`/`os.*` yourself). It does the same work as the identity variant without following symlinks and adds the Windows long-path prefix when needed.
 
 **Prefer the named helpers over composing primitives** - `sanitize_path_string`, `expand_path`, `resolve_path_safely`, and `normalize_path_for_platform` are building blocks. If you find yourself chaining them, use one of the two canonicalize helpers instead so behavior stays consistent across call sites.
+
+## Documentation
+
+**Update docs with user-facing changes** - When a change affects what users see or do, update the documentation in the same PR. Common mappings:
+
+- New or changed CLI commands/flags → `docs/reference/command_line_interface.md`
+- New or changed settings → `docs/reference/configuration_reference.md` (and `docs/guides/configuration.md` if it needs explanation)
+- New user-facing features or request event families → the relevant page under `docs/guides/`, or a new page
+- Editor-facing behavior changes (shortcuts, menus, panels) → `docs/guides/editor/`
+- Deprecated or renamed nodes → `MIGRATION.md` and the node's doc page
+
+**Wire new pages into mkdocs.yml twice** - A new docs page must be added to both the `nav` section and the `llmstxt` plugin sections in `mkdocs.yml`. Verify with `uv run mkdocs build --strict`.
+
+**Write for artists** - Docs follow the same rule as error messages: understandable by artists, not just engineers. Use exact UI labels, menu paths, and shortcuts. Match the voice of existing pages such as `docs/guides/libraries.md`.
 
 ## Architecture
 

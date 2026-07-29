@@ -62,11 +62,14 @@ class _CleanProbe:
 
 
 class _ViolatingProbe:
-    """Node class whose __init__ triggers a correctness-class violation.
+    """Node class whose __init__ triggers a schema-dropping violation.
 
     Uses ``reentrant-bus-in-init`` because it is registered with
-    ``correctness=True``; the LOAD_PROBE skip-on-correctness gate uses
-    that flag to decide whether to drop the class from the schema.
+    ``drops_class_from_schema=True``; the LOAD_PROBE gate uses that flag
+    to decide whether to drop the class from the schema. The rule is an
+    ergonomics rule (``correctness=False``), so on the orchestrator probe
+    (``is_worker=False``) it logs at WARNING while the class is still
+    dropped.
     """
 
     parameters: list = []  # noqa: RUF012
@@ -97,12 +100,13 @@ class TestSerializeSchemasStrictMode:
         with patched_registry({"Violator": _ViolatingProbe, "Clean": _CleanProbe}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
-        # Violating class dropped from output.
+        # Violating class dropped from output even though it only warns on the
+        # orchestrator: the drop is gated on drops_class_from_schema, not severity.
         assert [s.class_name for s in schemas] == ["Clean"]
 
-        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("fixture probe violation" in r.getMessage() for r in errors)
-        assert any("class=Violator" in r.getMessage() for r in errors)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("fixture probe violation" in r.getMessage() for r in warnings)
+        assert any("class=Violator" in r.getMessage() for r in warnings)
 
 
 class _DummyTrait(Trait):

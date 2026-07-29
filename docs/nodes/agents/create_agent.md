@@ -23,13 +23,13 @@ Use this node when you want to:
 ### Parameters
 
 - **agent**: An existing Agent configuration (optional). If specified, it will use the existing Agent when prompting.
-- **prompt**: The instructions or question you want to ask the Agent
-- **additional_context**: String or key-value pairs providing additional context to the Agent
-- **model**: The large language model to choose for your Agent. If you use the `prompt_model_config`, this will be ignored.
-- **prompt_model_config**: The an external model configuration for how the Agent communicates with AI models.
-- **tools**: Capabilities you want to give your Agent
-- **rulesets**: Rules that tell your Agent what it can and cannot do
-- **output_schema**: A JSON Schema template that defines the exact format you want the Agent's response to follow (optional)
+- **provider**: The AI provider to use (e.g., Griptape Cloud, Ollama, LM Studio, or a custom endpoint). See [AI Providers](../../guides/agent/providers/index.md) for setup instructions.
+- **prompt model**: The specific model from the selected provider.
+- **prompt**: The instructions or question you want to ask the Agent.
+- **additional_context**: String or key-value pairs providing additional context to the Agent.
+- **tools**: Capabilities you want to give your Agent.
+- **rulesets**: Rules that tell your Agent what it can and cannot do.
+- **output_schema**: A JSON Schema template that defines the exact format you want the Agent's response to follow (optional).
 
 ### Outputs
 
@@ -127,7 +127,7 @@ Let's say you want to extract information about a restaurant from a review:
 - The node supports both streaming and non-streaming prompt drivers
 - Tools and rulesets can be provided as individual items or as lists
 - The additional_context parameter allows you to provide additional_context to the agent as a string or dictionary of key/value pairs
-- By default, you need a valid Griptape API key set up in your environment as `GT_CLOUD_API_KEY` for the node to work. Depending on the models you want to use, the keys you need will be different.
+- By default the node uses Griptape Cloud, which requires a valid `GT_CLOUD_API_KEY`. You can switch to a local or custom provider using the **provider** parameter — see [AI Providers](../../guides/agent/providers/index.md).
 - When you pass an Agent from one node to another using the agent input/output pins, the conversation memory is maintained, which means:
     - The Agent "remembers" previous interactions in the same flow
     - Context from previous prompts influences how the Agent interprets new prompts
@@ -135,7 +135,15 @@ Let's say you want to extract information about a restaurant from a review:
     - The Agent can reference information provided in earlier steps of your workflow
 - Don't know how to create a JSON Schema for the output_schema parameter? Use an online tool like [JSON Schema Builder](https://transform.tools/json-to-json-schema) to create one based on your desired output structure. Or just give an Agent an example of the output you want and have it generate the schema for you!
 
+## Controlling Agent Behavior in Workflows
+
+To shape how an Agent behaves in a workflow, use **Rulesets** (or a plain **TextInput** connected to the `Behaviors (Rulesets)` input). These let you define what the Agent can and cannot do, set its persona, or constrain its output style.
+
+!!! note "Skills are not supported in the Agent node"
+
+    The `.agents/skills` folder used by the [chat sidebar](../../guides/agent/skills.md) does not apply to Agent nodes in workflows. Use a **Ruleset node** or a **TextInput** connected to the Agent's `Behaviors (Rulesets)` input to control agentic behavior instead.
+
 ## Common Issues
 
-- **Missing Prompt Driver**: If not specified, the node will use the default prompt driver (It will use the GT_CLOUD_API_KEY and gpt-4o)
-- **Streaming Issues**: If using a streaming prompt driver, ensure your flow supports handling streamed outputs
+- **No provider configured**: If no provider is set, the node uses Griptape Cloud by default, which requires a valid `GT_CLOUD_API_KEY`. See [AI Providers](../../guides/agent/providers/index.md) to add Ollama, LM Studio, or a custom endpoint.
+- **Streaming Issues**: If using a streaming prompt driver, ensure your flow supports handling streamed outputs.

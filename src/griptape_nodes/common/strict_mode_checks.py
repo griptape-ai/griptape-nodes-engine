@@ -32,6 +32,14 @@ class StrictModeRule:
     runs -- they warn on the orchestrator and escalate to a failure on
     the worker because the worker's stateless model makes them
     load-bearing.
+
+    ``drops_class_from_schema`` is an independent load-lifecycle signal:
+    when a class's schema probe fires such a rule, the class is skipped
+    (dropped from the worker schema) during library load. It is distinct
+    from severity, which only governs logging and worker-side failure
+    promotion. A rule can be an ergonomics warning at execution time yet
+    still be load-bearing enough to exclude the class from the worker
+    schema (e.g. a bus call in __init__ deadlocks the worker's probe).
     """
 
     rule_id: str
@@ -40,6 +48,7 @@ class StrictModeRule:
     description: str
     remediation_template: str
     worker_escalation: bool = True
+    drops_class_from_schema: bool = False
 
     def render(self, **context: Any) -> str:
         return self.remediation_template.format(**context)
@@ -48,8 +57,13 @@ class StrictModeRule:
 RULES: dict[str, StrictModeRule] = {
     "reentrant-bus-in-init": StrictModeRule(
         rule_id="reentrant-bus-in-init",
-        default_severity=StrictModeSeverity.ERROR,
-        correctness=True,
+        default_severity=StrictModeSeverity.WARNING,
+        # Ergonomics at execution time: a local node that hits the bus in
+        # __init__ still runs, so it warns on the orchestrator and escalates
+        # to a failure only on the worker (worker_escalation default). The
+        # deadlock hazard is worker-only, so the class is still dropped from
+        # the worker schema during library load via drops_class_from_schema.
+        correctness=False,
         description=(
             "A node issued an event-bus request from inside its __init__. "
             "The worker library probe runs __init__ to extract a schema; "
@@ -60,6 +74,7 @@ RULES: dict[str, StrictModeRule] = {
             "Move the call into aprocess (or a lifecycle hook that runs after "
             "construction)."
         ),
+        drops_class_from_schema=True,
     ),
     "parameter-behaviors-dropped-in-schema": StrictModeRule(
         rule_id="parameter-behaviors-dropped-in-schema",

@@ -47,3 +47,35 @@ class TestBaseProviderPreviewContract:
     def test_get_default_preview_generators_raises(self) -> None:
         with pytest.raises(NotImplementedError, match="does not generate previews"):
             _NonPreviewProvider.get_default_preview_generators()
+
+
+class TestBaseProviderPermissionDefaults:
+    """The permission hooks default to None so providers without a policy pay no cost.
+
+    Concrete providers that gate reads/writes on media-specific properties
+    (e.g. video codec) override these; every other provider inherits the
+    allow-by-default behavior. Without these defaults the OSManager write path
+    and the ``CheckArtifactReadPermissionRequest`` handler would need
+    hasattr checks at every dispatch site.
+    """
+
+    def test_get_write_vetting_policy_default_is_none(self) -> None:
+        # A ``None`` policy tells OSManager to skip vetting entirely for this
+        # format -- neither staging nor a provider hook call happens. Every
+        # provider that does not override this inherits the free path.
+        assert _NonPreviewProvider.get_write_vetting_policy() is None
+
+    def test_check_write_format_from_bytes_default_allows(self) -> None:
+        # An instance is required because the hook is instance-level (providers
+        # may hold lazy resources like ffprobe binaries). The base contract is
+        # simply "return None to allow"; a fresh instance must honor that.
+        provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]
+        assert provider.check_write_format_from_bytes(b"anything", "bin") is None
+
+    def test_check_write_format_from_path_default_allows(self) -> None:
+        provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]
+        assert provider.check_write_format_from_path("/some/path.bin", "bin") is None
+
+    def test_check_read_permission_default_allows(self) -> None:
+        provider = _NonPreviewProvider(registry=None)  # type: ignore[arg-type]
+        assert provider.check_read_permission("/some/path.bin") is None
