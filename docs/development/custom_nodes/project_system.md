@@ -39,11 +39,14 @@ class MyVideoNode(ControlNode):
             allowed_modes={ParameterMode.OUTPUT}
         ))
 
-        # Add project file parameter for output file configuration
+        # Add project file parameter for output file configuration.
+        # `situation` declares which situation this node saves under. It defaults
+        # to "save_node_output", but pass it explicitly so the choice is visible.
         self._output_video_file = ProjectFileParameter(
             node=self,
             name="output_video_file",
             default_filename="output_video.mp4",
+            situation="save_node_output",
         )
         self._output_video_file.add_parameter()
 
@@ -64,6 +67,16 @@ class MyVideoNode(ControlNode):
 - Call `build_file()` to get a `ProjectFileDestination` instance
 - Use `write_bytes()` to save the file
 - Access the saved file's URL/path via `saved.location`
+
+**How the situation is chosen:**
+
+The `situation` argument is the only place a node declares its situation. It is a constructor argument, not a parameter on the node: users never see or edit a situation field on the node face. It defaults to `save_node_output`, so omitting it is valid, but pass it explicitly so readers of your node can tell which situation is in play.
+
+The UI parameter this creates (conventionally named `output_file`) holds a filename, not a path. `build_file()` splits that filename into `file_name_base` and `file_extension`, then resolves it through the situation's macro, so the parameter's value is only one part of the final path. A user typing `render.png` on a `save_node_output` node gets `outputs/MyNode_render.png`.
+
+The situation name is not displayed on the parameter's value, but it does appear in the tooltip that `add_parameter()` generates (`Output filename (uses 'save_node_output' situation template)`), which is how a user discovers it.
+
+Users override the situation per-node via the cog button on the parameter, which spawns a `FileOutputSettings` node pre-filled with your declared situation. When that node is connected, `build_file()` returns *its* `FileDestination` and your `situation` argument is bypassed. Choose the situation that honestly describes your node's operation and let users redirect from there.
 
 **❌ Common Mistake: Not Capturing write_bytes() Return Value**
 
@@ -161,7 +174,10 @@ def new_save_video(video_bytes: bytes) -> VideoUrlArtifact:
 
 See [Situations](../../guides/projects/situations.md#default-situations) for the full table of default situations, their macros, and collision policies.
 
-Users can override any of these (paths, macros, collision policies) through their project's `griptape-nodes-project.yml` — see the [Customization Guide](../../guides/projects/customization.md). Your nodes automatically respect these customizations without any code changes.
+Users can override any of these (paths, macros, collision policies) in two ways, and your node needs no code changes to respect either:
+
+- **Project-wide**: redefining a situation in `griptape-nodes-project.yml` changes it for every node using it. See the [Customization Guide](../../guides/projects/customization.md).
+- **Per-node**: the cog button on your `ProjectFileParameter` connects a `FileOutputSettings` node that overrides the situation, macro, and collision policy for that node alone.
 
 ## Best Practices
 
@@ -208,6 +224,7 @@ class ProcessVideo(ControlNode):
             node=self,
             name="output_video_file",
             default_filename="processed_video.mp4",
+            situation="save_node_output",
         )
         self._output_video_file.add_parameter()
 
