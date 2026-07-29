@@ -129,7 +129,7 @@ Organizations can run Griptape Nodes on license keys instead of individual Gript
 
 If your organization runs an on-premises [Admin Server](enterprise/admin_server.md), you'll also point the application at it during activation. See [Using the Admin Server](enterprise/using_the_admin_server.md) for the full walkthrough of the license activation flow.
 
-Organization admins looking to issue and manage license keys should start with the [Admin Dashboard](enterprise/admin_dashboard.md) guide.
+Organization admins looking to issue and manage license keys should start with the [Admin Dashboard](enterprise/admin_dashboard.md) guide. For a diagram of how the pieces fit together in either deployment model, see [Architecture](architecture.md).
 
 ## Next Steps
 
