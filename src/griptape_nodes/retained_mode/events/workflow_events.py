@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import ExecutionPayload
+from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
@@ -407,9 +408,16 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow save failed. Common causes: file system error, permission denied, invalid path, workflow conflict."""
+    """Workflow save failed.
 
-    failure_reason: str | None = None
+    Common causes: file system error, permission denied, invalid path, workflow conflict.
+
+    Attributes:
+        failure_reason: Classification of why the save failed
+        result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason | None = None
 
 
 @dataclass

@@ -43,6 +43,18 @@ class TestDeriveRegistryKey:
     def test_known_inputs(self, input_path: str, expected: str) -> None:
         assert derive_registry_key(input_path) == expected
 
+    @pytest.mark.skipif(platform.system() == "Linux", reason="Case normalization only on case-insensitive filesystems")
+    def test_case_normalization_on_case_insensitive_filesystem(self) -> None:
+        """On macOS/Windows, registry keys are lowercased to prevent collisions."""
+        assert derive_registry_key("MyFlow.py") == "myflow"
+        assert derive_registry_key("UPPER/MixedCase.py") == "upper/mixedcase"
+
+    @pytest.mark.skipif(platform.system() != "Linux", reason="Case preservation only on case-sensitive filesystems")
+    def test_case_preservation_on_case_sensitive_filesystem(self) -> None:
+        """On Linux, registry keys preserve case since the filesystem is case-sensitive."""
+        assert derive_registry_key("MyFlow.py") == "MyFlow"
+        assert derive_registry_key("UPPER/MixedCase.py") == "UPPER/MixedCase"
+
 
 class TestWorkflowRegistry:
     """Test suite for WorkflowRegistry functionality."""
