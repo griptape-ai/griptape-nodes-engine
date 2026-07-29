@@ -64,36 +64,17 @@ The editor and the application are separate programs, so events between them nee
 - **Direct WebSocket.** The application listens locally and the editor connects straight to it. Events never leave the machine. This is what Griptape Nodes Desktop uses when you activate with a license.
 - **Nodes API WebSocket.** The editor and the application each open their own outbound connection to Griptape Cloud, which relays events between them. This is what lets an editor in a browser drive an application on a different machine.
 
-The relay is worth drawing, because it is the one arrangement where editor traffic crosses the internet:
-
-```mermaid
-flowchart TB
-    subgraph browser["Your browser, on any machine"]
-        editor["Editor"]
-    end
-
-    subgraph machine["The machine running your workflows"]
-        direction TB
-        app["Griptape Nodes application"]
-        workspace[("Workspace<br/>workflows, assets, secrets")]
-        app --- workspace
-    end
-
-    subgraph cloud["Griptape Cloud"]
-        wsapi["Nodes API WebSocket<br/>relays events between the two"]
-    end
-
-    editor <-.->|"outbound connection"| wsapi
-    app <-.->|"outbound connection"| wsapi
-```
-
-Neither side accepts an inbound connection. Both dial out to Griptape Cloud and exchange events over a pair of topics scoped to their session, which is why this works without opening a port or knowing the other machine's address.
-
-The distinction matters for privacy, because editor traffic carries workflow content: node graphs, parameter values, and previews of generated assets. On the direct WebSocket none of it is exposed to the network, and your workspace stays on the machine that runs the workflows in either case.
+The distinction matters for privacy, because editor traffic carries workflow content: node graphs, parameter values, and previews of generated assets. On the direct WebSocket none of it is exposed to the network. Either way your workspace stays on the machine that runs the workflows. The [SaaS configuration](#saas-configuration) section below draws both arrangements.
 
 ## SaaS configuration
 
-The default. Your machine reaches Griptape Cloud directly, so nothing needs to be deployed on your side. This diagram shows the editor on the same machine, connected over the direct WebSocket; swap in the relay above if your editor runs elsewhere.
+The default. Your machine reaches Griptape Cloud directly, so nothing needs to be deployed on your side. This configuration comes in two variations, which differ only in how the editor reaches the application.
+
+In both, solid lines are required and dotted lines are optional. The only traffic Griptape Nodes cannot run without is licensing.
+
+### Editor on the same machine
+
+The arrangement you get from Griptape Nodes Desktop. The editor connects straight to the application, so no workflow content touches the network.
 
 ```mermaid
 flowchart TB
@@ -124,7 +105,47 @@ flowchart TB
     app -.->|"direct, your own API key"| providers
 ```
 
-Solid lines are required, dotted lines are optional. The only traffic Griptape Nodes cannot run without is licensing.
+### Editor on a different machine
+
+Use this when you want the application on a bigger box than the one you are sitting at, or the editor in a browser on a laptop. The editor and the application each open an **outbound** connection to the Nodes API WebSocket, which relays events between them.
+
+```mermaid
+flowchart TB
+    subgraph remote["Any other machine"]
+        editor["Editor<br/>in a browser"]
+    end
+
+    subgraph machine["Your machine"]
+        direction TB
+        app["Griptape Nodes application<br/>engine + policy enforcement"]
+        workspace[("Workspace<br/>workflows, assets, secrets")]
+        local["Local models<br/>Ollama, LM Studio"]
+        app --- workspace
+        app -.-> local
+    end
+
+    subgraph cloud["Griptape Cloud"]
+        direction TB
+        wsapi["Nodes API<br/>WebSocket"]
+        control["Licensing,<br/>sessions,<br/>entitlements"]
+        modelproxy["Model<br/>proxy"]
+        buckets["Buckets<br/>and Assets"]
+    end
+
+    providers["Third-party model providers"]
+
+    editor <-.->|"outbound"| wsapi
+    app <-.->|"outbound"| wsapi
+    app ==>|"license + session<br/>(required)"| control
+    app -.->|"model calls"| modelproxy
+    app -.->|"optional sync"| buckets
+    modelproxy --> providers
+    app -.->|"your own API key"| providers
+```
+
+Because both sides dial out, this needs no open inbound port and neither machine needs to know the other's address. The trade is that editor traffic now crosses the internet: node graphs, parameter values, and asset previews pass through Griptape Cloud. Your workspace does not move, and the workflow still runs entirely on your machine.
+
+**Neither variation applies on premises.** The Nodes API WebSocket is a Griptape Cloud service, so an on-premises deployment uses the direct connection, which is what keeps workflow events inside your network.
 
 ## On-premises configuration
 
