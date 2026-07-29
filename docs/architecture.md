@@ -1,82 +1,84 @@
 # Architecture
 
-Griptape Nodes runs the same way everywhere. You build workflows in an editor, and an engine on a machine you control executes them. What changes between setups is how you sign in, how the editor reaches the engine, and whether your machines talk to Griptape Cloud directly or through a server you operate.
+Griptape Nodes runs the same way everywhere. You build workflows in an editor, and an application on a machine you control executes them. A license is what unlocks that application, and Griptape Cloud is what validates the license.
 
-This page covers the two configurations available today:
+That is the whole shape of it. The two configurations on this page differ in exactly one thing: **how the application's licensing checks reach Griptape Cloud.**
 
-- **[SaaS configuration](#saas-configuration)** is the default. Your machines talk to Griptape Cloud directly.
+- **[SaaS configuration](#saas-configuration)** is the default. The application talks to Griptape Cloud directly.
 - **[On-premises configuration](#on-premises-configuration)** keeps your machines off the public internet. They reach Griptape Cloud only through a single [Admin Server](enterprise/admin_server.md) you run.
 
-Both configurations run identical software. Moving between them is a matter of configuration, not a different product.
+Both run identical software, licensed the same way. Moving between them changes a route, not a product.
 
 ## The pieces
 
-Three things sit between you and a running workflow.
+Two things sit between you and a running workflow.
 
-| Component       | What it is                                                                                                                                                                                                            | Where it runs                                              |
-| --------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| **Editor**      | The visual canvas where you build workflows.                                                                                                                                                                          | In your browser, or bundled inside Griptape Nodes Desktop. |
-| **Application** | The licensed program you launch, distributed as [`griptape-nodes`](https://pypi.org/project/griptape-nodes/). It wraps the engine and enforces your license: which libraries you may load, which models you may call. | On your machine.                                           |
-| **Engine**      | The open source workflow executor, distributed as [`griptape-nodes-engine`](https://pypi.org/project/griptape-nodes-engine/). Loads node libraries, runs workflows, writes results to your workspace.                 | Inside the application, on your machine.                   |
+| Component       | What it is                                                                                                                                                                                                              | Where it runs                                              |
+| --------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
+| **Editor**      | The visual canvas where you build workflows.                                                                                                                                                                            | In your browser, or bundled inside Griptape Nodes Desktop. |
+| **Application** | The licensed program that runs your workflows, distributed as [`griptape-nodes`](https://pypi.org/project/griptape-nodes/). It validates your license, enforces the permissions attached to it, and executes the graph. | On your machine.                                           |
 
-[Griptape Nodes Desktop](installation.md#griptape-nodes-desktop-recommended) is the easiest way to get all three: it bundles the editor and ships the application with a pinned Python interpreter, so there is nothing to install separately.
+Inside the application is the open source [`griptape-nodes-engine`](https://pypi.org/project/griptape-nodes-engine/), which loads node libraries and does the actual execution. It is worth knowing about because it is public and auditable, but it is not a separate thing you deploy or connect to. An editor always connects to the application, never to the engine directly.
+
+[Griptape Nodes Desktop](installation.md#griptape-nodes-desktop-recommended) is the easiest way to get both: it bundles the editor and ships the application with a pinned Python interpreter, so there is nothing to install separately.
 
 Griptape Cloud provides the services the application cannot provide for itself:
 
 | Capability                 | What it does                                                                                                                              |
 | -------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
-| **Authentication**         | Signs you in and identifies your organization.                                                                                            |
-| **Licensing and sessions** | Issues licenses, allocates and renews the session that permits an application to run, then releases it when you are done.                 |
+| **Licensing and sessions** | Validates licenses, allocates and renews the session that permits an application to run, then releases it when you are done.              |
 | **Entitlements**           | Resolves the permissions attached to your license, which the application then enforces locally.                                           |
 | **Nodes API WebSocket**    | Carries events between an editor and an application that are not on the same machine.                                                     |
-| **Model proxy**            | Routes model calls to many providers under one Griptape credential, so you need no per provider accounts.                                 |
+| **Model proxy**            | Routes model calls to many providers under one Griptape credential, so you need no account with each provider.                            |
 | **Buckets and Assets**     | Optional cloud storage for syncing workflows and assets across machines.                                                                  |
 | **Admin Dashboard**        | Backs the interface where owners issue license keys and build permission templates. See [Admin Dashboard](enterprise/admin_dashboard.md). |
 
 Model calls can also bypass Griptape Cloud entirely. You can point nodes at a third party provider with your own API key, or at a local model runner such as Ollama or LM Studio. See [AI Providers](guides/agent/providers/index.md).
 
-## Two choices that shape your setup
+## How a license unlocks the application
 
-Before the diagrams, two settings are worth separating, because they are independent and each is often mistaken for the other.
+A license is issued to you by your organization and authenticates **the application itself**, not you as a person. Activating one is the same in both configurations described below:
 
-### How you sign in
+1. You paste your license key into the application.
+1. The application validates the key's signature locally, then asks Griptape Cloud to allocate a **session**, which is the permission slip that lets it run.
+1. Griptape Cloud returns the **entitlements** attached to your license: which node libraries you may load, which models you may call.
+1. The application enforces those entitlements locally for as long as it runs, renewing the session periodically.
 
-There are two ways to authenticate, and both work in either configuration:
+Step 2 is the only step whose network path differs between the two configurations. Everything else is identical.
 
-- **Griptape Cloud account.** You sign in through Griptape Cloud, and your account identifies you.
-- **License key.** You paste a license key issued by your organization and point the application at a server endpoint. No cloud account is involved. See [Using the Admin Server](enterprise/using_the_admin_server.md).
+See [Using the Admin Server](enterprise/using_the_admin_server.md) for the activation walkthrough.
 
-License keys are what on-premises deployments normally use, but nothing stops you from activating with a license against Griptape Cloud directly.
+!!! info "If you signed in with a Griptape account instead"
+
+    Individual users can also sign in with a Griptape Cloud account, which provisions credentials for you rather than using a license key. This is the older mechanism and it still works. Licenses are the direction the product is heading, and they are what organizations deploying Griptape Nodes should use, so this page describes the licensed path.
 
 ### How the editor reaches the application
 
-The editor and the application are separate programs, so events between them need a transport. Two are available:
+The editor and the application are separate programs, so events between them need a transport. Two exist:
 
-- **Direct WebSocket.** The application listens on your machine and the editor connects straight to it. Events never leave the machine.
-- **Nodes API WebSocket.** Both sides connect out to Griptape Cloud, which passes events between them. This is what lets you open an editor on a laptop and drive an application running somewhere else.
+- **Direct WebSocket.** The application listens on your machine and the editor connects straight to it. Events never leave the machine. **This is what license activation uses.**
+- **Nodes API WebSocket.** Both sides connect out to Griptape Cloud, which relays events between them. This is what lets you open an editor on a laptop and drive an application running on a different machine. It is tied to the account sign-in path above.
 
-**The transport follows how you signed in.** Griptape Nodes Desktop configures the direct WebSocket when you activate with a license key, and the Nodes API WebSocket when you sign in with a Griptape Cloud account. So the choice in the previous section decides this one.
+So on a licensed application, your workflow events are local by construction, in either configuration. Griptape Nodes Desktop wires this up for you: activate with a license and it configures the direct WebSocket.
 
 ## SaaS configuration
 
-This is the default setup, whether you installed Griptape Nodes Desktop or the engine by hand. Your machine talks to Griptape Cloud directly.
+The default. Your machine reaches Griptape Cloud directly, so licensing works with no infrastructure of your own.
 
 ```mermaid
 flowchart TB
     subgraph machine["Your machine"]
         direction TB
         editor["Editor"]
-        app["Application<br/>license + policy enforcement"]
-        engine["Engine<br/>workflow execution"]
+        app["Griptape Nodes application<br/>license enforcement<br/>+ workflow execution"]
         local["Local models<br/>Ollama, LM Studio"]
-        editor <-->|"direct WebSocket<br/>(license sign-in)"| app
-        app --- engine
-        engine -.-> local
+        editor <-->|"direct WebSocket"| app
+        app -.-> local
     end
 
     subgraph cloud["Griptape Cloud"]
         direction TB
-        control["Authentication<br/>Licensing and sessions<br/>Entitlements"]
+        control["Licensing and sessions<br/>Entitlements"]
         wsapi["Nodes API WebSocket"]
         modelproxy["Model proxy"]
         buckets["Buckets and Assets"]
@@ -84,37 +86,35 @@ flowchart TB
 
     providers["Third-party model providers"]
 
-    app -->|"HTTPS: sign-in, license, session"| control
-    editor <-.->|"or via cloud<br/>(account sign-in)"| wsapi
+    app -->|"HTTPS: license, session, entitlements"| control
+    editor <-.->|"account sign-in only"| wsapi
     wsapi <-.-> app
-    engine -->|"HTTPS: model calls"| modelproxy
-    engine -.->|"optional sync"| buckets
+    app -->|"HTTPS: model calls"| modelproxy
+    app -.->|"optional sync"| buckets
     modelproxy --> providers
-    engine -.->|"direct, your own API key"| providers
+    app -.->|"direct, your own API key"| providers
 ```
 
 Two things are worth noticing.
 
-**Your workflows and assets stay on your machine.** The engine reads and writes your local workspace. Nothing is copied to Griptape Cloud unless you opt into Buckets and Assets, or a node you placed sends data somewhere.
+**Your workflows and assets stay on your machine.** The application reads and writes your local workspace. Nothing is copied to Griptape Cloud unless you opt into Buckets and Assets, or a node you placed sends data somewhere.
 
-**Either transport is available here.** The dotted path through the Nodes API WebSocket is what you get with an account sign-in. Activate with a license key instead and the editor connects straight to the application, exactly as it does on premises.
+**Only licensing has to go to Griptape Cloud.** The dotted paths are all optional. Model calls can go direct to a provider or to a local runner, asset sync is opt in, and the Nodes API WebSocket is only involved on the account sign-in path.
 
 ## On-premises configuration
 
-In this setup your machines have no route to the public internet. They reach Griptape Cloud only through an [Admin Server](enterprise/admin_server.md) you run inside your network, so you allow one host through your firewall instead of one per machine.
+Same licensing flow, different route. Your machines have no path to the public internet, so they reach Griptape Cloud through an [Admin Server](enterprise/admin_server.md) you run inside your network. You allow one host through your firewall instead of one per machine.
 
 ```mermaid
 flowchart TB
     subgraph network["Your network"]
         direction TB
         editor["Editor<br/>bundled with Desktop"]
-        app["Application<br/>license + policy enforcement"]
-        engine["Engine<br/>workflow execution"]
+        app["Griptape Nodes application<br/>license enforcement<br/>+ workflow execution"]
         local["Local models<br/>Ollama, LM Studio"]
         admin["Admin Server<br/>single egress point<br/>optional path filtering"]
         editor <-->|"direct WebSocket<br/>never leaves your network"| app
-        app --- engine
-        engine -.-> local
+        app -.-> local
         app -->|"HTTPS, in-network"| admin
         %% Invisible link: keeps the Admin Server on its own rank below the
         %% local models, so the egress edge does not pass behind them.
@@ -123,7 +123,7 @@ flowchart TB
 
     subgraph cloud["Griptape Cloud"]
         direction TB
-        control["Authentication<br/>Licensing and sessions<br/>Entitlements"]
+        control["Licensing and sessions<br/>Entitlements"]
         modelproxy["Model proxy"]
     end
 
@@ -133,15 +133,15 @@ flowchart TB
 
 Three differences carry the whole configuration.
 
-**Everything about the editor is local.** Griptape Nodes Desktop bundles the editor, so no browser fetches it over the internet. Users activate with a license key, which puts the editor on the direct WebSocket, so workflow events never leave your network.
+**Everything about the editor is local.** Griptape Nodes Desktop bundles the editor, so no browser fetches it over the internet, and license activation puts it on the direct WebSocket. Workflow events never leave your network.
 
-**One host egresses, and you decide what it may carry.** Every application points at the Admin Server instead of `cloud.griptape.ai`. You get one firewall rule and one place to audit outbound traffic. The Admin Server can also restrict which Cloud paths may leave. You might keep model calls in network while still permitting licensing. See [forwarding rules](enterprise/admin_server.md#forwarding).
+**One host egresses, and you decide what it may carry.** Every application points at the Admin Server instead of `cloud.griptape.ai`. You get one firewall rule and one place to audit outbound traffic. The Admin Server can also restrict which Cloud paths may leave, so you might keep model calls in network while still permitting licensing. See [forwarding rules](enterprise/admin_server.md#forwarding).
 
 **Local models never egress at all.** A model running under Ollama or LM Studio on the same machine is reached without passing through the Admin Server.
 
 ### What has to leave your network
 
-Even fully locked down, an application needs a small set of Cloud routes to run. These are the licensing and session routes, and the Admin Server refuses to start if your configuration would block them:
+Even fully locked down, an application needs a small set of Cloud routes to license itself. The Admin Server refuses to start if your configuration would block them:
 
 | Route                  | Why it is needed                                                     |
 | ---------------------- | -------------------------------------------------------------------- |
@@ -165,15 +165,15 @@ If you are reviewing Griptape Nodes for a security assessment, these are the loa
 
 **The Admin Server forwards; it does not decide.** It validates no licenses, allocates no sessions, resolves no entitlements, and caches nothing. It does not authenticate callers either: each application's own credential is forwarded untouched for Griptape Cloud to accept or reject. Its jobs are egress consolidation and, if you configure it, egress filtering. Because it holds no state, it is not an offline fallback. With no route upstream, it returns an error.
 
-**Griptape Cloud remains the authority on identity and entitlement.** Authentication, session allocation, and entitlement resolution are Cloud decisions in both configurations. On premises changes only the path that traffic takes to get there.
+**Griptape Cloud remains the authority on licensing and entitlement.** Session allocation and entitlement resolution are Cloud decisions in both configurations. On premises changes only the path that traffic takes to get there.
 
-**The engine is open source and unlicensed.** Enforcement lives in the application, not the engine. A workflow saved as a Python file can be run directly against the open source engine with no license, which also places it outside the policy boundary described above.
+**The engine is open source and unlicensed.** Enforcement lives in the application, not the engine. A workflow saved as a Python file can be run directly against the open source engine with no license, which also places it outside the policy boundary described above. That is deliberate: it is what keeps the engine open source.
 
 ## Related pages
 
-- [Installation](installation.md) covers installing Desktop or the engine by hand.
-- [Admin Server](enterprise/admin_server.md) covers deploying and configuring the on-premises proxy.
+- [Installation](installation.md) covers installing Desktop or the application by hand.
 - [Using the Admin Server](enterprise/using_the_admin_server.md) walks through activating with a license key.
+- [Admin Server](enterprise/admin_server.md) covers deploying and configuring the on-premises proxy.
 - [Admin Dashboard](enterprise/admin_dashboard.md) covers issuing license keys and building permission templates.
 - [Assets and Outputs](guides/assets.md) explains where generated files go and how the editor previews them.
 - [Configuration](guides/configuration.md) covers workspace, storage backend, and static server settings.
