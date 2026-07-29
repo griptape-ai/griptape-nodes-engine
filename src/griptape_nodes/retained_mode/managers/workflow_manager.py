@@ -2554,9 +2554,9 @@ class WorkflowManager:
             return None
 
         # Saving over the current workflow (same key) is always allowed.
-        # current_workflow_name is guaranteed to be a normalized registry key because
-        # ContextManager.set_workflow_context derives it via derive_registry_key.
-        if current_workflow_name == registry_key:
+        # Normalize current_workflow_name for comparison since it may come from
+        # push_workflow(workflow_name=...) which doesn't normalize, only push_workflow(file_path=...) does.
+        if current_workflow_name is not None and derive_registry_key(current_workflow_name) == registry_key:
             return None
 
         # Found a different registered workflow with this key - this is a conflict!
