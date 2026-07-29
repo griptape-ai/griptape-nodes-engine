@@ -1011,6 +1011,8 @@ class BaseNode(ABC):
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
+        if isinstance(param, ParameterList) and self._has_connected_whole_list_value(param):
+            return self.parameter_values[param_name]
         if isinstance(param, ParameterContainer):
             value = handle_container_parameter(self, param)
             if value is not None:
@@ -1442,6 +1444,48 @@ class BaseNode(ABC):
         if node_connections is None:
             return False
         return param_name in node_connections
+
+    def _has_connected_whole_list_value(self, parameter_list: ParameterList) -> bool:
+        """Whether a ParameterList was handed an entire list through a connection to the list itself.
+
+        Requiring the connection is what makes this safe to read: `parameter_values[list_name]` is a
+        write-through cache of the child rows that is NOT cleared when a row is removed, so a stale
+        entry can outlive its rows. Gating on the connection keeps that stale entry unreachable.
+
+        Warns when the incoming list overrides manually-set rows or overruns `max_items`, since both
+        are silent data loss otherwise.
+        """
+        param_name = parameter_list.name
+        if param_name not in self.parameter_values:
+            return False
+        if not self._param_has_incoming_connection(param_name):
+            return False
+
+        value = self.parameter_values[param_name]
+        if not isinstance(value, list):
+            return False
+
+        child_count = len(parameter_list.find_elements_by_type(Parameter, find_recursively=False))
+        if child_count > 0:
+            logger.warning(
+                "Node '%s' list '%s' is fed by a connection, so its %d manually-set item(s) are being ignored. "
+                "Disconnect the list to use those items instead.",
+                self.name,
+                param_name,
+                child_count,
+            )
+
+        max_items = parameter_list.max_items
+        if max_items is not None and len(value) > max_items:
+            logger.warning(
+                "Node '%s' list '%s' received %d item(s) but accepts at most %d. The extra item(s) may be dropped.",
+                self.name,
+                param_name,
+                len(value),
+                max_items,
+            )
+
+        return True
 
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""

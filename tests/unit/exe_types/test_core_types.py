@@ -9,6 +9,8 @@ from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterButtonGroup,
     ParameterGroup,
+    ParameterList,
+    ParameterType,
 )
 
 # No badge by default; elements send badge: null until set_badge() is called.
@@ -647,3 +649,55 @@ class TestParameterConstructorOrdering:
 
         assert param.parent_group_name == "inner"
         assert param.parent_element_name == "inner"
+
+
+class TestAreTypesCompatible:
+    @pytest.mark.parametrize(
+        ("source", "target", "expected"),
+        [
+            # Exact matches.
+            ("list", "list", True),
+            ("list[str]", "list[str]", True),
+            # A parameterized list satisfies a bare or `any` list target.
+            ("list[str]", "list", True),
+            ("list[str]", "list[any]", True),
+            # A bare list does NOT satisfy a parameterized target. ParameterList opts into
+            # accepting one separately, by advertising a bare `list` among its input_types.
+            ("list", "list[str]", False),
+            ("list[any]", "list[str]", False),
+            # Mismatched element types never connect.
+            ("list[str]", "list[int]", False),
+            # Scalars and lists are not interchangeable.
+            ("str", "list[str]", False),
+            ("list[str]", "str", False),
+        ],
+    )
+    def test_list_compatibility(self, source: str, target: str, expected: bool) -> None:  # noqa: FBT001
+        assert ParameterType.are_types_compatible(source_type=source, target_type=target) is expected
+
+
+class TestParameterListInputTypes:
+    def test_advertises_parameterized_and_bare_list(self) -> None:
+        """The container accepts `list[X]` for each declared type, plus an unparameterized `list`."""
+        param_list = ParameterList(name="refs", tooltip="t", input_types=["ImageUrlArtifact", "str"])
+
+        assert param_list.input_types == ["list[ImageUrlArtifact]", "list[str]", "list"]
+
+    def test_accepts_list_sources_and_rejects_scalars(self) -> None:
+        param_list = ParameterList(name="refs", tooltip="t", input_types=["ImageUrlArtifact"])
+
+        # A list-producing node connects whether or not it declares an element type.
+        assert param_list.is_incoming_type_allowed("list[ImageUrlArtifact]") is True
+        assert param_list.is_incoming_type_allowed("list") is True
+        assert param_list.is_incoming_type_allowed("list[any]") is True
+        # A single artifact still belongs on a child row, not on the container.
+        assert param_list.is_incoming_type_allowed("ImageUrlArtifact") is False
+        assert param_list.is_incoming_type_allowed("str") is False
+
+    def test_children_keep_the_declared_element_types(self) -> None:
+        """Only the container widens; child rows still accept the bare element type."""
+        param_list = ParameterList(name="refs", tooltip="t", input_types=["ImageUrlArtifact"])
+        child = param_list.add_child_parameter()
+
+        assert child.input_types == ["ImageUrlArtifact"]
+        assert child.is_incoming_type_allowed("ImageUrlArtifact") is True

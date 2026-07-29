@@ -2521,6 +2521,10 @@ class ParameterList(ParameterContainer):
         )
 
     @property
+    def max_items(self) -> int | None:
+        return self._max_items
+
+    @property
     def collapsed(self) -> bool | None:
         return self._collapsed
 
@@ -2647,6 +2651,11 @@ class ParameterList(ParameterContainer):
         for base_input_type in base_input_types:
             container_variant = f"list[{base_input_type}]"
             result.append(container_variant)
+
+        # Also accept an unparameterized `list`. Sources that build a list at runtime cannot
+        # always declare an element type (a mixed image+audio list has no single correct one),
+        # so element-type correctness for those is deferred to the consuming node.
+        result.append("list")
 
         return result
 
