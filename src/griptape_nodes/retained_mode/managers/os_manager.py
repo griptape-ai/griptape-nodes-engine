@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import contextlib
 import ctypes
 import logging
 import mimetypes
@@ -2347,7 +2348,9 @@ class OSManager:
         # writes, and only if the macro author opted in via `:NN` padding.
         if isinstance(request.file_path, MacroPath):
             macro_path = request.file_path
-            path_display = f"{macro_path.parsed_macro}"
+            # The readable template string, not the ParsedMacro dataclass repr, which dumps
+            # the whole segment tree into every error message below.
+            path_display = macro_path.parsed_macro.template
             # First-attempt resolve: for CREATE_NEW, a missing sequence slot is EXPECTED —
             # the failure is the signal the seed-and-retry logic below uses to pick which
             # slot to auto-allocate. Demote the log level so the probing miss doesn't
@@ -3196,9 +3199,7 @@ class OSManager:
                 error_message=msg,
             )
 
-    def _write_with_portalocker(  # noqa: C901
-        self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str
-    ) -> int:
+    def _write_with_portalocker(self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str) -> int:
         """Write content to a file with exclusive lock using portalocker.
 
         Args:
@@ -3221,22 +3222,7 @@ class OSManager:
         error_details = None
 
         try:
-            # Determine binary vs text mode
-            if isinstance(content, bytes):
-                file_mode = mode + "b"
-            else:
-                file_mode = mode
-
-            with portalocker.Lock(
-                normalized_path,
-                mode=file_mode,  # type: ignore[arg-type]
-                encoding=encoding if isinstance(content, str) else None,
-                timeout=0,  # Non-blocking
-                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
-            ) as fh:
-                fh.write(content)
-                fh.flush()
-                os.fsync(fh.fileno())
+            self._write_locked_discarding_debris(normalized_path, content, encoding, mode=mode)
 
             # Calculate bytes written
             if isinstance(content, bytes):
@@ -3263,6 +3249,64 @@ class OSManager:
         except Exception as e:
             error_details = f"Unexpected error: {type(e).__name__}: {e}"
             logger.error(error_details)
+            raise
+
+    def _write_locked_discarding_debris(
+        self, normalized_path: str, content: str | bytes, encoding: str, *, mode: str
+    ) -> None:
+        """Write under an exclusive lock, removing the file if the write fails.
+
+        portalocker opens the file before it acquires the lock, so under ``mode="x"`` the
+        file exists by the time a lock failure or a write/fsync error is raised. Leaving it
+        there is what breaks the CREATE_NEW collision loop: that loop treats a lock failure
+        as "try the next candidate," so debris accumulates one file per index until every
+        candidate slot is taken and all later saves fail with "could not find available
+        filename" (griptape-ai/internal#178).
+
+        Removing it is safe because ``mode="x"`` maps to ``O_EXCL``, whose create is atomic:
+        if anything already holds the name -- a file, a directory, or a symlink, live or
+        dangling -- ``open()`` raises ``FileExistsError`` and the cleanup is never reached.
+        The unlink is therefore reachable only after *our* create succeeded, which both
+        proves the file is ours and rules out a concurrent writer sneaking a file in between
+        (their create would have lost the race to ours). That proof rests entirely on the
+        exclusive-create flag, so ``file_mode`` is derived here rather than accepted from the
+        caller: a caller passing ``mode="x"`` alongside a non-exclusive open would arm the
+        unlink against a pre-existing file.
+
+        Args:
+            normalized_path: Platform-normalized path string to write to
+            content: Content to write (str or bytes)
+            encoding: Text encoding (ignored for bytes content)
+            mode: Logical write mode ("x", "w", or "a"). Only "x" enables cleanup.
+
+        Raises:
+            Exception: Whatever the write raised, after cleanup.
+        """
+        # Binary flag belongs to the payload, not the caller's policy.
+        file_mode = mode + "b" if isinstance(content, bytes) else mode
+
+        try:
+            with portalocker.Lock(
+                normalized_path,
+                mode=file_mode,  # type: ignore[arg-type]
+                encoding=encoding if isinstance(content, str) else None,
+                timeout=0,  # Non-blocking
+                flags=portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING,
+            ) as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
+        # LOAD-BEARING, despite the blanket handler below also re-raising: this arm is what
+        # keeps the unlink away from a file we did not create. O_EXCL raises FileExistsError
+        # when the name is already taken, so returning here is the only thing standing
+        # between a lost race and deleting the winner's file. Do not merge it into the
+        # handler below.
+        except FileExistsError:
+            raise
+        except Exception:
+            if mode == "x":
+                with contextlib.suppress(OSError):
+                    Path(normalized_path).unlink()
             raise
 
     def _copy_file(self, src_path: Path, dest_path: Path) -> int:
