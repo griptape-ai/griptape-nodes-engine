@@ -1,8 +1,10 @@
 import asyncio
+import json
 import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from mcp.types import CallToolRequestParams
 
 from griptape_nodes.retained_mode.events.base_events import RequestPayload
 from griptape_nodes.servers import mcp as mcp_module
@@ -12,10 +14,15 @@ from griptape_nodes.servers.mcp import (
     EVENT_REQUEST_BATCH_TOOL_NAME,
     SUPPORTED_REQUEST_EVENTS,
     _build_batch_pairs,
+    _build_server,
+    _build_server_v1,
+    _build_server_v2,
     _dispatch_to_engine,
     _event_request_batch_input_schema,
     _resolve_batch_timeout_ms,
+    _run_tool,
     _summarize_result_details,
+    _supported_tools,
     _trim_batch_results,
     _trim_response,
 )
@@ -249,6 +256,117 @@ class TestEventRequestBatchToolName:
         # The batch tool is intentionally synthetic; gating it on SUPPORTED_REQUEST_EVENTS would
         # require a fake RequestPayload subclass and break call_tool's payload-class lookup.
         assert EVENT_REQUEST_BATCH_TOOL_NAME not in SUPPORTED_REQUEST_EVENTS
+
+
+def _field(model: object, camel_name: str) -> object:
+    """Read a field that mcp renamed between majors.
+
+    The 2.0 models still *accept* the camelCase spelling as a constructor alias, but expose the
+    attribute as snake_case (`inputSchema` -> `input_schema`, `isError` -> `is_error`). Dumping by
+    alias gives one spelling that works on both versions.
+    """
+    return model.model_dump(by_alias=True)[camel_name]  # type: ignore[attr-defined]
+
+
+class TestSupportedTools:
+    def test_advertises_every_supported_event_plus_the_batch_tool(self) -> None:
+        names = [tool.name for tool in _supported_tools()]
+
+        assert set(names) == set(SUPPORTED_REQUEST_EVENTS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
+
+    def test_every_tool_carries_an_input_schema(self) -> None:
+        assert all(_field(tool, "inputSchema")["type"] == "object" for tool in _supported_tools())  # type: ignore[index]
+
+
+class TestRunTool:
+    @pytest.mark.asyncio
+    async def test_rejects_unsupported_tool_name(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported tool"):
+            await _run_tool("NopeRequest", {})
+
+    @pytest.mark.asyncio
+    async def test_returns_trimmed_json_for_a_single_request(self) -> None:
+        async def fake_dispatch(_payload: object, timeout_ms: int | None = None) -> dict:  # noqa: ARG001
+            return {"result_type": "ListRegisteredLibrariesResultSuccess", "result": {"libraries": ["demo"]}}
+
+        with patch.object(mcp_module, "_dispatch_to_engine", fake_dispatch):
+            text = await _run_tool("ListRegisteredLibrariesRequest", {})
+
+        assert json.loads(text) == {"ok": True, "libraries": ["demo"]}
+
+    @pytest.mark.asyncio
+    async def test_routes_the_batch_tool_through_the_batch_dispatcher(self) -> None:
+        seen: dict[str, object] = {}
+
+        async def fake_batch_dispatch(pairs: list, timeout_ms: int) -> list:
+            seen["pairs"] = pairs
+            seen["timeout_ms"] = timeout_ms
+            return [{"result_type": "CreateNodeResultSuccess", "result": {"node_name": "A_1"}}]
+
+        with patch.object(mcp_module, "_dispatch_batch_to_engine", fake_batch_dispatch):
+            text = await _run_tool(
+                EVENT_REQUEST_BATCH_TOOL_NAME,
+                {"requests": [{"request_type": "CreateNodeRequest", "request": {"node_type": "TextInput"}}]},
+            )
+
+        assert json.loads(text) == [{"ok": True, "node_name": "A_1"}]
+        assert seen["timeout_ms"] == _BATCH_PER_REQUEST_TIMEOUT_MS
+
+
+class TestBuildServer:
+    """The low-level Server API changed shape in mcp 2.0.
+
+    1.x registers handlers with `@app.list_tools()` / `@app.call_tool()` decorators; 2.0 removed
+    those in favor of `on_list_tools=` / `on_call_tool=` constructor kwargs. _build_server picks the
+    path matching the installed version, so both builders are covered here regardless of which
+    version resolved.
+    """
+
+    def test_selects_the_builder_matching_the_installed_api(self) -> None:
+        # Whichever version is installed, building the server must not raise.
+        assert _build_server() is not None
+
+    def test_v1_builder_requires_the_decorator_api(self) -> None:
+        if not hasattr(mcp_module.Server, "call_tool"):
+            pytest.skip("mcp 2.x installed; the 1.x decorator API is unavailable")
+
+        assert _build_server_v1() is not None
+
+    def test_v2_builder_requires_the_kwarg_api(self) -> None:
+        if hasattr(mcp_module.Server, "call_tool"):
+            pytest.skip("mcp 1.x installed; the 2.x kwarg API is unavailable")
+
+        assert _build_server_v2() is not None
+
+    @pytest.mark.asyncio
+    async def test_v2_call_tool_converts_raises_into_error_results(self) -> None:
+        """Handlers must restore isError themselves, since mcp 2.0 dropped the decorator's try/except.
+
+        In 1.x a raise from the tool body came back as CallToolResult(isError=True). If the 2.x
+        handler let it propagate, the same bad call would surface as a JSON-RPC protocol error
+        instead, which clients report as a transport failure rather than a tool error.
+        """
+        if hasattr(mcp_module.Server, "call_tool"):
+            pytest.skip("mcp 1.x installed; the 2.x kwarg API is unavailable")
+
+        handler = _build_server_v2()._request_handlers["tools/call"].handler  # pyright: ignore[reportAttributeAccessIssue]
+        params = CallToolRequestParams(name="NopeRequest", arguments={})
+
+        result = await handler(MagicMock(), params)
+
+        assert _field(result, "isError") is True
+        assert "Unsupported tool" in result.content[0].text
+
+    @pytest.mark.asyncio
+    async def test_v2_list_tools_returns_a_result_object(self) -> None:
+        if hasattr(mcp_module.Server, "call_tool"):
+            pytest.skip("mcp 1.x installed; the 2.x kwarg API is unavailable")
+
+        handler = _build_server_v2()._request_handlers["tools/list"].handler  # pyright: ignore[reportAttributeAccessIssue]
+
+        result = await handler(MagicMock(), None)
+
+        assert {tool.name for tool in result.tools} == set(SUPPORTED_REQUEST_EVENTS) | {EVENT_REQUEST_BATCH_TOOL_NAME}
 
 
 class TestDispatchToEngineShield:

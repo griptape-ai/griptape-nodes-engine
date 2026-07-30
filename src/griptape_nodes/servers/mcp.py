@@ -12,6 +12,8 @@ from fastapi import FastAPI
 from mcp.server.lowlevel import Server
 from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
 from mcp.types import (
+    CallToolResult,
+    ListToolsResult,
     TextContent,
     Tool,
 )
@@ -172,9 +174,11 @@ EVENT_REQUEST_BATCH_DESCRIPTION = (
     "    single tool call ({ok, details, ...payload fields}). Failures appear as\n"
     "    {ok: false, details: ...} in their slot rather than aborting the rest of the batch.\n"
 )
+# Timeout applied to a single (non-batch) tool call.
+_SINGLE_REQUEST_TIMEOUT_MS = 30000
 # Per-inner-request timeout used when the caller does not pass timeout_ms. Mirrors the timeout the
-# single-request path applies (see call_tool below) so a batch of one behaves identically.
-_BATCH_PER_REQUEST_TIMEOUT_MS = 30000
+# single-request path applies (see _run_tool below) so a batch of one behaves identically.
+_BATCH_PER_REQUEST_TIMEOUT_MS = _SINGLE_REQUEST_TIMEOUT_MS
 # Hard ceiling for an auto-computed batch timeout. Long enough to accommodate a large build phase
 # without letting a runaway batch hold the connection open indefinitely.
 _BATCH_MAX_AUTO_TIMEOUT_MS = 300000
@@ -413,6 +417,44 @@ async def _dispatch_to_engine(request_payload: RequestPayload, timeout_ms: int |
     return await asyncio.shield(response_future)
 
 
+def _supported_tools() -> list[Tool]:
+    """Build the tool list advertised over MCP: one per supported request event, plus the batch tool."""
+    single_tools = [
+        Tool(name=event.__name__, description=event.__doc__, inputSchema=TypeAdapter(event).json_schema())
+        for event in SUPPORTED_REQUEST_EVENTS.values()
+    ]
+    batch_tool = Tool(
+        name=EVENT_REQUEST_BATCH_TOOL_NAME,
+        description=EVENT_REQUEST_BATCH_DESCRIPTION,
+        inputSchema=_event_request_batch_input_schema(),
+    )
+    return [*single_tools, batch_tool]
+
+
+async def _run_tool(name: str, arguments: dict[str, Any]) -> str:
+    """Dispatch a single MCP tool call and return the JSON text payload for the response.
+
+    Shared by both the mcp 1.x and 2.x registration paths so the dispatch semantics (batch
+    special-case, unsupported-name rejection, per-request timeout) live in exactly one place.
+    """
+    if name == EVENT_REQUEST_BATCH_TOOL_NAME:
+        pairs = _build_batch_pairs(arguments.get("requests"))
+        timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
+        raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
+        mcp_server_logger.debug("Got %d batch results", len(raw_results))
+        return json.dumps(_trim_batch_results(raw_results))
+
+    if name not in SUPPORTED_REQUEST_EVENTS:
+        msg = f"Unsupported tool: {name}"
+        raise ValueError(msg)
+
+    request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
+    result = await _dispatch_to_engine(request_payload, timeout_ms=_SINGLE_REQUEST_TIMEOUT_MS)
+    mcp_server_logger.debug("Got result: %s", result)
+
+    return json.dumps(_trim_response(result))
+
+
 async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], timeout_ms: int) -> list[Any]:
     """Dispatch a batch of (request_type, payload) pairs concurrently onto the engine loop.
 
@@ -425,6 +467,66 @@ async def _dispatch_batch_to_engine(pairs: list[tuple[str, dict[str, Any]]], tim
     return await asyncio.wait_for(gather, timeout=timeout_ms / 1000)
 
 
+def _build_server_v2() -> Server:
+    """Register the tool handlers using the mcp 2.x constructor-kwarg API.
+
+    2.x handlers receive a request context plus a typed params model and must return full result
+    objects. It also dropped the 1.x decorator's try/except wrapper, which turned any raise into a
+    CallToolResult(isError=True); the except below restores that so a bad tool call still comes
+    back as a tool-level error result instead of a JSON-RPC protocol error.
+    """
+
+    async def on_list_tools(_ctx: Any, _params: Any) -> Any:
+        return ListToolsResult(tools=_supported_tools())
+
+    async def on_call_tool(_ctx: Any, params: Any) -> Any:
+        try:
+            text = await _run_tool(params.name, params.arguments or {})
+        except Exception as exc:
+            return CallToolResult(content=[TextContent(type="text", text=str(exc))], isError=True)
+        return CallToolResult(content=[TextContent(type="text", text=text)], isError=False)
+
+    # Type-checked against whichever mcp major is installed; these kwargs only exist on 2.x.
+    return Server(
+        "mcp-gtn",
+        on_list_tools=on_list_tools,  # pyright: ignore[reportCallIssue]
+        on_call_tool=on_call_tool,  # pyright: ignore[reportCallIssue]
+    )
+
+
+def _build_server_v1() -> Server:
+    """Register the tool handlers using the mcp 1.x decorator API.
+
+    The 1.x decorators wrap the handler and build the result objects themselves, so these return
+    bare lists and let the wrapper convert raises into isError results.
+    """
+    app = Server("mcp-gtn")
+
+    @app.list_tools()
+    async def list_tools() -> list[Tool]:
+        return _supported_tools()
+
+    @app.call_tool()
+    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+        return [TextContent(type="text", text=await _run_tool(name, arguments))]
+
+    return app
+
+
+def _build_server() -> Server:
+    """Build the low-level MCP server against whichever mcp major version is installed.
+
+    mcp 2.0 replaced the `@app.list_tools()` / `@app.call_tool()` decorators with `on_list_tools=` /
+    `on_call_tool=` constructor kwargs. We cannot simply require 2.x: fastmcp-slim 3.x (pulled in
+    transitively by pydantic-ai-slim[mcp], and used by the agent MCP *client* path) imports
+    `McpError` from `mcp`, which 2.0 renamed to `MCPError`, so forcing 2.x breaks that client.
+    Supporting both keeps this server working either way.
+    """
+    if hasattr(Server, "call_tool"):
+        return _build_server_v1()
+    return _build_server_v2()
+
+
 def start_mcp_server(sock: socket.socket) -> None:
     """Synchronous version of main entry point for the Griptape Nodes MCP server.
 
@@ -435,39 +537,7 @@ def start_mcp_server(sock: socket.socket) -> None:
     bound_host, bound_port = sock.getsockname()[:2]
     mcp_server_logger.info("MCP server listening at http://%s:%d/mcp/", bound_host, bound_port)
 
-    app = Server("mcp-gtn")
-
-    @app.list_tools()
-    async def list_tools() -> list[Tool]:
-        single_tools = [
-            Tool(name=event.__name__, description=event.__doc__, inputSchema=TypeAdapter(event).json_schema())
-            for (name, event) in SUPPORTED_REQUEST_EVENTS.items()
-        ]
-        batch_tool = Tool(
-            name=EVENT_REQUEST_BATCH_TOOL_NAME,
-            description=EVENT_REQUEST_BATCH_DESCRIPTION,
-            inputSchema=_event_request_batch_input_schema(),
-        )
-        return [*single_tools, batch_tool]
-
-    @app.call_tool()
-    async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-        if name == EVENT_REQUEST_BATCH_TOOL_NAME:
-            pairs = _build_batch_pairs(arguments.get("requests"))
-            timeout_ms = _resolve_batch_timeout_ms(arguments.get("timeout_ms"), len(pairs))
-            raw_results = await _dispatch_batch_to_engine(pairs, timeout_ms)
-            mcp_server_logger.debug("Got %d batch results", len(raw_results))
-            return [TextContent(type="text", text=json.dumps(_trim_batch_results(raw_results)))]
-
-        if name not in SUPPORTED_REQUEST_EVENTS:
-            msg = f"Unsupported tool: {name}"
-            raise ValueError(msg)
-
-        request_payload = SUPPORTED_REQUEST_EVENTS[name](**arguments)
-        result = await _dispatch_to_engine(request_payload, timeout_ms=30000)
-        mcp_server_logger.debug("Got result: %s", result)
-
-        return [TextContent(type="text", text=json.dumps(_trim_response(result)))]
+    app = _build_server()
 
     # Create the session manager with our app and event store
     session_manager = StreamableHTTPSessionManager(

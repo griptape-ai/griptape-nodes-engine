@@ -19,7 +19,9 @@ dependencies = [
   "packaging>=25.0",
   "python-multipart>=0.0.20",
   "json-repair>=0.46.1",
-  "mcp[ws]>=1.10.1",
+  # The `ws` extra only added websockets, which we already declare directly, and it no longer
+  # exists in mcp 2.x. Left unpinned across majors: servers/mcp.py supports both server APIs.
+  "mcp>=1.10.1",
   "binaryornot>=0.4.4",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
