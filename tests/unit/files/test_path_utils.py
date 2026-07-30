@@ -65,6 +65,91 @@ class TestFilenameParts:
         assert parts.directory == Path()
 
 
+class TestSanitizePathStringWindowsSeparators:
+    r"""On a backslash-separated path, ``\`` is a separator, not a shell escape.
+
+    Stripping it wholesale turns ``C:\outputs\!final\render.png`` into
+    ``C:\outputs!final\render.png``, silently retargeting the path at a sibling of the
+    intended directory whenever a component starts with a shell-special character
+    (griptape-ai/internal#178).
+
+    The discriminator is the path's SHAPE, not ``sys.platform`` -- a path can be authored
+    on one OS and consumed on another -- so every case here runs on every platform. No
+    ``skipif``, no patched ``is_windows``: a regression fails on the developer's machine
+    rather than waiting for the Windows CI job.
+
+    ``\ `` is the one escape still honored on a Windows-shaped path, because a Windows
+    path component cannot begin with a space, so ``\ `` is unambiguous.
+    """
+
+    @pytest.mark.parametrize(
+        "component",
+        ["!final", "[wip]", "{batch}", "$tmp", "(draft)", "&more", "*glob", ";semi", "'quote"],
+    )
+    def test_preserves_separator_before_special_component(self, component: str) -> None:
+        """Every shell-special leading character must keep its preceding separator."""
+        path_str = f"C:\\outputs\\{component}\\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_unc_path(self) -> None:
+        r"""UNC roots (``\\server\share``) are backslash-separated too."""
+        path_str = r"\\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_extended_length_unc_path(self) -> None:
+        r"""The ``\\?\UNC\`` form is Windows-shaped despite its unusual remainder.
+
+        After the ``\\?\`` prefix is stripped, ``UNC\server\...`` matches neither the
+        drive-letter nor the ``\\`` root, so shape detection must key on the prefix
+        itself. ``_apply_windows_long_path_prefix`` emits exactly this form, and
+        ``on_write_file_request`` re-sanitizes on the way in, so a UNC path that
+        round-trips through normalization lands here.
+        """
+        path_str = r"\\?\UNC\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_extended_length_drive_path(self) -> None:
+        r"""The ``\\?\C:\`` form must keep separators before special components."""
+        path_str = r"\\?\C:\outputs\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_still_unescapes_spaces_on_extended_length_unc_path(self) -> None:
+        r"""``\ `` remains the one honored escape under the ``\\?\UNC\`` prefix too."""
+        assert sanitize_path_string(r"\\?\UNC\server\share\my\ file.txt") == r"\\?\UNC\server\share\my file.txt"
+
+    def test_still_unescapes_spaces_on_windows_path(self) -> None:
+        r"""``\ `` remains an escape: a Windows component cannot start with a space.
+
+        LocalFileDriver relies on this to read a Finder/shell-escaped path whose
+        directory happens to be a real Windows temp dir.
+        """
+        assert sanitize_path_string(r"C:\dir\test\ file.txt") == r"C:\dir\test file.txt"
+
+    def test_still_removes_newlines_on_windows_path(self) -> None:
+        """The newline cleanup (WinError 123) applies regardless of shape."""
+        assert sanitize_path_string("C:\\Users\\file\n\n.txt") == "C:\\Users\\file.txt"
+
+    def test_still_strips_quotes_on_windows_path(self) -> None:
+        """Quote stripping is shape-independent."""
+        assert sanitize_path_string('"C:\\Users\\my file.txt"') == "C:\\Users\\my file.txt"
+
+    def test_posix_shaped_path_keeps_full_unescaping(self) -> None:
+        """A POSIX-shaped path has no separator ambiguity, so every escape is stripped."""
+        assert sanitize_path_string(r"/Downloads/Dragon\'s\ Curse/x.jpg") == "/Downloads/Dragon's Curse/x.jpg"
+
+    def test_relative_backslash_path_keeps_full_unescaping(self) -> None:
+        r"""Only a drive/UNC root marks a Windows path; a bare relative string does not.
+
+        A relative POSIX filename may legitimately contain an escaped backslash, and it
+        must not be misread as a Windows path.
+        """
+        assert sanitize_path_string(r"sub/dir\ name/file.txt") == "sub/dir name/file.txt"
+
+
 class TestSanitizePathString:
     """Tests for sanitize_path_string function."""
 
@@ -262,6 +347,18 @@ class TestNormalizePathForPlatform:
         # Check for actual newline and carriage return characters, not the string sequences
         assert "\n" not in result
         assert "\r" not in result
+
+    @pytest.mark.skipif(not sys.platform.startswith("win"), reason="Windows-specific separator test")
+    def test_preserves_windows_separator_before_special_characters(self) -> None:
+        r"""Windows separators must survive even when the next component starts specially.
+
+        ``C:\outputs\!final\render.png`` must not become ``C:\outputs!final\render.png`` --
+        de-escaping would eat the separator and redirect the write to a sibling directory.
+        """
+        result = normalize_path_for_platform(Path(r"C:\outputs\!final\render.png"))
+
+        assert "\\!final" in result
+        assert "outputs!final" not in result
 
 
 class TestApplyWindowsLongPathPrefix:

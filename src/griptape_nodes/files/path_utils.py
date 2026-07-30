@@ -29,7 +29,13 @@ _MACOS_VOLUME_STRIP_PATTERN = r"^/Volumes/[^/]+/?"
 _LINUX_MOUNT_MATCH_PATTERN = r"^/(mnt|media)/([^/]+)"
 _LINUX_MOUNT_STRIP_PATTERN = r"^/(mnt|media)/[^/]+/?"
 
+# A backslash-separated Windows path: a drive letter (`C:\`) or a UNC root (`\\server`)
+# followed by a backslash separator. Used to decide how aggressively sanitize_path_string
+# may treat `\` as a shell escape rather than a directory separator.
+_WINDOWS_SEPARATOR_MATCH_PATTERN = r"^(?:[A-Z]:\\|\\\\)"
+
 _WINDOWS_DRIVE_PATTERN = re.compile(_WINDOWS_DRIVE_MATCH_PATTERN, re.IGNORECASE)
+_WINDOWS_SEPARATOR_PATTERN = re.compile(_WINDOWS_SEPARATOR_MATCH_PATTERN, re.IGNORECASE)
 _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
@@ -256,9 +262,31 @@ def sanitize_path_string(path: str | Path) -> str:
     # Remove shell escape characters (backslashes before special chars only)
     # Matches: space ' " ( ) { } [ ] & | ; < > $ ` ! * ? /
     # Does NOT match: \U \t \f etc in Windows paths like C:\Users
-    path_str = re.sub(r"\\([ '\"(){}[\]&|;<>$`!*?/])", r"\1", path_str)
+    #
+    # How much we strip depends on the SHAPE of the path, not on the host platform: a
+    # path can be authored on one OS and consumed on another (pasted from WSL, stored in
+    # a saved workflow), so `sys.platform` says nothing about which convention produced
+    # the string.
+    #
+    # On a backslash-separated Windows path, `\` is the directory separator, and
+    # stripping it wholesale turns `C:\outputs\!final\render.png` into
+    # `C:\outputs!final\render.png` -- silently retargeting the write at a sibling of the
+    # intended directory whenever a component begins with a shell-special character
+    # (griptape-ai/internal#178). Only `\ ` stays unambiguous there, because a Windows
+    # path component cannot begin with a space, so `\ ` can only be an escape.
+    #
+    # A stripped `\\?\` prefix is itself proof of Windows shape: the extended-length
+    # remainder of a UNC path (`UNC\server\...`) matches neither the drive-letter nor
+    # the `\\` form, so without this check it would fall into the aggressive branch
+    # and lose separators exactly as above.
+    if extended_length_prefix or _WINDOWS_SEPARATOR_PATTERN.search(path_str):
+        path_str = re.sub(r"\\( )", r"\1", path_str)
+    else:
+        path_str = re.sub(r"\\([ '\"(){}[\]&|;<>$`!*?/])", r"\1", path_str)
 
-    # Remove newlines and carriage returns from anywhere in the path
+    # Remove newlines and carriage returns from anywhere in the path.
+    # These cause WinError 123 on Windows (merge_texts nodes can introduce them
+    # between path components).
     path_str = path_str.replace("\n", "").replace("\r", "")
 
     # Strip leading/trailing whitespace
