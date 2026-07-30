@@ -91,6 +91,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
     UnresolveFlowResultSuccess,
 )
 from griptape_nodes.retained_mode.events.flow_events import (
+    TRANSIENT_KEY,
     AutoLayoutFlowRequest,
     AutoLayoutFlowResultFailure,
     AutoLayoutFlowResultSuccess,
@@ -1474,8 +1475,13 @@ class FlowManager:
                 set_lock_commands_per_node[serialized_node.node_uuid] = serialized_node.lock_node_command
 
         # Create a CreateFlowRequest for the packaged flow so that it can
-        # run as a standalone workflow
-        packaged_flow_metadata = {}  # Keep it simple until we have reason to populate it
+        # run as a standalone workflow.
+        # Flag it transient: the iterative executor deserializes this packaged body into one child
+        # flow per iteration, all parented to the running flow. They are recreated on every run and
+        # torn down after, so they must never be serialized into a saved workflow (otherwise a save
+        # bakes in a duplicate loop-body flow per iteration). The flow serializer skips transient
+        # child flows; CreateFlowRequest.metadata is applied directly to the created ControlFlow.
+        packaged_flow_metadata = {TRANSIENT_KEY: True}
 
         create_packaged_flow_request = CreateFlowRequest(
             parent_flow_name=None,  # Standalone flow
@@ -2981,6 +2987,15 @@ class FlowManager:
 
         try:
             await subflow_machine.start_flow(start_node)
+        except asyncio.CancelledError:
+            # The caller (e.g. a ForEach iteration) was cancelled. This isolated machine spawns its
+            # own asyncio tasks for the body nodes; cancelling the awaiting coroutine does NOT cancel
+            # those tasks, so without this they would run detached to completion and then touch a
+            # flow the loop's cleanup has already deleted ("no Flow with that name exists"). Cancel
+            # and await this machine's own tasks before unwinding, then re-raise so cancellation
+            # still propagates to the caller.
+            await subflow_machine.cancel_flow()
+            raise
         except Exception as err:
             msg = f"Failed to run flow {flow_name}. Error: {err}"
             return StartLocalSubflowResultFailure(result_details=msg)
@@ -3711,8 +3726,9 @@ class FlowManager:
                     return SerializeFlowToCommandsResultFailure(result_details=details)
 
                 # Skip transient child flows: they are runtime-only artifacts (e.g. a subflow a node
-                # imports at execution time) and must not be baked into the saved workflow.
-                if child_flow_obj.metadata.get("transient"):
+                # imports at execution time, or a per-iteration loop-body flow) and must not be
+                # baked into the saved workflow.
+                if child_flow_obj.metadata.get(TRANSIENT_KEY):
                     continue
 
                 # Check if this is a referenced workflow

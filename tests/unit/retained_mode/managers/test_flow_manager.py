@@ -16,8 +16,10 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.events.flow_events import (
+    TRANSIENT_KEY,
     CreateFlowRequest,
     CreateFlowResultSuccess,
+    DeleteFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
@@ -845,7 +847,7 @@ class TestSerializeFlowSkipsTransientChildFlows:
         assert isinstance(transient, CreateFlowResultSuccess)
 
         flow_manager = griptape_nodes.FlowManager()
-        flow_manager.get_flow_by_name(transient.flow_name).metadata["transient"] = True
+        flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
 
         result = flow_manager.on_serialize_flow_to_commands(
             SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
@@ -855,3 +857,42 @@ class TestSerializeFlowSkipsTransientChildFlows:
         serialized_child_flows = {sub.flow_name for sub in result.serialized_flow_commands.sub_flows_commands}
         assert keep.flow_name in serialized_child_flows
         assert transient.flow_name not in serialized_child_flows
+
+
+class TestDeleteIterationFlows:
+    """NodeExecutor._delete_iteration_flows tears down every tracked iteration flow.
+
+    This is the cleanup guarantee for iterative execution: whatever was deserialized must be gone
+    once the loop is no longer running, on every exit path. The helper must also tolerate a flow
+    that is already gone (e.g. a partially-run iteration cleaned itself up) without erroring.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("clean_object_state")
+    async def test_deletes_all_tracked_flows(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.common.node_executor import NodeExecutor
+
+        griptape_nodes.ContextManager().push_workflow("cleanup_wf")
+        griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
+        )
+
+        object_manager = griptape_nodes.ObjectManager()
+        deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
+        for i in range(3):
+            created = griptape_nodes.handle_request(
+                CreateFlowRequest(parent_flow_name="parent", flow_name=f"iter_{i}", set_as_new_context=False)
+            )
+            assert isinstance(created, CreateFlowResultSuccess)
+            deserialized_flows.append((i, created.flow_name, {}))
+
+        # Delete one flow out from under the helper to prove it tolerates an already-gone flow.
+        already_gone = deserialized_flows[1][1]
+        griptape_nodes.handle_request(DeleteFlowRequest(flow_name=already_gone))
+        assert object_manager.attempt_get_object_by_name(already_gone) is None
+
+        executor = NodeExecutor.__new__(NodeExecutor)
+        await executor._delete_iteration_flows(deserialized_flows, griptape_nodes.EventManager())
+
+        for _, flow_name, _ in deserialized_flows:
+            assert object_manager.attempt_get_object_by_name(flow_name) is None
