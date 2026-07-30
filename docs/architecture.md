@@ -185,7 +185,7 @@ Three properties carry the configuration.
 
 **Nothing about building or running a workflow crosses the perimeter.** Griptape Nodes Desktop bundles the editor, so no browser fetches it over the internet, and it connects to the application over the direct WebSocket. Workflows, assets, and secrets sit in a workspace on the machine. Combined with a local model runner, a workflow can execute start to finish with no packet leaving your network.
 
-**One host egresses, and you decide what it may carry.** Every application points at the Admin Server instead of `cloud.griptape.ai`, giving you one firewall rule and one place to audit outbound traffic. The Admin Server can also restrict which Cloud paths are permitted, so you can keep model calls in network while still permitting licensing. See [forwarding rules](enterprise/admin_server.md#forwarding).
+**One host egresses, and you decide what it may carry.** Every application points at the Admin Server instead of `cloud.griptape.ai`, giving you one firewall rule and one place to audit outbound traffic. The Admin Server can also restrict which Cloud paths are permitted, so you can keep model calls in network while still permitting licensing. See [forwarding rules](enterprise/admin_server.md#forwarding). It forwards rather than decides: it validates no licenses, allocates no sessions, and caches nothing, and each application's own credential passes through untouched for Griptape Cloud to accept or reject.
 
 **What must egress is a fixed, inspectable list.** Licensing needs the routes below, and nothing else is required. The Admin Server refuses to start if your configuration would block them:
 
@@ -202,18 +202,6 @@ Three properties carry the configuration.
     That connection does more than allocate a session. It is also how an application picks up the current contents of its license, so when an administrator changes what a license permits, running deployments get the new permissions on their next session rather than waiting for a reissue or a redeploy. Managing entitlements centrally and having them take effect immediately is the practical benefit of keeping the route open.
 
     It does mean on premises is not a disconnected mode. On premises means your machines, workflows, and assets stay inside your network; it does not mean Griptape Nodes runs with no route out. Sessions are allocated by Griptape Cloud, so the Admin Server needs to reach it. If that route is unavailable, the Admin Server returns an error rather than serving stale approvals, and applications cannot start new sessions.
-
-## Where the boundaries are
-
-If you are reviewing Griptape Nodes for a security assessment, these are the details that matter most.
-
-**The Admin Server forwards; it does not decide.** It validates no licenses, allocates no sessions, resolves no entitlements, and caches nothing. It does not authenticate callers either: each application's own credential is forwarded untouched for Griptape Cloud to accept or reject. Its jobs are egress consolidation and, if you configure it, egress filtering. It holds no state, so it is not an offline fallback. With no route upstream, it returns an error.
-
-**Policy is enforced on your machine, not in the network.** The application enforces the permissions attached to your license locally, before a request reaches the engine. Those permissions come from the signed license and are resolved from Griptape Cloud when a session is allocated, so no network appliance or firewall rule is involved in deciding what a workflow may do.
-
-**Griptape Cloud is the authority on licensing and entitlement.** Session allocation and entitlement resolution are Cloud decisions in both configurations. On premises changes only the path traffic takes to get there.
-
-**The execution runtime is open source and auditable.** The engine that runs your workflows is public, so its file handling, network calls, and node execution can be inspected rather than taken on trust. Enforcement lives in the application layer above it.
 
 ## Related pages
 
