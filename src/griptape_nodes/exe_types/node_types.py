@@ -1011,6 +1011,10 @@ class BaseNode(ABC):
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
+        # Scoped to ParameterList rather than ParameterContainer: the gate's checks are
+        # list-shaped (isinstance list, max_items), and no concrete non-list container exists
+        # (ParameterDictionary is abstract with no implementations). If one lands, lift this to
+        # ParameterContainer and have each subclass supply its own payload-shape check.
         if isinstance(param, ParameterList) and self._has_connected_whole_list_value(param):
             return self.parameter_values[param_name]
         if isinstance(param, ParameterContainer):
