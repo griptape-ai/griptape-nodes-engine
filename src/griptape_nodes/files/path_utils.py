@@ -274,7 +274,12 @@ def sanitize_path_string(path: str | Path) -> str:
     # intended directory whenever a component begins with a shell-special character
     # (griptape-ai/internal#178). Only `\ ` stays unambiguous there, because a Windows
     # path component cannot begin with a space, so `\ ` can only be an escape.
-    if _WINDOWS_SEPARATOR_PATTERN.search(path_str):
+    #
+    # A stripped `\\?\` prefix is itself proof of Windows shape: the extended-length
+    # remainder of a UNC path (`UNC\server\...`) matches neither the drive-letter nor
+    # the `\\` form, so without this check it would fall into the aggressive branch
+    # and lose separators exactly as above.
+    if extended_length_prefix or _WINDOWS_SEPARATOR_PATTERN.search(path_str):
         path_str = re.sub(r"\\( )", r"\1", path_str)
     else:
         path_str = re.sub(r"\\([ '\"(){}[\]&|;<>$`!*?/])", r"\1", path_str)

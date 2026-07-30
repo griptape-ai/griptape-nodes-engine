@@ -98,6 +98,29 @@ class TestSanitizePathStringWindowsSeparators:
 
         assert sanitize_path_string(path_str) == path_str
 
+    def test_preserves_separator_on_extended_length_unc_path(self) -> None:
+        r"""The ``\\?\UNC\`` form is Windows-shaped despite its unusual remainder.
+
+        After the ``\\?\`` prefix is stripped, ``UNC\server\...`` matches neither the
+        drive-letter nor the ``\\`` root, so shape detection must key on the prefix
+        itself. ``_apply_windows_long_path_prefix`` emits exactly this form, and
+        ``on_write_file_request`` re-sanitizes on the way in, so a UNC path that
+        round-trips through normalization lands here.
+        """
+        path_str = r"\\?\UNC\server\share\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_preserves_separator_on_extended_length_drive_path(self) -> None:
+        r"""The ``\\?\C:\`` form must keep separators before special components."""
+        path_str = r"\\?\C:\outputs\!final\render.png"
+
+        assert sanitize_path_string(path_str) == path_str
+
+    def test_still_unescapes_spaces_on_extended_length_unc_path(self) -> None:
+        r"""``\ `` remains the one honored escape under the ``\\?\UNC\`` prefix too."""
+        assert sanitize_path_string(r"\\?\UNC\server\share\my\ file.txt") == r"\\?\UNC\server\share\my file.txt"
+
     def test_still_unescapes_spaces_on_windows_path(self) -> None:
         r"""``\ `` remains an escape: a Windows component cannot start with a space.
 
