@@ -11,6 +11,7 @@ from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
 from griptape_nodes.common.parameter_hydration import hydrate_value
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -51,7 +52,14 @@ class PublicArtifactUrlParameter:
             )
             raise ValueError(msg)
 
-        api_key = str(self._get_secret_value(self.API_KEY_NAME))
+        api_key = resolve_cloud_credential(GriptapeNodes.SecretsManager(), secret_name=self.API_KEY_NAME)
+        if not api_key:
+            msg = (
+                f"Attempted to make '{artifact_url_parameter.name}' publicly accessible. "
+                f"Failed because {MISSING_CREDENTIAL_MESSAGE}"
+            )
+            raise ValueError(msg)
+
         base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self._storage_driver = GriptapeCloudStorageDriver(
             workspace_directory=GriptapeNodes.ConfigManager().workspace_path,

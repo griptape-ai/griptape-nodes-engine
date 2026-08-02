@@ -5,6 +5,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.base_file_driver import BaseFileDriver
 
@@ -45,14 +46,15 @@ class GriptapeCloudFileDriver(BaseFileDriver):
     def create_from_env(cls) -> "GriptapeCloudFileDriver | None":
         """Create driver from environment variables if available.
 
-        Checks for GT_CLOUD_BUCKET_ID and GT_CLOUD_API_KEY environment variables.
-        If both are present, creates and returns a driver instance.
+        Checks for a GT_CLOUD_BUCKET_ID and a Griptape Cloud credential (the
+        license, else GT_CLOUD_API_KEY). If both are present, creates and returns
+        a driver instance.
 
         Returns:
             GriptapeCloudFileDriver instance if credentials available, None otherwise
         """
         bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
-        api_key = os.environ.get("GT_CLOUD_API_KEY")
+        api_key = resolve_cloud_credential()
         base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
 
         if bucket_id and api_key:

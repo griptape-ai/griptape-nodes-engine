@@ -17,6 +17,7 @@ import os
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.cloud_models import (
     LM_STUDIO_DEFAULT_BASE_URL,
     OLLAMA_DEFAULT_BASE_URL,
@@ -38,18 +39,19 @@ def build_griptape_cloud_model(
     Args:
         model_name: The Griptape Cloud model id (e.g. ``"gpt-4o"``). Cloud picks
             the underlying provider from this name server-side.
-        api_key: Griptape Cloud API key. Falls back to the ``GT_CLOUD_API_KEY``
-            environment variable. Sent as ``Authorization: Bearer <key>``.
+        api_key: Griptape Cloud credential. Falls back to the Griptape Nodes
+            License, then the ``GT_CLOUD_API_KEY`` environment variable, per
+            :func:`resolve_cloud_credential`. Sent as ``Authorization: Bearer <key>``.
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
             the ``GT_CLOUD_BASE_URL`` environment variable, then to
             :data:`GRIPTAPE_CLOUD_BASE_URL`.
 
     Raises:
-        ValueError: If no API key is available.
+        ValueError: If neither a license nor an API key is available.
     """
-    resolved_key = api_key or os.environ.get("GT_CLOUD_API_KEY")
+    resolved_key = api_key or resolve_cloud_credential()
     if not resolved_key:
-        msg = "Griptape Cloud API key is required. Pass `api_key=` or set the GT_CLOUD_API_KEY environment variable."
+        msg = f"Attempted to reach Griptape Cloud. Failed because {MISSING_CREDENTIAL_MESSAGE}"
         raise ValueError(msg)
 
     cloud_root = (base_url or os.environ.get("GT_CLOUD_BASE_URL", GRIPTAPE_CLOUD_BASE_URL)).rstrip("/")
@@ -73,9 +75,9 @@ def build_model(
         provider: One of ``"griptape_cloud"``, ``"ollama"``, ``"lmstudio"``,
             or ``"custom"``.
         api_key: API key for the target endpoint. Required for
-            ``"griptape_cloud"`` (falls back to ``GT_CLOUD_API_KEY``) and
-            ``"custom"``. Ignored for ``"ollama"`` and ``"lmstudio"``
-            (no auth needed).
+            ``"griptape_cloud"`` (falls back to the license, then
+            ``GT_CLOUD_API_KEY``) and ``"custom"``. Ignored for ``"ollama"``
+            and ``"lmstudio"`` (no auth needed).
         base_url: Base URL of the endpoint. For ``"griptape_cloud"`` the
             ``/api/v1`` suffix is appended automatically. For ``"ollama"``
             defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. For ``"lmstudio"``

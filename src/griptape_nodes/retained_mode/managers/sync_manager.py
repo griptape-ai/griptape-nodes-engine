@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 from watchfiles import Change, PythonFilter, watch
 
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.path_utils import canonicalize_for_identity
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
@@ -213,13 +214,13 @@ class SyncManager:
         # Get cloud storage configuration from secrets
         bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
         base_url = secrets_manager.get_secret("GT_CLOUD_BASE_URL", should_error_on_not_found=False)
-        api_key = secrets_manager.get_secret("GT_CLOUD_API_KEY")
+        api_key = resolve_cloud_credential(secrets_manager)
 
         if not bucket_id:
             msg = "Cloud storage bucket_id not configured. Set GT_CLOUD_BUCKET_ID secret."
             raise RuntimeError(msg)
         if not api_key:
-            msg = "Cloud storage api_key not configured. Set GT_CLOUD_API_KEY secret."
+            msg = f"Attempted to reach cloud storage. Failed because {MISSING_CREDENTIAL_MESSAGE}"
             raise RuntimeError(msg)
 
         workspace_directory = self._config_manager.workspace_path

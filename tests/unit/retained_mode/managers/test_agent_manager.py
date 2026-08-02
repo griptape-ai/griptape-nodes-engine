@@ -9,12 +9,15 @@ the real config system.
 import asyncio
 import json
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from pathlib import Path
 
 import httpx
 import pytest
+from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+import griptape_nodes.retained_mode.managers.agent_manager as agent_manager_module
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -62,6 +65,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     AgentManager,
     ComposedPrompt,
     _ActiveRun,
+    _cloud_http_status_of,
     _compose_prompt,
     _friendly_list_models_error,
     _message_has_image_url,
@@ -1047,3 +1051,128 @@ class TestConfigureAgentActiveProvider:
         assert isinstance(result, ConfigureAgentResultSuccess)
         gc = next(p for p in providers_manager._providers if p.name == "griptape_cloud")
         assert gc.model == "gpt-5"
+
+
+class TestBuildRunnerCredential:
+    """The Griptape Cloud runner accepts a license, not just `GT_CLOUD_API_KEY`."""
+
+    def test_license_only_config_builds_runner(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The reported bug: an Enterprise license with no GT_CLOUD_API_KEY raised
+        # "Secret 'GT_CLOUD_API_KEY' not found" instead of running the agent.
+        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "the-license")
+        captured: dict[str, object] = {}
+        monkeypatch.setattr(
+            agent_manager_module,
+            "PydanticAgentRunner",
+            lambda **kwargs: captured.update(kwargs) or object(),
+        )
+        monkeypatch.setattr(providers_manager, "_ensure_skills_directory", lambda _root: None)
+        providers_manager._mcp_server_port = 1234
+        # The runner is stubbed out, so these only need to exist, not be real.
+        providers_manager._system_prompt_extra = ""
+        providers_manager._thread_storage = object()  # type: ignore[assignment]
+        providers_manager.static_files_manager = None  # type: ignore[assignment]
+
+        providers_manager._build_runner([], provider_name="griptape_cloud")
+
+        assert captured["api_key"] == "the-license"
+
+    def test_missing_both_credentials_names_both(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: None)
+
+        with pytest.raises(ValueError, match="Sign in with your Griptape license") as excinfo:
+            providers_manager._build_runner([], provider_name="griptape_cloud")
+
+        assert "GT_CLOUD_API_KEY" in str(excinfo.value)
+
+
+class TestExplainAgentRunError:
+    """A 403 on a license-authenticated Cloud request is an entitlement denial."""
+
+    def test_forbidden_with_license_explains_entitlement(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body="Forbidden")
+
+        message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
+
+        assert "not entitled" in message
+
+    def test_forbidden_with_api_key_keeps_original_message(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # An API key can't be refused by license policy, so don't blame licensing.
+        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "gt-abc")
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body="Forbidden")
+
+        message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
+
+        assert "not entitled" not in message
+
+    def test_non_forbidden_error_keeps_original_message(self, providers_manager: AgentManager) -> None:
+        message = providers_manager._explain_agent_run_error(ValueError("boom"), "griptape_cloud")
+
+        assert message == "boom"
+
+    def test_forbidden_on_other_provider_keeps_original_message(
+        self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
+        exc = ModelHTTPError(status_code=403, model_name="llama3.2", body="Forbidden")
+
+        message = providers_manager._explain_agent_run_error(exc, "my-ollama")
+
+        assert "not entitled" not in message
+
+
+_CLOUD_HOST = "cloud.griptape.ai"
+
+
+def _httpx_403(url: str) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", url)
+    response = httpx.Response(403, request=request)
+    return httpx.HTTPStatusError("Forbidden", request=request, response=response)
+
+
+class TestCloudHttpStatusOf:
+    """`_cloud_http_status_of` spans two error shapes but only for Griptape Cloud."""
+
+    def test_reads_model_http_error(self) -> None:
+        """The chat path raises pydantic-ai's ModelHTTPError, which has status_code."""
+        exc = ModelHTTPError(status_code=403, model_name="gpt-4o")
+
+        assert _cloud_http_status_of(exc, _CLOUD_HOST) == HTTPStatus.FORBIDDEN
+
+    def test_reads_httpx_status_error(self) -> None:
+        """The image path raises an httpx error, which keeps status on .response."""
+        exc = _httpx_403("https://cloud.griptape.ai/api/images/generations")
+
+        assert _cloud_http_status_of(exc, _CLOUD_HOST) == HTTPStatus.FORBIDDEN
+
+    def test_follows_cause_chain(self) -> None:
+        """The image toolset wraps its failure in ModelRetry via `raise ... from exc`."""
+        wrapped = ModelRetry("image generation failed")
+        wrapped.__cause__ = _httpx_403("https://cloud.griptape.ai/api/images/generations")
+
+        assert _cloud_http_status_of(wrapped, _CLOUD_HOST) == HTTPStatus.FORBIDDEN
+
+    def test_ignores_403_from_another_host(self) -> None:
+        """A remote MCP server's expired token must not be blamed on Griptape licensing."""
+        exc = _httpx_403("https://mcp.example.com/mcp/")
+
+        assert _cloud_http_status_of(exc, _CLOUD_HOST) is None
+
+    def test_honors_custom_cloud_host(self) -> None:
+        """A self-hosted GT_CLOUD_BASE_URL is still recognized as Cloud."""
+        exc = _httpx_403("https://cloud.internal.example/api/images/generations")
+
+        assert _cloud_http_status_of(exc, "cloud.internal.example") == HTTPStatus.FORBIDDEN
+
+    def test_returns_none_for_non_http_error(self) -> None:
+        """A plain error has no status, so the caller keeps the original message."""
+        assert _cloud_http_status_of(ValueError("boom"), _CLOUD_HOST) is None

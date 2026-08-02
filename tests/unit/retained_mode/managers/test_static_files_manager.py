@@ -471,7 +471,9 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             )
 
             assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
-            assert "GT_CLOUD_API_KEY secret is not available" in result.error
+            # Names both credentials: a license-only user has no API key to set.
+            assert "no Griptape Cloud credential was found" in result.error
+            assert "GT_CLOUD_API_KEY" in result.error
 
     @pytest.mark.asyncio
     async def test_create_download_url_from_path_non_cloud_url(
