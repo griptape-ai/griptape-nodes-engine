@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Literal, overload
-
 import pytest
 
 from griptape_nodes.drivers.cloud_credentials import (
@@ -19,19 +17,10 @@ _LICENSE = "eyJhbGciOiJFZERTQSJ9.eyJvcmdfaWQiOiJvIn0.sig"
 
 
 class _FakeSecretsManager:
-    """Stands in for SecretsManager, which reads .env files off disk.
-
-    Mirrors the real manager's overloads so it satisfies `SecretsReader`.
-    """
+    """Stands in for SecretsManager, which reads .env files off disk."""
 
     def __init__(self, secrets: dict[str, str | None]) -> None:
         self._secrets = secrets
-
-    @overload
-    def get_secret(self, secret_name: str, *, should_error_on_not_found: Literal[True] = True) -> str: ...
-
-    @overload
-    def get_secret(self, secret_name: str, *, should_error_on_not_found: Literal[False]) -> str | None: ...
 
     def get_secret(self, secret_name: str, *, should_error_on_not_found: bool = True) -> str | None:  # noqa: ARG002
         return self._secrets.get(secret_name)
@@ -51,19 +40,19 @@ class TestResolveCloudCredential:
         """The reported case: an Enterprise license, no GT_CLOUD_API_KEY."""
         secrets = _FakeSecretsManager({LICENSE_SECRET_NAME: _LICENSE})
 
-        assert resolve_cloud_credential(secrets) == _LICENSE
+        assert resolve_cloud_credential(secrets) == _LICENSE  # type: ignore[arg-type]
 
     def test_prefers_license_over_api_key(self) -> None:
         """With both configured the license wins, matching the standard library."""
         secrets = _FakeSecretsManager({LICENSE_SECRET_NAME: _LICENSE, API_KEY_SECRET_NAME: "gt-the-api-key"})
 
-        assert resolve_cloud_credential(secrets) == _LICENSE
+        assert resolve_cloud_credential(secrets) == _LICENSE  # type: ignore[arg-type]
 
     def test_falls_back_to_api_key(self) -> None:
         """Today's normal setup keeps working."""
         secrets = _FakeSecretsManager({API_KEY_SECRET_NAME: "gt-the-api-key"})
 
-        assert resolve_cloud_credential(secrets) == "gt-the-api-key"
+        assert resolve_cloud_credential(secrets) == "gt-the-api-key"  # type: ignore[arg-type]
 
     def test_ignores_proxy_env_override(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """GT_CLOUD_PROXY_API_KEY is proxy-scoped and must not hijack engine calls.
@@ -75,17 +64,17 @@ class TestResolveCloudCredential:
         monkeypatch.setenv(_PROXY_API_KEY_ENV_VAR, "local")
         secrets = _FakeSecretsManager({API_KEY_SECRET_NAME: "gt-the-api-key"})
 
-        assert resolve_cloud_credential(secrets) == "gt-the-api-key"
+        assert resolve_cloud_credential(secrets) == "gt-the-api-key"  # type: ignore[arg-type]
 
     def test_returns_none_when_nothing_configured(self) -> None:
         """Callers decide whether a missing credential is fatal."""
-        assert resolve_cloud_credential(_FakeSecretsManager({})) is None
+        assert resolve_cloud_credential(_FakeSecretsManager({})) is None  # type: ignore[arg-type]
 
     def test_honors_custom_secret_name(self) -> None:
         """A caller with its own API-key secret name still gets the license first."""
         secrets = _FakeSecretsManager({_OTHER_SECRET_NAME: "gt-other"})
 
-        assert resolve_cloud_credential(secrets, secret_name=_OTHER_SECRET_NAME) == "gt-other"
+        assert resolve_cloud_credential(secrets, secret_name=_OTHER_SECRET_NAME) == "gt-other"  # type: ignore[arg-type]
 
     def test_without_secrets_manager_reads_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Drivers built straight from the environment are license-aware too."""

@@ -17,7 +17,6 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
-import griptape_nodes.retained_mode.managers.agent_manager as agent_manager_module
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -71,6 +70,8 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _message_has_image_url,
     _rehydrate_history,
 )
+
+_AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
 
 
 @pytest.fixture
@@ -1061,11 +1062,10 @@ class TestBuildRunnerCredential:
     ) -> None:
         # The reported bug: an Enterprise license with no GT_CLOUD_API_KEY raised
         # "Secret 'GT_CLOUD_API_KEY' not found" instead of running the agent.
-        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "the-license")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: "the-license")
         captured: dict[str, object] = {}
         monkeypatch.setattr(
-            agent_manager_module,
-            "PydanticAgentRunner",
+            _AGENT_MANAGER_MODULE + ".PydanticAgentRunner",
             lambda **kwargs: captured.update(kwargs) or object(),
         )
         monkeypatch.setattr(providers_manager, "_ensure_skills_directory", lambda _root: None)
@@ -1082,7 +1082,7 @@ class TestBuildRunnerCredential:
     def test_missing_both_credentials_names_both(
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: None)
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: None)
 
         with pytest.raises(ValueError, match="Sign in with your Griptape license") as excinfo:
             providers_manager._build_runner([], provider_name="griptape_cloud")
@@ -1096,7 +1096,7 @@ class TestExplainAgentRunError:
     def test_forbidden_with_license_explains_entitlement(
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
         exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body="Forbidden")
 
         message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
@@ -1107,7 +1107,7 @@ class TestExplainAgentRunError:
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # An API key can't be refused by license policy, so don't blame licensing.
-        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "gt-abc")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: "gt-abc")
         exc = ModelHTTPError(status_code=403, model_name="gpt-4o", body="Forbidden")
 
         message = providers_manager._explain_agent_run_error(exc, "griptape_cloud")
@@ -1122,7 +1122,7 @@ class TestExplainAgentRunError:
     def test_forbidden_on_other_provider_keeps_original_message(
         self, providers_manager: AgentManager, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(agent_manager_module, "resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
+        monkeypatch.setattr(_AGENT_MANAGER_MODULE + ".resolve_cloud_credential", lambda *_a, **_k: "a.license.jwt")
         exc = ModelHTTPError(status_code=403, model_name="llama3.2", body="Forbidden")
 
         message = providers_manager._explain_agent_run_error(exc, "my-ollama")

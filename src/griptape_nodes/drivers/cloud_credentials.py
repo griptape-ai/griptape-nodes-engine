@@ -34,24 +34,10 @@ that authenticates can still be refused with HTTP 403. See
 from __future__ import annotations
 
 import os
-from typing import Literal, Protocol, overload
+from typing import TYPE_CHECKING
 
-
-class SecretsReader(Protocol):
-    """The slice of ``SecretsManager`` this module needs.
-
-    Structural so that callers can pass any secret source (and tests a stub)
-    without importing the manager, which would invert the dependency between
-    ``drivers`` and ``retained_mode``. The overloads mirror ``SecretsManager``'s
-    so the real manager satisfies this protocol.
-    """
-
-    @overload
-    def get_secret(self, secret_name: str, *, should_error_on_not_found: Literal[True] = True) -> str: ...
-
-    @overload
-    def get_secret(self, secret_name: str, *, should_error_on_not_found: Literal[False]) -> str | None: ...
-
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 
 LICENSE_SECRET_NAME = "GRIPTAPE_NODES_LICENSE"  # noqa: S105  # a secret's name, not a secret
 """Secret holding the Griptape Nodes License JWT. Written by the desktop app."""
@@ -82,7 +68,7 @@ POLICY_DENIED_HINT = (
 
 
 def resolve_cloud_credential(
-    secrets_manager: SecretsReader | None = None,
+    secrets_manager: SecretsManager | None = None,
     *,
     secret_name: str = API_KEY_SECRET_NAME,
 ) -> str | None:
