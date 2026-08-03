@@ -401,11 +401,17 @@ class FlowManager:
         # Build set of all node names in this flow and its direct children.
         # Exclude nodes from referenced workflow children - their internal connections
         # are not serialized at the parent level (they serialize as a standalone workflow).
+        # Also exclude transient children (e.g. per-iteration loop-body flows): their nodes are
+        # skipped by the node-serialization loop and never enter the UUID map, so collecting their
+        # connections here would fail the whole save with a "node not found in UUID map" error.
         all_node_names = set(flow.nodes.keys())
         for child_flow_name in child_flow_names:
             child_flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(child_flow_name, ControlFlow)
-            if child_flow is not None and not self.is_referenced_workflow(child_flow):
-                all_node_names.update(child_flow.nodes.keys())
+            if child_flow is None:
+                continue
+            if self.is_referenced_workflow(child_flow) or child_flow.metadata.get(TRANSIENT_KEY):
+                continue
+            all_node_names.update(child_flow.nodes.keys())
 
         # Include connections where both nodes are in this flow hierarchy
         for connection in self._connections.connections.values():
