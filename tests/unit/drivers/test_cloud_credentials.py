@@ -66,6 +66,12 @@ class TestResolveCloudCredential:
 
         assert resolve_cloud_credential(secrets) == "gt-the-api-key"  # type: ignore[arg-type]
 
+    def test_blank_license_falls_through_to_api_key(self) -> None:
+        """First non-empty wins: a hand-edited empty license must not shadow the key."""
+        secrets = _FakeSecretsManager({LICENSE_SECRET_NAME: "", API_KEY_SECRET_NAME: "gt-the-api-key"})
+
+        assert resolve_cloud_credential(secrets) == "gt-the-api-key"  # type: ignore[arg-type]
+
     def test_returns_none_when_nothing_configured(self) -> None:
         """Callers decide whether a missing credential is fatal."""
         assert resolve_cloud_credential(_FakeSecretsManager({})) is None  # type: ignore[arg-type]
