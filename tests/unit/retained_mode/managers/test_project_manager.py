@@ -4164,7 +4164,9 @@ class TestResolveWorkspaceDirForProjectId:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A workspace_dir starting with ~ is expanded to an absolute path, not joined with the project dir."""
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        home = str(tmp_path / "home")
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("USERPROFILE", home)  # Windows uses USERPROFILE, not HOME
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
@@ -4320,7 +4322,9 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
         False, so "~/libs" got prepended with the project directory before canonicalization expanded
         the tilde inside the wrong position.
         """
-        monkeypatch.setenv("HOME", str(tmp_path / "home"))
+        home = str(tmp_path / "home")
+        monkeypatch.setenv("HOME", home)
+        monkeypatch.setenv("USERPROFILE", home)  # Windows uses USERPROFILE, not HOME
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
         project_file.touch()
