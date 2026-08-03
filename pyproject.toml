@@ -10,7 +10,7 @@ dependencies = [
   "python-dotenv>=1.0.1",
   "xdg-base-dirs>=6.0.2",
   "httpx>=0.28.0,<1.0.0",
-  "websockets>=15.0.1,<17.0.0",
+  "websockets>=15.0.1,<18.0.0",
   "tomlkit>=0.13.2",
   # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/833
   "uv>=0.6.16",
@@ -80,7 +80,7 @@ test = [
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.2,<0.12"]
+requires = ["uv_build>=0.7.2,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
