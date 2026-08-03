@@ -218,7 +218,7 @@ The desktop application keeps its own log files for the local engine it manages,
 
 !!! note
 
-    Exporting requires the **Write engine logs to file** setting, found in the desktop application's Settings. It is enabled by default; if the **Export** button is disabled, use the **Manage** link next to it to jump to that setting.
+    Exporting requires the **Write engine logs to file** setting, found in the desktop application's [App Settings](guides/desktop/app_settings.md#logging-and-diagnostics). It is enabled by default; if the **Export** button is disabled, use the **Manage** link next to it to jump to that setting.
 
 ### From the terminal
 

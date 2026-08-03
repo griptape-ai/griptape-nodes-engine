@@ -126,6 +126,12 @@ Settings** (copies the settings file's path to your clipboard),
 **Show Settings Folder** (opens it in Finder/Explorer/your file
 manager), and **Reset Settings to Default**.
 
+These configure the engine and the editor. If you're running Griptape
+Nodes Desktop, the application's own settings — theme, license, log
+files, and update channel — live in
+[App Settings](../desktop/app_settings.md) instead, reached from the
+account menu in the top-right corner of the window.
+
 <!-- screenshot (#5166): the menu bar with the File menu open, showing its items and shortcuts -->
 
 ## The left sidebar
