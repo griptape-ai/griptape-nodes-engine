@@ -10,7 +10,7 @@ dependencies = [
   "python-dotenv>=1.0.1",
   "xdg-base-dirs>=6.0.2",
   "httpx>=0.28.0,<1.0.0",
-  "websockets>=15.0.1,<17.0.0",
+  "websockets>=15.0.1,<18.0.0",
   "tomlkit>=0.13.2",
   # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/833
   "uv>=0.6.16",
@@ -75,11 +75,12 @@ test = [
   "pytest-mock>=3.14.0",
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
+  "pytest-timeout>=2.4.0",
   "coverage>=7.0.0",
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.2,<0.12"]
+requires = ["uv_build>=0.7.2,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -109,10 +110,10 @@ ignore = [
   "ANN003",  # Intentional
   "ANN401",  # Intentional
   "COM812",  # Intentional
-  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834 
-  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835 
+  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834
+  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835
   "BLE001",  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/839
-  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838 
+  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838
   "SIM108",  # Intentional
   "SIM110",  # Intentional
   "D105",    # Intentional
