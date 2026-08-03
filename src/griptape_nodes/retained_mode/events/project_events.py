@@ -253,6 +253,12 @@ class ResolveProjectLibrariesResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
             default it falls back to, not None.
         source: Which layer supplied the path, so a client can distinguish an opted-into
             project-local libraries tree from the shared workspace default.
+
+    Note: an unknown project_id is a Failure here, not Success(libraries_root=...). This
+    intentionally differs from ResolveProjectWorkspace, which returns Success(workspace_dir=None)
+    for an unknown id. The libraries resolver can always produce a real path (the workspace-relative
+    default), so it distinguishes "unknown id" (Failure) from "no declared path" (Success with a
+    fallback). See ResolveProjectWorkspaceResultSuccess for the rationale on the workspace side.
     """
 
     libraries_root: str
