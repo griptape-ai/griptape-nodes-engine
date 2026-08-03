@@ -19,6 +19,7 @@ from griptape_nodes.cli.shared import (
     InitConfig,
     console,
 )
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
@@ -356,12 +357,12 @@ def _get_griptape_cloud_buckets_and_display_table() -> tuple[list[str], dict[str
     Returns:
         tuple: (bucket_names, name_to_id_mapping, display_table)
     """
-    api_key = secrets_manager.get_secret("GT_CLOUD_API_KEY")
+    api_key = resolve_cloud_credential(secrets_manager)
     bucket_names: list[str] = []
     name_to_id: dict[str, str] = {}
 
     if api_key is None:
-        msg = "Griptape Cloud API Key not found."
+        msg = f"Attempted to list Griptape Cloud buckets. Failed because {MISSING_CREDENTIAL_MESSAGE}"
         raise RuntimeError(msg)
 
     table = Table(show_header=True, box=HEAVY_EDGE, show_lines=True, expand=True)
@@ -595,9 +596,9 @@ def _create_new_bucket(bucket_name: str) -> str:
     Returns:
         The bucket ID of the created bucket.
     """
-    api_key = secrets_manager.get_secret("GT_CLOUD_API_KEY")
+    api_key = resolve_cloud_credential(secrets_manager)
     if api_key is None:
-        msg = "GT_CLOUD_API_KEY secret is required to create a bucket."
+        msg = f"Attempted to create a Griptape Cloud bucket. Failed because {MISSING_CREDENTIAL_MESSAGE}"
         raise ValueError(msg)
 
     try:

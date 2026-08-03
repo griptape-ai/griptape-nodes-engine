@@ -8,6 +8,7 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import get_workspace_relative_path
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
@@ -33,14 +34,14 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Args:
             workspace_directory: The base workspace directory path.
             bucket_id: The ID of the bucket to use. Required.
-            api_key: The API key for authentication. If not provided, it will be retrieved from the environment variable "GT_CLOUD_API_KEY".
+            api_key: The credential for authentication. If not provided, it is resolved from the Griptape Nodes License, then "GT_CLOUD_API_KEY".
             static_files_directory: The directory path prefix for static files. If provided, file names will be prefixed with this path.
             **kwargs: Additional keyword arguments including base_url and headers.
         """
         super().__init__(workspace_directory)
 
         self.base_url = kwargs.get("base_url") or os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-        self.api_key = api_key if api_key is not None else os.environ.get("GT_CLOUD_API_KEY")
+        self.api_key = api_key if api_key is not None else resolve_cloud_credential()
         self.headers = kwargs.get("headers") or {"Authorization": f"Bearer {self.api_key}"}
         self.request_timeout = kwargs.get("request_timeout")
         self.bucket_id = bucket_id
@@ -652,7 +653,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Args:
             asset_url: Cloud asset URL to convert
             bucket_id: Bucket ID. If None, reads from GT_CLOUD_BUCKET_ID env var.
-            api_key: API key. If None, reads from GT_CLOUD_API_KEY env var.
+            api_key: Credential. If None, resolves the license, then GT_CLOUD_API_KEY.
             base_url: Cloud base URL. If None, reads from GT_CLOUD_BASE_URL env var.
             httpx_request_func: The httpx request function to use (original, not patched)
 
@@ -663,7 +664,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         if bucket_id is None:
             bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
         if api_key is None:
-            api_key = os.environ.get("GT_CLOUD_API_KEY")
+            api_key = resolve_cloud_credential()
         if base_url is None:
             base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
 
@@ -673,7 +674,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             return None
 
         if not api_key:
-            logger.debug("GT_CLOUD_API_KEY not set, skipping cloud URL conversion: %s", asset_url)
+            logger.debug("No Griptape Cloud credential set, skipping cloud URL conversion: %s", asset_url)
             return None
 
         # Extract workspace-relative path
