@@ -129,11 +129,14 @@ These same links are also available as the three icons in the footer (bottom rig
 ## How can I test out unreleased features?
 
 If you're interested in testing out unreleased features, you can install the pre-release builds of Griptape Nodes.
-Updates are now published to the [latest](https://github.com/griptape-ai/griptape-nodes/releases/tag/latest) tag twice a day.
 
 !!! warning
 
     Pre-release builds are not guaranteed to be stable and may contain bugs or incomplete features. Use them at your own risk.
+
+If you use Griptape Nodes Desktop, switch the **Release Channel** to **Nightly** in [App Settings](guides/desktop/app_settings.md#release-channels). Nightly builds are published daily and bundle pre-release engine and editor builds along with the app. You can switch back to **Stable** at any time, without reinstalling.
+
+If you install the engine yourself, the pre-release engine is published to the [latest](https://github.com/griptape-ai/griptape-nodes/releases/tag/latest) tag twice a day.
 
 To switch to the pre-release update channel, run the following commands:
 
