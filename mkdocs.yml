@@ -3,7 +3,6 @@ site_url: https://docs.griptapenodes.com/
 
 plugins:
   - search
-  - mermaid2
   - mkdocstrings:
       handlers:
         python:
@@ -89,6 +88,7 @@ plugins:
         Get started:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install Griptape Nodes via the Desktop app (recommended), a manual engine install, or license activation
+          - architecture.md: Deployment architecture for the Griptape Cloud and on-premises models — components, trust boundaries, and what leaves your network
           - faq.md: Frequently asked questions
           - troubleshooting.md: Fixes for commonly encountered issues and states
           - glossary.md: Terms and definitions used throughout the docs
@@ -246,7 +246,7 @@ markdown_extensions:
       custom_fences:
         - name: mermaid
           class: mermaid
-          format: !!python/name:mermaid2.fence_mermaid_custom
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - tables
   - md_in_html
   - toc:
@@ -256,6 +256,7 @@ nav:
   - Get Started:
       - Overview: index.md
       - Installation: installation.md
+      - Architecture: architecture.md
       - Tutorials:
           - Overview: tutorials/index.md
           - 1. A Tour of the Editor: tutorials/00_tour/index.md

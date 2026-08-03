@@ -2,15 +2,23 @@
 
 # ruff: noqa: PLR2004
 
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from griptape_nodes.common.directed_graph import DirectedGraph
 from griptape_nodes.exe_types.connections import Direction
-from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.machines.control_flow import ControlFlowMachine
-from griptape_nodes.machines.dag_builder import DagBuilder
-from griptape_nodes.machines.parallel_resolution import ExecuteDagState, ParallelResolutionMachine
+from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, NodeState
+from griptape_nodes.machines.fsm import WorkflowState
+from griptape_nodes.machines.parallel_resolution import (
+    ErrorState,
+    ExecuteDagState,
+    ParallelResolutionContext,
+    ParallelResolutionMachine,
+)
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
@@ -467,3 +475,104 @@ class TestCollectValuesFromUpstreamNodes:
             assert request.node_name == "target_node"
             assert request.parameter_name == "prompt"
             assert request.value == "hello"
+
+
+class TestParallelResolutionNodeDoneWhenTaskCompletes:
+    """Reaping a finished task must set the node's terminal state in ``on_update`` itself.
+
+    The done-callback that used to do this could fire after the task was popped from
+    ``task_to_node`` (``asyncio.wait`` reports a task in ``done`` before its callback has run),
+    silently leaving the node ``PROCESSING`` and livelocking ``on_update``. The reap loop now
+    sets the terminal state for every outcome: ``DONE``, ``CANCELED``, or ``ERRORED``.
+    """
+
+    @staticmethod
+    def _context_with_processing_node() -> ParallelResolutionContext:
+        """A context with one PROCESSING leaf node, not in the priority queue - ready to be reaped."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "n"
+        node.lock = False
+        node.state = NodeResolutionState.RESOLVING
+
+        graph = DirectedGraph()
+        graph.add_node("n")
+
+        dag_builder = DagBuilder()
+        dag_builder.graphs["n"] = graph
+        dag_builder.node_to_reference["n"] = DagNode(node_reference=node, node_state=NodeState.PROCESSING)
+
+        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
+
+    @pytest.mark.asyncio
+    async def test_reaping_a_completed_task_marks_node_done(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A completed task's node must reach DONE via the reap, not a (possibly-late) callback."""
+        context = self._context_with_processing_node()
+        dag_node = context.node_to_reference["n"]
+
+        async def _finished() -> None:
+            return None
+
+        task = asyncio.ensure_future(_finished())
+        await asyncio.sleep(0)  # let the task run to completion
+        assert task.done()
+        context.task_to_node[task] = dag_node
+        context.running_tasks_count = 1
+
+        # handle_done_nodes touches the full engine (events, connections, library registry); stub it
+        # so this stays a focused scheduler unit test. It runs after the reap has set node_state.
+        monkeypatch.setattr(ExecuteDagState, "handle_done_nodes", AsyncMock())
+
+        await ExecuteDagState.on_update(context)
+
+        assert task not in context.task_to_node, "on_update did not reap the completed task"
+        assert dag_node.node_state == NodeState.DONE
+
+    @pytest.mark.asyncio
+    async def test_reaping_a_cancelled_task_marks_node_canceled(self) -> None:
+        """A cancelled task's node must be reaped as CANCELED and drive the flow to ErrorState."""
+        context = self._context_with_processing_node()
+        dag_node = context.node_to_reference["n"]
+
+        task = asyncio.ensure_future(asyncio.sleep(3600))
+        task.cancel()
+        await asyncio.sleep(0)  # let the cancellation propagate to completion
+        assert task.cancelled()
+        context.task_to_node[task] = dag_node
+        context.running_tasks_count = 1
+
+        state = await ExecuteDagState.on_update(context)
+
+        assert state is ErrorState
+        assert task not in context.task_to_node
+        assert dag_node.node_state == NodeState.CANCELED
+
+    @pytest.mark.asyncio
+    async def test_reaping_an_errored_task_marks_node_errored(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A task that raised must be reaped as ERRORED, set the error state, and go to ErrorState."""
+        context = self._context_with_processing_node()
+        dag_node = context.node_to_reference["n"]
+
+        async def _boom() -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        task = asyncio.ensure_future(_boom())
+        await asyncio.sleep(0)  # run the task to completion; it raises internally
+        assert isinstance(task.exception(), RuntimeError)
+        context.task_to_node[task] = dag_node
+        context.running_tasks_count = 1
+
+        # The error branch emits a NodeErrorEvent; stub the event manager so no engine is needed.
+        event_manager = MagicMock()
+        event_manager.aput_event = AsyncMock()
+        monkeypatch.setattr(
+            "griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.EventManager", lambda: event_manager
+        )
+
+        state = await ExecuteDagState.on_update(context)
+
+        assert state is ErrorState
+        assert task not in context.task_to_node
+        assert dag_node.node_state == NodeState.ERRORED
+        assert context.workflow_state == WorkflowState.ERRORED
+        assert context.error_message is not None

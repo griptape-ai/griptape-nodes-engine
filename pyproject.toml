@@ -19,7 +19,11 @@ dependencies = [
   "packaging>=25.0",
   "python-multipart>=0.0.20",
   "json-repair>=0.46.1",
-  "mcp[ws]>=1.10.1",
+  # servers/mcp.py targets the 1.x low-level server API. Migrating is not just a rewrite:
+  # pydantic-ai-slim reaches mcp through fastmcp-slim[client]<4, and every fastmcp-slim release
+  # under that cap requires mcp<2.0, so asking for 2.x makes the resolve unsatisfiable.
+  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/5218
+  "mcp>=1.10.1,<2",
   "binaryornot>=0.4.4",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
@@ -61,7 +65,6 @@ docs = [
   "mkdocs-material>=9.6.9",
   "mkdocs>=1.5.2",
   "mkdocstrings[python]>=0.29.1",
-  "mkdocs-mermaid2-plugin>=1.2.2",
   "mkdocs-llmstxt>=0.5.0",
   "mkdocs-redirects>=1.2.2,<1.2.4",
   "pymdown-extensions>=10.17",
@@ -72,6 +75,7 @@ test = [
   "pytest-mock>=3.14.0",
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
+  "pytest-timeout>=2.4.0",
   "coverage>=7.0.0",
 ]
 
@@ -106,10 +110,10 @@ ignore = [
   "ANN003",  # Intentional
   "ANN401",  # Intentional
   "COM812",  # Intentional
-  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834 
-  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835 
+  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834
+  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835
   "BLE001",  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/839
-  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838 
+  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838
   "SIM108",  # Intentional
   "SIM110",  # Intentional
   "D105",    # Intentional

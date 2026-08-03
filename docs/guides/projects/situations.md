@@ -162,10 +162,37 @@ workspace_dir="/projects/demo", file_name_base="my_workflow", file_extension="py
 
 ## How nodes use situations
 
-Nodes that save files use a `ProjectFileParameter` to declare which situation they operate in. The node provides its situation-specific variables (like `file_name_base` and `file_extension`), and the project system supplies everything else (directory paths, builtin variables).
+A node's situation is chosen by whoever wrote the node, not by you. Nodes that save files use a `ProjectFileParameter`, and the situation name is baked in when that parameter is built. There is **no situation field on the node face**. The node shows a filename parameter (often called **Output File**), and the situation sits behind it.
 
-To use a custom situation from your project file, configure the node's situation parameter to match the name of your custom situation.
+The filename parameter *is* the `ProjectFileParameter`. Whatever you type there becomes the `file_name_base` and `file_extension` variables, and the situation's macro decides where the file actually lands. So typing `render.png` into a node using `save_node_output` produces `outputs/MyNode_render.png`, not `render.png` in the project root. The node supplies the filename pieces; the project system supplies everything else (directory paths, built-in variables).
+
+Nearly every generation and save node uses `save_node_output`. The other situations are used by the parts of the system they name: dragging a file in uses `copy_external_file`, a URL download uses `download_url`, thumbnails use `save_preview`, and saving a workflow uses `save_workflow`.
+
+### Finding out which situation a node uses
+
+Hover the node's filename parameter. Its tooltip names the situation, for example:
+
+```
+Output filename (uses 'save_node_output' situation template)
+```
+
+There is no panel that lists every node and its situation, so the tooltip is the reliable way to check a specific node. In a custom node's source, it is the `situation=` argument passed to `ProjectFileParameter`.
+
+### Overriding a situation on one node
+
+To change where a single node writes without editing your project file, click the **cog** button on the node's filename parameter. This creates a **File Output Settings** node wired into that parameter, pre-filled with the node's situation and current filename.
+
+The File Output Settings node exposes what the situation had hidden, and each field can be changed:
+
+- **Situation**: pick any situation, including custom ones from your project file. Changing it reloads the macro and collision policy below.
+- **Macro**: the path template, editable for this one connection.
+- **If File Exists**: the collision policy (Increment Version, Overwrite Existing, or Abort / Error).
+- **Auto Create Path**: whether missing parent directories are created.
+
+Anything you set here applies only to the node it is connected to. To change where *every* node writes, edit the situation in your project file instead.
 
 ## Adding custom situations
 
 See [Customization Guide](customization.md) for examples.
+
+Redefining a default situation such as `save_node_output` in your project file changes the destination for every node that uses it, with no node edits required. Adding a *new* situation only takes effect where something selects it: either a custom node passing `situation=` or a **File Output Settings** node pointed at it.

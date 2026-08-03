@@ -16,8 +16,11 @@ import unicodedata
 from collections.abc import Generator
 from io import BytesIO
 from pathlib import Path
+from typing import IO
 from unittest.mock import patch
 
+import portalocker
+import portalocker.utils
 import pytest
 from PIL import Image
 
@@ -2108,3 +2111,206 @@ class TestWriteTempFileRequest:
         assert isinstance(result, WriteTempFileResultFailure)
         assert result.failure_reason == FileIOFailureReason.INVALID_PATH
         assert "save_temp_file" in str(result.result_details).lower()
+
+
+class TestFailedWriteLeavesNoLitter:
+    """A write that fails AFTER the file is created must not leave the file behind.
+
+    portalocker opens the file before acquiring the lock, so under ``mode="x"`` the file
+    exists by the time a lock failure or a write/fsync error is raised. Left in place,
+    that debris is indistinguishable from a real output: the CREATE_NEW collision loop
+    treats a lock failure as "try the next candidate," so one zero-byte file accumulates
+    per index until all MAX_INDEXED_CANDIDATES slots are taken and every later save fails
+    with "could not find available filename" (griptape-ai/internal#178).
+
+    These tests drive portalocker directly rather than gating on Windows: the open-then-lock
+    ordering is portalocker's, so the bug reproduces on any platform once the lock fails.
+    Windows is merely where it fires in practice, because POSIX ``fcntl`` locks are advisory
+    while Windows AV/indexers transiently lock freshly created files.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir).resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+        # Mirrors TestPaddedIndexMacroSaves: load + activate the project first, then pin
+        # workspace_path, since activation re-derives it.
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        if isinstance(load_result, LoadProjectTemplateResultSuccess):
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        yield
+
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @pytest.fixture
+    def outputs_dir(self, temp_dir: Path, setup_project: None) -> Path:  # noqa: ARG002
+        outputs = temp_dir / "outputs"
+        outputs.mkdir(parents=True, exist_ok=True)
+        return outputs
+
+    @staticmethod
+    def _fail_lock_times(monkeypatch: pytest.MonkeyPatch, count: int | None) -> None:
+        """Make the portalocker LOCK step fail, leaving the already-opened file behind.
+
+        ``count=None`` fails every attempt; an int fails the first ``count`` attempts and
+        then delegates to the real implementation.
+        """
+        real_get_lock = portalocker.utils.Lock._get_lock
+        attempts = {"n": 0}
+
+        def flaky_get_lock(self: portalocker.utils.Lock, fh: IO) -> IO:
+            attempts["n"] += 1
+            if count is None or attempts["n"] <= count:
+                msg = "simulated transient lock failure"
+                raise portalocker.exceptions.LockException(msg)
+            return real_get_lock(self, fh)
+
+        monkeypatch.setattr(portalocker.utils.Lock, "_get_lock", flaky_get_lock)
+
+    def test_transient_lock_failures_leave_no_litter(self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Candidates abandoned to a lock failure are cleaned up, so the save still lands."""
+        self._fail_lock_times(monkeypatch, count=3)
+
+        FileDestination(
+            MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {}),
+            existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+        ).write_bytes(b"payload")
+
+        # The 3 locked candidates left nothing behind; only the successful write remains.
+        written = sorted(p.name for p in outputs_dir.iterdir() if p.suffix == ".png")
+        assert written == ["render_v004.png"]
+        assert (outputs_dir / "render_v004.png").read_bytes() == b"payload"
+
+    def test_exhausting_every_candidate_leaves_directory_empty(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The failure path itself must not litter, or it poisons all later runs.
+
+        Without cleanup this leaves one zero-byte file per index, and because a zero-byte
+        file is indistinguishable from a real output, every subsequent save fails
+        immediately on FileExistsError for all candidates.
+        """
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.MAX_INDEXED_CANDIDATES", 5)
+        self._fail_lock_times(monkeypatch, count=None)
+
+        with pytest.raises(FileWriteError):
+            FileDestination(
+                MacroPath(ParsedMacro("{outputs}/render_v{_index:03}.png"), {}),
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            ).write_bytes(b"should not land")
+
+        assert list(outputs_dir.iterdir()) == []
+
+    def test_fail_policy_lock_failure_leaves_no_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """The FAIL policy also writes with mode="x", so it leaked debris too."""
+        self._fail_lock_times(monkeypatch, count=None)
+        target = outputs_dir / "single.png"
+
+        result = griptape_nodes.OSManager().on_write_file_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"payload",
+                existing_file_policy=ExistingFilePolicy.FAIL,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert result.failure_reason == FileIOFailureReason.FILE_LOCKED
+        assert not target.exists()
+
+    def test_write_error_leaves_no_partial_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """A mid-write failure is worse than zero-byte: the debris has a plausible size."""
+
+        def exploding_fsync(fd: int) -> None:  # noqa: ARG001
+            msg = "simulated disk full"
+            raise OSError(msg)
+
+        monkeypatch.setattr("griptape_nodes.retained_mode.managers.os_manager.os.fsync", exploding_fsync)
+        target = outputs_dir / "partial.png"
+
+        result = griptape_nodes.OSManager().on_write_file_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"A" * 4096,
+                existing_file_policy=ExistingFilePolicy.FAIL,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert not target.exists()
+
+    def test_cleanup_cannot_be_armed_against_a_non_exclusive_open(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """The exclusive-create flag is derived from ``mode``, so the two cannot disagree.
+
+        The whole safety proof is that ``O_EXCL`` makes a pre-existing file raise
+        FileExistsError before the cleanup is reachable. If a caller could pass ``mode="x"``
+        (cleanup on) alongside a non-exclusive open, a lock failure would delete a file it
+        never created.
+        """
+        target = outputs_dir / "precious.png"
+        target.write_bytes(b"REAL USER DATA")
+        self._fail_lock_times(monkeypatch, count=None)
+
+        # Even with every lock attempt rigged to fail, mode="x" over an existing file
+        # raises from open() first, so the cleanup is never reachable.
+        with pytest.raises(FileExistsError):
+            griptape_nodes.OSManager()._write_locked_discarding_debris(str(target), b"replacement", "utf-8", mode="x")
+
+        assert target.read_bytes() == b"REAL USER DATA"
+
+    def test_overwrite_never_deletes_pre_existing_file(
+        self, outputs_dir: Path, monkeypatch: pytest.MonkeyPatch, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """Guards the mode="x" gate: under "w" the file may predate us and hold real data."""
+        target = outputs_dir / "precious.png"
+        target.write_bytes(b"REAL USER DATA")
+        self._fail_lock_times(monkeypatch, count=None)
+
+        result = griptape_nodes.OSManager().on_write_file_request(
+            WriteFileRequest(
+                file_path=str(target),
+                content=b"replacement",
+                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        assert target.read_bytes() == b"REAL USER DATA"
+
+
+class TestMacroFailureMessageIsReadable:
+    """Error messages must name the macro template, not dump the ParsedMacro repr."""
+
+    def test_failure_details_show_template_not_dataclass_repr(self, griptape_nodes: GriptapeNodes) -> None:
+        template = "{outputs}/{file_name_base}_v{###}.{file_extension}"
+
+        result = griptape_nodes.OSManager().on_write_file_request(
+            WriteFileRequest(
+                file_path=MacroPath(ParsedMacro(template), {}),
+                content=b"payload",
+                existing_file_policy=ExistingFilePolicy.CREATE_NEW,
+            )
+        )
+
+        assert isinstance(result, WriteFileResultFailure)
+        details = str(result.result_details)
+        assert template in details
+        assert "ParsedMacro(" not in details
+        assert "ParsedVariable(" not in details
