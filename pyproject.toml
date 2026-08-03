@@ -75,6 +75,7 @@ test = [
   "pytest-mock>=3.14.0",
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
+  "pytest-timeout>=2.4.0",
   "coverage>=7.0.0",
 ]
 
@@ -109,10 +110,10 @@ ignore = [
   "ANN003",  # Intentional
   "ANN401",  # Intentional
   "COM812",  # Intentional
-  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834 
-  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835 
+  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834
+  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835
   "BLE001",  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/839
-  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838 
+  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838
   "SIM108",  # Intentional
   "SIM110",  # Intentional
   "D105",    # Intentional
