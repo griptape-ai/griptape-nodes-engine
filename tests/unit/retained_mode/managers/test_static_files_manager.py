@@ -5,6 +5,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
 
@@ -471,7 +474,9 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             )
 
             assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
-            assert "GT_CLOUD_API_KEY secret is not available" in result.error
+            # Names both credentials: a license-only user has no API key to set.
+            assert "no Griptape Cloud credential was found" in result.error
+            assert "GT_CLOUD_API_KEY" in result.error
 
     @pytest.mark.asyncio
     async def test_create_download_url_from_path_non_cloud_url(
@@ -1034,3 +1039,89 @@ class TestStaticFilesManagerOnAppInitializationComplete:
 
         with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
             _ = manager.static_server_base_url
+
+
+class TestStaticFilesManagerCloudCredential:
+    """The `StorageBackend.GTC` arm takes a license, and refuses a missing credential.
+
+    Without these, reverting the credential resolution (or dropping the
+    no-credential guard) leaves the suite green while either breaking
+    license-only users or sending `Bearer None` to Cloud on every upload.
+    """
+
+    _BUCKET_ID = "bucket-123"
+    _LICENSE = "eyJhbGciOiJFZERTQSJ9.eyJvcmdfaWQiOiJvIn0.sig"
+
+    @pytest.fixture
+    def gtc_config_manager(self) -> Mock:
+        """A ConfigManager configured for the Griptape Cloud storage backend."""
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/mock/workspace")
+        mock_config.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": StorageBackend.GTC,
+            "static_files_directory": "staticfiles",
+            "static_server_base_url": None,
+        }.get(key, default)
+        return mock_config
+
+    def _secrets(self, secrets: dict[str, str | None]) -> Mock:
+        manager = Mock()
+        manager.get_secret.side_effect = lambda name, **_kwargs: secrets.get(name)
+        return manager
+
+    def _build(self, config_manager: Mock, secrets: dict[str, str | None]) -> StaticFilesManager:
+        return StaticFilesManager(
+            config_manager=config_manager,
+            secrets_manager=self._secrets(secrets),
+            event_manager=None,
+        )
+
+    def test_license_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """The reported bug: a license with no GT_CLOUD_API_KEY must still reach Cloud."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == self._LICENSE
+
+    def test_api_key_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """Today's common setup is unchanged."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GT_CLOUD_API_KEY": "gt-the-key"},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == "gt-the-key"
+
+    def test_no_credential_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """A bucket but no credential must not yield a driver that sends "Bearer None"."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_no_bucket_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """Pre-existing behavior: no bucket means local storage regardless of credential."""
+        manager = self._build(gtc_config_manager, {"GRIPTAPE_NODES_LICENSE": self._LICENSE})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_download_url_driver_accepts_a_license(self, gtc_config_manager: Mock) -> None:
+        """`_create_cloud_storage_driver` backs the download-URL path for cloud assets."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        driver = manager._create_cloud_storage_driver(self._BUCKET_ID)
+
+        assert driver is not None
+        assert driver.api_key == self._LICENSE
+
+    def test_download_url_driver_is_none_without_a_credential(self, gtc_config_manager: Mock) -> None:
+        """No credential yields no driver, so the caller reports the missing credential."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None

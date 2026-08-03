@@ -9,10 +9,16 @@ from __future__ import annotations
 import logging
 import os
 from functools import cached_property
+from http import HTTPStatus
 from typing import TYPE_CHECKING
 
 import httpx
 
+from griptape_nodes.drivers.cloud_credentials import (
+    POLICY_DENIED_HINT,
+    is_license_credential,
+    resolve_cloud_credential,
+)
 from griptape_nodes.retained_mode.events.app_events import OrganizationInfo, UserInfo
 
 if TYPE_CHECKING:
@@ -42,6 +48,12 @@ class UserManager:
             UserInfo | None: The user information or None if not available/not logged in.
         """
         try:
+            # Deliberately not license-aware: /api/users has no license
+            # authenticator, so a license is rejected before it identifies anyone.
+            # Were one added, a license assigned to a user would correctly answer
+            # as that human, but an unassigned one authenticates as the org's
+            # service principal and would answer "who am I" with a synthetic
+            # "License Service Principal" row.
             api_key = self._secrets_manager.get_secret("GT_CLOUD_API_KEY")
             if not api_key:
                 logger.debug("No GT_CLOUD_API_KEY found, skipping user fetch")
@@ -85,10 +97,13 @@ class UserManager:
         Returns:
             OrganizationInfo | None: The organization information or None if not available/not logged in.
         """
+        # Bound before the try so the 403 handler below can always read it; this
+        # property never raises, it logs and returns None.
+        api_key: str | None = None
         try:
-            api_key = self._secrets_manager.get_secret("GT_CLOUD_API_KEY")
+            api_key = resolve_cloud_credential(self._secrets_manager)
             if not api_key:
-                logger.debug("No GT_CLOUD_API_KEY found, skipping user organization fetch")
+                logger.debug("No Griptape Cloud credential found, skipping user organization fetch")
                 return None
 
             base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
@@ -111,7 +126,10 @@ class UserManager:
             logger.debug("No organizations found in API response")
 
         except httpx.HTTPStatusError as e:
-            logger.warning("Failed to fetch user organization (HTTP %s): %s", e.response.status_code, e)
+            if e.response.status_code == HTTPStatus.FORBIDDEN and is_license_credential(api_key):
+                logger.warning("Failed to fetch user organization because %s", POLICY_DENIED_HINT)
+            else:
+                logger.warning("Failed to fetch user organization (HTTP %s): %s", e.response.status_code, e)
         except httpx.RequestError as e:
             logger.warning("Failed to fetch user organization (request error): %s", e)
         except Exception as e:

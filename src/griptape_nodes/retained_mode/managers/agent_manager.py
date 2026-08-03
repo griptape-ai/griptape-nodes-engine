@@ -26,11 +26,13 @@ import os
 import textwrap
 import threading
 from dataclasses import dataclass, replace
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
+from pydantic_ai.exceptions import ModelHTTPError
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
@@ -45,6 +47,12 @@ from griptape_nodes.agents.pydantic_ai.runner import (
     ThinkingDelta,
     ToolCall,
     ToolResult,
+)
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    POLICY_DENIED_HINT,
+    is_license_credential,
+    resolve_cloud_credential,
 )
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -182,6 +190,35 @@ _IMAGE_TOOL_INSTRUCTION = (
 def _build_agent_instructions(*, include_image_tool: bool) -> str:
     image_tool_line = _IMAGE_TOOL_INSTRUCTION if include_image_tool else ""
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
+
+
+def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
+    """Return the HTTP status of a Griptape Cloud failure, or None if it isn't one.
+
+    Two unrelated shapes reach this code: Pydantic AI's ``ModelHTTPError`` carries
+    ``status_code`` directly (the chat path), while ``httpx.HTTPStatusError`` keeps
+    it on ``response`` (the image path). The image toolset also wraps its failure in
+    ``ModelRetry`` with ``raise ... from exc``, so follow the cause chain.
+
+    Only errors from ``cloud_host`` count. An agent turn also talks to remote MCP
+    servers, which raise the same ``httpx.HTTPStatusError``; attributing their 403
+    to Griptape licensing would send the user to their Griptape administrator over
+    an expired token on their own MCP server.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            if current.request.url.host == cloud_host:
+                return current.response.status_code
+            return None
+        # ModelHTTPError has no URL, but the model is the Cloud provider whenever
+        # the caller has already confirmed the active provider is Griptape Cloud.
+        if isinstance(current, ModelHTTPError):
+            return current.status_code
+        current = current.__cause__
+    return None
 
 
 def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | None:
@@ -399,9 +436,28 @@ class AgentManager:
         try:
             return await self._run_agent(request)
         except Exception as e:
-            err_msg = f"Error running agent: {e}"
+            message = self._explain_agent_run_error(e, request.provider_name)
+            err_msg = f"Error running agent: {message}"
             logger.exception(err_msg)
-            return RunAgentResultFailure(error={"message": str(e)}, result_details=err_msg)
+            return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
+
+    def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
+        """Return the user-facing text for a failed agent run.
+
+        A Griptape Cloud request authenticated with a License can authenticate
+        successfully and still be refused: Cloud evaluates an entitlement policy
+        per request and answers HTTP 403. On its own that surfaces as a bare
+        "Forbidden", which reads like a bug rather than a licensing decision, so
+        name the cause. Every other error keeps its original text.
+        """
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return str(exc)
+        cloud_host = urlsplit(os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL).hostname or ""
+        if _cloud_http_status_of(exc, cloud_host) != HTTPStatus.FORBIDDEN:
+            return str(exc)
+        if not is_license_credential(resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)):
+            return str(exc)
+        return f"Griptape Cloud refused the request because {POLICY_DENIED_HINT} ({exc})"
 
     async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
@@ -742,9 +798,9 @@ class AgentManager:
         base_url = provider.base_url or ""
 
         if provider_type == _PROTECTED_PROVIDER_NAME:
-            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
+            api_key = resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)
             if not api_key:
-                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
+                msg = f"Attempted to start the agent. Failed because {MISSING_CREDENTIAL_MESSAGE}"
                 raise ValueError(msg)
             # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
             # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
