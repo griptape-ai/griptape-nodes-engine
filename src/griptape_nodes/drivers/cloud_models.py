@@ -92,11 +92,14 @@ IMAGE_MODEL_CHOICES: list[str] = [str(model["name"]) for model in IMAGE_MODEL_CH
 # deprecation notice to the user.
 DEPRECATED_MODELS = {
     # Anthropic
-    "claude-3-7-sonnet": "claude-sonnet-4-6",
+    "claude-3-7-sonnet": "claude-sonnet-5",
     "claude-3-5-haiku": "claude-haiku-4-5",
-    "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+    "claude-sonnet-4-20250514": "claude-sonnet-5",
+    "claude-4-5-sonnet": "claude-sonnet-5",
+    "claude-sonnet-4-6": "claude-sonnet-5",
+    "claude-opus-4-7": "claude-opus-5",
     # Bedrock
-    "amazon.titan-text-premier-v1": "claude-sonnet-4-6",
+    "amazon.titan-text-premier-v1": "claude-sonnet-5",
     # Azure OpenAI
     "gpt-4.5-preview": "gpt-4.1",
     "o1-mini": "o3-mini",
