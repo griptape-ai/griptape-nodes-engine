@@ -5891,7 +5891,7 @@ class WorkflowManager:
         # import. Fall back to a deterministic (sorted) choice rather than hash-ordered set iteration,
         # and log for diagnosis.
         candidates = top_level_flows or list(new_flows)
-        selected = sorted(candidates)[0]
+        selected = min(candidates)
         logger.warning(
             "Import of '%s' created %d flow(s) with %d parented to target '%s'; expected exactly one "
             "top-level flow. Using '%s'. All new flows: %s",

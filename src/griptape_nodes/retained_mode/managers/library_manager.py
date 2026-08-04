@@ -2035,7 +2035,7 @@ class LibraryManager:
         library_info: LibraryManager.LibraryInfo,
         file_path: str,
         request: RegisterLibraryFromFileRequest,
-    ) -> None | RegisterLibraryFromFileResultFailure:
+    ) -> RegisterLibraryFromFileResultFailure | None:
         """Progress library through lifecycle states until LOADED.
 
         Advances library_info through states: DISCOVERED → METADATA_LOADED →

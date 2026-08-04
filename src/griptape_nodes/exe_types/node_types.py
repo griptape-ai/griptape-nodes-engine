@@ -813,7 +813,7 @@ class BaseNode(ABC):
             msg = f"Parameter '{param}' not found for removing options trait."
             raise ValueError(msg)
 
-    def _replace_param_by_name(  # noqa: PLR0913
+    def _replace_param_by_name(  # noqa: PLR0913, PLR0917
         self,
         param_name: str,
         new_param_name: str,

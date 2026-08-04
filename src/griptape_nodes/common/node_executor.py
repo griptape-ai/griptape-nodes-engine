@@ -3155,7 +3155,7 @@ class NodeExecutor:
             # appended immediately after creation, inside this try.
             await self._delete_iteration_flows(deserialized_flows, event_manager)
 
-    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913
+    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
