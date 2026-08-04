@@ -67,10 +67,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
     ) -> None:
         super().__init__(name, metadata)
-        self.control_in = ControlParameterInput()
+        self.control_in = ControlParameterInput(name="group_exec_in")
         self.add_parameter(self.control_in)
         self.metadata[LEFT_PARAMETERS_KEY] = [self.control_in.name]
-        self.control_out = ControlParameterOutput()
+        self.control_out = ControlParameterOutput(name="group_exec_out")
         self.add_parameter(self.control_out)
         self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
         self.execution_environment = Parameter(
