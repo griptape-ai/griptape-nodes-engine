@@ -2086,15 +2086,6 @@ class WorkflowManager:
         # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
 
-        # Prepend the image paths appropriately.
-        if workflow_metadata.image is not None:
-            if workflow_metadata.is_griptape_provided:
-                workflow_metadata.image = workflow_metadata.image
-            else:
-                # For user workflows, the image should be just the filename, not a full path
-                # The frontend now sends just filenames, so we don't need to prepend the workspace path
-                workflow_metadata.image = workflow_metadata.image
-
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
             metadata=workflow_metadata, file_name=str(workflow_to_register)
