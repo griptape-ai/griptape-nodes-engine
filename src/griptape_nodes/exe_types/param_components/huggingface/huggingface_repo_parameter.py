@@ -12,7 +12,7 @@ logger = logging.getLogger("griptape_nodes")
 
 
 class HuggingFaceRepoParameter(HuggingFaceModelParameter):
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         node: BaseNode,
         repo_ids: list[str],
@@ -20,8 +20,9 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         *,
         list_all_models: bool = False,
         deprecated_repo_ids: list[str] | None = None,
+        gated: bool | None = None,
     ):
-        super().__init__(node, parameter_name)
+        super().__init__(node, parameter_name, gated=gated)
 
         deprecated_repo_ids = deprecated_repo_ids or []
         self._deprecated_repos = deprecated_repo_ids
@@ -55,6 +56,11 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
             return
 
         self._refresh_downloading_model_ids()
+        # Re-query license policy alongside the cache scan, matching the base class, so row
+        # decoration and the badge reflect the current license on every refresh. Guarded on the
+        # configured mode rather than `_gated`, which under auto-detect is the query's result.
+        if self._gate_mode is not False:
+            self._refresh_policy()
         # Get all cached models
         all_choices = self.get_choices()
         if not all_choices:
@@ -85,7 +91,7 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         if current_value and current_value in filtered_choices:
             default_value = current_value
         else:
-            default_value = filtered_choices[0]
+            default_value = self._preferred_default(filtered_choices)
 
         if parameter.find_elements_by_type(Options):
             self._node._update_option_choices(self._parameter_name, filtered_choices, default_value)
@@ -93,6 +99,7 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
             parameter.add_trait(Options(choices=filtered_choices))
 
         self._apply_data_choices(parameter, filtered_choices)
+        self._apply_denial_badge(parameter, default_value)
         self._update_download_button_visibility()
 
     def add_input_parameters(self) -> None:
