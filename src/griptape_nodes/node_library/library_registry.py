@@ -825,3 +825,22 @@ def get_declared_models(node: BaseNode) -> list[ResolvedModel]:
         return library.get_models_for_node_type(node_type)
     except KeyError:
         return []
+
+
+def resolve_provider_model_id(node: BaseNode, model_id: str) -> str | None:
+    """Resolve one of a node's declared catalog models to the upstream provider's id for it.
+
+    A node's dropdown stores the catalog model key, not the provider's own name
+    for it -- that is what the permission layer gates on. A node that goes on to
+    build the actual API request still needs the provider's id, so it resolves
+    the stored catalog key through this rather than keeping its own copy of the
+    mapping.
+
+    Returns ``None`` when ``model_id`` is not one of the models this node
+    declares, or when the catalog entry it resolves to declares no
+    ``provider_model_id`` of its own.
+    """
+    for resolved in get_declared_models(node):
+        if resolved.model_id == model_id:
+            return resolved.model.provider_model_id
+    return None

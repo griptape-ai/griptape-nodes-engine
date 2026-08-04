@@ -192,6 +192,8 @@ A few rules worth knowing:
 - **Model IDs must be unique across the entire library.** Pydantic enforces uniqueness within each provider's `models` dict for free; collisions across providers are caught at library-load time as `DuplicateModelIdProblem`.
 - **At most one `model_catalog` per library.** Declaring two is rejected at validation time; merge their providers into one.
 
+A node's model-selection dropdown should store the catalog model key itself (`kling_v2`, not `kling-v2-master` and not `Kling v2`) -- that key is what the permission layer gates on, so storing anything else means the node's selections can't be checked against license policy. If a node's dropdown historically stored something else, migrate those saved values in the node rather than renaming the catalog entry to match them; `ModelAccessComponent` accepts a `deprecated_values` mapping for exactly this.
+
 ##### `model_usage`
 
 A node references one or more catalog models by their dict keys. Use this when the node binds to a specific, named set of models. Each entry must resolve to a model somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.

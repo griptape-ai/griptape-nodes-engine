@@ -17,6 +17,12 @@ Focused on:
 - SuccessFailure-style usage: node calls query_for_denial and routes into
   _set_status_results (validated indirectly -- the component itself never
   raises, so the node's failure branch stays reachable)
+- a dropdown choice IS a catalog model id, so an offered choice is checked
+  for membership in the node's declared models rather than resolved; a
+  choice matching none of them fails closed rather than open
+- deprecated_values migrates a historical stored value to its current
+  choice through a converter, accepting it wherever it's assigned but
+  never offering it as a fresh selection
 """
 
 from __future__ import annotations
@@ -118,6 +124,7 @@ def _build_probe_node_with_component(
     model_choices: list[str],
     default_model: str,
     initial_stored_value: str | None = None,
+    deprecated_values: dict[str, str] | None = None,
 ) -> tuple[_AccessProbeNode, ModelAccessComponent, Parameter]:
     """Build node + parameter + component (fully installed) and return all three.
 
@@ -128,7 +135,8 @@ def _build_probe_node_with_component(
     ``initial_stored_value``: if set, the parameter's stored value is set to
     this via ``set_parameter_value(initial_setup=True)`` BEFORE the component
     is constructed, so the constructor sees it as the current value. Use this
-    to test the "born with a denied value" path.
+    to test the "born with a denied value" path, or a legacy value awaiting
+    migration.
     """
     from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
 
@@ -153,6 +161,7 @@ def _build_probe_node_with_component(
         parameter=param,
         model_choices=model_choices,
         default_model=default_model,
+        deprecated_values=deprecated_values,
     )
     return node, component, param
 
@@ -173,10 +182,10 @@ def _install_probe_node_with_helper(
 class TestPickPermittedDefault:
     def test_prefers_default_when_allowed(self) -> None:
         _, helper = _install_probe_node_with_helper(
-            model_choices=["alpha", "beta"],
-            default_model="alpha",
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
         )
-        assert helper.pick_permitted_default() == "alpha"
+        assert helper.pick_permitted_default() == "gtc_test_alpha"
 
     def test_falls_back_to_first_allowed_when_default_denied(self, griptape_nodes) -> None:  # noqa: ANN001
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
@@ -189,11 +198,11 @@ class TestPickPermittedDefault:
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
             _, helper = _install_probe_node_with_helper(
-                model_choices=["alpha", "beta"],
-                default_model="alpha",
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
             )
             # Alpha is denied at construction time; beta is the fallback.
-            assert helper.pick_permitted_default() == "beta"
+            assert helper.pick_permitted_default() == "gtc_test_beta"
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
@@ -213,8 +222,8 @@ class TestPickPermittedDefault:
         griptape_nodes.EventManager().add_authorization_hook(deny_all)
         try:
             _, helper = _install_probe_node_with_helper(
-                model_choices=["alpha", "beta"],
-                default_model="alpha",
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
             )
             assert helper.pick_permitted_default() is None
         finally:
@@ -223,7 +232,9 @@ class TestPickPermittedDefault:
 
 class TestInstall:
     def test_install_adds_button_trait_alongside_options(self) -> None:
-        node, _helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         param = node.get_parameter_by_name("model")
         assert param is not None
@@ -240,7 +251,9 @@ class TestInstall:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            node, _helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            node, _helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
 
             param = node.get_parameter_by_name("model")
             assert param is not None
@@ -249,16 +262,18 @@ class TestInstall:
             assert ui["dropdown_row_subtitles"] is True
             # Alpha row carries the denial decoration; beta is bare.
             data_by_name = {row["name"]: row for row in ui["data"]}
-            assert data_by_name["alpha"]["icon"] == "shield-off"
-            assert data_by_name["alpha"]["subtitle"] == "Not permitted by your license"
-            assert "icon" not in data_by_name["beta"]
-            assert "subtitle" not in data_by_name["beta"]
+            assert data_by_name["gtc_test_alpha"]["icon"] == "shield-off"
+            assert data_by_name["gtc_test_alpha"]["subtitle"] == "Not permitted by your license"
+            assert "icon" not in data_by_name["gtc_test_beta"]
+            assert "subtitle" not in data_by_name["gtc_test_beta"]
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
     def test_install_preserves_parameter_identity(self) -> None:
         """Install must not change parameter name / type / tooltip / stored value."""
-        node, _helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         pre_param = node.get_parameter_by_name("model")
         assert pre_param is not None
@@ -289,9 +304,9 @@ class TestInstall:
         griptape_nodes.EventManager().add_authorization_hook(deny_everything)
         try:
             _node, _component, param = _build_probe_node_with_component(
-                model_choices=["alpha", "beta"],
-                default_model="alpha",
-                initial_stored_value="alpha",
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
+                initial_stored_value="gtc_test_alpha",
             )
 
             badge = param.get_badge()
@@ -318,15 +333,15 @@ class TestInstall:
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
             node, _component, param = _build_probe_node_with_component(
-                model_choices=["alpha", "beta"], default_model="alpha"
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
             )
 
             # Stored value moved to permitted 'beta'.
-            assert node.get_parameter_value("model") == "beta"
+            assert node.get_parameter_value("model") == "gtc_test_beta"
             # No badge -- the current stored value is permitted.
             assert param.get_badge() is None
             # Declarative default_value on the Parameter is untouched.
-            assert param.default_value == "alpha"
+            assert param.default_value == "gtc_test_alpha"
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
@@ -344,11 +359,13 @@ class TestConstructorPreconditions:
         """Parameter must be attached to the node (via add_parameter) before component construction."""
         _register_probe_node()
         node = _AccessProbeNode(name="probe")
-        orphan = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        orphan = Parameter(name="model", type="str", default_value="gtc_test_alpha", tooltip="")
         # Note: no node.add_parameter(orphan) call.
 
         with pytest.raises(ValueError, match="not attached to node"):
-            ModelAccessComponent(node=node, parameter=orphan, model_choices=["alpha"], default_model="alpha")
+            ModelAccessComponent(
+                node=node, parameter=orphan, model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha"
+            )
 
     def test_raises_when_second_component_attaches_to_same_parameter(self) -> None:
         """Constructing a second component against the same parameter raises.
@@ -358,11 +375,16 @@ class TestConstructorPreconditions:
         as if the caller had attached Options themselves before construction.
         """
         _node, _first_component, param = _build_probe_node_with_component(
-            model_choices=["alpha", "beta"], default_model="alpha"
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
         )
 
         with pytest.raises(ValueError, match="already carries an Options trait"):
-            ModelAccessComponent(node=_node, parameter=param, model_choices=["alpha", "beta"], default_model="alpha")
+            ModelAccessComponent(
+                node=_node,
+                parameter=param,
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
+            )
 
     def test_raises_when_parameter_already_has_options(self) -> None:
         """A Parameter constructed with traits={Options(...)} would end up with two Options."""
@@ -372,14 +394,16 @@ class TestConstructorPreconditions:
         param = Parameter(
             name="model",
             type="str",
-            default_value="alpha",
+            default_value="gtc_test_alpha",
             tooltip="",
-            traits={Options(choices=["alpha"])},
+            traits={Options(choices=["gtc_test_alpha"])},
         )
         node.add_parameter(param)
 
         with pytest.raises(ValueError, match="already carries an Options trait"):
-            ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
+            ModelAccessComponent(
+                node=node, parameter=param, model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha"
+            )
 
     def test_raises_when_parameter_already_has_button(self) -> None:
         """A Parameter constructed with a Button trait would end up with two Buttons."""
@@ -389,14 +413,16 @@ class TestConstructorPreconditions:
         param = Parameter(
             name="model",
             type="str",
-            default_value="alpha",
+            default_value="gtc_test_alpha",
             tooltip="",
             traits={Button(icon="star", tooltip="")},
         )
         node.add_parameter(param)
 
         with pytest.raises(ValueError, match="already carries a Button trait"):
-            ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
+            ModelAccessComponent(
+                node=node, parameter=param, model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha"
+            )
 
 
 class TestEngineFailureIsFailClosedAtRuntime:
@@ -441,9 +467,11 @@ class TestEngineFailureIsFailClosedAtRuntime:
     def _build_component_against_unresolved_node(self) -> ModelAccessComponent:
         """Node whose class isn't registered -> engine returns Failure at construction."""
         node = _AccessProbeNode(name="probe")
-        param = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        param = Parameter(name="model", type="str", default_value="gtc_test_alpha", tooltip="")
         node.add_parameter(param)
-        return ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
+        return ModelAccessComponent(
+            node=node, parameter=param, model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha"
+        )
 
     def test_unknown_node_type_logs_warning(self, caplog) -> None:  # noqa: ANN001
         """Failure result -> warning logged, message names the node type."""
@@ -467,7 +495,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
-        denial = helper.query_for_denial("alpha")
+        denial = helper.query_for_denial("gtc_test_alpha")
         assert denial is not None, "Fail-closed contract: unresolved node type must not return None."
         assert any("could not be evaluated" in m for m in denial.messages())
         assert any("_AccessProbeNode" in m for m in denial.messages())
@@ -482,7 +510,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
             helper = self._build_component_against_unresolved_node()
 
         with pytest.raises(RuntimeError, match="could not be evaluated"):
-            helper.raise_if_denied("alpha")
+            helper.raise_if_denied("gtc_test_alpha")
 
     def test_query_for_denial_still_ignores_non_string_values(self, caplog) -> None:  # noqa: ANN001
         """Non-string values (driver objects) bypass even the fail-closed path."""
@@ -510,14 +538,16 @@ class TestEngineFailureIsFailClosedAtRuntime:
         _register_probe_node()  # empty declarations by default
 
         node = _AccessProbeNode(name="probe")
-        param = Parameter(name="model", type="str", default_value="alpha", tooltip="")
+        param = Parameter(name="model", type="str", default_value="gtc_test_alpha", tooltip="")
         node.add_parameter(param)
-        helper = ModelAccessComponent(node=node, parameter=param, model_choices=["alpha"], default_model="alpha")
+        helper = ModelAccessComponent(
+            node=node, parameter=param, model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha"
+        )
 
         # No synthesized denial -- everything is genuinely allowed.
-        assert helper.query_for_denial("alpha") is None
+        assert helper.query_for_denial("gtc_test_alpha") is None
         # And no exception on raise_if_denied either.
-        helper.raise_if_denied("alpha")
+        helper.raise_if_denied("gtc_test_alpha")
 
 
 class TestOnValueChanged:
@@ -531,13 +561,15 @@ class TestOnValueChanged:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            node, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            node, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
 
             param = node.get_parameter_by_name("model")
             assert param is not None
             assert param.get_badge() is None  # beta is allowed at install time
 
-            helper.on_value_changed("alpha")
+            helper.on_value_changed("gtc_test_alpha")
 
             badge = param.get_badge()
             assert badge is not None
@@ -555,16 +587,16 @@ class TestOnValueChanged:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            # default_model="beta" (permitted) so the constructor doesn't auto-move away
+            # default_model="gtc_test_beta" (permitted) so the constructor doesn't auto-move away
             # from a denied initial value. We then simulate the artist manually selecting
             # 'alpha' by calling on_value_changed directly.
             _node, helper, param = _build_probe_node_with_component(
-                model_choices=["alpha", "beta"], default_model="beta"
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
             )
-            helper.on_value_changed("alpha")
+            helper.on_value_changed("gtc_test_alpha")
             assert param.get_badge() is not None
 
-            helper.on_value_changed("beta")
+            helper.on_value_changed("gtc_test_beta")
             assert param.get_badge() is None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
@@ -575,7 +607,9 @@ class TestOnValueChanged:
         In that state the dropdown isn't the source of truth for the model
         anymore, so the badge must clear.
         """
-        node, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        node, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         param = node.get_parameter_by_name("model")
         assert param is not None
@@ -595,18 +629,22 @@ class TestRefreshAndQueryForDenial:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            _, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
 
-            denial = helper.query_for_denial("alpha")
+            denial = helper.query_for_denial("gtc_test_alpha")
             assert denial is not None
             assert denial.messages() == ["Alpha not enabled."]
 
-            assert helper.query_for_denial("beta") is None
+            assert helper.query_for_denial("gtc_test_beta") is None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
     def test_query_for_denial_ignores_non_string_values(self) -> None:
-        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         assert helper.query_for_denial(None) is None
         assert helper.query_for_denial({"driver": "obj"}) is None
@@ -619,7 +657,9 @@ class TestRefreshAndQueryForDenial:
         A candidate outside that set can't be gated -- internal engine errors
         must not gate user work, so we return None rather than raise.
         """
-        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         assert helper.query_for_denial("never-heard-of-this-model") is None
 
@@ -627,7 +667,9 @@ class TestRefreshAndQueryForDenial:
         """refresh() re-fetches the denial map so a policy change becomes visible."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
-        node, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        node, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         param = node.get_parameter_by_name("model")
         assert param is not None
@@ -642,9 +684,9 @@ class TestRefreshAndQueryForDenial:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            node.set_parameter_value("model", "alpha")
+            node.set_parameter_value("model", "gtc_test_alpha")
             # on_value_changed uses the STALE cache -- badge should NOT be set yet.
-            helper.on_value_changed("alpha")
+            helper.on_value_changed("gtc_test_alpha")
             assert param.get_badge() is None
 
             # After refresh, the helper sees the current hook decision and applies the badge.
@@ -667,22 +709,28 @@ class TestRaiseIfDenied:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            _, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
 
             with pytest.raises(RuntimeError, match="Alpha not enabled"):
-                helper.raise_if_denied("alpha")
+                helper.raise_if_denied("gtc_test_alpha")
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
     def test_does_not_raise_when_allowed(self) -> None:
-        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
         # Should not raise:
-        helper.raise_if_denied("alpha")
-        helper.raise_if_denied("beta")
+        helper.raise_if_denied("gtc_test_alpha")
+        helper.raise_if_denied("gtc_test_beta")
 
     def test_does_not_raise_on_non_string_value(self) -> None:
         """A driver / Agent connection carries model identity itself; bypass the gate."""
-        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
         helper.raise_if_denied(None)
         helper.raise_if_denied({"driver": "obj"})
 
@@ -692,7 +740,9 @@ class TestRefreshButton:
         """The inline Button trait's on_click hook invokes refresh()."""
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
-        node, _helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         param = node.get_parameter_by_name("model")
         assert param is not None
@@ -702,7 +752,7 @@ class TestRefreshButton:
 
         # Set stored value to alpha and register a deny hook that only reaches
         # the helper after refresh.
-        node.set_parameter_value("model", "alpha")
+        node.set_parameter_value("model", "gtc_test_alpha")
 
         def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
             if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
@@ -739,13 +789,15 @@ class TestSuccessFailureUsagePattern:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            _, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
 
             # Node-side pattern: inspect and route, no exception.
             routed_to_failure = False
             failure_reason: str | None = None
 
-            denial = helper.query_for_denial("alpha")
+            denial = helper.query_for_denial("gtc_test_alpha")
             if denial is not None:
                 routed_to_failure = True
                 failure_reason = denial.reason()
@@ -759,14 +811,16 @@ class TestSuccessFailureUsagePattern:
 class TestModelChoicesProperty:
     def test_returns_copy_of_choices(self) -> None:
         """`.model_choices` returns a defensive copy so callers can't mutate the internal list."""
-        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
 
         choices = helper.model_choices
-        assert choices == ["alpha", "beta"]
+        assert choices == ["gtc_test_alpha", "gtc_test_beta"]
 
         # Mutating the returned list does NOT affect the helper's own list.
         choices.append("gamma")
-        assert helper.model_choices == ["alpha", "beta"]
+        assert helper.model_choices == ["gtc_test_alpha", "gtc_test_beta"]
 
 
 class TestReinstallOptions:
@@ -781,14 +835,14 @@ class TestReinstallOptions:
 
         griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
         try:
-            # default_model="beta" (permitted) so construction doesn't relocate away
+            # default_model="gtc_test_beta" (permitted) so construction doesn't relocate away
             # from a denied initial value. Then flip the stored value to denied 'alpha'
             # so the reinstall path has a badge to restore.
             _node, helper, param = _build_probe_node_with_component(
-                model_choices=["alpha", "beta"], default_model="beta"
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
             )
-            helper.on_value_changed("alpha")  # apply the "we're viewing alpha" state
-            _node.set_parameter_value("model", "alpha", initial_setup=True)
+            helper.on_value_changed("gtc_test_alpha")  # apply the "we're viewing alpha" state
+            _node.set_parameter_value("model", "gtc_test_alpha", initial_setup=True)
 
             # Simulate what a node does when a driver connects: strip Options entirely.
             options_traits = param.find_elements_by_type(Options)
@@ -808,3 +862,174 @@ class TestReinstallOptions:
             assert "Alpha not enabled." in badge.message
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+
+class TestDeprecatedValuesValidation:
+    """deprecated_values is validated at construction, same as the component's other preconditions."""
+
+    def test_raises_when_a_value_is_not_a_current_choice(self) -> None:
+        with pytest.raises(ValueError, match="not in model_choices"):
+            _build_probe_node_with_component(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
+                deprecated_values={"Alpha": "gtc_test_gamma"},
+            )
+
+    def test_raises_when_a_key_collides_with_a_current_choice(self) -> None:
+        with pytest.raises(ValueError, match="already a current choice"):
+            _build_probe_node_with_component(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"],
+                default_model="gtc_test_alpha",
+                deprecated_values={"gtc_test_beta": "gtc_test_alpha"},
+            )
+
+
+class TestDeprecatedValuesMigration:
+    """A legacy stored value is accepted wherever assigned, migrated, and never offered as a fresh selection."""
+
+    def test_legacy_value_is_accepted_and_migrated_on_assignment(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        node.set_parameter_value(param.name, "Alpha")
+
+        assert node.get_parameter_value(param.name) == "gtc_test_alpha"
+
+    def test_legacy_value_is_migrated_on_the_workflow_load_path(self) -> None:
+        """The regression that matters most: workflow load sets values with initial_setup=True.
+
+        Converters run on every set_parameter_value call regardless of
+        initial_setup, so a legacy value is migrated on this path exactly the
+        same as on an artist-driven change -- it is never left un-migrated
+        just because before_value_set / after_value_set didn't fire.
+        """
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        node.set_parameter_value(param.name, "Alpha", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "gtc_test_alpha"
+
+    def test_legacy_value_is_in_options_choices_but_not_in_ui_options_data(self) -> None:
+        """A legacy value must be accepted (in the trait's choices) but never offered (not in the UI rows)."""
+        _node, _helper, param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert "Alpha" in options_trait.choices
+
+        data_names = {row["name"] for row in param.ui_options["data"]}
+        assert data_names == {"gtc_test_alpha", "gtc_test_beta"}
+
+    def test_constructor_migrates_an_already_stored_legacy_value(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_beta",
+            initial_stored_value="Alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        assert node.get_parameter_value(param.name) == "gtc_test_alpha"
+
+
+class TestMigrateValue:
+    def test_returns_canonical_choice_for_a_legacy_value(self) -> None:
+        _node, helper, _param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        assert helper.migrate_value("Alpha") == "gtc_test_alpha"
+
+    def test_returns_none_for_a_current_choice(self) -> None:
+        _node, helper, _param = _build_probe_node_with_component(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"],
+            default_model="gtc_test_alpha",
+            deprecated_values={"Alpha": "gtc_test_alpha"},
+        )
+
+        assert helper.migrate_value("gtc_test_alpha") is None
+
+    def test_returns_none_for_an_unknown_value(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
+
+        assert helper.migrate_value("never-heard-of-it") is None
+
+    def test_returns_none_for_non_string_input(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
+
+        assert helper.migrate_value(None) is None
+        assert helper.migrate_value(123) is None
+
+
+class TestChoiceMatchingNoDeclaredModelFailsClosed:
+    """The node declares catalog models, but one offered choice answers to none of them.
+
+    That's an authoring bug (a stale dropdown value, a typo, a mismatched display name),
+    not a policy outcome -- query_for_denial and raise_if_denied fail closed on
+    the unresolved choice rather than letting it through unevaluated, and other
+    choices on the same dropdown are unaffected.
+    """
+
+    def test_query_for_denial_synthesizes_denial_for_unresolved_choice(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "bogus"], default_model="gtc_test_alpha"
+        )
+
+        denial = helper.query_for_denial("bogus")
+        assert denial is not None
+        assert any("matches no model declared by this node" in m for m in denial.messages())
+
+        # The permitted sibling choice is unaffected by "bogus" failing closed.
+        assert helper.query_for_denial("gtc_test_alpha") is None
+
+    def test_raise_if_denied_raises_for_unresolved_choice(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "bogus"], default_model="gtc_test_alpha"
+        )
+
+        with pytest.raises(RuntimeError, match="matches no model declared"):
+            helper.raise_if_denied("bogus")
+
+
+class TestValueOutsideOfferedChoicesIsExempt:
+    def test_query_for_denial_returns_none_for_value_not_among_offered_choices(self) -> None:
+        """A value the component never offered isn't its concern, even one that would otherwise resolve.
+
+        The catalog would happily resolve "gtc_test_beta", but the node swapped its
+        dropdown to another provider's models at run time, so it's outside
+        this component's remit.
+        """
+        _, helper = _install_probe_node_with_helper(model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha")
+
+        # "gtc_test_beta" is a model this node declares, but this component
+        # only ever offered "gtc_test_alpha" as a choice.
+        assert helper.query_for_denial("gtc_test_beta") is None
+
+
+class TestPickPermittedDefaultSkipsUnresolvedChoices:
+    def test_skips_a_choice_that_resolves_to_nothing(self) -> None:
+        """A choice matching no declared model can never be a permitted default.
+
+        Even though nothing explicitly denies it, pick_permitted_default moves
+        on to the next resolvable choice instead of stopping on the unresolved one.
+        """
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["bogus", "gtc_test_alpha", "gtc_test_beta"], default_model="bogus"
+        )
+
+        assert helper.pick_permitted_default() == "gtc_test_alpha"
