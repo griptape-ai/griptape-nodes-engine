@@ -6,6 +6,14 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
+A dropdown stores the catalog model key itself (e.g. ``"gtc_seedream_4_5"``)
+-- the same key the permission layer gates on -- so a choice never needs
+resolving against the catalog; it either is one of the node's declared model
+ids, or it isn't. ``deprecated_values`` covers the values a node used to
+store before it adopted this convention (an old display label, a provider's
+own model id): the mapping is accepted wherever a value is assigned,
+migrated to its canonical choice, and never offered as a fresh selection.
+
 Usage — one construction step per parameter:
 
     class DescribeImage(ControlNode):
@@ -98,12 +106,21 @@ _BADGE_TITLE = "Model Not Permitted"
 class _AccessSnapshot:
     """The cached result of one ``QueryModelAccessForNodeRequest``.
 
-    Two lookup tables over the same set of verdicts, both keyed by the
-    dropdown-name (``provider_model_id``) so a caller with a dropdown value
-    can look up (a) whether it's denied and (b) what catalog id the engine
-    policy matches on.
+    Everything is keyed on the catalog ``model_id``, which every verdict always
+    carries. A dropdown choice IS a catalog model id (see the module
+    docstring), so ``model_id_by_choice`` needs no resolution step: it is the
+    subset of the offered choices that the query's verdicts recognized, mapped
+    to itself.
 
-    Grouped so the "refresh replaces both atomically" contract is visible:
+    ``unresolved_choices`` are the offered choices that matched no declared
+    catalog model. When the node declares models at all, that is an authoring
+    bug rather than a policy outcome: the dropdown still renders them, but
+    ``ModelAccessComponent.query_for_denial`` fails them closed rather than
+    pretending the policy allowed something it never saw. A node that declares
+    no models (``declares_models=False``) is not participating in model gating,
+    so its choices stay permitted -- ``INVOKE_MODEL`` remains their only gate.
+
+    Grouped so the "refresh replaces everything atomically" contract is visible:
     ``ModelAccessComponent._fetch_snapshot()`` returns a whole new snapshot,
     which the component assigns to ``self._snapshot`` in one step. The tables
     never drift because they're never mutated in place.
@@ -111,16 +128,25 @@ class _AccessSnapshot:
     ``resolution_failure_detail`` is set (non-``None``) when the engine could
     not answer the query at all -- e.g. the node's class name isn't registered
     against a library, or the manifest declaration is missing. In that case
-    both lookup tables are empty (we know NOTHING about denials or catalog
-    ids), but the component must NOT treat "no denials known" as "no denials"
-    at runtime. ``ModelAccessComponent.query_for_denial()`` synthesizes a
-    denial from this detail so the run fails closed with a clear error, rather
-    than silently letting a would-be-gated model through.
+    every table is empty (we know NOTHING about denials or catalog ids), but the
+    component must NOT treat "no denials known" as "no denials" at runtime.
+    ``ModelAccessComponent.query_for_denial()`` synthesizes a denial from this
+    detail so the run fails closed with a clear error, rather than silently
+    letting a would-be-gated model through.
     """
 
-    denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
-    catalog_id_by_provider_id: dict[str, str] = field(default_factory=dict)
+    denial_by_model_id: dict[str, CheckpointDenial] = field(default_factory=dict)
+    model_id_by_choice: dict[str, str] = field(default_factory=dict)
+    unresolved_choices: tuple[str, ...] = ()
+    declares_models: bool = False
     resolution_failure_detail: str | None = None
+
+    def denial_for_choice(self, choice: str) -> CheckpointDenial | None:
+        """The denial recorded for a dropdown choice, or ``None`` when permitted or unresolved."""
+        model_id = self.model_id_by_choice.get(choice)
+        if model_id is None:
+            return None
+        return self.denial_by_model_id.get(model_id)
 
 
 class ModelAccessComponent:
@@ -148,8 +174,28 @@ class ModelAccessComponent:
         parameter: Parameter,
         model_choices: list[str],
         default_model: str,
+        deprecated_values: dict[str, str] | None = None,
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
+
+        Every entry in ``model_choices`` IS the catalog model id the policy
+        gates on -- no resolution step needed. ``deprecated_values`` maps a
+        historical stored value (an old display label, a provider's own model
+        id, anything a prior version of this node once stored) to the current
+        choice it becomes. Every value in the mapping must be one of
+        ``model_choices``, and no key may itself already be a current choice;
+        either problem raises at construction.
+
+        A legacy value is accepted wherever it is assigned -- the ``Options``
+        trait's ``choices`` include it -- but migrated to its canonical choice
+        by a converter, and never offered as a fresh selection: the dropdown's
+        ``ui_options["data"]`` rows come from ``model_choices`` alone. The
+        parameter's current stored value is migrated the same way at
+        construction, before the denied-default relocation described below.
+
+        Choices that resolve to nothing the node declares are logged at
+        construction and fail closed at run time: the node offers a model the
+        catalog cannot identify, so policy cannot be evaluated for it.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -161,12 +207,16 @@ class ModelAccessComponent:
           adding a second ``Button`` overloads the refresh row. Migrate the
           node to construct the parameter without those traits and let the
           component add them.
+        - ``deprecated_values`` must map only to entries in ``model_choices``,
+          and none of its keys may already be a current choice. Either
+          violation raises.
         """
         # Constructor inputs -- immutable across the component's lifetime.
         self._node = node
         self._parameter = parameter
         self._model_choices = list(model_choices)
         self._default_model = default_model
+        self._deprecated_values = dict(deprecated_values or {})
 
         # Fail-fast preconditions -- see docstring.
         if self._node.get_parameter_by_name(parameter.name) is not parameter:
@@ -190,14 +240,32 @@ class ModelAccessComponent:
                 "refresh Button itself."
             )
             raise ValueError(msg)
+        choice_set = set(self._model_choices)
+        invalid_values = sorted(
+            {legacy for legacy, canonical in self._deprecated_values.items() if canonical not in choice_set}
+        )
+        colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
+        if invalid_values or colliding_keys:
+            problems = []
+            if invalid_values:
+                problems.append(f"value(s) not in model_choices: {', '.join(repr(v) for v in invalid_values)}")
+            if colliding_keys:
+                problems.append(f"key(s) already a current choice: {', '.join(repr(k) for k in colliding_keys)}")
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"deprecated_values is invalid: {'; '.join(problems)}."
+            )
+            raise ValueError(msg)
 
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
         # _AccessSnapshot's docstring for the contract.
         self._snapshot: _AccessSnapshot = self._fetch_snapshot()
 
-        # Install decoration + traits.
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        # Install decoration + traits. Options accepts legacy values too, so an
+        # assignment carrying one is never snapped to choices[0] before the
+        # migration converter (added below) gets a chance to run.
+        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -208,6 +276,15 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
+        parameter.add_converter(self._convert_legacy_value)
+
+        # Migrate a legacy stored value to its canonical choice before
+        # considering whether that choice is currently permitted.
+        current_value = self._node.get_parameter_value(parameter.name)
+        migrated_value = self.migrate_value(current_value)
+        if migrated_value is not None:
+            self._node.set_parameter_value(parameter.name, migrated_value, initial_setup=True)
+            current_value = migrated_value
 
         # If the caller's declared default_value is denied but another choice
         # IS permitted, move the parameter's stored value to that permitted
@@ -215,8 +292,7 @@ class ModelAccessComponent:
         # The Parameter's declarative default_value is untouched -- the
         # override is a stored-value change only, via set_parameter_value
         # with initial_setup=True so no change events fire.
-        current_value = self._node.get_parameter_value(parameter.name)
-        if isinstance(current_value, str) and current_value in self._snapshot.denial_by_provider_id:
+        if isinstance(current_value, str) and self._snapshot.denial_for_choice(current_value) is not None:
             replacement = self.pick_permitted_default()
             if replacement is not None and replacement != current_value:
                 self._node.set_parameter_value(parameter.name, replacement, initial_setup=True)
@@ -244,7 +320,7 @@ class ModelAccessComponent:
         already present -- ``add_trait`` will replace the existing instance.
         """
         parameter = self._parameter
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -260,7 +336,7 @@ class ModelAccessComponent:
         if not isinstance(value, str):
             parameter.clear_badge()
             return
-        denial = self._snapshot.denial_by_provider_id.get(value)
+        denial = self._snapshot.denial_for_choice(value)
         if denial is None:
             parameter.clear_badge()
             return
@@ -303,9 +379,24 @@ class ModelAccessComponent:
           a **synthesized** denial with a "policy could not be evaluated"
           reason. This is the fail-closed contract -- a broken library
           registration must not silently let denied models through.
+        - A value that is not one of this component's offered choices: return
+          ``None``. The dropdown is not the source of truth for it -- a node that
+          swaps its choices for another provider's models at run time, or holds a
+          value from an upstream connection, is outside this component's remit.
+        - An offered choice that resolves to none of the models the node
+          declares: return a **synthesized** denial. The node declares catalog
+          models yet offers a value none of them answers to, so policy cannot be
+          evaluated for it; failing closed surfaces the authoring bug instead of
+          hiding it. A node that declares no models at all is exempt -- it never
+          opted into model gating.
         - Live engine call fails or returns no verdict for the id: return
-          ``None``. These are transient conditions or already-vetted ids not
-          in the catalog; we don't gate user work on them.
+          ``None``. These are transient conditions we don't gate user work on.
+
+        An unresolvable choice is reported to the library author twice -- a
+        warning naming it when the component installs, and this fail-closed
+        denial when it runs -- but it is deliberately not badged on the
+        parameter: the fix belongs to whoever wrote the manifest, and an artist
+        cannot act on it.
 
         Use directly from SuccessFailureNode / GriptapeProxyNode::
 
@@ -319,23 +410,43 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
-        # Fail-closed: if the initial snapshot couldn't resolve this node at
-        # all, we can't evaluate policy for any value -- but the developer's
-        # setup bug must NOT silently open the gate. Synthesize a denial.
-        if self._snapshot.resolution_failure_detail is not None:
-            return CheckpointDenial(failures=(CheckpointFailure(detail=self._snapshot.resolution_failure_detail),))
-        catalog_id = self._snapshot.catalog_id_by_provider_id.get(value)
-        if catalog_id is None:
+        unevaluable = self._unevaluable_denial(value)
+        if unevaluable is not None:
+            return unevaluable
+        model_id = self._snapshot.model_id_by_choice.get(value)
+        # A value this component never offered belongs to whatever put it there.
+        if model_id is None:
             return None
         result = GriptapeNodes.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=type(self._node).__name__,
-                candidate_model_ids=[catalog_id],
+                candidate_model_ids=[model_id],
             )
         )
         if not isinstance(result, QueryModelAccessForNodeResultSuccess) or not result.verdicts:
             return None
         return result.verdicts[0].denial
+
+    def _unevaluable_denial(self, value: str) -> CheckpointDenial | None:
+        """Synthesize a denial when policy cannot be evaluated for ``value`` at all.
+
+        Two fail-closed cases, both authoring bugs rather than policy outcomes:
+        the engine could not resolve this node type, or the node declares catalog
+        models yet offers a choice none of them answers to. Everything else
+        returns ``None`` so the caller proceeds to the live query.
+        """
+        if self._snapshot.resolution_failure_detail is not None:
+            return CheckpointDenial(failures=(CheckpointFailure(detail=self._snapshot.resolution_failure_detail),))
+        if value in self._snapshot.model_id_by_choice:
+            return None
+        if not self._snapshot.declares_models or value not in self._model_choices:
+            return None
+        detail = (
+            f"License policy could not be evaluated for '{value}' on node "
+            f"'{type(self._node).__name__}': it matches no model declared by this node. "
+            "Verify the library manifest's model_usage block declares this model id."
+        )
+        return CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
 
     def raise_if_denied(self, value: Any) -> None:
         """Convenience wrapper: raise ``RuntimeError`` if ``query_for_denial`` returns a denial.
@@ -363,21 +474,40 @@ class ModelAccessComponent:
         permitted-default separately (e.g. logging, picking a value for a
         related parameter).
         """
-        denials = self._snapshot.denial_by_provider_id
-        if self._default_model not in denials:
+        if self._is_permitted(self._default_model):
             return self._default_model
         for choice in self._model_choices:
-            if choice not in denials:
+            if self._is_permitted(choice):
                 return choice
         return None
+
+    def migrate_value(self, value: Any) -> str | None:
+        """The canonical choice ``value`` migrates to if it is a deprecated key, else ``None``.
+
+        Non-``str`` input returns ``None`` -- the same rationale as
+        ``query_for_denial``: a connected driver's value isn't a dropdown token
+        this component's tables cover.
+        """
+        if not isinstance(value, str):
+            return None
+        return self._deprecated_values.get(value)
+
+    def _is_permitted(self, choice: str) -> bool:
+        """The choice resolves to a catalog model and no denial was recorded for it."""
+        model_id = self._snapshot.model_id_by_choice.get(choice)
+        if model_id is None:
+            return False
+        return model_id not in self._snapshot.denial_by_model_id
 
     def _fetch_snapshot(self) -> _AccessSnapshot:
         """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.
 
-        On ``Success``: populate both lookup tables from the verdicts so they
-        never drift. An empty verdict list is a valid response (node declares
-        no gated models) and yields an empty snapshot with
-        ``resolution_failure_detail=None``.
+        On ``Success``: a dropdown choice IS a catalog model id, so matching it
+        against the node's declared models is a membership check against the
+        verdicts' model ids -- no resolution step. Denials are recorded by the
+        same id, so both tables come from the same query and never drift. An
+        empty verdict list is a valid response (the node declares no gated
+        models).
 
         On ``Failure`` (or any unexpected result type): log a warning naming
         the node type + the failure reason, and return a snapshot with
@@ -403,21 +533,47 @@ class ModelAccessComponent:
                     "Verify the library manifest declares this node type with a model_usage block."
                 )
             )
-        snapshot = _AccessSnapshot()
+        declared_model_ids = {verdict.model_id for verdict in result.verdicts}
+        model_id_by_choice = {choice: choice for choice in self._model_choices if choice in declared_model_ids}
+        declares_models = bool(result.verdicts)
+        unresolved = tuple(choice for choice in self._model_choices if choice not in model_id_by_choice)
+        if unresolved and declares_models:
+            logger.warning(
+                "ModelAccessComponent: node type '%s' offers %s, which match no model it declares. "
+                "Selecting one fails closed at run time. Declare the model in the library manifest so "
+                "its catalog id matches this value.",
+                node_type,
+                ", ".join(repr(choice) for choice in unresolved),
+            )
+        elif unresolved:
+            logger.warning(
+                "ModelAccessComponent: node type '%s' declares no models, so its dropdown cannot be "
+                "narrowed by license policy. Add a model_usage block to its griptape_nodes_library.json "
+                "entry to gate these choices: %s.",
+                node_type,
+                ", ".join(repr(choice) for choice in unresolved),
+            )
+
+        snapshot = _AccessSnapshot(
+            model_id_by_choice=model_id_by_choice,
+            unresolved_choices=unresolved,
+            declares_models=declares_models,
+        )
         for verdict in result.verdicts:
-            if verdict.provider_model_id is None:
-                continue
-            snapshot.catalog_id_by_provider_id[verdict.provider_model_id] = verdict.model_id
             if verdict.denial is not None:
-                snapshot.denial_by_provider_id[verdict.provider_model_id] = verdict.denial
+                snapshot.denial_by_model_id[verdict.model_id] = verdict.denial
         return snapshot
 
     def _build_ui_options(self) -> dict[str, Any]:
-        """Build the ``ui_options`` dict that decorates the dropdown row-by-row."""
-        denials = self._snapshot.denial_by_provider_id
+        """Build the ``ui_options`` dict that decorates the dropdown row-by-row.
+
+        Built from ``model_choices`` alone, never ``deprecated_values`` -- a
+        legacy value is accepted when assigned but never offered as a fresh
+        selection.
+        """
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
-            if choice in denials:
+            if self._snapshot.denial_for_choice(choice) is not None:
                 data.append({"name": choice, "icon": _DENIED_ROW_ICON, "subtitle": _DENIED_ROW_SUBTITLE})
             else:
                 data.append({"name": choice})
@@ -426,6 +582,24 @@ class ModelAccessComponent:
             "dropdown_row_icons": True,
             "dropdown_row_subtitles": True,
         }
+
+    def _convert_legacy_value(self, value: Any) -> Any:
+        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+
+        Installed as a directly-attached converter (``Parameter.add_converter``)
+        rather than hooked into ``before_value_set`` / ``after_value_set``,
+        because ``BaseNode.set_parameter_value`` runs every converter
+        unconditionally on every assignment path -- including workflow load,
+        which calls it with ``initial_setup=True`` and
+        ``skip_before_value_set=True`` and therefore never calls
+        ``before_value_set`` at all. A converter is the only hook a saved
+        workflow's stored value is guaranteed to pass through, so it is the
+        only place this migration can live.
+        """
+        migrated = self.migrate_value(value)
+        if migrated is not None:
+            return migrated
+        return value
 
     def _on_refresh_click(
         self,

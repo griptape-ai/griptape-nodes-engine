@@ -2114,6 +2114,15 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         # You are NOT ALLOWED TO ADD DUPLICATE TRAITS (kate)
         self.remove_child(trait_type)
 
+    def add_converter(self, converter: Callable[[Any], Any]) -> None:
+        """Append a converter to this parameter's directly-attached converter list.
+
+        Trait converters run BEFORE directly-attached ones (see the
+        ``converters`` property), so a converter added here observes the
+        value only after every attached trait has already converted it.
+        """
+        self._converters.append(converter)
+
     def is_incoming_type_allowed(self, incoming_type: str | None) -> bool:
         if incoming_type is None:
             return False
