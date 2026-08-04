@@ -1,6 +1,5 @@
 """Tests for NodeExecutor._delete_workflow key derivation and registration logic."""
 
-import platform
 import tempfile
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch

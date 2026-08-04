@@ -1,7 +1,6 @@
 """Tests for ContextManager.push_workflow."""
 
 import ast
-import platform
 import tempfile
 from pathlib import Path
 
