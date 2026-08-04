@@ -6,6 +6,7 @@ import logging
 import pickle
 import re
 import sys
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
@@ -1816,9 +1817,13 @@ class WorkflowManager:
             for line in matches[0].group("content").splitlines(keepends=True)
         )
 
+        # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a
+        # formatting-preserving document model that costs ~20x more per header. Only the
+        # save path (_generate_workflow_metadata_header) needs tomlkit, to keep the
+        # formatting of headers it rewrites.
         try:
-            toml_doc = tomlkit.parse(metadata_content_toml)
-        except Exception as err:
+            toml_doc = tomllib.loads(metadata_content_toml)
+        except tomllib.TOMLDecodeError as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
@@ -1832,8 +1837,8 @@ class WorkflowManager:
         tool_header = "tool"
         griptape_nodes_header = "griptape-nodes"
         try:
-            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]  # type: ignore (this is the only way I could find to get tomlkit to do the dotted notation correctly)
-        except Exception as err:
+            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]
+        except (KeyError, TypeError) as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
