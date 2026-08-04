@@ -2127,6 +2127,7 @@ class WorkflowManager:
         success: bool
         error_details: str
         written_file: File | None = None
+        failure_reason: FileIOFailureReason | None = None
 
     class WorkflowSavePath(NamedTuple):
         """Unresolved workflow save destination plus its registry-relative form.
@@ -2260,7 +2261,11 @@ class WorkflowManager:
             written_file = destination.write_text(content, encoding="utf-8")
         except FileWriteError as err:
             details = self._format_workflow_write_error(file_name, err.failure_reason, err.result_details)
-            return self.WriteWorkflowFileResult(success=False, error_details=details)
+            return self.WriteWorkflowFileResult(
+                success=False,
+                error_details=details,
+                failure_reason=err.failure_reason,
+            )
         return self.WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @staticmethod
@@ -2299,6 +2304,11 @@ class WorkflowManager:
                 error_msg = "Path is a directory, not a file"
             case FileIOFailureReason.ENCODING_ERROR:
                 error_msg = f"Content encoding error: {details}"
+            case FileIOFailureReason.POLICY_NO_OVERWRITE:
+                error_msg = (
+                    "A different workflow already exists at this location. "
+                    "To replace it, save again with overwrite enabled."
+                )
             case _:
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
@@ -2326,41 +2336,21 @@ class WorkflowManager:
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
-        # Check for workflow conflicts AFTER determining the actual save target.
-        # Skip conflict checks for scenarios that intentionally generate unique names:
-        # - SAVE_FROM_TEMPLATE always creates new copies via _generate_unique_filename
-        # - CREATE_VERSIONED always bumps versions via the versioned macro's padding
-        # FIRST_SAVE, SAVE_AS, and OVERWRITE_EXISTING all need conflict checks because
-        # they use user-provided names or situation macros that may collide.
-        should_check_conflict = save_target.scenario not in {
-            WorkflowManager.SaveWorkflowScenario.SAVE_FROM_TEMPLATE,
-            WorkflowManager.SaveWorkflowScenario.CREATE_VERSIONED,
-        }
-        if not request.allow_overwrite and should_check_conflict:
-            conflicting_workflow = self._check_workflow_conflict(
-                registry_key=registry_key,
-                current_workflow_name=current_workflow_name,
-            )
-            if conflicting_workflow is not None:
-                conflict_path = conflicting_workflow.file_path or registry_key
-                # Get current workflow's display name for artist-comprehensible error message
-                current_display_name = file_name  # The resolved name from _determine_save_target
-                details = (
-                    f"Attempted to save workflow '{current_display_name}'. "
-                    f"Would overwrite different workflow at '{conflict_path}'. "
-                    f"To replace the other workflow, save again with allow_overwrite enabled."
-                )
-                return SaveWorkflowResultFailure(
-                    result_details=details,
-                    failure_reason=FileIOFailureReason.WORKFLOW_CONFLICT,
-                )
-
         logger.debug(
             "Save workflow post-target: scenario=%s, registry_key=%s, relative_file_path=%s",
             save_target.scenario.value,
             registry_key,
             relative_file_path,
         )
+
+        # Determine policy: saving over yourself is always allowed; anything else must not clobber.
+        is_self_save = current_workflow_name is not None and (
+            derive_registry_key(current_workflow_name) == registry_key
+        )
+        if request.allow_overwrite or is_self_save:
+            policy = ExistingFilePolicy.OVERWRITE
+        else:
+            policy = ExistingFilePolicy.FAIL
 
         # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
         # (in-place overwrite) wrapped in a ProjectFileDestination. All other
@@ -2372,7 +2362,7 @@ class WorkflowManager:
         elif save_target.file_path is not None:
             destination = ProjectFileDestination(
                 str(save_target.file_path),
-                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+                existing_file_policy=policy,
             )
         else:
             msg = (
@@ -2531,45 +2521,6 @@ class WorkflowManager:
         description: str | None
         image: str | None
         is_template: bool | None
-
-    def _check_workflow_conflict(
-        self,
-        registry_key: str,
-        current_workflow_name: str | None,
-    ) -> Workflow | None:
-        """Check if saving would overwrite a different registered workflow.
-
-        Args:
-            registry_key: The registry key that would be used for the save (must be
-                derived using derive_registry_key, which normalizes case on
-                case-insensitive filesystems)
-            current_workflow_name: The current workflow in context (if any)
-
-        Returns:
-            The conflicting Workflow if there's a conflict, None if save can proceed
-        """
-        has_workflow = WorkflowRegistry.has_workflow_with_name(registry_key)
-
-        if not has_workflow:
-            return None
-
-        # Saving over the current workflow (same key) is always allowed.
-        # Normalize current_workflow_name for comparison since it may come from
-        # push_workflow(workflow_name=...) which doesn't normalize, only push_workflow(file_path=...) does.
-        if current_workflow_name is not None and derive_registry_key(current_workflow_name) == registry_key:
-            return None
-
-        # Found a different registered workflow with this key - this is a conflict!
-        conflicting_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
-        conflict_path = conflicting_workflow.file_path or registry_key
-
-        logger.warning(
-            "Blocking save: registry_key=%s would overwrite existing workflow at '%s'",
-            registry_key,
-            conflict_path,
-        )
-
-        return conflicting_workflow
 
     def _get_existing_metadata(self, file_name: str) -> _ExistingMetadata:
         """Return metadata for an existing workflow, or all-None if not present."""
@@ -3067,7 +3018,10 @@ class WorkflowManager:
 
         write_result = self._write_workflow_file(destination, final_code_output, file_name)
         if not write_result.success:
-            return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=write_result.error_details)
+            return SaveWorkflowFileFromSerializedFlowResultFailure(
+                result_details=write_result.error_details,
+                failure_reason=write_result.failure_reason,
+            )
 
         # Prefer the post-write location from ``_write_workflow_file`` — for
         # macro-driven saves this reflects the resolved-and-possibly-seeded

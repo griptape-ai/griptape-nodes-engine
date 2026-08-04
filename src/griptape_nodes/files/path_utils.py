@@ -18,7 +18,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 
-from griptape_nodes.files.os_utils import is_mac, is_windows
+from griptape_nodes.files.os_utils import is_windows
 
 # Path decomposition patterns
 _WINDOWS_DRIVE_MATCH_PATTERN = r"^([A-Z]):"
@@ -86,15 +86,11 @@ def derive_registry_key(file_path: str) -> str:
     Strips the file extension and normalizes directory separators to forward slashes,
     preserving directory components for uniqueness across different directories.
 
-    On case-insensitive filesystems (macOS/Windows), the key is lowercased to ensure
-    consistent identity matching regardless of case variations in the input path.
-
     Args:
         file_path: Path to the workflow file, e.g. "subdir/my_workflow.py"
 
     Returns:
         Registry key with directory components preserved, e.g. "subdir/my_workflow"
-        (lowercased on macOS/Windows)
 
     Examples:
         >>> derive_registry_key("my_workflow.py")
@@ -103,14 +99,7 @@ def derive_registry_key(file_path: str) -> str:
         "subdir/my_workflow"
     """
     normalized = file_path.replace("\\", "/")
-    key = str(PurePosixPath(normalized).with_suffix(""))
-    # Lowercase on case-insensitive filesystems to prevent collisions
-    # (e.g., "MyFlow" and "myflow" refer to the same file on macOS/Windows).
-    # Platform approximation: assumes default filesystem (APFS/HFS+ on macOS, NTFS on Windows).
-    # Does not detect case-sensitive APFS on macOS or case-insensitive ext4 on Linux (both rare).
-    if is_windows() or is_mac():
-        return key.lower()
-    return key
+    return str(PurePosixPath(normalized).with_suffix(""))
 
 
 class FilenameParts(NamedTuple):
