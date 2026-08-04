@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import (
     ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
     Parameter,
     ParameterMode,
     ParameterTypeBuiltin,
@@ -65,6 +67,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
     ) -> None:
         super().__init__(name, metadata)
+        self.control_in = ControlParameterInput()
+        self.add_parameter(self.control_in)
+        self.metadata[LEFT_PARAMETERS_KEY] = [self.control_in.name]
+        self.control_out = ControlParameterOutput()
+        self.add_parameter(self.control_out)
+        self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
         self.execution_environment = Parameter(
             name="execution_environment",
             tooltip="Environment that the group should execute in",
