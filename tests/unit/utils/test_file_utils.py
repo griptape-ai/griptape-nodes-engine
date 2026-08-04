@@ -389,6 +389,46 @@ class TestAfindFilesRecursive:
 
         assert len(result) == 2  # noqa: PLR2004
 
+    @pytest.mark.asyncio
+    async def test_follows_symlinked_directories(self, temp_dir: Path) -> None:
+        """A symlinked directory is walked, so a workspace can reach content through a link.
+
+        Guards against a walk that skips links (os.walk's default), which would silently
+        stop discovering libraries or workflows reached that way.
+        """
+        real_dir = temp_dir / "real"
+        real_dir.mkdir()
+        (real_dir / "found.json").write_text("{}")
+        scan_root = temp_dir / "root"
+        scan_root.mkdir()
+        (scan_root / "linked").symlink_to(real_dir)
+
+        result = await find_files_recursive(scan_root, "*.json")
+
+        assert result == [scan_root / "linked" / "found.json"]
+
+    @pytest.mark.asyncio
+    async def test_symlink_loop_terminates(self, temp_dir: Path) -> None:
+        """A directory symlink pointing back at an ancestor terminates via the depth cap."""
+        nested = temp_dir / "a"
+        nested.mkdir()
+        (nested / "f.json").write_text("{}")
+        (nested / "loop").symlink_to(temp_dir)
+
+        result = await find_files_recursive(temp_dir, "*.json")
+
+        assert nested / "f.json" in result
+
+    @pytest.mark.asyncio
+    async def test_broken_symlink_is_skipped(self, temp_dir: Path) -> None:
+        """A dangling symlink is neither matched nor fatal to the walk."""
+        (temp_dir / "real.json").write_text("{}")
+        (temp_dir / "broken.json").symlink_to(temp_dir / "does_not_exist")
+
+        result = await find_files_recursive(temp_dir, "*.json")
+
+        assert result == [temp_dir / "real.json"]
+
 
 class TestAtomicWriteBytes:
     """Test atomic_write_bytes function."""
