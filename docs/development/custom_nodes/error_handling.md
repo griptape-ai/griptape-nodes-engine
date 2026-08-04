@@ -39,6 +39,23 @@ class MyNode(DataNode):
 - Define `API_KEY_NAME` as a class constant for consistency
 - Always validate that the secret exists before using it
 
+### Parameter Payload Size
+
+A parameter value can end up fully embedded in two places:
+
+- **Saved workflow files.** The workflow serializer writes unique parameter values inline into the saved `.py` file, with no size limit — whatever Python state the value holds gets written out whole.
+- **WebSocket events.** Parameter values traveling in request/response events are serialized and sent to every connected client (the editor UI, the MCP server).
+
+Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
+
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it.
+
+!!! warning "Keep parameter values small"
+
+    `griptape.artifacts.BlobArtifact` stores raw bytes, and `ImageArtifact` / `AudioArtifact` both subclass it — so a node using one of these as a parameter type sends the entire byte payload to every connected client, and writes it into saved workflows unless the parameter is declared `serializable=False`. Use `ImageUrlArtifact` / `AudioUrlArtifact` instead (the `ParameterImage` / `ParameterAudio` helper classes enforce them — see [Parameters](parameters.md#parameterimage-recommended-for-image-parameters)), which hold only a short URL string no matter how large the file they point to is.
+
+    Raw bytes aren't confined to `BlobArtifact` and its subclasses — `ThreeDArtifact` holds them too (though does not send its bytes over the WebSocket). Judge a parameter by the size of the value it will actually hold, not by whether its type name looks safe.
+
 ### Import Best Practices
 
 **Always import dependencies at module level, not inside functions:**

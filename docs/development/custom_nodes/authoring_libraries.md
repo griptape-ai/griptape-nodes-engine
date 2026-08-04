@@ -531,6 +531,7 @@ ParameterImage(
 
 **Benefits:**
 
+- Declares `ImageUrlArtifact` instead of `ImageArtifact`, keeping the parameter's value small — see [Parameter Payload Size](error_handling.md#parameter-payload-size)
 - Handles ImageArtifact, ImageUrlArtifact, and strings consistently
 - Built-in support for URLs, file paths, and data URIs
 - Graceful error handling for various input formats

@@ -685,6 +685,8 @@ def _poll_for_completion(self, task_id: str, api_key: str) -> dict[str, Any]:
 
 ## Flexible Artifact Processing
 
+The patterns below handle values that may still arrive as `ImageArtifact` from older workflows or upstream nodes — they're runtime input handling, not a template for declaring new parameters. New parameters should declare `ImageUrlArtifact` (see [Parameter Payload Size](error_handling.md#parameter-payload-size)).
+
 ### Duck Typing for Artifacts
 
 Handle multiple artifact formats gracefully:

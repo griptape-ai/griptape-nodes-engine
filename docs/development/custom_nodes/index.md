@@ -104,7 +104,7 @@ class MyNode(DataNode):
 - **[Parameter UI Reference](parameter_ui_reference.md)** — Parameter type to widget mapping, supported `ui_options` keys, and traits
 - **[Execution and Lifecycle](execution_and_lifecycle.md)** — Lifecycle callbacks and asynchronous API integration patterns
 - **[Working with the Project System](project_system.md)** — Saving files through situations, macros, and `ProjectFileParameter`
-- **[Best Practices and Error Handling](error_handling.md)** — Secrets, imports, validation, error handling, and logging
+- **[Best Practices and Error Handling](error_handling.md)** — Secrets, imports, parameter payload size, validation, error handling, and logging
 - **[Authoring Libraries](authoring_libraries.md)** — Library manifests, declarations, dependency management, and contributing to the standard library
 - **[Custom Widgets](custom_widgets.md)** — Custom JavaScript widget components and the widget testbed
 - **[Patterns and Examples](examples.md)** — Advanced patterns from production nodes and quick-reference material
