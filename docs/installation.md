@@ -33,6 +33,8 @@ On first run, you'll be asked to choose a *workspace directory*. Your workspace 
 
 That's it! The application takes care of the rest — installing the engine, generating an API key, and opening the editor. You're ready to move on to the [tutorials](tutorials/index.md).
 
+You can change your workspace, manage your license, and choose how the application updates itself later from [App Settings](guides/desktop/app_settings.md).
+
 ## Advanced: Manual Engine Install
 
 Prefer to manage the engine yourself? With this approach, you install the engine from the command line and use the editor in your web browser at [https://nodes.griptape.ai](https://nodes.griptape.ai).
@@ -129,7 +131,7 @@ Organizations can run Griptape Nodes on license keys instead of individual Gript
 
 If your organization runs an on-premises [Admin Server](enterprise/admin_server.md), you'll also point the application at it during activation. See [Using the Admin Server](enterprise/using_the_admin_server.md) for the full walkthrough of the license activation flow.
 
-Organization admins looking to issue and manage license keys should start with the [Admin Dashboard](enterprise/admin_dashboard.md) guide.
+Organization admins looking to issue and manage license keys should start with the [Admin Dashboard](enterprise/admin_dashboard.md) guide. For a diagram of how the pieces fit together in either deployment model, see [Architecture](architecture.md).
 
 ## Next Steps
 

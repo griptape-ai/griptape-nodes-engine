@@ -88,6 +88,7 @@ plugins:
         Get started:
           - index.md: Top-level introduction to Griptape Nodes
           - installation.md: Install Griptape Nodes via the Desktop app (recommended), a manual engine install, or license activation
+          - architecture.md: Deployment architecture for the Griptape Cloud and on-premises models — components, trust boundaries, and what leaves your network
           - faq.md: Frequently asked questions
           - troubleshooting.md: Fixes for commonly encountered issues and states
           - glossary.md: Terms and definitions used throughout the docs
@@ -99,6 +100,8 @@ plugins:
           - tutorials/02_coordinating_agents/index.md
           - tutorials/03_compare_prompts/index.md
           - tutorials/04_photography_team/index.md
+        Desktop App:
+          - guides/desktop/app_settings.md: Griptape Nodes Desktop App Settings — workspace, license, logs, update behavior, and the Stable/Nightly release channels
         Editor:
           - guides/editor/index.md: Orientation tour of the visual editor (canvas, header, menus, sidebars)
           - guides/editor/keyboard_shortcuts.md: Complete keyboard shortcut reference
@@ -255,6 +258,7 @@ nav:
   - Get Started:
       - Overview: index.md
       - Installation: installation.md
+      - Architecture: architecture.md
       - Tutorials:
           - Overview: tutorials/index.md
           - 1. A Tour of the Editor: tutorials/00_tour/index.md
@@ -266,6 +270,8 @@ nav:
       - Troubleshooting: troubleshooting.md
       - Glossary: glossary.md
   - Guides:
+      - Desktop App:
+          - App Settings: guides/desktop/app_settings.md
       - Editor:
           - Overview: guides/editor/index.md
           - Keyboard Shortcuts: guides/editor/keyboard_shortcuts.md

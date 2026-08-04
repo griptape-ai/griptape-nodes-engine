@@ -9,6 +9,7 @@ from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
@@ -110,9 +111,20 @@ class StaticFilesManager:
             case StorageBackend.GTC:
                 bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
 
+                cloud_credential = resolve_cloud_credential(secrets_manager)
+
                 if not bucket_id:
                     logger.warning(
                         "GT_CLOUD_BUCKET_ID secret is not available, falling back to local storage. Run `gtn init` to set it up."
+                    )
+                    self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
+                elif not cloud_credential:
+                    # Without this the driver would send "Bearer None" and every
+                    # upload would fail with an opaque 401 instead of naming the
+                    # missing credential at boot.
+                    logger.warning(
+                        "Falling back to local storage because %s",
+                        MISSING_CREDENTIAL_MESSAGE,
                     )
                     self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
                 else:
@@ -122,7 +134,7 @@ class StaticFilesManager:
                     self.storage_driver = GriptapeCloudStorageDriver(
                         workspace_directory,
                         bucket_id=bucket_id,
-                        api_key=secrets_manager.get_secret("GT_CLOUD_API_KEY"),
+                        api_key=cloud_credential,
                         static_files_directory=static_files_directory,
                     )
             case StorageBackend.LOCAL:
@@ -295,9 +307,9 @@ class StaticFilesManager:
             bucket_id: The bucket ID to use
 
         Returns:
-            GriptapeCloudStorageDriver instance if API key is available, None otherwise
+            GriptapeCloudStorageDriver instance if a credential is available, None otherwise
         """
-        api_key = self.secrets_manager.get_secret("GT_CLOUD_API_KEY", should_error_on_not_found=False)
+        api_key = resolve_cloud_credential(self.secrets_manager)
 
         if not api_key:
             return None
@@ -372,7 +384,7 @@ class StaticFilesManager:
         if bucket_id is not None:
             driver = self._create_cloud_storage_driver(bucket_id)
             if driver is None:
-                msg = f"Attempted to create download URL for Griptape Cloud file. Failed with file_path='{file_path}' because GT_CLOUD_API_KEY secret is not available."
+                msg = f"Attempted to create download URL for Griptape Cloud file. Failed with file_path='{file_path}' because {MISSING_CREDENTIAL_MESSAGE}"
                 return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
             # For cloud URLs, pass the full URL to the driver
