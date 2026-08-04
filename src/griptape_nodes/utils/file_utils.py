@@ -156,7 +156,7 @@ def find_all_files_in_directory(directory: Path, pattern: str) -> list[Path]:
 
 @dataclass
 class _AsyncWalkParams:
-    """Immutable walk settings shared across recursion levels of the finder."""
+    """Immutable walk settings shared across recursion levels of the async finder."""
 
     pattern: str
     skip_hidden: bool
@@ -165,21 +165,66 @@ class _AsyncWalkParams:
     matches: list[Path]
 
 
-def _recurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> None:
-    """Depth-bounded walk that appends matching files into ``params.matches``.
+@dataclass(frozen=True)
+class _ScannedEntry:
+    """One directory entry, classified while its ``scandir`` iterator was still open.
+
+    A ``DirEntry``'s cached stat is tied to the ``scandir`` iterator that produced it,
+    so it cannot outlive the ``with`` block. Copying the three fields the walk needs
+    lets the classification happen in the worker thread while the recursion stays on
+    the event loop.
+    """
+
+    name: str
+    path: str
+    is_file: bool
+    is_dir: bool
+
+
+def _scan_directory(path: Path, *, skip_hidden: bool) -> list[_ScannedEntry]:
+    """List one directory, classifying each entry, for a single thread hop.
 
     Uses os.scandir rather than Path.iterdir + is_file/is_dir: scandir carries the
     entry type along with the directory read, so classifying an entry costs no extra
-    stat call. The previous per-entry await pair dispatched two thread hops per entry,
-    which dominated boot-time discovery on large trees.
+    stat call. Hidden entries are dropped here so they are never classified.
 
-    Symlinked directories are followed (matching the DirEntry.is_dir default), because
-    a workspace may reach its libraries or workflows through a link. max_depth is what
-    bounds a symlink loop, so there is no visited-set.
+    Symlinked directories are reported as directories (matching the DirEntry.is_dir
+    default), because a workspace may reach its libraries or workflows through a link.
+    """
+    entries = []
+    with os.scandir(path) as scan:
+        for entry in scan:
+            if skip_hidden and entry.name.startswith("."):
+                continue
+
+            # is_file/is_dir may still stat when the entry is a symlink, which can raise
+            # on protected paths (e.g. macOS system caches). Skip the offending entry
+            # rather than aborting the whole directory.
+            try:
+                entry_is_file = entry.is_file()
+                entry_is_dir = entry.is_dir()
+            except (PermissionError, OSError) as e:
+                logger.debug("Cannot access entry %s: %s", entry.path, e)
+                continue
+
+            entries.append(_ScannedEntry(name=entry.name, path=entry.path, is_file=entry_is_file, is_dir=entry_is_dir))
+
+    return sorted(entries, key=lambda entry: entry.name)
+
+
+async def _arecurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> None:
+    """Depth-bounded async walk that appends matching files into ``params.matches``.
+
+    Offloads one thread hop per directory rather than per entry. The per-entry variant
+    (anyio.Path.iterdir plus an await pair per entry) dispatched two hops for every
+    entry, which dominated boot-time discovery on large trees; hopping per directory
+    recovers nearly all of that while keeping the walk a coroutine, so a caller can
+    still bound discovery with a timeout and cancellation lands at a directory edge.
+
+    max_depth is what bounds a symlink loop, so there is no visited-set.
     """
     try:
-        with os.scandir(path) as scan:
-            entries = sorted(scan, key=lambda entry: entry.name)
+        entries = await to_thread(_scan_directory, path, skip_hidden=params.skip_hidden)
     except (PermissionError, OSError) as e:
         logger.debug("Cannot access directory %s: %s", path, e)
         return
@@ -187,24 +232,12 @@ def _recurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> None:
     for item in entries:
         if params.max_files is not None and len(params.matches) >= params.max_files:
             return
-        if params.skip_hidden and item.name.startswith("."):
-            continue
 
-        # is_file/is_dir may still stat when the entry is a symlink, which can raise on
-        # protected paths (e.g. macOS system caches). Skip the offending entry rather
-        # than aborting the whole directory.
-        try:
-            item_is_file = item.is_file()
-            item_is_dir = item.is_dir()
-        except (PermissionError, OSError) as e:
-            logger.debug("Cannot access entry %s: %s", item.path, e)
-            continue
-
-        if item_is_file:
+        if item.is_file:
             if fnmatch(item.name, params.pattern):
                 params.matches.append(Path(item.path))
-        elif item_is_dir and depth < params.max_depth:
-            _recurse_find(Path(item.path), depth + 1, params)
+        elif item.is_dir and depth < params.max_depth:
+            await _arecurse_find(Path(item.path), depth + 1, params)
 
 
 async def find_files_recursive(
@@ -216,8 +249,8 @@ async def find_files_recursive(
 ) -> list[Path]:
     """Asynchronously search directory recursively for files matching pattern.
 
-    Depth-bounded finder suitable for the engine boot path: the whole walk runs in a
-    single worker thread so it never blocks the event loop, and the
+    Depth-bounded async finder suitable for the engine boot path: each directory read is
+    offloaded to a worker thread so it never blocks the event loop, and the
     `discovery_max_depth` setting bounds recursion so a pathologically deep tree
     or symlink loop can't stall startup.
 
@@ -247,11 +280,7 @@ async def find_files_recursive(
         max_files=max_files,
         matches=matches,
     )
-    # One thread hop for the entire walk. Offloading per-entry instead (the anyio.Path
-    # approach) cost two hops per directory entry, which is what made discovery slow.
-    # _resolve_discovery_max_depth is read above, on the event loop, so the thread does
-    # nothing but filesystem work.
-    await to_thread(_recurse_find, Path(directory), 0, params)
+    await _arecurse_find(Path(directory), 0, params)
 
     if not matches:
         logger.debug("No files matching pattern '%s' found in directory: %s", pattern, directory)
