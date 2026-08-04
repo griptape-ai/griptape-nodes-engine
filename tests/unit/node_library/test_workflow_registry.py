@@ -32,29 +32,16 @@ class TestDeriveRegistryKey:
         assert derive_registry_key("./my_workflow.py") == "my_workflow"
 
     def test_known_inputs(self) -> None:
-        """Test derive_registry_key with known inputs, accounting for platform-specific case normalization."""
-        # These cases work the same on all platforms (already lowercase)
+        """Test derive_registry_key with known inputs."""
         assert derive_registry_key("my_workflow.py") == "my_workflow"
         assert derive_registry_key("subdir/my_workflow.py") == "subdir/my_workflow"
         assert derive_registry_key("a/b/deep_workflow.py") == "a/b/deep_workflow"
 
-        # Backslash normalization: case handling varies by platform
-        if platform.system() == "Linux":
-            # Case-sensitive filesystem: preserve case
-            assert derive_registry_key("windows\\path\\workflow.py") == "windows/path/workflow"
-        else:
-            # Case-insensitive filesystem (macOS/Windows): lowercase
-            assert derive_registry_key("windows\\path\\workflow.py") == "windows/path/workflow"
+        # Backslash normalization to forward slashes
+        assert derive_registry_key("windows\\path\\workflow.py") == "windows/path/workflow"
 
-    @pytest.mark.skipif(platform.system() == "Linux", reason="Case normalization only on case-insensitive filesystems")
-    def test_case_normalization_on_case_insensitive_filesystem(self) -> None:
-        """On macOS/Windows, registry keys are lowercased to prevent collisions."""
-        assert derive_registry_key("MyFlow.py") == "myflow"
-        assert derive_registry_key("UPPER/MixedCase.py") == "upper/mixedcase"
-
-    @pytest.mark.skipif(platform.system() != "Linux", reason="Case preservation only on case-sensitive filesystems")
-    def test_case_preservation_on_case_sensitive_filesystem(self) -> None:
-        """On Linux, registry keys preserve case since the filesystem is case-sensitive."""
+    def test_case_preservation(self) -> None:
+        """Registry keys preserve case on all platforms."""
         assert derive_registry_key("MyFlow.py") == "MyFlow"
         assert derive_registry_key("UPPER/MixedCase.py") == "UPPER/MixedCase"
 

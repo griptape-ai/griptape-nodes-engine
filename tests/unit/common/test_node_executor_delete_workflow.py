@@ -105,9 +105,6 @@ class TestDeleteWorkflowKeyDerivation:
             delete_request = mock_gn.ahandle_request.call_args.args[0]
             assert isinstance(delete_request, DeleteWorkflowRequest)
             expected_key = (await anyio.Path(other_dir).resolve() / "my_flow").as_posix()
-            # On Windows/macOS, registry keys are lowercased for case-insensitive filesystem
-            if platform.system() in ("Windows", "Darwin"):
-                expected_key = expected_key.lower()
             assert delete_request.name == expected_key
 
 

@@ -59,9 +59,6 @@ class TestPushWorkflow:
                 config_manager.workspace_path = original
 
         expected = (Path(other_dir).resolve() / "my_flow").as_posix()
-        # On Windows/macOS, registry keys are lowercased for case-insensitive filesystem
-        if platform.system() in ("Windows", "Darwin"):
-            expected = expected.lower()
         assert result == expected
         assert context_manager.get_current_workflow_name() == expected
 
