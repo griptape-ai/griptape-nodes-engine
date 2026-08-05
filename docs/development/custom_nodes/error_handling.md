@@ -41,21 +41,20 @@ class MyNode(DataNode):
 
 ### Parameter Payload Size
 
-A parameter value can end up fully embedded in two places, and the engine makes no exception for any type, Griptape Framework artifacts included:
+A parameter value can end up fully embedded in two places:
 
-- **Saved workflow files.** The workflow serializer pickles unique parameter values inline into the saved `.py` file. This is a plain `pickle.dumps()` call with no size limit — whatever Python state the value holds gets written out whole.
-- **WebSocket events.** Parameter values traveling in request/response events are serialized to JSON and sent to every connected client (the editor UI, the MCP server). Griptape Framework artifacts are unstructured by calling their own `to_dict()`, which emits every field the artifact *class* tags with the attrs metadata `{"serializable": True}`.
+- **Saved workflow files.** The workflow serializer writes unique parameter values inline into the saved `.py` file, with no size limit — whatever Python state the value holds gets written out whole.
+- **WebSocket events.** Parameter values traveling in request/response events are serialized and sent to every connected client (the editor UI, the MCP server).
 
-Neither path checks the size of the value first — by default, a parameter holding a large value will bloat the saved workflow file and the WebSocket traffic, regardless of what type it's declared as. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it. Two unrelated things are called "serializable" here, and each one covers the path the other doesn't:
+Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
 
-- **`Parameter(serializable=False)`** (see [Parameter Attributes](parameters.md#parameter-attributes)) is a Griptape Nodes flag you set on your own parameter when you declare it. It keeps the value out of **saved workflow files** — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers. It has no effect on WebSocket events: the value is still sent to every connected client.
-- **The field-level attrs metadata `{"serializable": True}`** is a Griptape Framework mechanism, baked into an artifact class by whoever wrote that class. It decides which fields that artifact's `to_dict()` emits, so it governs **WebSocket events** only. You can't change it from your node, and it has no bearing on what gets pickled into a saved workflow file. There is no per-parameter opt-out of the WebSocket path, so keeping the value itself small is the only thing that reduces the traffic it generates.
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it.
 
-!!! warning "Avoid `ImageArtifact`, `AudioArtifact`, and `BlobArtifact`"
+!!! warning "Keep parameter values small"
 
-    `griptape.artifacts.BlobArtifact` stores raw bytes in a field its class tags `{"serializable": True}`, and `ImageArtifact` / `AudioArtifact` both subclass it — so any node that uses one of these as a parameter type inlines the artifact's entire byte payload into WebSocket traffic, and into saved workflows unless the parameter is declared `serializable=False`. Use `ImageUrlArtifact` / `AudioUrlArtifact` instead (the `ParameterImage` / `ParameterAudio` helper classes enforce them — see [Parameters](parameters.md#parameterimage-recommended-for-image-parameters)), which hold only a short URL string no matter how large the file they point to is.
+    `griptape.artifacts.BlobArtifact` stores raw bytes, and `ImageArtifact` / `AudioArtifact` both subclass it — so a node using one of these as a parameter type sends the entire byte payload to every connected client, and writes it into saved workflows unless the parameter is declared `serializable=False`. Use `ImageUrlArtifact` / `AudioUrlArtifact` instead (the `ParameterImage` / `ParameterAudio` helper classes enforce them — see [Parameters](parameters.md#parameterimage-recommended-for-image-parameters)), which hold only a short URL string no matter how large the file they point to is.
 
-    This isn't limited to those three types. `ThreeDArtifact` — defined in the Griptape Nodes standard node library rather than the Griptape Framework — holds raw bytes too, but its class doesn't tag that field `{"serializable": True}`. Its bytes are therefore invisible to the WebSocket path, yet still fully pickled into saved workflow files — which is why the flag above and this metadata have to be reasoned about separately. Judge a parameter by the size of the value it will actually hold, not by whether its type name looks safe.
+    Raw bytes aren't confined to `BlobArtifact` and its subclasses — `ThreeDArtifact` holds them too (though does not send its bytes over the WebSocket). Judge a parameter by the size of the value it will actually hold, not by whether its type name looks safe.
 
 ### Import Best Practices
 

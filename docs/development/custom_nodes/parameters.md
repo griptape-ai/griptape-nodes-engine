@@ -248,7 +248,7 @@ self.add_parameter(
 - Follow the same patterns as `ParameterImage` for these media types.
 - **Audio:** `ParameterAudio` matters for payload size the same way `ParameterImage` does — `AudioArtifact` (the generic alternative) inlines its entire byte payload into WebSocket traffic, and into saved workflows unless the parameter is declared `serializable=False`; `AudioUrlArtifact` holds only a short URL. See [Parameter Payload Size](error_handling.md#parameter-payload-size).
 - **Video:** there is no raw-bytes `VideoArtifact` class, so that name carries no payload-size risk. Declare `VideoUrlArtifact` in new nodes — it's the type actually produced, and connection type-checking matches type names exactly, so `"VideoArtifact"` and `"VideoUrlArtifact"` are *not* interchangeable. Some libraries list both in `input_types` to accept either spelling.
-- **3D:** `ThreeDArtifact` does hold raw bytes, so prefer `ThreeDUrlArtifact` (which `Parameter3D` enforces). It leaks differently from `AudioArtifact` though: its bytes stay off the WebSocket but are still pickled into saved workflow files. [Parameter Payload Size](error_handling.md#parameter-payload-size) explains why the two paths disagree.
+- **3D:** `ThreeDArtifact` holds raw bytes too, so prefer `ThreeDUrlArtifact` (which `Parameter3D` enforces). See [Parameter Payload Size](error_handling.md#parameter-payload-size).
 
 #### `ParameterButton`
 
