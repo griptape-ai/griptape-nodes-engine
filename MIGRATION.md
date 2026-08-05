@@ -1,3 +1,34 @@
+# Unreleased
+
+## Test isolation for node library test suites
+
+`GriptapeNodes` is no longer built by `SingletonMeta`. Its managers now live on an `Engine`
+that is resolved per context, so clearing the metaclass cache no longer resets engine state.
+
+If your library's test suite copied this repo's old isolation pattern:
+
+```python
+from griptape_nodes.utils.metaclasses import SingletonMeta
+
+SingletonMeta._instances.clear()
+```
+
+replace it with:
+
+```python
+from griptape_nodes.retained_mode.engine import reset_root_engine
+
+reset_root_engine()
+```
+
+This matters even though the old call still imports and runs: it silently stops resetting the
+engine, so a patched `USER_CONFIG_PATH` or `ENV_VAR_PATH` set up per test no longer takes
+effect after the first test touches the engine. Tests keep passing while reading config from a
+previous test's temporary directory.
+
+A test that needs an engine it can hold, rather than a reset between cases, can use
+`engine_scope()` from the same module.
+
 # v0.64.0
 
 This guide documents the removal of deprecated nodes from Griptape Nodes libraries in version 0.64.0.
