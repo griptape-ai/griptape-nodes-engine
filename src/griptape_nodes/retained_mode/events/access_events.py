@@ -37,6 +37,14 @@ class ModelAccessVerdict:
     so ``None`` cannot be read as "unresolved" -- match on `model_id` for identity
     and treat `provider_model_id` purely as the upstream display handle.
 
+    `display_name` is the catalog's human-readable name for the model (e.g.
+    ``"Claude Opus 4.7"``), populated on the same terms as `provider_model_id` --
+    ``None`` when the candidate did not resolve against the catalog. It exists
+    for PRESENTATION ONLY: a caller may render it in a dropdown row or an error
+    message, but must never resolve a stored value through it or use it as a
+    lookup key. `model_id` remains the sole identity for a model; `display_name`
+    is not guaranteed unique and can change independently of it.
+
     `denial` is ``None`` when the model is allowed; a ``CheckpointDenial``
     otherwise, carrying the same failure tuple any other denied checkpoint
     surfaces (so the UI renders identical reason text).
@@ -45,6 +53,7 @@ class ModelAccessVerdict:
     model_id: str
     provider_model_id: str | None
     denial: CheckpointDenial | None
+    display_name: str | None = None
 
 
 @dataclass

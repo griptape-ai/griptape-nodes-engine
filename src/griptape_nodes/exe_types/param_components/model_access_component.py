@@ -9,10 +9,15 @@ the node so saved workflows round-trip byte-identically.
 A dropdown stores the catalog model key itself (e.g. ``"gtc_seedream_4_5"``)
 -- the same key the permission layer gates on -- so a choice never needs
 resolving against the catalog; it either is one of the node's declared model
-ids, or it isn't. ``deprecated_values`` covers the values a node used to
-store before it adopted this convention (an old display label, a provider's
-own model id): the mapping is accepted wherever a value is assigned,
-migrated to its canonical choice, and never offered as a fresh selection.
+ids, or it isn't. Each row's ``ui_options["data"]`` entry additionally carries
+a ``"label"``: the catalog's human-readable ``display_name`` for that choice,
+rendered by the dropdown instead of the raw key. The label is presentation
+only -- the parameter's stored value, and everything this component matches
+it against, stays the catalog key. ``deprecated_values`` covers the values a
+node used to store before it adopted this convention (an old display label, a
+provider's own model id): the mapping is accepted wherever a value is
+assigned, migrated to its canonical choice, and never offered as a fresh
+selection.
 
 Usage — one construction step per parameter:
 
@@ -125,6 +130,12 @@ class _AccessSnapshot:
     which the component assigns to ``self._snapshot`` in one step. The tables
     never drift because they're never mutated in place.
 
+    ``display_name_by_model_id`` is the catalog's human-readable name for a
+    model id, populated from the verdicts on the same terms as
+    ``denial_by_model_id``. It exists for rendering the dropdown row and
+    error/badge text only -- ``ModelAccessComponent`` never looks a value up
+    BY its display name; identity is always the catalog ``model_id``.
+
     ``resolution_failure_detail`` is set (non-``None``) when the engine could
     not answer the query at all -- e.g. the node's class name isn't registered
     against a library, or the manifest declaration is missing. In that case
@@ -136,6 +147,7 @@ class _AccessSnapshot:
     """
 
     denial_by_model_id: dict[str, CheckpointDenial] = field(default_factory=dict)
+    display_name_by_model_id: dict[str, str] = field(default_factory=dict)
     model_id_by_choice: dict[str, str] = field(default_factory=dict)
     unresolved_choices: tuple[str, ...] = ()
     declares_models: bool = False
@@ -311,6 +323,21 @@ class ModelAccessComponent:
         """
         return list(self._model_choices)
 
+    def display_name_for_choice(self, choice: str) -> str:
+        """The catalog's human-readable name for a dropdown choice, for a node's own messages.
+
+        Falls back to ``choice`` itself when the catalog declares no display
+        name for it, or when the choice did not resolve to a catalogued model
+        at all -- so the caller always has something readable to render and
+        never has to check for ``None``. For presentation only: the returned
+        name is not looked up against anything, and the choice itself remains
+        the value a node stores and this component gates on.
+        """
+        model_id = self._snapshot.model_id_by_choice.get(choice)
+        if model_id is None:
+            return choice
+        return self._snapshot.display_name_by_model_id.get(model_id, choice)
+
     def reinstall_options(self) -> None:
         """Reinstall the ``Options`` trait and reapply decoration + badge.
 
@@ -340,10 +367,13 @@ class ModelAccessComponent:
         if denial is None:
             parameter.clear_badge()
             return
+        display_name = self.display_name_for_choice(value)
         parameter.set_badge(
             variant="error",
             title=_BADGE_TITLE,
-            message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
+            message=(
+                f"Model `{display_name}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}"
+            ),
             icon=_DENIED_ROW_ICON,
         )
 
@@ -459,7 +489,8 @@ class ModelAccessComponent:
         denial = self.query_for_denial(value)
         if denial is None:
             return
-        msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
+        display_name = self.display_name_for_choice(value)
+        msg = f"Cannot run {type(self._node).__name__}: '{display_name}' is not permitted. {denial.reason()}"
         raise RuntimeError(msg)
 
     def pick_permitted_default(self) -> str | None:
@@ -562,6 +593,8 @@ class ModelAccessComponent:
         for verdict in result.verdicts:
             if verdict.denial is not None:
                 snapshot.denial_by_model_id[verdict.model_id] = verdict.denial
+            if verdict.display_name is not None:
+                snapshot.display_name_by_model_id[verdict.model_id] = verdict.display_name
         return snapshot
 
     def _build_ui_options(self) -> dict[str, Any]:
@@ -569,14 +602,17 @@ class ModelAccessComponent:
 
         Built from ``model_choices`` alone, never ``deprecated_values`` -- a
         legacy value is accepted when assigned but never offered as a fresh
-        selection.
+        selection. Each row's ``"label"`` is the catalog display name for that
+        choice (``display_name_for_choice`` falls back to the raw choice), so a
+        row never renders blank even when the catalog has nothing to say about it.
         """
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
+            row: dict[str, str] = {"name": choice, "label": self.display_name_for_choice(choice)}
             if self._snapshot.denial_for_choice(choice) is not None:
-                data.append({"name": choice, "icon": _DENIED_ROW_ICON, "subtitle": _DENIED_ROW_SUBTITLE})
-            else:
-                data.append({"name": choice})
+                row["icon"] = _DENIED_ROW_ICON
+                row["subtitle"] = _DENIED_ROW_SUBTITLE
+            data.append(row)
         return {
             "data": data,
             "dropdown_row_icons": True,

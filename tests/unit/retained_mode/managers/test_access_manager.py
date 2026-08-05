@@ -1,8 +1,9 @@
 """Unit tests for `AccessManager`: per-candidate `OFFER_MODEL` authorization queries.
 
 Covers the three request types -- bare, node-attributed, catalog-scoped -- plus
-catalog enrichment of checkpoint attributes, the hook chain's recursion-guard
-behavior across a per-candidate loop, and failure paths.
+catalog enrichment of checkpoint attributes, the verdict's `provider_model_id` /
+`display_name` catalog enrichment, the hook chain's recursion-guard behavior
+across a per-candidate loop, and failure paths.
 """
 
 from __future__ import annotations
@@ -205,6 +206,49 @@ class TestAccessManager:
         assert len(result.verdicts) == 1
         assert result.verdicts[0].model_id == "gtc_claude_opus_4_7"
         assert result.verdicts[0].provider_model_id == "claude-opus-4-7"
+
+    def test_for_node_verdict_carries_display_name(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
+        from griptape_nodes.retained_mode.events.access_events import (
+            QueryModelAccessForNodeRequest,
+            QueryModelAccessForNodeResultSuccess,
+        )
+
+        self._register(
+            node_declarations=[ModelUsageNodeProperty(model_ids=["gtc_claude_opus_4_7"])],
+            library_declarations=[self._catalog()],
+        )
+
+        result = GriptapeNodes.handle_request(
+            QueryModelAccessForNodeRequest(node_type=_ProbeNode.__name__, specific_library_name=self._LIBRARY_NAME)
+        )
+        assert isinstance(result, QueryModelAccessForNodeResultSuccess)
+        assert len(result.verdicts) == 1
+        assert result.verdicts[0].model_id == "gtc_claude_opus_4_7"
+        assert result.verdicts[0].display_name == "Claude Opus 4.7"
+
+    def test_for_node_unresolved_candidate_verdict_has_no_display_name(
+        self,
+        griptape_nodes: GriptapeNodes,  # noqa: ARG002
+    ) -> None:
+        """An id that does not resolve against the catalog carries no display_name either."""
+        from griptape_nodes.retained_mode.events.access_events import (
+            QueryModelAccessForNodeRequest,
+            QueryModelAccessForNodeResultSuccess,
+        )
+
+        self._register(library_declarations=[self._catalog()])
+
+        result = GriptapeNodes.handle_request(
+            QueryModelAccessForNodeRequest(
+                node_type=_ProbeNode.__name__,
+                candidate_model_ids=["not_in_catalog"],
+                specific_library_name=self._LIBRARY_NAME,
+            )
+        )
+        assert isinstance(result, QueryModelAccessForNodeResultSuccess)
+        assert result.verdicts[0].model_id == "not_in_catalog"
+        assert result.verdicts[0].display_name is None
 
     def test_for_node_unknown_candidate_no_catalog_enrichment(self, griptape_nodes: GriptapeNodes) -> None:
         """Per-node request with an EXPLICIT candidate list including an unknown id.

@@ -192,7 +192,7 @@ A few rules worth knowing:
 - **Model IDs must be unique across the entire library.** Pydantic enforces uniqueness within each provider's `models` dict for free; collisions across providers are caught at library-load time as `DuplicateModelIdProblem`.
 - **At most one `model_catalog` per library.** Declaring two is rejected at validation time; merge their providers into one.
 
-A node's model-selection dropdown should store the catalog model key itself (`kling_v2`, not `kling-v2-master` and not `Kling v2`) -- that key is what the permission layer gates on, so storing anything else means the node's selections can't be checked against license policy. If a node's dropdown historically stored something else, migrate those saved values in the node rather than renaming the catalog entry to match them; `ModelAccessComponent` accepts a `deprecated_values` mapping for exactly this.
+A node's model-selection dropdown should store the catalog model key itself (`kling_v2`, not `kling-v2-master` and not `Kling v2`) -- that key is what the permission layer gates on, so storing anything else means the node's selections can't be checked against license policy. If a node's dropdown historically stored something else, migrate those saved values in the node rather than renaming the catalog entry to match them; `ModelAccessComponent` accepts a `deprecated_values` mapping for exactly this. The catalog's `display_name` is what artists actually see in the dropdown, so write it like a product name (`Kling v2`, not `kling_v2`); the key stays the stored, gated value underneath it.
 
 ##### `model_usage`
 

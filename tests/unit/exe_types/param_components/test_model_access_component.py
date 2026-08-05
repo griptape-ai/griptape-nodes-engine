@@ -23,6 +23,9 @@ Focused on:
 - deprecated_values migrates a historical stored value to its current
   choice through a converter, accepting it wherever it's assigned but
   never offering it as a fresh selection
+- display_name_for_choice() and the dropdown row's "label" render the
+  catalog's display_name, falling back to the raw choice; the stored value
+  and every internal lookup stay on the catalog key regardless
 """
 
 from __future__ import annotations
@@ -268,6 +271,31 @@ class TestInstall:
             assert "subtitle" not in data_by_name["gtc_test_beta"]
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_install_populates_ui_options_data_labels_with_catalog_display_names(self) -> None:
+        """Each row's ``label`` is the catalog display name; ``name`` stays the catalog key."""
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        assert data_by_name["gtc_test_alpha"]["name"] == "gtc_test_alpha"
+        assert data_by_name["gtc_test_alpha"]["label"] == "Alpha"
+        assert data_by_name["gtc_test_beta"]["name"] == "gtc_test_beta"
+        assert data_by_name["gtc_test_beta"]["label"] == "Beta"
+
+    def test_install_falls_back_to_the_key_as_label_for_an_unresolved_choice(self) -> None:
+        """A choice that resolves to no declared model has no catalog display name; its label is the key."""
+        node, _helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "bogus"], default_model="gtc_test_alpha"
+        )
+
+        param = node.get_parameter_by_name("model")
+        assert param is not None
+        data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+        assert data_by_name["bogus"]["label"] == "bogus"
 
     def test_install_preserves_parameter_identity(self) -> None:
         """Install must not change parameter name / type / tooltip / stored value."""
@@ -577,6 +605,32 @@ class TestOnValueChanged:
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
+    def test_badge_message_names_the_model_by_its_display_name(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The badge is artist-facing; it must not quote the raw catalog key."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            node, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
+
+            helper.on_value_changed("gtc_test_alpha")
+
+            param = node.get_parameter_by_name("model")
+            assert param is not None
+            badge = param.get_badge()
+            assert badge is not None
+            assert "Alpha" in badge.message
+            assert "gtc_test_alpha" not in badge.message
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
     def test_clears_badge_when_switching_to_allowed_value(self, griptape_nodes) -> None:  # noqa: ANN001
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 
@@ -715,6 +769,27 @@ class TestRaiseIfDenied:
 
             with pytest.raises(RuntimeError, match="Alpha not enabled"):
                 helper.raise_if_denied("gtc_test_alpha")
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_raises_with_the_display_name_rather_than_the_raw_key(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The raised message is artist-facing; it must name the model readably, not by its catalog key."""
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(
+                model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_beta"
+            )
+
+            with pytest.raises(RuntimeError, match="Alpha") as exc_info:
+                helper.raise_if_denied("gtc_test_alpha")
+            assert "gtc_test_alpha" not in str(exc_info.value)
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
@@ -974,6 +1049,29 @@ class TestMigrateValue:
 
         assert helper.migrate_value(None) is None
         assert helper.migrate_value(123) is None
+
+
+class TestDisplayNameForChoice:
+    def test_returns_the_catalog_display_name_for_a_resolvable_choice(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "gtc_test_beta"], default_model="gtc_test_alpha"
+        )
+
+        assert helper.display_name_for_choice("gtc_test_alpha") == "Alpha"
+        assert helper.display_name_for_choice("gtc_test_beta") == "Beta"
+
+    def test_falls_back_to_the_choice_when_it_resolves_to_no_declared_model(self) -> None:
+        _, helper = _install_probe_node_with_helper(
+            model_choices=["gtc_test_alpha", "bogus"], default_model="gtc_test_alpha"
+        )
+
+        assert helper.display_name_for_choice("bogus") == "bogus"
+
+    def test_falls_back_to_the_choice_for_a_value_never_offered_as_a_choice(self) -> None:
+        """A value outside this component's remit (e.g. a legacy or foreign value) is not looked up either."""
+        _, helper = _install_probe_node_with_helper(model_choices=["gtc_test_alpha"], default_model="gtc_test_alpha")
+
+        assert helper.display_name_for_choice("never-heard-of-it") == "never-heard-of-it"
 
 
 class TestChoiceMatchingNoDeclaredModelFailsClosed:

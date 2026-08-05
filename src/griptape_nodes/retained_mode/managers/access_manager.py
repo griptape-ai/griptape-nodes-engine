@@ -328,6 +328,10 @@ class AccessManager:
         Sequential calls reset the hook chain's recursion guard between
         iterations; the guard only short-circuits when a hook itself re-enters a
         guarded engine operation, not when one handler loops over candidates.
+
+        Each verdict carries ``model_id`` (always), ``provider_model_id`` and
+        ``display_name`` (both from ``resolved_by_id`` when the candidate resolves,
+        else ``None``), and ``denial``.
         """
         event_manager = GriptapeNodes.EventManager()
         verdicts: list[ModelAccessVerdict] = []
@@ -337,11 +341,13 @@ class AccessManager:
                 attributes[CheckpointAttribute.NODE_TYPE] = node_type
             resolved = resolved_by_id.get(model_id)
             provider_model_id: str | None = None
+            display_name: str | None = None
             if resolved is not None:
                 attributes[CheckpointAttribute.PROVIDER_ID] = resolved.provider_id
                 if resolved.model.family:
                     attributes[CheckpointAttribute.MODEL_FAMILIES] = [resolved.model.family]
                 provider_model_id = resolved.model.provider_model_id
+                display_name = resolved.model.display_name
             denial = event_manager.evaluate_authorization_checkpoint(
                 AuthorizationCheckpoint(
                     action=CheckpointAction.OFFER_MODEL,
@@ -350,5 +356,12 @@ class AccessManager:
                     attributes=attributes,
                 )
             )
-            verdicts.append(ModelAccessVerdict(model_id=model_id, provider_model_id=provider_model_id, denial=denial))
+            verdicts.append(
+                ModelAccessVerdict(
+                    model_id=model_id,
+                    provider_model_id=provider_model_id,
+                    denial=denial,
+                    display_name=display_name,
+                )
+            )
         return verdicts
