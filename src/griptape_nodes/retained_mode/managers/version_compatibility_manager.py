@@ -136,7 +136,7 @@ class SetParameterVersionCompatibilityCheck(ABC):
 class VersionCompatibilityManager(EngineScoped):
     """Manages version compatibility checks for libraries and other components."""
 
-    def __init__(self, event_manager: EventManager, engine: Engine | None = None) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         super().__init__(engine)
         self._event_manager = event_manager
         self._compatibility_checks: list[LibraryVersionCompatibilityCheck] = []
