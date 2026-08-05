@@ -81,24 +81,16 @@ from typing import Any
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
 
+
 class MyNode(DataNode):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.category = "Category"
         self.description = "Description"
 
-        self.add_parameter(Parameter(
-            name="input",
-            input_types=["str"],
-            type="str",
-            tooltip="Input parameter"
-        ))
+        self.add_parameter(Parameter(name="input", input_types=["str"], type="str", tooltip="Input parameter"))
 
-        self.add_parameter(Parameter(
-            name="output",
-            output_type="str",
-            tooltip="Output parameter"
-        ))
+        self.add_parameter(Parameter(name="output", output_type="str", tooltip="Output parameter"))
 
     def process(self) -> None:
         val = self.get_parameter_value("input").upper()

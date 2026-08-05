@@ -253,7 +253,7 @@ class RetainedMode:
 
     # NODE OPERATIONS
     @classmethod
-    def create_node(  # noqa: PLR0913
+    def create_node(  # noqa: PLR0913, PLR0917
         cls,
         node_type: str,
         specific_library_name: str | None = None,
@@ -483,7 +483,7 @@ class RetainedMode:
         return result.parameter_names
 
     @classmethod
-    def add_param(  # noqa: PLR0913
+    def add_param(  # noqa: PLR0913, PLR0917
         cls,
         node_name: str,
         parameter_name: str,
@@ -605,7 +605,7 @@ class RetainedMode:
         return result
 
     @classmethod
-    def create_node_relative_to(  # noqa: C901, PLR0911, PLR0913
+    def create_node_relative_to(  # noqa: C901, PLR0911, PLR0913, PLR0917
         cls,
         reference_node_name: str,
         new_node_type: str,
@@ -791,7 +791,7 @@ class RetainedMode:
         return positions.get(offset_side, positions["right"])  # Default to right
 
     @classmethod
-    def migrate_parameter(  # noqa: PLR0913
+    def migrate_parameter(  # noqa: PLR0913, PLR0917
         cls,
         source_node_name: str,
         target_node_name: str,
