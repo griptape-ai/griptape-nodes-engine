@@ -20,6 +20,7 @@ from xdg_base_dirs import xdg_data_home
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.files.file import File, FileWriteError
 from griptape_nodes.node_library.library_registry import get_declared_models
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.model_events import (
     DeclareModelInvocationRequest,
@@ -50,7 +51,6 @@ from griptape_nodes.retained_mode.events.model_events import (
     SearchModelsResultFailure,
     SearchModelsResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -62,8 +62,10 @@ from griptape_nodes.utils.async_utils import cancel_subprocess
 
 if TYPE_CHECKING:
     from griptape_nodes.node_library.library_declarations import ResolvedModel
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -228,7 +230,7 @@ def _create_progress_tracker(model_id: str) -> type[tqdm]:  # noqa: C901
     return BoundModelDownloadTracker
 
 
-class ModelManager:
+class ModelManager(EngineScoped):
     """A manager for downloading models from Hugging Face Hub.
 
     This manager provides async handlers for downloading models using the Hugging Face Hub API.
@@ -236,12 +238,14 @@ class ModelManager:
     local storage management.
     """
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         """Initialize the ModelManager.
 
         Args:
             event_manager: The EventManager instance to use for event handling.
+            engine: The owning Engine, used to reach peer managers.
         """
+        super().__init__(engine)
         self._download_tasks = {}
         self._download_processes = {}
 
@@ -734,7 +738,9 @@ class ModelManager:
         )
 
     @staticmethod
-    def _model_checkpoint_attributes(request: DeclareModelInvocationRequest) -> dict[str, Any]:
+    def _model_checkpoint_attributes(
+        request: DeclareModelInvocationRequest, *, object_manager: ObjectManager
+    ) -> dict[str, Any]:
         """Resolve the facts a hook may gate a model invocation on.
 
         `id` is the stable catalog key the node declared -- always present, so a
@@ -748,7 +754,7 @@ class ModelManager:
         node's declared models falls back to the bare id.
         """
         attributes: dict[str, Any] = {CheckpointAttribute.ID: request.model_id}
-        resolved = ModelManager._resolve_invocation_model(request)
+        resolved = ModelManager._resolve_invocation_model(request, object_manager=object_manager)
         if resolved is not None:
             attributes[CheckpointAttribute.PROVIDER_ID] = resolved.provider_id
             if resolved.model.family:
@@ -756,7 +762,9 @@ class ModelManager:
         return attributes
 
     @staticmethod
-    def _resolve_invocation_model(request: DeclareModelInvocationRequest) -> ResolvedModel | None:
+    def _resolve_invocation_model(
+        request: DeclareModelInvocationRequest, *, object_manager: ObjectManager
+    ) -> ResolvedModel | None:
         """Resolve a declared invocation's stable catalog key to its catalog entry.
 
         The declaring node names itself, so the key resolves against that node's
@@ -768,7 +776,7 @@ class ModelManager:
         """
         if request.node_name is None:
             return None
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        node = object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             return None
         return next(
@@ -798,12 +806,12 @@ class ModelManager:
         # gates the invocation, not just a bare-id rule. The node already opted in
         # by declaring; a denial returns a failure so the node does not invoke the
         # model.
-        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        denial = self.engine.event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.INVOKE_MODEL,
                 subject_type=CheckpointSubjectType.MODEL,
                 subject_id=request.model_id,
-                attributes=self._model_checkpoint_attributes(request),
+                attributes=self._model_checkpoint_attributes(request, object_manager=self.engine.object_manager),
             )
         )
         if denial is not None:
@@ -902,7 +910,7 @@ class ModelManager:
             payload: The app initialization complete payload
         """
         # Get models to download from configuration
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
         models_to_download = config_manager.get_config_value(MODELS_TO_DOWNLOAD_KEY, default=[])
 
         # Find unfinished downloads to resume

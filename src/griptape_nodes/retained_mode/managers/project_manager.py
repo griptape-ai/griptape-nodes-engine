@@ -49,6 +49,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete, CurrentProjectChanged
 from griptape_nodes.retained_mode.events.library_events import (
     ReloadAllLibrariesRequest,
@@ -118,7 +119,6 @@ from griptape_nodes.retained_mode.events.project_events import (
     ValidateProjectTemplateRequest,
     ValidateProjectTemplateResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -147,6 +147,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.common.macro_parser.segments import ParsedSegment
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -512,7 +513,7 @@ def _find_unresolved_sequence_segment(
     return None
 
 
-class ProjectManager:
+class ProjectManager(EngineScoped):
     """Manages project templates, validation, and file path resolution.
 
     Responsibilities:
@@ -535,6 +536,8 @@ class ProjectManager:
         event_manager: EventManager,
         config_manager: ConfigManager,
         secrets_manager: SecretsManager,
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the ProjectManager.
 
@@ -542,7 +545,9 @@ class ProjectManager:
             event_manager: The EventManager instance to use for event handling
             config_manager: ConfigManager instance for accessing configuration
             secrets_manager: SecretsManager instance for macro resolution
+            engine: The owning Engine, injected by Engine.__init__.
         """
+        super().__init__(engine)
         self._event_manager = event_manager
         self._config_manager = config_manager
         self._secrets_manager = secrets_manager
@@ -762,7 +767,7 @@ class ProjectManager:
         # forbids never enters the engine, whether reached by explicit load or
         # directory discovery. Mirrors the activation gate, which resolves the same
         # facts; the name is passed in because the project is not cached yet.
-        load_denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        load_denial = self._event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.LOAD_PROJECT,
                 subject_type=CheckpointSubjectType.PROJECT,
@@ -836,7 +841,7 @@ class ProjectManager:
             encoding="utf-8",
             workspace_only=False,
         )
-        read_result = await GriptapeNodes.ahandle_request(read_request)
+        read_result = await self.engine.ahandle_request(read_request)
 
         if read_result.failed():
             validation = ProjectValidationInfo(status=ProjectValidationStatus.MISSING)
@@ -1329,7 +1334,7 @@ class ProjectManager:
         unclaimed_names = {v.name for v in variable_infos if v.name not in resolution_bag}
         if unclaimed_names:
             stored_substitutable = _substitutable_stored_values(
-                GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
+                self.engine.variables_manager.stored_project_variable_values(project_info.project_id)
             )
             for var_name in unclaimed_names & set(stored_substitutable):
                 resolution_bag[var_name] = stored_substitutable[var_name]
@@ -2248,14 +2253,14 @@ class ProjectManager:
         gate included) fails, otherwise None.
         """
         if library_config_changed:
-            reload_result = await GriptapeNodes.ahandle_request(ReloadAllLibrariesRequest())
+            reload_result = await self.engine.ahandle_request(ReloadAllLibrariesRequest())
             if isinstance(reload_result, ReloadAllLibrariesResultFailure):
                 return SetCurrentProjectResultFailure(
                     result_details=f"Attempted to set project '{project_id}'. "
                     f"Config updated but library reload failed: {reload_result.result_details}",
                 )
         if workspace_changed:
-            await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
+            await self.engine.workflow_manager.refresh_workflow_registry()
         return None
 
     def _project_checkpoint_attributes(self, project_id: ProjectID, *, name: str | None = None) -> dict[str, Any]:
@@ -2363,7 +2368,7 @@ class ProjectManager:
         # current project untouched (the activation below never runs). Rollback
         # re-activates the previous project through _activate_project directly, so
         # it never re-enters this gate.
-        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        denial = self._event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.ACTIVATE_PROJECT,
                 subject_type=CheckpointSubjectType.PROJECT,
@@ -2484,7 +2489,7 @@ class ProjectManager:
             # the orchestrator's project must not write it back: both processes share the
             # on-disk config, so a worker write races the orchestrator's. The worker still
             # re-establishes its in-memory layers above; it just skips the persist.
-            if not GriptapeNodes.LibraryManager().is_worker:
+            if not self.engine.library_manager.is_worker:
                 # Persist the active project so the next engine restart restores it via
                 # _resolve_project_file_path(). A file-backed project persists its path.
                 # System defaults persists the SYSTEM_DEFAULTS_KEY sentinel so that a
@@ -2660,7 +2665,7 @@ class ProjectManager:
         for loaded_id, loaded_info in list(self._successfully_loaded_project_templates.items()):
             if loaded_info.project_file_path == canonical_path:
                 self._successfully_loaded_project_templates.pop(loaded_id, None)
-                GriptapeNodes.VariablesManager().remove_project_variables(loaded_id)
+                self.engine.variables_manager.remove_project_variables(loaded_id)
         self._registered_template_status.pop(canonical_path, None)
 
         return SaveProjectTemplateResultSuccess(
@@ -2734,7 +2739,7 @@ class ProjectManager:
         # declared type), so validation here cannot fail for writes made through the API —
         # but persist must never raise past an already-acknowledged write, so guard anyway
         # and report which entry is unpersistable instead of crashing (or coercing).
-        stored_variables = GriptapeNodes.VariablesManager().stored_project_variables(project_id)
+        stored_variables = self.engine.variables_manager.stored_project_variables(project_id)
         rebuilt: dict[str, ProjectVariableDef] = {}
         for variable in stored_variables:
             try:
@@ -3085,7 +3090,7 @@ class ProjectManager:
         # Remove from in-memory caches: the registry is id-keyed, the status map
         # is path-keyed. Drop the project's stored-variable bag with it.
         self._successfully_loaded_project_templates.pop(project_id, None)
-        GriptapeNodes.VariablesManager().remove_project_variables(project_id)
+        self.engine.variables_manager.remove_project_variables(project_id)
         if file_path is not None:
             self._registered_template_status.pop(file_path, None)
 
@@ -3282,7 +3287,7 @@ class ProjectManager:
         if referenced_unsatisfied:
             stored_substitutable_names = set(
                 _substitutable_stored_values(
-                    GriptapeNodes.VariablesManager().stored_project_variable_values(project_info.project_id)
+                    self.engine.variables_manager.stored_project_variable_values(project_info.project_id)
                 )
             )
             satisfiable_names |= stored_substitutable_names
@@ -3769,7 +3774,7 @@ class ProjectManager:
                     permission=var_def.permission,
                 )
             )
-        GriptapeNodes.VariablesManager().set_project_variables(project_id, layer)
+        self.engine.variables_manager.set_project_variables(project_id, layer)
 
     def resolve_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable:
         """Resolve a computed project variable (builtin or template directory) to a snapshot FlowVariable.
@@ -3953,14 +3958,14 @@ class ProjectManager:
                 return str(self._config_manager.workspace_path)
 
             case "workflow_name":
-                context_manager = GriptapeNodes.ContextManager()
+                context_manager = self.engine.context_manager
                 if not context_manager.has_current_workflow():
                     msg = "No current workflow"
                     raise RuntimeError(msg)
                 return context_manager.get_current_workflow_name()
 
             case "workflow_dir":
-                context_manager = GriptapeNodes.ContextManager()
+                context_manager = self.engine.context_manager
                 if not context_manager.has_current_workflow():
                     msg = "No current workflow"
                     raise RuntimeError(msg)
@@ -4416,7 +4421,7 @@ class ProjectManager:
         orchestrator's switch must not write the shared file back, since both
         processes share it and a worker write races the orchestrator's.
         """
-        if GriptapeNodes.LibraryManager().is_worker:
+        if self.engine.library_manager.is_worker:
             return
         try:
             registered: list[str | dict | PerPlatformProjectPath] = (

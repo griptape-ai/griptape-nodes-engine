@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple
 
 import semver
 
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -23,7 +24,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     ListRegisteredLibrariesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.workflow_events import WorkflowStatus
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.deprecated_node_warning_problem import (
     DeprecatedNodeWarningProblem,
 )
@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.library_registry import LibrarySchema
     from griptape_nodes.node_library.workflow_registry import WorkflowMetadata
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.parameter_events import (
         SetParameterValueResultFailure,
         SetParameterValueResultSuccess,
@@ -132,10 +133,11 @@ class SetParameterVersionCompatibilityCheck(ABC):
         """
 
 
-class VersionCompatibilityManager:
+class VersionCompatibilityManager(EngineScoped):
     """Manages version compatibility checks for libraries and other components."""
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._event_manager = event_manager
         self._compatibility_checks: list[LibraryVersionCompatibilityCheck] = []
         self._workflow_compatibility_checks: list[WorkflowVersionCompatibilityCheck] = []
@@ -269,7 +271,7 @@ class VersionCompatibilityManager:
         """
         issues: list[WorkflowVersionCompatibilityIssue] = []
 
-        list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+        list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
 
         if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
             return issues
@@ -287,9 +289,7 @@ class VersionCompatibilityManager:
 
             # Get library metadata to get version
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
-                library_metadata_request
-            )
+            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library exists, but handle gracefully
@@ -306,7 +306,7 @@ class VersionCompatibilityManager:
 
             # Check if node type exists in library (silent check - no error logging)
             list_node_types_request = ListNodeTypesInLibraryRequest(library=library_name)
-            list_node_types_result = GriptapeNodes.LibraryManager().on_list_node_types_in_library_request(
+            list_node_types_result = self.engine.library_manager.on_list_node_types_in_library_request(
                 list_node_types_request
             )
 
@@ -331,7 +331,7 @@ class VersionCompatibilityManager:
 
             # Get node metadata from library (we know the node exists now)
             node_metadata_request = GetNodeMetadataFromLibraryRequest(library=library_name, node_type=node_type)
-            node_metadata_result = GriptapeNodes.LibraryManager().get_node_metadata_from_library_request(
+            node_metadata_result = self.engine.library_manager.get_node_metadata_from_library_request(
                 node_metadata_request
             )
 
@@ -388,7 +388,7 @@ class VersionCompatibilityManager:
 
     def _get_current_engine_version(self) -> semver.VersionInfo:
         """Get the current engine version."""
-        result = GriptapeNodes.handle_request(GetEngineVersionRequest())
+        result = self.engine.handle_request(GetEngineVersionRequest())
         if isinstance(result, GetEngineVersionResultSuccess):
             return semver.VersionInfo(major=result.major, minor=result.minor, patch=result.patch)
         msg = "Failed to get engine version"

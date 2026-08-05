@@ -10,6 +10,7 @@ from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetArtifactSchemasRequest,
@@ -59,7 +60,7 @@ logger = logging.getLogger("griptape_nodes")
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
 
 
-class ConfigManager:
+class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
 
     This class handles loading and saving configuration from multiple sources with the following precedence:
@@ -84,12 +85,14 @@ class ConfigManager:
         merged_config (dict): The merged configuration, combining all sources in precedence order.
     """
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         """Initialize the ConfigManager.
 
         Args:
             event_manager: The EventManager instance to use for event handling.
+            engine: The Engine this manager belongs to.
         """
+        super().__init__(engine)
         self._project_config_path: Path | None = None
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
@@ -570,9 +573,7 @@ class ConfigManager:
             return None
 
         if should_load_env_var_if_detected and isinstance(value, str) and value.startswith("$"):
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-            value = GriptapeNodes.SecretsManager().get_secret(value[1:])
+            value = self.engine.secrets_manager.get_secret(value[1:])
 
         if cast_type is not None:
             value = self._coerce_to_type(value, cast_type)
@@ -643,9 +644,7 @@ class ConfigManager:
         write_succeeded = self._write_user_config_delta(delta)
 
         if should_set_env_var_if_detected and isinstance(value, str) and value.startswith("$"):
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-            value = GriptapeNodes.SecretsManager().set_secret(value[1:], "")
+            value = self.engine.secrets_manager.set_secret(value[1:], "")
 
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
@@ -766,8 +765,6 @@ class ConfigManager:
         libraries without schemas get simple object types.
         """
         try:
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             # Get base settings schema and current values
             base_schema = Settings.model_json_schema()
             current_values = self.merged_config.copy()
@@ -777,7 +774,7 @@ class ConfigManager:
 
             # Get artifact schemas (dynamically generated from registered providers/generators)
             schemas_request = GetArtifactSchemasRequest()
-            schemas_result = GriptapeNodes.handle_request(schemas_request)
+            schemas_result = self.engine.handle_request(schemas_request)
 
             if not isinstance(schemas_result, GetArtifactSchemasResultSuccess):
                 result_details = f"Failed to retrieve artifact schemas: {schemas_result.result_details}"
@@ -915,10 +912,7 @@ class ConfigManager:
             worker fan-out on this so workers don't reload from a file that
             wasn't actually updated.
         """
-        # Lazy import to avoid circular dependency during initialization
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        os_manager = GriptapeNodes.OSManager()
+        os_manager = self.engine.os_manager
         config_path_str = str(USER_CONFIG_PATH)
 
         # Step 1: Check if config file exists

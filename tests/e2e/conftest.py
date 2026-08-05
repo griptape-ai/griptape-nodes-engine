@@ -14,13 +14,13 @@ import pytest
 import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
 import griptape_nodes.retained_mode.managers.secrets_manager as secrets_manager_module
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import reset_root_engine
 from griptape_nodes.retained_mode.events.connection_events import (
     CreateConnectionRequest,
     CreateConnectionResultSuccess,
 )
 from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.utils.metaclasses import SingletonMeta
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -36,12 +36,11 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     developer's real ``GT_CLOUD_BUCKET_ID`` and runs in Griptape Cloud mode, whose
     background threads segfault the child at interpreter shutdown.
 
-    Clearing ``SingletonMeta._instances`` forces the managers to re-initialize against the
-    patched paths and gives each test a fresh object registry. ``LibraryRegistry`` keeps its
-    state in ``ClassVar`` dicts that ``SingletonMeta`` clearing does not touch, so it is
-    reset explicitly.
+    Dropping the root engine forces the managers to re-initialize against the patched paths
+    and gives each test a fresh object registry. ``LibraryRegistry`` keeps its state in
+    ``ClassVar`` dicts that the engine does not own, so it is reset explicitly.
     """
-    SingletonMeta._instances.clear()
+    reset_root_engine()
     LibraryRegistry._clear()
 
     for key in list(os.environ):
@@ -59,7 +58,7 @@ def _isolated_engine_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
             ):
                 yield
     finally:
-        SingletonMeta._instances.clear()
+        reset_root_engine()
         LibraryRegistry._clear()
 
 
