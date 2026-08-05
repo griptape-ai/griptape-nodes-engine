@@ -104,6 +104,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
+    GetVariableSubstitutionEnabledRequest,
+    GetVariableSubstitutionEnabledResultFailure,
+    GetVariableSubstitutionEnabledResultSuccess,
     GetWorkflowInfoRequest,
     GetWorkflowInfoResultFailure,
     GetWorkflowInfoResultSuccess,
@@ -426,6 +429,10 @@ class WorkflowManager:
             self.on_set_workflow_metadata_request,
         )
         event_manager.assign_manager_to_request_type(
+            GetVariableSubstitutionEnabledRequest,
+            self.on_get_variable_substitution_enabled_request,
+        )
+        event_manager.assign_manager_to_request_type(
             SetVariableSubstitutionEnabledRequest,
             self.on_set_variable_substitution_enabled_request,
         )
@@ -522,6 +529,24 @@ class WorkflowManager:
         workflow_name = context_manager.get_current_workflow_name()
         # Return the stored value, or True if this workflow has never set the flag.
         return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_get_variable_substitution_enabled_request(
+        self,
+        request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
+    ) -> ResultPayload:
+        """Return whether variable substitution is enabled for the current workflow."""
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return GetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to get variable substitution enabled. Failed because no workflow is active."
+            )
+        enabled = self.is_variable_substitution_enabled()
+        return GetVariableSubstitutionEnabledResultSuccess(
+            result_details=f"Variable substitution is {'enabled' if enabled else 'disabled'} for the current workflow.",
+            enabled=enabled,
+        )
 
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest
