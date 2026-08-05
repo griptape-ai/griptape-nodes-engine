@@ -513,6 +513,46 @@ class LibraryRegistry(metaclass=SingletonMeta):
         return schemas
 
 
+class NodeTypeEntry:
+    """A node type registered in a Library, resolved to its class on demand.
+
+    Holds the node's class name plus either an already-imported class (eager
+    registration) or a zero-argument loader that imports the class on first
+    ``resolve()`` (lazy registration). Either way the resolved class is cached,
+    so a node's module is imported at most once. When registered lazily, the
+    module is imported the first time the class is actually needed (node
+    creation, execution, or introspection) rather than at library load time, so
+    startup never pays the import cost of node modules that are never used, and
+    an import failure surfaces to whichever caller first resolves the entry.
+    """
+
+    def __init__(
+        self,
+        class_name: str,
+        *,
+        node_class: type[BaseNode] | None = None,
+        loader: Callable[[], type[BaseNode]] | None = None,
+    ) -> None:
+        self.class_name = class_name
+        self._resolved = node_class
+        self._loader = loader
+
+    def resolve(self) -> type[BaseNode]:
+        """Return the node class, importing its module on first use for a lazy entry.
+
+        Not thread-safe: assumes resolution happens on a single thread (the event loop).
+        Concurrent callers could each run the loader (a double import). This holds today
+        because lazy entries are only resolved on the event loop -- workers force eager
+        loading, so their entries are already resolved before any threaded access.
+        """
+        if self._resolved is None:
+            if self._loader is None:
+                msg = f"Node type '{self.class_name}' has neither a resolved class nor a loader."
+                raise RuntimeError(msg)
+            self._resolved = self._loader()
+        return self._resolved
+
+
 class Library:
     """A collection of nodes curated by library author.
 
@@ -521,8 +561,9 @@ class Library:
 
     _library_data: LibrarySchema
     _is_default_library: bool
-    # Maintain fast lookups for node class name to class and to its metadata.
-    _node_types: dict[str, type[BaseNode]]
+    # Fast lookup from node class name to its registration entry (which resolves
+    # the class on demand -- see NodeTypeEntry) and to its metadata.
+    _node_types: dict[str, NodeTypeEntry]
     _node_metadata: dict[str, NodeMetadata]
     _advanced_library: AdvancedNodeLibrary | None
     # Tracks handlers registered on behalf of this library so they can be
@@ -583,8 +624,27 @@ class Library:
             library=self, node_class_name=node_class_as_str
         )
 
-        self._node_types[node_class_as_str] = node_class
+        self._node_types[node_class_as_str] = NodeTypeEntry(node_class_as_str, node_class=node_class)
         self._node_metadata[node_class_as_str] = metadata
+        return library_problem
+
+    def register_lazy_node_type(
+        self, node_class_name: str, metadata: NodeMetadata, loader: Callable[[], type[BaseNode]]
+    ) -> LibraryProblem | None:
+        """Register a node type without importing its module yet.
+
+        The class is imported on first use via ``loader`` (see ``NodeTypeEntry``),
+        so an import failure surfaces when the node is first created rather than
+        at library load time. The registry key is the caller-supplied
+        ``node_class_name`` (the library JSON's declared class name), since the
+        class is not imported here to read its ``__name__``. Returns a
+        LibraryProblem if registration fails (e.g. a cross-library name
+        collision), or None if all clear.
+        """
+        library_problem = LibraryRegistry.register_node_type_from_library(library=self, node_class_name=node_class_name)
+
+        self._node_types[node_class_name] = NodeTypeEntry(class_name=node_class_name, loader=loader)
+        self._node_metadata[node_class_name] = metadata
         return library_problem
 
     def unregister_node_type(self, node_class_name: str) -> None:
@@ -634,10 +694,13 @@ class Library:
         metadata: dict[Any, Any] | None = None,
     ) -> BaseNode:
         """Create a new node instance of the specified type."""
-        node_class = self._node_types.get(node_type)
-        if not node_class:
+        if not self.has_node_type(node_type):
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
             raise KeyError(msg)
+        # Resolve the class, importing its module now if it was registered lazily.
+        # An import failure propagates to the caller (e.g. the CreateNode handler,
+        # which substitutes an Error Proxy node carrying the failure reason).
+        node_class = self._node_types[node_type].resolve()
         # Inject the metadata ABOUT the node from the Library
         # into the node's metadata blob.
         if metadata is None:
@@ -676,10 +739,13 @@ class Library:
         For callers that need the class itself, e.g. classmethod checks like
         `allow_outgoing_connection_by_class`, rather than an instance produced
         by `create_node`.
+
+        Imports the node's module now if it was registered lazily; the import
+        failure propagates to the caller.
         """
         if node_type not in self._node_types:
             raise KeyError(self._library_data.name, node_type)
-        return self._node_types[node_type]
+        return self._node_types[node_type].resolve()
 
     def get_categories(self) -> list[dict[str, CategoryDefinition]]:
         return self._library_data.categories
@@ -701,6 +767,11 @@ class Library:
     def get_nodes_by_base_type(self, base_type: type) -> list[str]:
         """Get all node types in this library that are subclasses of the specified base type.
 
+        Resolving a lazily-registered node type imports its module, so the first call on a
+        lazily-loaded library imports every node module in it (to test each against
+        ``base_type``); a node whose module fails to import is skipped rather than aborting
+        the scan. Callers on the event loop should be aware this can block on those imports.
+
         Args:
             base_type: The base class to filter by (e.g., StartNode, ControlNode)
 
@@ -708,7 +779,18 @@ class Library:
             List of node type names that extend the base type
         """
         matching_nodes = []
-        for node_type, node_class in self._node_types.items():
+        for node_type, entry in self._node_types.items():
+            try:
+                node_class = entry.resolve()
+            except (ImportError, AttributeError, TypeError):
+                logger.debug(
+                    "Skipping node type '%s' in library '%s' while scanning for base type '%s': module failed to import.",
+                    node_type,
+                    self._library_data.name,
+                    base_type.__name__,
+                    exc_info=True,
+                )
+                continue
             if issubclass(node_class, base_type):
                 matching_nodes.append(node_type)
         return matching_nodes
