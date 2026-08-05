@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -550,6 +551,44 @@ class TestAfindFilesRecursive:
             await task
 
         assert len(matches) < expected_total
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_walk_returns_without_awaiting_the_scan(self, temp_dir: Path) -> None:
+        """Cancellation returns promptly instead of blocking on the in-flight directory scan.
+
+        Cancelling at a directory edge is only a real bound if the await also *returns* at
+        that edge. A thread-offload that waits for its worker would make a hung mount block
+        discovery for as long as the scan takes, no matter what timeout the caller set, so
+        this pins the promptness rather than just the fact that the walk stopped early.
+        """
+        (temp_dir / "unreachable.json").write_text("{}")
+        scan_duration_s = 5.0
+
+        def hung_scan(*_args: object, **_kwargs: object) -> list[object]:
+            time.sleep(scan_duration_s)
+            return []
+
+        params = _AsyncWalkParams(
+            pattern="*.json",
+            skip_hidden=True,
+            max_depth=5,
+            max_files=None,
+            matches=[],
+        )
+
+        with patch("griptape_nodes.utils.file_utils._scan_directory", hung_scan):
+            task = asyncio.create_task(_arecurse_find(temp_dir, 0, params))
+            # Let the walk dispatch the scan, so the cancel lands while it is in flight.
+            await asyncio.sleep(0.05)
+            task.cancel()
+
+            started_at = time.perf_counter()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            elapsed_s = time.perf_counter() - started_at
+
+        # Generous bound: the point is "did not wait for the 5s scan", not a precise timing.
+        assert elapsed_s < scan_duration_s / 2
 
 
 class TestAtomicWriteBytes:

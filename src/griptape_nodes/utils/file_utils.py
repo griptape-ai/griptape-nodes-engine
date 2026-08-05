@@ -7,11 +7,11 @@ import os
 import tempfile
 from dataclasses import dataclass
 from fnmatch import fnmatch
+from functools import partial
 from pathlib import Path
 
 import anyio
-
-from griptape_nodes.utils.async_utils import to_thread
+import anyio.to_thread
 
 logger = logging.getLogger(__name__)
 
@@ -223,8 +223,17 @@ async def _arecurse_find(path: Path, depth: int, params: _AsyncWalkParams) -> No
 
     max_depth is what bounds a symlink loop, so there is no visited-set.
     """
+    # abandon_on_cancel: a cancelled await returns immediately instead of waiting for the
+    # in-flight scandir, which is what makes the timeout above a real bound -- on a hung
+    # mount, waiting for the thread would leave discovery unbounded. Safe here because the
+    # scan is read-only; the shielding in async_utils.to_thread exists to protect a
+    # partially-completed write, which this is not. run_sync is positional-only, hence the
+    # partial for the keyword argument.
     try:
-        entries = await to_thread(_scan_directory, path, skip_hidden=params.skip_hidden)
+        entries = await anyio.to_thread.run_sync(
+            partial(_scan_directory, path, skip_hidden=params.skip_hidden),
+            abandon_on_cancel=True,
+        )
     except (PermissionError, OSError) as e:
         logger.debug("Cannot access directory %s: %s", path, e)
         return
