@@ -35,7 +35,7 @@ config_manager = GriptapeNodes.ConfigManager()
 secrets_manager = GriptapeNodes.SecretsManager()
 
 
-def init_command(  # noqa: PLR0913
+def init_command(  # noqa: PLR0913, PLR0917
     api_key: Annotated[str | None, typer.Option(help="Set the Griptape Nodes API key.")] = None,
     workspace_directory: Annotated[str | None, typer.Option(help="Set the Griptape Nodes workspace directory.")] = None,
     storage_backend: Annotated[

@@ -180,7 +180,7 @@ class BaseArtifactProvider(ABC):
         """
         return f"{cls.get_config_key_prefix()}.{cls.get_preview_generator_leaf_key()}"
 
-    async def attempt_generate_preview(  # noqa: PLR0913
+    async def attempt_generate_preview(  # noqa: PLR0913, PLR0917
         self,
         preview_generator_friendly_name: str,
         source_file_location: str,

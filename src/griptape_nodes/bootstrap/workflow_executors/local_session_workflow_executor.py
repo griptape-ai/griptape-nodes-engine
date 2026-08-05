@@ -200,7 +200,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
         def _handle_task_done(task: asyncio.Task) -> None:
             background_tasks.discard(task)
             if task.exception() and not task.cancelled():
-                logger.exception("Background task failed", exc_info=task.exception())
+                logger.error("Background task failed", exc_info=task.exception())
 
         event_queue = GriptapeNodes.EventManager().event_queue
         while not is_flow_finished:

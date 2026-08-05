@@ -1550,7 +1550,7 @@ class FlowManager:
 
     def _validate_multi_node_request(
         self, request: PackageNodesAsSerializedFlowRequest
-    ) -> None | PackageNodesAsSerializedFlowResultFailure:
+    ) -> PackageNodesAsSerializedFlowResultFailure | None:
         """Validate that all requested nodes exist and control flow configuration is valid."""
         # Validate all nodes exist
         missing_nodes = []
@@ -1579,7 +1579,7 @@ class FlowManager:
 
         return None
 
-    def _serialize_package_nodes_for_local_execution(  # noqa: PLR0913, C901
+    def _serialize_package_nodes_for_local_execution(  # noqa: C901, PLR0913, PLR0917
         self,
         nodes_to_package: list[BaseNode],
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
@@ -1961,7 +1961,7 @@ class FlowManager:
             end_node_name=end_node_name,
         )
 
-    def _create_end_node_control_connections(  # noqa: PLR0913
+    def _create_end_node_control_connections(  # noqa: PLR0913, PLR0917
         self,
         request: PackageNodesAsSerializedFlowRequest,
         package_nodes: list[BaseNode],
@@ -2036,7 +2036,7 @@ class FlowManager:
                     output_shape_data=output_shape_data,
                 )
 
-    def _create_end_node_data_parameters_and_connections(  # noqa: PLR0913
+    def _create_end_node_data_parameters_and_connections(  # noqa: PLR0913, PLR0917
         self,
         request: PackageNodesAsSerializedFlowRequest,
         package_nodes: list[BaseNode],
@@ -2104,7 +2104,7 @@ class FlowManager:
                         output_shape_data=output_shape_data,
                     )
 
-    def _process_parameter_for_end_node(  # noqa: PLR0913
+    def _process_parameter_for_end_node(  # noqa: PLR0913, PLR0917
         self,
         request: PackageNodesAsSerializedFlowRequest,
         parameter: Parameter,
@@ -2172,7 +2172,7 @@ class FlowManager:
         )
         package_to_end_connections.append(package_to_end_connection)
 
-    def _create_multi_node_start_node_with_connections(  # noqa: PLR0913
+    def _create_multi_node_start_node_with_connections(  # noqa: PLR0913, PLR0917
         self,
         request: PackageNodesAsSerializedFlowRequest,
         library_version: str,
@@ -2288,7 +2288,7 @@ class FlowManager:
             start_node_name=start_node_name,
         )
 
-    def _apply_node_group_parameters_to_start_node(  # noqa: PLR0913
+    def _apply_node_group_parameters_to_start_node(  # noqa: PLR0913, PLR0917
         self,
         node_group_node: SubflowNodeGroup,
         start_node_library_name: str,
@@ -2390,7 +2390,7 @@ class FlowManager:
             )
             start_node_parameter_value_commands.append(indirect_set_value_command)
 
-    def _create_start_node_parameters_and_connections_for_incoming_data(  # noqa: PLR0913
+    def _create_start_node_parameters_and_connections_for_incoming_data(  # noqa: PLR0913, PLR0917
         self,
         target_node_name: str,
         incoming_data_connections: list[IncomingConnection],

@@ -1497,7 +1497,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
     parent_container_name: str | None = None
     parent_element_name: str | None = None
 
-    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915
+    def __init__(  # noqa: C901, PLR0912, PLR0913, PLR0915, PLR0917
         self,
         name: str,
         tooltip: str | list[dict] | None = None,
@@ -2220,7 +2220,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
 # Convenience classes to reduce boilerplate in node definitions
 class ControlParameter(Parameter, ABC):
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict],
@@ -2296,7 +2296,7 @@ class ControlParameter(Parameter, ABC):
 
 
 class ControlParameterInput(ControlParameter):
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         tooltip: str | list[dict] = "Connection from previous node in the execution chain",
         name: str = "exec_in",
@@ -2336,7 +2336,7 @@ class ControlParameterInput(ControlParameter):
 
 
 class ControlParameterOutput(ControlParameter):
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         tooltip: str | list[dict] = "Connection to the next node in the execution chain",
         name: str = "exec_out",
@@ -2382,7 +2382,7 @@ class ParameterContainer(Parameter, ABC):
     But it also has the ability to own and manage children and make them accessible by keys, etc.
     """
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict],
@@ -2456,7 +2456,7 @@ class ParameterContainer(Parameter, ABC):
 class ParameterList(ParameterContainer):
     _original_traits: set[Trait.__class__ | Trait]
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict],
@@ -2832,7 +2832,7 @@ class ParameterList(ParameterContainer):
 
 
 class ParameterKeyValuePair(Parameter):
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict],
@@ -2970,7 +2970,7 @@ class ParameterDictionary(ParameterContainer):
     _kvp_type: ParameterType.KeyValueTypePair
     _original_traits: set[Trait.__class__ | Trait]
 
-    def __init__(  # noqa: PLR0913
+    def __init__(  # noqa: PLR0913, PLR0917
         self,
         name: str,
         tooltip: str | list[dict],

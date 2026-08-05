@@ -4230,7 +4230,7 @@ class NodeManager:
         return diff
 
     @staticmethod
-    def _handle_value_hashing(  # noqa: PLR0913
+    def _handle_value_hashing(  # noqa: PLR0913, PLR0917
         value: Any,
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         unique_parameter_uuid_to_values: dict,

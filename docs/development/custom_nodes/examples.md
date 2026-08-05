@@ -25,9 +25,9 @@ from google.auth.transport.requests import Request
 
 # Authentication
 credentials = service_account.Credentials.from_service_account_file(
-    service_account_file,
-    scopes=['https://www.googleapis.com/auth/cloud-platform']
+    service_account_file, scopes=["https://www.googleapis.com/auth/cloud-platform"]
 )
+
 
 def _get_access_token(self, credentials) -> str:
     """Get access token from credentials."""
@@ -35,19 +35,15 @@ def _get_access_token(self, credentials) -> str:
         credentials.refresh(Request())
     return credentials.token
 
+
 # Build JSON payload matching REST API spec
 payload = {
     "contents": {
         "role": "USER",
         "parts": [
             {"text": prompt},
-            {
-                "inline_data": {
-                    "mime_type": "image/jpeg",
-                    "data": base64.b64encode(image_bytes).decode('utf-8')
-                }
-            }
-        ]
+            {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(image_bytes).decode("utf-8")}},
+        ],
     },
     "generation_config": {
         "temperature": 1.0,
@@ -56,16 +52,13 @@ payload = {
         "response_modalities": ["TEXT", "IMAGE"],
         "image_config": {  # Feature not in SDK!
             "aspect_ratio": "16:9"
-        }
-    }
+        },
+    },
 }
 
 # Make authenticated request
 access_token = self._get_access_token(credentials)
-headers = {
-    "Authorization": f"Bearer {access_token}",
-    "Content-Type": "application/json"
-}
+headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
 
 api_endpoint = f"https://{location}-aiplatform.googleapis.com/v1/projects/{project_id}/locations/{location}/publishers/google/models/{model}:generateContent"
 
@@ -115,9 +108,9 @@ class IfElse(BaseNode):
 
         # Sophisticated connection tracking for type management
         self._possibility_space: list[str] = []  # Types acceptable to output target
-        self._locked_type: str | None = None     # Specific type locked by input
-        self._connected_inputs: set[str] = set() # Track input connections
-        self._output_connected: bool = False     # Track output connections
+        self._locked_type: str | None = None  # Specific type locked by input
+        self._connected_inputs: set[str] = set()  # Track input connections
+        self._output_connected: bool = False  # Track output connections
 
     def _update_parameter_types(self) -> None:
         """Update all parameter types based on current state."""
@@ -148,18 +141,12 @@ Inherit from ControlNode for agent management:
 from griptape.structures import Agent
 from griptape_nodes.exe_types.node_types import ControlNode
 
+
 class MyAgentNode(ControlNode):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self.add_parameter(Parameter(
-            name="agent_in",
-            input_types=["Agent"],
-            type="Agent"
-        ))
-        self.add_parameter(Parameter(
-            name="agent_out",
-            output_type="Agent"
-        ))
+        self.add_parameter(Parameter(name="agent_in", input_types=["Agent"], type="Agent"))
+        self.add_parameter(Parameter(name="agent_out", output_type="Agent"))
 
     def process(self) -> None:
         agent_state = self.get_parameter_value("agent_in")
@@ -177,6 +164,7 @@ from abc import abstractmethod
 from typing import Any
 
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
+
 
 class BaseCustomIterativeStartNode(BaseIterativeStartNode):
     """Base class for a family of custom iterative start nodes."""
@@ -215,6 +203,7 @@ Use ClassVar for shared resources:
 ```python
 from typing import ClassVar, Any
 
+
 class CachedModelNode(DataNode):
     _cache: ClassVar[dict[str, Any]] = {}
 
@@ -228,15 +217,12 @@ class CachedModelNode(DataNode):
 
 ```python
 # Gated model detection
-is_gated = getattr(model, 'gated', False)
-model_dict['gated'] = is_gated
+is_gated = getattr(model, "gated", False)
+model_dict["gated"] = is_gated
 
 # Status updates for gated models
-if getattr(model_info, 'gated', False):
-    self.publish_update_to_parameter(
-        "status",
-        "🔒 GATED MODEL - May require approval"
-    )
+if getattr(model_info, "gated", False):
+    self.publish_update_to_parameter("status", "🔒 GATED MODEL - May require approval")
 ```
 
 ### ParameterMessage for External Links and Status Updates
@@ -251,8 +237,9 @@ ParameterMessage(
     variant="info",
     value="View model documentation",
     button_link=f"https://huggingface.co/{model_id}",
-    button_text="View on HuggingFace"
+    button_text="View on HuggingFace",
 )
+
 
 # Dynamic status message example
 class MyIterativeNode(BaseIterativeStartNode):
@@ -327,6 +314,7 @@ For nodes that can succeed or fail, inherit from SuccessFailureNode:
 ```python
 from griptape_nodes.exe_types.node_types import SuccessFailureNode
 
+
 class LoadImage(SuccessFailureNode):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -384,6 +372,7 @@ from griptape_nodes_library.utils.artifact_path_tethering import (
     ArtifactPathTethering,
     ArtifactTetheringConfig,
 )
+
 
 class LoadImage(SuccessFailureNode):
     def __init__(self, **kwargs) -> None:
@@ -596,18 +585,22 @@ class MusicGenerationNode(DataNode):
             prompt = self.get_parameter_value("prompt") or ""
             prompt_limit = self.PROMPT_LIMITS_CUSTOM.get(model, 3000)
             if len(prompt) > prompt_limit:
-                exceptions.append(ValueError(
-                    f"{self.name}: Prompt exceeds {prompt_limit} character limit for {model} "
-                    f"(current: {len(prompt)} characters)"
-                ))
+                exceptions.append(
+                    ValueError(
+                        f"{self.name}: Prompt exceeds {prompt_limit} character limit for {model} "
+                        f"(current: {len(prompt)} characters)"
+                    )
+                )
 
             style = self.get_parameter_value("style") or ""
             style_limit = self.STYLE_LIMITS.get(model, 200)
             if len(style) > style_limit:
-                exceptions.append(ValueError(
-                    f"{self.name}: Style exceeds {style_limit} character limit for {model} "
-                    f"(current: {len(style)} characters)"
-                ))
+                exceptions.append(
+                    ValueError(
+                        f"{self.name}: Style exceeds {style_limit} character limit for {model} "
+                        f"(current: {len(style)} characters)"
+                    )
+                )
 
         return exceptions if exceptions else None
 ```
@@ -651,6 +644,7 @@ music_urls_param = Parameter(
     ui_options={"is_full_width": True, "display_name": "Music URLs"},
 )
 self.add_parameter(music_urls_param)
+
 
 def process(self) -> None:
     # ... generation logic ...
@@ -730,6 +724,7 @@ def _extract_image_value(self, image_input: Any) -> str | None:
 from PIL import Image
 from io import BytesIO
 
+
 def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> str:
     """Convert image to API-compatible format."""
     # ... extract image_bytes ...
@@ -738,29 +733,25 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
         img = Image.open(BytesIO(image_bytes))
 
         # Convert unsupported formats (MPO, TIFF, BMP, etc.) to JPEG
-        if img.format not in ['JPEG', 'PNG', 'WEBP']:
+        if img.format not in ["JPEG", "PNG", "WEBP"]:
             self._log(f"Converting {img.format} to JPEG for API compatibility")
             # Convert to RGB if needed (for formats like MPO)
-            if img.mode not in ['RGB', 'L']:
-                img = img.convert('RGB')
+            if img.mode not in ["RGB", "L"]:
+                img = img.convert("RGB")
             # Save as JPEG to bytes
             output = BytesIO()
-            img.save(output, format='JPEG', quality=95)
+            img.save(output, format="JPEG", quality=95)
             image_bytes = output.getvalue()
             mime_type = "image/jpeg"
         else:
-            format_to_mime = {
-                'JPEG': 'image/jpeg',
-                'PNG': 'image/png',
-                'WEBP': 'image/webp'
-            }
-            mime_type = format_to_mime.get(img.format, 'image/jpeg')
+            format_to_mime = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+            mime_type = format_to_mime.get(img.format, "image/jpeg")
     except Exception as e:
         self._log(f"Could not detect image format: {e}")
         mime_type = "image/jpeg"
 
     # Encode as base64 data URI
-    base64_data = base64.b64encode(image_bytes).decode('utf-8')
+    base64_data = base64.b64encode(image_bytes).decode("utf-8")
     return f"data:{mime_type};base64,{base64_data}"
 ```
 
@@ -789,6 +780,7 @@ def _outgoing_connection_exists(source_node: str, source_param: str) -> bool:
 
     param_connections = source_connections.get(source_param)
     return bool(param_connections) if param_connections else False
+
 
 def _incoming_connection_exists(target_node: str, target_param: str) -> bool:
     """Check if a target node/parameter has any incoming connections."""
@@ -842,13 +834,16 @@ def _image_to_bytes(self, image_artifact) -> bytes:
 ```python
 # Core imports
 from griptape_nodes.exe_types.core_types import (
-    Parameter, ParameterList, ParameterMode, ParameterTypeBuiltin,
-    ParameterGroup, ParameterMessage, ControlParameterInput, ControlParameterOutput
+    Parameter,
+    ParameterList,
+    ParameterMode,
+    ParameterTypeBuiltin,
+    ParameterGroup,
+    ParameterMessage,
+    ControlParameterInput,
+    ControlParameterOutput,
 )
-from griptape_nodes.exe_types.node_types import (
-    DataNode, ControlNode, BaseNode, SuccessFailureNode,
-    StartNode, EndNode
-)
+from griptape_nodes.exe_types.node_types import DataNode, ControlNode, BaseNode, SuccessFailureNode, StartNode, EndNode
 from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode, BaseIterativeEndNode
 from griptape_nodes.traits.options import Options
 from griptape_nodes.traits.slider import Slider
@@ -859,9 +854,7 @@ from griptape_nodes.traits.file_system_picker import FileSystemPicker
 from griptape.artifacts import ImageArtifact, ImageUrlArtifact, TextArtifact
 
 # Utilities
-from griptape_nodes_library.utils.artifact_path_tethering import (
-    ArtifactPathTethering, ArtifactTetheringConfig
-)
+from griptape_nodes_library.utils.artifact_path_tethering import ArtifactPathTethering, ArtifactTetheringConfig
 from griptape_nodes_library.utils.image_utils import (
     dict_to_image_url_artifact,
     load_pil_from_url,
@@ -935,10 +928,7 @@ filename = generate_filename(self.name, suffix="processed", ext="png")
 from griptape_nodes.files.project_file import ProjectFileDestination
 
 # Save file using project system
-dest = ProjectFileDestination.from_situation(
-    filename="output.mp4",
-    situation="save_node_output"
-)
+dest = ProjectFileDestination.from_situation(filename="output.mp4", situation="save_node_output")
 saved = dest.write_bytes(file_bytes)
 artifact = VideoUrlArtifact(saved.location)
 ```
@@ -974,6 +964,7 @@ Inherit from BaseArtifact and override methods as needed:
 ```python
 from griptape.artifacts import BaseArtifact
 
+
 class CustomArtifact(BaseArtifact):
     def __init__(self, value: Any, **kwargs):
         super().__init__(value, **kwargs)
@@ -994,6 +985,7 @@ def initialize_spotlight(self) -> None:
     evaluate_param = self.get_parameter_by_name("evaluate")
     if evaluate_param and ParameterMode.INPUT in evaluate_param.get_mode():
         self.current_spotlight_parameter = evaluate_param
+
 
 def advance_parameter(self) -> bool:
     """Custom parameter advancement with conditional dependency resolution."""

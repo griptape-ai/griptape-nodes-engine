@@ -20,6 +20,7 @@ Use `GriptapeNodes.SecretsManager()` to access API keys and secrets:
 ```python
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+
 class MyNode(DataNode):
     SERVICE_NAME = "MyService"
     API_KEY_NAME = "MY_SERVICE_API_KEY"
@@ -58,6 +59,7 @@ def _get_image_data(self, image_artifact):
 # At top of file
 from PIL import Image
 from io import BytesIO
+
 
 def _get_image_data(self, image_artifact):
     img = Image.open(BytesIO(image_bytes))
@@ -227,9 +229,7 @@ def validate_before_node_run(self) -> list[Exception] | None:
     if model == "advanced":
         images = self.get_parameter_list_value("images") or []
         if len(images) > MAX_IMAGES:
-            exceptions.append(ValueError(
-                f"{self.name}: Maximum {MAX_IMAGES} images allowed, got {len(images)}"
-            ))
+            exceptions.append(ValueError(f"{self.name}: Maximum {MAX_IMAGES} images allowed, got {len(images)}"))
 
     return exceptions if exceptions else None
 ```
@@ -280,6 +280,7 @@ def _set_safe_defaults(self) -> None:
     self.parameter_output_values["status"] = "error"
     self.parameter_output_values["count"] = 0
 
+
 def process(self) -> None:
     try:
         # Processing logic
@@ -297,6 +298,7 @@ Use `urllib.parse.urljoin()` for safe URL building:
 ```python
 from urllib.parse import urljoin
 import os
+
 
 def __init__(self, **kwargs):
     super().__init__(**kwargs)
@@ -320,6 +322,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def _log(self, message: str) -> None:
     """Safe logging with exception suppression."""
     with suppress(Exception):
@@ -335,6 +338,7 @@ from copy import deepcopy
 import json
 
 PROMPT_TRUNCATE_LENGTH = 100
+
 
 def _log_request(self, payload: dict[str, Any]) -> None:
     """Log request with sanitized sensitive data."""
