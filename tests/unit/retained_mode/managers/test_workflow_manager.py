@@ -41,6 +41,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     ListAllWorkflowInfoRequest,
     ListAllWorkflowInfoResultFailure,
     ListAllWorkflowInfoResultSuccess,
+    LoadWorkflowMetadata,
     LoadWorkflowMetadataResultFailure,
     LoadWorkflowMetadataResultSuccess,
     MoveWorkflowRequest,
@@ -57,6 +58,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.context_manager import ContextManager
+from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
+    InvalidTomlFormatProblem,
+    MissingTomlSectionProblem,
+)
 from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 from griptape_nodes.retained_mode.managers.object_manager import ObjectManager
 from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
@@ -1450,6 +1455,66 @@ class TestWorkflowManager:
         assert leaked_path.name not in scanned_names
         # Sanity check: a regular file in the same directory still reaches the processor.
         assert good_path.name in scanned_names
+
+    # --- Metadata header parse failures ---
+
+    @pytest.mark.asyncio
+    async def test_malformed_toml_header_reports_unusable(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """A header that is not valid TOML is UNUSABLE, not a crash.
+
+        The read path parses with tomllib, which is stricter than the tomlkit it replaced,
+        so this pins the strictness: a header this rejects must land in UNUSABLE with an
+        InvalidTomlFormatProblem rather than reaching schema validation.
+        """
+        workflow_manager = griptape_nodes.WorkflowManager()
+        griptape_nodes.ConfigManager().workspace_path = tmp_path
+        griptape_nodes.LibraryManager()._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        # Unclosed table declaration: parses as a header block, fails as TOML.
+        (tmp_path / "bad_toml.py").write_text(
+            "\n".join([f"# /// {header}", "# [tool.griptape-nodes", '# name = "x"', "# ///", ""]),
+            encoding="utf-8",
+        )
+
+        result = await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name="bad_toml.py"))
+
+        assert isinstance(result, LoadWorkflowMetadataResultFailure)
+        info = workflow_manager._workflow_file_path_to_info[str(tmp_path / "bad_toml.py")]
+        assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE
+        assert any(isinstance(problem, InvalidTomlFormatProblem) for problem in info.problems)
+
+    @pytest.mark.asyncio
+    async def test_header_missing_griptape_nodes_section_reports_unusable(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A header without [tool.griptape-nodes] is UNUSABLE.
+
+        Covers both ways the section lookup can fail now that tomllib returns plain dicts:
+        the key being absent (KeyError) and `tool` being a scalar, so subscripting it raises
+        TypeError. Both must be caught and reported, not escape as an unhandled error.
+        """
+        workflow_manager = griptape_nodes.WorkflowManager()
+        griptape_nodes.ConfigManager().workspace_path = tmp_path
+        griptape_nodes.LibraryManager()._libraries_loading_complete.set()
+
+        header = WorkflowManager.WORKFLOW_METADATA_HEADER
+        cases = {
+            # Valid TOML, but the section the engine needs is a different table.
+            "missing_section.py": [f"# /// {header}", "# [tool.something-else]", '# name = "x"', "# ///", ""],
+            # Valid TOML where `tool` is a scalar, so tool["griptape-nodes"] raises TypeError.
+            "tool_is_scalar.py": [f"# /// {header}", "# tool = 5", "# ///", ""],
+        }
+
+        for file_name, lines in cases.items():
+            (tmp_path / file_name).write_text("\n".join(lines), encoding="utf-8")
+
+            result = await workflow_manager.on_load_workflow_metadata_request(LoadWorkflowMetadata(file_name=file_name))
+
+            assert isinstance(result, LoadWorkflowMetadataResultFailure), file_name
+            info = workflow_manager._workflow_file_path_to_info[str(tmp_path / file_name)]
+            assert info.status is WorkflowManager.WorkflowStatus.UNUSABLE, file_name
+            assert any(isinstance(problem, MissingTomlSectionProblem) for problem in info.problems), file_name
 
     # --- WorkflowInfo payload helpers ---
 
