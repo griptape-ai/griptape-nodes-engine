@@ -108,10 +108,10 @@ class AdvancedNodeLibrary:
         discover which request types it registered and inspect their field schemas
         using standard Python APIs::
 
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+            from griptape_nodes.node_library.library_registry import LibraryRegistry
             import dataclasses, typing
 
-            library = GriptapeNodes.LibraryRegistry().get_library("My Library Name")
+            library = LibraryRegistry.get_library("My Library Name")
             for request_type in library.get_registered_request_handler_types():
                 hints = typing.get_type_hints(request_type)
                 fields = dataclasses.fields(request_type)
