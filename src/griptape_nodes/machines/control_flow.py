@@ -142,7 +142,9 @@ class CompleteState(State):
             # Use pickle-based serialization for complex parameter output values
 
             parameter_output_values, unique_uuid_to_values = NodeManager.serialize_parameter_output_values(
-                current_node, use_pickling=context.pickle_control_flow_result
+                current_node,
+                workflow_manager=GriptapeNodes.WorkflowManager(),
+                use_pickling=context.pickle_control_flow_result,
             )
             GriptapeNodes.EventManager().put_event(
                 ExecutionGriptapeNodeEvent(

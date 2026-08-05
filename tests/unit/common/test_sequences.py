@@ -21,6 +21,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.common.sequences import MissingItemPolicy, NoTokenBehavior
+from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.os_events import (
     FileIOFailureReason,
     FileSystemEntry,
@@ -637,7 +638,7 @@ class TestPathRoundTrip:
         filenames = [f"abc{n:03d}.png" for n in [1, 2, 3]]
         path = f"{macro_directory}/abc###.png"
         with patch.object(
-            GriptapeNodes,
+            Engine,
             "handle_request",
             side_effect=_stub_listing_with_macro(
                 macro_directory=macro_directory,
@@ -789,7 +790,7 @@ class TestNoTokenBehavior:
         filenames = [f"render.{n:04d}.png" for n in [1, 2, 3, 4, 5]]
         path = f"{macro_directory}/render.0002.png"
         with patch.object(
-            GriptapeNodes,
+            Engine,
             "handle_request",
             side_effect=_stub_listing_with_macro(
                 macro_directory=macro_directory,

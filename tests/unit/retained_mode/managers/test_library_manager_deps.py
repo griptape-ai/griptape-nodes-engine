@@ -338,9 +338,8 @@ class TestLibraryDependencyResolution:
             patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(mgr, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn,
+            patch.object(griptape_nodes, "_config_manager", config_mock),
         ):
-            mock_gtn.ConfigManager.return_value = config_mock
             await mgr._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
@@ -368,9 +367,8 @@ class TestLibraryDependencyResolution:
             patch.object(mgr, "install_library_dependencies_request", return_value=_INSTALL_STOP),
             patch.object(mgr, "download_library_request") as mock_download,
             patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn,
+            patch.object(griptape_nodes, "_config_manager", config_mock),
         ):
-            mock_gtn.ConfigManager.return_value = config_mock
             await mgr._progress_library_through_lifecycle(
                 library_info=lib_info,
                 file_path="/mock.json",
@@ -694,7 +692,7 @@ class TestDownloadLibraryRequestAutoRegister:
                     return_value=fake_json_path,
                 ),
                 patch.object(
-                    GriptapeNodes,
+                    griptape_nodes,
                     "ahandle_request",
                     new_callable=AsyncMock,
                     return_value=RegisterLibraryFromFileResultFailure(result_details="schema validation error"),

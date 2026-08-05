@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.files.path_utils import canonicalize_for_identity, derive_registry_key
 from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.context_events import (
     EnsureWorkflowAndFlowRequest,
     EnsureWorkflowAndFlowResultFailure,
@@ -23,13 +24,14 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.core_types import BaseNodeElement
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class ContextManager:
+class ContextManager(EngineScoped):
     """Context manager for Workflow, Flow, Node, and Element contexts.
 
     Workflows own Flows, Flows own Nodes, and Nodes own Elements.
@@ -245,8 +247,9 @@ class ContextManager:
         ) -> None:
             self._manager.pop_element()
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         """Initialize the context manager with empty workflow and flow stacks."""
+        super().__init__(engine)
         self._workflow_stack = []
         event_manager.assign_manager_to_request_type(
             request_type=SetWorkflowContextRequest, callback=self.on_set_workflow_context_request
@@ -313,13 +316,12 @@ class ContextManager:
             CreateFlowRequest,
             CreateFlowResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         created_workflow = False
         if self.has_current_workflow():
             workflow_name = self.get_current_workflow_name()
         else:
-            set_workflow_result = GriptapeNodes.handle_request(
+            set_workflow_result = self.engine.handle_request(
                 SetWorkflowContextRequest(
                     workflow_name=request.workflow_name,
                     display_name=request.display_name,
@@ -339,7 +341,7 @@ class ContextManager:
         if self.has_current_flow():
             flow_name = self.get_current_flow().name
         else:
-            create_flow_result = GriptapeNodes.handle_request(
+            create_flow_result = self.engine.handle_request(
                 CreateFlowRequest(
                     parent_flow_name=None,
                     flow_name=request.flow_name,
@@ -382,8 +384,6 @@ class ContextManager:
         return self.WorkflowContext(self, workflow_name)
 
     def flow(self, flow: ControlFlow | str) -> ContextManager.FlowContext:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         """Create a context manager for a Flow context.
 
         Args:
@@ -394,7 +394,7 @@ class ContextManager:
         """
         if isinstance(flow, str):
             try:
-                control_flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(flow, ControlFlow)
+                control_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow, ControlFlow)
                 if control_flow is None:
                     msg = f"Flow '{flow}' not found in current workflow."
                     logger.error(msg)
@@ -587,11 +587,8 @@ class ContextManager:
         if workflow_name is not None:
             resolved_name = workflow_name
         elif file_path is not None:
-            # Lazy import required: context_manager is imported by griptape_nodes, creating a circular dependency.
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             resolved = canonicalize_for_identity(file_path)
-            workspace_path = canonicalize_for_identity(GriptapeNodes.ConfigManager().workspace_path)
+            workspace_path = canonicalize_for_identity(self.engine.config_manager.workspace_path)
             if resolved.is_relative_to(workspace_path):
                 path_for_key = str(resolved.relative_to(workspace_path))
             else:

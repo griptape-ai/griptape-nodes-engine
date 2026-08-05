@@ -61,6 +61,7 @@ from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
     validate_library_declarations,
 )
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
     AppSessionStartedEvent,
@@ -194,7 +195,6 @@ from griptape_nodes.retained_mode.events.resource_events import (
     ListCompatibleResourceInstancesResultSuccess,
 )
 from griptape_nodes.retained_mode.events.worker_events import StartWorkerRequest
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -286,6 +286,7 @@ if TYPE_CHECKING:
     from types import ModuleType
 
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import Payload, RequestPayload, ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
@@ -411,7 +412,7 @@ class LibraryVenvInitResult(NamedTuple):
     reused: bool
 
 
-class LibraryManager:
+class LibraryManager(EngineScoped):
     SANDBOX_LIBRARY_NAME = "Sandbox Library"
     # Prefix for the stable, deterministic module namespaces that library node files are
     # importable under. Anything under this prefix is a dynamically loaded library module
@@ -574,7 +575,11 @@ class LibraryManager:
     # Callbacks invoked immediately before all libraries are reloaded.
     _pre_reload_callbacks: list[Callable[[], Awaitable[None]]]
 
-    def __init__(self, event_manager: EventManager, *, worker_manager: WorkerManager) -> None:
+    def __init__(
+        self, event_manager: EventManager, *, worker_manager: WorkerManager, engine: Engine | None = None
+    ) -> None:
+        super().__init__(engine)
+        self._worker_manager = worker_manager
         self._library_file_path_to_info = {}
         self._dynamic_to_stable_module_mapping = {}
         self._stable_to_dynamic_module_mapping = {}
@@ -759,7 +764,7 @@ class LibraryManager:
         if library_name:
             library_info = self.get_library_info_by_library_name(library_name)
             if library_info and library_info.requires_worker:
-                wm = GriptapeNodes.WorkerManager()
+                wm = self._worker_manager
                 if wm:
                     worker = wm.get_worker_for_key(library_name)
                     if worker:
@@ -788,7 +793,7 @@ class LibraryManager:
                 library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.WORKER_PENDING
                 # Create (or reset) the worker_ready event for this spawn.
                 library_info.worker_ready = asyncio.Event()
-                await GriptapeNodes.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
+                await self.engine.ahandle_request(StartWorkerRequest(library_name=library_info.library_name))
 
     def on_worker_evicted(self, worker_engine_id: str, library_name: str | None) -> None:
         """Called when a worker is evicted by the orchestrator heartbeat monitor.
@@ -1436,7 +1441,7 @@ class LibraryManager:
                 icon="Folder",
             )
 
-            engine_version = GriptapeNodes().handle_engine_version_request(request=GetEngineVersionRequest())
+            engine_version = self.engine.handle_engine_version_request(request=GetEngineVersionRequest())
             if not isinstance(engine_version, GetEngineVersionResultSuccess):
                 details = "Could not get engine version for sandbox library generation."
                 return LoadLibraryMetadataFromFileResultFailure(
@@ -1609,7 +1614,7 @@ class LibraryManager:
         Returns:
             Path to sandbox directory if configured and exists, None otherwise.
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         sandbox_library_subdir = config_mgr.get_config_value("sandbox_library_directory")
         if not sandbox_library_subdir:
             return None
@@ -2256,7 +2261,7 @@ class LibraryManager:
 
                         # Download and install any griptape libraries this library depends on.
                         if griptape_library_deps:
-                            config_mgr = GriptapeNodes.ConfigManager()
+                            config_mgr = self.engine.config_manager
                             install_behavior = config_mgr.get_config_value(
                                 LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
                                 default=LibraryDependencyInstallBehavior.ALWAYS,
@@ -2436,7 +2441,7 @@ class LibraryManager:
                             and library_info.library_name
                         ):
                             node_schemas = await self._serialize_library_node_schemas(library_info.library_name)
-                            await GriptapeNodes.abroadcast_app_event(
+                            await self.engine.abroadcast_app_event(
                                 LibraryLoadedNotification(
                                     library_name=library_info.library_name,
                                     fitness=library_info.fitness,
@@ -2524,19 +2529,19 @@ class LibraryManager:
             return []
 
         problems: list[LibraryProblem] = []
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         for library_data_setting in library_data.settings:
             get_category_request = GetConfigCategoryRequest(
                 category=library_data_setting.category,
                 failure_log_level=logging.DEBUG,
             )
-            get_category_result = GriptapeNodes.handle_request(get_category_request)
+            get_category_result = self.engine.handle_request(get_category_request)
             if not isinstance(get_category_result, GetConfigCategoryResultSuccess):
                 # Create new category
                 create_new_category_request = SetConfigCategoryRequest(
                     category=library_data_setting.category, contents=library_data_setting.contents
                 )
-                create_new_category_result = GriptapeNodes.handle_request(create_new_category_request)
+                create_new_category_result = self.engine.handle_request(create_new_category_request)
                 if not isinstance(create_new_category_result, SetConfigCategoryResultSuccess):
                     problems.append(CreateConfigCategoryProblem(category_name=library_data_setting.category))
                     details = f"Failed attempting to create new config category '{library_data_setting.category}' for library '{library_data.name}'."
@@ -2570,7 +2575,7 @@ class LibraryManager:
             set_category_request = SetConfigCategoryRequest(
                 category=library_data_setting.category, contents=existing_category_contents
             )
-            set_category_result = GriptapeNodes.handle_request(set_category_request)
+            set_category_result = self.engine.handle_request(set_category_request)
             if not isinstance(set_category_result, SetConfigCategoryResultSuccess):
                 problems.append(UpdateConfigCategoryProblem(category_name=library_data_setting.category))
                 details = f"Failed attempting to update config category '{library_data_setting.category}' for library '{library_data.name}'."
@@ -2603,7 +2608,7 @@ class LibraryManager:
                 )
             elif self._can_write_to_venv_location(library_python_venv_path):
                 # Check disk space before installing dependencies
-                config_manager = GriptapeNodes.ConfigManager()
+                config_manager = self.engine.config_manager
                 min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
                 if not OSManager.check_available_disk_space(Path(venv_path), min_space_gb):
                     error_msg = OSManager.format_disk_space_error(Path(venv_path))
@@ -2642,7 +2647,7 @@ class LibraryManager:
 
         library_path = str(files(package_name).joinpath(request.library_config_name))
 
-        register_result = await GriptapeNodes.ahandle_request(RegisterLibraryFromFileRequest(file_path=library_path))
+        register_result = await self.engine.ahandle_request(RegisterLibraryFromFileRequest(file_path=library_path))
         if isinstance(register_result, RegisterLibraryFromFileResultFailure):
             details = f"Attempted to install library '{request.requirement_specifier}'. Failed due to {register_result}"
             return RegisterLibraryFromRequirementSpecifierResultFailure(result_details=details)
@@ -2686,7 +2691,7 @@ class LibraryManager:
                 raise RuntimeError(msg) from e
 
         # Check disk space before creating virtual environment
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(library_venv_path.parent, min_space_gb):
             error_msg = OSManager.format_disk_space_error(library_venv_path.parent)
@@ -2739,7 +2744,7 @@ class LibraryManager:
                 requirements=os_requirements,
                 include_locked=True,
             )
-            result = GriptapeNodes.handle_request(list_request)
+            result = self.engine.handle_request(list_request)
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
@@ -2760,7 +2765,7 @@ class LibraryManager:
                 requirements=compute_requirements,
                 include_locked=True,
             )
-            result = GriptapeNodes.handle_request(list_request)
+            result = self.engine.handle_request(list_request)
 
             if isinstance(result, ListCompatibleResourceInstancesResultSuccess) and not result.instance_ids:
                 system_capabilities = self._get_system_capabilities()
@@ -2790,11 +2795,11 @@ class LibraryManager:
             requirements=None,
             include_locked=True,
         )
-        os_result = GriptapeNodes.handle_request(os_list_request)
+        os_result = self.engine.handle_request(os_list_request)
 
         if isinstance(os_result, ListCompatibleResourceInstancesResultSuccess) and os_result.instance_ids:
             status_request = GetResourceInstanceStatusRequest(instance_id=os_result.instance_ids[0])
-            status_result = GriptapeNodes.handle_request(status_request)
+            status_result = self.engine.handle_request(status_request)
             if isinstance(status_result, GetResourceInstanceStatusResultSuccess):
                 capabilities.update(status_result.status.capabilities)
 
@@ -2803,11 +2808,11 @@ class LibraryManager:
             requirements=None,
             include_locked=True,
         )
-        compute_result = GriptapeNodes.handle_request(compute_list_request)
+        compute_result = self.engine.handle_request(compute_list_request)
 
         if isinstance(compute_result, ListCompatibleResourceInstancesResultSuccess) and compute_result.instance_ids:
             status_request = GetResourceInstanceStatusRequest(instance_id=compute_result.instance_ids[0])
-            status_result = GriptapeNodes.handle_request(status_request)
+            status_result = self.engine.handle_request(status_request)
             if isinstance(status_result, GetResourceInstanceStatusResultSuccess):
                 capabilities.update(status_result.status.capabilities)
 
@@ -2889,7 +2894,9 @@ class LibraryManager:
 
     def unload_library_from_registry_request(self, request: UnloadLibraryFromRegistryRequest) -> ResultPayload:
         try:
-            LibraryRegistry.unregister_library(library_name=request.library_name)
+            LibraryRegistry.unregister_library(
+                library_name=request.library_name, event_manager=self.engine.event_manager
+            )
         except Exception as e:
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
@@ -3018,7 +3025,7 @@ class LibraryManager:
                 len(library_data.widgets),
             )
             # Get the static server base URL for constructing absolute bundle URLs
-            static_server_base_url = GriptapeNodes.StaticFilesManager().static_server_base_url
+            static_server_base_url = self.engine.static_files_manager.static_server_base_url
             # Get the library directory so we can hash each bundle file
             library_info_for_path = self.get_library_info_by_library_name(request.library)
             library_dir = Path(library_info_for_path.library_path).parent if library_info_for_path is not None else None
@@ -3257,8 +3264,7 @@ class LibraryManager:
             current = current.__cause__
         return current
 
-    @staticmethod
-    def _check_engine_version_compatibility(required_engine_version: str) -> tuple[bool, str]:
+    def _check_engine_version_compatibility(self, required_engine_version: str) -> tuple[bool, str]:
         """Check if a required engine version is compatible with the current engine.
 
         Args:
@@ -3269,7 +3275,7 @@ class LibraryManager:
             is_compatible is True if required_engine_version <= current_engine_version.
             If version comparison fails, returns (True, current_engine_version) to allow the operation.
         """
-        engine_version_result = GriptapeNodes.handle_request(GetEngineVersionRequest())
+        engine_version_result = self.engine.handle_request(GetEngineVersionRequest())
         if not isinstance(engine_version_result, GetEngineVersionResultSuccess):
             logger.warning("Failed to get engine version for compatibility check, allowing operation to proceed")
             return True, ""
@@ -3465,7 +3471,7 @@ class LibraryManager:
             if pre_register_info and pre_register_info.library_name
             else Path(lib_path).stem
         )
-        GriptapeNodes.EventManager().put_event(
+        self.engine.event_manager.put_event(
             AppEvent(
                 payload=EngineInitializationProgress(
                     phase=InitializationPhase.LIBRARIES,
@@ -3492,7 +3498,7 @@ class LibraryManager:
                 if isinstance(load_result.result_details, ResultDetails)
                 else str(load_result.result_details)
             )
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineInitializationProgress(
                         phase=InitializationPhase.LIBRARIES,
@@ -3506,7 +3512,7 @@ class LibraryManager:
                 )
             )
         elif isinstance(load_result, RegisterLibraryFromFileResultSuccess):
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineInitializationProgress(
                         phase=InitializationPhase.LIBRARIES,
@@ -3603,7 +3609,7 @@ class LibraryManager:
         library pin or engine_version, so it gets the same plan + gate. A non-loaded
         file-backed project (or one with no adjacent config dir) is a Failure.
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
 
         # System defaults is a synthetic id, not a path, so match it verbatim before
         # any canonicalization (mirroring on_set_current_project_request). Its activation
@@ -3612,7 +3618,7 @@ class LibraryManager:
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
-            dirs = await GriptapeNodes.ProjectManager().resolve_provisioning_config_dirs(request.project_id)
+            dirs = await self.engine.project_manager.resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(
                     result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
@@ -3637,9 +3643,7 @@ class LibraryManager:
         # (a layer may re-point it); only the base dir is the shared global workspace.
         libraries_root = None
         if request.project_id != SYSTEM_DEFAULTS_KEY:
-            libraries_root = await GriptapeNodes.ProjectManager().resolve_libraries_root_for_project_id(
-                request.project_id
-            )
+            libraries_root = await self.engine.project_manager.resolve_libraries_root_for_project_id(request.project_id)
         if libraries_root is not None:
             libraries_path = libraries_root
         else:
@@ -3679,7 +3683,7 @@ class LibraryManager:
         if engine_version_failure is not None:
             return [engine_version_failure]
 
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         raw_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         downloads = normalize_library_downloads(raw_libraries)
 
@@ -3697,7 +3701,7 @@ class LibraryManager:
         Reads the merged `requires_engine` config key and delegates the PEP 440
         compare to `engine_version_failure_detail`. No key means no constraint.
         """
-        spec_string = GriptapeNodes.ConfigManager().get_config_value(REQUIRES_ENGINE_KEY, default=None)
+        spec_string = self.engine.config_manager.get_config_value(REQUIRES_ENGINE_KEY, default=None)
         return engine_version_failure_detail(spec_string)
 
     async def _plan_one_library_provisioning(
@@ -3716,7 +3720,7 @@ class LibraryManager:
         The preview passes it so the installed-version probe reads the workspace
         the switch would land in, not the currently-active one; activation runs
         after the config layers switch, so its reconcile leaves this None and
-        resolves from the (now-target) live config.
+        resolves from this engine's (now-target) live config.
 
         `destructive` is True ONLY for a git OVERWRITE, matching the
         `overwrite_existing = installed_version is not None` decision in
@@ -3728,6 +3732,9 @@ class LibraryManager:
         handler lands it, so a `version` pin is enforced without requiring `name`.
         The action's `library_name` falls back to the repo name for display.
         """
+        if libraries_path is None:
+            libraries_path = self.engine.config_manager.resolved_libraries_root()
+
         library_name = download.name if download.name is not None else extract_repo_name_from_url(download.git_url)
         installed_version = await self._installed_download_version(download, libraries_path)
         parsed = parse_git_url_with_ref(download.git_url)
@@ -3808,7 +3815,9 @@ class LibraryManager:
         download_directory: str | None = None
         target_directory_name: str | None = None
         if overwrite_existing and download.name is not None:
-            manifest_path = await self._installed_library_manifest_path(download.name)
+            manifest_path = await self._installed_library_manifest_path(
+                download.name, self.engine.config_manager.resolved_libraries_root()
+            )
             if manifest_path is not None:
                 download_directory = str(manifest_path.parent.parent)
                 target_directory_name = manifest_path.parent.name
@@ -3822,14 +3831,14 @@ class LibraryManager:
             download_directory=download_directory,
             target_directory_name=target_directory_name,
         )
-        download_result = await GriptapeNodes.ahandle_request(download_request)
+        download_result = await self.engine.ahandle_request(download_request)
         if not isinstance(download_result, DownloadLibraryResultSuccess):
             library_label = download.name if download.name is not None else extract_repo_name_from_url(git_url)
             return f"Failed to provision library '{library_label}' from '{git_url}': {download_result.result_details}"
         return None
 
     @staticmethod
-    async def _installed_library_manifest_path(library_name: str, libraries_path: Path | None = None) -> Path | None:
+    async def _installed_library_manifest_path(library_name: str, libraries_path: Path) -> Path | None:
         """Return the on-disk manifest path for a provisioned library by name, or None.
 
         Scans the manifests under `libraries_directory` (where reconcile clones
@@ -3841,9 +3850,9 @@ class LibraryManager:
         manifest matches.
 
         `libraries_path` lets the provisioning preview probe the TARGET project's
-        libraries directory rather than the live one. When None it resolves from
-        the live config, which is correct for the real reconcile (it runs after
-        activation has switched the config layers to the target).
+        libraries directory rather than the live one; the real reconcile passes
+        the live config's resolved libraries root (it runs after activation has
+        switched the config layers to the target).
 
         This is the single source of truth for the provisioning planner
         (`_installed_library_version`, which decides SKIP/INSTALL/OVERWRITE) and
@@ -3851,9 +3860,6 @@ class LibraryManager:
         directory before re-cloning), guaranteeing the file the planner reasoned
         about is exactly the file overwrite targets.
         """
-        if libraries_path is None:
-            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
-
         for manifest_path in await find_files_recursive(libraries_path, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN):
             try:
                 content = manifest_path.read_text(encoding="utf-8")
@@ -3866,20 +3872,18 @@ class LibraryManager:
         return None
 
     @staticmethod
-    async def _installed_library_version(library_name: str) -> str | None:
+    async def _installed_library_version(library_name: str, libraries_path: Path) -> str | None:
         """Return the on-disk version of a library by manifest name, or None when absent.
 
         Locates the provisioned manifest via `_installed_library_manifest_path`
         (the shared resolver), then reads `metadata.library_version`. None when no
         manifest matches or the version is absent/unreadable.
         """
-        manifest_path = await LibraryManager._installed_library_manifest_path(library_name)
+        manifest_path = await LibraryManager._installed_library_manifest_path(library_name, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
 
     @staticmethod
-    async def _installed_manifest_path_for_download(
-        download: LibraryDownload, libraries_path: Path | None = None
-    ) -> Path | None:
+    async def _installed_manifest_path_for_download(download: LibraryDownload, libraries_path: Path) -> Path | None:
         """Return the on-disk manifest path for a download entry, or None when absent.
 
         Locates the installed copy the same way the download handler lands it:
@@ -3891,27 +3895,25 @@ class LibraryManager:
         the directory is unconfigured/missing or no manifest is found.
 
         `libraries_path` lets the provisioning preview probe the TARGET project's
-        libraries directory; when None it resolves from the live config (correct
-        for the real reconcile, which runs post-activation).
+        libraries directory; the real reconcile passes the live config's resolved
+        libraries root (correct post-activation).
         """
         if download.name is not None:
             return await LibraryManager._installed_library_manifest_path(download.name, libraries_path)
-
-        if libraries_path is None:
-            libraries_path = GriptapeNodes.ConfigManager().resolved_libraries_root()
 
         repo_name = extract_repo_name_from_url(download.git_url)
         repo_directory = libraries_path / repo_name
         return find_file_in_directory(repo_directory, LibraryManager.LIBRARY_CONFIG_GLOB_PATTERN)
 
     @staticmethod
-    async def _installed_download_version(download: LibraryDownload, libraries_path: Path | None = None) -> str | None:
+    async def _installed_download_version(download: LibraryDownload, libraries_path: Path) -> str | None:
         """Return the on-disk version for a download entry, or None when absent.
 
         Resolves the installed manifest via `_installed_manifest_path_for_download`
         (repo-name directory, or `name` override), then reads
         `metadata.library_version`. `libraries_path` threads the TARGET project's
-        libraries directory through for the preview; None resolves from live config.
+        libraries directory through for the preview, or the live config's
+        resolved root for the real reconcile.
         """
         manifest_path = await LibraryManager._installed_manifest_path_for_download(download, libraries_path)
         return LibraryManager._library_version_from_manifest(manifest_path)
@@ -3964,7 +3966,7 @@ class LibraryManager:
         Supports URL format with @ref suffix (e.g., "https://github.com/user/repo@stable").
         Libraries are registered later by load_all_libraries_from_config().
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         raw_downloads = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         git_urls = [download.git_url for download in normalize_library_downloads(raw_downloads)]
 
@@ -4016,7 +4018,7 @@ class LibraryManager:
                 }
             }
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         libraries_path = config_mgr.resolved_libraries_root()
 
         async def download_one(git_url_with_ref: str) -> tuple[str, dict[str, Any]]:
@@ -4037,7 +4039,7 @@ class LibraryManager:
                 }
 
             logger.info("Downloading library from '%s'", git_url_with_ref)
-            download_result = await GriptapeNodes.ahandle_request(
+            download_result = await self.engine.ahandle_request(
                 DownloadLibraryRequest(
                     git_url=git_url,
                     branch_tag_commit=ref,
@@ -4081,11 +4083,11 @@ class LibraryManager:
     async def _run_app_initialization(self, payload: AppInitializationComplete) -> None:
         if payload.skip_library_loading:
             # Register all secrets even in headless mode
-            GriptapeNodes.SecretsManager().register_all_secrets()
+            self.engine.secrets_manager.register_all_secrets()
 
             # Still need to tell WorkflowManager to register workflows
             # Pass the specific workflows if provided, otherwise it will scan workspace
-            await GriptapeNodes.WorkflowManager().refresh_workflow_registry(
+            await self.engine.workflow_manager.refresh_workflow_registry(
                 workflows_to_register=payload.workflows_to_register
             )
             return
@@ -4121,20 +4123,20 @@ class LibraryManager:
         # when AppStartSessionRequest arrives and will finish before the user can open a
         # workflow. Awaiting here on fresh boot would wait the full worker-startup grace
         # period for workers that haven't started yet.
-        if GriptapeNodes.get_session_id():
+        if self.engine.get_session_id():
             await self._await_pending_workers()
 
         # Register all secrets now that libraries are loaded and settings are merged
-        GriptapeNodes.SecretsManager().register_all_secrets()
+        self.engine.secrets_manager.register_all_secrets()
 
         # We have to load all libraries before we attempt to load workflows.
 
         # This will (attempts to) load all workflows specified by LIBRARIES. User workflows are loaded later.
         library_workflow_files_to_register = await self._collect_library_workflow_files()
-        await GriptapeNodes.WorkflowManager().register_list_of_workflows(library_workflow_files_to_register)
+        await self.engine.workflow_manager.register_list_of_workflows(library_workflow_files_to_register)
 
         # Go tell the Workflow Manager that it's turn is now.
-        await GriptapeNodes.WorkflowManager().refresh_workflow_registry()
+        await self.engine.workflow_manager.refresh_workflow_registry()
 
         # Signal readiness so the application layer can render its library status
         # table and "engine ready" banner, and other consumers (the GUI, the
@@ -4143,7 +4145,7 @@ class LibraryManager:
         # owned by the app, not the engine. The library statuses reflect real
         # fitness because workers have already reported back above.
         if not self._is_worker:
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineReadyEvent(
                         libraries=self._collect_library_load_statuses(),
@@ -4159,7 +4161,7 @@ class LibraryManager:
         to sys.path so relative imports work when the workflow is loaded.
         """
         workflow_files: list[str] = []
-        library_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+        library_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
         if not isinstance(library_result, ListRegisteredLibrariesResultSuccess):
             return workflow_files
         for library_name in library_result.libraries:
@@ -4204,9 +4206,9 @@ class LibraryManager:
         not send that request, so this method handles the case at the end of library
         initialization.
         """
-        if self._is_worker or not GriptapeNodes.get_session_id():
+        if self._is_worker or not self.engine.get_session_id():
             return
-        worker_manager = GriptapeNodes.WorkerManager()
+        worker_manager = self._worker_manager
         if worker_manager is not None:
             worker_manager.set_session_ready()
             await self._start_workers()
@@ -4231,7 +4233,7 @@ class LibraryManager:
             return
 
         if wait_seconds is None:
-            config_mgr = GriptapeNodes.ConfigManager()
+            config_mgr = self.engine.config_manager
             wait_seconds = config_mgr.get_config_value(
                 WORKER_HEARTBEAT_STARTUP_GRACE_KEY, default=600.0, cast_type=float
             )
@@ -4427,7 +4429,7 @@ class LibraryManager:
         """
         if self._is_worker:
             return False
-        return bool(GriptapeNodes.ConfigManager().get_config_value(LIBRARY_LAZY_NODE_LOADING_KEY, default=True))
+        return bool(self.engine.config_manager.get_config_value(LIBRARY_LAZY_NODE_LOADING_KEY, default=True))
 
     def _register_node_eager(
         self,
@@ -4640,7 +4642,7 @@ class LibraryManager:
                         len(handlers),
                     )
                 for request_type, handler in handlers:
-                    event_manager = GriptapeNodes.EventManager()
+                    event_manager = self.engine.event_manager
                     event_manager.assign_manager_to_request_type(request_type, handler)
                     library._registered_request_handler_types.append(request_type)
                 if handlers:
@@ -4973,7 +4975,7 @@ class LibraryManager:
             content=library_schema.model_dump_json(indent=2),
             encoding="utf-8",
         )
-        write_result = GriptapeNodes.handle_request(write_request)
+        write_result = self.engine.handle_request(write_request)
 
         if write_result.failed():
             logger.error("Failed to write library schema to '%s': %s", json_path, write_result.result_details)
@@ -5004,7 +5006,7 @@ class LibraryManager:
         if is_incompatible or not registered_path:
             return manifest_default
 
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         raw_entries = config_mgr.get_config_value(LIBRARIES_TO_REGISTER_KEY) or []
         target_path_lower = registered_path.lower()
         for entry in raw_entries:
@@ -5033,7 +5035,7 @@ class LibraryManager:
 
     def _remove_missing_libraries_from_config(self, config_category: str) -> None:
         # Now remove all libraries that were missing from the user's config.
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         libraries_to_register_category = config_mgr.get_config_value(config_category)
 
         paths_to_remove = set()
@@ -5059,7 +5061,7 @@ class LibraryManager:
         the libraries are re-downloaded. This migration happens automatically on app startup,
         so users don't need to run gtn init.
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
 
         # Get both config lists
         register_key = LIBRARIES_TO_REGISTER_KEY
@@ -5156,14 +5158,14 @@ class LibraryManager:
     async def _run_reload_libraries(self, request: ReloadAllLibrariesRequest) -> ResultPayload:  # noqa: ARG002
         # Start with a clean slate.
         clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-        clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
+        clear_all_result = await self.engine.ahandle_request(clear_all_request)
         if not clear_all_result.succeeded():
             details = "Failed to clear the existing object state when preparing to reload all libraries."
             return ReloadAllLibrariesResultFailure(result_details=details)
 
         # Unload all libraries now.
         all_libraries_request = ListRegisteredLibrariesRequest(broadcast_result=False)
-        all_libraries_result = await GriptapeNodes.ahandle_request(all_libraries_request)
+        all_libraries_result = await self.engine.ahandle_request(all_libraries_request)
         if not isinstance(all_libraries_result, ListRegisteredLibrariesResultSuccess):
             details = "When preparing to reload all libraries, failed to get registered libraries."
             logger.error(details)
@@ -5171,7 +5173,7 @@ class LibraryManager:
 
         for library_name in all_libraries_result.libraries:
             unload_library_request = UnloadLibraryFromRegistryRequest(library_name=library_name)
-            unload_library_result = GriptapeNodes.handle_request(unload_library_request)
+            unload_library_result = self.engine.handle_request(unload_library_request)
             if not unload_library_result.succeeded():
                 details = f"When preparing to reload all libraries, failed to unload library '{library_name}'."
                 logger.error(details)
@@ -5201,7 +5203,7 @@ class LibraryManager:
         # fitness now that workers have reported back. is_initial_start=False so the app
         # refreshes the table without re-showing the startup banner. Orchestrator only.
         if not self._is_worker:
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineReadyEvent(
                         libraries=self._collect_library_load_statuses(),
@@ -5382,7 +5384,7 @@ class LibraryManager:
         problems: list[LibraryProblem] = []
 
         # Check for version-based compatibility issues
-        version_issues = GriptapeNodes.VersionCompatibilityManager().check_library_version_compatibility(schema)
+        version_issues = self.engine.version_compatibility_manager.check_library_version_compatibility(schema)
         has_disqualifying_issues = False
 
         for issue in version_issues:
@@ -5402,7 +5404,7 @@ class LibraryManager:
         # stage. A denial is rendered as a fitness problem and marks the library
         # UNUSABLE, so it is not registered and the GUI shows every missing
         # permission on the failure icon. With no hook installed this allows.
-        denial = GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        denial = self.engine.event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.LOAD_LIBRARY,
                 subject_type=CheckpointSubjectType.LIBRARY,
@@ -5425,7 +5427,9 @@ class LibraryManager:
         # without blocking the library, which stays usable for its permitted nodes.
         # Instantiating a denied node later substitutes an Error Proxy via the same
         # checkpoint. Runs on the schema, so no library module is imported here.
-        node_denials = GriptapeNodes.NodeManager().evaluate_schema_node_instantiation_denials(schema)
+        node_denials = self.engine.node_manager.evaluate_schema_node_instantiation_denials(
+            schema, event_manager=self.engine.event_manager
+        )
         for node_type, node_denial in node_denials.items():
             problems.append(NodePermissionDeniedProblem(node_type=node_type, messages=node_denial.messages()))
 
@@ -5505,7 +5509,7 @@ class LibraryManager:
                 if pre_register_info and pre_register_info.library_name
                 else Path(lib_path).stem
             )
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineInitializationProgress(
                         phase=InitializationPhase.LIBRARIES,
@@ -5541,7 +5545,7 @@ class LibraryManager:
                 loaded_count += 1
 
                 # Emit success event
-                GriptapeNodes.EventManager().put_event(
+                self.engine.event_manager.put_event(
                     AppEvent(
                         payload=EngineInitializationProgress(
                             phase=InitializationPhase.LIBRARIES,
@@ -5563,7 +5567,7 @@ class LibraryManager:
                     if isinstance(load_result.result_details, ResultDetails)
                     else str(load_result.result_details)
                 )
-                GriptapeNodes.EventManager().put_event(
+                self.engine.event_manager.put_event(
                     AppEvent(
                         payload=EngineInitializationProgress(
                             phase=InitializationPhase.LIBRARIES,
@@ -5597,7 +5601,7 @@ class LibraryManager:
             workspace resolution). Directory entries expand to one entry per discovered
             library file; every child inherits the parent's `registered_path`.
         """
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         user_libraries_section = LIBRARIES_TO_REGISTER_KEY
 
         discovered_entries: list[LibraryManager.DiscoveredLibraryEntry] = []
@@ -5641,7 +5645,9 @@ class LibraryManager:
         # libraries_to_register config (which would leak it into every project).
         download_libraries = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
         for download in normalize_library_downloads(download_libraries):
-            manifest_path = await self._installed_manifest_path_for_download(download)
+            manifest_path = await self._installed_manifest_path_for_download(
+                download, config_mgr.resolved_libraries_root()
+            )
             if manifest_path is not None:
                 await process_path(manifest_path, enabled=True, registered_path=str(manifest_path))
 
@@ -5666,7 +5672,7 @@ class LibraryManager:
 
     def _read_minimum_release_age_config(self) -> MinimumReleaseAgeConfig:
         """Read the minimum-release-age setting once. Centralizes the key literal and default handling."""
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         # get_config_value returns None for an explicit `null` override (it bypasses both cast_type
         # and the default in that case), so coalesce None back to the default here to keep the gate
         # fail-open rather than raising when float(None) is attempted.
@@ -5996,7 +6002,7 @@ class LibraryManager:
             On failure: ResultPayloadFailure instance
         """
         # Unload the library
-        unload_result = GriptapeNodes.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
+        unload_result = self.engine.handle_request(UnloadLibraryFromRegistryRequest(library_name=library_name))
         if not unload_result.succeeded():
             details = f"Failed to unload Library '{library_name}' after git operation."
             return failure_result_class(result_details=details)
@@ -6042,7 +6048,7 @@ class LibraryManager:
         self._library_file_path_to_info[actual_library_file_path] = lib_info
 
         # Reload the library from file
-        reload_result = await GriptapeNodes.ahandle_request(
+        reload_result = await self.engine.ahandle_request(
             RegisterLibraryFromFileRequest(file_path=actual_library_file_path)
         )
         if not isinstance(reload_result, RegisterLibraryFromFileResultSuccess):
@@ -6236,7 +6242,7 @@ class LibraryManager:
         download_directory = request.download_directory
 
         # Determine the parent directory for the download
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
 
         if download_directory is not None:
             # Use custom download directory if provided
@@ -6264,7 +6270,7 @@ class LibraryManager:
             if request.overwrite_existing:
                 # Delete existing directory before cloning
                 delete_request = DeleteFileRequest(path=str(target_path), workspace_only=False)
-                delete_result = await GriptapeNodes.ahandle_request(delete_request)
+                delete_result = await self.engine.ahandle_request(delete_request)
 
                 if isinstance(delete_result, DeleteFileResultFailure):
                     details = f"Cannot delete existing directory at {target_path}: {delete_result.result_details}"
@@ -6333,7 +6339,7 @@ class LibraryManager:
             self._library_file_path_to_info[str(library_json_path)] = lib_info
 
             register_request = RegisterLibraryFromFileRequest(file_path=str(library_json_path))
-            register_result = await GriptapeNodes.ahandle_request(register_request)
+            register_result = await self.engine.ahandle_request(register_request)
             if not register_result.succeeded():
                 return DownloadLibraryResultFailure(
                     result_details=f"Library '{library_name}' downloaded but failed to register: {register_result.result_details}"
@@ -6414,7 +6420,7 @@ class LibraryManager:
             return InstallLibraryDependenciesResultFailure(result_details=details)
 
         # Check disk space
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
         min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_libraries")
         if not OSManager.check_available_disk_space(Path(venv_path), min_space_gb):
             error_msg = OSManager.format_disk_space_error(Path(venv_path))
@@ -6563,7 +6569,7 @@ class LibraryManager:
     async def sync_libraries_request(self, request: SyncLibrariesRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         """Sync all libraries to latest versions and ensure dependencies are installed."""
         # Phase 1: Download missing libraries from both config keys
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
 
         # Collect git URLs from both config keys
         download_config = config_mgr.get_config_value(LIBRARIES_TO_DOWNLOAD_KEY, default=[])
@@ -6600,7 +6606,7 @@ class LibraryManager:
         # Phase 2: Load libraries to ensure newly downloaded ones are registered
         logger.info("Loading libraries to register newly downloaded ones")
         load_request = LoadLibrariesRequest()
-        load_result = await GriptapeNodes.ahandle_request(load_request)
+        load_result = await self.engine.ahandle_request(load_request)
 
         if not isinstance(load_result, LoadLibrariesResultSuccess):
             logger.warning("Failed to load libraries after download: %s", load_result.result_details)
@@ -6608,7 +6614,7 @@ class LibraryManager:
 
         # Phase 3: Check and update all registered libraries
         # Get all registered libraries
-        list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+        list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
         if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
             details = "Failed to list registered libraries for sync"
             return SyncLibrariesResultFailure(result_details=details)
@@ -6621,7 +6627,7 @@ class LibraryManager:
         async def check_library_for_update(library_name: str) -> tuple[str, ResultPayload]:
             """Check a single library for updates."""
             logger.info("Checking library '%s' for updates", library_name)
-            check_result = await GriptapeNodes.ahandle_request(
+            check_result = await self.engine.ahandle_request(
                 CheckLibraryUpdateRequest(library_name=library_name, failure_log_level=logging.DEBUG)
             )
             return library_name, check_result
@@ -6688,7 +6694,7 @@ class LibraryManager:
         async def update_library(library_name: str, old_version: str, new_version: str) -> LibraryUpdateResult:
             """Update a single library."""
             logger.info("Updating library '%s' from %s to %s", library_name, old_version, new_version)
-            update_result = await GriptapeNodes.ahandle_request(
+            update_result = await self.engine.ahandle_request(
                 UpdateLibraryRequest(
                     library_name=library_name,
                     overwrite_existing=request.overwrite_existing,
