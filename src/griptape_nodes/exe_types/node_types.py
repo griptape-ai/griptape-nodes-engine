@@ -1588,8 +1588,7 @@ class BaseNode(ABC):
             )
         else:
             event_data = parameter.to_event(self)
-            # Mirror the display-preservation logic from TrackedParameterOutputValues._emit_parameter_change_event:
-            # when substitution ran during aprocess, show the raw template instead of the resolved value.
+            # Mirror display-preservation guard from TrackedParameterOutputValues._emit_parameter_change_event.
             if _in_aprocess.get() and "value" in event_data:
                 event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
@@ -1747,7 +1746,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get():
-            value = self._node._resolve_variables_in_value(value)
+            param = self._node.get_parameter_by_name(key)
+            if param is None or param.allow_variable_substitution:
+                value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
