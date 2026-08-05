@@ -9,8 +9,10 @@ unknown and slips through.
 These tests pin the fail-closed contract:
 
   - a denied repo stays denied no matter which string shape it renders as
-  - a repo absent from the catalog is refused rather than offered, because an undeclared model
-    carries no ``ModelProvider`` parent edge and no provider-scoped policy can reach it
+  - a repo absent from the catalog is refused rather than offered -- an undeclared model carries no
+    ``ModelProvider`` parent edge, so no provider-scoped policy can reach it. This applies only
+    when the catalog is a complete picture of what the parameter offers; see
+    ``test_huggingface_subclass_gating.py`` for the cases where it is not and absence is allowed.
   - an ungated parameter keeps the historical "offer whatever is cached" behavior
 """
 

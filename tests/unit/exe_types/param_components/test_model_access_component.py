@@ -454,7 +454,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             self._build_component_against_unresolved_node()
 
-        matches = [r for r in caplog.records if "engine could not resolve access" in r.message]
+        matches = [r for r in caplog.records if "Could not resolve model access" in r.message]
         assert matches, "Expected a warning log about unresolved access; got none."
         assert "_AccessProbeNode" in matches[0].message
 

@@ -6,7 +6,6 @@ from griptape_nodes.exe_types.param_components.huggingface.huggingface_utils imp
     list_all_repo_revisions_in_cache,
     list_repo_revisions_in_cache,
 )
-from griptape_nodes.traits.options import Options
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -22,13 +21,14 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         deprecated_repo_ids: list[str] | None = None,
         gated: bool | None = None,
     ):
-        super().__init__(node, parameter_name, gated=gated)
-
+        # Set before super().__init__, which queries policy and reads these via
+        # offers_only_declared_repos() / filter_choices().
         deprecated_repo_ids = deprecated_repo_ids or []
-        self._deprecated_repos = deprecated_repo_ids
-
         self._repo_ids = repo_ids + deprecated_repo_ids
         self._list_all_models = list_all_models
+
+        super().__init__(node, parameter_name, gated=gated, deprecated_repos=deprecated_repo_ids)
+
         self.refresh_parameters()
 
     def fetch_repo_revisions(self) -> list[tuple[str, str]]:
@@ -37,70 +37,14 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
             return sorted(all_revisions, key=lambda x: x[0] not in self._repo_ids)
         return [repo_revision for repo in self._repo_ids for repo_revision in list_repo_revisions_in_cache(repo)]
 
-    def _is_deprecated(self, repo: str) -> bool:
-        return repo in self._deprecated_repos
+    def offers_only_declared_repos(self) -> bool:
+        """False under ``list_all_models``, which offers every repo in the local cache.
 
-    def refresh_parameters(self, value_being_set: str | None = None) -> None:
-        """Override to filter deprecated models except the currently selected one.
-
-        Args:
-            value_being_set: Optional value that's being set (used during after_value_set)
+        The library author enumerated ``repo_ids``, but this mode surfaces whatever else the artist
+        has pulled down, which no catalog could enumerate ahead of time. Refusing those would turn
+        most of the dropdown into "not permitted by your license" rows that no policy ever denied.
         """
-        parameter = self._node.get_parameter_by_name(self._parameter_name)
-        if parameter is None:
-            logger.debug(
-                "Parameter '%s' not found on node '%s'; cannot refresh choices.",
-                self._parameter_name,
-                self._node.name,
-            )
-            return
-
-        self._refresh_downloading_model_ids()
-        # Re-query license policy alongside the cache scan, matching the base class, so row
-        # decoration and the badge reflect the current license on every refresh. Guarded on the
-        # configured mode rather than `_gated`, which under auto-detect is the query's result.
-        if self._gate_mode is not False:
-            self._refresh_policy()
-        # Get all cached models
-        all_choices = self.get_choices()
-        if not all_choices:
-            super().refresh_parameters()
-            return
-
-        # Get current value - use value_being_set if provided (during after_value_set)
-        current_value = (
-            value_being_set if value_being_set is not None else self._node.get_parameter_value(self._parameter_name)
-        )
-
-        # Filter: include non-deprecated models, and deprecated model if it's currently selected
-        filtered_choices = []
-        for choice in all_choices:
-            repo_id, _ = self._key_to_repo_revision(choice)
-            is_deprecated = self._is_deprecated(repo_id)
-
-            # Include if: not deprecated OR matches current/being-set value
-            if not is_deprecated or choice == current_value:
-                filtered_choices.append(choice)
-
-        # If no choices after filtering, include all (initial state)
-        if not filtered_choices:
-            super().refresh_parameters()
-            return
-
-        # Determine default value
-        if current_value and current_value in filtered_choices:
-            default_value = current_value
-        else:
-            default_value = self._preferred_default(filtered_choices)
-
-        if parameter.find_elements_by_type(Options):
-            self._node._update_option_choices(self._parameter_name, filtered_choices, default_value)
-        else:
-            parameter.add_trait(Options(choices=filtered_choices))
-
-        self._apply_data_choices(parameter, filtered_choices)
-        self._apply_denial_badge(parameter, default_value)
-        self._update_download_button_visibility()
+        return not self._list_all_models
 
     def add_input_parameters(self) -> None:
         """Override to apply deprecated model filtering after parameter creation."""

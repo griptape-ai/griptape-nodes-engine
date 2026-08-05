@@ -6,9 +6,15 @@ from pathlib import Path
 from huggingface_hub.constants import HF_HUB_CACHE
 
 from griptape_nodes.exe_types.node_types import BaseNode
-from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import HuggingFaceModelParameter
+from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import (
+    NO_MODELS_PLACEHOLDER,
+    HuggingFaceModelParameter,
+)
 
 logger = logging.getLogger("griptape_nodes")
+
+# "owner/repo/variant" -- the number of slash-separated segments in a full variant key.
+_VARIANT_KEY_SEGMENTS = 3
 
 
 def _get_repo_cache_path(repo_id: str) -> Path | None:
@@ -92,6 +98,8 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
         repo_id: str,
         variants: list[str],
         parameter_name: str = "model",
+        *,
+        gated: bool | None = None,
     ):
         """Initialize the parameter.
 
@@ -100,8 +108,9 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
             repo_id: The HuggingFace repo ID (e.g., "Lightricks/LTX-2")
             variants: List of variant/subfolder names (e.g., ["ltx-2-19b-dev", "ltx-2-19b-dev-fp8"])
             parameter_name: Name of the parameter (default: "model")
+            gated: License enforcement mode; see `HuggingFaceModelParameter.__init__`.
         """
-        super().__init__(node, parameter_name)
+        super().__init__(node, parameter_name, gated=gated)
         self._repo_id = repo_id
         self._variants = variants
         self.refresh_parameters()
@@ -115,11 +124,14 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
     def _key_to_repo_variant(cls, key: str) -> tuple[str, str]:
         """Parse a display key back to repo_id and variant.
 
-        Key format: "owner/repo/variant"
+        Key format: "owner/repo/variant". A key with fewer than three segments is a bare
+        "owner/repo" -- a value saved before this parameter offered variants, or one that reached
+        here from another source -- and must be returned whole. Splitting it would yield the owner
+        alone as the repo id, which matches no HuggingFace repo and no catalog entry.
         """
-        parts = key.rsplit("/", 1)
-        if len(parts) == 2:  # noqa: PLR2004
-            return parts[0], parts[1]
+        if key.count("/") >= _VARIANT_KEY_SEGMENTS - 1:
+            repo_id, _, variant = key.rpartition("/")
+            return repo_id, variant
         # Fallback: treat entire key as repo_id with empty variant
         return key, ""
 
@@ -150,6 +162,19 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
         ]
 
     def _get_model_search_term(self, choice: str) -> str:
+        repo_id, _ = self._key_to_repo_variant(choice)
+        return repo_id
+
+    def repo_id_for_choice(self, choice: str) -> str | None:
+        """Reduce an ``owner/repo/variant`` key to the ``owner/repo`` the catalog declares.
+
+        Required override: this subclass renders a third key shape that the base implementation
+        does not recognize, and a catalog declares the repo, not each variant within it. Without
+        this, every variant row would fail to match and be refused as undeclared -- including
+        permitted ones.
+        """
+        if not choice or choice == NO_MODELS_PLACEHOLDER:
+            return None
         repo_id, _ = self._key_to_repo_variant(choice)
         return repo_id
 

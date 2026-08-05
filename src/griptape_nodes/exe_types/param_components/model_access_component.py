@@ -6,6 +6,15 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
+Policy itself lives in ``model_policy``, shared with ``HuggingFaceModelParameter``
+(which builds its choices by scanning the local HuggingFace cache instead of from
+a declared list). The two components own their ``Parameter`` differently and do
+not compose, but they must not disagree about whether a model is permitted, so
+the snapshot, the query, and the denial wording are common. This component
+enumerates its choices at authoring time, so it leaves
+``refuse_unrecognized`` off: an id absent from the catalog is an already-vetted
+value rather than something to gate user work on.
+
 Usage — one construction step per parameter:
 
     class DescribeImage(ControlNode):
@@ -68,15 +77,20 @@ Composition (not inheritance) is deliberate. Three reasons:
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.exe_types.param_components.model_policy import (
+    DENIED_ROW_ICON,
+    DENIED_ROW_SUBTITLE,
+    ModelPolicySnapshot,
+    apply_denial_badge,
+    query_model_policy,
+)
 from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -85,42 +99,10 @@ logger = logging.getLogger("griptape_nodes")
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
-    from griptape_nodes.retained_mode.events.base_events import ResultPayload
+    from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
     from griptape_nodes.traits.button import ButtonDetailsMessagePayload
 
 _REFRESH_ICON = "list-restart"
-_DENIED_ROW_ICON = "shield-off"
-_DENIED_ROW_SUBTITLE = "Not permitted by your license"
-_BADGE_TITLE = "Model Not Permitted"
-
-
-@dataclass
-class _AccessSnapshot:
-    """The cached result of one ``QueryModelAccessForNodeRequest``.
-
-    Two lookup tables over the same set of verdicts, both keyed by the
-    dropdown-name (``provider_model_id``) so a caller with a dropdown value
-    can look up (a) whether it's denied and (b) what catalog id the engine
-    policy matches on.
-
-    Grouped so the "refresh replaces both atomically" contract is visible:
-    ``ModelAccessComponent._fetch_snapshot()`` returns a whole new snapshot,
-    which the component assigns to ``self._snapshot`` in one step. The tables
-    never drift because they're never mutated in place.
-
-    ``resolution_failure_detail`` is set (non-``None``) when the engine could
-    not answer the query at all -- e.g. the node's class name isn't registered
-    against a library, or the manifest declaration is missing. In that case
-    both lookup tables are empty (we know NOTHING about denials or catalog
-    ids), but the component must NOT treat "no denials known" as "no denials"
-    at runtime. ``ModelAccessComponent.query_for_denial()`` synthesizes a
-    denial from this detail so the run fails closed with a clear error, rather
-    than silently letting a would-be-gated model through.
-    """
-
-    denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
-    catalog_id_by_provider_id: dict[str, str] = field(default_factory=dict)
-    resolution_failure_detail: str | None = None
 
 
 class ModelAccessComponent:
@@ -193,8 +175,8 @@ class ModelAccessComponent:
 
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
-        # _AccessSnapshot's docstring for the contract.
-        self._snapshot: _AccessSnapshot = self._fetch_snapshot()
+        # ModelPolicySnapshot's docstring for the contract.
+        self._snapshot: ModelPolicySnapshot = self._fetch_snapshot()
 
         # Install decoration + traits.
         parameter.add_trait(Options(choices=list(self._model_choices)))
@@ -260,16 +242,7 @@ class ModelAccessComponent:
         if not isinstance(value, str):
             parameter.clear_badge()
             return
-        denial = self._snapshot.denial_by_provider_id.get(value)
-        if denial is None:
-            parameter.clear_badge()
-            return
-        parameter.set_badge(
-            variant="error",
-            title=_BADGE_TITLE,
-            message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
-            icon=_DENIED_ROW_ICON,
-        )
+        apply_denial_badge(parameter, value, self._snapshot.denial_by_provider_id.get(value))
 
     def refresh(self) -> None:
         """Re-query the engine and rebuild the decoration + current-selection badge.
@@ -299,7 +272,7 @@ class ModelAccessComponent:
 
         - Non-string values (driver objects, ``None``, anything else): return
           ``None``. Bypasses the gate entirely -- see paragraph above.
-        - Initial snapshot resolution failed (see ``_AccessSnapshot``): return
+        - Initial snapshot resolution failed (see ``ModelPolicySnapshot``): return
           a **synthesized** denial with a "policy could not be evaluated"
           reason. This is the fail-closed contract -- a broken library
           registration must not silently let denied models through.
@@ -319,14 +292,18 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
-        # Fail-closed: if the initial snapshot couldn't resolve this node at
-        # all, we can't evaluate policy for any value -- but the developer's
-        # setup bug must NOT silently open the gate. Synthesize a denial.
-        if self._snapshot.resolution_failure_detail is not None:
-            return CheckpointDenial(failures=(CheckpointFailure(detail=self._snapshot.resolution_failure_detail),))
+        # Fail-closed on an unresolvable node, then defer to the cached snapshot
+        # for the verdict. `refuse_unrecognized` stays off: these choices were
+        # enumerated by the library author, so an id absent from the catalog is
+        # an already-vetted value rather than something to gate user work on.
+        cached = self._snapshot.denial_for(value)
+        if cached is not None:
+            return cached
         catalog_id = self._snapshot.catalog_id_by_provider_id.get(value)
         if catalog_id is None:
             return None
+        # Re-ask live for the resolved id, so a license change since the last
+        # refresh is honored at run time rather than at decoration time.
         result = GriptapeNodes.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=type(self._node).__name__,
@@ -371,46 +348,15 @@ class ModelAccessComponent:
                 return choice
         return None
 
-    def _fetch_snapshot(self) -> _AccessSnapshot:
-        """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.
+    def _fetch_snapshot(self) -> ModelPolicySnapshot:
+        """Ask the engine for this node type's policy verdicts.
 
-        On ``Success``: populate both lookup tables from the verdicts so they
-        never drift. An empty verdict list is a valid response (node declares
-        no gated models) and yields an empty snapshot with
-        ``resolution_failure_detail=None``.
-
-        On ``Failure`` (or any unexpected result type): log a warning naming
-        the node type + the failure reason, and return a snapshot with
-        ``resolution_failure_detail`` set. This distinguishes "engine says no
-        denials" (fine) from "engine could not answer" (fail-closed at
-        runtime). See ``_AccessSnapshot`` for the fail-closed contract.
+        Fails closed: an unanswerable query yields a snapshot carrying
+        ``failure_detail``, so runtime checks deny rather than reading "no
+        denials known" as "no denials". A node that simply declares no models
+        is a valid empty snapshot, not a failure.
         """
-        node_type = type(self._node).__name__
-        result: ResultPayload = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
-        if not isinstance(result, QueryModelAccessForNodeResultSuccess):
-            details = getattr(result, "result_details", None) or type(result).__name__
-            logger.warning(
-                "ModelAccessComponent: engine could not resolve access for node type '%s' (%s). "
-                "Dropdown decoration is empty and runtime denial checks fail closed for this node. "
-                "Verify that the node's class is registered and its griptape_nodes_library.json "
-                "entry declares a model_usage block.",
-                node_type,
-                details,
-            )
-            return _AccessSnapshot(
-                resolution_failure_detail=(
-                    f"License policy could not be evaluated for node '{node_type}' ({details}). "
-                    "Verify the library manifest declares this node type with a model_usage block."
-                )
-            )
-        snapshot = _AccessSnapshot()
-        for verdict in result.verdicts:
-            if verdict.provider_model_id is None:
-                continue
-            snapshot.catalog_id_by_provider_id[verdict.provider_model_id] = verdict.model_id
-            if verdict.denial is not None:
-                snapshot.denial_by_provider_id[verdict.provider_model_id] = verdict.denial
-        return snapshot
+        return query_model_policy(type(self._node).__name__)
 
     def _build_ui_options(self) -> dict[str, Any]:
         """Build the ``ui_options`` dict that decorates the dropdown row-by-row."""
@@ -418,7 +364,7 @@ class ModelAccessComponent:
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
             if choice in denials:
-                data.append({"name": choice, "icon": _DENIED_ROW_ICON, "subtitle": _DENIED_ROW_SUBTITLE})
+                data.append({"name": choice, "icon": DENIED_ROW_ICON, "subtitle": DENIED_ROW_SUBTITLE})
             else:
                 data.append({"name": choice})
         return {
