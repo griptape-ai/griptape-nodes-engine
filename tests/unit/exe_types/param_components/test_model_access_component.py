@@ -989,3 +989,85 @@ class TestReinstallOptionsKeepsLegacyValues:
         (options_trait,) = param.find_elements_by_type(Options)
         assert "Beta" in options_trait.choices
         assert {row["name"] for row in param.ui_options["data"]} == {"alpha", "beta"}
+
+
+class TestSelectionReadingApi:
+    """The component owns the parameter, so callers never re-derive the current value."""
+
+    def test_parameter_name_and_selected_value_read_the_owned_parameter(self) -> None:
+        node, helper, param = _build_probe_node_with_component(model_choices=["alpha", "beta"], default_model="alpha")
+
+        assert helper.parameter_name == param.name
+        assert helper.selected_value == "alpha"
+
+        node.set_parameter_value(param.name, "beta")
+        assert helper.selected_value == "beta"
+
+    def test_selection_denial_gates_the_current_selection(self, griptape_nodes) -> None:  # noqa: ANN001
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            assert helper.selection_denial() is None
+
+            node.set_parameter_value(param.name, "alpha", initial_setup=True)
+            denial = helper.selection_denial()
+            assert denial is not None
+            assert denial.messages() == ["Alpha not enabled."]
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_raise_if_selection_denied_raises_for_the_current_selection(self, griptape_nodes) -> None:  # noqa: ANN001
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            helper.raise_if_selection_denied()  # permitted: must not raise
+
+            node.set_parameter_value(param.name, "alpha", initial_setup=True)
+            with pytest.raises(RuntimeError, match="not permitted"):
+                helper.raise_if_selection_denied()
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_on_value_set_ignores_other_parameters(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The component filters for its own parameter so nodes can forward unconditionally."""
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            node, helper, param = _build_probe_node_with_component(
+                model_choices=["alpha", "beta"], default_model="beta"
+            )
+            other = Parameter(name="unrelated", type="str", tooltip="")
+            node.add_parameter(other)
+
+            helper.on_value_set(other, "alpha")
+            assert param.get_badge() is None
+
+            helper.on_value_set(param, "alpha")
+            assert param.get_badge() is not None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
