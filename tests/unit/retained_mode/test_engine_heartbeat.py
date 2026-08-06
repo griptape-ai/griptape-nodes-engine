@@ -12,7 +12,7 @@ from griptape_nodes.retained_mode.events.app_events import (
 )
 
 if TYPE_CHECKING:
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestEngineHeartbeatOrchestratorId:
@@ -23,7 +23,7 @@ class TestEngineHeartbeatOrchestratorId:
     identify a worker engine and nest it under its orchestrator.
     """
 
-    def test_orchestrator_reports_none(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_orchestrator_reports_none(self, griptape_nodes: Engine) -> None:
         # No GTN_ORCHESTRATOR_ENGINE_ID in the environment -> this engine IS the orchestrator.
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("GTN_ORCHESTRATOR_ENGINE_ID", None)
@@ -32,7 +32,7 @@ class TestEngineHeartbeatOrchestratorId:
         assert isinstance(result, EngineHeartbeatResultSuccess)
         assert result.orchestrator_engine_id is None
 
-    def test_worker_reports_spawning_orchestrator_id(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_worker_reports_spawning_orchestrator_id(self, griptape_nodes: Engine) -> None:
         # A worker process is spawned with GTN_ORCHESTRATOR_ENGINE_ID set to its parent's id;
         # the heartbeat echoes it so the client can nest this worker under that orchestrator.
         with patch.dict(os.environ, {"GTN_ORCHESTRATOR_ENGINE_ID": "eng-orchestrator"}):

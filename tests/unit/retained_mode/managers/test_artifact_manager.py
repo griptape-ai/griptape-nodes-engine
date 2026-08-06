@@ -4,6 +4,7 @@ import tempfile
 from collections.abc import Generator
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
+from unittest.mock import Mock
 
 import anyio
 import pytest
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 # to the REAL user config files at ~/.config/griptape_nodes/
 #
 # To prevent test pollution of real config files, we MUST mock
-# GriptapeNodes.handle_request to intercept SetConfigValueRequest calls.
+# Engine.handle_request to intercept SetConfigValueRequest calls.
 #
 # Without this mock, running tests will write test provider configs to your
 # actual config files, causing the errors you saw in the editor.
@@ -59,27 +60,31 @@ if TYPE_CHECKING:
 
 @pytest.fixture(autouse=True)
 def mock_config_writes(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Mock GriptapeNodes.handle_request to prevent tests from writing to real config files.
+    """Mock Engine.handle_request to prevent tests from writing to real config files.
 
     This fixture is autouse=True, so it applies to ALL tests in this file automatically.
     Any test that registers providers would otherwise pollute the real user config.
+
+    ArtifactManager resolves its engine through `self.engine`, which falls back to the
+    process-wide current engine when a test constructs it bare (as most tests here do).
+    Patching `Engine.handle_request` at the class level intercepts every such instance's
+    calls, mirroring how the old `GriptapeNodes.handle_request` classmethod patch worked.
     """
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.config_events import SetConfigValueRequest
 
     # Store the original handle_request method
-    original_handle_request = GriptapeNodes.handle_request
+    original_handle_request = Engine.handle_request
 
-    def selective_mock(request: RequestPayload) -> ResultPayload:
+    def selective_mock(self: Engine, request: RequestPayload) -> ResultPayload:
         """Only mock SetConfigValueRequest, let all other requests through."""
         if isinstance(request, SetConfigValueRequest):
             # Mock config writes to prevent test pollution
             return SetConfigValueResultSuccess(result_details="Mocked config write")
         # Let all other requests go to the real handler
-        return original_handle_request(request)
+        return original_handle_request(self, request)
 
-    monkeypatch.setattr(
-        "griptape_nodes.retained_mode.managers.artifact_manager.GriptapeNodes.handle_request", selective_mock
-    )
+    monkeypatch.setattr(Engine, "handle_request", selective_mock)
 
 
 class TestArtifactManager:
@@ -1630,20 +1635,15 @@ class TestProviderRegistrationConfigLogLevels:
             PILThumbnailGenerator,
         )
 
-        manager = ArtifactManager()
+        manager = ArtifactManager(engine=Mock())
         captured_requests: list[RequestPayload] = []
-
-        original = GriptapeNodes.handle_request
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return original(request)
+            return GriptapeNodes.handle_request(request)
 
-        try:
-            GriptapeNodes.handle_request = staticmethod(capture_requests)
-            manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
-        finally:
-            GriptapeNodes.handle_request = original
+        manager.engine.handle_request = capture_requests
+        manager._read_generator_config(ImageArtifactProvider, PILThumbnailGenerator)
 
         category_requests = [r for r in captured_requests if isinstance(r, GetConfigCategoryRequest)]
         assert len(category_requests) == 1
@@ -1657,20 +1657,15 @@ class TestProviderRegistrationConfigLogLevels:
             GetConfigValueRequest,
         )
 
-        manager = ArtifactManager()
+        manager = ArtifactManager(engine=Mock())
         captured_requests: list[RequestPayload] = []
-
-        original = GriptapeNodes.handle_request
 
         def capture_requests(request: RequestPayload) -> ResultPayload:
             captured_requests.append(request)
-            return original(request)
+            return GriptapeNodes.handle_request(request)
 
-        try:
-            GriptapeNodes.handle_request = staticmethod(capture_requests)
-            manager._validate_and_write_provider_settings(ImageArtifactProvider)
-        finally:
-            GriptapeNodes.handle_request = original
+        manager.engine.handle_request = capture_requests
+        manager._validate_and_write_provider_settings(ImageArtifactProvider)
 
         value_requests = [r for r in captured_requests if isinstance(r, GetConfigValueRequest)]
         assert len(value_requests) >= 2  # noqa: PLR2004

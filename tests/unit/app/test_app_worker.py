@@ -66,11 +66,11 @@ def worker_manager() -> WorkerManager:
     gtn.get_engine_id.return_value = _ENGINE
     # WorkerManager reads several float config values at construction; hand back
     # the declared default so asyncio.wait_for / time arithmetic gets a real number.
-    gtn._config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+    gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
     # spawn_worker builds the child env from the orchestrator's pre-project environ;
     # hand back a real dict so {**base_environ, ...} doesn't choke on a MagicMock.
-    gtn.ProjectManager().get_pre_project_environ.return_value = {}
-    wm = WorkerManager(griptape_nodes=gtn, event_manager=MagicMock())
+    gtn.project_manager.get_pre_project_environ.return_value = {}
+    wm = WorkerManager(engine=gtn, event_manager=MagicMock())
     wm.attach_transport(
         ws_outgoing_queue=asyncio.Queue(),
         send_message=AsyncMock(),
@@ -466,7 +466,7 @@ class TestSpawnWorker:
     async def test_spawn_env_stamps_orchestrator_engine_id(self, worker_manager: WorkerManager) -> None:
         # The worker must learn its parent orchestrator's id so it can report it in its
         # discovery heartbeat (orchestrator_engine_id), which the GUI uses to nest workers.
-        worker_manager._griptape_nodes.EngineIdentityManager().active_engine_id = _ENGINE  # type: ignore[union-attr]
+        worker_manager.engine.engine_identity_manager.active_engine_id = _ENGINE  # type: ignore[union-attr]
 
         with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
             await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
@@ -480,7 +480,7 @@ class TestSpawnWorker:
     async def test_spawn_env_omits_orchestrator_id_when_unknown(self, worker_manager: WorkerManager) -> None:
         # Defensive: never put a None into the subprocess env dict. If the orchestrator has
         # no id yet, the key is simply absent (worker heartbeats as an orchestrator).
-        worker_manager._griptape_nodes.EngineIdentityManager().active_engine_id = None  # type: ignore[union-attr]
+        worker_manager.engine.engine_identity_manager.active_engine_id = None  # type: ignore[union-attr]
 
         with patch("asyncio.create_subprocess_exec", return_value=MagicMock()) as mock_exec:
             await worker_manager.spawn_worker(["/usr/bin/gtn", "engine"], "my-key")
@@ -736,7 +736,7 @@ class TestSpawnWhenSessionReady:
     @pytest.mark.asyncio
     async def test_skips_wait_when_session_already_active(self, worker_manager: WorkerManager) -> None:
         """If a session is already active, spawn proceeds without waiting for the event."""
-        worker_manager._griptape_nodes.get_session_id.return_value = _SESSION  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.return_value = _SESSION  # type: ignore[union-attr]
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
             await worker_manager._spawn_when_session_ready("My Library")
@@ -748,7 +748,7 @@ class TestSpawnWhenSessionReady:
     async def test_waits_then_spawns_after_session_ready(self, worker_manager: WorkerManager) -> None:
         """If no session yet, waits for the event and spawns once the session is available."""
         # First call (pre-check) returns None; second call (post-wait) returns session ID.
-        worker_manager._griptape_nodes.get_session_id.side_effect = [None, _SESSION]  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.side_effect = [None, _SESSION]  # type: ignore[union-attr]
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
             task = asyncio.create_task(worker_manager._spawn_when_session_ready("My Library"))
@@ -761,7 +761,7 @@ class TestSpawnWhenSessionReady:
     @pytest.mark.asyncio
     async def test_logs_error_when_no_session_after_event(self, worker_manager: WorkerManager) -> None:
         """If the session event fires but get_session_id still returns None, spawn is not attempted."""
-        worker_manager._griptape_nodes.get_session_id.side_effect = [None, None]  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.side_effect = [None, None]  # type: ignore[union-attr]
         worker_manager._session_ready_event.set()
 
         with patch.object(worker_manager, "spawn_worker", new=AsyncMock()) as mock_spawn:
@@ -863,7 +863,7 @@ class TestGetTopicsToSubscribe:
         assert f"sessions/{_SESSION}/workers/{_ENGINE}/request" not in topics
 
     def test_orchestrator_mode_no_session_excludes_session_topic(self, worker_manager: WorkerManager) -> None:
-        worker_manager._griptape_nodes.get_session_id.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
 
         topics = worker_manager.get_topics_to_subscribe(is_worker=False)
 
@@ -908,15 +908,15 @@ class TestDetermineResponseTopic:
         assert topic == f"sessions/{_SESSION}/response"
 
     def test_returns_engine_response_topic_when_no_session(self, worker_manager: WorkerManager) -> None:
-        worker_manager._griptape_nodes.get_session_id.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
 
         topic = worker_manager._determine_response_topic()
 
         assert topic == f"engines/{_ENGINE}/response"
 
     def test_returns_default_when_no_session_or_engine(self, worker_manager: WorkerManager) -> None:
-        worker_manager._griptape_nodes.get_session_id.return_value = None  # type: ignore[union-attr]
-        worker_manager._griptape_nodes.get_engine_id.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.get_session_id.return_value = None  # type: ignore[union-attr]
+        worker_manager.engine.get_engine_id.return_value = None  # type: ignore[union-attr]
 
         topic = worker_manager._determine_response_topic()
 
@@ -1060,8 +1060,8 @@ class TestWorkerManagerDomainEventListeners:
         gtn = MagicMock()
         gtn.get_session_id.return_value = _SESSION
         gtn.get_engine_id.return_value = _ENGINE
-        gtn._config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
-        wm = WorkerManager(griptape_nodes=gtn, event_manager=EventManager())
+        gtn.config_manager.get_config_value.side_effect = lambda _key, default, cast_type=float: cast_type(default)
+        wm = WorkerManager(engine=gtn, event_manager=EventManager())
         wm.attach_transport(
             ws_outgoing_queue=asyncio.Queue(),
             send_message=AsyncMock(),

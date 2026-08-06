@@ -27,7 +27,7 @@ class TestGetSandboxDirectory:
         config_mgr.workspace_path = Path("/workspace")
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
                 return_value=Path("/workspace/sandbox_library"),
@@ -47,7 +47,7 @@ class TestGetSandboxDirectory:
         config_mgr.workspace_path = Path("/workspace")
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
                 return_value=Path("/opt/sandbox"),
@@ -66,7 +66,7 @@ class TestGetSandboxDirectory:
         config_mgr.get_config_value.return_value = ""
         config_mgr.workspace_path = Path("/workspace")
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr):
+        with patch.object(griptape_nodes, "_config_manager", config_mgr):
             result = library_manager._get_sandbox_directory()
 
         assert result is None
@@ -79,7 +79,7 @@ class TestGetSandboxDirectory:
         config_mgr.workspace_path = Path("/workspace")
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.resolve_workspace_path",
                 return_value=Path("/workspace/sandbox_library"),
@@ -101,7 +101,7 @@ class TestDownloadLibrariesFromGitUrlsPath:
         config_mgr = MagicMock()
         config_mgr.resolved_libraries_root.return_value = Path("/workspace/libraries")
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr):
+        with patch.object(griptape_nodes, "_config_manager", config_mgr):
             result = await library_manager._download_libraries_from_git_urls([])
 
         config_mgr.resolved_libraries_root.assert_called_once_with()
@@ -125,7 +125,7 @@ class TestDownloadLibraryRequestPath:
         request.download_directory = None
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
@@ -153,7 +153,7 @@ class TestDownloadLibraryRequestPath:
         request.download_directory = "/custom/dir"
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",
@@ -188,7 +188,7 @@ class TestDownloadLibraryRequestPath:
         request.fail_on_exists = True
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr),
+            patch.object(griptape_nodes, "_config_manager", config_mgr),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.normalize_github_url",
                 return_value="https://github.com/user/repo.git",

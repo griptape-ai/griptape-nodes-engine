@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import subprocess
@@ -61,6 +62,7 @@ from griptape_nodes.retained_mode.managers.settings import (
     LibraryDownload,
     LibraryRegistration,
 )
+from griptape_nodes.utils.file_utils import DEFAULT_MAX_SEARCH_DEPTH
 from griptape_nodes.utils.library_utils import extract_library_path
 
 
@@ -395,10 +397,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -422,10 +421,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         mock_config_manager.get_config_value.return_value = valid_paths
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -442,10 +438,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         mock_config_manager = MagicMock()
         mock_config_manager.get_config_value.return_value = []
 
-        with patch(
-            "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
-        ):
+        with patch.object(griptape_nodes, "_config_manager", mock_config_manager):
             library_manager._migrate_old_xdg_library_paths()
 
             # Verify config was NOT updated (empty config)
@@ -458,10 +451,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         mock_config_manager = MagicMock()
         mock_config_manager.get_config_value.return_value = None
 
-        with patch(
-            "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-            return_value=mock_config_manager,
-        ):
+        with patch.object(griptape_nodes, "_config_manager", mock_config_manager):
             library_manager._migrate_old_xdg_library_paths()
 
             # Verify config was NOT updated (None config)
@@ -492,10 +482,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -530,10 +517,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -566,10 +550,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -608,10 +589,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -648,10 +626,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -693,10 +668,7 @@ class TestLibraryManagerMigrateOldXdgPaths:
         )
 
         with (
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ConfigManager",
-                return_value=mock_config_manager,
-            ),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
             patch("griptape_nodes.utils.library_utils.xdg_data_home") as mock_xdg,
         ):
             mock_xdg.return_value = Path("/home/user/.local/share")
@@ -2137,19 +2109,17 @@ class TestLibraryManagerEngineVersionCheck:
     def test_satisfied_returns_none(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "_config_manager", self._config_manager_returning(">=0.5,<1.0")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            mock_gn.ConfigManager.return_value = self._config_manager_returning(">=0.5,<1.0")
             assert library_manager._check_engine_version() is None
 
     def test_unsatisfied_returns_detail_naming_running_version(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "_config_manager", self._config_manager_returning(">=2.0,<3.0")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            mock_gn.ConfigManager.return_value = self._config_manager_returning(">=2.0,<3.0")
             detail = library_manager._check_engine_version()
 
         assert detail is not None
@@ -2158,10 +2128,9 @@ class TestLibraryManagerEngineVersionCheck:
     def test_malformed_specifier_returns_detail(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "_config_manager", self._config_manager_returning("not-a-specifier")),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            mock_gn.ConfigManager.return_value = self._config_manager_returning("not-a-specifier")
             detail = library_manager._check_engine_version()
 
         assert detail is not None
@@ -2169,8 +2138,7 @@ class TestLibraryManagerEngineVersionCheck:
 
     def test_no_key_returns_none(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = self._config_manager_returning(None)
+        with patch.object(griptape_nodes, "_config_manager", self._config_manager_returning(None)):
             assert library_manager._check_engine_version() is None
 
 
@@ -2247,6 +2215,10 @@ class TestInstalledLibraryVersion:
     def _config_manager_for(libraries_dir: Path) -> MagicMock:
         config_manager = MagicMock()
         config_manager.resolved_libraries_root.return_value = libraries_dir
+        # find_files_recursive resolves `discovery_max_depth` through this same
+        # config manager (via GriptapeNodes.ConfigManager()), so it needs a real
+        # int here or the recursive walk's depth comparison blows up on a MagicMock.
+        config_manager.get_config_value.return_value = DEFAULT_MAX_SEARCH_DEPTH
         return config_manager
 
     @pytest.mark.asyncio
@@ -2254,25 +2226,23 @@ class TestInstalledLibraryVersion:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert await library_manager._installed_library_version("Griptape Nodes Library") == "0.78.0"
+        with patch.object(griptape_nodes, "_config_manager", self._config_manager_for(libraries_dir)):
+            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) == "0.78.0"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_no_manifest_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
+        with patch.object(griptape_nodes, "_config_manager", self._config_manager_for(libraries_dir)):
+            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = self._config_manager_for(tmp_path / "empty-libraries")
-            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
+        libraries_dir = tmp_path / "empty-libraries"
+        with patch.object(griptape_nodes, "_config_manager", self._config_manager_for(libraries_dir)):
+            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_returns_none_when_manifest_has_no_version(
@@ -2281,9 +2251,8 @@ class TestInstalledLibraryVersion:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         self._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", None)
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = self._config_manager_for(libraries_dir)
-            assert await library_manager._installed_library_version("Griptape Nodes Library") is None
+        with patch.object(griptape_nodes, "_config_manager", self._config_manager_for(libraries_dir)):
+            assert await library_manager._installed_library_version("Griptape Nodes Library", libraries_dir) is None
 
 
 class TestInstalledLibraryManifestPath:
@@ -2299,9 +2268,10 @@ class TestInstalledLibraryManifestPath:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "0.78.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            result = await library_manager._installed_library_manifest_path("Griptape Nodes Library")
+        with patch.object(
+            griptape_nodes, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        ):
+            result = await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir)
         assert result == libraries_dir / "git-lib" / "griptape_nodes_library.json"
 
     @pytest.mark.asyncio
@@ -2309,18 +2279,25 @@ class TestInstalledLibraryManifestPath:
         library_manager = griptape_nodes.LibraryManager()
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other", "Some Other Library", "1.0.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
+        with patch.object(
+            griptape_nodes, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        ):
+            assert (
+                await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir) is None
+            )
 
     @pytest.mark.asyncio
     async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
-                tmp_path / "empty-libraries"
+        libraries_dir = tmp_path / "empty-libraries"
+        with patch.object(
+            griptape_nodes,
+            "_config_manager",
+            TestInstalledLibraryVersion._config_manager_for(libraries_dir),
+        ):
+            assert (
+                await library_manager._installed_library_manifest_path("Griptape Nodes Library", libraries_dir) is None
             )
-            assert await library_manager._installed_library_manifest_path("Griptape Nodes Library") is None
 
 
 class TestInstalledDownloadVersion:
@@ -2342,9 +2319,10 @@ class TestInstalledDownloadVersion:
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "git-lib", "Griptape Nodes Library", "1.2.3")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert await library_manager._installed_download_version(download) == "1.2.3"
+        with patch.object(
+            griptape_nodes, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        ):
+            assert await library_manager._installed_download_version(download, libraries_dir) == "1.2.3"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_repo_directory_absent(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
@@ -2352,9 +2330,10 @@ class TestInstalledDownloadVersion:
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "other-lib", "Other", "1.0.0")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert await library_manager._installed_download_version(download) is None
+        with patch.object(
+            griptape_nodes, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        ):
+            assert await library_manager._installed_download_version(download, libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_name_overrides_directory_match(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
@@ -2364,19 +2343,22 @@ class TestInstalledDownloadVersion:
         libraries_dir = tmp_path / "libraries"
         TestInstalledLibraryVersion._write_manifest(libraries_dir / "legacy-dir", "Griptape Nodes Library", "0.9.0")
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0", name="Griptape Nodes Library")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            assert await library_manager._installed_download_version(download) == "0.9.0"
+        with patch.object(
+            griptape_nodes, "_config_manager", TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        ):
+            assert await library_manager._installed_download_version(download, libraries_dir) == "0.9.0"
 
     @pytest.mark.asyncio
     async def test_returns_none_when_libraries_root_empty(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         library_manager = griptape_nodes.LibraryManager()
         download = LibraryDownload(git_url="griptape-ai/git-lib@v2.0", version=">=1.0")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = TestInstalledLibraryVersion._config_manager_for(
-                tmp_path / "empty-libraries"
-            )
-            assert await library_manager._installed_download_version(download) is None
+        libraries_dir = tmp_path / "empty-libraries"
+        with patch.object(
+            griptape_nodes,
+            "_config_manager",
+            TestInstalledLibraryVersion._config_manager_for(libraries_dir),
+        ):
+            assert await library_manager._installed_download_version(download, libraries_dir) is None
 
     @pytest.mark.asyncio
     async def test_explicit_libraries_path_probes_target_not_live(
@@ -2393,8 +2375,7 @@ class TestInstalledDownloadVersion:
         # libraries_directory must never be read.
         live_config.get_config_value.return_value = str(tmp_path / "live" / "libraries")
         live_config.workspace_path = str(tmp_path / "live")
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = live_config
+        with patch.object(griptape_nodes, "_config_manager", live_config):
             assert await library_manager._installed_download_version(download, target_libs) == "3.3.0"
         live_config.get_config_value.assert_not_called()
 
@@ -2421,10 +2402,9 @@ class TestDiscoverProvisionedManifestPaths:
         # provisioning the pinned library.
         config = [str(expected_manifest)]
 
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
-            mock_gn.ConfigManager.return_value = config_manager
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
+        with patch.object(griptape_nodes, "_config_manager", config_manager):
             result = await library_manager._discover_library_files()
 
         discovered_paths = [Path(entry.registration.path) for entry in result if entry.registration.path is not None]
@@ -2439,10 +2419,9 @@ class TestDiscoverProvisionedManifestPaths:
         # A register entry whose path is not on disk yet: nothing to discover.
         config = [str(libraries_dir / "missing" / "griptape_nodes_library.json")]
 
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
-            config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
-            mock_gn.ConfigManager.return_value = config_manager
+        config_manager = TestInstalledLibraryVersion._config_manager_for(libraries_dir)
+        config_manager.get_config_value.side_effect = _config_value_dispatcher(libraries_dir, config)
+        with patch.object(griptape_nodes, "_config_manager", config_manager):
             result = await library_manager._discover_library_files()
 
         assert result == []
@@ -2519,11 +2498,10 @@ class TestReconcileLibrariesFromConfig:
         register_config = ["griptape_nodes_library.json", {"path": "../shared/lib"}]
         config_manager = self._config_manager_for_keys(downloads=download_config, register=register_config)
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "_config_manager", config_manager),
             patch.object(library_manager, "_check_engine_version", return_value=None),
             patch.object(library_manager, "_provision_one_library", new=AsyncMock(return_value=None)) as mock_provision,
         ):
-            mock_gn.ConfigManager.return_value = config_manager
             failures = await library_manager._reconcile_libraries_from_config()
 
         assert failures == []
@@ -2536,11 +2514,10 @@ class TestReconcileLibrariesFromConfig:
         download_config = [{"name": "git-lib", "git_url": "griptape-ai/git-lib@v2", "version": ">=2.0"}]
         config_manager = self._config_manager_for_keys(downloads=download_config)
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "_config_manager", config_manager),
             patch.object(library_manager, "_check_engine_version", return_value=None),
             patch.object(library_manager, "_provision_one_library", new=AsyncMock(return_value="clone failed")),
         ):
-            mock_gn.ConfigManager.return_value = config_manager
             failures = await library_manager._reconcile_libraries_from_config()
 
         assert failures == ["clone failed"]
@@ -2579,27 +2556,45 @@ class TestPreviewProjectProvisioning:
         }
 
     @staticmethod
-    def _patch_managers(mock_gn: MagicMock, *, dirs: object, merged: object, libraries_root: object = None) -> None:
+    @contextlib.contextmanager
+    def _patch_managers(
+        griptape_nodes: GriptapeNodes, *, dirs: object, merged: object, libraries_root: object = None
+    ) -> Generator[tuple[MagicMock, MagicMock], None, None]:
         """Wire the mocked ProjectManager/ConfigManager the new handler calls.
 
         `libraries_root` is what resolve_libraries_root_for_project_id returns: None (the default)
         makes the preview fall back to the merged config's workspace-relative libraries dir.
         """
-        mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs = AsyncMock(return_value=dirs)
-        mock_gn.ProjectManager.return_value.resolve_libraries_root_for_project_id = AsyncMock(
-            return_value=libraries_root
-        )
-        mock_gn.ConfigManager.return_value.compute_project_provisioning_config.return_value = merged
+        mock_project_manager = MagicMock()
+        mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=dirs)
+        mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=libraries_root)
+        mock_config_manager = MagicMock()
+        mock_config_manager.compute_project_provisioning_config.return_value = merged
+        with (
+            patch.object(griptape_nodes, "_project_manager", mock_project_manager),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
+        ):
+            yield mock_project_manager, mock_config_manager
 
     @staticmethod
-    def _patch_system_defaults(mock_gn: MagicMock, *, merged: object) -> None:
+    @contextlib.contextmanager
+    def _patch_system_defaults(
+        griptape_nodes: GriptapeNodes, *, merged: object
+    ) -> Generator[tuple[MagicMock, MagicMock], None, None]:
         """Wire the mocked ConfigManager for the system-defaults branch.
 
         System defaults reads its merged config from compute_system_defaults_provisioning_config
         (defaults -> user -> env, no project-adjacent or workspace file), so the handler never
         calls ProjectManager.resolve_provisioning_config_dirs for it.
         """
-        mock_gn.ConfigManager.return_value.compute_system_defaults_provisioning_config.return_value = merged
+        mock_project_manager = MagicMock()
+        mock_config_manager = MagicMock()
+        mock_config_manager.compute_system_defaults_provisioning_config.return_value = merged
+        with (
+            patch.object(griptape_nodes, "_project_manager", mock_project_manager),
+            patch.object(griptape_nodes, "_config_manager", mock_config_manager),
+        ):
+            yield mock_project_manager, mock_config_manager
 
     @pytest.mark.asyncio
     async def test_not_loaded_project_is_failure(self, griptape_nodes: GriptapeNodes) -> None:
@@ -2609,8 +2604,9 @@ class TestPreviewProjectProvisioning:
         )
 
         library_manager = griptape_nodes.LibraryManager()
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs = AsyncMock(return_value=None)
+        mock_project_manager = MagicMock()
+        mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=None)
+        with patch.object(griptape_nodes, "_project_manager", mock_project_manager):
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id="/nope/project.yml")
             )
@@ -2626,8 +2622,7 @@ class TestPreviewProjectProvisioning:
 
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([])
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
+        with self._patch_managers(griptape_nodes, dirs=MagicMock(), merged=merged):
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2656,14 +2651,13 @@ class TestPreviewProjectProvisioning:
         )
         installed = {"skip-lib": "2.1.0", "install-lib": None, "overwrite-lib": "1.0.0"}
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_managers(griptape_nodes, dirs=MagicMock(), merged=merged),
             patch.object(
                 library_manager,
                 "_installed_download_version",
                 new=AsyncMock(side_effect=lambda download, _libraries_path=None: installed[download.name]),
             ),
         ):
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2703,15 +2697,17 @@ class TestPreviewProjectProvisioning:
         # project-adjacent file alone would carry; the plan must reflect this entry.
         merged = self._merged_config([{"name": "merged-lib", "git_url": "griptape-ai/merged-lib@v2", "version": ">=2"}])
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_managers(griptape_nodes, dirs=dirs, merged=merged) as (
+                _mock_project_manager,
+                mock_config_manager,
+            ),
             patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value=None)),
         ):
-            self._patch_managers(mock_gn, dirs=dirs, merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
 
-        compute = mock_gn.ConfigManager.return_value.compute_project_provisioning_config
+        compute = mock_config_manager.compute_project_provisioning_config
         compute.assert_called_once_with(dirs.project_dir, dirs.workspace_dir, apply_override=dirs.apply_override)
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
         assert [a.library_name for a in result.actions] == ["merged-lib"]
@@ -2750,9 +2746,14 @@ class TestPreviewProjectProvisioning:
         # used the target/merged workspace instead, the plan would wrongly be a non-destructive INSTALL.
         live_config = MagicMock()
         live_config.configured_global_workspace_path.return_value = global_ws
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ConfigManager.return_value = live_config
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
+        live_config.compute_project_provisioning_config.return_value = merged
+        mock_project_manager = MagicMock()
+        mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=MagicMock())
+        mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=None)
+        with (
+            patch.object(griptape_nodes, "_project_manager", mock_project_manager),
+            patch.object(griptape_nodes, "_config_manager", live_config),
+        ):
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2790,8 +2791,7 @@ class TestPreviewProjectProvisioning:
             workspace_directory=str(tmp_path / "ws"),
             libraries_directory="libraries",
         )
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged, libraries_root=resolved_root)
+        with self._patch_managers(griptape_nodes, dirs=MagicMock(), merged=merged, libraries_root=resolved_root):
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2813,10 +2813,9 @@ class TestPreviewProjectProvisioning:
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([], engine_version=">=2.0,<3.0")
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_managers(griptape_nodes, dirs=MagicMock(), merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2838,10 +2837,9 @@ class TestPreviewProjectProvisioning:
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([], engine_version=">=0.5,<1.0")
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_managers(griptape_nodes, dirs=MagicMock(), merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            self._patch_managers(mock_gn, dirs=MagicMock(), merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=str(tmp_path / "project.yml"))
             )
@@ -2870,15 +2868,14 @@ class TestPreviewProjectProvisioning:
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([{"name": "user-pin", "git_url": "griptape-ai/user-pin@v2", "version": "==2.0.0"}])
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_system_defaults(griptape_nodes, merged=merged) as (mock_project_manager, _mock_config_manager),
             patch.object(library_manager, "_installed_download_version", new=AsyncMock(return_value="1.0.0")),
         ):
-            self._patch_system_defaults(mock_gn, merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
 
-        mock_gn.ProjectManager.return_value.resolve_provisioning_config_dirs.assert_not_called()
+        mock_project_manager.resolve_provisioning_config_dirs.assert_not_called()
         assert isinstance(result, PreviewProjectProvisioningResultSuccess)
         assert [a.library_name for a in result.actions] == ["user-pin"]
         assert result.actions[0].kind == LibraryProvisioningActionKind.OVERWRITE
@@ -2897,10 +2894,9 @@ class TestPreviewProjectProvisioning:
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([], engine_version=">=2.0,<3.0")
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            self._patch_system_defaults(griptape_nodes, merged=merged),
             patch("griptape_nodes.utils.version_utils.engine_version", "0.5.3"),
         ):
-            self._patch_system_defaults(mock_gn, merged=merged)
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
@@ -2919,8 +2915,7 @@ class TestPreviewProjectProvisioning:
 
         library_manager = griptape_nodes.LibraryManager()
         merged = self._merged_config([])
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn:
-            self._patch_system_defaults(mock_gn, merged=merged)
+        with self._patch_system_defaults(griptape_nodes, merged=merged):
             result = await library_manager.on_preview_project_provisioning_request(
                 PreviewProjectProvisioningRequest(project_id=SYSTEM_DEFAULTS_KEY)
             )
@@ -2960,12 +2955,11 @@ class TestProvisionGitLibraryOverwriteDir:
         success = MagicMock(spec=DownloadLibraryResultSuccess)
         ahandle = AsyncMock(return_value=success)
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "ahandle_request", ahandle),
             patch.object(
                 library_manager, "_installed_library_manifest_path", new=AsyncMock(return_value=manifest_path)
             ),
         ):
-            mock_gn.ahandle_request = ahandle
             failure = await library_manager._provision_git_library(
                 download, git_url="griptape-ai/repo-name@v2.0", installed_version="1.0.0"
             )
@@ -2998,10 +2992,9 @@ class TestProvisionGitLibraryOverwriteDir:
         success = MagicMock(spec=DownloadLibraryResultSuccess)
         ahandle = AsyncMock(return_value=success)
         with (
-            patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gn,
+            patch.object(griptape_nodes, "ahandle_request", ahandle),
             patch.object(library_manager, "_installed_library_manifest_path", new=AsyncMock()) as mock_resolve,
         ):
-            mock_gn.ahandle_request = ahandle
             failure = await library_manager._provision_git_library(
                 download, git_url="griptape-ai/repo-name@v2.0", installed_version=None
             )
@@ -3134,7 +3127,7 @@ class TestDownloadLibraryRegisterPersistence:
         library_manager = griptape_nodes.LibraryManager()
         config_mgr = griptape_nodes.ConfigManager()
 
-        # download_library_request routes registration through GriptapeNodes.ahandle_request;
+        # download_library_request routes registration through the engine's ahandle_request;
         # the minimal fake manifest can't pass full LibrarySchema validation, so mock the
         # registration step to return success so the test stays focused on config persistence.
         mock_register_result = RegisterLibraryFromFileResultSuccess(
@@ -3147,7 +3140,7 @@ class TestDownloadLibraryRegisterPersistence:
                 side_effect=self._make_clone("explicit_lib"),
             ),
             patch.object(
-                GriptapeNodes,
+                griptape_nodes,
                 "ahandle_request",
                 new=AsyncMock(return_value=mock_register_result),
             ),
@@ -3784,16 +3777,18 @@ class TestLibraryManagerDuplicateEntryHygiene:
 
         with (
             patch.object(library_manager, "_library_file_path_to_info", entries),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.handle_request",
+            patch.object(
+                griptape_nodes,
+                "handle_request",
                 return_value=UnloadLibraryFromRegistryResultSuccess(result_details="ok"),
             ),
             patch(
                 "griptape_nodes.retained_mode.managers.library_manager.find_file_in_directory",
                 return_value=Path(new_path),
             ),
-            patch(
-                "griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes.ahandle_request",
+            patch.object(
+                griptape_nodes,
+                "ahandle_request",
                 AsyncMock(return_value=RegisterLibraryFromFileResultSuccess(library_name="MyLib", result_details="ok")),
             ),
             patch.object(LibraryRegistry, "get_library", return_value=mock_library),

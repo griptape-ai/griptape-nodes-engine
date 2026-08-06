@@ -35,7 +35,7 @@ from griptape_nodes.retained_mode.managers.model_manager import DownloadParams, 
 @pytest.fixture
 def model_manager() -> ModelManager:
     """Bare ModelManager without event wiring."""
-    return ModelManager.__new__(ModelManager)
+    return ModelManager()
 
 
 # ---------------------------------------------------------------------------
@@ -255,7 +255,7 @@ class TestOnHandleDeclareModelInvocationRequest:
             return None
 
         GriptapeNodes.EventManager().add_authorization_hook(deny)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         denied = manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
@@ -282,7 +282,7 @@ class TestOnHandleDeclareModelInvocationRequest:
             return CheckpointDenial(failures=())
 
         GriptapeNodes.EventManager().add_authorization_hook(deny)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         denied = manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_claude_opus_4_7")
@@ -400,7 +400,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         griptape_nodes.EventManager().add_authorization_hook(capture)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
@@ -434,7 +434,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         griptape_nodes.EventManager().add_authorization_hook(deny)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         result = manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini", node_name="Probe_1")
@@ -460,7 +460,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         griptape_nodes.EventManager().add_authorization_hook(capture)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_not_declared", node_name="Probe_1")
@@ -481,7 +481,7 @@ class TestDeclareModelInvocationCatalogEnrichment:
             return None
 
         griptape_nodes.EventManager().add_authorization_hook(capture)
-        manager = ModelManager.__new__(ModelManager)
+        manager = ModelManager()
 
         manager.on_handle_declare_model_invocation_request(
             DeclareModelInvocationRequest(model_id="gtc_gpt_image_1_mini")

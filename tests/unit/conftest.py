@@ -8,17 +8,16 @@ from unittest.mock import patch
 
 import pytest
 
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import Engine, current_engine, reset_root_engine
 
 
 @pytest.fixture(autouse=True)
 def isolate_user_config() -> Generator[Path, None, None]:
     """Isolate the user config file during tests to prevent pollution of the real config."""
     import griptape_nodes.retained_mode.managers.config_manager as config_manager_module
-    from griptape_nodes.utils.metaclasses import SingletonMeta
 
-    # Clear any existing singleton instances to force re-initialization with patched config
-    SingletonMeta._instances.clear()
+    # Drop the root engine so managers re-initialize against the patched config below.
+    reset_root_engine()
 
     # Create a temporary directory for the test config
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -31,12 +30,17 @@ def isolate_user_config() -> Generator[Path, None, None]:
         with patch.object(config_manager_module, "USER_CONFIG_PATH", temp_config_path):
             yield temp_config_path
 
-            # Clear singleton instances after test to ensure clean state
-            SingletonMeta._instances.clear()
+            # Drop it again so the next test doesn't inherit this one's object graph.
+            reset_root_engine()
 
 
 @pytest.fixture
-def griptape_nodes() -> GriptapeNodes:
-    """Provide a properly initialized GriptapeNodes instance for testing."""
-    # Initialize GriptapeNodes (it's a singleton, so this returns the existing instance)
-    return GriptapeNodes()
+def engine() -> Engine:
+    """Provide the engine for this test, building it on first use."""
+    return current_engine()
+
+
+@pytest.fixture
+def griptape_nodes() -> Engine:
+    """Alias of `engine`, named for the tests written against the old facade."""
+    return current_engine()
