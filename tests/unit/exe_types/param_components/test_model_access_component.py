@@ -118,6 +118,7 @@ def _build_probe_node_with_component(
     model_choices: list[str],
     default_model: str,
     initial_stored_value: str | None = None,
+    deprecated_values: dict[str, str] | None = None,
 ) -> tuple[_AccessProbeNode, ModelAccessComponent, Parameter]:
     """Build node + parameter + component (fully installed) and return all three.
 
@@ -128,7 +129,8 @@ def _build_probe_node_with_component(
     ``initial_stored_value``: if set, the parameter's stored value is set to
     this via ``set_parameter_value(initial_setup=True)`` BEFORE the component
     is constructed, so the constructor sees it as the current value. Use this
-    to test the "born with a denied value" path.
+    to test the "born with a denied value" path, or a legacy value awaiting
+    migration.
     """
     from griptape_nodes.node_library.library_declarations import ModelUsageNodeProperty
 
@@ -153,6 +155,7 @@ def _build_probe_node_with_component(
         parameter=param,
         model_choices=model_choices,
         default_model=default_model,
+        deprecated_values=deprecated_values,
     )
     return node, component, param
 
@@ -808,3 +811,157 @@ class TestReinstallOptions:
             assert "Alpha not enabled." in badge.message
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+
+class TestDeprecatedValuesValidation:
+    """deprecated_values is validated at construction, same as the component's other preconditions."""
+
+    def test_raises_when_a_value_is_not_a_current_choice(self) -> None:
+        with pytest.raises(ValueError, match="not in model_choices"):
+            _build_probe_node_with_component(
+                model_choices=["alpha", "beta"],
+                default_model="alpha",
+                deprecated_values={"Alpha": "gamma"},
+            )
+
+    def test_raises_when_a_key_collides_with_a_current_choice(self) -> None:
+        with pytest.raises(ValueError, match="already a current choice"):
+            _build_probe_node_with_component(
+                model_choices=["alpha", "beta"],
+                default_model="alpha",
+                deprecated_values={"beta": "alpha"},
+            )
+
+
+class TestDeprecatedValuesMigration:
+    """A legacy stored value is accepted wherever assigned, migrated, and never offered as a fresh selection.
+
+    Every migration here targets ``"beta"``, which is deliberately NOT
+    ``choices[0]``. ``Options`` rewrites a value outside ``choices`` to
+    ``choices[0]``, so a test whose expected result IS ``choices[0]`` would pass
+    even if migration never ran.
+    """
+
+    def test_legacy_value_is_accepted_and_migrated_on_assignment(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        node.set_parameter_value(param.name, "Beta")
+
+        assert node.get_parameter_value(param.name) == "beta"
+
+    def test_legacy_value_is_migrated_on_the_workflow_load_path(self) -> None:
+        """The regression that matters most: workflow load sets values with initial_setup=True.
+
+        Converters run on every set_parameter_value call regardless of
+        initial_setup, so a legacy value is migrated on this path exactly the
+        same as on an artist-driven change -- it is never left un-migrated
+        just because before_value_set / after_value_set didn't fire.
+        """
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        node.set_parameter_value(param.name, "Beta", initial_setup=True)
+
+        assert node.get_parameter_value(param.name) == "beta"
+
+    def test_legacy_value_is_in_options_choices_but_not_in_ui_options_data(self) -> None:
+        """A legacy value must be accepted (in the trait's choices) but never offered (not in the UI rows)."""
+        _node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert "Beta" in options_trait.choices
+
+        data_names = {row["name"] for row in param.ui_options["data"]}
+        assert data_names == {"alpha", "beta"}
+
+    def test_constructor_migrates_an_already_stored_legacy_value(self) -> None:
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            initial_stored_value="Beta",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        assert node.get_parameter_value(param.name) == "beta"
+
+    def test_a_legacy_value_shaped_like_a_catalog_key_migrates(self) -> None:
+        """Legacy keys are arbitrary tokens, not just old display labels.
+
+        A node whose dropdown once stored the catalog's own key for a model
+        declares that migration path here like any other. Nothing about the
+        key's shape is special to the component.
+        """
+        node, _helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            initial_stored_value="gtc_test_beta",
+            deprecated_values={"gtc_test_beta": "beta"},
+        )
+
+        assert node.get_parameter_value(param.name) == "beta"
+
+
+class TestMigrateValue:
+    def test_returns_canonical_choice_for_a_legacy_value(self) -> None:
+        _node, helper, _param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        assert helper.migrate_value("Beta") == "beta"
+
+    def test_returns_none_for_a_current_choice(self) -> None:
+        _node, helper, _param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+
+        assert helper.migrate_value("beta") is None
+
+    def test_returns_none_for_an_unknown_value(self) -> None:
+        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+
+        assert helper.migrate_value("never-heard-of-it") is None
+
+    def test_returns_none_for_non_string_input(self) -> None:
+        _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
+
+        assert helper.migrate_value(None) is None
+        assert helper.migrate_value(123) is None
+
+
+class TestReinstallOptionsKeepsLegacyValues:
+    def test_reinstall_puts_legacy_values_back_into_choices(self) -> None:
+        """reinstall_options() rebuilds Options with the same choices + legacy union.
+
+        A node that strips Options when a driver connects, then reinstalls it
+        when the driver is removed, must not lose the ability to accept a legacy
+        value -- otherwise loading an old workflow after a driver round-trip
+        snaps the value to choices[0].
+        """
+        _node, helper, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Beta": "beta"},
+        )
+        for trait in param.find_elements_by_type(Options):
+            param.remove_trait(trait_type=trait)
+
+        helper.reinstall_options()
+
+        (options_trait,) = param.find_elements_by_type(Options)
+        assert "Beta" in options_trait.choices
+        assert {row["name"] for row in param.ui_options["data"]} == {"alpha", "beta"}

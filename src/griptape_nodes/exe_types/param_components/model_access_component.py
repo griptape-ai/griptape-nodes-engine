@@ -6,6 +6,13 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
+``model_choices`` are ``provider_model_id``s, which the component resolves to
+the catalog ``model_id`` the permission layer gates on. ``deprecated_values``
+covers the values a parameter stored before it adopted that convention (an old
+display label, a retired provider id): each is accepted wherever a value is
+assigned, migrated to its canonical choice, and never offered as a fresh
+selection.
+
 Usage — one construction step per parameter:
 
     class DescribeImage(ControlNode):
@@ -148,8 +155,21 @@ class ModelAccessComponent:
         parameter: Parameter,
         model_choices: list[str],
         default_model: str,
+        deprecated_values: dict[str, str] | None = None,
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
+
+        ``deprecated_values`` maps a historical stored value to the current
+        choice it becomes. Every value in the mapping must be one of
+        ``model_choices``, and no key may itself already be a current choice;
+        either problem raises at construction.
+
+        A legacy value is accepted wherever it is assigned -- the ``Options``
+        trait's ``choices`` include it -- but migrated to its canonical choice
+        by a converter, and never offered as a fresh selection: the dropdown's
+        ``ui_options["data"]`` rows come from ``model_choices`` alone. The
+        parameter's current stored value is migrated the same way at
+        construction, before the denied-default relocation described below.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -167,6 +187,7 @@ class ModelAccessComponent:
         self._parameter = parameter
         self._model_choices = list(model_choices)
         self._default_model = default_model
+        self._deprecated_values = dict(deprecated_values or {})
 
         # Fail-fast preconditions -- see docstring.
         if self._node.get_parameter_by_name(parameter.name) is not parameter:
@@ -190,14 +211,32 @@ class ModelAccessComponent:
                 "refresh Button itself."
             )
             raise ValueError(msg)
+        choice_set = set(self._model_choices)
+        invalid_values = sorted(
+            {legacy for legacy, canonical in self._deprecated_values.items() if canonical not in choice_set}
+        )
+        colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
+        if invalid_values or colliding_keys:
+            problems = []
+            if invalid_values:
+                problems.append(f"value(s) not in model_choices: {', '.join(repr(v) for v in invalid_values)}")
+            if colliding_keys:
+                problems.append(f"key(s) already a current choice: {', '.join(repr(k) for k in colliding_keys)}")
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"deprecated_values is invalid: {'; '.join(problems)}."
+            )
+            raise ValueError(msg)
 
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
         # _AccessSnapshot's docstring for the contract.
         self._snapshot: _AccessSnapshot = self._fetch_snapshot()
 
-        # Install decoration + traits.
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        # Install decoration + traits. Options accepts legacy values too, so an
+        # assignment carrying one is never snapped to choices[0] before the
+        # migration converter (added below) gets a chance to run.
+        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -208,6 +247,15 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
+        parameter.add_converter(self._convert_legacy_value)
+
+        # Migrate a legacy stored value to its canonical choice before
+        # considering whether that choice is currently permitted.
+        current_value = self._node.get_parameter_value(parameter.name)
+        migrated_value = self.migrate_value(current_value)
+        if migrated_value is not None:
+            self._node.set_parameter_value(parameter.name, migrated_value, initial_setup=True)
+            current_value = migrated_value
 
         # If the caller's declared default_value is denied but another choice
         # IS permitted, move the parameter's stored value to that permitted
@@ -215,7 +263,6 @@ class ModelAccessComponent:
         # The Parameter's declarative default_value is untouched -- the
         # override is a stored-value change only, via set_parameter_value
         # with initial_setup=True so no change events fire.
-        current_value = self._node.get_parameter_value(parameter.name)
         if isinstance(current_value, str) and current_value in self._snapshot.denial_by_provider_id:
             replacement = self.pick_permitted_default()
             if replacement is not None and replacement != current_value:
@@ -244,7 +291,7 @@ class ModelAccessComponent:
         already present -- ``add_trait`` will replace the existing instance.
         """
         parameter = self._parameter
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -371,6 +418,35 @@ class ModelAccessComponent:
                 return choice
         return None
 
+    def migrate_value(self, value: Any) -> str | None:
+        """The canonical choice ``value`` migrates to if it is a deprecated key, else ``None``.
+
+        Non-``str`` input returns ``None`` -- the same rationale as
+        ``query_for_denial``: a connected driver's value isn't a dropdown token
+        this component's tables cover.
+        """
+        if not isinstance(value, str):
+            return None
+        return self._deprecated_values.get(value)
+
+    def _convert_legacy_value(self, value: Any) -> Any:
+        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+
+        Installed as a directly-attached converter (``Parameter.add_converter``)
+        rather than hooked into ``before_value_set`` / ``after_value_set``,
+        because ``BaseNode.set_parameter_value`` runs every converter
+        unconditionally on every assignment path -- including workflow load,
+        which calls it with ``initial_setup=True`` and
+        ``skip_before_value_set=True`` and therefore never calls
+        ``before_value_set`` at all. A converter is the only hook a saved
+        workflow's stored value is guaranteed to pass through, so it is the
+        only place this migration can live.
+        """
+        migrated = self.migrate_value(value)
+        if migrated is not None:
+            return migrated
+        return value
+
     def _fetch_snapshot(self) -> _AccessSnapshot:
         """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.
 
@@ -413,7 +489,12 @@ class ModelAccessComponent:
         return snapshot
 
     def _build_ui_options(self) -> dict[str, Any]:
-        """Build the ``ui_options`` dict that decorates the dropdown row-by-row."""
+        """Build the ``ui_options`` dict that decorates the dropdown row-by-row.
+
+        Built from ``model_choices`` alone, never ``deprecated_values`` -- a
+        legacy value is accepted when assigned but never offered as a fresh
+        selection.
+        """
         denials = self._snapshot.denial_by_provider_id
         data: list[dict[str, str]] = []
         for choice in self._model_choices:

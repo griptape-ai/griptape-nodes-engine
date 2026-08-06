@@ -192,6 +192,20 @@ A few rules worth knowing:
 - **Model IDs must be unique across the entire library.** Pydantic enforces uniqueness within each provider's `models` dict for free; collisions across providers are caught at library-load time as `DuplicateModelIdProblem`.
 - **At most one `model_catalog` per library.** Declaring two is rejected at validation time; merge their providers into one.
 
+A node's model-selection dropdown stores the provider's own model id (`kling-v2-master`, not `Kling v2`), and `ModelAccessComponent` resolves it to the catalog key that the permission layer gates on. Storing a display name instead means the selection cannot be resolved, so it cannot be checked against license policy. If a dropdown historically stored something else, migrate those saved values with the component's `deprecated_values` mapping rather than renaming the catalog entry to match them:
+
+```python
+self._model_access = ModelAccessComponent(
+    node=self,
+    parameter=model_param,
+    model_choices=["kling-v2-master", "kling-v2-1-master"],
+    default_model="kling-v2-master",
+    deprecated_values={"Kling v2": "kling-v2-master", "Kling v2.1": "kling-v2-1-master"},
+)
+```
+
+Each key is accepted wherever a value is assigned, including workflow load, and migrated to its mapped choice. Keys are never offered in the dropdown, so retiring a model means moving it from `model_choices` into `deprecated_values` pointed at its replacement. Every mapped value must be one of `model_choices`, and no key may already be a choice; either mistake raises when the node is constructed.
+
 ##### `model_usage`
 
 A node references one or more catalog models by their dict keys. Use this when the node binds to a specific, named set of models. Each entry must resolve to a model somewhere in the catalog at library-load time; unresolved references surface as `UnresolvedModelUsageReferenceProblem`.
