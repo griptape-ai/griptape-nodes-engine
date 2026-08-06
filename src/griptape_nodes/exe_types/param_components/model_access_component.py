@@ -213,7 +213,7 @@ class ModelAccessComponent:
             raise ValueError(msg)
         choice_set = set(self._model_choices)
         invalid_values = sorted(
-            {legacy for legacy, canonical in self._deprecated_values.items() if canonical not in choice_set}
+            {canonical for canonical in self._deprecated_values.values() if canonical not in choice_set}
         )
         colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
         if invalid_values or colliding_keys:
@@ -236,7 +236,7 @@ class ModelAccessComponent:
         # Install decoration + traits. Options accepts legacy values too, so an
         # assignment carrying one is never snapped to choices[0] before the
         # migration converter (added below) gets a chance to run.
-        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
+        parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -291,7 +291,7 @@ class ModelAccessComponent:
         already present -- ``add_trait`` will replace the existing instance.
         """
         parameter = self._parameter
-        parameter.add_trait(Options(choices=[*self._model_choices, *self._deprecated_values]))
+        parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -446,6 +446,17 @@ class ModelAccessComponent:
         if migrated is not None:
             return migrated
         return value
+
+    def _dropdown_choices(self) -> list[str]:
+        """The list handed to ``Options.choices``: current choices plus legacy keys.
+
+        ``Options`` rewrites any assigned value outside ``choices`` to
+        ``choices[0]``, so the legacy keys have to be in here for a stored
+        legacy value to survive long enough for the migration converter to
+        translate it. They are deliberately absent from ``_build_ui_options``,
+        so they are accepted but never offered.
+        """
+        return [*self._model_choices, *self._deprecated_values]
 
     def _fetch_snapshot(self) -> _AccessSnapshot:
         """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.

@@ -817,7 +817,9 @@ class TestDeprecatedValuesValidation:
     """deprecated_values is validated at construction, same as the component's other preconditions."""
 
     def test_raises_when_a_value_is_not_a_current_choice(self) -> None:
-        with pytest.raises(ValueError, match="not in model_choices"):
+        # The message must name the offending canonical value ('gamma'), not the
+        # legacy key ('Alpha') -- naming the key sends the reader to the wrong fix.
+        with pytest.raises(ValueError, match="not in model_choices: 'gamma'"):
             _build_probe_node_with_component(
                 model_choices=["alpha", "beta"],
                 default_model="alpha",
@@ -825,7 +827,7 @@ class TestDeprecatedValuesValidation:
             )
 
     def test_raises_when_a_key_collides_with_a_current_choice(self) -> None:
-        with pytest.raises(ValueError, match="already a current choice"):
+        with pytest.raises(ValueError, match="already a current choice: 'beta'"):
             _build_probe_node_with_component(
                 model_choices=["alpha", "beta"],
                 default_model="alpha",
