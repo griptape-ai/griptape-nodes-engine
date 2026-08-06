@@ -204,7 +204,7 @@ self._model_access = ModelAccessComponent(
 )
 ```
 
-Each key is accepted wherever a value is assigned, including workflow load, and migrated to its mapped choice. Keys are never offered in the dropdown, so retiring a model means moving it from `model_choices` into `deprecated_values` pointed at its replacement. Every mapped value must be one of `model_choices`, and no key may already be a choice; either mistake raises when the node is constructed.
+Each key is accepted wherever a value is assigned, including workflow load, and migrated to its mapped choice. Keys are never offered in the dropdown, so retiring a model means moving it from `model_choices` into `deprecated_values` pointed at its replacement. Every mapped value must be one of `model_choices`, and no key may already be a choice; either mistake raises when the node is constructed. If the model you are retiring was also the `default_model`, point `default_model` at its replacement in the same edit -- `default_model` must always name a current choice, never a retired key, and the component raises if it does not.
 
 ##### `model_usage`
 

@@ -834,6 +834,27 @@ class TestDeprecatedValuesValidation:
                 deprecated_values={"beta": "alpha"},
             )
 
+    def test_raises_when_default_model_is_a_deprecated_key(self) -> None:
+        """A legacy key as default_model would make pick_permitted_default lie.
+
+        Denials are keyed by provider id, so a legacy key never appears in them
+        and would always look permitted -- leaving a denied model selected with
+        no badge. Caught at construction instead.
+        """
+        with pytest.raises(ValueError, match="default_model 'Alpha', which is not one of model_choices"):
+            _build_probe_node_with_component(
+                model_choices=["alpha", "beta"],
+                default_model="Alpha",
+                deprecated_values={"Alpha": "alpha"},
+            )
+
+    def test_raises_when_default_model_is_not_a_choice_at_all(self) -> None:
+        with pytest.raises(ValueError, match="default_model 'gamma', which is not one of model_choices"):
+            _build_probe_node_with_component(
+                model_choices=["alpha", "beta"],
+                default_model="gamma",
+            )
+
 
 class TestDeprecatedValuesMigration:
     """A legacy stored value is accepted wherever assigned, migrated, and never offered as a fresh selection.

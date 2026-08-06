@@ -169,7 +169,8 @@ class ModelAccessComponent:
         by a converter, and never offered as a fresh selection: the dropdown's
         ``ui_options["data"]`` rows come from ``model_choices`` alone. The
         parameter's current stored value is migrated the same way at
-        construction, before the denied-default relocation described below.
+        construction, before the denied-default relocation described in the
+        class docstring.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -181,6 +182,10 @@ class ModelAccessComponent:
           adding a second ``Button`` overloads the refresh row. Migrate the
           node to construct the parameter without those traits and let the
           component add them.
+        - ``default_model`` must be one of ``model_choices``. In particular it
+          may not be a ``deprecated_values`` key: legacy keys are not real
+          provider ids, so they never appear in the access verdicts and would
+          make ``pick_permitted_default`` report a denied model as permitted.
         """
         # Constructor inputs -- immutable across the component's lifetime.
         self._node = node
@@ -190,43 +195,7 @@ class ModelAccessComponent:
         self._deprecated_values = dict(deprecated_values or {})
 
         # Fail-fast preconditions -- see docstring.
-        if self._node.get_parameter_by_name(parameter.name) is not parameter:
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' is not attached to node "
-                f"'{self._node.name}'. Call node.add_parameter(parameter) BEFORE constructing "
-                "the component."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Options):
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
-                "already carries an Options trait. Remove traits={Options(...)} from the "
-                "Parameter constructor -- ModelAccessComponent adds Options itself."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Button):
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
-                "already carries a Button trait. Remove it -- ModelAccessComponent adds the "
-                "refresh Button itself."
-            )
-            raise ValueError(msg)
-        choice_set = set(self._model_choices)
-        invalid_values = sorted(
-            {canonical for canonical in self._deprecated_values.values() if canonical not in choice_set}
-        )
-        colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
-        if invalid_values or colliding_keys:
-            problems = []
-            if invalid_values:
-                problems.append(f"value(s) not in model_choices: {', '.join(repr(v) for v in invalid_values)}")
-            if colliding_keys:
-                problems.append(f"key(s) already a current choice: {', '.join(repr(k) for k in colliding_keys)}")
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
-                f"deprecated_values is invalid: {'; '.join(problems)}."
-            )
-            raise ValueError(msg)
+        self._raise_if_misconfigured()
 
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
@@ -405,6 +374,10 @@ class ModelAccessComponent:
         back to the first allowed entry in ``model_choices``. Returns ``None``
         when every declared choice is currently denied.
 
+        The denial lookup is keyed by provider id, so it only means anything
+        for a real choice. ``__init__`` guarantees ``default_model`` is one of
+        ``model_choices``, which is what makes the first check below sound.
+
         Called internally by ``__init__`` to move the parameter's stored value
         off a denied default. Kept public for callers that want to consult the
         permitted-default separately (e.g. logging, picking a value for a
@@ -446,6 +419,60 @@ class ModelAccessComponent:
         if migrated is not None:
             return migrated
         return value
+
+    def _raise_if_misconfigured(self) -> None:
+        """Raise on any constructor misuse, before the component touches the parameter.
+
+        Every precondition in ``__init__``'s docstring is checked here so a
+        misconfigured node fails loudly at construction rather than shipping a
+        dropdown that silently misbehaves.
+        """
+        parameter = self._parameter
+        if self._node.get_parameter_by_name(parameter.name) is not parameter:
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' is not attached to node "
+                f"'{self._node.name}'. Call node.add_parameter(parameter) BEFORE constructing "
+                "the component."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Options):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries an Options trait. Remove traits={Options(...)} from the "
+                "Parameter constructor -- ModelAccessComponent adds Options itself."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Button):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries a Button trait. Remove it -- ModelAccessComponent adds the "
+                "refresh Button itself."
+            )
+            raise ValueError(msg)
+        choice_set = set(self._model_choices)
+        if self._default_model not in choice_set:
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"declares default_model {self._default_model!r}, which is not one of model_choices. "
+                "Point default_model at a current choice -- a retired value belongs in "
+                "deprecated_values, not default_model."
+            )
+            raise ValueError(msg)
+        invalid_values = sorted(
+            {canonical for canonical in self._deprecated_values.values() if canonical not in choice_set}
+        )
+        colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
+        if invalid_values or colliding_keys:
+            problems = []
+            if invalid_values:
+                problems.append(f"value(s) not in model_choices: {', '.join(repr(v) for v in invalid_values)}")
+            if colliding_keys:
+                problems.append(f"key(s) already a current choice: {', '.join(repr(k) for k in colliding_keys)}")
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"deprecated_values is invalid: {'; '.join(problems)}."
+            )
+            raise ValueError(msg)
 
     def _dropdown_choices(self) -> list[str]:
         """The list handed to ``Options.choices``: current choices plus legacy keys.
