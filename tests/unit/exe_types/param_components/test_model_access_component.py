@@ -337,10 +337,11 @@ class TestInstall:
 class TestConstructorPreconditions:
     """The component's constructor rejects misuse rather than silently misbehaving.
 
-    Under the one-step API, ``install()`` is folded into ``__init__``. The four
-    precondition checks (parameter-not-attached, pre-existing Options trait,
-    pre-existing Button trait, second-instance-on-same-parameter) all fire
-    from the constructor.
+    Under the one-step API, ``install()`` is folded into ``__init__``. The
+    parameter-shape checks (parameter-not-attached, pre-existing Options trait,
+    pre-existing Button trait, second-instance-on-same-parameter) all fire from
+    the constructor. The checks on the declared choice list live in
+    ``TestDeprecatedValuesValidation``.
     """
 
     def test_raises_when_parameter_is_not_on_node(self) -> None:
