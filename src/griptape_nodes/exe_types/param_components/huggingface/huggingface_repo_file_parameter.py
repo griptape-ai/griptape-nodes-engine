@@ -19,7 +19,8 @@ class HuggingFaceRepoFileParameter(HuggingFaceModelParameter):
         *,
         gated: bool | None = None,
     ):
-        # Set before super().__init__, which queries policy and reads these.
+        # Set before super().__init__, which queries license policy and may consult subclass
+        # state via `offers_only_declared_repos()`.
         deprecated_repo_files = deprecated_repo_files or []
         self._repo_files = repo_files + deprecated_repo_files
 

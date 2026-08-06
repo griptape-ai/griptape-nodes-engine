@@ -110,9 +110,13 @@ class HuggingFaceRepoVariantParameter(HuggingFaceModelParameter):
             parameter_name: Name of the parameter (default: "model")
             gated: License enforcement mode; see `HuggingFaceModelParameter.__init__`.
         """
-        super().__init__(node, parameter_name, gated=gated)
+        # Set before super().__init__, matching the sibling subclasses: the base constructor
+        # queries license policy, and `offers_only_declared_repos()` may consult subclass state.
         self._repo_id = repo_id
         self._variants = variants
+
+        super().__init__(node, parameter_name, gated=gated)
+
         self.refresh_parameters()
 
     @classmethod

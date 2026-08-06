@@ -121,6 +121,39 @@ class TestDenialFor:
         assert snapshot.denial_for(DENIED, refuse_unrecognized=True) is _DENIAL
 
 
+class TestAnUnattributableDenialIsNotDropped:
+    """A denial policy handed us must be honored even when no row can carry it.
+
+    `provider_model_id` is optional on a catalog `Model`, so an author can declare a model with
+    only the two required fields. If policy DENIES such an entry, there is no handle to match it to
+    a dropdown value -- and the same absence switches off the undeclared backstop. Dropping the
+    denial would mean both enforcement layers fail off together and the forbidden weights run.
+    """
+
+    def test_the_whole_parameter_is_refused(self) -> None:
+        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])):
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.unmatchable_denials == ("md_flux_dev",)
+        denial = snapshot.denial_for(ALLOWED, refuse_unrecognized=True)
+        assert denial is not None
+        assert "md_flux_dev" in denial.reason()
+        assert "provider_model_id" in denial.reason()
+
+    def test_a_permitted_handleless_entry_does_not_refuse_anything(self) -> None:
+        """Only a DENIED unmatchable entry escalates; a permitted one is merely unmatchable."""
+        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_no_handle", None, None)])):
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.unmatchable_denials == ()
+        assert snapshot.has_unmatchable_entries is True
+        assert snapshot.denial_for(ALLOWED, refuse_unrecognized=True) is None
+
+    def test_it_applies_even_with_refuse_unrecognized_off(self) -> None:
+        """A static dropdown must not run a model policy explicitly forbade either."""
+        with patch(_HANDLE, return_value=_success([ModelAccessVerdict("md_flux_dev", None, _DENIAL)])):
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.denial_for(ALLOWED) is not None
+
+
 class TestSnapshotIsImmutable:
     def test_frozen(self) -> None:
         """Callers replace the snapshot wholesale, so the tables cannot drift apart."""

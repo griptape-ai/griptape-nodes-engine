@@ -292,18 +292,20 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
-        # Fail-closed on an unresolvable node, then defer to the cached snapshot
-        # for the verdict. `refuse_unrecognized` stays off: these choices were
-        # enumerated by the library author, so an id absent from the catalog is
-        # an already-vetted value rather than something to gate user work on.
-        cached = self._snapshot.denial_for(value)
-        if cached is not None:
-            return cached
+        # Fail-closed when the node could not be resolved at all: the developer's
+        # setup bug must NOT silently open the gate.
+        if self._snapshot.failure_detail is not None:
+            return self._snapshot.denial_for(value)
         catalog_id = self._snapshot.catalog_id_by_provider_id.get(value)
         if catalog_id is None:
+            # Not in the catalog. `refuse_unrecognized` stays off here: these choices were
+            # enumerated by the library author, so an unrecognized id is an already-vetted
+            # value rather than something to gate user work on.
             return None
-        # Re-ask live for the resolved id, so a license change since the last
-        # refresh is honored at run time rather than at decoration time.
+        # Re-ask live for the resolved id rather than trusting the cached verdict, so a license
+        # change since the last refresh is honored at run time in BOTH directions -- a newly
+        # granted permission unblocks the artist without waiting for a refresh, and a newly
+        # revoked one still denies. Returning a cached denial early would make grants invisible.
         result = GriptapeNodes.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=type(self._node).__name__,

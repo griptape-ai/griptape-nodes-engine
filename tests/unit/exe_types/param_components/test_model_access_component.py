@@ -605,6 +605,31 @@ class TestRefreshAndQueryForDenial:
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
+    def test_query_for_denial_honors_a_grant_made_since_the_last_refresh(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The run-path re-query must work in BOTH directions, not just allow -> deny.
+
+        The snapshot is captured at construction/refresh time. If a cached denial short-circuited
+        the live re-query, a studio that GRANTS a permission mid-session would leave artists blocked
+        with "not permitted" until something happened to call refresh() -- and a grant is precisely
+        the case where re-asking live matters.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+        finally:
+            # Policy relaxed. No refresh() -- the run path alone must notice.
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+        assert helper.query_for_denial("alpha") is None
+
     def test_query_for_denial_ignores_non_string_values(self) -> None:
         _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")
 

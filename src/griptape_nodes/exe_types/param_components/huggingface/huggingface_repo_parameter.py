@@ -21,8 +21,8 @@ class HuggingFaceRepoParameter(HuggingFaceModelParameter):
         deprecated_repo_ids: list[str] | None = None,
         gated: bool | None = None,
     ):
-        # Set before super().__init__, which queries policy and reads these via
-        # offers_only_declared_repos() / filter_choices().
+        # Set before super().__init__, which queries license policy. That query consults
+        # `offers_only_declared_repos()`, whose answer here depends on `_list_all_models`.
         deprecated_repo_ids = deprecated_repo_ids or []
         self._repo_ids = repo_ids + deprecated_repo_ids
         self._list_all_models = list_all_models

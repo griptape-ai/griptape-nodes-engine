@@ -59,12 +59,18 @@ class ModelPolicySnapshot:
     Such an entry is declared but cannot be matched against a dropdown value, which makes
     ``catalog_id_by_provider_id`` an incomplete view of the catalog. Callers that would refuse an
     unrecognized value must not do so in that case; absence proves nothing.
+
+    ``unmatchable_denials`` names the catalog ids that policy DENIED but that carry no
+    ``provider_model_id`` to match a dropdown value against. Those denials cannot be honored
+    per-row, so they are honored for the whole parameter instead -- see ``denial_for``. Dropping
+    them would let an explicitly forbidden model run.
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
     catalog_id_by_provider_id: dict[str, str] = field(default_factory=dict)
     failure_detail: str | None = None
     has_unmatchable_entries: bool = False
+    unmatchable_denials: tuple[str, ...] = ()
 
     @property
     def declares_models(self) -> bool:
@@ -75,6 +81,13 @@ class ModelPolicySnapshot:
         nothing" would silently disable enforcement for it.
         """
         return bool(self.catalog_id_by_provider_id) or self.has_unmatchable_entries
+
+    def _describe_unmatchable_denials(self) -> str:
+        shown = ", ".join(f"'{model_id}'" for model_id in self.unmatchable_denials[:3])
+        remaining = len(self.unmatchable_denials) - 3
+        if remaining > 0:
+            return f"{shown} and {remaining} more"
+        return shown
 
     def denial_for(
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
@@ -98,6 +111,22 @@ class ModelPolicySnapshot:
         denial = self.denial_by_provider_id.get(provider_model_id)
         if denial is not None:
             return denial
+        # A denial we cannot attribute to a row still has to be honored. Refusing the whole
+        # parameter over-blocks, but the alternative is running a model policy explicitly forbade,
+        # and `has_unmatchable_entries` has already switched off the undeclared backstop that would
+        # otherwise have caught it.
+        if self.unmatchable_denials:
+            return CheckpointDenial(
+                failures=(
+                    CheckpointFailure(
+                        detail=(
+                            f"License policy denies {self._describe_unmatchable_denials()}, but those catalog "
+                            "entries declare no provider_model_id, so the denial cannot be applied to a single "
+                            "model. Add provider_model_id to those entries so policy can be enforced per model."
+                        )
+                    ),
+                )
+            )
         is_unrecognized = provider_model_id not in self.catalog_id_by_provider_id
         if refuse_unrecognized and not self.has_unmatchable_entries and is_unrecognized:
             return CheckpointDenial(
@@ -147,20 +176,33 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
     denials: dict[str, CheckpointDenial] = {}
     catalog_ids: dict[str, str] = {}
     unmatchable = False
+    unmatchable_denials: list[str] = []
     for verdict in result.verdicts:
         # `provider_model_id` is optional on a catalog `Model`, and per ModelAccessVerdict's
         # contract its absence means "declared, but with no upstream handle" -- NOT "unresolved".
         if verdict.provider_model_id is None:
             unmatchable = True
+            if verdict.denial is not None:
+                unmatchable_denials.append(verdict.model_id)
             continue
         catalog_ids[verdict.provider_model_id] = verdict.model_id
         if verdict.denial is not None:
             denials[verdict.provider_model_id] = verdict.denial
 
+    if unmatchable_denials:
+        logger.warning(
+            "Node type '%s' declares model(s) %s that license policy DENIES, but they carry no "
+            "provider_model_id, so the denial cannot be matched to a dropdown row. Refusing the whole "
+            "parameter instead. Add provider_model_id to those catalog entries.",
+            node_type,
+            unmatchable_denials,
+        )
+
     return ModelPolicySnapshot(
         denial_by_provider_id=denials,
         catalog_id_by_provider_id=catalog_ids,
         has_unmatchable_entries=unmatchable,
+        unmatchable_denials=tuple(unmatchable_denials),
     )
 
 
