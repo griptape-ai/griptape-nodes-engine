@@ -517,7 +517,24 @@ ______________________________________________________________________
 ### add_param
 
 ```python
-cmd.add_param(node_name, parameter_name, default_value, tooltip, type=None, input_types=None, output_type=None, edit=False, tooltip_as_input=None, tooltip_as_property=None, tooltip_as_output=None, ui_options=None, mode_allowed_input=True, mode_allowed_property=True, mode_allowed_output=True, **kwargs)
+cmd.add_param(
+    node_name,
+    parameter_name,
+    default_value,
+    tooltip,
+    type=None,
+    input_types=None,
+    output_type=None,
+    edit=False,
+    tooltip_as_input=None,
+    tooltip_as_property=None,
+    tooltip_as_output=None,
+    ui_options=None,
+    mode_allowed_input=True,
+    mode_allowed_property=True,
+    mode_allowed_output=True,
+    **kwargs,
+)
 ```
 
 Adds a parameter to a node.
@@ -965,7 +982,6 @@ cmd.set_value("MyText.text", "This is a sample text to summarize.")
 
 # Connect two nodes
 cmd.connect("MyText.text", "MyAgent.prompt")
-
 ```
 
 ### Running a Flow
@@ -976,7 +992,7 @@ cmd.run_flow("MyFlow")
 
 # Get the result
 summary = cmd.get_value("MyAgent.output")
-print(summary) # <whatever that summary would be!>
+print(summary)  # <whatever that summary would be!>
 ```
 
 ### Working with Parameters
@@ -988,19 +1004,14 @@ cmd.add_param(
     parameter_name="sunglasses",
     default_value=100,
     tooltip="The coolness of sunglasses",
-    type=["int"]
+    type=["int"],
 )
 
 # Set the value of the new parameter
 cmd.set_value("MyAgent.sunglasses", 50)
 
 # Change the parameter
-cmd.add_param(
-    node_name="MyAgent",
-    parameter_name="sunglasses",
-    tooltip="The coolness of sunglasses if halved",
-    edit=1
-)
+cmd.add_param(node_name="MyAgent", parameter_name="sunglasses", tooltip="The coolness of sunglasses if halved", edit=1)
 ```
 
 ### Listing and Querying
@@ -1008,13 +1019,13 @@ cmd.add_param(
 ```python
 # List all nodes in a flow
 nodes = cmd.get_nodes_in_flow("MyFlow")
-print(nodes) # ["MyText","MyAgent"]
+print(nodes)  # ["MyText","MyAgent"]
 
 # List all parameters on a node
 params = cmd.list_params("MyAgent")
-print(params) # ["agent", "prompt_driver", "tools", "rulesets", "prompt", "prompt_context", "output"]
+print(params)  # ["agent", "prompt_driver", "tools", "rulesets", "prompt", "prompt_context", "output"]
 
 # Check if a node exists
 if cmd.exists("MyText"):
-    print("MyText node exists") # True
+    print("MyText node exists")  # True
 ```

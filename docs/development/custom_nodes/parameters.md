@@ -135,7 +135,7 @@ self.add_parameter(
     ParameterImage(
         name="output_image",
         tooltip="Generated image result",
-        allow_input=False,   # Output only
+        allow_input=False,  # Output only
         allow_property=False,
     )
 )
@@ -168,6 +168,7 @@ def __init__(self, **kwargs) -> None:
     # Initialize visibility based on default model
     self._initialize_parameter_visibility()
 
+
 def _initialize_parameter_visibility(self) -> None:
     """Initialize parameter visibility based on default model."""
     model = self.get_parameter_value("model") or "default"
@@ -175,6 +176,7 @@ def _initialize_parameter_visibility(self) -> None:
         self.show_parameter_by_name("input_image")
     else:
         self.hide_parameter_by_name("input_image")
+
 
 def after_value_set(self, parameter: Parameter, value: Any) -> None:
     """Update visibility when model changes."""
@@ -265,6 +267,7 @@ Buttons must be wrapped in a `ParameterButtonGroup` container:
 from griptape_nodes.exe_types.core_types import ParameterButtonGroup
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
+
 
 class MyNode(DataNode):
     def __init__(self, **kwargs) -> None:
@@ -503,7 +506,7 @@ Parameter(
     type="str",
     tooltip="Search term to find models",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"placeholder_text": "e.g., llama, bert, stable-diffusion"}
+    ui_options={"placeholder_text": "e.g., llama, bert, stable-diffusion"},
 )
 ```
 
@@ -516,7 +519,7 @@ Parameter(
     type="list[dict]",
     tooltip="Search results with full information",
     allowed_modes={ParameterMode.OUTPUT},
-    ui_options={"is_full_width": True}
+    ui_options={"is_full_width": True},
 )
 ```
 
@@ -529,7 +532,7 @@ Parameter(
     type="str",
     tooltip="Description of desired output",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"multiline": True, "placeholder_text": "Describe what you want..."}
+    ui_options={"multiline": True, "placeholder_text": "Describe what you want..."},
 )
 ```
 
@@ -542,7 +545,7 @@ Parameter(
     type="ImageArtifact",
     tooltip="Input image file",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"clickable_file_browser": True}
+    ui_options={"clickable_file_browser": True},
 )
 ```
 
@@ -572,6 +575,7 @@ Update parameter choices at runtime:
 
 ```python
 from griptape_nodes.traits.options import Options
+
 
 def _update_option_choices(self, param_name: str, choices: list, default_value: str):
     """Update Options trait choices dynamically."""
@@ -747,6 +751,7 @@ Parameters appear in the UI in the order they are added via `add_parameter()`. T
 ```python
 from griptape_nodes.exe_types.node_types import SuccessFailureNode
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
+
 
 class ColorMatch(SuccessFailureNode):
     """Transfer colors from a reference image to a target image."""

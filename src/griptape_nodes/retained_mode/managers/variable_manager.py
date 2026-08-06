@@ -1247,6 +1247,8 @@ class VariablesManager:
             if obj.state not in (NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING):
                 continue
             for param in obj.parameters:
+                if not param.allow_variable_substitution:
+                    continue
                 value = obj.parameter_values.get(param.name, param.default_value)
                 if any(VariableResolver.references_variable(value, name) for name in variable_names):
                     obj.make_node_unresolved(

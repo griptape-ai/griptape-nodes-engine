@@ -653,7 +653,7 @@ class ExecuteDagState(State):
                     node_name = dag_node.node_reference.name
                     dag_node.node_state = NodeState.ERRORED
 
-                    logger.exception("Error processing node '%s'", node_name, exc_info=exc)
+                    logger.error("Error processing node '%s'", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await GriptapeNodes.EventManager().aput_event(

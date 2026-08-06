@@ -27,17 +27,20 @@ from griptape_nodes.exe_types.param_components.project_file_parameter import Pro
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+
 class MyVideoNode(ControlNode):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
         # Add regular output parameter
-        self.add_parameter(Parameter(
-            name="output_video",
-            output_type="VideoUrlArtifact",
-            tooltip="Generated video",
-            allowed_modes={ParameterMode.OUTPUT}
-        ))
+        self.add_parameter(
+            Parameter(
+                name="output_video",
+                output_type="VideoUrlArtifact",
+                tooltip="Generated video",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
 
         # Add project file parameter for output file configuration.
         # `situation` declares which situation this node saves under. It defaults
@@ -108,15 +111,13 @@ Use `ProjectFileDestination.from_situation()` directly in utility functions or w
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
+
 def frames_to_video_artifact(frames: list, fps: int = 30, video_format: str = "mp4") -> VideoUrlArtifact:
     """Convert a list of frames to a VideoUrlArtifact."""
     # ... process frames into video_bytes ...
 
     # Save using project file system
-    dest = ProjectFileDestination.from_situation(
-        filename=f"video.{video_format}",
-        situation="save_node_output"
-    )
+    dest = ProjectFileDestination.from_situation(filename=f"video.{video_format}", situation="save_node_output")
     saved = dest.write_bytes(video_bytes)
 
     return VideoUrlArtifact(saved.location)
@@ -136,6 +137,7 @@ def frames_to_video_artifact(frames: list, fps: int = 30, video_format: str = "m
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 import uuid
 
+
 def old_save_video(video_bytes: bytes) -> VideoUrlArtifact:
     filename = f"{uuid.uuid4()}.mp4"
     url = GriptapeNodes.StaticFilesManager().save_static_file(video_bytes, filename)
@@ -147,11 +149,9 @@ def old_save_video(video_bytes: bytes) -> VideoUrlArtifact:
 ```python
 from griptape_nodes.files.project_file import ProjectFileDestination
 
+
 def new_save_video(video_bytes: bytes) -> VideoUrlArtifact:
-    dest = ProjectFileDestination.from_situation(
-        filename="video.mp4",
-        situation="save_node_output"
-    )
+    dest = ProjectFileDestination.from_situation(filename="video.mp4", situation="save_node_output")
     saved = dest.write_bytes(video_bytes)
     return VideoUrlArtifact(saved.location)
 ```
@@ -201,23 +201,28 @@ from griptape_nodes.exe_types.node_types import ControlNode, AsyncResult
 from griptape_nodes.exe_types.param_components.project_file_parameter import ProjectFileParameter
 from griptape_nodes.files.file import File
 
+
 class ProcessVideo(ControlNode):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
 
-        self.add_parameter(Parameter(
-            name="input_video",
-            input_types=["VideoUrlArtifact"],
-            type="VideoUrlArtifact",
-            tooltip="Input video to process"
-        ))
+        self.add_parameter(
+            Parameter(
+                name="input_video",
+                input_types=["VideoUrlArtifact"],
+                type="VideoUrlArtifact",
+                tooltip="Input video to process",
+            )
+        )
 
-        self.add_parameter(Parameter(
-            name="output_video",
-            output_type="VideoUrlArtifact",
-            tooltip="Processed video",
-            allowed_modes={ParameterMode.OUTPUT}
-        ))
+        self.add_parameter(
+            Parameter(
+                name="output_video",
+                output_type="VideoUrlArtifact",
+                tooltip="Processed video",
+                allowed_modes={ParameterMode.OUTPUT},
+            )
+        )
 
         # Add project file parameter for output
         self._output_video_file = ProjectFileParameter(

@@ -121,10 +121,7 @@ async def mcp_stream(request: Request):
     return StreamingResponse(
         process_mcp_stream(request),
         media_type="application/json",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive"
-        }
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
     )
 ```
 
