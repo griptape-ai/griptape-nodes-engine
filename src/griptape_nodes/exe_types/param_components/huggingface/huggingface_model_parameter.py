@@ -152,8 +152,15 @@ class HuggingFaceModelParameter(ABC):
             display_choices = choices
             default_value = self._preferred_default(choices, current_value)
         else:
-            default_value = NO_MODELS_PLACEHOLDER
             display_choices = [NO_MODELS_PLACEHOLDER]
+            # Nothing is cached. Keep a real stored selection rather than overwriting it with the
+            # placeholder: opening a saved workflow on a machine that has not downloaded the model
+            # would otherwise destroy the recorded repo id, and re-saving would persist the loss.
+            # `get_repo_revision()` then reports the missing model by name instead of the
+            # placeholder string.
+            default_value = current_value if isinstance(current_value, str) and current_value else NO_MODELS_PLACEHOLDER
+            if default_value not in display_choices:
+                display_choices = [*display_choices, default_value]
 
         if parameter.find_elements_by_type(Options):
             self._node._update_option_choices(self._parameter_name, display_choices, default_value)

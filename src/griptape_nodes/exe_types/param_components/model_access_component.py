@@ -198,7 +198,7 @@ class ModelAccessComponent:
         # override is a stored-value change only, via set_parameter_value
         # with initial_setup=True so no change events fire.
         current_value = self._node.get_parameter_value(parameter.name)
-        if isinstance(current_value, str) and current_value in self._snapshot.denial_by_provider_id:
+        if isinstance(current_value, str) and self._cached_denial(current_value) is not None:
             replacement = self.pick_permitted_default()
             if replacement is not None and replacement != current_value:
                 self._node.set_parameter_value(parameter.name, replacement, initial_setup=True)
@@ -242,7 +242,7 @@ class ModelAccessComponent:
         if not isinstance(value, str):
             parameter.clear_badge()
             return
-        apply_denial_badge(parameter, value, self._snapshot.denial_by_provider_id.get(value))
+        apply_denial_badge(parameter, value, self._cached_denial(value))
 
     def refresh(self) -> None:
         """Re-query the engine and rebuild the decoration + current-selection badge.
@@ -296,25 +296,31 @@ class ModelAccessComponent:
         # setup bug must NOT silently open the gate.
         if self._snapshot.failure_detail is not None:
             return self._snapshot.denial_for(value)
-        catalog_id = self._snapshot.catalog_id_by_provider_id.get(value)
-        if catalog_id is None:
+        # Every catalog entry behind this dropdown name: `provider_model_id` is not unique, so a
+        # BYOK entry and a hosted-key entry can share one. All of them must be asked, and any
+        # denial governs.
+        catalog_ids = self._snapshot.catalog_ids_for(value)
+        if not catalog_ids:
             # Not in the catalog. `refuse_unrecognized` stays off here: these choices were
             # enumerated by the library author, so an unrecognized id is an already-vetted
             # value rather than something to gate user work on.
             return None
-        # Re-ask live for the resolved id rather than trusting the cached verdict, so a license
-        # change since the last refresh is honored at run time in BOTH directions -- a newly
-        # granted permission unblocks the artist without waiting for a refresh, and a newly
-        # revoked one still denies. Returning a cached denial early would make grants invisible.
+        # Re-ask live rather than trusting the cached verdict, so a license change since the last
+        # refresh is honored at run time in BOTH directions -- a newly granted permission unblocks
+        # the artist without waiting for a refresh, and a newly revoked one still denies. Returning
+        # a cached denial early would make grants invisible.
         result = GriptapeNodes.handle_request(
             QueryModelAccessForNodeRequest(
                 node_type=type(self._node).__name__,
-                candidate_model_ids=[catalog_id],
+                candidate_model_ids=list(catalog_ids),
             )
         )
         if not isinstance(result, QueryModelAccessForNodeResultSuccess) or not result.verdicts:
-            return None
-        return result.verdicts[0].denial
+            # Unanswerable now (library reloaded or unregistered mid-session). Fall back to the
+            # cached verdict rather than to None: forgetting a denial we already hold would run a
+            # forbidden model on a transient lookup failure.
+            return self._snapshot.denial_for(value)
+        return next((verdict.denial for verdict in result.verdicts if verdict.denial is not None), None)
 
     def raise_if_denied(self, value: Any) -> None:
         """Convenience wrapper: raise ``RuntimeError`` if ``query_for_denial`` returns a denial.
@@ -342,13 +348,23 @@ class ModelAccessComponent:
         permitted-default separately (e.g. logging, picking a value for a
         related parameter).
         """
-        denials = self._snapshot.denial_by_provider_id
-        if self._default_model not in denials:
+        if self._cached_denial(self._default_model) is None:
             return self._default_model
         for choice in self._model_choices:
-            if choice not in denials:
+            if self._cached_denial(choice) is None:
                 return choice
         return None
+
+    def _cached_denial(self, choice: str) -> CheckpointDenial | None:
+        """The cached verdict for ``choice``, via the shared snapshot rules.
+
+        Every decoration path goes through here rather than reading
+        ``denial_by_provider_id`` directly, so rules that live on the snapshot
+        (an unattributable denial escalating to the whole parameter, for
+        instance) apply to this component too. Reading the table directly would
+        make those rules silently HuggingFace-only.
+        """
+        return self._snapshot.denial_for(choice)
 
     def _fetch_snapshot(self) -> ModelPolicySnapshot:
         """Ask the engine for this node type's policy verdicts.
@@ -362,10 +378,9 @@ class ModelAccessComponent:
 
     def _build_ui_options(self) -> dict[str, Any]:
         """Build the ``ui_options`` dict that decorates the dropdown row-by-row."""
-        denials = self._snapshot.denial_by_provider_id
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
-            if choice in denials:
+            if self._cached_denial(choice) is not None:
                 data.append({"name": choice, "icon": DENIED_ROW_ICON, "subtitle": DENIED_ROW_SUBTITLE})
             else:
                 data.append({"name": choice})

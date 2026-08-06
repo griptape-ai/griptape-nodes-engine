@@ -109,7 +109,7 @@ class TestFailClosed:
         param = _param(gated=True, repo_ids=[ALLOWED_REPO, UNDECLARED_REPO])
         denial = param.query_for_denial(UNDECLARED_REPO)
         assert denial is not None
-        assert "not declared" in denial.reason()
+        assert UNDECLARED_REPO in denial.reason()
 
     def test_allowed_repo_is_permitted(self) -> None:
         param = _param(gated=True)

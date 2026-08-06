@@ -100,7 +100,9 @@ class TestDenialFor:
         snapshot = ModelPolicySnapshot(catalog_id_by_provider_id={ALLOWED: "x"})
         denial = snapshot.denial_for(UNKNOWN, refuse_unrecognized=True)
         assert denial is not None
-        assert "not declared" in denial.reason()
+        # Artist-facing wording: names the model, no manifest-editing instructions.
+        assert UNKNOWN in denial.reason()
+        assert "provider_model_id" not in denial.reason()
 
     def test_unrecognized_is_allowed_when_the_catalog_view_is_incomplete(self) -> None:
         """An unmatchable entry means absence proves nothing, so the refusal is suppressed.
@@ -136,8 +138,10 @@ class TestAnUnattributableDenialIsNotDropped:
         assert snapshot.unmatchable_denials == ("md_flux_dev",)
         denial = snapshot.denial_for(ALLOWED, refuse_unrecognized=True)
         assert denial is not None
-        assert "md_flux_dev" in denial.reason()
-        assert "provider_model_id" in denial.reason()
+        # The escalation must reach the artist as an effect, not as a manifest instruction; the
+        # catalog id and the fix belong in the log warning instead.
+        assert "provider_model_id" not in denial.reason()
+        assert "md_flux_dev" not in denial.reason()
 
     def test_a_permitted_handleless_entry_does_not_refuse_anything(self) -> None:
         """Only a DENIED unmatchable entry escalates; a permitted one is merely unmatchable."""
