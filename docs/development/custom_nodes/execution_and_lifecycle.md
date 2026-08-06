@@ -263,6 +263,8 @@ This avoids requiring image inputs when the user wants text-only generation, and
 
 ### Image Artifact Conversion to Base64
 
+The `ImageArtifact` branch below exists to keep working with values that may still arrive from older saved workflows or upstream nodes that haven't been updated. New parameters should declare `ImageUrlArtifact` (via `ParameterImage`) rather than `ImageArtifact` — see [Parameter Payload Size](error_handling.md#parameter-payload-size).
+
 **CRITICAL: Localhost URL Handling**
 
 When sending images to external APIs, ImageUrlArtifact URLs from static storage are localhost and inaccessible to external services. Always detect and convert localhost URLs to base64:
@@ -360,8 +362,8 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
 ```python
 Parameter(
     name="image_input",
-    input_types=["ImageArtifact", "ImageUrlArtifact"],  # Accept both
-    type="ImageArtifact",
+    input_types=["ImageUrlArtifact", "ImageArtifact"],  # ImageArtifact: legacy input compatibility only
+    type="ImageUrlArtifact",
     tooltip="Image input (file or URL)",
     ui_options={"clickable_file_browser": True},  # Enable file browser
 )
@@ -369,7 +371,7 @@ Parameter(
 
 ### Multi-Image Input Validation
 
-When nodes accept multiple image parameters, use a reusable validation method with clear parameter identification:
+When nodes accept multiple image parameters, use a reusable validation method with clear parameter identification. As above, the `ImageArtifact` branch is legacy-input handling, not a reason to declare new parameters against `ImageArtifact`:
 
 ```python
 def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, param_name: str) -> list[Exception]:
