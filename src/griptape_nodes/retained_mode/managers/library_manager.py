@@ -673,6 +673,9 @@ class LibraryManager:
     # node class from that file has been resolved. An entry is dropped as soon as its module
     # actually loads (sys.modules satisfies imports from then on) or when its library unloads.
     _pending_stable_module_loaders: dict[str, Callable[[], ModuleType]]  # stable_namespace -> module loader
+    # Node file each pending loader will import, so a legacy volatile module reference can be
+    # matched to (and resolved against) a file that lazy loading has not imported yet.
+    _pending_stable_module_files: dict[str, Path]  # stable_namespace -> node file it will load
     _library_to_pending_stable_namespaces: dict[str, set[str]]  # library_name -> pending stable_namespaces
     # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
     _stable_namespace_finder: StableNamespaceImportFinder
@@ -684,6 +687,7 @@ class LibraryManager:
         self._library_file_path_to_info = {}
         self._library_to_stable_modules = {}
         self._pending_stable_module_loaders = {}
+        self._pending_stable_module_files = {}
         self._library_to_pending_stable_namespaces = {}
         self._stable_module_to_file = {}
         # Installed last so the finder only ever observes fully initialized tracking state.
@@ -3203,7 +3207,11 @@ class LibraryManager:
         sys.meta_path.append(self._stable_namespace_finder)
 
     def _register_pending_stable_module_loader(
-        self, stable_namespace: str, library_name: str, module_loader: Callable[[], ModuleType]
+        self,
+        stable_namespace: str,
+        library_name: str,
+        node_file_path: Path,
+        module_loader: Callable[[], ModuleType],
     ) -> None:
         """Make a lazily registered node file importable via its stable namespace.
 
@@ -3214,9 +3222,12 @@ class LibraryManager:
         Args:
             stable_namespace: Stable namespace the file will be importable under
             library_name: Name of the owning library (for cleanup on unload)
+            node_file_path: Node file the loader imports, recorded so legacy volatile module
+                references can be matched against files that have not been imported yet
             module_loader: Memoized zero-argument loader that imports the file's module
         """
         self._pending_stable_module_loaders[stable_namespace] = module_loader
+        self._pending_stable_module_files[stable_namespace] = node_file_path
         self._library_to_pending_stable_namespaces.setdefault(library_name, set()).add(stable_namespace)
 
     def _unregister_pending_stable_module_loaders_for_library(self, library_name: str) -> None:
@@ -3228,6 +3239,7 @@ class LibraryManager:
         pending_namespaces = self._library_to_pending_stable_namespaces.pop(library_name, set())
         for stable_namespace in pending_namespaces:
             self._pending_stable_module_loaders.pop(stable_namespace, None)
+            self._pending_stable_module_files.pop(stable_namespace, None)
 
     def _resolve_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
         """Resolve the stable namespace to load a file under, disambiguating collisions.
@@ -3327,6 +3339,7 @@ class LibraryManager:
         # The module is in sys.modules now; retire its pending loader so the meta-path finder
         # can never serve a stale module object after this one is unloaded.
         self._pending_stable_module_loaders.pop(stable_namespace, None)
+        self._pending_stable_module_files.pop(stable_namespace, None)
         self._library_to_pending_stable_namespaces.get(library_name, set()).discard(stable_namespace)
 
         # Wire the leaf module onto its parent package for attribute-based import navigation.
@@ -3448,6 +3461,11 @@ class LibraryManager:
         # files the way they did in the old format.
         file_token = match.group("file_token")
 
+        # Under lazy node loading the file this reference points at may not be imported yet, so
+        # there would be nothing tracked to match against. Import just the pending files whose
+        # name matches the recorded token, leaving every unrelated node file untouched.
+        self._load_pending_modules_for_volatile_token(file_token)
+
         matching_modules: list[ModuleType] = []
         for stable_namespace, module_file in sorted(self._stable_module_to_file.items()):
             # Match on the file's own logical name, not the namespace leaf: a module that
@@ -3515,6 +3533,30 @@ class LibraryManager:
         if len(matching_modules) > 1:
             raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matching_modules])
         return self._get_class_defined_in_module(matching_modules[0], class_name)
+
+    def _load_pending_modules_for_volatile_token(self, file_token: str) -> None:
+        """Import pending lazy node modules whose file name matches a legacy volatile token.
+
+        Legacy pickles name the module by file (``gtn_dynamic_module_<file>_py_<hash>``), and
+        volatile recovery can only match against modules that are actually loaded. With lazy
+        node loading a library's files stay unimported until first use, so recovery would find
+        no candidate at all. Importing only the pending files whose name matches the recorded
+        token keeps lazy loading intact for everything else.
+
+        Args:
+            file_token: File token recorded in the legacy module name, in the old
+                ``file_path.name.replace(".", "_")`` form
+        """
+        # Snapshot first: loading a module retires its own pending entry, mutating these dicts.
+        matching_namespaces = [
+            stable_namespace
+            for stable_namespace, node_file_path in self._pending_stable_module_files.items()
+            if node_file_path.name.replace(".", "_") == file_token
+        ]
+        for stable_namespace in matching_namespaces:
+            module_loader = self._pending_stable_module_loaders.get(stable_namespace)
+            if module_loader is not None:
+                module_loader()
 
     @staticmethod
     def _collision_suffix(file_path: Path) -> str:
@@ -4855,7 +4897,7 @@ class LibraryManager:
         # StableNamespaceImportFinder resolves on first import of the namespace.
         stable_namespace = self._create_stable_namespace(library_name, node_file_path)
         module_loader = self._get_or_create_module_loader(node_file_path, library_name, module_loaders)
-        self._register_pending_stable_module_loader(stable_namespace, library_name, module_loader)
+        self._register_pending_stable_module_loader(stable_namespace, library_name, node_file_path, module_loader)
         library_problem = library.register_lazy_node_type(
             node_definition.class_name, metadata=node_definition.metadata, loader=loader
         )
