@@ -42,14 +42,19 @@ different value is currently permitted — resets the parameter's stored value
 to a permitted alternative via ``set_parameter_value(..., initial_setup=True)``.
 The parameter's declarative ``default_value`` is untouched.
 
-Nodes then forward ``after_value_set`` for the model parameter to
-``self._model_access.on_value_changed(value)``, and pick a failure-routing
-idiom that matches their base class:
+Nodes then forward ``after_value_set`` to ``self._model_access.on_value_set(
+parameter, value)`` -- the component filters for its own parameter -- and pick a
+failure-routing idiom that matches their base class:
 
-  - ControlNode / raise-based execute paths call ``raise_if_denied(value)``.
-  - SuccessFailureNode / GriptapeProxyNode nodes call ``query_for_denial(value)``
+  - ControlNode / raise-based execute paths call ``raise_if_selection_denied()``.
+  - SuccessFailureNode / GriptapeProxyNode nodes call ``selection_denial()``
     and route the reason into ``self._set_status_results(was_successful=False,
     result_details=denial.reason())``.
+
+Both read the current selection off the parameter the component owns, so a node
+never restates its own parameter's name. ``query_for_denial(value)`` and
+``raise_if_denied(value)`` remain for the rare caller holding a model id from
+somewhere other than the dropdown.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
@@ -251,6 +256,26 @@ class ModelAccessComponent:
         """
         return list(self._model_choices)
 
+    @property
+    def parameter_name(self) -> str:
+        """Name of the parameter this component decorates.
+
+        A node base class that forwards hooks generically reads the name from
+        here rather than hardcoding it, since it differs across nodes (``model``
+        on most, ``model_name`` or ``model_id`` on others).
+        """
+        return self._parameter.name
+
+    @property
+    def selected_value(self) -> Any:
+        """The parameter's current stored value.
+
+        Typed ``Any`` rather than ``str`` on purpose: an upstream connection can
+        replace the dropdown selection with a driver object, which the gating
+        methods deliberately pass through untouched.
+        """
+        return self._node.get_parameter_value(self._parameter.name)
+
     def reinstall_options(self) -> None:
         """Reinstall the ``Options`` trait and reapply decoration + badge.
 
@@ -286,6 +311,21 @@ class ModelAccessComponent:
             message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
             icon=_DENIED_ROW_ICON,
         )
+
+    def on_value_set(self, parameter: Parameter, value: Any) -> None:
+        """Forward from ``BaseNode.after_value_set``, ignoring every other parameter.
+
+        A node's ``after_value_set`` fires for all of its parameters, so the
+        component filters on its own before updating the badge. Nodes forward
+        unconditionally and let this decide:
+
+            def after_value_set(self, parameter, value) -> None:
+                self._model_access.on_value_set(parameter, value)
+                return super().after_value_set(parameter, value)
+        """
+        if parameter.name != self._parameter.name:
+            return
+        self.on_value_changed(value)
 
     def refresh(self) -> None:
         """Re-query the engine and rebuild the decoration + current-selection badge.
@@ -366,6 +406,20 @@ class ModelAccessComponent:
             return
         msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
         raise RuntimeError(msg)
+
+    def selection_denial(self) -> CheckpointDenial | None:
+        """``query_for_denial`` against the current selection.
+
+        The component owns the parameter, so it reads the stored value itself.
+        Prefer this over passing ``get_parameter_value(...)`` back in: a caller
+        that re-derives the value has to know the parameter's name, which varies
+        per node.
+        """
+        return self.query_for_denial(self.selected_value)
+
+    def raise_if_selection_denied(self) -> None:
+        """``raise_if_denied`` against the current selection. See ``selection_denial``."""
+        self.raise_if_denied(self.selected_value)
 
     def pick_permitted_default(self) -> str | None:
         """Return the value the node should use as its ``default_value=``, or ``None``.
