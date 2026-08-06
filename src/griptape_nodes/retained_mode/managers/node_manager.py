@@ -816,6 +816,27 @@ class NodeManager:
         if remapped_requested_node_name:
             details = f"{details}. Had to rename from original node name requested '{request.node_name}' as an object with this name already existed."
 
+        # Handle parent_group_name: add this node to an existing group.
+        # This must happen before the paired-node handling below so the auto-created
+        # End node can inherit the same group as its Start node.
+        if request.parent_group_name:
+            try:
+                parent_group = self.get_node_by_name(request.parent_group_name)
+                if isinstance(parent_group, BaseNodeGroup):
+                    parent_group.add_nodes_to_group([node])
+                else:
+                    logger.warning(
+                        "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
+                        node.name,
+                        request.parent_group_name,
+                    )
+            except KeyError:
+                logger.warning(
+                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
+                    node.name,
+                    request.parent_group_name,
+                )
+
         # Special handling for paired classes (e.g., create a Start node and it automatically creates a corresponding End node already connected).
         if isinstance(node, BaseIterativeStartNode) and not request.initial_setup:
             # If it's StartLoop, create an EndLoop and connect it to the StartLoop.
@@ -832,6 +853,8 @@ class NodeManager:
                 msg = f"Attempted to create a paired set of nodes for Node '{final_node_name}'. Failed because paired class '{end_class_name}' does not exist for start class '{node_class_name}'. The corresponding node will have to be created by hand and attached manually."
                 logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
             else:
+                # Place the paired End node in the same group as the Start node (if any).
+                paired_parent_group_name = node.parent_group.name if node.parent_group else None
                 # Create the EndNode
                 end_loop = GriptapeNodes.handle_request(
                     CreateNodeRequest(
@@ -840,6 +863,7 @@ class NodeManager:
                             "position": {"x": node.metadata["position"]["x"] + 650, "y": node.metadata["position"]["y"]}
                         },
                         override_parent_flow_name=parent_flow_name,
+                        parent_group_name=paired_parent_group_name,
                     )
                 )
                 if not isinstance(end_loop, CreateNodeResultSuccess):
@@ -906,25 +930,6 @@ class NodeManager:
                     f"Failed because node is not a BaseNodeGroup."
                 )
                 logger.warning(warning_details)
-
-        # Handle parent_group_name: add this node to an existing group
-        if request.parent_group_name:
-            try:
-                parent_group = self.get_node_by_name(request.parent_group_name)
-                if isinstance(parent_group, BaseNodeGroup):
-                    parent_group.add_nodes_to_group([node])
-                else:
-                    logger.warning(
-                        "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
-                        node.name,
-                        request.parent_group_name,
-                    )
-            except KeyError:
-                logger.warning(
-                    "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
-                    node.name,
-                    request.parent_group_name,
-                )
 
         return CreateNodeResultSuccess(
             node_name=node.name,
@@ -998,7 +1003,12 @@ class NodeManager:
         return node_group
 
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
-        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup."""
+        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
+
+        For any BaseIterativeStartNode in the list whose paired end_node is not already
+        in the group and not already in the requested list, the end_node is appended to
+        the final list so that Start and End always land in the group together.
+        """
         flow_result = self._get_flow_for_node_group_operation(request.flow_name)
         if isinstance(flow_result, AddNodesToNodeGroupResultFailure):
             return flow_result
@@ -1013,15 +1023,32 @@ class NodeManager:
             return node_group_result
         node_group = node_group_result
 
+        # Build the final node list, pulling in any paired End nodes that are missing.
+        final_nodes: list[BaseNode] = list(nodes)
+        for node in nodes:
+            if not isinstance(node, BaseIterativeStartNode):
+                continue
+            end_node = node.end_node
+            if end_node is None:
+                continue
+            if end_node in final_nodes:
+                continue
+            if end_node.name in node_group.nodes:
+                continue
+            final_nodes.append(end_node)
+
         try:
-            node_group.add_nodes_to_group(nodes)
+            node_group.add_nodes_to_group(final_nodes)
         except Exception as err:
-            details = f"Attempted to add node '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
+            details = f"Attempted to add nodes '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return AddNodesToNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully added node '{request.node_names}' to NodeGroup '{request.node_group_name}'"
+        node_names_added = [n.name for n in final_nodes]
+        details = f"Successfully added nodes '{node_names_added}' to NodeGroup '{request.node_group_name}'"
         return AddNodesToNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_added=node_names_added,
+            node_group_name=request.node_group_name,
         )
 
     def _get_flow_for_remove_operation(self, flow_name: str | None) -> RemoveNodeFromNodeGroupResultFailure | None:
