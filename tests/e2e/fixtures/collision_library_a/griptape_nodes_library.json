@@ -1,0 +1,35 @@
+{
+  "name": "Collision Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Namespace-collision fixture A used by library-module-lifecycle e2e tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "CollisionNodeA",
+      "file_path": "collide.py",
+      "metadata": {
+        "category": "test",
+        "description": "Namespace-collision fixture A",
+        "display_name": "Collision A"
+      }
+    }
+  ]
+}
