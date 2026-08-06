@@ -34,8 +34,11 @@ class ModelAccessVerdict:
     ``claude-opus-4-7``), populated from the library catalog when the candidate
     resolves to a known entry. It is ``None`` both when the candidate did not
     resolve AND when it resolved to an entry that declares no ``provider_model_id``,
-    so ``None`` cannot be read as "unresolved" -- match on `model_id` for identity
-    and treat `provider_model_id` purely as the upstream display handle.
+    so ``None`` cannot be read as "unresolved". A model dropdown stores this id,
+    so a caller may resolve a stored value to its `model_id` through it, but
+    `model_id` remains the sole identity the engine gates on and the field to
+    match a verdict back to a candidate. The catalog permits two entries to share
+    one `provider_model_id`, so that resolution is not guaranteed unique.
 
     `display_name` is the catalog's human-readable name for the model (e.g.
     ``"Claude Opus 4.7"``), populated on the same terms as `provider_model_id` --

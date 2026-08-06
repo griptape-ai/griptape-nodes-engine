@@ -6,18 +6,20 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
-A dropdown stores the catalog model key itself (e.g. ``"gtc_seedream_4_5"``)
--- the same key the permission layer gates on -- so a choice never needs
-resolving against the catalog; it either is one of the node's declared model
-ids, or it isn't. Each row's ``ui_options["data"]`` entry additionally carries
-a ``"label"``: the catalog's human-readable ``display_name`` for that choice,
-rendered by the dropdown instead of the raw key. The label is presentation
-only -- the parameter's stored value, and everything this component matches
-it against, stays the catalog key. ``deprecated_values`` covers the values a
-node used to store before it adopted this convention (an old display label, a
-provider's own model id): the mapping is accepted wherever a value is
-assigned, migrated to its canonical choice, and never offered as a fresh
-selection.
+A dropdown stores the provider's own model id (e.g.
+``"dreamina-seedance-2-0-260128"``) -- the id a node already needs in order to
+build its upstream API request -- and this component resolves it to the
+catalog ``model_id`` the permission layer gates on. That way a node never has
+to think in catalog terms, and the mapping lives here rather than being
+restated at every call site. Each row's ``ui_options["data"]`` entry carries a
+``"label"``: the catalog's human-readable ``display_name`` for that choice,
+rendered by the dropdown instead of the raw provider id. The label is
+presentation only -- the parameter's stored value stays the provider model id,
+and identity for gating is always the catalog ``model_id`` it resolves to.
+``deprecated_values`` covers the values a node used to store before it adopted
+this convention (an old display label, a catalog key): the mapping is accepted
+wherever a value is assigned, migrated to its canonical choice, and never
+offered as a fresh selection.
 
 Usage — one construction step per parameter:
 
@@ -96,8 +98,11 @@ from griptape_nodes.traits.options import Options
 logger = logging.getLogger("griptape_nodes")
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.events.access_events import ModelAccessVerdict
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.traits.button import ButtonDetailsMessagePayload
 
@@ -112,10 +117,10 @@ class _AccessSnapshot:
     """The cached result of one ``QueryModelAccessForNodeRequest``.
 
     Everything is keyed on the catalog ``model_id``, which every verdict always
-    carries. A dropdown choice IS a catalog model id (see the module
-    docstring), so ``model_id_by_choice`` needs no resolution step: it is the
-    subset of the offered choices that the query's verdicts recognized, mapped
-    to itself.
+    carries. A dropdown choice is a ``provider_model_id`` (see the module
+    docstring), so ``model_id_by_choice`` holds the resolution step: the subset
+    of the offered choices whose provider id matched a verdict, mapped to that
+    verdict's catalog ``model_id``.
 
     ``unresolved_choices`` are the offered choices that matched no declared
     catalog model. When the node declares models at all, that is an authoring
@@ -190,13 +195,14 @@ class ModelAccessComponent:
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
 
-        Every entry in ``model_choices`` IS the catalog model id the policy
-        gates on -- no resolution step needed. ``deprecated_values`` maps a
-        historical stored value (an old display label, a provider's own model
-        id, anything a prior version of this node once stored) to the current
-        choice it becomes. Every value in the mapping must be one of
-        ``model_choices``, and no key may itself already be a current choice;
-        either problem raises at construction.
+        Every entry in ``model_choices`` is a ``provider_model_id`` -- the
+        upstream provider's own name for the model -- which the component
+        resolves to the catalog model id the policy gates on.
+        ``deprecated_values`` maps a historical stored value (an old display
+        label, a catalog key, anything a prior version of this node once
+        stored) to the current choice it becomes. Every value in the mapping
+        must be one of ``model_choices``, and no key may itself already be a
+        current choice; either problem raises at construction.
 
         A legacy value is accepted wherever it is assigned -- the ``Options``
         trait's ``choices`` include it -- but migrated to its canonical choice
@@ -474,7 +480,7 @@ class ModelAccessComponent:
         detail = (
             f"License policy could not be evaluated for '{value}' on node "
             f"'{type(self._node).__name__}': it matches no model declared by this node. "
-            "Verify the library manifest's model_usage block declares this model id."
+            "Verify the library manifest's model_usage block declares a model with this provider model id."
         )
         return CheckpointDenial(failures=(CheckpointFailure(detail=detail),))
 
@@ -533,12 +539,17 @@ class ModelAccessComponent:
     def _fetch_snapshot(self) -> _AccessSnapshot:
         """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.
 
-        On ``Success``: a dropdown choice IS a catalog model id, so matching it
-        against the node's declared models is a membership check against the
-        verdicts' model ids -- no resolution step. Denials are recorded by the
-        same id, so both tables come from the same query and never drift. An
-        empty verdict list is a valid response (the node declares no gated
-        models).
+        On ``Success``: a dropdown choice is a ``provider_model_id``, so it is
+        resolved to the catalog ``model_id`` the verdicts are keyed on. Denials
+        and display names are recorded by that same catalog id, so every table
+        comes from the same query and they never drift. An empty verdict list is
+        a valid response (the node declares no gated models).
+
+        The catalog schema permits two entries to share one ``provider_model_id``
+        (the same upstream model with different ``key_support``). A dropdown
+        value then cannot say which entry policy should apply to, so the first
+        declared entry wins and the collision is logged: silently gating against
+        the wrong entry would be worse than a noisy warning.
 
         On ``Failure`` (or any unexpected result type): log a warning naming
         the node type + the failure reason, and return a snapshot with
@@ -564,15 +575,14 @@ class ModelAccessComponent:
                     "Verify the library manifest declares this node type with a model_usage block."
                 )
             )
-        declared_model_ids = {verdict.model_id for verdict in result.verdicts}
-        model_id_by_choice = {choice: choice for choice in self._model_choices if choice in declared_model_ids}
+        model_id_by_choice = self._resolve_choices(result.verdicts, node_type=node_type)
         declares_models = bool(result.verdicts)
         unresolved = tuple(choice for choice in self._model_choices if choice not in model_id_by_choice)
         if unresolved and declares_models:
             logger.warning(
                 "ModelAccessComponent: node type '%s' offers %s, which match no model it declares. "
                 "Selecting one fails closed at run time. Declare the model in the library manifest so "
-                "its catalog id matches this value.",
+                "its provider_model_id matches this value.",
                 node_type,
                 ", ".join(repr(choice) for choice in unresolved),
             )
@@ -596,6 +606,52 @@ class ModelAccessComponent:
             if verdict.display_name is not None:
                 snapshot.display_name_by_model_id[verdict.model_id] = verdict.display_name
         return snapshot
+
+    def _resolve_choices(self, verdicts: Sequence[ModelAccessVerdict], *, node_type: str) -> dict[str, str]:
+        """Map each offered choice to the catalog ``model_id`` that license policy gates on.
+
+        A choice is a ``provider_model_id`` (see the module docstring), so the
+        verdicts are inverted into ``provider_model_id -> model_id`` and the
+        offered choices are selected from that. A verdict carrying no provider
+        id contributes nothing: it describes a catalog entry no dropdown can
+        name. Choices absent from the result are left out entirely, which is
+        what makes them ``unresolved_choices`` and fails them closed at run time.
+
+        The catalog permits two entries to share one ``provider_model_id``, in
+        which case the first declared entry claims it and the collision is
+        logged for any choice actually affected. Gating against an arbitrary one
+        of two entries is not something to do silently.
+        """
+        model_id_by_provider_id: dict[str, str] = {}
+        colliding_provider_ids: set[str] = set()
+        for verdict in verdicts:
+            provider_model_id = verdict.provider_model_id
+            if provider_model_id is None:
+                continue
+            claimed_model_id = model_id_by_provider_id.get(provider_model_id)
+            if claimed_model_id is None:
+                model_id_by_provider_id[provider_model_id] = verdict.model_id
+                continue
+            if claimed_model_id != verdict.model_id:
+                colliding_provider_ids.add(provider_model_id)
+        model_id_by_choice = {
+            choice: model_id_by_provider_id[choice]
+            for choice in self._model_choices
+            if choice in model_id_by_provider_id
+        }
+        offered_collisions = sorted(
+            provider_id for provider_id in colliding_provider_ids if provider_id in model_id_by_choice
+        )
+        if offered_collisions:
+            logger.warning(
+                "ModelAccessComponent: node type '%s' declares several catalog models that share the "
+                "provider model id(s) %s, so a dropdown value cannot identify which entry license "
+                "policy applies to. Gating uses the first declared entry. Offer only one of the "
+                "colliding catalog entries, or give them distinct provider model ids.",
+                node_type,
+                ", ".join(repr(provider_id) for provider_id in offered_collisions),
+            )
+        return model_id_by_choice
 
     def _build_ui_options(self) -> dict[str, Any]:
         """Build the ``ui_options`` dict that decorates the dropdown row-by-row.
