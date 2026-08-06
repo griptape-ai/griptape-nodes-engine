@@ -30,7 +30,7 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
     NodeModuleImportProblem,
 )
-from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+from griptape_nodes.retained_mode.managers.library_manager import LibraryManager, loads_with_library_recovery
 from griptape_nodes.retained_mode.managers.settings import LibrarySettings
 
 if TYPE_CHECKING:
@@ -343,6 +343,26 @@ class TestStableNamespaceImportUnderLazyLoading:
 
         assert root_package.__path__ is not None
         assert library_package.__path__ is not None
+
+    def test_legacy_volatile_reference_recovers_before_any_import(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A legacy volatile module reference must recover with nothing imported yet.
+
+        Older engines recorded per-process module names like
+        ``gtn_dynamic_module_good_node_py_<hash>``. Volatile recovery matches those against
+        modules that are loaded, so under lazy loading it has to import the pending file whose
+        name matches the recorded token before it can find anything.
+        """
+        self._register_lazy_library(griptape_nodes, tmp_path)
+        assert self.GOOD_STABLE_NAMESPACE not in sys.modules
+
+        payload = b"cgtn_dynamic_module_good_node_py_123456789\nGoodNode\n."
+        node_class = loads_with_library_recovery(payload)
+
+        assert node_class is LibraryRegistry.get_library("Lazy Flag Test Library").get_node_class("GoodNode")
+        # Only the file named by the token is imported; unrelated node files stay lazy.
+        assert self.BROKEN_STABLE_NAMESPACE not in sys.modules
 
     def test_broken_module_import_raises_import_error(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         self._register_lazy_library(griptape_nodes, tmp_path)
