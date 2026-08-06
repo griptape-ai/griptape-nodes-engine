@@ -21,11 +21,15 @@ Focused on:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultFailure
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -629,6 +633,35 @@ class TestRefreshAndQueryForDenial:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
         assert helper.query_for_denial("alpha") is None
+
+    def test_an_unanswerable_live_requery_falls_back_to_the_cached_denial(self, griptape_nodes) -> None:  # noqa: ANN001
+        """A transient lookup failure must not forget a denial we already hold.
+
+        The run path re-asks policy live so grants are honored. If that query cannot be answered
+        (library reloaded or unregistered mid-session) returning None would run a model the cached
+        snapshot knows is forbidden.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+
+            # The live re-query now comes back unanswerable.
+            with patch.object(
+                GriptapeNodes,
+                "handle_request",
+                return_value=QueryModelAccessForNodeResultFailure(result_details="library unregistered"),
+            ):
+                assert helper.query_for_denial("alpha") is not None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
     def test_query_for_denial_ignores_non_string_values(self) -> None:
         _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="alpha")

@@ -313,6 +313,31 @@ class TestIncomingSelectionIsHonored:
         assert param._node.get_parameter_value("model") == other
 
 
+class TestAnEmptyCacheDoesNotDestroyASavedSelection:
+    """Opening a saved workflow on a machine that lacks the model must not lose the model's name.
+
+    The old per-subclass override returned early when nothing was cached, leaving the stored value
+    intact. The template method always writes, so an empty scan would replace a real repo id with
+    the placeholder string -- and re-saving would persist that loss, turning "you need to download
+    X" into "model 'No models downloaded — visit Model Manager' not found".
+    """
+
+    @pytest.mark.parametrize("subclass", ["repo", "file"])
+    def test_the_stored_repo_id_survives_a_refresh_with_nothing_cached(self, subclass: str) -> None:
+        verdicts = [ModelAccessVerdict(model_id="md_a", provider_model_id=FILE_REPO, denial=None)]
+        with _stub(verdicts):
+            if subclass == "repo":
+                param = HuggingFaceRepoParameter(MockNode(), repo_ids=[FILE_REPO])
+            else:
+                param = HuggingFaceRepoFileParameter(MockNode(), repo_files=[(FILE_REPO, FILE_NAME)])
+            param.add_input_parameters()
+            param._node.set_parameter_value("model", FILE_REPO)
+            # Nothing cached AND nothing offered for download -> no choices at all.
+            with patch.object(type(param), "get_choices", return_value=[]):
+                param.refresh_parameters()
+        assert param._node.get_parameter_value("model") == FILE_REPO
+
+
 class TestEnforcementDecisionCannotDriftFromTheSnapshot:
     """`_gated` is derived from the snapshot on read, never stored beside it.
 

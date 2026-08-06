@@ -158,6 +158,39 @@ class TestAnUnattributableDenialIsNotDropped:
         assert snapshot.denial_for(ALLOWED) is not None
 
 
+class TestASharedProviderModelIdIsNotLastWriteWins:
+    """Two catalog entries may declare the same ``provider_model_id`` with different key support.
+
+    `Model`'s contract sanctions this (a BYOK entry beside a hosted-key entry). If the tables were
+    last-write-wins, a permitted twin arriving after a denied one would erase the denial and the
+    forbidden entry would run.
+    """
+
+    def test_a_denial_survives_a_permitted_twin(self) -> None:
+        shared = "black-forest-labs/FLUX.1-dev"
+        verdicts = [
+            ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=_DENIAL),
+            ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
+        ]
+        with patch(_HANDLE, return_value=_success(verdicts)):
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.denial_for(shared) is _DENIAL
+
+    def test_every_catalog_id_behind_a_handle_is_retained(self) -> None:
+        """Callers that re-ask policy live must ask about all of them, not whichever was last."""
+        shared = "black-forest-labs/FLUX.1-dev"
+        verdicts = [
+            ModelAccessVerdict(model_id="md_flux_byok", provider_model_id=shared, denial=None),
+            ModelAccessVerdict(model_id="md_flux_gtc", provider_model_id=shared, denial=None),
+        ]
+        with patch(_HANDLE, return_value=_success(verdicts)):
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.catalog_ids_for(shared) == ("md_flux_byok", "md_flux_gtc")
+
+    def test_an_unknown_handle_has_no_catalog_ids(self) -> None:
+        assert ModelPolicySnapshot().catalog_ids_for(UNKNOWN) == ()
+
+
 class TestSnapshotIsImmutable:
     def test_frozen(self) -> None:
         """Callers replace the snapshot wholesale, so the tables cannot drift apart."""
