@@ -1790,6 +1790,7 @@ class NodeManager:
             parent_container_name=request.parent_container_name,
             parent_element_name=parent_group.name if parent_group is not None else None,
             settable=request.settable,
+            allow_variable_substitution=request.allow_variable_substitution,
         )
         try:
             with sanctioned_parameter_mutation():
@@ -2060,6 +2061,7 @@ class NodeManager:
             is_user_defined=getattr(element, "user_defined", False),
             settable=getattr(element, "settable", None),
             private=getattr(element, "private", False),
+            allow_variable_substitution=getattr(element, "allow_variable_substitution", True),
             ui_options=getattr(element, "ui_options", None),
             result_details=details,
         )
@@ -2199,6 +2201,8 @@ class NodeManager:
                 parameter.allowed_modes.discard(ParameterMode.OUTPUT)
         if request.settable is not None:
             parameter.settable = request.settable
+        if request.allow_variable_substitution is not None:
+            parameter.allow_variable_substitution = request.allow_variable_substitution
 
     def _validate_and_break_invalid_connections(
         self, node_name: str, parameter: Parameter, request: AlterParameterDetailsRequest

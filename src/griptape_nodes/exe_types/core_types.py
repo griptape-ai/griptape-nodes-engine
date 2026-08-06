@@ -1479,6 +1479,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
 
     user_defined: bool = False
     private: bool = False
+    allow_variable_substitution: bool = True
     _allowed_modes: set = field(
         default_factory=lambda: {
             ParameterMode.OUTPUT,
@@ -1524,6 +1525,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         serializable: bool = True,
         user_defined: bool = False,
         private: bool = False,
+        allow_variable_substitution: bool = True,
         element_id: str | None = None,
         element_type: str | None = None,
         parent_container_name: str | None = None,
@@ -1560,6 +1562,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         self.serializable = serializable
         self.user_defined = user_defined
         self.private = private
+        self.allow_variable_substitution = allow_variable_substitution
 
         # Process allowed_modes - use convenience parameters if allowed_modes not explicitly set
         if allowed_modes is None:
@@ -1733,6 +1736,7 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         our_dict["settable"] = self.settable
         our_dict["serializable"] = self.serializable
         our_dict["private"] = self.private
+        our_dict["allow_variable_substitution"] = self.allow_variable_substitution
         our_dict["ui_options"] = self.ui_options
 
         # Let's bundle up the mode details.

@@ -1202,6 +1202,33 @@ class SaveSubflowToWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadF
 
 @dataclass
 @PayloadRegistry.register
+class GetVariableSubstitutionEnabledRequest(RequestPayload):
+    """Get whether inline variable substitution is enabled for the current workflow.
+
+    Results: GetVariableSubstitutionEnabledResultSuccess | GetVariableSubstitutionEnabledResultFailure
+    """
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariableSubstitutionEnabledResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    """Variable substitution enabled state retrieved successfully.
+
+    Args:
+        enabled: True if {VAR} tokens are substituted at execution time, False otherwise.
+    """
+
+    enabled: bool
+
+
+@dataclass
+@PayloadRegistry.register
+class GetVariableSubstitutionEnabledResultFailure(ResultPayloadFailure):
+    """Variable substitution enabled state retrieval failed. Common cause: no active workflow context."""
+
+
+@dataclass
+@PayloadRegistry.register
 class SetVariableSubstitutionEnabledRequest(RequestPayload):
     """Enable or disable inline variable substitution for the current workflow.
 

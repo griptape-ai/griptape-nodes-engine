@@ -1030,6 +1030,7 @@ class BaseNode(ABC):
             and VariableResolver.contains_variable_macro(value)
             and _in_aprocess.get()
             and not self._param_has_incoming_connection(param_name)
+            and param.allow_variable_substitution
         ):
             value = self._resolve_variables_in_string(value)
         return value
@@ -1125,6 +1126,8 @@ class BaseNode(ABC):
         """Runs before the entire workflow is run."""
         if VariableResolver.is_substitution_enabled():
             for param in self.parameters:
+                if not param.allow_variable_substitution:
+                    continue
                 value = self.parameter_values.get(param.name, param.default_value)
                 if VariableResolver.contains_variable_macro(value):
                     self.make_node_unresolved(
@@ -1585,6 +1588,9 @@ class BaseNode(ABC):
             )
         else:
             event_data = parameter.to_event(self)
+            # Mirror display-preservation guard from TrackedParameterOutputValues._emit_parameter_change_event.
+            if _in_aprocess.get() and "value" in event_data:
+                event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
             event = ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
@@ -1740,7 +1746,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get():
-            value = self._node._resolve_variables_in_value(value)
+            param = self._node.get_parameter_by_name(key)
+            if param is None or param.allow_variable_substitution:
+                value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
