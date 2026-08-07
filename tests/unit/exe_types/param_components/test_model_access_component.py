@@ -21,11 +21,15 @@ Focused on:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultFailure
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -454,7 +458,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             self._build_component_against_unresolved_node()
 
-        matches = [r for r in caplog.records if "engine could not resolve access" in r.message]
+        matches = [r for r in caplog.records if "Could not resolve model access" in r.message]
         assert matches, "Expected a warning log about unresolved access; got none."
         assert "_AccessProbeNode" in matches[0].message
 
@@ -602,6 +606,60 @@ class TestRefreshAndQueryForDenial:
             assert denial.messages() == ["Alpha not enabled."]
 
             assert helper.query_for_denial("beta") is None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_query_for_denial_honors_a_grant_made_since_the_last_refresh(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The run-path re-query must work in BOTH directions, not just allow -> deny.
+
+        The snapshot is captured at construction/refresh time. If a cached denial short-circuited
+        the live re-query, a studio that GRANTS a permission mid-session would leave artists blocked
+        with "not permitted" until something happened to call refresh() -- and a grant is precisely
+        the case where re-asking live matters.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+        finally:
+            # Policy relaxed. No refresh() -- the run path alone must notice.
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+        assert helper.query_for_denial("alpha") is None
+
+    def test_an_unanswerable_live_requery_falls_back_to_the_cached_denial(self, griptape_nodes) -> None:  # noqa: ANN001
+        """A transient lookup failure must not forget a denial we already hold.
+
+        The run path re-asks policy live so grants are honored. If that query cannot be answered
+        (library reloaded or unregistered mid-session) returning None would run a model the cached
+        snapshot knows is forbidden.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+
+            # The live re-query now comes back unanswerable.
+            with patch.object(
+                GriptapeNodes,
+                "handle_request",
+                return_value=QueryModelAccessForNodeResultFailure(result_details="library unregistered"),
+            ):
+                assert helper.query_for_denial("alpha") is not None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
