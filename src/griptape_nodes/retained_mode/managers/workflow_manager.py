@@ -6,6 +6,7 @@ import logging
 import pickle
 import re
 import sys
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
@@ -103,6 +104,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
+    GetVariableSubstitutionEnabledRequest,
+    GetVariableSubstitutionEnabledResultFailure,
+    GetVariableSubstitutionEnabledResultSuccess,
     GetWorkflowInfoRequest,
     GetWorkflowInfoResultFailure,
     GetWorkflowInfoResultSuccess,
@@ -425,6 +429,10 @@ class WorkflowManager:
             self.on_set_workflow_metadata_request,
         )
         event_manager.assign_manager_to_request_type(
+            GetVariableSubstitutionEnabledRequest,
+            self.on_get_variable_substitution_enabled_request,
+        )
+        event_manager.assign_manager_to_request_type(
             SetVariableSubstitutionEnabledRequest,
             self.on_set_variable_substitution_enabled_request,
         )
@@ -521,6 +529,24 @@ class WorkflowManager:
         workflow_name = context_manager.get_current_workflow_name()
         # Return the stored value, or True if this workflow has never set the flag.
         return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_get_variable_substitution_enabled_request(
+        self,
+        request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
+    ) -> ResultPayload:
+        """Return whether variable substitution is enabled for the current workflow."""
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_workflow():
+            return GetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to get variable substitution enabled. Failed because no workflow is active."
+            )
+        enabled = self.is_variable_substitution_enabled()
+        return GetVariableSubstitutionEnabledResultSuccess(
+            result_details=f"Variable substitution is {'enabled' if enabled else 'disabled'} for the current workflow.",
+            enabled=enabled,
+        )
 
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest
@@ -1816,9 +1842,13 @@ class WorkflowManager:
             for line in matches[0].group("content").splitlines(keepends=True)
         )
 
+        # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a
+        # formatting-preserving document model that costs ~20x more per header. Only the
+        # save path (_generate_workflow_metadata_header) needs tomlkit, to keep the
+        # formatting of headers it rewrites.
         try:
-            toml_doc = tomlkit.parse(metadata_content_toml)
-        except Exception as err:
+            toml_doc = tomllib.loads(metadata_content_toml)
+        except tomllib.TOMLDecodeError as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
@@ -1832,8 +1862,8 @@ class WorkflowManager:
         tool_header = "tool"
         griptape_nodes_header = "griptape-nodes"
         try:
-            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]  # type: ignore (this is the only way I could find to get tomlkit to do the dotted notation correctly)
-        except Exception as err:
+            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]
+        except (KeyError, TypeError) as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
@@ -2063,13 +2093,15 @@ class WorkflowManager:
     async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
         await self._process_workflows_for_registration(workflows_to_register)
 
-    async def _register_workflow(self, workflow_to_register: str) -> bool:
+    def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
         """Registers a workflow from a file.
 
         Args:
-            config_mgr: The ConfigManager instance to use for path resolution.
-            workflow_mgr: The WorkflowManager instance to use for workflow registration.
             workflow_to_register: The path to the workflow file to register.
+            workflow_metadata: Metadata already loaded from that file by the caller.
+                Passed in rather than re-read here: loading it parses the file's TOML
+                header, and the caller has to do that anyway to decide the file is
+                registerable, so re-reading would parse every workflow twice.
 
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
@@ -2078,31 +2110,6 @@ class WorkflowManager:
         # However, the table of WorkflowInfo DOES get updated in this request, which may present a confusing state of affairs to the user.
         # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
-
-        # Attempt to extract the metadata out of the workflow.
-        load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_to_register))
-        load_metadata_result = await self.on_load_workflow_metadata_request(load_metadata_request)
-        if not load_metadata_result.succeeded():
-            # SKIP IT
-            return False
-
-        if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-            err_str = (
-                f"Attempted to register workflow '{workflow_to_register}', but failed to extract metadata. SKIPPING IT."
-            )
-            logger.error(err_str)
-            return False
-
-        workflow_metadata = load_metadata_result.metadata
-
-        # Prepend the image paths appropriately.
-        if workflow_metadata.image is not None:
-            if workflow_metadata.is_griptape_provided:
-                workflow_metadata.image = workflow_metadata.image
-            else:
-                # For user workflows, the image should be just the filename, not a full path
-                # The frontend now sends just filenames, so we don't need to prepend the workspace path
-                workflow_metadata.image = workflow_metadata.image
 
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
@@ -5891,7 +5898,7 @@ class WorkflowManager:
         # import. Fall back to a deterministic (sorted) choice rather than hash-ordered set iteration,
         # and log for diagnosis.
         candidates = top_level_flows or list(new_flows)
-        selected = sorted(candidates)[0]
+        selected = min(candidates)
         logger.warning(
             "Import of '%s' created %d flow(s) with %d parented to target '%s'; expected exactly one "
             "top-level flow. Using '%s'. All new flows: %s",
@@ -6689,10 +6696,9 @@ class WorkflowManager:
             logger.debug("Skipping already registered workflow: %s", workflow_file)
             return None
 
-        # Register workflow using existing method with parsed metadata available
-        # The _register_workflow method will re-parse metadata, but this is acceptable
-        # since we've already validated it's parseable and the duplicate work is minimal
-        if await self._register_workflow(file_path_to_register):
+        # Hand the already-parsed metadata to the registrar so the file's TOML header is
+        # read once per workflow rather than twice.
+        if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
             return registry_key
         return None
 

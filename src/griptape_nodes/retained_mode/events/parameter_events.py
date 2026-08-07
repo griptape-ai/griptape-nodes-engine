@@ -47,6 +47,7 @@ class AddParameterToNodeRequest(RequestPayload):
         parent_element_name: Name of parent element if nested
         initial_setup: Skip setup work when loading from file
         settable: Whether parameter can be set directly by the user or not
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
 
     Results: AddParameterToNodeResultSuccess (with parameter name) | AddParameterToNodeResultFailure
     """
@@ -68,6 +69,7 @@ class AddParameterToNodeRequest(RequestPayload):
     mode_allowed_output: bool = field(default=True)
     is_user_defined: bool = field(default=True)
     settable: bool = field(default=True)
+    allow_variable_substitution: bool = field(default=True)
     parent_container_name: str | None = None
     parent_element_name: str | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
@@ -319,6 +321,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
         is_user_defined: Whether this is a user-defined parameter
         settable: Whether parameter can be set directly by the user or not (None for non-Parameters)
         private: Whether this parameter is private
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: UI configuration options
     """
 
@@ -337,6 +340,7 @@ class GetParameterDetailsResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuc
     is_user_defined: bool
     settable: bool | None
     private: bool
+    allow_variable_substitution: bool
     ui_options: dict | None
 
 
@@ -370,6 +374,7 @@ class AlterParameterDetailsRequest(RequestPayload):
         mode_allowed_property: Whether parameter can be used as property
         mode_allowed_output: Whether parameter can be used as output
         settable: Whether parameter can be set directly by the user or not
+        allow_variable_substitution: Whether {VAR} tokens in this parameter's value are substituted at execution time
         ui_options: New UI configuration options
         traits: Set of parameter traits
         initial_setup: Skip setup work when loading from file
@@ -393,6 +398,7 @@ class AlterParameterDetailsRequest(RequestPayload):
     mode_allowed_property: bool | None = None
     mode_allowed_output: bool | None = None
     settable: bool | None = None
+    allow_variable_substitution: bool | None = None
     ui_options: dict | None = None
     traits: set[str] | None = None
     # initial_setup prevents unnecessary work when we are loading a workflow from a file.
@@ -432,6 +438,7 @@ class AlterParameterDetailsRequest(RequestPayload):
             "mode_allowed_property",
             "mode_allowed_output",
             "settable",
+            "allow_variable_substitution",
             "ui_options",
             "traits",
         ]

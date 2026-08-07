@@ -57,6 +57,7 @@ The **[Maya MCP Server](https://github.com/PatrickPalmer/MayaMCP)** enables AI a
     ```python
     import maya.cmds as cmds
 
+
     def setup_maya_command_port(port=50007):
         """Setup Maya command port with error handling"""
         try:
@@ -77,6 +78,7 @@ The **[Maya MCP Server](https://github.com/PatrickPalmer/MayaMCP)** enables AI a
             print(f"Error setting up command port: {e}")
             return False
 
+
     # Run the setup
     if setup_maya_command_port(50007):
         print("Maya MCP server should now be able to connect!")
@@ -96,6 +98,7 @@ The **[Maya MCP Server](https://github.com/PatrickPalmer/MayaMCP)** enables AI a
 
         ```python
         import maya.cmds as cmds
+
 
         def enable_mcp_command_port(port=50007):
             """Setup Maya command port with error handling"""
@@ -122,6 +125,7 @@ The **[Maya MCP Server](https://github.com/PatrickPalmer/MayaMCP)** enables AI a
 
         ```python
         import enable_mcp_command_port
+
         enable_mcp_command_port.enable_mcp_command_port()
         ```
 
@@ -141,6 +145,7 @@ The **[Maya MCP Server](https://github.com/PatrickPalmer/MayaMCP)** enables AI a
         - Add this line to your existing `userSetup.py` file (or create one if it doesn't exist):
             ```python
             import enable_mcp_command_port
+
             enable_mcp_command_port.enable_mcp_command_port()
             ```
         - Restart Maya - the command port will be enabled automatically

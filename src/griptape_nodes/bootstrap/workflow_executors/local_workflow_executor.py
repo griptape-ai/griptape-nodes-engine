@@ -138,13 +138,13 @@ class LocalWorkflowExecutor(WorkflowExecutor):
         load_result = await GriptapeNodes.ahandle_request(LoadProjectTemplateRequest(project_path=project_file_path))
         if not isinstance(load_result, LoadProjectTemplateResultSuccess):
             msg = f"Attempted to load project template from {project_file_path}. Failed with result: {load_result}"
-            logger.exception(msg)
+            logger.error(msg)
             raise LocalExecutorError(msg)
 
         set_result = await GriptapeNodes.ahandle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
         if set_result.failed():
             msg = f"Attempted to set project {load_result.project_id} as current. Failed with result: {set_result}"
-            logger.exception(msg)
+            logger.error(msg)
             raise LocalExecutorError(msg)
 
         logger.info("Loaded and activated project template from %s", project_file_path)
