@@ -97,7 +97,7 @@ def _stub_hf_cache() -> Iterator[None]:
         yield
 
 
-def _register_probe_node(*, include_handleless_model: bool = False) -> None:
+def _register_probe_node(*, include_handleless_model: bool = False, handleless_is_denied: bool = False) -> None:
     """Register `_HfProbeNode` in a real library whose catalog declares the test repos."""
     from griptape_nodes.node_library.library_declarations import (
         KeySupport,
@@ -170,7 +170,7 @@ def _register_probe_node(*, include_handleless_model: bool = False) -> None:
             category="t",
             description="d",
             display_name="HF Probe",
-            declarations=[ModelUsageNodeProperty(model_ids=sorted({*denied_models, "md_clip"}))],
+            declarations=[ModelUsageNodeProperty(model_ids=sorted({*denied_models, *allowed_models}))],
         ),
     )
 
