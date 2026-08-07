@@ -292,10 +292,16 @@ class ModelAccessComponent:
         # source of truth for the model in this state; bypass the gate.
         if not isinstance(value, str):
             return None
-        # Fail-closed when the node could not be resolved at all: the developer's
-        # setup bug must NOT silently open the gate.
-        if self._snapshot.failure_detail is not None:
-            return self._snapshot.denial_for(value)
+        # Snapshot-level refusals first: an unresolvable node (a developer setup bug must not
+        # silently open the gate) and a denial policy handed us that no row can carry. Both are
+        # decisions about the whole parameter, so the live per-id re-query below cannot answer
+        # them -- the unattributable entry is by definition absent from `candidate_model_ids`.
+        # Skipping this is how the dropdown ends up greying every row while the node still runs.
+        snapshot_denial = self._snapshot.denial_for(value)
+        if snapshot_denial is not None and (
+            self._snapshot.failure_detail is not None or self._snapshot.unmatchable_denials
+        ):
+            return snapshot_denial
         # Every catalog entry behind this dropdown name: `provider_model_id` is not unique, so a
         # BYOK entry and a hosted-key entry can share one. All of them must be asked, and any
         # denial governs.

@@ -191,6 +191,48 @@ class TestASharedProviderModelIdIsNotLastWriteWins:
         assert ModelPolicySnapshot().catalog_ids_for(UNKNOWN) == ()
 
 
+class TestBothComponentsAgreeOnAnUnattributableDenial:
+    """The decoration path and the run path must reach the same verdict.
+
+    An unattributable denial is a decision about the WHOLE parameter, so a live per-id re-query
+    cannot answer it -- the entry with no `provider_model_id` is by definition absent from any
+    candidate list. A run path that skipped the snapshot check greyed out every row, told the artist
+    "running this node will fail", and then ran the node anyway.
+    """
+
+    def test_the_static_component_run_path_honors_it(self) -> None:
+        from griptape_nodes.exe_types.core_types import Parameter
+        from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
+        from tests.unit.exe_types.mocks import MockNode
+
+        verdicts = [
+            ModelAccessVerdict(model_id="md_unattributable", provider_model_id=None, denial=_DENIAL),
+            ModelAccessVerdict(model_id="md_ok", provider_model_id="alpha", denial=None),
+        ]
+
+        def handle(request: object) -> object:
+            candidates = getattr(request, "candidate_model_ids", None)
+            chosen = [v for v in verdicts if v.model_id in candidates] if candidates else verdicts
+            return _success(chosen)
+
+        node = MockNode()
+        parameter = Parameter(name="model", type="str", default_value="alpha", tooltip="m")
+        node.add_parameter(parameter)
+        module = "griptape_nodes.exe_types.param_components"
+        with (
+            patch(f"{module}.model_policy.GriptapeNodes.handle_request", side_effect=handle),
+            patch(f"{module}.model_access_component.GriptapeNodes.handle_request", side_effect=handle),
+        ):
+            component = ModelAccessComponent(
+                node=node, parameter=parameter, model_choices=["alpha"], default_model="alpha"
+            )
+            # Decoration and the run gate must not disagree.
+            assert component._cached_denial("alpha") is not None
+            assert component.query_for_denial("alpha") is not None
+            with pytest.raises(RuntimeError):
+                component.raise_if_denied("alpha")
+
+
 class TestSnapshotIsImmutable:
     def test_frozen(self) -> None:
         """Callers replace the snapshot wholesale, so the tables cannot drift apart."""
