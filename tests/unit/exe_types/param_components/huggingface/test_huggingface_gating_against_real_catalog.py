@@ -18,7 +18,7 @@ Covers all three subclasses, because gating behaves differently in each: `Huggin
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from typing import TYPE_CHECKING
 from unittest.mock import patch
 
 import pytest
@@ -31,7 +31,6 @@ from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_para
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_variant_parameter import (
     HuggingFaceRepoVariantParameter,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -39,6 +38,9 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 _LIBRARY_NAME = "hf-gating-real-catalog-test-library"
 _MODULE = "griptape_nodes.exe_types.param_components.huggingface"
@@ -135,9 +137,11 @@ def _register_probe_node(*, include_handleless_model: bool = False, handleless_i
     if include_handleless_model:
         # Legal: `provider_model_id` is optional. Unmatchable against a cache-derived choice, so it
         # must not be mistaken for "the node declares nothing" or for an undeclared selection.
-        # Deliberately under the PERMITTED provider: a handleless entry that policy also DENIES is
-        # a separate case (it escalates to refusing the whole parameter) and is covered below.
-        allowed_models[HANDLELESS_MODEL_ID] = Model(
+        # `handleless_is_denied` picks which provider it lands under, which is the difference
+        # between "merely unmatchable" (permitted) and "denied but unattributable" (escalates to
+        # refusing the whole parameter).
+        target = denied_models if handleless_is_denied else allowed_models
+        target[HANDLELESS_MODEL_ID] = Model(
             display_name="No Upstream Handle",
             key_support=KeySupport.NO_KEY_REQUIRED,
         )
@@ -201,12 +205,12 @@ def denying_policy(griptape_nodes) -> Iterator[None]:  # noqa: ANN001
 class TestRealCatalogResolution:
     """The catalog resolves through `access_manager`, so verdicts are engine-produced."""
 
-    def test_a_denied_repo_is_denied(self, denying_policy) -> None:  # noqa: ARG002
+    def test_a_denied_repo_is_denied(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[DENIED_REPO, ALLOWED_REPO])
         assert param.query_for_denial(DENIED_REPO) is not None
 
-    def test_a_permitted_repo_is_allowed(self, denying_policy) -> None:  # noqa: ARG002
+    def test_a_permitted_repo_is_allowed(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[DENIED_REPO, ALLOWED_REPO])
         assert param.query_for_denial(ALLOWED_REPO) is None
@@ -226,41 +230,67 @@ class TestAHandlelessCatalogModel:
     permitted models as undeclared and hard-denied them.
     """
 
-    def test_it_does_not_deny_a_permitted_sibling(self, denying_policy) -> None:  # noqa: ARG002
+    def test_it_does_not_deny_a_permitted_sibling(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node(include_handleless_model=True)
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[ALLOWED_REPO])
         assert param.query_for_denial(ALLOWED_REPO) is None
 
-    def test_it_does_not_switch_enforcement_off(self, denying_policy) -> None:  # noqa: ARG002
+    def test_it_does_not_switch_enforcement_off(self, denying_policy: None) -> None:  # noqa: ARG002
         """The node still HAS a catalog, so a denied sibling must still be denied."""
         _register_probe_node(include_handleless_model=True)
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[DENIED_REPO, ALLOWED_REPO])
         assert param._gated is True
         assert param.query_for_denial(DENIED_REPO) is not None
 
-    def test_it_suppresses_the_undeclared_backstop(self, denying_policy) -> None:  # noqa: ARG002
+    def test_it_suppresses_the_undeclared_backstop(self, denying_policy: None) -> None:  # noqa: ARG002
         """With an unmatchable entry present, absence from the table proves nothing."""
         _register_probe_node(include_handleless_model=True)
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[ALLOWED_REPO])
         assert param._policy.has_unmatchable_entries is True
         assert param.query_for_denial(UNDECLARED_REPO) is None
 
-    def test_a_fully_matchable_catalog_still_refuses_undeclared(self, denying_policy) -> None:  # noqa: ARG002
+    def test_a_fully_matchable_catalog_still_refuses_undeclared(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[ALLOWED_REPO])
         assert param._policy.has_unmatchable_entries is False
         assert param.query_for_denial(UNDECLARED_REPO) is not None
 
 
+class TestADeniedButUnattributableModel:
+    """Policy denies a catalog entry that carries no `provider_model_id`.
+
+    The denial cannot be pinned to any dropdown row, and the same absence switches off the
+    undeclared backstop that would otherwise have caught it. Dropping it would run a model policy
+    explicitly forbade, so the whole parameter is refused instead. This case is unreachable with a
+    stubbed verdict, and the real catalog surfaced it immediately.
+    """
+
+    def test_the_whole_parameter_is_refused(self, denying_policy: None) -> None:  # noqa: ARG002
+        _register_probe_node(include_handleless_model=True, handleless_is_denied=True)
+        param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[ALLOWED_REPO])
+        assert param._policy.unmatchable_denials == (HANDLELESS_MODEL_ID,)
+        denial = param.query_for_denial(ALLOWED_REPO)
+        assert denial is not None
+        # Artist-facing: states the effect, no manifest-editing instructions.
+        assert "provider_model_id" not in denial.reason()
+
+    def test_a_permitted_handleless_entry_refuses_nothing(self, denying_policy: None) -> None:  # noqa: ARG002
+        """Only a DENIED unattributable entry escalates; a permitted one is merely unmatchable."""
+        _register_probe_node(include_handleless_model=True, handleless_is_denied=False)
+        param = HuggingFaceRepoParameter(_HfProbeNode(), repo_ids=[ALLOWED_REPO])
+        assert param._policy.unmatchable_denials == ()
+        assert param.query_for_denial(ALLOWED_REPO) is None
+
+
 class TestEverySubclassAgainstTheRealCatalog:
     """Gating differs per subclass, so each is exercised in its own key shape."""
 
-    def test_repo_file_parameter(self, denying_policy) -> None:  # noqa: ARG002
+    def test_repo_file_parameter(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         param = HuggingFaceRepoFileParameter(_HfProbeNode(), repo_files=[(DENIED_REPO, FILE_NAME)])
         assert param.query_for_denial(DENIED_REPO) is not None
 
-    def test_repo_variant_parameter_denies_its_variant_keys(self, denying_policy) -> None:  # noqa: ARG002
+    def test_repo_variant_parameter_denies_its_variant_keys(self, denying_policy: None) -> None:  # noqa: ARG002
         """`owner/repo/variant` must reduce to the `owner/repo` the catalog declares.
 
         The other shape a stubbed verdict cannot express: the rendered choice does not equal the
@@ -271,7 +301,7 @@ class TestEverySubclassAgainstTheRealCatalog:
         # LTX-2 sits under the denied provider in this catalog.
         assert param.query_for_denial(f"{VARIANT_REPO}/{VARIANT}") is not None
 
-    def test_repo_variant_parameter_allows_a_permitted_base(self, denying_policy) -> None:  # noqa: ARG002
+    def test_repo_variant_parameter_allows_a_permitted_base(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         param = HuggingFaceRepoVariantParameter(_HfProbeNode(), repo_id=ALLOWED_REPO, variants=[VARIANT])
         assert param.query_for_denial(f"{ALLOWED_REPO}/{VARIANT}") is None
@@ -280,7 +310,7 @@ class TestEverySubclassAgainstTheRealCatalog:
 class TestRunPathGateAgainstTheRealCatalog:
     """`validate_before_node_run` is the actual gate; decoration is advisory."""
 
-    def test_a_denied_selection_blocks_the_run(self, denying_policy) -> None:  # noqa: ARG002
+    def test_a_denied_selection_blocks_the_run(self, denying_policy: None) -> None:  # noqa: ARG002
         _register_probe_node()
         node = _HfProbeNode()
         param = HuggingFaceRepoParameter(node, repo_ids=[DENIED_REPO, ALLOWED_REPO])
@@ -290,7 +320,7 @@ class TestRunPathGateAgainstTheRealCatalog:
         assert errors is not None
         assert "not permitted" in str(errors[0])
 
-    def test_a_permitted_selection_does_not_block_on_policy(self, denying_policy) -> None:  # noqa: ARG002
+    def test_a_permitted_selection_does_not_block_on_policy(self, denying_policy: None) -> None:  # noqa: ARG002
         """A permitted model must not be refused for license reasons.
 
         It may still fail for being uncached (that is the download path, not the gate), so this
