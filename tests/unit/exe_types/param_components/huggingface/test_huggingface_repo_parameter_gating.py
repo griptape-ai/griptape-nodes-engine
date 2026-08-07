@@ -196,14 +196,32 @@ class TestAutoDetect:
         assert param.query_for_denial(DENIED_REPO) is None
         assert param.query_for_denial(UNDECLARED_REPO) is None
 
-    def test_stays_ungated_when_the_node_type_cannot_be_resolved(self) -> None:
-        """A pre-adoption library is the status quo, not a failure to fail closed on."""
+    def test_fails_closed_when_the_node_type_cannot_be_resolved(self) -> None:
+        """An unanswerable query must NOT read as "pre-adoption" -- auto-detect fails closed.
+
+        A library that genuinely has not adopted declarations resolves *successfully* with an empty
+        verdict list, which already leaves enforcement off. So a Failure means the node type could
+        not be resolved at all (unregistered, ambiguous across two libraries, or mid-reload), and
+        treating that as "allow everything" let an admin's deny be bypassed by a lookup error.
+        """
         module = "griptape_nodes.exe_types.param_components.huggingface"
         with patch(
             f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
             return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
         ):
             param = _param(gated=None)
+        assert param._gated is True
+        assert param.query_for_denial(DENIED_REPO) is not None
+
+    def test_stays_ungated_for_a_library_that_declares_nothing(self) -> None:
+        """The real pre-adoption path: a Success carrying no verdicts leaves gating off."""
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+        with patch(
+            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            return_value=QueryModelAccessForNodeResultSuccess(verdicts=[], result_details="ok"),
+        ):
+            param = _param(gated=None)
+        assert param._gated is False
         assert param.query_for_denial(DENIED_REPO) is None
 
     def test_explicit_true_still_fails_closed_on_resolution_failure(self) -> None:

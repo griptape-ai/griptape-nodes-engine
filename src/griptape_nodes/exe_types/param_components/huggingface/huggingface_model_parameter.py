@@ -108,6 +108,11 @@ class HuggingFaceModelParameter(ABC):
         """
         if self._gate_mode is not None:
             return self._gate_mode
+        # A snapshot that could not be evaluated carries no verdicts, so `declares_models` is False
+        # for it. Enforce anyway: "we could not ask" must not read as "nothing is declared", or a
+        # lookup error would silently switch gating off and bypass an admin's deny.
+        if self._policy.failure_detail is not None:
+            return True
         # Auto-detect: enforce once the node declares anything at all.
         return self._policy.declares_models
 
@@ -373,11 +378,15 @@ class HuggingFaceModelParameter(ABC):
         One assignment, no derived state to update alongside it -- ``_gated`` reads through to this
         snapshot, so the enforcement decision and the verdicts it rests on advance together.
 
-        Under auto-detect an unresolvable node type means the library has not adopted declarations
-        -- the pre-adoption status quo rather than an error -- so the query is allowed to fail open
-        and enforcement simply stays off. An explicit ``gated=True`` fails closed instead.
+        Fails closed in every mode except an explicit ``gated=False``, matching
+        ``ModelAccessComponent``. Auto-detect deliberately does NOT fail open here: a library that
+        has not adopted declarations resolves *successfully* with an empty verdict list, which
+        already leaves ``declares_models`` false and enforcement off. So a ``Failure`` never means
+        "pre-adoption" -- it means the node type could not be resolved at all (unregistered, or
+        ambiguous across two libraries, or mid-reload), and treating that as "allow everything"
+        would let an admin's deny be bypassed by a lookup error.
         """
-        self._policy = query_model_policy(type(self._node).__name__, fail_closed=self._gate_mode is True)
+        self._policy = query_model_policy(type(self._node).__name__, fail_closed=self._gate_mode is not False)
 
     def _apply_denial_badge(self, parameter: Parameter, value: str | None = None) -> None:
         """Set or clear the parameter's badge for the current selection.
