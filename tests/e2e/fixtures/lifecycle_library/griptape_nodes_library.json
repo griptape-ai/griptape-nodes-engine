@@ -1,0 +1,35 @@
+{
+  "name": "Lifecycle Library",
+  "library_schema_version": "0.7.0",
+  "metadata": {
+    "author": "Test Fixture",
+    "description": "Minimal library used by library-module-lifecycle e2e tests",
+    "library_version": "0.1.0",
+    "engine_version": "0.0.0",
+    "tags": ["test"],
+    "dependencies": {
+      "pip_dependencies": []
+    }
+  },
+  "categories": [
+    {
+      "test": {
+        "title": "test",
+        "description": "Test nodes",
+        "color": "border-gray-500",
+        "icon": "Folder"
+      }
+    }
+  ],
+  "nodes": [
+    {
+      "class_name": "LifecycleNode",
+      "file_path": "lifecycle_node.py",
+      "metadata": {
+        "category": "test",
+        "description": "Exposes an enum-typed parameter default and a version marker",
+        "display_name": "Lifecycle"
+      }
+    }
+  ]
+}
