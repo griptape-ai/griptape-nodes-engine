@@ -271,19 +271,17 @@ def schedule_broadcast(broadcast_type: type[RequestPayload]) -> None:
     Use this from a manager's request handler (orchestrator-side) to fire the
     matching broadcast after a successful local mutation -- e.g. ``ConfigManager``
     calls ``schedule_broadcast(ReloadConfigRequest)`` after persisting a config
-    write. No-op when the GriptapeNodes singleton has not been instantiated yet
-    (isolated unit tests that construct managers on their own) or when no
-    workers are registered.
+    write. No-op when no engine has been built yet (isolated unit tests that construct
+    managers on their own) or when no workers are registered.
 
-    Imports the singleton lazily because this module is loaded during engine
-    boot, before the GriptapeNodes accessor is ready.
+    Imports the engine lazily because this module is loaded during engine boot,
+    before the accessor is ready.
     """
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-    from griptape_nodes.utils.metaclasses import SingletonMeta
+    from griptape_nodes.retained_mode.engine import current_engine, has_current_engine
 
-    if GriptapeNodes not in SingletonMeta._instances:
+    if not has_current_engine():
         return
-    GriptapeNodes.WorkerManager().schedule_broadcast(broadcast_type)
+    current_engine().worker_manager.schedule_broadcast(broadcast_type)
 
 
 def register_remote_handlers(event_manager: EventManager) -> None:

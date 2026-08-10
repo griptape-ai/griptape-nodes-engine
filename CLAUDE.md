@@ -79,10 +79,12 @@ Instance methods come first because they can call anything. Class methods come n
 
 ## Architecture
 
-**Singleton managers** - `GriptapeNodes` is a singleton holding 25+ managers (e.g., `FlowManager`, `NodeManager`), each accessed via `GriptapeNodes.ManagerName()` classmethods.
+**Engine owns the managers** - `Engine` (`retained_mode/engine.py`) holds ~28 managers (e.g. `FlowManager`, `NodeManager`) and injects itself into each one. Managers extend `EngineScoped` and reach peers via `self.engine.flow_manager`, not through process-wide state. `Engine` is a plain class, so tests and embedders can construct as many as they need.
+
+**One global, at the edge** - `GriptapeNodes` (`retained_mode/griptape_nodes.py`) is a thin facade whose classmethods delegate to `current_engine()`. It is the only intentionally global entry point, and it exists for callers that cannot be handed a reference: saved workflow `.py` files (generated code carrying a `schema_version`), separately-versioned node libraries, and process entry points like the CLI. Engine-internal code must not use it; a `TID251` ban in `pyproject.toml` enforces this, with an allowlist that separates legitimate facade users from code not yet migrated.
 
 **Event-driven operations** - All operations flow through request/response event dataclasses defined in `retained_mode/events/`, routed by `GriptapeNodes.handle_request()`.
 
-**Library registration flow** - Libraries are defined by `griptape_nodes_library.json` files and registered via the `LibraryRegistry` singleton. Node creation flows through `LibraryRegistry.create_node()` -> `Library.create_node()`.
+**Library registration flow** - Libraries are defined by `griptape_nodes_library.json` files and registered via the `LibraryRegistry`. Node creation flows through `LibraryRegistry.create_node()` -> `Library.create_node()`. `LibraryRegistry` is deliberately process-global: it hands out node classes imported into `sys.modules`, so per-engine copies would advertise isolation the module system does not provide. `WorkflowRegistry` is still process-global too, but less defensibly: which workflows exist depends on the engine's workspace config, so it should become engine-owned.
 
 **Custom nodes** - Extend `BaseNode` from `exe_types/node_types.py`. Parameters, flows, and connections are defined in `exe_types/core_types.py` and `exe_types/node_types.py`.

@@ -6,13 +6,13 @@ from pathlib import Path
 
 import pytest
 
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.engine import Engine
 
 
 class TestPushWorkflow:
     """Tests for ContextManager.push_workflow."""
 
-    def test_push_workflow_with_name(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_with_name(self, griptape_nodes: Engine) -> None:
         """workflow_name is used directly as the registry key."""
         context_manager = griptape_nodes.ContextManager()
         result = context_manager.push_workflow(workflow_name="my_workflow")
@@ -22,7 +22,7 @@ class TestPushWorkflow:
 
         context_manager.pop_workflow()
 
-    def test_push_workflow_with_file_path_inside_workspace(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_with_file_path_inside_workspace(self, griptape_nodes: Engine) -> None:
         """file_path inside workspace produces a workspace-relative registry key."""
         context_manager = griptape_nodes.ContextManager()
         config_manager = griptape_nodes.ConfigManager()
@@ -42,7 +42,7 @@ class TestPushWorkflow:
 
         context_manager.pop_workflow()
 
-    def test_push_workflow_with_file_path_outside_workspace(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_with_file_path_outside_workspace(self, griptape_nodes: Engine) -> None:
         """file_path outside workspace uses the absolute path as the registry key."""
         context_manager = griptape_nodes.ContextManager()
         config_manager = griptape_nodes.ConfigManager()
@@ -63,21 +63,21 @@ class TestPushWorkflow:
 
         context_manager.pop_workflow()
 
-    def test_push_workflow_raises_when_both_provided(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_raises_when_both_provided(self, griptape_nodes: Engine) -> None:
         """Raises ValueError when both workflow_name and file_path are given."""
         context_manager = griptape_nodes.ContextManager()
 
         with pytest.raises(ValueError, match="not both"):
             context_manager.push_workflow(workflow_name="my_workflow", file_path="/some/path.py")
 
-    def test_push_workflow_raises_when_neither_provided(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_raises_when_neither_provided(self, griptape_nodes: Engine) -> None:
         """Raises ValueError when neither workflow_name nor file_path is given."""
         context_manager = griptape_nodes.ContextManager()
 
         with pytest.raises(ValueError, match="must be provided"):
             context_manager.push_workflow()
 
-    def test_push_workflow_strips_extension(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_push_workflow_strips_extension(self, griptape_nodes: Engine) -> None:
         """Registry key derived from file_path has no file extension."""
         context_manager = griptape_nodes.ContextManager()
         config_manager = griptape_nodes.ConfigManager()
@@ -101,7 +101,7 @@ class TestPushWorkflow:
 class TestGeneratedWorkflowCode:
     """Tests that generated workflow code uses push_workflow(file_path=__file__)."""
 
-    def test_generated_code_uses_file_path_not_workflow_name(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_generated_code_uses_file_path_not_workflow_name(self, griptape_nodes: Engine) -> None:
         """_generate_workflow_run_prerequisite_code emits push_workflow(file_path=__file__)."""
         from griptape_nodes.retained_mode.managers.workflow_manager import ImportRecorder
 
@@ -124,13 +124,13 @@ class TestGeneratedWorkflowCode:
 class TestEnsureWorkflowAndFlowRequest:
     """Tests for ContextManager.on_ensure_workflow_and_flow_request."""
 
-    def _cleanup(self, griptape_nodes: GriptapeNodes) -> None:
+    def _cleanup(self, griptape_nodes: Engine) -> None:
         """Tear down any workflow/flow state left over between tests."""
         from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 
         griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
-    def test_creates_workflow_and_flow_from_cold_start(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_creates_workflow_and_flow_from_cold_start(self, griptape_nodes: Engine) -> None:
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,
             EnsureWorkflowAndFlowResultSuccess,
@@ -155,7 +155,7 @@ class TestEnsureWorkflowAndFlowRequest:
 
         self._cleanup(griptape_nodes)
 
-    def test_reuses_existing_workflow_and_flow(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_reuses_existing_workflow_and_flow(self, griptape_nodes: Engine) -> None:
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,
             EnsureWorkflowAndFlowResultSuccess,
@@ -183,7 +183,7 @@ class TestEnsureWorkflowAndFlowRequest:
 
         self._cleanup(griptape_nodes)
 
-    def test_auto_generates_workflow_name_when_none_given(self, griptape_nodes: GriptapeNodes) -> None:
+    def test_auto_generates_workflow_name_when_none_given(self, griptape_nodes: Engine) -> None:
         from griptape_nodes.node_library.workflow_registry import WorkflowRegistry
         from griptape_nodes.retained_mode.events.context_events import (
             EnsureWorkflowAndFlowRequest,

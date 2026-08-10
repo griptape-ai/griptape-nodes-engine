@@ -1,6 +1,7 @@
 """Tests for ManifestManager.on_generate_manifest_request."""
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import cast
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -25,8 +26,6 @@ from griptape_nodes.retained_mode.events.project_events import (
 )
 from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
-
-MODULE_PATH = "griptape_nodes.retained_mode.managers.manifest_manager"
 
 
 def _library_metadata() -> LibraryMetadata:
@@ -53,37 +52,37 @@ class TestManifestManager:
 
     @pytest.fixture
     def manifest_manager(self) -> ManifestManager:
-        return ManifestManager(MagicMock())
+        return ManifestManager(MagicMock(), engine=MagicMock())
 
     @pytest.mark.asyncio
     async def test_generate_manifest_includes_libraries_and_project_templates(
         self, manifest_manager: ManifestManager
     ) -> None:
         """A full run includes libraries, project templates, engine id, and engine version."""
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[
-                    ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
-                    GetLibraryMetadataResultSuccess(metadata=_library_metadata(), result_details="ok"),
-                    GetLibrarySourceInfoResultSuccess(
-                        library_name="Lib A",
-                        library_json_path="/libs/a/griptape_nodes_library.json",
-                        library_directory="/libs/a",
-                        result_details="ok",
-                    ),
-                    ListProjectTemplatesResultSuccess(
-                        successfully_loaded=[_project_info()],
-                        failed_to_load=[],
-                        result_details="ok",
-                    ),
-                    GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
-                ]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
+                GetLibraryMetadataResultSuccess(metadata=_library_metadata(), result_details="ok"),
+                GetLibrarySourceInfoResultSuccess(
+                    library_name="Lib A",
+                    library_json_path="/libs/a/griptape_nodes_library.json",
+                    library_directory="/libs/a",
+                    result_details="ok",
+                ),
+                ListProjectTemplatesResultSuccess(
+                    successfully_loaded=[_project_info()],
+                    failed_to_load=[],
+                    result_details="ok",
+                ),
+                GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
+            ]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_model_catalog=False)
-            )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_model_catalog=False)
+        )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         manifest = result.manifest
@@ -93,7 +92,7 @@ class TestManifestManager:
 
         # Project templates are requested with system builtins included, so the
         # always-loaded default project is part of the manifest.
-        list_templates_request = mock_gn.ahandle_request.await_args_list[3].args[0]
+        list_templates_request = mock_engine.ahandle_request.await_args_list[3].args[0]
         assert isinstance(list_templates_request, ListProjectTemplatesRequest)
         assert list_templates_request.include_system_builtins is True
 
@@ -116,14 +115,14 @@ class TestManifestManager:
     @pytest.mark.asyncio
     async def test_generate_manifest_fails_when_library_listing_fails(self, manifest_manager: ManifestManager) -> None:
         """A failure listing libraries surfaces as a manifest generation failure."""
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[ListRegisteredLibrariesResultFailure(result_details="registry down")]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[ListRegisteredLibrariesResultFailure(result_details="registry down")]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_model_catalog=False)
-            )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_model_catalog=False)
+        )
 
         assert isinstance(result, GenerateManifestResultFailure)
 
@@ -132,30 +131,30 @@ class TestManifestManager:
         self, manifest_manager: ManifestManager
     ) -> None:
         """A library whose metadata fails is still included with what could be gathered."""
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[
-                    ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
-                    GetLibraryMetadataResultFailure(result_details="not loaded"),
-                    GetLibrarySourceInfoResultSuccess(
-                        library_name="Lib A",
-                        library_json_path="/libs/a/griptape_nodes_library.json",
-                        library_directory="/libs/a",
-                        result_details="ok",
-                    ),
-                    ListProjectTemplatesResultSuccess(
-                        successfully_loaded=[],
-                        failed_to_load=[],
-                        result_details="ok",
-                    ),
-                    GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
-                ]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
+                GetLibraryMetadataResultFailure(result_details="not loaded"),
+                GetLibrarySourceInfoResultSuccess(
+                    library_name="Lib A",
+                    library_json_path="/libs/a/griptape_nodes_library.json",
+                    library_directory="/libs/a",
+                    result_details="ok",
+                ),
+                ListProjectTemplatesResultSuccess(
+                    successfully_loaded=[],
+                    failed_to_load=[],
+                    result_details="ok",
+                ),
+                GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
+            ]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_model_catalog=False)
-            )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_model_catalog=False)
+        )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         assert len(result.manifest.libraries) == 1
@@ -175,22 +174,22 @@ class TestManifestManager:
         default_info.project_file_path = None
         default_info.parent_project_id = None
 
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[
-                    ListProjectTemplatesResultSuccess(
-                        successfully_loaded=[default_info],
-                        failed_to_load=[],
-                        result_details="ok",
-                    ),
-                    GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
-                ]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListProjectTemplatesResultSuccess(
+                    successfully_loaded=[default_info],
+                    failed_to_load=[],
+                    result_details="ok",
+                ),
+                GetEngineVersionResultSuccess(major=1, minor=2, patch=3, result_details="ok"),
+            ]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_libraries=False, include_model_catalog=False)
-            )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_libraries=False, include_model_catalog=False)
+        )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         assert len(result.manifest.project_templates) == 1
@@ -202,23 +201,23 @@ class TestManifestManager:
     @pytest.mark.asyncio
     async def test_generate_manifest_respects_toggles(self, manifest_manager: ManifestManager) -> None:
         """Disabling both toggles only resolves the engine version."""
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[GetEngineVersionResultSuccess(major=2, minor=0, patch=0, result_details="ok")]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[GetEngineVersionResultSuccess(major=2, minor=0, patch=0, result_details="ok")]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(
-                    include_libraries=False, include_project_templates=False, include_model_catalog=False
-                )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(
+                include_libraries=False, include_project_templates=False, include_model_catalog=False
             )
+        )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         assert result.manifest.libraries == []
         assert result.manifest.project_templates == []
         assert result.manifest.engine_version == "2.0.0"
-        assert mock_gn.ahandle_request.await_count == 1
+        assert mock_engine.ahandle_request.await_count == 1
 
     @pytest.mark.asyncio
     async def test_generate_manifest_aggregates_model_catalog(self, manifest_manager: ManifestManager) -> None:
@@ -256,19 +255,19 @@ class TestManifestManager:
             ],
         )
 
-        with patch(f"{MODULE_PATH}.GriptapeNodes") as mock_gn:
-            mock_gn.EngineIdentityManager.return_value.engine_id = "engine-uuid-1"
-            mock_gn.ahandle_request = AsyncMock(
-                side_effect=[
-                    ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
-                    GetLibraryMetadataResultSuccess(metadata=metadata, result_details="ok"),
-                    GetEngineVersionResultSuccess(major=1, minor=0, patch=0, result_details="ok"),
-                ]
-            )
+        mock_engine = cast("MagicMock", manifest_manager.engine)
+        mock_engine.engine_identity_manager.engine_id = "engine-uuid-1"
+        mock_engine.ahandle_request = AsyncMock(
+            side_effect=[
+                ListRegisteredLibrariesResultSuccess(libraries=["Lib A"], result_details="ok"),
+                GetLibraryMetadataResultSuccess(metadata=metadata, result_details="ok"),
+                GetEngineVersionResultSuccess(major=1, minor=0, patch=0, result_details="ok"),
+            ]
+        )
 
-            result = await manifest_manager.on_generate_manifest_request(
-                GenerateManifestRequest(include_libraries=False, include_project_templates=False)
-            )
+        result = await manifest_manager.on_generate_manifest_request(
+            GenerateManifestRequest(include_libraries=False, include_project_templates=False)
+        )
 
         assert isinstance(result, GenerateManifestResultSuccess)
         assert [provider.provider_id for provider in result.manifest.model_providers] == ["anthropic"]

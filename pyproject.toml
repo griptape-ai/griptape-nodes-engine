@@ -130,11 +130,40 @@ ignore = [
 "libraries.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of libraries.griptape_nodes_library"
 "libraries.griptape_nodes_advanced_media_library".msg = "Import from griptape_nodes_advanced_media_library instead of libraries.griptape_nodes_advanced_media_library"
 "libraries.griptape_cloud".msg = "Import from griptape_cloud instead of libraries.griptape_cloud"
+"griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "D104"]
+"tests/*" = ["S101", "D104", "TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
+
+# TID251 allowlist for the GriptapeNodes facade. Two groups, and the difference matters.
+#
+# Group 1 -- legitimate facade users. These are process entry points or the public
+# surface that separately-versioned callers bind to, so they have no Engine to be handed.
+"src/griptape_nodes/retained_mode/griptape_nodes.py" = ["TID251"]
+"src/griptape_nodes/retained_mode/retained_mode.py" = ["TID251"]
+"src/griptape_nodes/cli/**" = ["TID251"]
+"src/griptape_nodes/api_client/**" = ["TID251"]
+"src/griptape_nodes/servers/**" = ["TID251"]
+"src/griptape_nodes/bootstrap/**" = ["TID251"]
+"src/griptape_nodes/app/**" = ["TID251"]
+#
+# Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
+# Deleting an entry from this list is the definition of done; do not add new entries.
+"src/griptape_nodes/common/**" = ["TID251"]
+"src/griptape_nodes/drivers/**" = ["TID251"]
+"src/griptape_nodes/exe_types/**" = ["TID251"]
+"src/griptape_nodes/files/**" = ["TID251"]
+"src/griptape_nodes/machines/**" = ["TID251"]
+# WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
+# Making it engine-owned is its own change, since it alters what node libraries import.
+"src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
+"src/griptape_nodes/utils/**" = ["TID251"]
+"src/griptape_nodes/version_compatibility/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/file_metadata/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/publishing/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/managers/artifact_providers/**" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]

@@ -4,18 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Never
+from typing import TYPE_CHECKING, Never
 from unittest.mock import MagicMock, patch
 
 from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
 from griptape_nodes.node_library.library_registry import Library, LibrarySchema
 from griptape_nodes.retained_mode.events.base_events import RequestPayload, ResultPayload
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     RequestHandlerRegistrationProblem,
     RequestHandlersWorkerIncompatibleProblem,
 )
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
 @dataclass
@@ -67,7 +69,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -89,7 +91,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -114,7 +116,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -132,7 +134,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -153,7 +155,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -178,7 +180,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,
@@ -202,7 +204,7 @@ class TestRequestHandlerRegistration:
 
         lm = griptape_nodes.LibraryManager()
         event_manager = MagicMock()
-        with patch.object(GriptapeNodes, "EventManager", return_value=event_manager):
+        with patch.object(griptape_nodes, "_event_manager", event_manager):
             lm._attempt_load_nodes_from_library(
                 library_data=library._library_data,
                 library=library,

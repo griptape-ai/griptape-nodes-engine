@@ -14,6 +14,7 @@ from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.files.path_utils import FilenameParts
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetPreviewForArtifactRequest,
@@ -46,7 +47,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -73,7 +73,7 @@ class ResolvedStaticFilePath(NamedTuple):
     file_metadata: SidecarContent | None = None
 
 
-class StaticFilesManager:
+class StaticFilesManager(EngineScoped):
     """A class to manage the creation and management of static files."""
 
     def __init__(
@@ -81,6 +81,8 @@ class StaticFilesManager:
         config_manager: ConfigManager,
         secrets_manager: SecretsManager,
         event_manager: EventManager | None = None,
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the StaticFilesManager.
 
@@ -88,7 +90,9 @@ class StaticFilesManager:
             config_manager: The ConfigManager instance to use for accessing the workspace path.
             event_manager: The EventManager instance to use for event handling.
             secrets_manager: The SecretsManager instance to use for accessing secrets.
+            engine: The owning Engine, used to resolve peer managers.
         """
+        super().__init__(engine)
         self.config_manager = config_manager
         self.secrets_manager = secrets_manager
 
@@ -191,7 +195,7 @@ class StaticFilesManager:
         if not extension:
             return file_path, None
 
-        registry = GriptapeNodes.ArtifactManager()._registry
+        registry = self.engine.artifact_manager._registry
         provider_classes = registry.get_provider_classes_by_format(extension)
         if not provider_classes:
             logger.debug("Skipping preview for unsupported file format: %s", file_path)
@@ -199,7 +203,7 @@ class StaticFilesManager:
 
         provider_name = provider_classes[0].get_friendly_name()
 
-        result = await GriptapeNodes.ahandle_request(
+        result = await self.engine.ahandle_request(
             GetPreviewForArtifactRequest(
                 macro_path=MacroPath(ParsedMacro(str(file_path)), {}),
                 artifact_provider_name=provider_name,
@@ -370,7 +374,7 @@ class StaticFilesManager:
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         if parsed.get_variables():
-            resolve_result = GriptapeNodes.handle_request(
+            resolve_result = self.engine.handle_request(
                 GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
             )
             if not isinstance(resolve_result, GetPathForMacroResultSuccess):
@@ -501,7 +505,7 @@ class StaticFilesManager:
         Returns:
             ResolvedStaticFilePath if situation resolution succeeds, or None on failure.
         """
-        situation_result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        situation_result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(situation_result, GetSituationResultSuccess):
             logger.warning(
                 "Project template does not include '%s' situation; static files will save to the default directory. "
@@ -520,7 +524,7 @@ class StaticFilesManager:
             logger.warning("Failed to parse %s situation macro: %s", situation_name, e)
             return None
 
-        macro_result = GriptapeNodes.handle_request(
+        macro_result = self.engine.handle_request(
             GetPathForMacroRequest(
                 parsed_macro=parsed_macro,
                 variables={"file_name_base": parts.stem, "file_extension": parts.extension},
@@ -530,7 +534,7 @@ class StaticFilesManager:
             logger.warning("Failed to resolve %s situation path: %s", situation_name, macro_result.result_details)
             return None
 
-        workspace_dir = GriptapeNodes.ConfigManager().workspace_path
+        workspace_dir = self.config_manager.workspace_path
         try:
             # Resolve both sides to ensure drive letters match on Windows (drive-relative vs absolute paths).
             workspace_relative_path = macro_result.absolute_path.resolve().relative_to(workspace_dir.resolve())
