@@ -21,11 +21,15 @@ Focused on:
 
 from __future__ import annotations
 
+from unittest.mock import patch
+
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.exe_types.param_components.model_access_component import ModelAccessComponent
+from griptape_nodes.retained_mode.events.access_events import QueryModelAccessForNodeResultFailure
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.traits.button import Button
 from griptape_nodes.traits.options import Options
 
@@ -412,12 +416,13 @@ class TestEngineFailureIsFailClosedAtRuntime:
       decoration. Artists can still open workflows built against an
       unregistered node type without hitting a raise on load.
     - Runtime denial checks fail CLOSED. ``query_for_denial()`` returns a
-      synthesized CheckpointDenial with a "policy could not be evaluated"
-      reason, so a developer's setup bug cannot silently let denied models
-      through at run time. ``raise_if_denied()`` raises with the same reason.
+      synthesized CheckpointDenial saying the models could not be checked, so a
+      developer's setup bug cannot silently let denied models through at run
+      time. ``raise_if_denied()`` raises with the same reason.
 
-    A developer-facing WARNING log names the node type + failure kind so the
-    misconfiguration is discoverable.
+    The denial's own wording stays artist-facing -- it reaches a badge and a run
+    error -- so the node type and the failure kind live in a developer-facing
+    WARNING log instead, where the misconfiguration is still discoverable.
     """
 
     def _register_library_without_probe_node(self) -> None:
@@ -458,7 +463,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             self._build_component_against_unresolved_node()
 
-        matches = [r for r in caplog.records if "engine could not resolve access" in r.message]
+        matches = [r for r in caplog.records if "Could not resolve model access" in r.message]
         assert matches, "Expected a warning log about unresolved access; got none."
         assert "_AccessProbeNode" in matches[0].message
 
@@ -473,8 +478,10 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         denial = helper.query_for_denial("alpha")
         assert denial is not None, "Fail-closed contract: unresolved node type must not return None."
-        assert any("could not be evaluated" in m for m in denial.messages())
-        assert any("_AccessProbeNode" in m for m in denial.messages())
+        assert any("could not be checked against your license" in m for m in denial.messages())
+        # The node type is developer detail: it belongs in the log, not on an artist's badge.
+        assert not any("_AccessProbeNode" in m for m in denial.messages())
+        assert "_AccessProbeNode" in caplog.text
 
     def test_raise_if_denied_raises(self, caplog) -> None:  # noqa: ANN001
         """Failure -> raise_if_denied raises the synthesized reason."""
@@ -485,7 +492,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
-        with pytest.raises(RuntimeError, match="could not be evaluated"):
+        with pytest.raises(RuntimeError, match="could not be checked against your license"):
             helper.raise_if_denied("alpha")
 
     def test_query_for_denial_still_ignores_non_string_values(self, caplog) -> None:  # noqa: ANN001
@@ -606,6 +613,60 @@ class TestRefreshAndQueryForDenial:
             assert denial.messages() == ["Alpha not enabled."]
 
             assert helper.query_for_denial("beta") is None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_query_for_denial_honors_a_grant_made_since_the_last_refresh(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The run-path re-query must work in BOTH directions, not just allow -> deny.
+
+        The snapshot is captured at construction/refresh time. If a cached denial short-circuited
+        the live re-query, a studio that GRANTS a permission mid-session would leave artists blocked
+        with "not permitted" until something happened to call refresh() -- and a grant is precisely
+        the case where re-asking live matters.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+        finally:
+            # Policy relaxed. No refresh() -- the run path alone must notice.
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+        assert helper.query_for_denial("alpha") is None
+
+    def test_an_unanswerable_live_requery_falls_back_to_the_cached_denial(self, griptape_nodes) -> None:  # noqa: ANN001
+        """A transient lookup failure must not forget a denial we already hold.
+
+        The run path re-asks policy live so grants are honored. If that query cannot be answered
+        (library reloaded or unregistered mid-session) returning None would run a model the cached
+        snapshot knows is forbidden.
+        """
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            _, helper = _install_probe_node_with_helper(model_choices=["alpha", "beta"], default_model="beta")
+            assert helper.query_for_denial("alpha") is not None
+
+            # The live re-query now comes back unanswerable.
+            with patch.object(
+                GriptapeNodes,
+                "handle_request",
+                return_value=QueryModelAccessForNodeResultFailure(result_details="library unregistered"),
+            ):
+                assert helper.query_for_denial("alpha") is not None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
