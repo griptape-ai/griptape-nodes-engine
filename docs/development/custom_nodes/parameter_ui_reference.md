@@ -2,7 +2,7 @@
 
 This page maps what you declare on a `Parameter` in Python to what the editor renders for it. Three things determine a parameter's UI:
 
-1. **The parameter's `type`** selects the widget: `str` gets a text field, `bool` gets a toggle, `ImageArtifact` gets the image viewer, and so on.
+1. **The parameter's `type`** selects the widget: `str` gets a text field, `bool` gets a toggle, `ImageUrlArtifact` gets the image viewer, and so on.
 1. **`ui_options`** tweaks that widget: hide it, stretch it full-width, make a text field multiline, add a webcam capture button.
 1. **Traits** bundle UI and behavior together: `Slider` renders a slider *and* validates the range, `Options` renders a dropdown *and* constrains the value to its choices. Under the hood, a trait writes its own keys into `ui_options` — traits are the supported way to get those keys right.
 
@@ -35,7 +35,7 @@ For each parameter, the editor picks a widget in this order:
 | `button`                                                                                                                                                                                       | Clickable button (configure with the `Button` trait)                                                                         |
 | `Status`                                                                                                                                                                                       | Status/message block                                                                                                         |
 | `UrlArtifact`                                                                                                                                                                                  | URL display                                                                                                                  |
-| `ImageArtifact` / `ImageUrlArtifact`, `VideoArtifact` / `VideoUrlArtifact`, `AudioArtifact` / `AudioUrlArtifact`, `ThreeDArtifact` / `ThreeDUrlArtifact`, `SplatArtifact` / `SplatUrlArtifact` | The media viewers and editors — see [Media Viewers and Editors](../../guides/editor/media_editors.md) for what each one does |
+| `ImageUrlArtifact` / `ImageArtifact`, `VideoUrlArtifact` / `VideoArtifact`, `AudioUrlArtifact` / `AudioArtifact`, `ThreeDUrlArtifact` / `ThreeDArtifact`, `SplatUrlArtifact` / `SplatArtifact` | The media viewers and editors — see [Media Viewers and Editors](../../guides/editor/media_editors.md) for what each one does |
 | anything else                                                                                                                                                                                  | No inline widget; label and connection handles only                                                                          |
 
 `GLTFArtifact` / `GLTFUrlArtifact` still render (as the 3D viewer) for backward compatibility; use the `ThreeD` types in new nodes.
