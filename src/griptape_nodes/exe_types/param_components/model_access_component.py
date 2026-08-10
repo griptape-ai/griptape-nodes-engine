@@ -6,6 +6,13 @@ icons + subtitles, an error badge on denied selections, and runtime denial
 queries. Node identity (parameter name, type, input_types, tooltip) stays with
 the node so saved workflows round-trip byte-identically.
 
+``model_choices`` are ``provider_model_id``s, which the component resolves to
+the catalog ``model_id`` the permission layer gates on. ``deprecated_values``
+covers the values a parameter stored before it adopted that convention (an old
+display label, a retired provider id): each is accepted wherever a value is
+assigned, migrated to its canonical choice, and never offered as a fresh
+selection.
+
 Usage — one construction step per parameter:
 
     class DescribeImage(ControlNode):
@@ -35,14 +42,19 @@ different value is currently permitted — resets the parameter's stored value
 to a permitted alternative via ``set_parameter_value(..., initial_setup=True)``.
 The parameter's declarative ``default_value`` is untouched.
 
-Nodes then forward ``after_value_set`` for the model parameter to
-``self._model_access.on_value_changed(value)``, and pick a failure-routing
-idiom that matches their base class:
+Nodes then forward ``after_value_set`` to ``self._model_access.on_value_set(
+parameter, value)`` -- the component filters for its own parameter -- and pick a
+failure-routing idiom that matches their base class:
 
-  - ControlNode / raise-based execute paths call ``raise_if_denied(value)``.
-  - SuccessFailureNode / GriptapeProxyNode nodes call ``query_for_denial(value)``
+  - ControlNode / raise-based execute paths call ``raise_if_selection_denied()``.
+  - SuccessFailureNode / GriptapeProxyNode nodes call ``selection_denial()``
     and route the reason into ``self._set_status_results(was_successful=False,
     result_details=denial.reason())``.
+
+Both read the current selection off the parameter the component owns, so a node
+never restates its own parameter's name. ``query_for_denial(value)`` and
+``raise_if_denied(value)`` remain for the rare caller holding a model id from
+somewhere other than the dropdown.
 
 Nodes that reinstall the ``Options`` trait themselves (e.g. after a driver
 disconnect) call ``reinstall_options()`` to put the component's trait +
@@ -148,8 +160,22 @@ class ModelAccessComponent:
         parameter: Parameter,
         model_choices: list[str],
         default_model: str,
+        deprecated_values: dict[str, str] | None = None,
     ) -> None:
         """Attach the component to an already-added Parameter and decorate it.
+
+        ``deprecated_values`` maps a historical stored value to the current
+        choice it becomes. Every value in the mapping must be one of
+        ``model_choices``, and no key may itself already be a current choice;
+        either problem raises at construction.
+
+        A legacy value is accepted wherever it is assigned -- the ``Options``
+        trait's ``choices`` include it -- but migrated to its canonical choice
+        by a converter, and never offered as a fresh selection: the dropdown's
+        ``ui_options["data"]`` rows come from ``model_choices`` alone. The
+        parameter's current stored value is migrated the same way at
+        construction, before the denied-default relocation described in the
+        class docstring.
 
         Preconditions (checked; a misuse raises rather than silently misbehaving):
 
@@ -161,43 +187,30 @@ class ModelAccessComponent:
           adding a second ``Button`` overloads the refresh row. Migrate the
           node to construct the parameter without those traits and let the
           component add them.
+        - ``default_model`` must be one of ``model_choices``. In particular it
+          may not be a ``deprecated_values`` key: legacy keys are not real
+          provider ids, so they never appear in the access verdicts and would
+          make ``pick_permitted_default`` report a denied model as permitted.
         """
         # Constructor inputs -- immutable across the component's lifetime.
         self._node = node
         self._parameter = parameter
         self._model_choices = list(model_choices)
         self._default_model = default_model
+        self._deprecated_values = dict(deprecated_values or {})
 
         # Fail-fast preconditions -- see docstring.
-        if self._node.get_parameter_by_name(parameter.name) is not parameter:
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' is not attached to node "
-                f"'{self._node.name}'. Call node.add_parameter(parameter) BEFORE constructing "
-                "the component."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Options):
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
-                "already carries an Options trait. Remove traits={Options(...)} from the "
-                "Parameter constructor -- ModelAccessComponent adds Options itself."
-            )
-            raise ValueError(msg)
-        if parameter.find_elements_by_type(Button):
-            msg = (
-                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
-                "already carries a Button trait. Remove it -- ModelAccessComponent adds the "
-                "refresh Button itself."
-            )
-            raise ValueError(msg)
+        self._raise_if_misconfigured()
 
         # Cached result of the last QueryModelAccessForNodeRequest. Replaced
         # atomically on refresh so its two lookup tables never drift. See
         # _AccessSnapshot's docstring for the contract.
         self._snapshot: _AccessSnapshot = self._fetch_snapshot()
 
-        # Install decoration + traits.
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        # Install decoration + traits. Options accepts legacy values too, so an
+        # assignment carrying one is never snapped to choices[0] before the
+        # migration converter (added below) gets a chance to run.
+        parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.add_trait(
             Button(
                 icon=_REFRESH_ICON,
@@ -208,6 +221,15 @@ class ModelAccessComponent:
             )
         )
         parameter.update_ui_options(self._build_ui_options())
+        parameter.add_converter(self._convert_legacy_value)
+
+        # Migrate a legacy stored value to its canonical choice before
+        # considering whether that choice is currently permitted.
+        current_value = self._node.get_parameter_value(parameter.name)
+        migrated_value = self.migrate_value(current_value)
+        if migrated_value is not None:
+            self._node.set_parameter_value(parameter.name, migrated_value, initial_setup=True)
+            current_value = migrated_value
 
         # If the caller's declared default_value is denied but another choice
         # IS permitted, move the parameter's stored value to that permitted
@@ -215,7 +237,6 @@ class ModelAccessComponent:
         # The Parameter's declarative default_value is untouched -- the
         # override is a stored-value change only, via set_parameter_value
         # with initial_setup=True so no change events fire.
-        current_value = self._node.get_parameter_value(parameter.name)
         if isinstance(current_value, str) and current_value in self._snapshot.denial_by_provider_id:
             replacement = self.pick_permitted_default()
             if replacement is not None and replacement != current_value:
@@ -235,6 +256,26 @@ class ModelAccessComponent:
         """
         return list(self._model_choices)
 
+    @property
+    def parameter_name(self) -> str:
+        """Name of the parameter this component decorates.
+
+        A node base class that forwards hooks generically reads the name from
+        here rather than hardcoding it, since it differs across nodes (``model``
+        on most, ``model_name`` or ``model_id`` on others).
+        """
+        return self._parameter.name
+
+    @property
+    def selected_value(self) -> Any:
+        """The parameter's current stored value.
+
+        Typed ``Any`` rather than ``str`` on purpose: an upstream connection can
+        replace the dropdown selection with a driver object, which the gating
+        methods deliberately pass through untouched.
+        """
+        return self._node.get_parameter_value(self._parameter.name)
+
     def reinstall_options(self) -> None:
         """Reinstall the ``Options`` trait and reapply decoration + badge.
 
@@ -244,7 +285,7 @@ class ModelAccessComponent:
         already present -- ``add_trait`` will replace the existing instance.
         """
         parameter = self._parameter
-        parameter.add_trait(Options(choices=list(self._model_choices)))
+        parameter.add_trait(Options(choices=self._dropdown_choices()))
         parameter.update_ui_options(self._build_ui_options())
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
@@ -270,6 +311,21 @@ class ModelAccessComponent:
             message=f"Model `{value}` is not permitted. Running this node will fail.\n\nReason(s): {denial.reason()}",
             icon=_DENIED_ROW_ICON,
         )
+
+    def on_value_set(self, parameter: Parameter, value: Any) -> None:
+        """Forward from ``BaseNode.after_value_set``, ignoring every other parameter.
+
+        A node's ``after_value_set`` fires for all of its parameters, so the
+        component filters on its own before updating the badge. Nodes forward
+        unconditionally and let this decide:
+
+            def after_value_set(self, parameter, value) -> None:
+                self._model_access.on_value_set(parameter, value)
+                return super().after_value_set(parameter, value)
+        """
+        if parameter.name != self._parameter.name:
+            return
+        self.on_value_changed(value)
 
     def refresh(self) -> None:
         """Re-query the engine and rebuild the decoration + current-selection badge.
@@ -351,12 +407,30 @@ class ModelAccessComponent:
         msg = f"Cannot run {type(self._node).__name__}: '{value}' is not permitted. {denial.reason()}"
         raise RuntimeError(msg)
 
+    def selection_denial(self) -> CheckpointDenial | None:
+        """``query_for_denial`` against the current selection.
+
+        The component owns the parameter, so it reads the stored value itself.
+        Prefer this over passing ``get_parameter_value(...)`` back in: a caller
+        that re-derives the value has to know the parameter's name, which varies
+        per node.
+        """
+        return self.query_for_denial(self.selected_value)
+
+    def raise_if_selection_denied(self) -> None:
+        """``raise_if_denied`` against the current selection. See ``selection_denial``."""
+        self.raise_if_denied(self.selected_value)
+
     def pick_permitted_default(self) -> str | None:
         """Return the value the node should use as its ``default_value=``, or ``None``.
 
         Prefers the node's ``default_model`` when it's currently allowed. Falls
         back to the first allowed entry in ``model_choices``. Returns ``None``
         when every declared choice is currently denied.
+
+        The denial lookup is keyed by provider id, so it only means anything
+        for a real choice. ``__init__`` guarantees ``default_model`` is one of
+        ``model_choices``, which is what makes the first check below sound.
 
         Called internally by ``__init__`` to move the parameter's stored value
         off a denied default. Kept public for callers that want to consult the
@@ -370,6 +444,100 @@ class ModelAccessComponent:
             if choice not in denials:
                 return choice
         return None
+
+    def migrate_value(self, value: Any) -> str | None:
+        """The canonical choice ``value`` migrates to if it is a deprecated key, else ``None``.
+
+        Non-``str`` input returns ``None`` -- the same rationale as
+        ``query_for_denial``: a connected driver's value isn't a dropdown token
+        this component's tables cover.
+        """
+        if not isinstance(value, str):
+            return None
+        return self._deprecated_values.get(value)
+
+    def _convert_legacy_value(self, value: Any) -> Any:
+        """Migrate a legacy stored value to its canonical choice; everything else passes through.
+
+        Installed as a directly-attached converter (``Parameter.add_converter``)
+        rather than hooked into ``before_value_set`` / ``after_value_set``,
+        because ``BaseNode.set_parameter_value`` runs every converter
+        unconditionally on every assignment path -- including workflow load,
+        which calls it with ``initial_setup=True`` and
+        ``skip_before_value_set=True`` and therefore never calls
+        ``before_value_set`` at all. A converter is the only hook a saved
+        workflow's stored value is guaranteed to pass through, so it is the
+        only place this migration can live.
+        """
+        migrated = self.migrate_value(value)
+        if migrated is not None:
+            return migrated
+        return value
+
+    def _raise_if_misconfigured(self) -> None:
+        """Raise on any constructor misuse, before the component touches the parameter.
+
+        Every precondition in ``__init__``'s docstring is checked here so a
+        misconfigured node fails loudly at construction rather than shipping a
+        dropdown that silently misbehaves.
+        """
+        parameter = self._parameter
+        if self._node.get_parameter_by_name(parameter.name) is not parameter:
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' is not attached to node "
+                f"'{self._node.name}'. Call node.add_parameter(parameter) BEFORE constructing "
+                "the component."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Options):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries an Options trait. Remove traits={Options(...)} from the "
+                "Parameter constructor -- ModelAccessComponent adds Options itself."
+            )
+            raise ValueError(msg)
+        if parameter.find_elements_by_type(Button):
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                "already carries a Button trait. Remove it -- ModelAccessComponent adds the "
+                "refresh Button itself."
+            )
+            raise ValueError(msg)
+        choice_set = set(self._model_choices)
+        if self._default_model not in choice_set:
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"declares default_model {self._default_model!r}, which is not one of model_choices. "
+                "Point default_model at a current choice -- a retired value belongs in "
+                "deprecated_values, not default_model."
+            )
+            raise ValueError(msg)
+        invalid_values = sorted(
+            {canonical for canonical in self._deprecated_values.values() if canonical not in choice_set}
+        )
+        colliding_keys = sorted(legacy for legacy in self._deprecated_values if legacy in choice_set)
+        if invalid_values or colliding_keys:
+            problems = []
+            if invalid_values:
+                problems.append(f"value(s) not in model_choices: {', '.join(repr(v) for v in invalid_values)}")
+            if colliding_keys:
+                problems.append(f"key(s) already a current choice: {', '.join(repr(k) for k in colliding_keys)}")
+            msg = (
+                f"ModelAccessComponent: parameter '{parameter.name}' on node '{self._node.name}' "
+                f"deprecated_values is invalid: {'; '.join(problems)}."
+            )
+            raise ValueError(msg)
+
+    def _dropdown_choices(self) -> list[str]:
+        """The list handed to ``Options.choices``: current choices plus legacy keys.
+
+        ``Options`` rewrites any assigned value outside ``choices`` to
+        ``choices[0]``, so the legacy keys have to be in here for a stored
+        legacy value to survive long enough for the migration converter to
+        translate it. They are deliberately absent from ``_build_ui_options``,
+        so they are accepted but never offered.
+        """
+        return [*self._model_choices, *self._deprecated_values]
 
     def _fetch_snapshot(self) -> _AccessSnapshot:
         """Ask the engine and build a fresh ``_AccessSnapshot`` from the response.
@@ -413,7 +581,12 @@ class ModelAccessComponent:
         return snapshot
 
     def _build_ui_options(self) -> dict[str, Any]:
-        """Build the ``ui_options`` dict that decorates the dropdown row-by-row."""
+        """Build the ``ui_options`` dict that decorates the dropdown row-by-row.
+
+        Built from ``model_choices`` alone, never ``deprecated_values`` -- a
+        legacy value is accepted when assigned but never offered as a fresh
+        selection.
+        """
         denials = self._snapshot.denial_by_provider_id
         data: list[dict[str, str]] = []
         for choice in self._model_choices:
