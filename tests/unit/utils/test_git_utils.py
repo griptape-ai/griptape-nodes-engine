@@ -2,40 +2,87 @@
 
 from __future__ import annotations
 
+import json
+import subprocess
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-import pygit2
 import pytest
 
 from griptape_nodes.utils.git_utils import (
     GitCloneError,
+    GitError,
+    GitNotFoundError,
     GitPullError,
     GitRefError,
     GitRemoteError,
     GitRepositoryError,
-    _CredentialCallbacks,
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
+    get_current_tag,
     get_git_info,
     get_git_remote,
     get_git_repository_root,
+    get_local_commit_sha,
     git_update_from_remote,
+    has_uncommitted_changes,
     is_git_repository,
     is_git_url,
+    is_on_tag,
     normalize_github_url,
     parse_commit_datetime,
     parse_git_url_with_ref,
     remote_ref_exists,
+    sparse_checkout_library_json,
     switch_branch,
+    switch_branch_or_tag,
+    update_library_git,
+    update_to_moving_tag,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run a git command with a throwaway identity so commits succeed without machine git config."""
+    return subprocess.run(  # noqa: S603
+        ["git", "-c", "user.email=test@example.com", "-c", "user.name=Test", *args],  # noqa: S607
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def make_origin_repo(origin_path: Path, *, library_version: str = "1.2.3") -> Path:
+    """Create a git repository at origin_path with a committed griptape_nodes_library.json.
+
+    Pins the initial branch to "main" instead of relying on the local machine's
+    init.defaultBranch configuration.
+    """
+    origin_path.mkdir(parents=True, exist_ok=True)
+    run_git(origin_path, "init", "-b", "main")
+    library_json = origin_path / "griptape_nodes_library.json"
+    library_json.write_text(json.dumps({"metadata": {"library_version": library_version}}), encoding="utf-8")
+    run_git(origin_path, "add", ".")
+    run_git(origin_path, "commit", "-m", "initial commit")
+    return origin_path
+
+
+def clone_repo(origin_path: Path, clone_path: Path) -> Path:
+    """Clone origin_path into clone_path with the git CLI directly, bypassing the code under test."""
+    run_git(clone_path.parent, "clone", str(origin_path), str(clone_path))
+    return clone_path
+
+
+def head_sha(repo_path: Path) -> str:
+    """Return the full commit SHA that HEAD points to in repo_path."""
+    return run_git(repo_path, "rev-parse", "HEAD").stdout.strip()
 
 
 class TestParseGitUrlWithRef:
@@ -196,7 +243,7 @@ class TestIsGitUrl:
         assert result is False
 
     def test_is_git_url_returns_false_for_local_path(self) -> None:
-        """Test that local paths are not recognized as git URLs."""
+        """Test that local paths are not recognized as a git URL."""
         result = is_git_url("/home/user/repo")
 
         assert result is False
@@ -299,12 +346,7 @@ class TestIsGitRepository:
 
     def test_is_git_repository_returns_false_when_not_git_repo(self) -> None:
         """Test that False is returned when directory is not a git repository."""
-        with (
-            tempfile.TemporaryDirectory() as tmpdir,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_discover.side_effect = pygit2.GitError("not a git repository")
-
+        with tempfile.TemporaryDirectory() as tmpdir:
             result = is_git_repository(Path(tmpdir))
 
             assert result is False
@@ -347,82 +389,30 @@ class TestGetGitRemote:
 
     def test_get_git_remote_returns_none_when_not_git_repository(self, temp_dir: Path) -> None:
         """Test that None is returned when path is not a git repository."""
-        with patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git:
-            mock_is_git.return_value = False
+        result = get_git_remote(temp_dir)
 
-            result = get_git_remote(temp_dir)
-
-            assert result is None
-
-    def test_get_git_remote_returns_none_when_repository_not_discovered(self, temp_dir: Path) -> None:
-        """Test that None is returned when repository cannot be discovered."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = None
-
-            result = get_git_remote(temp_dir)
-
-            assert result is None
+        assert result is None
 
     def test_get_git_remote_returns_none_when_no_origin_remote(self, temp_dir: Path) -> None:
         """Test that None is returned when no origin remote exists."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        repo = make_origin_repo(temp_dir / "repo")
 
-            mock_repo = Mock()
-            mock_repo.remotes = {}
-            mock_repo_class.return_value = mock_repo
+        result = get_git_remote(repo)
 
-            result = get_git_remote(temp_dir)
-
-            assert result is None
+        assert result is None
 
     def test_get_git_remote_returns_url_when_origin_exists(self, temp_dir: Path) -> None:
         """Test that remote URL is returned when origin exists."""
+        repo = make_origin_repo(temp_dir / "repo")
         expected_url = "https://github.com/user/repo.git"
+        run_git(repo, "remote", "add", "origin", expected_url)
 
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        result = get_git_remote(repo)
 
-            mock_remote = Mock()
-            mock_remote.url = expected_url
-            mock_repo = Mock()
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo_class.return_value = mock_repo
-
-            result = get_git_remote(temp_dir)
-
-            assert result == expected_url
-
-    def test_get_git_remote_raises_error_on_git_error(self, temp_dir: Path) -> None:
-        """Test that GitRemoteError is raised on pygit2.GitError."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.side_effect = pygit2.GitError("error")
-
-            with pytest.raises(GitRemoteError) as exc_info:
-                get_git_remote(temp_dir)
-
-            assert "Error getting git remote" in str(exc_info.value)
+        assert result == expected_url
 
 
-class TestGetCurrentBranch:
+class TestGetCurrentRef:
     """Test get_current_ref function."""
 
     @pytest.fixture
@@ -433,89 +423,159 @@ class TestGetCurrentBranch:
 
     def test_get_current_ref_returns_none_when_not_git_repository(self, temp_dir: Path) -> None:
         """Test that None is returned when path is not a git repository."""
-        with patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git:
-            mock_is_git.return_value = False
+        result = get_current_ref(temp_dir)
 
-            result = get_current_ref(temp_dir)
-
-            assert result is None
-
-    def test_get_current_ref_returns_none_when_repository_not_discovered(self, temp_dir: Path) -> None:
-        """Test that None is returned when repository cannot be discovered."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = None
-
-            result = get_current_ref(temp_dir)
-
-            assert result is None
-
-    def test_get_current_ref_returns_none_when_head_detached(self, temp_dir: Path) -> None:
-        """Test that commit SHA is returned when HEAD is detached."""
-        expected_commit_sha = "abc123def456"
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-            patch("griptape_nodes.utils.git_utils.get_current_tag") as mock_get_current_tag,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
-            mock_get_current_tag.return_value = None
-
-            mock_head = Mock()
-            mock_head.target = expected_commit_sha
-            mock_repo = Mock()
-            mock_repo.head_is_unborn = False
-            mock_repo.head_is_detached = True
-            mock_repo.head = mock_head
-            mock_repo_class.return_value = mock_repo
-
-            result = get_current_ref(temp_dir)
-
-            assert result == expected_commit_sha
+        assert result is None
 
     def test_get_current_ref_returns_branch_name_when_on_branch(self, temp_dir: Path) -> None:
         """Test that branch name is returned when on a branch."""
-        expected_branch = "main"
+        repo = make_origin_repo(temp_dir / "repo")
 
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        result = get_current_ref(repo)
 
-            mock_head = Mock()
-            mock_head.shorthand = expected_branch
-            mock_repo = Mock()
-            mock_repo.head_is_unborn = False
-            mock_repo.head_is_detached = False
-            mock_repo.head = mock_head
-            mock_repo_class.return_value = mock_repo
+        assert result == "main"
 
-            result = get_current_ref(temp_dir)
+    def test_get_current_ref_returns_tag_name_when_head_detached_and_tagged(self, temp_dir: Path) -> None:
+        """Test that tag name is returned when HEAD is detached on a tagged commit."""
+        repo = make_origin_repo(temp_dir / "repo")
+        run_git(repo, "tag", "v1.0.0")
+        run_git(repo, "checkout", "--detach", "v1.0.0")
 
-            assert result == expected_branch
+        result = get_current_ref(repo)
 
-    def test_get_current_ref_raises_error_on_git_error(self, temp_dir: Path) -> None:
-        """Test that GitRefError is raised on pygit2.GitError."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.side_effect = pygit2.GitError("error")
+        assert result == "v1.0.0"
 
-            with pytest.raises(GitRefError) as exc_info:
-                get_current_ref(temp_dir)
+    def test_get_current_ref_returns_commit_sha_when_head_detached_and_not_tagged(self, temp_dir: Path) -> None:
+        """Test that commit SHA is returned when HEAD is detached and not tagged."""
+        repo = make_origin_repo(temp_dir / "repo")
+        sha = head_sha(repo)
+        run_git(repo, "checkout", "--detach", sha)
 
-            assert "Error getting current git reference" in str(exc_info.value)
+        result = get_current_ref(repo)
+
+        assert result == sha
+
+    def test_get_current_ref_returns_none_when_head_is_unborn(self, temp_dir: Path) -> None:
+        """Test that None is returned for a freshly initialized repository with no commits."""
+        repo = temp_dir / "unborn"
+        repo.mkdir()
+        run_git(repo, "init", "-b", "main")
+
+        result = get_current_ref(repo)
+
+        assert result is None
+
+
+class TestGetCurrentTag:
+    """Test get_current_tag function."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_get_current_tag_returns_none_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that None is returned when path is not a git repository."""
+        result = get_current_tag(temp_dir)
+
+        assert result is None
+
+    def test_get_current_tag_returns_none_when_head_is_unborn(self, temp_dir: Path) -> None:
+        """Test that None is returned for a freshly initialized repository with no commits."""
+        repo = temp_dir / "unborn"
+        repo.mkdir()
+        run_git(repo, "init", "-b", "main")
+
+        result = get_current_tag(repo)
+
+        assert result is None
+
+    def test_get_current_tag_returns_none_when_head_not_tagged(self, temp_dir: Path) -> None:
+        """Test that None is returned when HEAD has no tag pointing at it."""
+        repo = make_origin_repo(temp_dir / "repo")
+
+        result = get_current_tag(repo)
+
+        assert result is None
+
+    def test_get_current_tag_returns_tag_name_when_head_is_tagged(self, temp_dir: Path) -> None:
+        """Test that the tag name is returned when a tag points at HEAD, even on a branch."""
+        repo = make_origin_repo(temp_dir / "repo")
+        run_git(repo, "tag", "v1.0.0")
+
+        result = get_current_tag(repo)
+
+        assert result == "v1.0.0"
+
+
+class TestIsOnTag:
+    """Test is_on_tag function."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_is_on_tag_returns_false_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that False is returned when path is not a git repository."""
+        result = is_on_tag(temp_dir)
+
+        assert result is False
+
+    def test_is_on_tag_returns_false_when_head_not_tagged(self, temp_dir: Path) -> None:
+        """Test that False is returned when HEAD has no tag pointing at it."""
+        repo = make_origin_repo(temp_dir / "repo")
+
+        result = is_on_tag(repo)
+
+        assert result is False
+
+    def test_is_on_tag_returns_true_when_head_is_tagged(self, temp_dir: Path) -> None:
+        """Test that True is returned when a tag points at HEAD."""
+        repo = make_origin_repo(temp_dir / "repo")
+        run_git(repo, "tag", "v1.0.0")
+
+        result = is_on_tag(repo)
+
+        assert result is True
+
+
+class TestGetLocalCommitSha:
+    """Test get_local_commit_sha function."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_get_local_commit_sha_returns_none_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that None is returned when path is not a git repository."""
+        result = get_local_commit_sha(temp_dir)
+
+        assert result is None
+
+    def test_get_local_commit_sha_returns_none_when_head_is_unborn(self, temp_dir: Path) -> None:
+        """Test that None is returned for a freshly initialized repository with no commits."""
+        repo = temp_dir / "unborn"
+        repo.mkdir()
+        run_git(repo, "init", "-b", "main")
+
+        result = get_local_commit_sha(repo)
+
+        assert result is None
+
+    def test_get_local_commit_sha_returns_full_commit_sha_when_head_has_commits(self, temp_dir: Path) -> None:
+        """Test that the full HEAD commit SHA is returned."""
+        repo = make_origin_repo(temp_dir / "repo")
+
+        result = get_local_commit_sha(repo)
+
+        assert result == head_sha(repo)
+        assert result is not None
+        assert len(result) == 40  # noqa: PLR2004
 
 
 class TestGetGitRepositoryRoot:
@@ -529,75 +589,164 @@ class TestGetGitRepositoryRoot:
 
     def test_get_git_repository_root_returns_none_when_not_git_repository(self, temp_dir: Path) -> None:
         """Test that None is returned when path is not a git repository."""
-        with patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git:
-            mock_is_git.return_value = False
+        result = get_git_repository_root(temp_dir)
 
-            result = get_git_repository_root(temp_dir)
+        assert result is None
 
-            assert result is None
+    def test_get_git_repository_root_returns_root_when_called_on_root(self, temp_dir: Path) -> None:
+        """Test that the repository root is returned when called on the root itself."""
+        repo = make_origin_repo(temp_dir / "repo")
 
-    def test_get_git_repository_root_returns_none_when_repository_not_discovered(self, temp_dir: Path) -> None:
-        """Test that None is returned when repository cannot be discovered."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = None
+        result = get_git_repository_root(repo)
 
-            result = get_git_repository_root(temp_dir)
+        assert result == repo
 
-            assert result is None
+    def test_get_git_repository_root_returns_root_when_called_on_subdirectory(self, temp_dir: Path) -> None:
+        """Test that the repository root is returned when called on a subdirectory."""
+        repo = make_origin_repo(temp_dir / "repo")
+        subdir = repo / "subdir"
+        subdir.mkdir()
 
-    def test_get_git_repository_root_returns_parent_for_normal_repository(self, temp_dir: Path) -> None:
-        """Test that parent of .git directory is returned for normal repository."""
-        git_dir = temp_dir / ".git"
+        result = get_git_repository_root(subdir)
 
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(git_dir)
+        assert result == repo
 
-            result = get_git_repository_root(temp_dir)
 
-            assert result == temp_dir
+class TestCloneRepositoryWorkingDirectory:
+    """Test clone_repository's independence from the working directory."""
 
-    def test_get_git_repository_root_returns_bare_repo_path_for_bare_repository(self, temp_dir: Path) -> None:
-        """Test that bare repository path is returned for bare repositories."""
-        bare_repo_path = temp_dir / "repo.git"
-        bare_repo_path.mkdir()
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
 
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(bare_repo_path)
+    def test_clone_repository_ignores_a_broken_repository_in_the_working_directory(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that a broken repository at the working directory doesn't fail the clone."""
+        origin = make_origin_repo(temp_dir / "origin")
+        broken = temp_dir / "broken"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/worktrees/gone\n")
+        monkeypatch.chdir(broken)
 
-            mock_repo = Mock()
-            mock_repo.is_bare = True
-            mock_repo_class.return_value = mock_repo
+        clone_repository(str(origin), temp_dir / "clone")
 
-            result = get_git_repository_root(temp_dir)
+        assert (temp_dir / "clone" / "griptape_nodes_library.json").exists()
 
-            assert result == bare_repo_path
 
-    def test_get_git_repository_root_raises_error_on_git_error(self, temp_dir: Path) -> None:
-        """Test that GitRepositoryError is raised on pygit2.GitError."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.side_effect = pygit2.GitError("error")
+class TestGetGitInfo:
+    """Test get_git_info function.
 
-            with pytest.raises(GitRepositoryError) as exc_info:
-                get_git_repository_root(temp_dir)
+    get_git_info degrades to (None, None) where get_git_remote() and get_current_ref() would
+    each raise or independently re-check is_git_repository().
+    """
 
-            assert "Error getting git repository root" in str(exc_info.value)
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_get_git_info_returns_none_none_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that (None, None) is returned when path is not a git repository."""
+        git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
+
+    def test_get_git_info_returns_remote_and_branch_when_on_branch(self, temp_dir: Path) -> None:
+        """Test that both remote URL and branch name are returned when on a branch."""
+        repo = make_origin_repo(temp_dir / "repo")
+        expected_url = "https://github.com/user/repo.git"
+        run_git(repo, "remote", "add", "origin", expected_url)
+
+        git_remote, git_ref = get_git_info(repo)
+
+        assert git_remote == expected_url
+        assert git_ref == "main"
+
+    def test_get_git_info_returns_none_remote_when_no_origin(self, temp_dir: Path) -> None:
+        """Test that remote is None when no origin is configured."""
+        repo = make_origin_repo(temp_dir / "repo")
+
+        git_remote, git_ref = get_git_info(repo)
+
+        assert git_remote is None
+        assert git_ref == "main"
+
+    def test_get_git_info_returns_commit_sha_when_head_detached_and_no_tag(self, temp_dir: Path) -> None:
+        """Test that the commit SHA is returned as the ref for a detached, untagged HEAD."""
+        repo = make_origin_repo(temp_dir / "repo")
+        sha = head_sha(repo)
+        run_git(repo, "checkout", "--detach", sha)
+
+        _git_remote, git_ref = get_git_info(repo)
+
+        assert git_ref == sha
+
+    def test_get_git_info_returns_tag_name_when_head_on_tag(self, temp_dir: Path) -> None:
+        """Test that the tag name is returned as the ref for a detached, tagged HEAD."""
+        repo = make_origin_repo(temp_dir / "repo")
+        run_git(repo, "tag", "v1.0.0")
+        run_git(repo, "checkout", "--detach", "v1.0.0")
+
+        _git_remote, git_ref = get_git_info(repo)
+
+        assert git_ref == "v1.0.0"
+
+    def test_get_git_info_returns_none_ref_when_head_unborn(self, temp_dir: Path) -> None:
+        """Test that ref is None for a freshly initialized repository with no commits."""
+        repo = temp_dir / "unborn"
+        repo.mkdir()
+        run_git(repo, "init", "-b", "main")
+
+        git_remote, git_ref = get_git_info(repo)
+
+        assert git_remote is None
+        assert git_ref is None
+
+
+class TestHasUncommittedChanges:
+    """Test has_uncommitted_changes function."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_has_uncommitted_changes_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that GitRepositoryError is raised when not a git repository."""
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            has_uncommitted_changes(temp_dir)
+
+    def test_has_uncommitted_changes_returns_false_when_clean(self, temp_dir: Path) -> None:
+        """Test that False is returned when the working tree is clean."""
+        repo = make_origin_repo(temp_dir / "repo")
+
+        result = has_uncommitted_changes(repo)
+
+        assert result is False
+
+    def test_has_uncommitted_changes_returns_true_when_tracked_file_modified(self, temp_dir: Path) -> None:
+        """Test that True is returned when a tracked file has local modifications."""
+        repo = make_origin_repo(temp_dir / "repo")
+        (repo / "griptape_nodes_library.json").write_text("changed", encoding="utf-8")
+
+        result = has_uncommitted_changes(repo)
+
+        assert result is True
+
+    def test_has_uncommitted_changes_returns_true_when_untracked_file_present(self, temp_dir: Path) -> None:
+        """Test that True is returned when an untracked file is present."""
+        repo = make_origin_repo(temp_dir / "repo")
+        (repo / "untracked.txt").write_text("new", encoding="utf-8")
+
+        result = has_uncommitted_changes(repo)
+
+        assert result is True
 
 
 class TestGitUpdateFromRemote:
@@ -611,187 +760,204 @@ class TestGitUpdateFromRemote:
 
     def test_git_update_from_remote_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
         """Test that GitRepositoryError is raised when not a git repository."""
-        with patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git:
-            mock_is_git.return_value = False
-
-            with pytest.raises(GitRepositoryError) as exc_info:
-                git_update_from_remote(temp_dir)
-
-            assert "not a git repository" in str(exc_info.value)
-
-    def test_git_update_from_remote_raises_error_when_repository_not_discovered(self, temp_dir: Path) -> None:
-        """Test that GitRepositoryError is raised when repository cannot be discovered."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = None
-
-            with pytest.raises(GitRepositoryError) as exc_info:
-                git_update_from_remote(temp_dir)
-
-            assert "Cannot discover repository" in str(exc_info.value)
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            git_update_from_remote(temp_dir)
 
     def test_git_update_from_remote_raises_error_when_head_detached(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when HEAD is detached."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "--detach", head_sha(clone))
 
-            mock_repo = Mock()
-            mock_repo.head_is_detached = True
-            mock_repo_class.return_value = mock_repo
-
-            with pytest.raises(GitPullError) as exc_info:
-                git_update_from_remote(temp_dir)
-
-            assert "detached HEAD" in str(exc_info.value)
+        with pytest.raises(GitPullError, match="detached HEAD"):
+            git_update_from_remote(clone)
 
     def test_git_update_from_remote_raises_error_when_no_upstream_branch(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when no upstream branch is set."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "-b", "untracked")
 
-            mock_branch = Mock()
-            mock_branch.upstream = None
-            mock_branch.branch_name = "main"
-
-            mock_head = Mock()
-            mock_head.shorthand = "main"
-
-            mock_branches = Mock()
-            mock_branches.get.return_value = mock_branch
-
-            mock_repo = Mock()
-            mock_repo.head_is_detached = False
-            mock_repo.head = mock_head
-            mock_repo.branches = mock_branches
-            mock_repo_class.return_value = mock_repo
-
-            with pytest.raises(GitPullError) as exc_info:
-                git_update_from_remote(temp_dir)
-
-            assert "No upstream branch" in str(exc_info.value)
+        with pytest.raises(GitPullError, match="No upstream branch"):
+            git_update_from_remote(clone)
 
     def test_git_update_from_remote_raises_error_when_no_origin_remote(self, temp_dir: Path) -> None:
         """Test that GitPullError is raised when no origin remote exists."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        # Renaming keeps the branch's upstream tracking resolvable while origin disappears,
+        # isolating the "no origin remote" check from the "no upstream" check.
+        run_git(clone, "remote", "rename", "origin", "other")
 
-            mock_branch = Mock()
-            mock_branch.upstream = Mock()
-            mock_branch.branch_name = "main"
+        with pytest.raises(GitPullError, match="No origin remote"):
+            git_update_from_remote(clone)
 
-            mock_head = Mock()
-            mock_head.shorthand = "main"
+    def test_git_update_from_remote_raises_error_when_uncommitted_changes_and_not_overwriting(
+        self, temp_dir: Path
+    ) -> None:
+        """Test that GitPullError is raised when uncommitted changes exist and overwrite_existing is False."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
 
-            mock_branches = Mock()
-            mock_branches.get.return_value = mock_branch
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            git_update_from_remote(clone)
 
-            mock_repo = Mock()
-            mock_repo.head_is_detached = False
-            mock_repo.head = mock_head
-            mock_repo.branches = mock_branches
-            mock_repo.remotes = {}
-            mock_repo_class.return_value = mock_repo
+    def test_git_update_from_remote_discards_uncommitted_changes_when_overwrite_existing_true(
+        self, temp_dir: Path
+    ) -> None:
+        """Test that uncommitted changes are discarded when overwrite_existing is True."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
 
-            with pytest.raises(GitPullError) as exc_info:
-                git_update_from_remote(temp_dir)
+        git_update_from_remote(clone, overwrite_existing=True)
 
-            assert "No origin remote" in str(exc_info.value)
+        assert has_uncommitted_changes(clone) is False
 
-    def test_git_update_from_remote_succeeds_with_pygit2(self, temp_dir: Path) -> None:
-        """Test that function succeeds when pygit2 operations succeed."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-            patch("griptape_nodes.utils.git_utils.has_uncommitted_changes") as mock_has_changes,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
-            mock_has_changes.return_value = False
+    def test_git_update_from_remote_resets_to_upstream_tip_after_origin_moves_forward(self, temp_dir: Path) -> None:
+        """Test that the local branch is reset to match the remote after origin advances."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance origin")
 
-            mock_upstream_ref = Mock()
-            mock_upstream_ref.target = "abc123"
+        git_update_from_remote(clone)
 
-            mock_references = Mock()
-            mock_references.get.return_value = mock_upstream_ref
+        assert get_local_commit_sha(clone) == head_sha(origin)
+        assert (clone / "extra.txt").exists()
 
-            mock_branch = Mock()
-            mock_branch.upstream = Mock()
-            mock_branch.upstream.branch_name = "origin/main"
 
-            mock_head = Mock()
-            mock_head.shorthand = "main"
+class TestUpdateToMovingTag:
+    """Test update_to_moving_tag function."""
 
-            mock_branches = Mock()
-            mock_branches.get.return_value = mock_branch
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
 
-            mock_remote = Mock()
-            mock_repo = Mock()
-            mock_repo.head_is_detached = False
-            mock_repo.head = mock_head
-            mock_repo.branches = mock_branches
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo.references = mock_references
-            mock_repo_class.return_value = mock_repo
+    def test_update_to_moving_tag_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that GitRepositoryError is raised when not a git repository."""
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            update_to_moving_tag(temp_dir, "latest")
 
-            git_update_from_remote(temp_dir)
+    def test_update_to_moving_tag_raises_error_when_no_origin_remote(self, temp_dir: Path) -> None:
+        """Test that GitPullError is raised when no origin remote exists."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "latest")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "remote", "rename", "origin", "other")
 
-            mock_remote.fetch.assert_called_once()
-            mock_repo.reset.assert_called_once()
+        with pytest.raises(GitPullError, match="No origin remote"):
+            update_to_moving_tag(clone, "latest")
 
-    def test_git_update_from_remote_raises_error_when_fetch_fails(self, temp_dir: Path) -> None:
-        """Test that GitPullError is raised when fetch fails."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-            patch("griptape_nodes.utils.git_utils.has_uncommitted_changes") as mock_has_changes,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
-            mock_has_changes.return_value = False
+    def test_update_to_moving_tag_raises_error_when_tag_not_found_on_remote(self, temp_dir: Path) -> None:
+        """Test that GitPullError is raised when the tag does not exist on the remote."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
 
-            mock_branch = Mock()
-            mock_branch.upstream = Mock()
-            mock_branch.upstream.branch_name = "origin/main"
+        with pytest.raises(GitPullError, match="not found"):
+            update_to_moving_tag(clone, "latest")
 
-            mock_head = Mock()
-            mock_head.shorthand = "main"
+    def test_update_to_moving_tag_follows_tag_when_origin_force_moves_it(self, temp_dir: Path) -> None:
+        """Test that the tag is followed to a new commit after origin force-moves it."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "latest")
+        clone = clone_repo(origin, temp_dir / "clone")
 
-            mock_branches = Mock()
-            mock_branches.get.return_value = mock_branch
+        update_to_moving_tag(clone, "latest")
 
-            mock_remote = Mock()
-            mock_remote.fetch.side_effect = pygit2.GitError("fetch failed")
-            mock_repo = Mock()
-            mock_repo.head_is_detached = False
-            mock_repo.head = mock_head
-            mock_repo.branches = mock_branches
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo_class.return_value = mock_repo
+        assert get_local_commit_sha(clone) == head_sha(origin)
 
-            with pytest.raises(GitPullError) as exc_info:
-                git_update_from_remote(temp_dir)
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance origin")
+        run_git(origin, "tag", "-f", "latest")
+        moved_sha = head_sha(origin)
 
-            assert "Git error during update" in str(exc_info.value)
+        update_to_moving_tag(clone, "latest")
+
+        assert get_local_commit_sha(clone) == moved_sha
+
+    def test_update_to_moving_tag_raises_error_when_uncommitted_changes_and_not_overwriting(
+        self, temp_dir: Path
+    ) -> None:
+        """Test that GitPullError is raised when uncommitted changes exist and overwrite_existing is False."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "latest")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
+
+        with pytest.raises(GitPullError, match="uncommitted changes"):
+            update_to_moving_tag(clone, "latest")
+
+    def test_update_to_moving_tag_discards_uncommitted_changes_when_overwrite_existing_true(
+        self, temp_dir: Path
+    ) -> None:
+        """Test that uncommitted changes are discarded when overwrite_existing is True."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "latest")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (clone / "griptape_nodes_library.json").write_text("dirty", encoding="utf-8")
+
+        update_to_moving_tag(clone, "latest", overwrite_existing=True)
+
+        assert has_uncommitted_changes(clone) is False
+
+
+class TestUpdateLibraryGit:
+    """Test update_library_git function."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_update_library_git_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that GitRepositoryError is raised when not a git repository."""
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            update_library_git(temp_dir)
+
+    def test_update_library_git_dispatches_to_branch_update_when_on_branch(self, temp_dir: Path) -> None:
+        """Test that update_library_git resets to the remote tip for a branch-based checkout."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance origin")
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == head_sha(origin)
+
+    def test_update_library_git_dispatches_to_tag_update_when_detached_head_on_tag(self, temp_dir: Path) -> None:
+        """Test that update_library_git follows a moving tag for a tag-based checkout."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "stable")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "--detach", "stable")
+
+        (origin / "extra.txt").write_text("extra", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "advance origin")
+        run_git(origin, "tag", "-f", "stable")
+        moved_sha = head_sha(origin)
+
+        update_library_git(clone)
+
+        assert get_local_commit_sha(clone) == moved_sha
+
+    def test_update_library_git_raises_error_when_detached_head_without_known_tag(self, temp_dir: Path) -> None:
+        """Test that GitPullError is raised for a detached HEAD that isn't on a known tag."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "checkout", "--detach", head_sha(clone))
+
+        with pytest.raises(GitPullError, match="not on a known tag"):
+            update_library_git(clone)
 
 
 class TestSwitchBranch:
@@ -805,118 +971,98 @@ class TestSwitchBranch:
 
     def test_switch_branch_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
         """Test that GitRepositoryError is raised when not a git repository."""
-        with patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git:
-            mock_is_git.return_value = False
-
-            with pytest.raises(GitRepositoryError) as exc_info:
-                switch_branch(temp_dir, "main")
-
-            assert "not a git repository" in str(exc_info.value)
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            switch_branch(temp_dir, "main")
 
     def test_switch_branch_raises_error_when_no_origin_remote(self, temp_dir: Path) -> None:
         """Test that GitRefError is raised when no origin remote exists."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "remote", "rename", "origin", "other")
 
-            mock_repo = Mock()
-            mock_repo.remotes = {}
-            mock_repo_class.return_value = mock_repo
-
-            with pytest.raises(GitRefError) as exc_info:
-                switch_branch(temp_dir, "main")
-
-            assert "No origin remote" in str(exc_info.value)
+        with pytest.raises(GitRefError, match="No origin remote"):
+            switch_branch(clone, "main")
 
     def test_switch_branch_checks_out_existing_local_branch(self, temp_dir: Path) -> None:
-        """Test that existing local branch is checked out."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        """Test that an existing local branch is checked out."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "branch", "feature")
 
-            mock_branch = Mock()
-            mock_branches = Mock()
-            mock_branches.get.return_value = mock_branch
+        switch_branch(clone, "feature")
 
-            mock_remote = Mock()
-            mock_repo = Mock()
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo.branches = mock_branches
-            mock_repo_class.return_value = mock_repo
+        assert get_current_ref(clone) == "feature"
 
-            switch_branch(temp_dir, "main")
+    def test_switch_branch_creates_tracking_branch_from_remote_when_only_remote_has_it(self, temp_dir: Path) -> None:
+        """Test that a tracking branch is created from the remote when only origin has it."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(origin, "branch", "feature")
 
-            mock_remote.fetch.assert_called_once()
-            mock_repo.checkout.assert_called_once_with(mock_branch)
+        switch_branch(clone, "feature")
 
-    def test_switch_branch_creates_tracking_branch_from_remote(self, temp_dir: Path) -> None:
-        """Test that tracking branch is created from remote when local doesn't exist."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
-
-            mock_remote_branch = Mock()
-            mock_remote_branch.target = "abc123"
-            mock_commit = Mock()
-            mock_new_branch = Mock()
-
-            mock_local_branches = Mock()
-            mock_local_branches.create.return_value = mock_new_branch
-
-            mock_branches = Mock()
-            # First call for local branch returns None, second for remote returns mock
-            mock_branches.get.side_effect = [None, mock_remote_branch]
-            mock_branches.local = mock_local_branches
-
-            mock_remote = Mock()
-            mock_repo = Mock()
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo.branches = mock_branches
-            mock_repo.get.return_value = mock_commit
-            mock_repo_class.return_value = mock_repo
-
-            switch_branch(temp_dir, "feature")
-
-            mock_remote.fetch.assert_called_once()
-            mock_local_branches.create.assert_called_once_with("feature", mock_commit)
-            assert mock_new_branch.upstream == mock_remote_branch
-            mock_repo.checkout.assert_called_once_with(mock_new_branch)
+        assert get_current_ref(clone) == "feature"
 
     def test_switch_branch_raises_error_when_branch_not_found(self, temp_dir: Path) -> None:
-        """Test that GitRefError is raised when branch doesn't exist locally or remotely."""
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository") as mock_is_git,
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository") as mock_discover,
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository") as mock_repo_class,
-        ):
-            mock_is_git.return_value = True
-            mock_discover.return_value = str(temp_dir / ".git")
+        """Test that GitRefError is raised when the branch doesn't exist locally or remotely."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
 
-            mock_branches = Mock()
-            mock_branches.get.return_value = None
+        with pytest.raises(GitRefError, match="not found"):
+            switch_branch(clone, "nonexistent")
 
-            mock_remote = Mock()
-            mock_repo = Mock()
-            mock_repo.remotes = {"origin": mock_remote}
-            mock_repo.branches = mock_branches
-            mock_repo_class.return_value = mock_repo
 
-            with pytest.raises(GitRefError) as exc_info:
-                switch_branch(temp_dir, "nonexistent")
+class TestSwitchBranchOrTag:
+    """Test switch_branch_or_tag function."""
 
-            assert "not found" in str(exc_info.value)
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_switch_branch_or_tag_raises_error_when_not_git_repository(self, temp_dir: Path) -> None:
+        """Test that GitRepositoryError is raised when not a git repository."""
+        with pytest.raises(GitRepositoryError, match="is not a git repository"):
+            switch_branch_or_tag(temp_dir, "main")
+
+    def test_switch_branch_or_tag_checks_out_tag(self, temp_dir: Path) -> None:
+        """Test that a tag is checked out as a detached HEAD."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "v1.0.0")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        switch_branch_or_tag(clone, "v1.0.0")
+
+        assert get_current_tag(clone) == "v1.0.0"
+
+    def test_switch_branch_or_tag_checks_out_remote_only_branch(self, temp_dir: Path) -> None:
+        """Test that a branch only present on the remote is checked out as a tracking branch."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(origin, "branch", "feature")
+
+        switch_branch_or_tag(clone, "feature")
+
+        assert get_current_ref(clone) == "feature"
+
+    def test_switch_branch_or_tag_checks_out_local_branch(self, temp_dir: Path) -> None:
+        """Test that a local-only branch is checked out."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        run_git(clone, "branch", "localonly")
+
+        switch_branch_or_tag(clone, "localonly")
+
+        assert get_current_ref(clone) == "localonly"
+
+    def test_switch_branch_or_tag_raises_error_for_unknown_ref(self, temp_dir: Path) -> None:
+        """Test that GitRefError is raised when the ref doesn't exist anywhere."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        with pytest.raises(GitRefError, match="not found"):
+            switch_branch_or_tag(clone, "nonexistent")
 
 
 class TestCloneRepository:
@@ -933,293 +1079,254 @@ class TestCloneRepository:
         existing_path = temp_dir / "existing"
         existing_path.mkdir()
 
-        with pytest.raises(GitCloneError) as exc_info:
+        with pytest.raises(GitCloneError, match="already exists"):
             clone_repository("https://github.com/user/repo.git", existing_path)
 
-        assert "already exists" in str(exc_info.value)
+    def test_clone_repository_clones_repository(self, temp_dir: Path) -> None:
+        """Test that a repository is cloned successfully."""
+        origin = make_origin_repo(temp_dir / "origin")
+        target = temp_dir / "clone"
 
-    def test_clone_repository_clones_https_url(self, temp_dir: Path) -> None:
-        """Test that HTTPS URLs are cloned successfully."""
-        target_path = temp_dir / "repo"
+        clone_repository(str(origin), target)
 
-        with patch("griptape_nodes.utils.git_utils.pygit2.clone_repository") as mock_clone:
-            mock_clone.return_value = Mock()
-
-            clone_repository("https://github.com/user/repo.git", target_path)
-
-            args, kwargs = mock_clone.call_args
-            assert args == ("https://github.com/user/repo.git", str(target_path))
-            assert isinstance(kwargs["callbacks"], _CredentialCallbacks)
-
-    def test_clone_repository_raises_error_when_clone_returns_none(self, temp_dir: Path) -> None:
-        """Test that GitCloneError is raised when clone returns None."""
-        target_path = temp_dir / "repo"
-
-        with patch("griptape_nodes.utils.git_utils.pygit2.clone_repository") as mock_clone:
-            mock_clone.return_value = None
-
-            with pytest.raises(GitCloneError) as exc_info:
-                clone_repository("https://github.com/user/repo.git", target_path)
-
-            assert "Failed to clone" in str(exc_info.value)
+        assert (target / ".git").exists()
+        assert (target / "griptape_nodes_library.json").exists()
+        assert get_current_ref(target) == "main"
 
     def test_clone_repository_checks_out_specified_branch(self, temp_dir: Path) -> None:
-        """Test that specified branch is checked out after cloning."""
-        target_path = temp_dir / "repo"
+        """Test that the specified branch is checked out after cloning."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "branch", "feature")
+        target = temp_dir / "clone"
 
-        with patch("griptape_nodes.utils.git_utils.pygit2.clone_repository") as mock_clone:
-            mock_branch = Mock()
-            mock_repo = Mock()
-            mock_repo.branches = {"feature": mock_branch}
-            mock_clone.return_value = mock_repo
+        clone_repository(str(origin), target, "feature")
 
-            clone_repository("https://github.com/user/repo.git", target_path, "feature")
+        assert get_current_ref(target) == "feature"
 
-            mock_repo.checkout.assert_called_once_with(mock_branch)
+    def test_clone_repository_checks_out_specified_tag(self, temp_dir: Path) -> None:
+        """Test that the specified tag is checked out as a detached HEAD after cloning."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "v1.0.0")
+        target = temp_dir / "clone"
 
-    def test_clone_repository_checks_out_commit_when_branch_not_found(self, temp_dir: Path) -> None:
-        """Test that commit is checked out when branch doesn't exist."""
-        target_path = temp_dir / "repo"
+        clone_repository(str(origin), target, "v1.0.0")
 
-        with patch("griptape_nodes.utils.git_utils.pygit2.clone_repository") as mock_clone:
-            mock_commit = Mock()
-            mock_commit.id = "abc123"
-            mock_repo = Mock()
-            mock_repo.branches = {}
-            mock_repo.references = []
-            mock_repo.revparse_single.return_value = mock_commit
-            mock_clone.return_value = mock_repo
+        assert get_current_tag(target) == "v1.0.0"
 
-            clone_repository("https://github.com/user/repo.git", target_path, "abc123")
+    def test_clone_repository_checks_out_specified_commit(self, temp_dir: Path) -> None:
+        """Test that a full commit SHA is checked out as a detached HEAD after cloning."""
+        origin = make_origin_repo(temp_dir / "origin")
+        sha = head_sha(origin)
+        target = temp_dir / "clone"
 
-            mock_repo.checkout_tree.assert_called_once_with(mock_commit)
-            mock_repo.set_head.assert_called_once_with(mock_commit.id)
+        clone_repository(str(origin), target, sha)
 
-    def test_clone_repository_raises_error_on_git_error(self, temp_dir: Path) -> None:
-        """Test that GitCloneError is raised on pygit2.GitError."""
-        target_path = temp_dir / "repo"
+        assert get_local_commit_sha(target) == sha
+        assert get_current_ref(target) == sha
 
-        with patch("griptape_nodes.utils.git_utils.pygit2.clone_repository") as mock_clone:
-            mock_clone.side_effect = pygit2.GitError("clone failed")
+    def test_clone_repository_raises_error_on_bogus_source_url(self, temp_dir: Path) -> None:
+        """Test that GitCloneError is raised when the source URL doesn't resolve to a repository."""
+        target = temp_dir / "clone"
 
-            with pytest.raises(GitCloneError) as exc_info:
-                clone_repository("https://github.com/user/repo.git", target_path)
-
-            assert "Git error while cloning" in str(exc_info.value)
+        with pytest.raises(GitCloneError, match="Git error while cloning"):
+            clone_repository(str(temp_dir / "does-not-exist"), target)
 
 
-class TestGetGitInfo:
-    """Test get_git_info function.
-
-    get_git_info opens the pygit2 repo once and returns both (git_remote, git_ref),
-    replacing the previous pattern of calling get_git_remote + get_current_ref
-    separately (which opened the repo 2-3x per library).
-    """
+class TestSparseCheckoutLibraryJson:
+    """Test sparse_checkout_library_json function."""
 
     @pytest.fixture
     def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
-    def _make_repo_mock(  # noqa: PLR0913
-        self,
-        *,
-        remote_url: str | None = "https://github.com/user/repo.git",
-        head_is_unborn: bool = False,
-        head_is_detached: bool = False,
-        branch_shorthand: str = "main",
-        head_target: object = "abc123",
-        references: dict | None = None,
-    ) -> Mock:
-        mock_repo = Mock()
-        mock_repo.remotes = {"origin": Mock(url=remote_url)} if remote_url else {}
-        mock_repo.head_is_unborn = head_is_unborn
-        mock_repo.head_is_detached = head_is_detached
-        mock_repo.head = Mock(shorthand=branch_shorthand, target=head_target)
-        mock_repo.references = references if references is not None else {}
-        return mock_repo
+    def test_sparse_checkout_library_json_returns_metadata_for_default_ref(self, temp_dir: Path) -> None:
+        """Test that library version, commit SHA, commit datetime, and library data are returned for HEAD."""
+        origin = make_origin_repo(temp_dir / "origin", library_version="1.2.3")
 
-    def test_returns_none_none_when_not_git_repository(self, temp_dir: Path) -> None:
-        with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=False):
-            git_remote, git_ref = get_git_info(temp_dir)
+        result = sparse_checkout_library_json(str(origin))
 
-        assert git_remote is None
-        assert git_ref is None
+        assert result.library_version == "1.2.3"
+        assert len(result.commit_sha) == 40  # noqa: PLR2004
+        assert result.commit_sha == head_sha(origin)
+        assert result.commit_datetime is not None
+        assert result.commit_datetime.tzinfo is not None
+        assert result.library_data == {"metadata": {"library_version": "1.2.3"}}
 
-    def test_returns_none_none_when_repository_not_discovered(self, temp_dir: Path) -> None:
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=None),
-        ):
-            git_remote, git_ref = get_git_info(temp_dir)
+    def test_sparse_checkout_library_json_uses_specified_ref(self, temp_dir: Path) -> None:
+        """Test that an older tagged commit is fetched when a ref is specified."""
+        origin = make_origin_repo(temp_dir / "origin", library_version="1.0.0")
+        run_git(origin, "tag", "v1")
+        library_json = origin / "griptape_nodes_library.json"
+        library_json.write_text(json.dumps({"metadata": {"library_version": "2.0.0"}}), encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "bump version")
 
-        assert git_remote is None
-        assert git_ref is None
+        head_result = sparse_checkout_library_json(str(origin))
+        tagged_result = sparse_checkout_library_json(str(origin), ref="v1")
 
-    def test_returns_none_none_on_git_error_opening_repo(self, temp_dir: Path) -> None:
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch(
-                "griptape_nodes.utils.git_utils.pygit2.discover_repository",
-                side_effect=pygit2.GitError("error"),
-            ),
-        ):
-            git_remote, git_ref = get_git_info(temp_dir)
+        assert head_result.library_version == "2.0.0"
+        assert tagged_result.library_version == "1.0.0"
 
-        assert git_remote is None
-        assert git_ref is None
+    def test_sparse_checkout_library_json_raises_error_when_no_library_json_present(self, temp_dir: Path) -> None:
+        """Test that GitCloneError is raised when the repository has no library JSON file."""
+        origin = temp_dir / "origin"
+        origin.mkdir()
+        run_git(origin, "init", "-b", "main")
+        (origin / "README.md").write_text("no library here", encoding="utf-8")
+        run_git(origin, "add", ".")
+        run_git(origin, "commit", "-m", "initial commit")
 
-    def test_returns_remote_and_branch_when_on_branch(self, temp_dir: Path) -> None:
-        mock_repo = self._make_repo_mock(remote_url="https://github.com/user/repo.git", branch_shorthand="main")
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
-        ):
-            git_remote, git_ref = get_git_info(temp_dir)
-
-        assert git_remote == "https://github.com/user/repo.git"
-        assert git_ref == "main"
-
-    def test_returns_none_remote_when_no_origin(self, temp_dir: Path) -> None:
-        mock_repo = self._make_repo_mock(remote_url=None, branch_shorthand="main")
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
-        ):
-            git_remote, git_ref = get_git_info(temp_dir)
-
-        assert git_remote is None
-        assert git_ref == "main"
-
-    def test_returns_commit_sha_when_head_detached_and_no_tag(self, temp_dir: Path) -> None:
-        expected_sha = "deadbeef1234"
-        mock_repo = self._make_repo_mock(
-            remote_url=None, head_is_detached=True, head_target=expected_sha, references={}
-        )
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
-        ):
-            _git_remote, git_ref = get_git_info(temp_dir)
-
-        assert git_ref == expected_sha
-
-    def test_returns_tag_name_when_head_on_tag(self, temp_dir: Path) -> None:
-        expected_sha = "deadbeef1234"
-        expected_tag = "v1.0.0"
-
-        mock_tag_ref = Mock()
-        mock_tag_ref.peel.return_value.id = expected_sha
-
-        mock_repo = self._make_repo_mock(
-            remote_url=None,
-            head_is_detached=True,
-            head_target=expected_sha,
-            references={f"refs/tags/{expected_tag}": mock_tag_ref},
-        )
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
-        ):
-            _git_remote, git_ref = get_git_info(temp_dir)
-
-        assert git_ref == expected_tag
-
-    def test_returns_none_ref_when_head_unborn(self, temp_dir: Path) -> None:
-        mock_repo = self._make_repo_mock(remote_url=None, head_is_unborn=True)
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo),
-        ):
-            _git_remote, git_ref = get_git_info(temp_dir)
-
-        assert git_ref is None
-
-    def test_opens_repo_exactly_once(self, temp_dir: Path) -> None:
-        mock_repo = self._make_repo_mock()
-
-        with (
-            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
-            patch("griptape_nodes.utils.git_utils.pygit2.discover_repository", return_value=str(temp_dir / ".git")),
-            patch("griptape_nodes.utils.git_utils.pygit2.Repository", return_value=mock_repo) as mock_repo_class,
-        ):
-            get_git_info(temp_dir)
-
-        mock_repo_class.assert_called_once()
+        with pytest.raises(GitCloneError, match="No library JSON file found"):
+            sparse_checkout_library_json(str(origin))
 
 
 class TestRemoteRefExists:
-    """Tests for remote_ref_exists."""
+    """Test remote_ref_exists function."""
 
-    def test_returns_true_when_git_cli_lists_matching_ref(self) -> None:
-        completed = Mock(returncode=0, stdout="abc123\trefs/heads/main\n", stderr="")
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_remote_ref_exists_returns_true_for_existing_branch(self, temp_dir: Path) -> None:
+        """Test that True is returned for a branch that exists on the remote."""
+        origin = make_origin_repo(temp_dir / "origin")
+
+        assert remote_ref_exists(str(origin), "main") is True
+
+    def test_remote_ref_exists_returns_true_for_existing_tag(self, temp_dir: Path) -> None:
+        """Test that True is returned for a tag that exists on the remote."""
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "tag", "v1.0.0")
+
+        assert remote_ref_exists(str(origin), "v1.0.0") is True
+
+    def test_remote_ref_exists_returns_false_for_unknown_ref(self, temp_dir: Path) -> None:
+        """Test that False is returned for a ref that doesn't exist on the remote."""
+        origin = make_origin_repo(temp_dir / "origin")
+
+        assert remote_ref_exists(str(origin), "no-such-ref") is False
+
+    def test_remote_ref_exists_returns_false_for_commit_sha(self, temp_dir: Path) -> None:
+        """Test that False is returned for a commit SHA, since SHAs aren't advertised as named refs."""
+        origin = make_origin_repo(temp_dir / "origin")
+        sha = head_sha(origin)
+
+        assert remote_ref_exists(str(origin), sha) is False
+
+    def test_remote_ref_exists_raises_error_when_remote_cannot_be_queried(self, temp_dir: Path) -> None:
+        """Test that GitRemoteError is raised when the remote cannot be queried."""
+        with pytest.raises(GitRemoteError, match="Failed to query remote refs"):
+            remote_ref_exists(str(temp_dir / "not-a-repo"), "main")
+
+    def test_remote_ref_exists_ignores_a_broken_repository_in_the_working_directory(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that a broken repository at the working directory doesn't fail the query."""
+        origin = make_origin_repo(temp_dir / "origin")
+        broken = temp_dir / "broken"
+        broken.mkdir()
+        (broken / ".git").write_text("gitdir: /nonexistent/worktrees/gone\n")
+        monkeypatch.chdir(broken)
+
+        assert remote_ref_exists(str(origin), "main") is True
+
+
+class TestOptionLikeArguments:
+    """Test that caller-supplied values git would read as options are rejected."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_clone_repository_rejects_option_like_url(self, temp_dir: Path) -> None:
+        """Test that GitCloneError is raised for a URL that git would parse as an option."""
+        with pytest.raises(GitCloneError, match="must not start with"):
+            clone_repository("--upload-pack=touch /tmp/pwned", temp_dir / "clone")
+
+    def test_clone_repository_rejects_option_like_ref(self, temp_dir: Path) -> None:
+        """Test that GitCloneError is raised for a ref that git would parse as an option."""
+        origin = make_origin_repo(temp_dir / "origin")
+
+        with pytest.raises(GitCloneError, match="must not start with"):
+            clone_repository(str(origin), temp_dir / "clone", "--orphan")
+
+    def test_remote_ref_exists_rejects_option_like_url(self) -> None:
+        """Test that GitRemoteError is raised for a URL that git would parse as an option."""
+        with pytest.raises(GitRemoteError, match="must not start with"):
+            remote_ref_exists("--upload-pack=touch /tmp/pwned", "main")
+
+    def test_sparse_checkout_library_json_rejects_option_like_url(self) -> None:
+        """Test that GitCloneError is raised for a URL that git would parse as an option."""
+        with pytest.raises(GitCloneError, match="must not start with"):
+            sparse_checkout_library_json("--upload-pack=touch /tmp/pwned")
+
+    def test_switch_branch_rejects_option_like_branch(self, temp_dir: Path) -> None:
+        """Test that GitRefError is raised for a branch name that git would parse as an option."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        with pytest.raises(GitRefError, match="must not start with"):
+            switch_branch(clone, "--track")
+
+    def test_switch_branch_or_tag_rejects_option_like_ref(self, temp_dir: Path) -> None:
+        """Test that GitRefError is raised for a ref name that git would parse as an option."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        with pytest.raises(GitRefError, match="must not start with"):
+            switch_branch_or_tag(clone, "--detach")
+
+    def test_update_to_moving_tag_rejects_option_like_tag(self, temp_dir: Path) -> None:
+        """Test that GitPullError is raised for a tag name that git would parse as an option."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        with pytest.raises(GitPullError, match="must not start with"):
+            update_to_moving_tag(clone, "--force")
+
+
+class TestGitNotInstalled:
+    """Test the documented contract for functions when git isn't found on PATH."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_reader_raises_git_not_found_error_naming_git_as_a_requirement(self, temp_dir: Path) -> None:
+        """Test that get_current_tag raises GitNotFoundError naming git as a requirement when git is missing."""
+        # A bare ".git" marker is enough for is_git_repository's filesystem check; no real
+        # git invocation happens before the patched subprocess.run call.
+        (temp_dir / ".git").mkdir()
+
         with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
-            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed) as mock_run,
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(GitNotFoundError, match="git was not found on PATH"),
         ):
-            assert remote_ref_exists("git@github.com:owner/repo.git", "main") is True
+            get_current_tag(temp_dir)
 
-        args = mock_run.call_args.args[0]
-        assert args == ["git", "ls-remote", "--heads", "--tags", "git@github.com:owner/repo.git", "main"]
-
-    def test_returns_false_when_git_cli_lists_no_matching_ref(self) -> None:
-        completed = Mock(returncode=0, stdout="\n", stderr="")
+    def test_mutator_raises_git_not_found_error_naming_git_as_a_requirement(self) -> None:
+        """Test that remote_ref_exists raises GitNotFoundError naming git as a requirement when git is missing."""
         with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
-            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(GitNotFoundError, match="git was not found on PATH"),
         ):
-            assert remote_ref_exists("git@github.com:owner/repo.git", "local-only-branch") is False
+            remote_ref_exists("https://example.com/user/repo.git", "main")
 
-    def test_raises_git_remote_error_when_git_cli_fails(self) -> None:
-        completed = Mock(returncode=128, stdout="", stderr="fatal: could not read from remote\n")
+    def test_git_not_found_error_is_catchable_as_git_error(self) -> None:
+        """Test that callers handling the base GitError also handle a missing git."""
         with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=True),
-            patch("griptape_nodes.utils.git_utils.subprocess.run", return_value=completed),
-            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
+            pytest.raises(GitError),
         ):
-            remote_ref_exists("git@github.com:owner/repo.git", "main")
-
-    def test_returns_true_when_pygit2_lists_matching_ref(self) -> None:
-        mock_remote = Mock()
-        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/feature/foo"}, {"name": "refs/heads/main"}]
-        mock_repo = Mock()
-        mock_repo.remotes.create.return_value = mock_remote
-        with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
-            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
-        ):
-            assert remote_ref_exists("https://github.com/owner/repo.git", "feature/foo") is True
-
-    def test_returns_false_when_pygit2_lists_no_matching_ref(self) -> None:
-        mock_remote = Mock()
-        mock_remote.ls_remotes.return_value = [{"name": "refs/heads/main"}]
-        mock_repo = Mock()
-        mock_repo.remotes.create.return_value = mock_remote
-        with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
-            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
-        ):
-            assert remote_ref_exists("https://github.com/owner/repo.git", "local-only-branch") is False
-
-    def test_raises_git_remote_error_when_pygit2_fails(self) -> None:
-        mock_repo = Mock()
-        mock_repo.remotes.create.side_effect = pygit2.GitError("auth failed")
-        with (
-            patch("griptape_nodes.utils.git_utils._is_git_available", return_value=False),
-            patch("griptape_nodes.utils.git_utils.pygit2.init_repository", return_value=mock_repo),
-            pytest.raises(GitRemoteError, match="Failed to query remote refs"),
-        ):
-            remote_ref_exists("https://github.com/owner/repo.git", "main")
+            remote_ref_exists("https://example.com/user/repo.git", "main")
 
 
 class TestParseCommitDatetime:

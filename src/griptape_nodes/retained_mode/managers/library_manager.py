@@ -246,12 +246,7 @@ from griptape_nodes.utils.async_utils import subprocess_run
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, normalize_secrets_to_register
 from griptape_nodes.utils.file_utils import find_file_in_directory, find_files_recursive
 from griptape_nodes.utils.git_utils import (
-    GitCloneError,
     GitError,
-    GitPullError,
-    GitRefError,
-    GitRemoteError,
-    GitRepositoryError,
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
@@ -5798,13 +5793,13 @@ class LibraryManager(EngineScoped):
             if git_remote is None:
                 details = f"Library '{library_name}' is not a git repository or has no remote configured."
                 return CheckLibraryUpdateResultFailure(result_details=details)
-        except GitRemoteError as e:
+        except GitError as e:
             details = f"Failed to get git remote for Library '{library_name}': {e}"
             return CheckLibraryUpdateResultFailure(result_details=details)
 
         try:
             git_ref = await asyncio.to_thread(get_current_ref, library_dir)
-        except GitRefError as e:
+        except GitError as e:
             details = f"Failed to get current git reference for Library '{library_name}': {e}"
             return CheckLibraryUpdateResultFailure(result_details=details)
 
@@ -5823,7 +5818,7 @@ class LibraryManager(EngineScoped):
         if git_ref is not None:
             try:
                 ref_on_remote = await asyncio.to_thread(remote_ref_exists, git_remote, git_ref)
-            except GitRemoteError as e:
+            except GitError as e:
                 details = f"Failed to query git remote for Library '{library_name}': {e}"
                 return CheckLibraryUpdateResultFailure(result_details=details)
 
@@ -5850,7 +5845,7 @@ class LibraryManager(EngineScoped):
             version_info = await asyncio.to_thread(clone_and_get_library_version, git_remote, ref_to_check)
             latest_version = version_info.library_version
             remote_commit = version_info.commit_sha
-        except GitCloneError as e:
+        except GitError as e:
             details = f"Failed to retrieve latest version from git remote for Library '{library_name}': {e}"
             return CheckLibraryUpdateResultFailure(result_details=details)
 
@@ -6115,7 +6110,7 @@ class LibraryManager(EngineScoped):
                 library_dir,
                 overwrite_existing=request.overwrite_existing,
             )
-        except (GitPullError, GitRepositoryError) as e:
+        except GitError as e:
             error_msg = str(e).lower()
 
             # Check if error is retryable (uncommitted changes)
@@ -6195,14 +6190,14 @@ class LibraryManager(EngineScoped):
             if old_ref is None:
                 details = f"Library '{library_name}' is not on a branch/tag or is not a git repository."
                 return SwitchLibraryRefResultFailure(result_details=details)
-        except GitRefError as e:
+        except GitError as e:
             details = f"Failed to get current branch/tag for Library '{library_name}': {e}"
             return SwitchLibraryRefResultFailure(result_details=details)
 
         # Perform git ref switch (branch or tag)
         try:
             await asyncio.to_thread(switch_branch_or_tag, library_dir, ref_name)
-        except (GitRefError, GitRepositoryError) as e:
+        except GitError as e:
             details = f"Failed to switch to '{ref_name}' for Library '{library_name}': {e}"
             return SwitchLibraryRefResultFailure(result_details=details)
 
@@ -6222,7 +6217,7 @@ class LibraryManager(EngineScoped):
             new_ref = await asyncio.to_thread(get_current_ref, library_dir)
             if new_ref is None:
                 new_ref = "unknown"
-        except GitRefError:
+        except GitError:
             new_ref = "unknown"
 
         details = f"Successfully switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' (version {new_version})."
@@ -6301,7 +6296,7 @@ class LibraryManager(EngineScoped):
         else:
             try:
                 await asyncio.to_thread(clone_repository, git_url, target_path, branch_tag_commit)
-            except GitCloneError as e:
+            except GitError as e:
                 details = f"Failed to clone repository from {git_url} to {target_path}: {e}"
                 return DownloadLibraryResultFailure(result_details=details)
 
@@ -6789,7 +6784,7 @@ class LibraryManager(EngineScoped):
         # Perform sparse checkout to get library JSON
         try:
             checkout = sparse_checkout_library_json(normalized_url, ref)
-        except GitCloneError as e:
+        except GitError as e:
             details = f"Failed to inspect library from {normalized_url}: {e}"
             logger.error(details)
             return InspectLibraryRepoResultFailure(result_details=details)
