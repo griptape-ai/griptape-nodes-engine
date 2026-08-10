@@ -21,6 +21,7 @@ from unittest.mock import patch
 
 import pytest
 
+from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import NO_MODELS_PLACEHOLDER
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
 from griptape_nodes.retained_mode.events.access_events import (
     ModelAccessVerdict,
@@ -129,13 +130,58 @@ class TestFailClosed:
             param = _param(gated=True)
         denial = param.query_for_denial(ALLOWED_REPO)
         assert denial is not None
-        assert "could not be evaluated" in denial.reason()
+        assert "could not be checked against your license" in denial.reason()
 
     def test_raise_if_denied_raises_for_denied_and_passes_for_allowed(self) -> None:
         param = _param(gated=True)
         with pytest.raises(RuntimeError, match="not permitted"):
             param.raise_if_denied(DENIED_REPO)
         param.raise_if_denied(ALLOWED_REPO)
+
+
+class TestTheEmptyCachePlaceholderIsNotBadgedAsUnlicensed:
+    """Fail-closed applies to models, not to the row that says there are none.
+
+    With an empty cache the dropdown falls back to the placeholder, and if the access query is
+    also unanswerable, every whole-parameter refusal is live at once. Badging that row red says
+    the artist's license forbids something, when what actually happened is a library-registration
+    problem -- and it buries `get_repo_revision()`'s accurate "no such model" report under a
+    licensing error, which points them at the wrong thing entirely.
+    """
+
+    def _unresolvable_param(self, *, add_parameters: bool = False) -> HuggingFaceRepoParameter:
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+        with patch(
+            f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request",
+            return_value=QueryModelAccessForNodeResultFailure(result_details="node type not found"),
+        ):
+            # `repo_ids=[]` + `list_all_models=True` is the "offer whatever is cached" config, and
+            # the cache scan is stubbed empty, so the placeholder is what gets selected.
+            param = HuggingFaceRepoParameter(MockNode(), repo_ids=[], list_all_models=True, gated=True)
+            if add_parameters:
+                param.add_input_parameters()
+            return param
+
+    def test_the_placeholder_is_not_denied(self) -> None:
+        param = self._unresolvable_param()
+        # Fail-closed still holds for a real repo id -- only the non-model row is exempt.
+        assert param.query_for_denial(ALLOWED_REPO) is not None
+        assert param.query_for_denial(NO_MODELS_PLACEHOLDER) is None
+
+    def test_no_badge_lands_on_the_placeholder_row(self) -> None:
+        param = self._unresolvable_param(add_parameters=True)
+        parameter = param._node.get_parameter_by_name("model")
+        assert parameter is not None
+        assert param._node.get_parameter_value("model") == NO_MODELS_PLACEHOLDER
+        assert parameter.get_badge() is None
+
+    def test_the_run_error_is_about_the_missing_model_not_the_license(self) -> None:
+        param = self._unresolvable_param(add_parameters=True)
+        errors = param.validate_before_node_run()
+        assert errors is not None
+        message = str(errors[0])
+        assert "could not be checked against your license" not in message
+        assert "not found in available models" in message
 
 
 class TestUngatedIsUnchanged:

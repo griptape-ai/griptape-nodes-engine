@@ -6,6 +6,7 @@ must never answer "is this model permitted?" differently. These tests pin the sh
 in particular the one axis on which the two are ALLOWED to differ: `refuse_unrecognized`.
 """
 
+import logging
 from dataclasses import FrozenInstanceError
 from unittest.mock import patch
 
@@ -44,7 +45,7 @@ class TestQueryModelPolicy:
         with patch(_HANDLE, return_value=_success(verdicts)):
             snapshot = query_model_policy("SomeNode")
         assert snapshot.denial_by_provider_id == {DENIED: _DENIAL}
-        assert snapshot.catalog_id_by_provider_id == {DENIED: "md_denied", ALLOWED: "md_allowed"}
+        assert snapshot.catalog_ids_by_provider_id == {DENIED: ("md_denied",), ALLOWED: ("md_allowed",)}
         assert snapshot.failure_detail is None
         assert snapshot.has_unmatchable_entries is False
 
@@ -52,7 +53,31 @@ class TestQueryModelPolicy:
         with patch(_HANDLE, return_value=QueryModelAccessForNodeResultFailure(result_details="not found")):
             snapshot = query_model_policy("SomeNode")
         assert snapshot.failure_detail is not None
-        assert "SomeNode" in snapshot.failure_detail
+        assert snapshot.denial_for(ALLOWED) is not None
+
+    def test_the_failure_detail_reads_for_an_artist(self, caplog: pytest.LogCaptureFixture) -> None:
+        """This string reaches a badge and a run error, so it must not name manifest internals.
+
+        The node type, the engine's reason, and the "declare a model_usage block" instruction are
+        for whoever maintains the library, and belong in the log. An artist cannot act on any of
+        them, and a registration problem worded as a licensing one sends them looking in the wrong
+        place entirely.
+        """
+        with (
+            caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+            patch(_HANDLE, return_value=QueryModelAccessForNodeResultFailure(result_details="not registered")),
+        ):
+            snapshot = query_model_policy("SomeNode")
+
+        detail = snapshot.failure_detail
+        assert detail is not None
+        for jargon in ("model_usage", "manifest", "griptape_nodes_library.json", "SomeNode", "not registered"):
+            assert jargon not in detail
+        assert "Contact whoever maintains this node library." in detail
+        # The author-facing diagnostic is not lost -- it moved to the log.
+        assert "model_usage block" in caplog.text
+        assert "SomeNode" in caplog.text
+        assert "not registered" in caplog.text
 
     def test_fail_open_records_nothing(self) -> None:
         """Auto-detect uses this: an unresolvable node means "has not adopted declarations"."""
@@ -67,24 +92,38 @@ class TestQueryModelPolicy:
         with patch(_HANDLE, return_value=_success(verdicts)):
             snapshot = query_model_policy("SomeNode")
         assert snapshot.has_unmatchable_entries is True
-        assert snapshot.catalog_id_by_provider_id == {}
+        assert snapshot.catalog_ids_by_provider_id == {}
         # Still counts as declaring models -- otherwise enforcement would silently switch off.
         assert snapshot.declares_models is True
 
 
 class TestDenialFor:
     def test_an_explicit_denial_is_returned(self) -> None:
-        snapshot = ModelPolicySnapshot(denial_by_provider_id={DENIED: _DENIAL}, catalog_id_by_provider_id={DENIED: "x"})
+        snapshot = ModelPolicySnapshot(
+            denial_by_provider_id={DENIED: _DENIAL}, catalog_ids_by_provider_id={DENIED: ("x",)}
+        )
         assert snapshot.denial_for(DENIED) is _DENIAL
 
     def test_a_permitted_model_is_allowed(self) -> None:
-        snapshot = ModelPolicySnapshot(catalog_id_by_provider_id={ALLOWED: "x"})
+        snapshot = ModelPolicySnapshot(catalog_ids_by_provider_id={ALLOWED: ("x",)})
         assert snapshot.denial_for(ALLOWED) is None
 
     def test_none_is_never_denied(self) -> None:
-        """A placeholder row or a connected driver object is not a model."""
-        snapshot = ModelPolicySnapshot(failure_detail=None, catalog_id_by_provider_id={ALLOWED: "x"})
+        """A placeholder row or a connected driver object is not a model.
+
+        Pinned against a snapshot that carries every whole-parameter refusal there is, since those
+        are exactly the paths that would deny a value which is not a model at all -- badging the
+        "no models downloaded" placeholder as unlicensed, and replacing the "download this model"
+        message with a license error.
+        """
+        snapshot = ModelPolicySnapshot(
+            failure_detail="could not evaluate",
+            unmatchable_denials=("md_flux_dev",),
+            has_unmatchable_entries=True,
+            catalog_ids_by_provider_id={ALLOWED: ("x",)},
+        )
         assert snapshot.denial_for(None, refuse_unrecognized=True) is None
+        assert snapshot.denial_for(None) is None
 
     def test_a_failure_detail_denies_everything(self) -> None:
         snapshot = ModelPolicySnapshot(failure_detail="could not evaluate")
@@ -92,12 +131,12 @@ class TestDenialFor:
 
     def test_unrecognized_is_allowed_by_default(self) -> None:
         """The static-dropdown stance: an unknown id was vetted at authoring time."""
-        snapshot = ModelPolicySnapshot(catalog_id_by_provider_id={ALLOWED: "x"})
+        snapshot = ModelPolicySnapshot(catalog_ids_by_provider_id={ALLOWED: ("x",)})
         assert snapshot.denial_for(UNKNOWN) is None
 
     def test_unrecognized_is_refused_when_asked(self) -> None:
         """The cache-scan stance: an unknown repo could be anything the artist pulled down."""
-        snapshot = ModelPolicySnapshot(catalog_id_by_provider_id={ALLOWED: "x"})
+        snapshot = ModelPolicySnapshot(catalog_ids_by_provider_id={ALLOWED: ("x",)})
         denial = snapshot.denial_for(UNKNOWN, refuse_unrecognized=True)
         assert denial is not None
         # Artist-facing wording: names the model, no manifest-editing instructions.
@@ -110,14 +149,14 @@ class TestDenialFor:
         Without this, a library author who declared a model with only the two required fields would
         have it blocked, with an error telling them to declare what they already declared.
         """
-        snapshot = ModelPolicySnapshot(catalog_id_by_provider_id={ALLOWED: "x"}, has_unmatchable_entries=True)
+        snapshot = ModelPolicySnapshot(catalog_ids_by_provider_id={ALLOWED: ("x",)}, has_unmatchable_entries=True)
         assert snapshot.denial_for(UNKNOWN, refuse_unrecognized=True) is None
 
     def test_explicit_denials_survive_an_incomplete_view(self) -> None:
         """Suppressing undeclared-refusal must not suppress real policy denials."""
         snapshot = ModelPolicySnapshot(
             denial_by_provider_id={DENIED: _DENIAL},
-            catalog_id_by_provider_id={DENIED: "x"},
+            catalog_ids_by_provider_id={DENIED: ("x",)},
             has_unmatchable_entries=True,
         )
         assert snapshot.denial_for(DENIED, refuse_unrecognized=True) is _DENIAL

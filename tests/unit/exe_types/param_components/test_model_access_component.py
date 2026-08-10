@@ -416,12 +416,13 @@ class TestEngineFailureIsFailClosedAtRuntime:
       decoration. Artists can still open workflows built against an
       unregistered node type without hitting a raise on load.
     - Runtime denial checks fail CLOSED. ``query_for_denial()`` returns a
-      synthesized CheckpointDenial with a "policy could not be evaluated"
-      reason, so a developer's setup bug cannot silently let denied models
-      through at run time. ``raise_if_denied()`` raises with the same reason.
+      synthesized CheckpointDenial saying the models could not be checked, so a
+      developer's setup bug cannot silently let denied models through at run
+      time. ``raise_if_denied()`` raises with the same reason.
 
-    A developer-facing WARNING log names the node type + failure kind so the
-    misconfiguration is discoverable.
+    The denial's own wording stays artist-facing -- it reaches a badge and a run
+    error -- so the node type and the failure kind live in a developer-facing
+    WARNING log instead, where the misconfiguration is still discoverable.
     """
 
     def _register_library_without_probe_node(self) -> None:
@@ -477,8 +478,10 @@ class TestEngineFailureIsFailClosedAtRuntime:
 
         denial = helper.query_for_denial("alpha")
         assert denial is not None, "Fail-closed contract: unresolved node type must not return None."
-        assert any("could not be evaluated" in m for m in denial.messages())
-        assert any("_AccessProbeNode" in m for m in denial.messages())
+        assert any("could not be checked against your license" in m for m in denial.messages())
+        # The node type is developer detail: it belongs in the log, not on an artist's badge.
+        assert not any("_AccessProbeNode" in m for m in denial.messages())
+        assert "_AccessProbeNode" in caplog.text
 
     def test_raise_if_denied_raises(self, caplog) -> None:  # noqa: ANN001
         """Failure -> raise_if_denied raises the synthesized reason."""
@@ -489,7 +492,7 @@ class TestEngineFailureIsFailClosedAtRuntime:
         with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
             helper = self._build_component_against_unresolved_node()
 
-        with pytest.raises(RuntimeError, match="could not be evaluated"):
+        with pytest.raises(RuntimeError, match="could not be checked against your license"):
             helper.raise_if_denied("alpha")
 
     def test_query_for_denial_still_ignores_non_string_values(self, caplog) -> None:  # noqa: ANN001

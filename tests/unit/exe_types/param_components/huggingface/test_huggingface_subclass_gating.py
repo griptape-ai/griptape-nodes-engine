@@ -388,11 +388,11 @@ class TestPolicySnapshotIsAtomic:
             param = HuggingFaceRepoParameter(MockNode(), repo_ids=[FILE_REPO], gated=True)
         first = param._policy
         assert first.denial_by_provider_id != {}
-        assert first.catalog_id_by_provider_id != {}
+        assert first.catalog_ids_by_provider_id != {}
 
         with _stub([]):
             param._refresh_policy()
         second = param._policy
         assert second is not first, "snapshot was mutated in place rather than replaced"
         assert second.denial_by_provider_id == {}
-        assert second.catalog_id_by_provider_id == {}
+        assert second.catalog_ids_by_provider_id == {}

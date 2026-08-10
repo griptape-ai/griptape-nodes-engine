@@ -329,9 +329,9 @@ class ModelAccessComponent:
         - Non-string values (driver objects, ``None``, anything else): return
           ``None``. Bypasses the gate entirely -- see paragraph above.
         - Initial snapshot resolution failed (see ``ModelPolicySnapshot``): return
-          a **synthesized** denial with a "policy could not be evaluated"
-          reason. This is the fail-closed contract -- a broken library
-          registration must not silently let denied models through.
+          a **synthesized** denial saying the models could not be checked. This
+          is the fail-closed contract -- a broken library registration must not
+          silently let denied models through.
         - Live engine call fails or returns no verdict for the id: return
           ``None``. These are transient conditions or already-vetted ids not
           in the catalog; we don't gate user work on them.

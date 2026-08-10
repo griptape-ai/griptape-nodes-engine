@@ -48,14 +48,17 @@ class ModelPolicySnapshot:
 
     Both tables are keyed by ``provider_model_id`` -- the upstream provider's name for the model --
     because that is the handle a dropdown value can be reduced to. ``denial_by_provider_id`` holds
-    only what policy denied; ``catalog_id_by_provider_id`` maps every resolved entry to the stable
-    catalog key policy gates on.
+    only what policy denied; ``catalog_ids_by_provider_id`` maps every resolved handle to the stable
+    catalog keys policy gates on.
 
     That key is deliberately NOT unique: ``Model``'s contract allows two catalog entries to describe
     the same ``provider_model_id`` with different ``key_support`` (e.g. a BYOK entry and a
     hosted-key entry). So a denial on ANY entry sharing a handle denies the handle, and
     ``catalog_ids_for`` returns every catalog id behind it rather than whichever was seen last --
-    otherwise the permitted twin of a denied entry would let the denied one run.
+    otherwise the permitted twin of a denied entry would let the denied one run. That is also why
+    there is exactly one catalog table rather than a handle-to-single-id map beside it: a second
+    table holding "whichever entry was seen first" would be the shape this one exists to replace,
+    and keeping both invites an edit that updates one and not the other.
 
     ``failure_detail`` is set when the engine could not answer at all (unregistered node class,
     missing manifest declaration). Both tables are then empty, and a caller must not read "no
@@ -63,7 +66,7 @@ class ModelPolicySnapshot:
 
     ``has_unmatchable_entries`` is True when a resolved model declared no ``provider_model_id``.
     Such an entry is declared but cannot be matched against a dropdown value, which makes
-    ``catalog_id_by_provider_id`` an incomplete view of the catalog. Callers that would refuse an
+    ``catalog_ids_by_provider_id`` an incomplete view of the catalog. Callers that would refuse an
     unrecognized value must not do so in that case; absence proves nothing.
 
     ``unmatchable_denials`` names the catalog ids that policy DENIED but that carry no
@@ -73,12 +76,11 @@ class ModelPolicySnapshot:
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
-    catalog_id_by_provider_id: dict[str, str] = field(default_factory=dict)
+    # Every catalog id behind a shared provider_model_id, for callers that re-ask policy live.
+    catalog_ids_by_provider_id: dict[str, tuple[str, ...]] = field(default_factory=dict)
     failure_detail: str | None = None
     has_unmatchable_entries: bool = False
     unmatchable_denials: tuple[str, ...] = ()
-    # Every catalog id behind a shared provider_model_id, for callers that re-ask policy live.
-    catalog_ids_by_provider_id: dict[str, tuple[str, ...]] = field(default_factory=dict)
 
     def catalog_ids_for(self, provider_model_id: str) -> tuple[str, ...]:
         """Every catalog id declared against ``provider_model_id``, in declaration order."""
@@ -92,7 +94,7 @@ class ModelPolicySnapshot:
         models all lack a ``provider_model_id`` still HAS a catalog, and reading that as "declares
         nothing" would silently disable enforcement for it.
         """
-        return bool(self.catalog_id_by_provider_id) or self.has_unmatchable_entries
+        return bool(self.catalog_ids_by_provider_id) or self.has_unmatchable_entries
 
     def denial_for(
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
@@ -109,10 +111,14 @@ class ModelPolicySnapshot:
                 it on so an undeclared model cannot pass by omission -- but only when
                 ``has_unmatchable_entries`` is False, since otherwise absence is uninformative.
         """
-        if self.failure_detail is not None:
-            return CheckpointDenial(failures=(CheckpointFailure(detail=self.failure_detail),))
+        # "Not a model" is decided before any refusal, including the fail-closed one. Every real
+        # handle still fails closed below -- a declared repo id never reduces to `None` -- but a
+        # placeholder row badged "Model Not Permitted" would report a library-registration problem
+        # as a licensing one, and hide the "download this model" message that says what to do.
         if provider_model_id is None:
             return None
+        if self.failure_detail is not None:
+            return CheckpointDenial(failures=(CheckpointFailure(detail=self.failure_detail),))
         denial = self.denial_by_provider_id.get(provider_model_id)
         if denial is not None:
             return denial
@@ -135,7 +141,7 @@ class ModelPolicySnapshot:
                     ),
                 )
             )
-        is_unrecognized = provider_model_id not in self.catalog_id_by_provider_id
+        is_unrecognized = provider_model_id not in self.catalog_ids_by_provider_id
         if refuse_unrecognized and not self.has_unmatchable_entries and is_unrecognized:
             return CheckpointDenial(
                 failures=(
@@ -174,15 +180,18 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             node_type,
             details,
         )
+        # Artist-facing, like the `unmatchable_denials` wording in `denial_for`: state the effect
+        # and who to ask. The node type, the engine's reason, and the manifest instruction stay in
+        # the warning above -- an artist cannot edit a library manifest, and naming one reads as a
+        # licensing problem when the actual fault is a broken registration.
         return ModelPolicySnapshot(
             failure_detail=(
-                f"License policy could not be evaluated for node '{node_type}' ({details}). "
-                "Verify the library manifest declares this node type with a model_usage block."
+                "This node's models could not be checked against your license, so nothing can be "
+                "used here yet. Contact whoever maintains this node library."
             )
         )
 
     denials: dict[str, CheckpointDenial] = {}
-    catalog_ids: dict[str, str] = {}
     all_catalog_ids: dict[str, list[str]] = {}
     unmatchable = False
     unmatchable_denials: list[str] = []
@@ -194,7 +203,6 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             if verdict.denial is not None:
                 unmatchable_denials.append(verdict.model_id)
             continue
-        catalog_ids.setdefault(verdict.provider_model_id, verdict.model_id)
         all_catalog_ids.setdefault(verdict.provider_model_id, []).append(verdict.model_id)
         # Any-denial-wins: two entries can share this handle, and the permitted one must not
         # overwrite the denied one.
@@ -212,7 +220,6 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
 
     return ModelPolicySnapshot(
         denial_by_provider_id=denials,
-        catalog_id_by_provider_id=catalog_ids,
         catalog_ids_by_provider_id={k: tuple(v) for k, v in all_catalog_ids.items()},
         has_unmatchable_entries=unmatchable,
         unmatchable_denials=tuple(unmatchable_denials),
