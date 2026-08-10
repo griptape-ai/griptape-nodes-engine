@@ -533,9 +533,7 @@ class WorkflowManager(EngineScoped):
         request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
     ) -> ResultPayload:
         """Return whether variable substitution is enabled for the current workflow."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
             return GetVariableSubstitutionEnabledResultFailure(
                 result_details="Attempted to get variable substitution enabled. Failed because no workflow is active."
