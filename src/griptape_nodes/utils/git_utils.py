@@ -290,16 +290,31 @@ _GIT_MISSING_MESSAGE = (
     "git was not found on PATH. Griptape Nodes requires a git installation to install and update libraries."
 )
 
+# Transports a library URL is allowed to use. Anything outside this list, notably a
+# "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
+# before a connection is attempted.
+_GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
+
 
 def _git_env() -> dict[str, str]:
     """Build the environment for a git subprocess.
 
     The engine runs headless, so git must never block on an interactive credential
-    prompt nobody can answer. An inherited value wins, letting a launcher opt back
-    into prompting. This covers git's own prompts; `_git` closes stdin to stop the
-    transports git shells out to (ssh, in particular) from prompting either.
+    prompt nobody can answer. This covers git's own prompts; `_git` closes stdin to stop
+    the transports git shells out to (ssh, in particular) from prompting either.
+
+    Library URLs reach git from workflow and request payloads, so the transports git will
+    speak are pinned to `_GIT_ALLOWED_PROTOCOLS`. git already refuses the `ext` transport
+    by default, but leaves unrecognized ones permitted for a directly invoked command.
+
+    An inherited value wins for both, letting a launcher opt back into prompting or admit
+    a transport this list omits.
     """
-    return {"GIT_TERMINAL_PROMPT": "0", **os.environ}
+    return {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
+        **os.environ,
+    }
 
 
 def _reject_option_like(value: str, description: str, error_cls: type[GitError]) -> None:
@@ -868,12 +883,19 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
 
     Args:
         git_url: The git repository URL to clone (HTTPS or SSH).
-        target_path: The target directory path to clone into.
+        target_path: The target directory path to clone into. A relative path is anchored to the
+            current working directory.
         branch_tag_commit: Optional branch, tag, or commit to checkout after cloning.
 
     Raises:
         GitCloneError: If cloning fails or target path already exists.
     """
+    # The clone runs in a throwaway directory (see _run_git_detached), so git would resolve a
+    # relative target against that directory and the clone would be discarded with it. Anchor to
+    # the caller's working directory instead, before anything else reads the path. Deliberately
+    # not canonicalize_for_io: it applies the Windows \\?\ long-path prefix, which git rejects.
+    target_path = target_path.absolute()
+
     if target_path.exists():
         msg = f"Cannot clone: target path {target_path} already exists"
         raise GitCloneError(msg)

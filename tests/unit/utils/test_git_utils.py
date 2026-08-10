@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -634,6 +635,39 @@ class TestCloneRepositoryWorkingDirectory:
         clone_repository(str(origin), temp_dir / "clone")
 
         assert (temp_dir / "clone" / "griptape_nodes_library.json").exists()
+
+    def test_clone_repository_clones_relative_target_into_the_working_directory(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that a relative target lands in the caller's cwd, not the internal scratch dir."""
+        origin = make_origin_repo(temp_dir / "origin")
+        workdir = temp_dir / "workdir"
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+
+        clone_repository(str(origin), Path("nested/clone"))
+
+        assert (workdir / "nested" / "clone" / "griptape_nodes_library.json").exists()
+
+    def test_clone_repository_rejects_remote_helper_url(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that a '<helper>::<url>' URL cannot make git exec a transport binary from PATH.
+
+        git resolves an unrecognized URL prefix to a git-remote-<prefix> executable and runs it.
+        A planted helper stands in for that binary: it must never be executed, so the URL has to
+        be refused on the transport policy rather than on the helper's own exit code.
+        """
+        marker = temp_dir / "helper-ran"
+        bin_dir = temp_dir / "bin"
+        bin_dir.mkdir()
+        helper = bin_dir / "git-remote-weirdhelper"
+        helper.write_text(f'#!/bin/sh\ntouch "{marker}"\nexit 1\n')
+        helper.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+
+        with pytest.raises(GitCloneError):
+            clone_repository("weirdhelper::whatever", temp_dir / "clone")
+
+        assert not marker.exists()
 
 
 class TestGetGitInfo:
