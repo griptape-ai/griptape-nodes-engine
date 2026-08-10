@@ -17,6 +17,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
@@ -46,6 +47,7 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
 
     from griptape_nodes.api_client.request_client import RequestClient
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
@@ -89,8 +91,9 @@ class ResultContext(TypedDict, total=False):
     request_id: str | None
 
 
-class EventManager:
-    def __init__(self) -> None:
+class EventManager(EngineScoped):
+    def __init__(self, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         # Dictionary to store the SPECIFIC manager for each request type
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # Dictionary to store ALL SUBSCRIBERS to app events.
@@ -646,10 +649,8 @@ class EventManager:
         context: ResultContext,
     ) -> EventResultSuccess | EventResultFailure:
         """Core logic for handling requests, shared between sync and async methods."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
-        workflow_mgr = GriptapeNodes.WorkflowManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
+        workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
             # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
@@ -705,9 +706,7 @@ class EventManager:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -761,9 +760,7 @@ class EventManager:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -985,9 +982,7 @@ class EventManager:
                     tg.create_task(call_function(listener_callback, app_event))
 
     def _flush_tracked_parameter_changes(self) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        obj_manager = GriptapeNodes.ObjectManager()
+        obj_manager = self.engine.object_manager
         # Get all flows and their nodes
         nodes = obj_manager.get_filtered_subset(type=BaseNode)
         for node in nodes.values():

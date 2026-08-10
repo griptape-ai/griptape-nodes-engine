@@ -22,8 +22,10 @@ if TYPE_CHECKING:
 
     from griptape_nodes.node_library.library_declarations import LibraryDeclaration, NodeDeclaration
     from griptape_nodes.node_library.library_registry import LibrarySchema
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.worker_manager import WorkerManager
+    from griptape_nodes.retained_mode.managers.workflow_manager import WorkflowManager
 from griptape_nodes.exe_types.base_iterative_nodes import (
     BaseIterativeEndNode,
     BaseIterativeStartNode,
@@ -63,6 +65,7 @@ from griptape_nodes.node_library.library_declarations import (
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion, LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     EventRequest,
     ResultDetails,
@@ -228,7 +231,6 @@ from griptape_nodes.retained_mode.events.validation_events import (
     ValidateNodeDependenciesResultFailure,
     ValidateNodeDependenciesResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -304,10 +306,11 @@ class _NodeInstantiationDeniedError(Exception):
     """
 
 
-class NodeManager:
+class NodeManager(EngineScoped):
     _name_to_parent_flow_name: dict[str, str]
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._name_to_parent_flow_name = {}
 
         # Orchestrator-side: node_name → (target_request_id, worker_engine_id, worker_request_topic)
@@ -412,8 +415,8 @@ class NodeManager:
         node = self.get_node_by_name(old_name)
         # Get all connections for this node and update them.
         flow_name = self.get_node_parent_flow_by_name(old_name)
-        flow = GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
-        connections = GriptapeNodes.FlowManager().get_connections()
+        flow = self.engine.flow_manager.get_flow_by_name(flow_name)
+        connections = self.engine.flow_manager.get_connections()
         # Get all incoming and outgoing connections and update them.
         if old_name in connections.incoming_index:
             incoming_connections = connections.incoming_index[old_name]
@@ -461,7 +464,7 @@ class NodeManager:
             node_name: The name of the node to delete
         """
         delete_node_request = DeleteNodeRequest(node_name=node_name)
-        delete_result = GriptapeNodes.handle_request(delete_node_request)
+        delete_result = self.engine.handle_request(delete_node_request)
         if delete_result.failed():
             logger.warning(
                 "Failed to clean up node '%s' after deserialization failure: %s",
@@ -603,6 +606,7 @@ class NodeManager:
         node_type: str,
         node_declarations: Sequence[NodeDeclaration],
         library_declarations: Sequence[LibraryDeclaration],
+        event_manager: EventManager,
     ) -> CheckpointDenial | None:
         """Ask any registered authorization hook whether this node type may be instantiated.
 
@@ -610,7 +614,7 @@ class NodeManager:
         instantiation path (CreateNode) and the library-load fitness preview so both
         resolve the same action and facts from whatever declarations they hold.
         """
-        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(
+        return event_manager.evaluate_authorization_checkpoint(
             AuthorizationCheckpoint(
                 action=CheckpointAction.INSTANTIATE_NODE,
                 subject_type=CheckpointSubjectType.NODE_TYPE,
@@ -625,7 +629,7 @@ class NodeManager:
 
     @staticmethod
     def _evaluate_instantiation_checkpoint(
-        *, node_type: str, specific_library_name: str | None
+        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
     ) -> CheckpointDenial | None:
         """Ask any registered authorization hook whether this node type may be instantiated."""
         library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
@@ -633,10 +637,13 @@ class NodeManager:
             node_type=node_type,
             node_declarations=library.get_node_metadata(node_type).declarations,
             library_declarations=library.get_metadata().declarations,
+            event_manager=event_manager,
         )
 
     @staticmethod
-    def _enforce_instantiation_checkpoint(*, node_type: str, specific_library_name: str | None) -> None:
+    def _enforce_instantiation_checkpoint(
+        *, node_type: str, specific_library_name: str | None, event_manager: EventManager
+    ) -> None:
         """Raise `_NodeInstantiationDeniedError` when the policy denies this node type.
 
         Raised rather than returned so a denial joins the Error Proxy substitution
@@ -644,14 +651,16 @@ class NodeManager:
         to load. The message lists every missing permission.
         """
         denial = NodeManager._evaluate_instantiation_checkpoint(
-            node_type=node_type, specific_library_name=specific_library_name
+            node_type=node_type, specific_library_name=specific_library_name, event_manager=event_manager
         )
         if denial is not None:
             message = denial.reason(separator="\n")
             raise _NodeInstantiationDeniedError(message)
 
     @staticmethod
-    def evaluate_schema_node_instantiation_denials(schema: LibrarySchema) -> dict[str, CheckpointDenial]:
+    def evaluate_schema_node_instantiation_denials(
+        schema: LibrarySchema, *, event_manager: EventManager
+    ) -> dict[str, CheckpointDenial]:
         """Denials that would block instantiating each node type a library schema declares.
 
         Lets library-load fitness preview the node-instantiation gate without
@@ -667,6 +676,7 @@ class NodeManager:
                 node_type=node.class_name,
                 node_declarations=node.metadata.declarations,
                 library_declarations=schema.metadata.declarations,
+                event_manager=event_manager,
             )
             if denial is not None:
                 denials[node.class_name] = denial
@@ -678,17 +688,17 @@ class NodeManager:
         parent_flow = None
         if parent_flow_name is None:
             # Try to get the current context flow
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = (
                     "Attempted to create Node in the Current Context. Failed because the Current Context was empty."
                 )
                 return CreateNodeResultFailure(result_details=details)
-            parent_flow = GriptapeNodes.ContextManager().get_current_flow()
+            parent_flow = self.engine.context_manager.get_current_flow()
             parent_flow_name = parent_flow.name
 
         # Does this flow actually exist?
         if parent_flow is None:
-            flow_mgr = GriptapeNodes.FlowManager()
+            flow_mgr = self.engine.flow_manager
             try:
                 parent_flow = flow_mgr.get_flow_by_name(parent_flow_name)
             except KeyError as err:
@@ -713,7 +723,7 @@ class NodeManager:
                 # Fall back to the class name
                 requested_node_name = request.node_type
 
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         final_node_name = obj_mgr.generate_name_for_object(
             type_name=request.node_type, requested_name=requested_node_name
         )
@@ -730,6 +740,7 @@ class NodeManager:
             self._enforce_instantiation_checkpoint(
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
+                event_manager=self.engine.event_manager,
             )
             node = LibraryRegistry.create_node(
                 name=final_node_name,
@@ -753,7 +764,7 @@ class NodeManager:
                         failure_reason = str(err)
                     else:
                         # Use fitness problem details if available for a more actionable error message
-                        library_metadata_result = GriptapeNodes.handle_request(
+                        library_metadata_result = self.engine.handle_request(
                             GetLibraryMetadataRequest(library=request.specific_library_name or "")
                         )
                         if (
@@ -802,7 +813,7 @@ class NodeManager:
 
         # See if we want to push this into the context of the current flow.
         if request.set_as_new_context:
-            GriptapeNodes.ContextManager().push_node(node=node)
+            self.engine.context_manager.push_node(node=node)
 
         # Success message based on whether we used Current Context or explicit flow
         if request.override_parent_flow_name is None:
@@ -833,7 +844,7 @@ class NodeManager:
                 logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
             else:
                 # Create the EndNode
-                end_loop = GriptapeNodes.handle_request(
+                end_loop = self.engine.handle_request(
                     CreateNodeRequest(
                         node_type=end_class_name,
                         metadata={
@@ -847,7 +858,7 @@ class NodeManager:
                     logger.error(msg)  # while this is bad, it's not unsalvageable, so we'll consider this a success.
                 else:
                     # Create Loop between output and input to the start node.
-                    GriptapeNodes.handle_request(
+                    self.engine.handle_request(
                         CreateConnectionRequest(
                             source_node_name=node.name,
                             source_parameter_name="loop",
@@ -938,12 +949,12 @@ class NodeManager:
     def _get_flow_for_node_group_operation(self, flow_name: str | None) -> AddNodesToNodeGroupResultFailure | None:
         """Get the flow for a node group operation."""
         if flow_name is None:
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = "Attempted to add node to NodeGroup in the Current Context. Failed because the Current Context was empty."
                 return AddNodesToNodeGroupResultFailure(result_details=details)
         else:
             try:
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except KeyError as err:
                 details = (
                     f"Attempted to add node to NodeGroup. Failed when attempting to find the parent Flow. Error: {err}"
@@ -958,7 +969,7 @@ class NodeManager:
 
         Collects all errors and returns them together if multiple nodes fail.
         """
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         nodes = []
         errors = []
 
@@ -986,7 +997,7 @@ class NodeManager:
     ) -> BaseNodeGroup | AddNodesToNodeGroupResultFailure:
         """Get the NodeGroup node."""
         try:
-            node_group = GriptapeNodes.ObjectManager().get_object_by_name(node_group_name)
+            node_group = self.engine.object_manager.get_object_by_name(node_group_name)
         except KeyError:
             details = f"Attempted to add nodes '{node_names}' to NodeGroup '{node_group_name}'. Failed because NodeGroup was not found."
             return AddNodesToNodeGroupResultFailure(result_details=details)
@@ -1027,12 +1038,12 @@ class NodeManager:
     def _get_flow_for_remove_operation(self, flow_name: str | None) -> RemoveNodeFromNodeGroupResultFailure | None:
         """Get the flow for a remove node from group operation."""
         if flow_name is None:
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = "Attempted to remove nodes from NodeGroup in the Current Context. Failed because the Current Context was empty."
                 return RemoveNodeFromNodeGroupResultFailure(result_details=details)
         else:
             try:
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except KeyError as err:
                 details = f"Attempted to remove nodes from NodeGroup. Failed when attempting to find the parent Flow. Error: {err}"
                 return RemoveNodeFromNodeGroupResultFailure(result_details=details)
@@ -1045,7 +1056,7 @@ class NodeManager:
 
         Collects all errors and returns them together if multiple nodes fail.
         """
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         nodes = []
         errors = []
 
@@ -1073,7 +1084,7 @@ class NodeManager:
     ) -> BaseNodeGroup | RemoveNodeFromNodeGroupResultFailure:
         """Get the NodeGroup node for remove operation."""
         try:
-            node_group = GriptapeNodes.ObjectManager().get_object_by_name(node_group_name)
+            node_group = self.engine.object_manager.get_object_by_name(node_group_name)
         except KeyError:
             details = f"Attempted to remove nodes '{node_names}' from NodeGroup '{node_group_name}'. Failed because NodeGroup was not found."
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
@@ -1133,27 +1144,27 @@ class NodeManager:
             This method also clears the flow queue regardless of whether cancellation occurred,
             to ensure the specified node is not processed in the future.
         """
-        if GriptapeNodes.FlowManager().check_for_existing_running_flow():
+        if self.engine.flow_manager.check_for_existing_running_flow():
             # get the current node executing / resolving
             # if it's in connected nodes, cancel flow.
             # otherwise, leave it.
-            control_node_names, resolving_node_names, _ = GriptapeNodes.FlowManager().flow_state(parent_flow)
+            control_node_names, resolving_node_names, _ = self.engine.flow_manager.flow_state(parent_flow)
             connected_nodes = parent_flow.get_all_connected_nodes(node)
             cancelled = False
             if control_node_names is not None:
                 for control_node_name in control_node_names:
-                    control_node = GriptapeNodes.ObjectManager().get_object_by_name(control_node_name)
+                    control_node = self.engine.object_manager.get_object_by_name(control_node_name)
                     if control_node in connected_nodes:
-                        result = GriptapeNodes.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
+                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
                         cancelled = True
                         if result.failed():
                             details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
                             return DeleteNodeResultFailure(result_details=details)
             if resolving_node_names is not None and not cancelled:
                 for resolving_node_name in resolving_node_names:
-                    resolving_node = GriptapeNodes.ObjectManager().get_object_by_name(resolving_node_name)
+                    resolving_node = self.engine.object_manager.get_object_by_name(resolving_node_name)
                     if resolving_node in connected_nodes:
-                        result = GriptapeNodes.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
+                        result = self.engine.handle_request(CancelFlowRequest(flow_name=parent_flow_name))
                         if result.failed():
                             details = f"Attempted to delete a Node '{node.name}'. Failed because running flow could not cancel."
                             return DeleteNodeResultFailure(result_details=details)
@@ -1167,24 +1178,24 @@ class NodeManager:
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to delete a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return DeleteNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to delete a Node '{node_name}', but no such Node was found."
             return DeleteNodeResultFailure(result_details=details)
 
-        with GriptapeNodes.ContextManager().node(node=node):
+        with self.engine.context_manager.node(node=node):
             parent_flow_name = self._name_to_parent_flow_name[node_name]
             try:
-                parent_flow = GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+                parent_flow = self.engine.flow_manager.get_flow_by_name(parent_flow_name)
             except KeyError as err:
                 details = f"Attempted to delete a Node '{node_name}'. Error: {err}"
                 return DeleteNodeResultFailure(result_details=details)
@@ -1206,7 +1217,7 @@ class NodeManager:
                 any_connections_remain = False
 
                 list_node_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
-                list_connections_result = GriptapeNodes.handle_request(request=list_node_connections_request)
+                list_connections_result = self.engine.handle_request(request=list_node_connections_request)
                 if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
                     details = f"Attempted to delete a Node '{node_name}'. Failed because it could not gather Connections to the Node."
                     return DeleteNodeResultFailure(result_details=details)
@@ -1221,7 +1232,7 @@ class NodeManager:
                         target_node_name=node_name,
                         target_parameter_name=connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, ResultPayloadFailure):
                         details = (
                             f"Attempted to delete a Node '{node_name}'. Failed when attempting to delete Connection."
@@ -1239,7 +1250,7 @@ class NodeManager:
                         target_node_name=connection.target_node_name,
                         target_parameter_name=connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, ResultPayloadFailure):
                         details = (
                             f"Attempted to delete a Node '{node_name}'. Failed when attempting to delete Connection."
@@ -1257,12 +1268,12 @@ class NodeManager:
         parent_flow.remove_node(node.name)
 
         # Now remove the record keeping
-        GriptapeNodes.ObjectManager().del_obj_by_name(node_name)
+        self.engine.object_manager.del_obj_by_name(node_name)
         del self._name_to_parent_flow_name[node_name]
 
         # If we were part of the Current Context, pop it.
         if request.node_name is None:
-            GriptapeNodes.ContextManager().pop_node()
+            self.engine.context_manager.pop_node()
 
         details = f"Successfully deleted Node '{node_name}'."
         return DeleteNodeResultSuccess(result_details=details)
@@ -1283,15 +1294,15 @@ class NodeManager:
 
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to move a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return MoveNodeToNewFlowResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to move Node '{node_name}', but no such Node was found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
@@ -1308,13 +1319,13 @@ class NodeManager:
             source_flow_name = self._name_to_parent_flow_name[node_name]
 
         try:
-            source_flow = GriptapeNodes.FlowManager().get_flow_by_name(source_flow_name)
+            source_flow = self.engine.flow_manager.get_flow_by_name(source_flow_name)
         except KeyError:
             details = f"Attempted to move Node '{node_name}' from Flow '{source_flow_name}'. Failed because source flow was not found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
 
         try:
-            target_flow = GriptapeNodes.FlowManager().get_flow_by_name(request.target_flow_name)
+            target_flow = self.engine.flow_manager.get_flow_by_name(request.target_flow_name)
         except KeyError:
             details = f"Attempted to move Node '{node_name}' to Flow '{request.target_flow_name}'. Failed because target flow was not found."
             return MoveNodeToNewFlowResultFailure(result_details=details)
@@ -1340,16 +1351,16 @@ class NodeManager:
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get resolution state for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetNodeResolutionStateResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
             # Does this node exist?
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get resolution state for a Node '{node_name}', but no such Node was found."
@@ -1367,16 +1378,16 @@ class NodeManager:
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get metadata for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetNodeMetadataResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1395,16 +1406,16 @@ class NodeManager:
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to set metadata for a Node from the Current Context. Failed because the Current Context is empty."
                 return SetNodeMetadataResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1429,17 +1440,17 @@ class NodeManager:
             node = None
             if node_name is None:
                 # Get from current context
-                if not GriptapeNodes.ContextManager().has_current_node():
+                if not self.engine.context_manager.has_current_node():
                     failed_nodes["current_context"] = "No current context node available"
                     continue
-                node = GriptapeNodes.ContextManager().get_current_node()
+                node = self.engine.context_manager.get_current_node()
                 actual_node_name = node.name
             else:
                 actual_node_name = node_name
 
             # Look up node if we don't have it yet
             if node is None:
-                obj_mgr = GriptapeNodes.ObjectManager()
+                obj_mgr = self.engine.object_manager
                 node = obj_mgr.attempt_get_object_by_name_as_type(actual_node_name, BaseNode)
                 if node is None:
                     failed_nodes[actual_node_name] = f"Node '{actual_node_name}' not found"
@@ -1469,16 +1480,16 @@ class NodeManager:
         node = None
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to list Connections for a Node from the Current Context. Failed because the Current Context is empty."
                 return ListConnectionsForNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
 
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
@@ -1489,7 +1500,7 @@ class NodeManager:
 
         parent_flow_name = self._name_to_parent_flow_name[node_name]
         try:
-            GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+            self.engine.flow_manager.get_flow_by_name(parent_flow_name)
         except KeyError as err:
             details = f"Attempted to list Connections for a Node '{node_name}'. Error: {err}"
 
@@ -1497,7 +1508,7 @@ class NodeManager:
             return result
 
         # Kinda gross, but let's do it
-        connection_mgr = GriptapeNodes.FlowManager().get_connections()
+        connection_mgr = self.engine.flow_manager.get_connections()
         # get outgoing connections
         outgoing_connections_list = []
         if node_name in connection_mgr.outgoing_index:
@@ -1545,16 +1556,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get connections for a parameter from the Current Context. Failed because the Current Context is empty."
                 return GetConnectionsForParameterResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get connections for parameter '{parameter_name}' on node '{node_name}', but no such node was found."
@@ -1568,7 +1579,7 @@ class NodeManager:
 
         parent_flow_name = self._name_to_parent_flow_name[node_name]
         try:
-            GriptapeNodes.FlowManager().get_flow_by_name(parent_flow_name)
+            self.engine.flow_manager.get_flow_by_name(parent_flow_name)
         except KeyError as err:
             details = (
                 f"Attempted to get connections for parameter '{parameter_name}' on node '{node_name}'. Error: {err}"
@@ -1576,7 +1587,7 @@ class NodeManager:
             return GetConnectionsForParameterResultFailure(result_details=details)
 
         # Get connections for this specific parameter
-        connection_mgr = GriptapeNodes.FlowManager().get_connections()
+        connection_mgr = self.engine.flow_manager.get_connections()
 
         # Get outgoing connections for this parameter
         outgoing_connections_list = []
@@ -1620,16 +1631,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to list Parameters for a Node from the Current Context. Failed because the Current Context is empty."
                 return ListParametersOnNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to list Parameters for a Node '{node_name}', but no such Node was found."
@@ -1668,16 +1679,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context.
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to add Parameter to a Node from the Current Context. Failed because the Current Context is empty."
                 return AddParameterToNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to add Parameter '{request.parameter_name}' to a Node '{node_name}', but no such Node was found."
@@ -1828,15 +1839,15 @@ class NodeManager:
         parent_group: ParameterGroup | None = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to add ParameterGroup to a Node from the Current Context. Failed because the Current Context is empty."
                 return AddParameterGroupToNodeResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to add ParameterGroup '{request.group_name}' to a Node '{node_name}', but no such Node was found."
@@ -1891,18 +1902,18 @@ class NodeManager:
 
         if node_name is None:
             # Get the Current Context
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from a Node, but no Current Context was found."
 
                 result = RemoveParameterFromNodeResultFailure(result_details=details)
                 return result
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from a Node '{node_name}', but no such Node was found."
@@ -1926,7 +1937,7 @@ class NodeManager:
         # If it's a ParameterGroup, we need to remove all the Parameters inside it.
         if isinstance(element, ParameterGroup):
             for child in element.find_elements_by_type(Parameter):
-                GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(child.name, node_name))
+                self.engine.handle_request(RemoveParameterFromNodeRequest(child.name, node_name))
             node.remove_node_element(element)
 
             return RemoveParameterFromNodeResultSuccess(
@@ -1951,7 +1962,7 @@ class NodeManager:
         # Get all the connections to/from this Parameter.
         if isinstance(element, Parameter):
             list_node_connections_request = ListConnectionsForNodeRequest(node_name=node_name)
-            list_connections_result = GriptapeNodes.handle_request(request=list_node_connections_request)
+            list_connections_result = self.engine.handle_request(request=list_node_connections_request)
             if not isinstance(list_connections_result, ListConnectionsForNodeResultSuccess):
                 details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to get a list of Connections for the Parameter's Node."
 
@@ -1969,7 +1980,7 @@ class NodeManager:
                         target_node_name=node_name,
                         target_parameter_name=incoming_connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, DeleteConnectionResultFailure):
                         details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to delete a Connection for that Parameter."
 
@@ -1984,7 +1995,7 @@ class NodeManager:
                         target_node_name=outgoing_connection.target_node_name,
                         target_parameter_name=outgoing_connection.target_parameter_name,
                     )
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
                     if isinstance(delete_result, DeleteConnectionResultFailure):
                         details = f"Attempted to remove Parameter '{request.parameter_name}' from Node '{node_name}'. Failed because we were unable to delete a Connection for that Parameter."
 
@@ -2008,17 +2019,17 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get details for Parameter '{request.parameter_name}' from a Node, but no Current Context was found."
 
                 result = GetParameterDetailsResultFailure(result_details=details)
                 return result
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get details for Parameter '{request.parameter_name}' from a Node '{node_name}', but no such Node was found."
@@ -2072,16 +2083,16 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get element details for element '{request.specific_element_id}` from a Node, but no Current Context was found."
 
                 return GetNodeElementDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to get element details for Node '{node_name}', but no such Node was found."
@@ -2230,7 +2241,7 @@ class NodeManager:
                 source_node = self.get_node_by_name(conn.source_node_name)
                 source_param = source_node.get_parameter_by_name(conn.source_parameter_name)
                 if source_param and not parameter.is_incoming_type_allowed(source_param.output_type):
-                    delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=conn.source_node_name,
                             source_parameter_name=conn.source_parameter_name,
@@ -2248,7 +2259,7 @@ class NodeManager:
                 target_node = self.get_node_by_name(conn.target_node_name)
                 target_param = target_node.get_parameter_by_name(conn.target_parameter_name)
                 if target_param and not target_param.is_incoming_type_allowed(parameter.output_type):
-                    delete_result = GriptapeNodes.FlowManager().on_delete_connection_request(
+                    delete_result = self.engine.flow_manager.on_delete_connection_request(
                         DeleteConnectionRequest(
                             source_node_name=node_name,
                             source_parameter_name=request.parameter_name,
@@ -2267,16 +2278,16 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to alter details for Parameter '{request.parameter_name}' from node in the Current Context. Failed because there was no such Node."
 
                 return AlterParameterDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to alter details for Parameter '{request.parameter_name}' from Node '{node_name}', but no such Node was found."
@@ -2351,14 +2362,14 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to alter details for ParameterGroup '{request.group_name}' from node in the Current Context. Failed because there was no such Node."
                 return AlterParameterGroupDetailsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to alter details for ParameterGroup '{request.group_name}' from Node '{node_name}', but no such Node was found."
@@ -2398,11 +2409,11 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to get value for Parameter '{request.parameter_name}' from node in the Current Context. Failed because there was no such Node."
 
                 return GetParameterValueResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Parse the parameter name to check for list indexing
@@ -2410,7 +2421,7 @@ class NodeManager:
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f'"{node_name}" not found'
@@ -2453,10 +2464,10 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = f"Attempted to set parameter '{request.parameter_name}' value. Failed because no Node was found in the Current Context."
                 return SetParameterValueResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Parse the parameter name to check for list indexing
@@ -2464,7 +2475,7 @@ class NodeManager:
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to set parameter '{param_name}' value on node '{node_name}'. Failed because no such Node could be found."
@@ -2477,7 +2488,7 @@ class NodeManager:
 
         # Let versioning system potentially squelch removed parameters.
         # This check must run BEFORE we validate parameter existence, since removed parameters won't exist.
-        version_compat_result = GriptapeNodes.VersionCompatibilityManager().check_set_parameter_version_compatibility(
+        version_compat_result = self.engine.version_compatibility_manager.check_set_parameter_version_compatibility(
             node, param_name, request.value
         )
         if version_compat_result is not None:
@@ -2526,7 +2537,7 @@ class NodeManager:
             and ParameterMode.PROPERTY in parameter.allowed_modes
         ):
             # Check if this parameter has any incoming connections
-            connections = GriptapeNodes.FlowManager().get_connections()
+            connections = self.engine.flow_manager.get_connections()
             target_connections = connections.incoming_index.get(node_name)
             if target_connections is not None:
                 param_connections = target_connections.get(request.parameter_name)
@@ -2584,7 +2595,7 @@ class NodeManager:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because the node's parent flow does not exist. Could not unresolve future nodes."
             return SetParameterValueResultFailure(result_details=details)
 
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
         parent_flow = obj_mgr.attempt_get_object_by_name_as_type(parent_flow_name, ControlFlow)
         if not parent_flow:
             details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because the node's parent flow does not exist. Could not unresolve future nodes."
@@ -2602,7 +2613,7 @@ class NodeManager:
             return SetParameterValueResultFailure(result_details=details)
         if not request.initial_setup and modified:
             try:
-                GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+                self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
             except Exception as err:
                 details = f"Attempted to set parameter value for '{node_name}.{request.parameter_name}'. Failed because Exception: {err}"
                 return SetParameterValueResultFailure(result_details=details)
@@ -2623,7 +2634,7 @@ class NodeManager:
                 )
                 is_dest_node_locked = target_node.lock
                 if (not is_control_parameter) and (not is_dest_node_locked):
-                    GriptapeNodes.handle_request(
+                    self.engine.handle_request(
                         SetParameterValueRequest(
                             parameter_name=target_parameter.name,
                             node_name=target_node.name,
@@ -2656,7 +2667,7 @@ class NodeManager:
                 for target_node, target_parameter in conn_targets:
                     if target_node.lock:
                         continue
-                    GriptapeNodes.handle_request(
+                    self.engine.handle_request(
                         SetParameterValueRequest(
                             parameter_name=target_parameter.name,
                             node_name=target_node.name,
@@ -2712,16 +2723,16 @@ class NodeManager:
 
         # Get from the current context.
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get all info for a Node from the Current Context. Failed because the Current Context is empty."
                 return GetAllNodeInfoResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 # Logged at DEBUG: this is usually a benign race where the GUI requests info
@@ -2798,15 +2809,15 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to get compatible parameters for node, but no current node was found."
                 return GetCompatibleParametersResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Vet the node
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = (
@@ -2836,9 +2847,7 @@ class NodeManager:
 
         # Iterate through all nodes in this Flow (yes, this restriction still sucks)
         list_nodes_in_flow_request = ListNodesInFlowRequest(flow_name=flow_name)
-        list_nodes_in_flow_result = GriptapeNodes.FlowManager().on_list_nodes_in_flow_request(
-            list_nodes_in_flow_request
-        )
+        list_nodes_in_flow_result = self.engine.flow_manager.on_list_nodes_in_flow_request(list_nodes_in_flow_request)
         if not list_nodes_in_flow_result.succeeded():
             details = f"Attempted to get compatible parameters for '{node_name}.{request.parameter_name}'. Failed due to inability to list nodes in parent flow '{flow_name}'."
             return GetCompatibleParametersResultFailure(result_details=details)
@@ -2899,7 +2908,7 @@ class NodeManager:
         )
 
     def get_node_by_name(self, name: str) -> BaseNode:
-        obj_mgr = GriptapeNodes.ObjectManager()
+        obj_mgr = self.engine.object_manager
 
         node = obj_mgr.attempt_get_object_by_name_as_type(name, BaseNode)
         if node is None:
@@ -2936,7 +2945,7 @@ class NodeManager:
 
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
         try:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             flow = obj_mgr.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
         except KeyError as e:
             details = f'Failed to fetch parent flow for "{node_name}": {e}'
@@ -2948,7 +2957,7 @@ class NodeManager:
             return ResolveNodeResultFailure(validation_exceptions=[], result_details=details)
 
         # Check for existing running flow
-        flow_mgr = GriptapeNodes.FlowManager()
+        flow_mgr = self.engine.flow_manager
         if flow_mgr.check_for_existing_running_flow() and not flow_mgr._global_single_node_resolution:
             # Behavior should also match if the flow running is a Control Flow, and not a singular node resolution.
             errormsg = f"This workflow is already in progress. Please wait for the current control process to finish before starting {node.name} again."
@@ -2962,7 +2971,7 @@ class NodeManager:
                 result_details=f"Node {node.name} is already executing. Cannot start execution.",
             )
         try:
-            GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+            self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         except Exception as e:
             details = f'Failed to mark future nodes dirty. Unable to kick off flow from "{node_name}": {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
@@ -2984,7 +2993,7 @@ class NodeManager:
             details = f"Failed to resolve node '{node_name}'. Flow Validation Failed. Error: {e}"
             return StartFlowResultFailure(validation_exceptions=[e], result_details=details)
         try:
-            await GriptapeNodes.FlowManager().resolve_singular_node(flow, node, debug_mode=debug_mode)
+            await self.engine.flow_manager.resolve_singular_node(flow, node, debug_mode=debug_mode)
         except Exception as e:
             details = f'Failed to resolve "{node_name}".  Error: {e}'
             return ResolveNodeResultFailure(validation_exceptions=[e], result_details=details)
@@ -3012,7 +3021,7 @@ class NodeManager:
         If the orchestrator's lookup succeeds and the node's library is owned by
         a worker, the request is forwarded over the wire to that worker.
         """
-        library_manager = GriptapeNodes.LibraryManager()
+        library_manager = self.engine.library_manager
         is_worker = library_manager.is_worker
 
         if is_worker:
@@ -3021,7 +3030,7 @@ class NodeManager:
                 return worker_node
             node = worker_node
         else:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             orchestrator_node = obj_mgr.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
             if orchestrator_node is None:
                 return ExecuteNodeResultFailure(
@@ -3041,7 +3050,7 @@ class NodeManager:
         # this process is actually going to execute the node.
         if not is_worker:
             worker = library_manager.get_worker_for_library(library_name) if library_name else None
-            wm = GriptapeNodes.WorkerManager()
+            wm = self.engine.worker_manager
             if wm is not None and worker is not None:
                 return await self._execute_node_via_worker(request, wm, worker)
 
@@ -3092,7 +3101,9 @@ class NodeManager:
         # ExecuteNodeRequest straight to a worker, never passing through the
         # gated CreateNode path.
         try:
-            denial = self._evaluate_instantiation_checkpoint(node_type=node_type, specific_library_name=library_name)
+            denial = self._evaluate_instantiation_checkpoint(
+                node_type=node_type, specific_library_name=library_name, event_manager=self.engine.event_manager
+            )
         except KeyError:
             # Node type/library not registered here; let create_node below
             # surface the clearer "node type not found" failure rather than
@@ -3185,7 +3196,7 @@ class NodeManager:
         if entry is None:
             return
         target_request_id, worker_engine_id, worker_request_topic = entry
-        wm = GriptapeNodes.WorkerManager()
+        wm = self.engine.worker_manager
         cancel_request = CancelExecuteNodeRequest(target_request_id=target_request_id)
         await wm.forward_event_to_worker(
             EventRequest(request=cancel_request),
@@ -3251,8 +3262,8 @@ class NodeManager:
         # installed (register_remote_handlers is worker-only), so opening the
         # scope there would just bump a refcount that nothing reads. Skip it
         # to keep the depth counter accurate to its name.
-        is_worker = GriptapeNodes.LibraryManager()._is_worker
-        scope_cm = GriptapeNodes.EventManager().worker_node_execution_scope() if is_worker else contextlib.nullcontext()
+        is_worker = self.engine.library_manager._is_worker
+        scope_cm = self.engine.event_manager.worker_node_execution_scope() if is_worker else contextlib.nullcontext()
         with scope_cm:
             # Rehydrate serialized artifacts that crossed the orchestrator->worker JSON boundary.
             parameter_values = hydrate_parameter_values(request.parameter_values)
@@ -3310,7 +3321,7 @@ class NodeManager:
 
     def on_validate_node_dependencies_request(self, request: ValidateNodeDependenciesRequest) -> ResultPayload:
         node_name = request.node_name
-        obj_manager = GriptapeNodes.ObjectManager()
+        obj_manager = self.engine.object_manager
         node = obj_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f'Failed to validate node dependencies. Node with "{node_name}" does not exist.'
@@ -3320,7 +3331,7 @@ class NodeManager:
         except Exception as e:
             details = f'Failed to validate node dependencies. Node with "{node_name}" has no parent flow. Error: {e}'
             return ValidateNodeDependenciesResultFailure(result_details=details)
-        flow = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(flow_name, ControlFlow)
+        flow = self.engine.object_manager.attempt_get_object_by_name_as_type(flow_name, ControlFlow)
         if not flow:
             details = f'Failed to validate node dependencies. Flow with "{flow_name}" does not exist.'
             return ValidateNodeDependenciesResultFailure(result_details=details)
@@ -3428,22 +3439,22 @@ class NodeManager:
         node = None
 
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to serialize a Node to commands from the Current Context. Failed because the Current Context is empty."
                 return SerializeNodeToCommandsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # Does this node exist?
         if node is None:
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize Node '{node_name}' to commands. Failed because no Node with that name could be found."
                 return SerializeNodeToCommandsResultFailure(result_details=details)
 
         # This is our current dude.
-        with GriptapeNodes.ContextManager().node(node=node):
+        with self.engine.context_manager.node(node=node):
             # Get the library and version details for all nodes.
             # A node's owning library is normally injected into metadata by
             # LibraryRegistry.create_node, but proxy/placeholder nodes can be created
@@ -3464,7 +3475,7 @@ class NodeManager:
                 if execution_env not in (LOCAL_EXECUTION, PRIVATE_EXECUTION):
                     # Get library details for the execution environment library
                     exec_env_metadata_request = GetLibraryMetadataRequest(library=execution_env)
-                    exec_env_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
+                    exec_env_metadata_result = self.engine.library_manager.get_library_metadata_request(
                         exec_env_metadata_request
                     )
                     if isinstance(exec_env_metadata_result, GetLibraryMetadataResultSuccess):
@@ -3476,9 +3487,7 @@ class NodeManager:
             library_metadata_request = GetLibraryMetadataRequest(library=library_used)
             # Call LibraryManager directly to avoid error toasts when library is unavailable (expected for ErrorProxyNode)
             # Per https://github.com/griptape-ai/griptape-nodes/issues/1940
-            library_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
-                library_metadata_request
-            )
+            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 if isinstance(node, ErrorProxyNode):
@@ -3656,6 +3665,7 @@ class NodeManager:
                     unique_parameter_uuid_to_values=request.unique_parameter_uuid_to_values,
                     serialized_parameter_value_tracker=request.serialized_parameter_value_tracker,
                     create_node_request=create_node_request,
+                    workflow_manager=self.engine.workflow_manager,
                     use_pickling=request.use_pickling,
                 )
                 if set_param_value_requests is not None:
@@ -3725,7 +3735,7 @@ class NodeManager:
 
         """
         connection_info_request = GetParameterDetailsRequest(source_parameter_name, source_node_name)
-        connection_info_response = GriptapeNodes.handle_request(connection_info_request)
+        connection_info_response = self.engine.handle_request(connection_info_request)
         # only get value if it succeeds
         connection_type = NodeManager.check_response(
             self, connection_info_response, GetParameterDetailsResultSuccess, "type"
@@ -3751,7 +3761,7 @@ class NodeManager:
             list_connections_for_node_request = ListConnectionsForNodeRequest(
                 node_name=old_node_name, include_internal=False
             )
-            list_connections_for_node_response = GriptapeNodes.handle_request(list_connections_for_node_request)
+            list_connections_for_node_response = self.engine.handle_request(list_connections_for_node_request)
 
             # Only get incoming/outgoing connections if it returns the proper type
             incoming_connections = NodeManager.check_response(
@@ -3789,7 +3799,7 @@ class NodeManager:
                         target_node_name=new_node_name,
                         target_parameter_name=target_parameter_name,
                     )
-                    GriptapeNodes.handle_request(create_old_incoming_connections_request)
+                    self.engine.handle_request(create_old_incoming_connections_request)
 
             # If there are any outgoing connections, loop over them
             for outgoing_connection in outgoing_connections:
@@ -3813,12 +3823,12 @@ class NodeManager:
                         target_node_name=target_node_name,
                         target_parameter_name=outgoing_connection.target_parameter_name,
                     )
-                    GriptapeNodes.handle_request(create_old_outgoing_connections_request)
+                    self.engine.handle_request(create_old_outgoing_connections_request)
 
     def on_deserialize_node_from_commands(self, request: DeserializeNodeFromCommandsRequest) -> ResultPayload:
         # Issue the creation command first.
         create_node_request = request.serialized_node_commands.create_node_command
-        create_node_result = GriptapeNodes().handle_request(create_node_request)
+        create_node_result = self.engine.handle_request(create_node_request)
         if not isinstance(create_node_result, CreateNodeResultSuccess):
             req_node_name = create_node_request.node_name
             details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to create node '{req_node_name}'."
@@ -3826,11 +3836,11 @@ class NodeManager:
 
         # Adopt the newly-created node as our current context.
         node_name = create_node_result.node_name
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to get node '{node_name}'."
             return DeserializeNodeFromCommandsResultFailure(result_details=details)
-        with GriptapeNodes.ContextManager().node(node=node):
+        with self.engine.context_manager.node(node=node):
             for element_command in request.serialized_node_commands.element_modification_commands:
                 # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/4862
                 # This isinstance allowlist must be updated by hand for every new
@@ -3847,7 +3857,7 @@ class NodeManager:
                     ),
                 ):
                     element_command.node_name = node_name
-                element_result = GriptapeNodes().handle_request(element_command)
+                element_result = self.engine.handle_request(element_command)
                 if element_result.failed():
                     details = f"Attempted to deserialize a serialized set of Node Creation commands. Failed to execute an element command for node '{node_name}'."
                     self._cleanup_node_on_failed_deserialization(node_name)
@@ -3884,7 +3894,7 @@ class NodeManager:
 
         for node_name, _ in nodes_to_serialize:
             # Check if this is a group node that needs special handling
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get node '{node_name}'."
                 return SerializeNodeToCommandsResultFailure(result_details=details)
@@ -3957,12 +3967,12 @@ class NodeManager:
         for node_name in all_selected_for_connections:
             try:
                 flow_name = self.get_node_parent_flow_by_name(node_name)
-                GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
+                self.engine.flow_manager.get_flow_by_name(flow_name)
             except Exception:
                 details = f"Attempted to serialize a selection of Nodes. Failed to get the flow of node {node_name}. Cannot serialize connections for this node."
                 logger.warning(details)
                 continue
-            connections = GriptapeNodes.FlowManager().get_connections()
+            connections = self.engine.flow_manager.get_connections()
             if node_name in connections.outgoing_index:
                 node_connections = [
                     connections.connections[connection_id]
@@ -4118,12 +4128,12 @@ class NodeManager:
 
             created_node_names.append(result.node_name)
             node_uuid_to_name[node_command.node_uuid] = result.node_name
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(result.node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(result.node_name, BaseNode)
             if node is None:
                 details = "Attempted to deserialize node but ran into an error on node serialization."
                 self._cleanup_created_nodes(created_node_names)
                 return DeserializeSelectedNodesFromCommandsResultFailure(result_details=details)
-            with GriptapeNodes.ContextManager().node(node=node):
+            with self.engine.context_manager.node(node=node):
                 parameter_commands = commands.set_parameter_value_commands[node_command.node_uuid]
                 for parameter_command in parameter_commands:
                     param_request = parameter_command.set_parameter_value_command
@@ -4139,15 +4149,13 @@ class NodeManager:
                         except Exception:  # noqa: S110
                             pass
                         param_request.value = value
-                        set_parameter_result = GriptapeNodes.handle_request(
-                            parameter_command.set_parameter_value_command
-                        )
+                        set_parameter_result = self.engine.handle_request(parameter_command.set_parameter_value_command)
                         if not set_parameter_result.succeeded():
                             details = f"Failed to set parameter value for {param_request.parameter_name} on node {param_request.node_name}"
                             logger.warning(details)
                 lock_command = commands.set_lock_commands_per_node[node_command.node_uuid]
                 if lock_command is not None:
-                    lock_node_result = GriptapeNodes.handle_request(lock_command)
+                    lock_node_result = self.engine.handle_request(lock_command)
                     if not lock_node_result.succeeded():
                         details = f"Failed to lock node {lock_command.node_name}"
                         logger.warning(details)
@@ -4160,7 +4168,7 @@ class NodeManager:
                 target_node_name=node_uuid_to_name[connection_command.target_node_uuid],
                 target_parameter_name=connection_command.target_parameter_name,
             )
-            result = GriptapeNodes.handle_request(connection_request)
+            result = self.engine.handle_request(connection_request)
             if result.failed():
                 details = f"Failed to create a connection between {connection_request.source_node_name} and {connection_request.target_node_name}"
                 logger.warning(details)
@@ -4174,7 +4182,7 @@ class NodeManager:
         )
 
     def on_duplicate_selected_nodes(self, request: DuplicateSelectedNodesRequest) -> ResultPayload:
-        serialize_result = GriptapeNodes.handle_request(
+        serialize_result = self.engine.handle_request(
             SerializeSelectedNodesToCommandsRequest(nodes_to_serialize=request.nodes_to_duplicate)
         )
         if not isinstance(serialize_result, SerializeSelectedNodesToCommandsResultSuccess):
@@ -4187,7 +4195,7 @@ class NodeManager:
             pickled_values=serialize_result.pickled_values,
             positions=request.positions,
         )
-        result = GriptapeNodes.handle_request(deserialize_request)
+        result = self.engine.handle_request(deserialize_request)
         if not isinstance(result, DeserializeSelectedNodesFromCommandsResultSuccess):
             details = "Failed to deserialize selected nodes."
             return DuplicateSelectedNodesResultFailure(result_details=details)
@@ -4239,6 +4247,7 @@ class NodeManager:
         node_name: str,
         *,
         is_output: bool,
+        workflow_manager: WorkflowManager,
         use_pickling: bool = False,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         try:
@@ -4276,8 +4285,6 @@ class NodeManager:
                 unique_uuid = SerializedNodeCommands.UniqueParameterValueUUID(str(uuid4()))
 
                 if use_pickling:
-                    # Use pickle serialization via WorkflowManager
-                    workflow_manager = GriptapeNodes.WorkflowManager()
                     pickled_bytes = workflow_manager._patch_and_pickle_object(value)
                     unique_parameter_uuid_to_values[unique_uuid] = pickled_bytes
                 else:
@@ -4311,6 +4318,7 @@ class NodeManager:
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
         *,
+        workflow_manager: WorkflowManager,
         use_pickling: bool = False,
         serialize_all_parameter_values: bool = False,
     ) -> list[SerializedNodeCommands.IndirectSetParameterValueCommand] | None:
@@ -4330,6 +4338,7 @@ class NodeManager:
             unique_parameter_uuid_to_values (dict[SerializedNodeCommands.UniqueParameterValueUUID, Any]): Dictionary mapping unique value UUIDs to values
             serialized_parameter_value_tracker (SerializedParameterValueTracker): Object mapping maintaining value hashes to unique value UUIDs, and non-serializable values
             create_node_request (CreateNodeRequest): The node creation request that will be modified if serialization fails
+            workflow_manager (WorkflowManager): Used to pickle values when use_pickling is True
             use_pickling (bool): If True, use pickle-based serialization; if False, use deep copy
             serialize_all_parameter_values (bool): If True, save all parameter values regardless of whether they were explicitly set or match defaults
 
@@ -4371,6 +4380,7 @@ class NodeManager:
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
+            workflow_manager=workflow_manager,
             use_pickling=use_pickling,
         )
         if internal_command is not None:
@@ -4384,6 +4394,7 @@ class NodeManager:
             unique_parameter_uuid_to_values=unique_parameter_uuid_to_values,
             serialized_parameter_value_tracker=serialized_parameter_value_tracker,
             create_node_request=create_node_request,
+            workflow_manager=workflow_manager,
             use_pickling=use_pickling,
         )
         if output_command is not None:
@@ -4401,6 +4412,7 @@ class NodeManager:
         unique_parameter_uuid_to_values: dict[SerializedNodeCommands.UniqueParameterValueUUID, Any],
         serialized_parameter_value_tracker: SerializedParameterValueTracker,
         create_node_request: CreateNodeRequest,
+        workflow_manager: WorkflowManager,
         use_pickling: bool,
     ) -> SerializedNodeCommands.IndirectSetParameterValueCommand | None:
         """Serialize one of a parameter's values (internal-set or output) for workflow save.
@@ -4425,6 +4437,7 @@ class NodeManager:
             is_output=is_output,
             parameter_name=parameter.name,
             node_name=node.name,
+            workflow_manager=workflow_manager,
             use_pickling=use_pickling,
         )
         if command is not None:
@@ -4443,11 +4456,14 @@ class NodeManager:
         return None
 
     @staticmethod
-    def serialize_parameter_output_values(node: BaseNode, *, use_pickling: bool = False) -> SerializedParameterValues:
+    def serialize_parameter_output_values(
+        node: BaseNode, *, workflow_manager: WorkflowManager, use_pickling: bool = False
+    ) -> SerializedParameterValues:
         """Serialize parameter output values with optional pickling for complex objects.
 
         Args:
             node: The node whose parameter output values should be serialized
+            workflow_manager: Used to pickle values when use_pickling is True
             use_pickling: If True, use pickle-based serialization; if False, use safe_unstructure
 
         Returns:
@@ -4461,7 +4477,7 @@ class NodeManager:
         if not use_pickling:
             return NodeManager._serialize_without_pickling(node)
 
-        return NodeManager._serialize_with_pickling(node)
+        return NodeManager._serialize_with_pickling(node, workflow_manager=workflow_manager)
 
     @staticmethod
     def _serialize_without_pickling(node: BaseNode) -> SerializedParameterValues:
@@ -4485,11 +4501,14 @@ class NodeManager:
     @staticmethod
     def _serialize_with_pickling(
         node: BaseNode,
+        *,
+        workflow_manager: WorkflowManager,
     ) -> SerializedParameterValues:
         """Serialize parameter values using pickle-based serialization with UUID references.
 
         Args:
             node: The node whose parameter values should be serialized
+            workflow_manager: Used to pickle values
 
         Returns:
             SerializedParameterValues with pickled values
@@ -4508,6 +4527,7 @@ class NodeManager:
                 serialized_parameter_value_tracker,
                 unique_parameter_uuid_to_values,
                 uuid_referenced_values,
+                workflow_manager=workflow_manager,
             )
 
             uuid_referenced_values[param_name] = unique_uuid
@@ -4530,12 +4550,14 @@ class NodeManager:
         return node.get_parameter_value(param_name)
 
     @staticmethod
-    def _process_parameter_for_pickling(
+    def _process_parameter_for_pickling(  # noqa: PLR0913
         param_value: Any,
         param_name: str,
         tracker: SerializedParameterValueTracker,
         unique_parameter_uuid_to_values: dict,
         uuid_referenced_values: dict,
+        *,
+        workflow_manager: WorkflowManager,
     ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
         """Process a parameter value for pickle-based serialization.
 
@@ -4545,6 +4567,7 @@ class NodeManager:
             tracker: Tracker for managing serialization state
             unique_parameter_uuid_to_values: Dictionary to store pickled values
             uuid_referenced_values: Dictionary to store UUID references
+            workflow_manager: Used to pickle newly seen values
 
         Returns:
             UUID reference for the value, or None if not serializable
@@ -4565,16 +4588,23 @@ class NodeManager:
                 return None
             case SerializedParameterValueTracker.TrackerState.NOT_IN_TRACKER:
                 return NodeManager._handle_new_value_for_pickling(
-                    param_value, param_name, tracker, unique_parameter_uuid_to_values, uuid_referenced_values
+                    param_value,
+                    param_name,
+                    tracker,
+                    unique_parameter_uuid_to_values,
+                    uuid_referenced_values,
+                    workflow_manager=workflow_manager,
                 )
 
     @staticmethod
-    def _handle_new_value_for_pickling(
+    def _handle_new_value_for_pickling(  # noqa: PLR0913
         param_value: Any,
         param_name: str,
         tracker: SerializedParameterValueTracker,
         unique_parameter_uuid_to_values: dict,
         uuid_referenced_values: dict,
+        *,
+        workflow_manager: WorkflowManager,
     ) -> SerializedNodeCommands.UniqueParameterValueUUID | None:
         """Handle a new value that hasn't been seen before in pickling serialization.
 
@@ -4584,6 +4614,7 @@ class NodeManager:
             tracker: Tracker for managing serialization state
             unique_parameter_uuid_to_values: Dictionary to store pickled values
             uuid_referenced_values: Dictionary to store UUID references
+            workflow_manager: Used to pickle the value
 
         Returns:
             UUID reference for the value, or None if not serializable
@@ -4595,7 +4626,6 @@ class NodeManager:
             value_id = id(param_value)
 
         try:
-            workflow_manager = GriptapeNodes.WorkflowManager()
             pickled_bytes = workflow_manager._patch_and_pickle_object(param_value)
         except Exception:
             tracker.add_as_not_serializable(value_id)
@@ -4619,10 +4649,10 @@ class NodeManager:
         # Get the node
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to rename Parameter in the Current Context. Failed because the Current Context was empty."
                 return RenameParameterResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -4659,8 +4689,8 @@ class NodeManager:
 
         # Get all connections for this node
         flow_name = self.get_node_parent_flow_by_name(node_name)
-        GriptapeNodes.FlowManager().get_flow_by_name(flow_name)
-        connections = GriptapeNodes.FlowManager().get_connections()
+        self.engine.flow_manager.get_flow_by_name(flow_name)
+        connections = self.engine.flow_manager.get_connections()
 
         # Update connections that reference this parameter
         if node_name in connections.incoming_index:
@@ -4705,10 +4735,10 @@ class NodeManager:
     def on_toggle_lock_node_request(self, request: SetLockNodeStateRequest) -> ResultPayload:
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to lock node in the Current Context. Failed because the Current Context was empty."
                 return SetLockNodeStateResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -4761,16 +4791,16 @@ class NodeManager:
 
         if node_name is None:
             # Get from the current context
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to send message to Node from Current Context. Failed because the Current Context is empty."
                 return SendNodeMessageResultFailure(result_details=details)
 
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         if node is None:
             # Find the node by name
-            obj_mgr = GriptapeNodes.ObjectManager()
+            obj_mgr = self.engine.object_manager
             node = obj_mgr.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 details = f"Attempted to send message to Node '{node_name}', but no such Node was found."
@@ -4883,7 +4913,7 @@ class NodeManager:
         """Break all incoming and outgoing connections for a parameter."""
         # Break incoming connections
         for incoming_connection in connections_result.incoming_connections:
-            delete_result = GriptapeNodes.handle_request(
+            delete_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -4901,7 +4931,7 @@ class NodeManager:
 
         # Break outgoing connections
         for outgoing_connection in connections_result.outgoing_connections:
-            delete_result = GriptapeNodes.handle_request(
+            delete_result = self.engine.handle_request(
                 DeleteConnectionRequest(
                     source_node_name=source_node_name,
                     source_parameter_name=source_parameter_name,
@@ -4936,7 +4966,7 @@ class NodeManager:
     def _migrate_parameter_value(self, request: MigrateParameterRequest) -> MigrateParameterResultFailure | None:
         """Handle migrating parameter value when no incoming connections exist."""
         # Get the current value from source
-        get_value_result = GriptapeNodes.handle_request(
+        get_value_result = self.engine.handle_request(
             GetParameterValueRequest(node_name=request.source_node_name, parameter_name=request.source_parameter_name)
         )
 
@@ -4954,7 +4984,7 @@ class NodeManager:
                 return MigrateParameterResultFailure(result_details=f"Failed to apply value transformation: {e!s}")
 
         # Set the value on target
-        set_value_result = GriptapeNodes.handle_request(
+        set_value_result = self.engine.handle_request(
             SetParameterValueRequest(
                 node_name=request.target_node_name, parameter_name=request.target_parameter_name, value=value
             )
@@ -4996,7 +5026,7 @@ class NodeManager:
         # Set additional parameters
         if input_conversion.additional_parameters:
             for param_name, param_value in input_conversion.additional_parameters.items():
-                set_value_result = GriptapeNodes.handle_request(
+                set_value_result = self.engine.handle_request(
                     SetParameterValueRequest(
                         node_name=intermediate_node_name, parameter_name=param_name, value=param_value
                     )
@@ -5008,7 +5038,7 @@ class NodeManager:
 
         # Connect all sources to intermediate node
         for incoming_connection in connections_result.incoming_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -5023,7 +5053,7 @@ class NodeManager:
                 )
 
         # Connect intermediate node to target
-        connection_result = GriptapeNodes.handle_request(
+        connection_result = self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=intermediate_node_name,
                 source_parameter_name=input_conversion.output_parameter,
@@ -5044,7 +5074,7 @@ class NodeManager:
     ) -> MigrateParameterResultFailure | None:
         """Create direct incoming connections without conversion."""
         for incoming_connection in connections_result.incoming_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=incoming_connection.source_node_name,
                     source_parameter_name=incoming_connection.source_parameter_name,
@@ -5089,7 +5119,7 @@ class NodeManager:
         # Set additional parameters
         if output_conversion.additional_parameters:
             for param_name, param_value in output_conversion.additional_parameters.items():
-                set_value_result = GriptapeNodes.handle_request(
+                set_value_result = self.engine.handle_request(
                     SetParameterValueRequest(
                         node_name=intermediate_node_name, parameter_name=param_name, value=param_value
                     )
@@ -5100,7 +5130,7 @@ class NodeManager:
                     )
 
         # Connect target to intermediate node
-        connection_result = GriptapeNodes.handle_request(
+        connection_result = self.engine.handle_request(
             CreateConnectionRequest(
                 source_node_name=request.target_node_name,
                 source_parameter_name=request.target_parameter_name,
@@ -5116,7 +5146,7 @@ class NodeManager:
 
         # Connect intermediate node to all destinations
         for outgoing_connection in connections_result.outgoing_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=intermediate_node_name,
                     source_parameter_name=output_conversion.output_parameter,
@@ -5137,7 +5167,7 @@ class NodeManager:
     ) -> MigrateParameterResultFailure | None:
         """Create direct outgoing connections without conversion."""
         for outgoing_connection in connections_result.outgoing_connections:
-            connection_result = GriptapeNodes.handle_request(
+            connection_result = self.engine.handle_request(
                 CreateConnectionRequest(
                     source_node_name=request.target_node_name,
                     source_parameter_name=request.target_parameter_name,
@@ -5177,18 +5207,18 @@ class NodeManager:
 
         # FAILURE CHECK: Validate node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to check reset eligibility for a Node from the Current Context. "
                     "Failed because the Current Context is empty."
                 )
                 return CanResetNodeToDefaultsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # FAILURE CHECK: Get source node
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to check reset eligibility for Node '{node_name}', but no such Node was found."
             return CanResetNodeToDefaultsResultFailure(result_details=details)
@@ -5226,17 +5256,17 @@ class NodeManager:
 
         # FAILURE CHECK: Validate node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = (
                     "Attempted to reset a Node from the Current Context. Failed because the Current Context is empty."
                 )
                 return ResetNodeToDefaultsResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
 
         # FAILURE CHECK: Get source node
         if node is None:
-            node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(node_name, BaseNode)
+            node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
         if node is None:
             details = f"Attempted to reset Node '{node_name}', but no such Node was found."
             return ResetNodeToDefaultsResultFailure(result_details=details)
@@ -5311,7 +5341,7 @@ class NodeManager:
                 target_node_name=new_node_name,
                 target_parameter_name=incoming_connection.target_parameter_name,
             )
-            connection_result = GriptapeNodes.FlowManager().on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_incoming.append(incoming_connection)
 
@@ -5322,7 +5352,7 @@ class NodeManager:
                 target_node_name=outgoing_connection.target_node_name,
                 target_parameter_name=outgoing_connection.target_parameter_name,
             )
-            connection_result = GriptapeNodes.FlowManager().on_create_connection_request(connection_request)
+            connection_result = self.engine.flow_manager.on_create_connection_request(connection_request)
             if not isinstance(connection_result, CreateConnectionResultSuccess):
                 failed_outgoing.append(outgoing_connection)
 
@@ -5337,7 +5367,7 @@ class NodeManager:
         rename_request = RenameObjectRequest(
             object_name=new_node_name, requested_name=node_name, allow_next_closest_name_available=False
         )
-        rename_result = GriptapeNodes.ObjectManager().on_rename_object_request(rename_request)
+        rename_result = self.engine.object_manager.on_rename_object_request(rename_request)
         if not isinstance(rename_result, RenameObjectResultSuccess):
             details = f"Attempted to reset Node '{node_name}'. Failed to rename new node to original name."
             return ResetNodeToDefaultsResultFailure(result_details=details)
@@ -5375,10 +5405,10 @@ class NodeManager:
         # Get the node
         node_name = request.node_name
         if node_name is None:
-            if not GriptapeNodes.ContextManager().has_current_node():
+            if not self.engine.context_manager.has_current_node():
                 details = "Attempted to reorder ParameterList item in the Current Context. Failed because the Current Context was empty."
                 return ReorderParameterListItemResultFailure(result_details=details)
-            node = GriptapeNodes.ContextManager().get_current_node()
+            node = self.engine.context_manager.get_current_node()
             node_name = node.name
         else:
             try:
@@ -5443,7 +5473,7 @@ class NodeManager:
 
     def on_unresolve_node_request(self, request: UnresolveNodeRequest) -> ResultPayload:
         """Mark a single node UNRESOLVED and propagate to downstream nodes."""
-        node = GriptapeNodes.ObjectManager().attempt_get_object_by_name_as_type(request.node_name, BaseNode)
+        node = self.engine.object_manager.attempt_get_object_by_name_as_type(request.node_name, BaseNode)
         if node is None:
             return UnresolveNodeResultFailure(
                 result_details=f"Attempted to unresolve Node '{request.node_name}'. Node not found."
@@ -5453,5 +5483,5 @@ class NodeManager:
                 result_details=f"Attempted to unresolve Node '{request.node_name}'. Node is currently RESOLVING."
             )
         node.make_node_unresolved(current_states_to_trigger_change_event={NodeResolutionState.RESOLVED})
-        GriptapeNodes.FlowManager().get_connections().unresolve_future_nodes(node)
+        self.engine.flow_manager.get_connections().unresolve_future_nodes(node)
         return UnresolveNodeResultSuccess(result_details=f"Node '{request.node_name}' marked as unresolved.")
