@@ -200,9 +200,9 @@ Griptape Nodes uses a variety of environment variables for influencing its low-l
 - **`GT_CLOUD_API_KEY`**: The API key for authenticating with the Griptape Cloud API. This is required for the engine to function properly.
 - **`STATIC_SERVER_HOST`**: The host for the static server (default `localhost`). This is used to serve static files from the engine.
 - **`STATIC_SERVER_PORT`**: The port for the static server (default `8124`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_URL`**: The URL path for the static server (default `/static`). This is used to serve static files from the engine.
-- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the static server (default `info`). This is used to control the verbosity of the static server logs.
-- **`STATIC_SERVER_ENABLED`**: Whether the static server is enabled (default `true`. This is used to control whether the static server is started or not.
+- **`STATIC_SERVER_URL`**: The URL path the workspace is served under (default `/workspace`). This is used to serve static files from the engine.
+- **`STATIC_SERVER_LOG_LEVEL`**: The log level for the static server (default `error`). This is used to control the verbosity of the static server logs.
+- **`STATIC_SERVER_ENABLED`**: Whether the static server is enabled (default `true`). This is used to control whether the static server is started or not.
 
 ## Contributing to Documentation
 
