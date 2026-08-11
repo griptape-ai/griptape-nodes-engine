@@ -72,12 +72,27 @@ class BaseNodeGroup(BaseNode):
         Returns:
             The nodes actually added, including any extra nodes a previous owner released.
         """
+        # Reject impossible nesting before detaching anything: _remove_nodes_from_existing_parents
+        # mutates the previous owner, so validating after it would leave a rejected add having
+        # already ejected the nodes from the group that held them.
+        self._validate_nodes_can_be_nested(nodes)
         nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
         self._add_nodes_to_group_dict(nodes)
 
         self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
         return nodes
+
+    def contains_node(self, node: BaseNode) -> bool:
+        """Whether this group holds the node directly, or inside a group nested within it.
+
+        Args:
+            node: The node to look for
+
+        Returns:
+            True if the node is anywhere inside this group's nesting tree
+        """
+        return self in self.get_enclosing_groups(node)
 
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Remove nodes from this group.
@@ -137,12 +152,60 @@ class BaseNodeGroup(BaseNode):
             node.parent_group = self
             self.nodes[node.name] = node
 
+    def _validate_nodes_can_be_nested(self, nodes: list[BaseNode]) -> None:
+        """Reject additions that would make a group contain itself.
+
+        Nesting a group inside one of its own descendants (or inside itself) would create a
+        cycle in the parent_group chain, which every ancestor walk would then traverse forever.
+
+        Args:
+            nodes: The nodes about to be added
+
+        Raises:
+            ValueError: If any node is this group itself or one of its ancestors
+        """
+        for node in nodes:
+            if node is self:
+                msg = f"Cannot add group '{self.name}' to itself."
+                raise ValueError(msg)
+            if isinstance(node, BaseNodeGroup) and node.contains_node(self):
+                msg = (
+                    f"Attempted to add group '{node.name}' to group '{self.name}'. "
+                    f"Failed because '{self.name}' is already inside '{node.name}', "
+                    f"and a group cannot contain itself."
+                )
+                raise ValueError(msg)
+
     def _validate_nodes_in_group(self, nodes: list[BaseNode]) -> None:
         """Validate that all nodes are in the group."""
         for node in nodes:
             if node.name not in self.nodes:
                 msg = f"Node {node.name} is not in node group {self.name}"
                 raise ValueError(msg)
+
+    @staticmethod
+    def get_enclosing_groups(node: BaseNode) -> list[BaseNodeGroup]:
+        """Walk the parent_group chain and return every group enclosing the node, innermost first.
+
+        Membership in a nested group is transitive: a node inside an inner group is also inside
+        every group wrapping it. Callers that only inspect ``node.parent_group`` see the innermost
+        group alone and treat the outer ones as external, so they must use this instead.
+
+        Args:
+            node: The node whose enclosing groups are wanted
+
+        Returns:
+            The enclosing groups, innermost first (empty if the node is not in a group)
+        """
+        enclosing_groups: list[BaseNodeGroup] = []
+        # Guard against a malformed parent_group cycle rather than looping forever.
+        visited: set[int] = {id(node)}
+        current = node.parent_group
+        while isinstance(current, BaseNodeGroup) and id(current) not in visited:
+            enclosing_groups.append(current)
+            visited.add(id(current))
+            current = current.parent_group
+        return enclosing_groups
 
     def handle_child_node_rename(self, old_name: str, new_name: str) -> None:
         """Update group membership when a child node is renamed.

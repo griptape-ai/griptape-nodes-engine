@@ -955,3 +955,79 @@ class TestDeleteIterationFlows:
 
         for _, flow_name, _ in deserialized_flows:
             assert object_manager.attempt_get_object_by_name(flow_name) is None
+
+
+class TestReparentFlow:
+    """Moving a Flow under a new parent, which is how a nested group's subflow finds its home.
+
+    When a node group is nested inside another, the inner group's subflow has to become a child of
+    the outer group's subflow. Serialization walks parent/child links, so a subflow left parented to
+    the top-level flow is written outside its enclosing group and its members vanish on load.
+    """
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_moves_flow_under_new_parent(self, griptape_nodes: GriptapeNodes) -> None:
+        griptape_nodes.ContextManager().push_workflow("reparent_wf")
+        top = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="top", set_as_new_context=False)
+        )
+        assert isinstance(top, CreateFlowResultSuccess)
+        outer = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="outer", set_as_new_context=False)
+        )
+        assert isinstance(outer, CreateFlowResultSuccess)
+        inner = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=top.flow_name, flow_name="inner", set_as_new_context=False)
+        )
+        assert isinstance(inner, CreateFlowResultSuccess)
+
+        flow_manager = griptape_nodes.FlowManager()
+        flow_manager.reparent_flow(inner.flow_name, outer.flow_name)
+
+        assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_rejects_unknown_flows(self, griptape_nodes: GriptapeNodes) -> None:
+        griptape_nodes.ContextManager().push_workflow("reparent_unknown_wf")
+        real = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="real", set_as_new_context=False)
+        )
+        assert isinstance(real, CreateFlowResultSuccess)
+        flow_manager = griptape_nodes.FlowManager()
+
+        with pytest.raises(ValueError, match="doesn't exist"):
+            flow_manager.reparent_flow("ghost", real.flow_name)
+        with pytest.raises(ValueError, match="doesn't exist"):
+            flow_manager.reparent_flow(real.flow_name, "ghost")
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_rejects_making_a_flow_its_own_parent(self, griptape_nodes: GriptapeNodes) -> None:
+        griptape_nodes.ContextManager().push_workflow("reparent_self_wf")
+        solo = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="solo", set_as_new_context=False)
+        )
+        assert isinstance(solo, CreateFlowResultSuccess)
+
+        with pytest.raises(ValueError, match="its own parent"):
+            griptape_nodes.FlowManager().reparent_flow(solo.flow_name, solo.flow_name)
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_rejects_moving_a_flow_inside_its_own_descendant(self, griptape_nodes: GriptapeNodes) -> None:
+        """That move would detach the branch and leave the ancestor walk with no way out."""
+        griptape_nodes.ContextManager().push_workflow("reparent_cycle_wf")
+        outer = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="outer", set_as_new_context=False)
+        )
+        assert isinstance(outer, CreateFlowResultSuccess)
+        inner = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=outer.flow_name, flow_name="inner", set_as_new_context=False)
+        )
+        assert isinstance(inner, CreateFlowResultSuccess)
+
+        flow_manager = griptape_nodes.FlowManager()
+        with pytest.raises(ValueError, match="already inside"):
+            flow_manager.reparent_flow(outer.flow_name, inner.flow_name)
+
+        # The rejected move must leave the hierarchy untouched.
+        assert flow_manager.get_parent_flow(inner.flow_name) == outer.flow_name
+        assert flow_manager.get_parent_flow(outer.flow_name) is None

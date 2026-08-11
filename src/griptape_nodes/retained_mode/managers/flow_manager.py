@@ -431,6 +431,44 @@ class FlowManager(EngineScoped):
         msg = f"Flow with name {flow_name} doesn't exist"
         raise ValueError(msg)
 
+    def reparent_flow(self, flow_name: str, new_parent_flow_name: str) -> None:
+        """Move a Flow under a different parent Flow.
+
+        Used when a node group is nested inside another: the inner group's subflow has to become a
+        child of the outer group's subflow so the saved flow hierarchy mirrors the group nesting.
+        Serialization walks parent/child links, so a subflow left parented to the top-level flow is
+        saved outside its enclosing group and its members go missing on load.
+
+        Args:
+            flow_name: The Flow to move
+            new_parent_flow_name: The Flow that should become its parent
+
+        Raises:
+            ValueError: If either Flow is unknown, or the move would create a cycle
+        """
+        if flow_name not in self._name_to_parent_name:
+            msg = f"Flow with name {flow_name} doesn't exist"
+            raise ValueError(msg)
+        if new_parent_flow_name not in self._name_to_parent_name:
+            msg = f"Flow with name {new_parent_flow_name} doesn't exist"
+            raise ValueError(msg)
+        if flow_name == new_parent_flow_name:
+            msg = f"Attempted to make Flow '{flow_name}' its own parent."
+            raise ValueError(msg)
+
+        # Walk up from the proposed parent: if we meet the flow being moved, the move would
+        # detach that branch from the tree and make the ancestor walk loop forever.
+        ancestor = self._name_to_parent_name[new_parent_flow_name]
+        while ancestor is not None:
+            if ancestor == flow_name:
+                msg = (
+                    f"Attempted to move Flow '{flow_name}' under '{new_parent_flow_name}', which is already inside it."
+                )
+                raise ValueError(msg)
+            ancestor = self._name_to_parent_name.get(ancestor)
+
+        self._name_to_parent_name[flow_name] = new_parent_flow_name
+
     def is_referenced_workflow(self, flow: ControlFlow) -> bool:
         """Check if this flow was created by importing a referenced workflow.
 
@@ -999,8 +1037,11 @@ class FlowManager(EngineScoped):
             details = f"Deleted the previous connection from '{old_source_node_name}.{old_source_param_name}' to '{old_target_node_name}.{old_target_param_name}' to make room for the new connection."
         try:
             # Actually create the Connection.
-            if (isinstance(source_node, SubflowNodeGroup) and target_node.parent_group == source_node) or (
-                isinstance(target_node, SubflowNodeGroup) and source_node.parent_group == target_node
+            # A connection between a group and a node inside it is internal. "Inside" is
+            # transitive: with nested groups the node's own parent_group may be an inner group,
+            # so we test containment across the whole nesting tree rather than the direct parent.
+            if (isinstance(source_node, SubflowNodeGroup) and source_node.contains_node(target_node)) or (
+                isinstance(target_node, SubflowNodeGroup) and target_node.contains_node(source_node)
             ):
                 # Here we're checking if it's an internal connection. (from the NodeGroup to a node within it.)
                 # If that's true, we set that automatically.
@@ -1055,13 +1096,31 @@ class FlowManager(EngineScoped):
         source_parent = source_node.parent_group
         target_parent = target_node.parent_group
 
-        # If source is in a group, this is an outgoing external connection
+        # Only a connection that actually leaves the group needs a proxy parameter. Containment is
+        # transitive, so a group must treat a node nested deeper inside it as internal: testing only
+        # the direct parent made a group proxy connections that never crossed its boundary, and the
+        # replacement connections re-entered here and were proxied again without end.
+        # Each remap hands off one level outward (a child's group proxies to its own parent group),
+        # so the walk terminates at the outermost group.
+        crossed_source_group = None
         if (
-            source_parent is not None
-            and isinstance(source_parent, SubflowNodeGroup)
-            and source_parent not in (target_parent, target_node)
+            isinstance(source_parent, SubflowNodeGroup)
+            and source_parent is not target_node
+            and not source_parent.contains_node(target_node)
         ):
-            success = source_parent.map_external_connection(
+            crossed_source_group = source_parent
+
+        crossed_target_group = None
+        if (
+            isinstance(target_parent, SubflowNodeGroup)
+            and target_parent is not source_node
+            and not target_parent.contains_node(source_node)
+        ):
+            crossed_target_group = target_parent
+
+        # If source is in a group, this is an outgoing external connection
+        if crossed_source_group is not None:
+            success = crossed_source_group.map_external_connection(
                 conn=conn,
                 is_incoming=False,
             )
@@ -1072,12 +1131,8 @@ class FlowManager(EngineScoped):
             return CreateConnectionResultFailure(result_details=details)
 
         # If target is in a group, this is an incoming external connection
-        if (
-            target_parent is not None
-            and isinstance(target_parent, SubflowNodeGroup)
-            and target_parent not in (source_parent, source_node)
-        ):
-            success = target_parent.map_external_connection(
+        if crossed_target_group is not None:
+            success = crossed_target_group.map_external_connection(
                 conn=conn,
                 is_incoming=True,
             )

@@ -116,26 +116,48 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         subflow_name = f"{self.name}_subflow"
         self.metadata["subflow_name"] = subflow_name
 
-        # Get current flow to set as parent so subflow will be serialized with parent
-        current_flow = GriptapeNodes.ContextManager().get_current_flow()
-        parent_flow_name = current_flow.name if current_flow else None
-
         # Create metadata with flow_type
         subflow_metadata = {"flow_type": NODE_GROUP_FLOW}
 
         request = CreateFlowRequest(
             flow_name=subflow_name,
-            parent_flow_name=parent_flow_name,
+            parent_flow_name=self._get_subflow_parent_flow_name(),
             set_as_new_context=False,
             metadata=subflow_metadata,
         )
         result = GriptapeNodes.handle_request(request)
-        if isinstance(result, CreateFlowResultSuccess):
-            # Final name may be different that initial name due to de-dupe.
-            self.metadata["subflow_name"] = result.flow_name
-
         if not isinstance(result, CreateFlowResultSuccess):
+            # Drop the name we optimistically recorded: no such flow exists, and leaving it set
+            # makes every later lookup point at a phantom flow.
+            self.metadata.pop("subflow_name", None)
             logger.warning("%s failed to create subflow '%s': %s", self.name, subflow_name, result.result_details)
+            msg = f"Attempted to create the group '{self.name}'. Failed because {result.result_details}"
+            raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
+
+        # Final name may be different that initial name due to de-dupe.
+        self.metadata["subflow_name"] = result.flow_name
+
+    def _get_subflow_parent_flow_name(self) -> str | None:
+        """Pick the flow that should own this group's subflow.
+
+        When this group is nested, its subflow belongs under the enclosing group's subflow so the
+        flow hierarchy mirrors the nesting. Otherwise it goes under the flow that is currently
+        being built, matching where the group node itself lives.
+
+        Returns:
+            The parent flow name, or None to let the engine parent it to the current context
+        """
+        parent_group = self.parent_group
+        if isinstance(parent_group, SubflowNodeGroup):
+            enclosing_subflow_name = parent_group.metadata.get("subflow_name")
+            if isinstance(enclosing_subflow_name, str):
+                return enclosing_subflow_name
+
+        # Called during __init__ too, when there may be no Flow on the context stack yet.
+        context_manager = GriptapeNodes.ContextManager()
+        if not context_manager.has_current_flow():
+            return None
+        return context_manager.get_current_flow().name
 
     def _add_start_flow_parameters(self) -> None:
         """Add parameters from all registered StartFlow nodes to this SubflowNodeGroup.
@@ -325,11 +347,20 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         return proxy_param
 
     def get_all_nodes(self) -> dict[str, BaseNode]:
-        all_nodes = {}
+        """Collect this group's members and every node nested beneath them, at any depth.
+
+        Recurses through nested groups rather than descending a single level, so callers that
+        package a group for execution (remote/private/iterative) see the whole body instead of
+        silently dropping nodes below depth 2.
+
+        Returns:
+            All nested nodes keyed by name, including the nested groups themselves
+        """
+        all_nodes: dict[str, BaseNode] = {}
         for node_name, node in self.nodes.items():
             all_nodes[node_name] = node
             if isinstance(node, SubflowNodeGroup):
-                all_nodes.update(node.nodes)
+                all_nodes.update(node.get_all_nodes())
         return all_nodes
 
     def map_external_connection(self, conn: Connection, *, is_incoming: bool) -> bool:
@@ -685,14 +716,21 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         # Pull in companions this group does not already hold, so a Start/End pair joins together.
         nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=False)
-        nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
-        self._add_nodes_to_group_dict(nodes)
+
+        # Reject impossible nesting BEFORE touching any membership state: detaching the nodes from
+        # their previous owner mutates that group, so a validation failure after it would leave a
+        # rejected add having already ejected the nodes from the group that held them. Validated
+        # after the expansion above, since a tethered companion can itself be a group.
+        self._validate_nodes_can_be_nested(nodes)
 
         # Create subflow on-demand if it doesn't exist
         subflow_name = self.metadata.get("subflow_name")
         if subflow_name is None:
             self._create_subflow()
             subflow_name = self.metadata.get("subflow_name")
+
+        nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
+        self._add_nodes_to_group_dict(nodes)
 
         if subflow_name is not None:
             for node in nodes:
@@ -702,6 +740,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     msg = "%s failed to move node '%s' to subflow: %s", self.name, node.name, move_result.result_details
                     logger.error(msg)
                     raise RuntimeError(msg)  # noqa: TRY004
+
+                self._nest_subflow_of(node, parent_subflow_name=subflow_name)
 
         connections = GriptapeNodes.FlowManager().get_connections()
         node_names_in_group = set(self.nodes.keys())
@@ -740,6 +780,36 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                 expanded.append(companion)
 
         return expanded
+
+    def _nest_subflow_of(self, node: BaseNode, parent_subflow_name: str) -> None:
+        """Reparent a nested group's own subflow under this group's subflow.
+
+        Keeps the flow hierarchy mirroring the group nesting. Without this the inner group's
+        subflow stays parented to whatever flow was current when it was created, so saving walks
+        right past it and the inner group's members are lost on load.
+
+        Args:
+            node: The node just added to this group; only groups own a subflow
+            parent_subflow_name: This group's subflow, which should become the parent
+        """
+        if not isinstance(node, SubflowNodeGroup):
+            return
+
+        child_subflow_name = node.metadata.get("subflow_name")
+        if not isinstance(child_subflow_name, str):
+            # The nested group has no subflow yet; it will be created under this one on first add.
+            return
+
+        try:
+            GriptapeNodes.FlowManager().reparent_flow(child_subflow_name, parent_subflow_name)
+        except ValueError:
+            logger.exception(
+                "%s could not nest subflow '%s' of group '%s' under '%s'",
+                self.name,
+                child_subflow_name,
+                node.name,
+                parent_subflow_name,
+            )
 
     def _map_external_connections_for_nodes(
         self, nodes: list[BaseNode], connections: Connections, node_names_in_group: set[str]
@@ -980,6 +1050,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                     )
                     logger.error(msg)
                     raise RuntimeError(msg)
+
+                # The node left this group, so its own subflow must leave this group's subflow too.
+                self._nest_subflow_of(node, parent_subflow_name=parent_flow_name)
 
         for node in nodes:
             self.unmap_node_connections(node, connections)
