@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
+import sys
 import tempfile
 from datetime import UTC, datetime
 from pathlib import Path
@@ -49,7 +51,22 @@ from griptape_nodes.utils.git_utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Generator
+    from collections.abc import Callable, Generator
+
+
+def remove_repo(path: Path) -> None:
+    """Delete a git working tree.
+
+    git marks the files under .git/objects read-only, and Windows refuses to unlink a read-only
+    file until that bit is cleared.
+    """
+
+    def clear_readonly(func: Callable[[str], None], target: str, _exc: BaseException) -> None:
+        target_path = Path(target)
+        target_path.chmod(target_path.stat().st_mode | stat.S_IWRITE)
+        func(target)
+
+    shutil.rmtree(path, onexc=clear_readonly)
 
 
 def run_git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
@@ -686,6 +703,10 @@ class TestCloneRepositoryWorkingDirectory:
 
         assert not marker.exists()
 
+    @pytest.mark.skipif(
+        sys.platform.startswith("win"),
+        reason="Windows holds a handle on the process's working directory, so it cannot be deleted.",
+    )
     def test_clone_repository_reports_a_deleted_working_directory_as_a_clone_failure(
         self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1527,7 +1548,7 @@ class TestVanishedRepository:
         # Pass is_git_repository's filesystem check, then delete the directory so the git call
         # itself is the thing that finds it gone.
         with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
-            shutil.rmtree(clone)
+            remove_repo(clone)
 
             with pytest.raises(GitRepositoryError, match="no folder exists"):
                 has_uncommitted_changes(clone)
@@ -1553,7 +1574,7 @@ class TestVanishedRepository:
         clone = clone_repo(origin, temp_dir / "clone")
 
         with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
-            shutil.rmtree(clone)
+            remove_repo(clone)
 
             assert get_git_remote(clone) is None
             assert get_git_info(clone) == (None, None)
