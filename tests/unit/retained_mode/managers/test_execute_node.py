@@ -12,9 +12,6 @@ from griptape_nodes.retained_mode.events.execution_events import (
 )
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 
-_LIBRARY_MANAGER_PATH = "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.LibraryManager"
-_WORKER_MANAGER_PATH = "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.WorkerManager"
-_OBJECT_MANAGER_PATH = "griptape_nodes.retained_mode.managers.node_manager.GriptapeNodes.ObjectManager"
 _LIBRARY_REGISTRY_CREATE_NODE_PATH = "griptape_nodes.retained_mode.managers.node_manager.LibraryRegistry.create_node"
 
 
@@ -37,8 +34,23 @@ def _make_mock_obj_mgr(existing_node: MagicMock | None = None) -> MagicMock:
 def _make_mock_library_manager(*, is_worker: bool) -> MagicMock:
     lib_mgr = MagicMock()
     lib_mgr.is_worker = is_worker
+    lib_mgr._is_worker = is_worker
     lib_mgr.get_worker_for_library.return_value = None
     return lib_mgr
+
+
+def _make_node_manager(
+    *,
+    object_manager: MagicMock | None = None,
+    library_manager: MagicMock | None = None,
+    worker_manager: MagicMock | None = None,
+) -> NodeManager:
+    """Build a NodeManager wired to a mock engine instead of the process-wide facade."""
+    mock_engine = MagicMock()
+    mock_engine.object_manager = object_manager
+    mock_engine.library_manager = library_manager
+    mock_engine.worker_manager = worker_manager
+    return NodeManager(MagicMock(), engine=mock_engine)
 
 
 class TestExecuteNodeOrchestratorPath:
@@ -50,23 +62,14 @@ class TestExecuteNodeOrchestratorPath:
     bugs with a stub that has no connections or flow parentage.
     """
 
-    def _get_node_manager(self) -> NodeManager:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.NodeManager()
-
     @pytest.mark.asyncio
     async def test_missing_node_fails_without_fallback_to_create(self) -> None:
         """Orchestrator lookup miss returns failure; LibraryRegistry.create_node NOT called."""
-        node_manager = self._get_node_manager()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH) as mock_create,
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH) as mock_create:
             request = ExecuteNodeRequest(
                 node_name="nonexistent_node",
                 node_metadata=cast("NodeMetadata", {"node_type": "SomeNodeType", "library": "some_library"}),
@@ -82,16 +85,12 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_reuses_existing_node(self) -> None:
         """Node already in ObjectManager: skip creation, execute in place."""
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH) as mock_create,
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH) as mock_create:
             request = ExecuteNodeRequest(
                 node_name="test_node",
                 parameter_values={"input_param": "input_value"},
@@ -107,17 +106,13 @@ class TestExecuteNodeOrchestratorPath:
 
     @pytest.mark.asyncio
     async def test_no_params(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(node_name="test_node", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(node_name="test_node", node_metadata=cast("NodeMetadata", {"node_type": "T"}))
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_not_called()
@@ -125,21 +120,17 @@ class TestExecuteNodeOrchestratorPath:
 
     @pytest.mark.asyncio
     async def test_set_parameter_fails(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_node.set_parameter_value.side_effect = ValueError("bad value")
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="test_node",
-                parameter_values={"bad_param": "bad_value"},
-            )
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(
+            node_name="test_node",
+            parameter_values={"bad_param": "bad_value"},
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "bad_param" in str(result.result_details)
@@ -147,38 +138,30 @@ class TestExecuteNodeOrchestratorPath:
 
     @pytest.mark.asyncio
     async def test_aprocess_fails(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_node.aprocess.side_effect = RuntimeError("process exploded")
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(node_name="test_node")
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(node_name="test_node")
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "process exploded" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_multiple_params(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="test_node",
-                parameter_values={"param_a": 1, "param_b": "two", "param_c": [3]},
-            )
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(
+            node_name="test_node",
+            parameter_values={"param_a": 1, "param_b": "two", "param_c": [3]},
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         expected_param_count = 3
@@ -187,22 +170,18 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_hydrate_skips_identical_values(self) -> None:
         """Identity-skip guard: hydrate does not re-call set_parameter_value for matching values."""
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         # Pre-populate parameter_values so each hydrate lookup finds a match.
         mock_node.parameter_values = {"param_a": 1, "param_b": "two", "param_c": [3]}
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="test_node",
-                parameter_values=dict(mock_node.parameter_values),
-            )
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(
+            node_name="test_node",
+            parameter_values=dict(mock_node.parameter_values),
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_not_called()
@@ -211,21 +190,17 @@ class TestExecuteNodeOrchestratorPath:
     @pytest.mark.asyncio
     async def test_hydrate_calls_set_for_differing_values(self) -> None:
         """Identity-skip does not fire when the incoming value differs from current."""
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_node.parameter_values = {"param_a": 1}  # existing, but stale
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=mock_node)
         lib_mgr = _make_mock_library_manager(is_worker=False)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="test_node",
-                parameter_values={"param_a": 999},  # differs from current
-            )
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(
+            node_name="test_node",
+            parameter_values={"param_a": 999},  # differs from current
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         mock_node.set_parameter_value.assert_called_once_with("param_a", 999)
@@ -240,24 +215,15 @@ class TestExecuteNodeWorkerPathStateless:
     of truth for node identity and parameter values.
     """
 
-    def _get_node_manager(self) -> NodeManager:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.NodeManager()
-
     @pytest.mark.asyncio
     async def test_constructs_fresh_node_and_executes(self) -> None:
         """Worker path: no prior ObjectManager entry, construct from metadata, run."""
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node) as mock_create,
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node) as mock_create:
             request = ExecuteNodeRequest(
                 node_name="test_node",
                 parameter_values={"input_param": "value"},
@@ -278,16 +244,12 @@ class TestExecuteNodeWorkerPathStateless:
     @pytest.mark.asyncio
     async def test_never_persists_node_in_object_manager(self) -> None:
         """Worker path never calls add_object_by_name; node is transient per request."""
-        node_manager = self._get_node_manager()
         mock_node = _make_mock_node()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node),
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node):
             request = ExecuteNodeRequest(
                 node_name="test_node",
                 node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
@@ -305,17 +267,13 @@ class TestExecuteNodeWorkerPathStateless:
         future mid-transition case where old code paths coexist); the worker must
         not trust it.
         """
-        node_manager = self._get_node_manager()
         stale_node = _make_mock_node(name="stale")
         fresh_node = _make_mock_node(name="test_node")
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=stale_node)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=fresh_node) as mock_create,
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=fresh_node) as mock_create:
             request = ExecuteNodeRequest(
                 node_name="test_node",
                 node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
@@ -331,35 +289,27 @@ class TestExecuteNodeWorkerPathStateless:
     @pytest.mark.asyncio
     async def test_missing_metadata_fails(self) -> None:
         """Worker path requires node_metadata; absent → failure."""
-        node_manager = self._get_node_manager()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(node_name="nonexistent_node")
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(node_name="nonexistent_node")
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "nonexistent_node" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_missing_node_type_in_metadata_fails(self) -> None:
-        node_manager = self._get_node_manager()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="some_node",
-                node_metadata=cast("NodeMetadata", {"library": "some_library"}),
-            )
-            result = await node_manager.on_execute_node_request(request)
+        request = ExecuteNodeRequest(
+            node_name="some_node",
+            node_metadata=cast("NodeMetadata", {"library": "some_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "node_type" in str(result.result_details)
@@ -367,15 +317,11 @@ class TestExecuteNodeWorkerPathStateless:
     @pytest.mark.asyncio
     async def test_creation_failure_returns_failure(self) -> None:
         """LibraryRegistry.create_node raises → ExecuteNodeResultFailure."""
-        node_manager = self._get_node_manager()
         mock_obj_mgr = _make_mock_obj_mgr(existing_node=None)
         lib_mgr = _make_mock_library_manager(is_worker=True)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr)
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, side_effect=RuntimeError("library not loaded")),
-        ):
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, side_effect=RuntimeError("library not loaded")):
             request = ExecuteNodeRequest(
                 node_name="test_node",
                 node_metadata={"node_type": "SomeNodeType", "library": "some_library"},
@@ -396,11 +342,6 @@ class TestExecuteNodeWorkerRoute:
     without calling aprocess locally.
     """
 
-    def _get_node_manager(self) -> NodeManager:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        return GriptapeNodes.NodeManager()
-
     def _make_mock_node(self, name: str = "worker_node") -> MagicMock:
         node = MagicMock(spec=BaseNode)
         node.name = name
@@ -417,7 +358,6 @@ class TestExecuteNodeWorkerRoute:
 
     @pytest.mark.asyncio
     async def test_routes_to_worker_and_returns_worker_result(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = self._make_mock_node()
         mock_obj_mgr = self._make_mock_obj_mgr(existing_node=mock_node)
 
@@ -430,18 +370,16 @@ class TestExecuteNodeWorkerRoute:
         )
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_WORKER_MANAGER_PATH, return_value=wm),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="worker_node",
-                node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
-            )
-            result = await node_manager.on_execute_node_request(request)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultSuccess)
         assert result.parameter_output_values == {"out": 42}
@@ -451,7 +389,6 @@ class TestExecuteNodeWorkerRoute:
 
     @pytest.mark.asyncio
     async def test_worker_failure_returns_failure(self) -> None:
-        node_manager = self._get_node_manager()
         mock_node = self._make_mock_node()
         mock_obj_mgr = self._make_mock_obj_mgr(existing_node=mock_node)
 
@@ -464,18 +401,16 @@ class TestExecuteNodeWorkerRoute:
         )
         lib_mgr = MagicMock()
         lib_mgr.is_worker = False
+        lib_mgr._is_worker = False
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_WORKER_MANAGER_PATH, return_value=wm),
-        ):
-            request = ExecuteNodeRequest(
-                node_name="worker_node",
-                node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
-            )
-            result = await node_manager.on_execute_node_request(request)
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+
+        request = ExecuteNodeRequest(
+            node_name="worker_node",
+            node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),
+        )
+        result = await node_manager.on_execute_node_request(request)
 
         assert isinstance(result, ExecuteNodeResultFailure)
         assert "worker exploded" in str(result.result_details)
@@ -490,7 +425,6 @@ class TestExecuteNodeWorkerRoute:
         worker constructs the node from metadata; it does not consult
         ObjectManager at all, so any existing entry there is irrelevant.
         """
-        node_manager = self._get_node_manager()
         mock_node = self._make_mock_node()
         mock_obj_mgr = self._make_mock_obj_mgr(existing_node=None)
 
@@ -498,14 +432,12 @@ class TestExecuteNodeWorkerRoute:
         wm.route_to_worker = AsyncMock()
         lib_mgr = MagicMock()
         lib_mgr.is_worker = True
+        lib_mgr._is_worker = True
         lib_mgr.get_worker_for_library.return_value = ("eng-id", "topic")
 
-        with (
-            patch(_OBJECT_MANAGER_PATH, return_value=mock_obj_mgr),
-            patch(_LIBRARY_MANAGER_PATH, return_value=lib_mgr),
-            patch(_WORKER_MANAGER_PATH, return_value=wm),
-            patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node),
-        ):
+        node_manager = _make_node_manager(object_manager=mock_obj_mgr, library_manager=lib_mgr, worker_manager=wm)
+
+        with patch(_LIBRARY_REGISTRY_CREATE_NODE_PATH, return_value=mock_node):
             request = ExecuteNodeRequest(
                 node_name="worker_node",
                 node_metadata=cast("NodeMetadata", {"node_type": "WorkerNode", "library": "worker_library"}),

@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
 
 logger = logging.getLogger("griptape_nodes")
@@ -1042,7 +1043,7 @@ class NodeExecutor:
         sources = self._find_sources_for_control_param(incoming_connections, control_param_name)
         return sources[0] if sources else None
 
-    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901, PLR0912
+    async def _execute_loop_iterations_sequentially(  # noqa: PLR0915, C901
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,
@@ -1066,43 +1067,52 @@ class NodeExecutor:
             - break_occurred: True if the loop exited early due to a break signal
             - failed_iterations: List of iteration indices that raised a subflow error
         """
-        # Deserialize flow once
+        # Deserialize the loop body once and reuse it for every iteration.
+        # Everything from deserialization onward is inside the try so the finally deletes the
+        # iteration flow on ALL exit paths (success, exception, cancellation), closing the window
+        # where a raise after creation but before execution would leak the flow. deserialized_flows
+        # is populated the instant the flow is created. (The flow is also tagged transient at
+        # packaging time, so a mid-run save cannot bake it into the workflow regardless.)
         context_manager = GriptapeNodes.ContextManager()
         event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
-            deserialize_request = DeserializeFlowFromCommandsRequest(
-                serialized_flow_commands=package_result.serialized_flow_commands
-            )
-            deserialize_result = GriptapeNodes.handle_request(deserialize_request)
-            if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
-                msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
-                raise TypeError(msg)
-
-            flow_name = deserialize_result.flow_name
-            node_name_mappings = deserialize_result.node_name_mappings
-
-            # Pop the deserialized flow from context stack
-            if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
-                context_manager.pop_flow()
-
-        logger.info("Successfully deserialized flow for sequential execution: %s", flow_name)
-        # Get node mappings
-        start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
-        start_node_name = start_node_mapping.node_name
-        packaged_start_node_name = node_name_mappings.get(start_node_name)
-
-        iteration_results: dict[int, Any] = {}
-        successful_iterations: list[int] = []
-        failed_iterations: list[int] = []
-        skipped_count = 0
-        break_occurred = False
-
-        # Build reverse mapping: packaged_name → original_name for event translation
-        reverse_node_mapping = {
-            packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
-        }
-
+        deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
         try:
+            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+                deserialize_request = DeserializeFlowFromCommandsRequest(
+                    serialized_flow_commands=package_result.serialized_flow_commands
+                )
+                deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+                if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
+                    msg = f"Failed to deserialize flow for sequential loop. Error: {deserialize_result.result_details}"
+                    raise TypeError(msg)
+
+                flow_name = deserialize_result.flow_name
+                node_name_mappings = deserialize_result.node_name_mappings
+                # Track for cleanup as soon as the flow exists (iteration index 0 is a placeholder;
+                # the single flow is reused across all iterations).
+                deserialized_flows.append((0, flow_name, node_name_mappings))
+
+                # Pop the deserialized flow from context stack
+                if context_manager.has_current_flow() and context_manager.get_current_flow().name == flow_name:
+                    context_manager.pop_flow()
+
+            logger.info("Successfully deserialized flow for sequential execution: %s", flow_name)
+            # Get node mappings
+            start_node_mapping = self.get_node_parameter_mappings(package_result, "start")
+            start_node_name = start_node_mapping.node_name
+            packaged_start_node_name = node_name_mappings.get(start_node_name)
+
+            iteration_results: dict[int, Any] = {}
+            successful_iterations: list[int] = []
+            failed_iterations: list[int] = []
+            skipped_count = 0
+            break_occurred = False
+
+            # Build reverse mapping: packaged_name → original_name for event translation
+            reverse_node_mapping = {
+                packaged_name: original_name for original_name, packaged_name in node_name_mappings.items()
+            }
+
             if packaged_start_node_name is None:
                 msg = f"Could not find deserialized Start node (original: '{start_node_name}') for sequential loop"
                 raise TypeError(msg)
@@ -1183,10 +1193,10 @@ class NodeExecutor:
                     )
                     # Extract result from this iteration before breaking
                     # (the work was done, so we should collect the result)
-                    deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
+                    single_flow_ref = [(iteration_index, flow_name, node_name_mappings)]
                     single_iteration_results = self.get_parameter_values_from_iterations(
                         end_loop_node=end_loop_node,
-                        deserialized_flows=deserialized_flows,
+                        deserialized_flows=single_flow_ref,
                         package_flow_result_success=package_result,
                     )
                     iteration_results.update(single_iteration_results)
@@ -1196,10 +1206,10 @@ class NodeExecutor:
                 # control_action == ADD: fall through to extract result
 
                 # Extract result from this iteration
-                deserialized_flows = [(iteration_index, flow_name, node_name_mappings)]
+                single_flow_ref = [(iteration_index, flow_name, node_name_mappings)]
                 single_iteration_results = self.get_parameter_values_from_iterations(
                     end_loop_node=end_loop_node,
-                    deserialized_flows=deserialized_flows,
+                    deserialized_flows=single_flow_ref,
                     package_flow_result_success=package_result,
                 )
                 iteration_results.update(single_iteration_results)
@@ -1214,9 +1224,9 @@ class NodeExecutor:
 
             # Extract last iteration values from the last successful iteration
             last_successful_iteration = successful_iterations[-1] if successful_iterations else 0
-            deserialized_flows = [(last_successful_iteration, flow_name, node_name_mappings)]
+            single_flow_ref = [(last_successful_iteration, flow_name, node_name_mappings)]
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
-                deserialized_flows=deserialized_flows,
+                deserialized_flows=single_flow_ref,
                 package_result=package_result,
                 total_iterations=len(successful_iterations),
             )
@@ -1231,16 +1241,8 @@ class NodeExecutor:
             )
 
         finally:
-            # Cleanup - delete the flow
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
-                delete_request = DeleteFlowRequest(flow_name=flow_name)
-                delete_result = await GriptapeNodes.ahandle_request(delete_request)
-                if not isinstance(delete_result, DeleteFlowResultSuccess):
-                    logger.warning(
-                        "Failed to delete sequential loop flow '%s': %s",
-                        flow_name,
-                        delete_result.result_details,
-                    )
+            # Cleanup - delete the iteration flow on ALL exit paths (success, exception, cancel).
+            await self._delete_iteration_flows(deserialized_flows, event_manager)
 
     async def _handle_sequential_loop_execution(  # noqa: C901
         self, start_node: BaseIterativeStartNode, end_node: BaseIterativeEndNode
@@ -2907,6 +2909,36 @@ class NodeExecutor:
 
         return last_iteration_values
 
+    async def _delete_iteration_flows(
+        self,
+        deserialized_flows: list[tuple[int, str, dict[str, str]]],
+        event_manager: EventManager,
+    ) -> None:
+        """Delete every per-iteration flow, tolerating already-gone flows and surfacing real failures.
+
+        Called from a finally so it runs on all exit paths (success, exception, cancellation). A
+        delete that reports failure because the flow no longer exists is expected during cleanup and
+        is logged at debug; any other failure is logged at error so a genuinely stuck flow is
+        surfaced rather than silently leaked. We never raise here — a raise from finally would mask
+        an in-flight exception (including CancelledError).
+        """
+        # Suppress events during deletion to prevent sending them to websockets.
+        with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
+            for iteration_index, flow_name, _ in deserialized_flows:
+                # Skip flows already torn down (e.g. a partially-run iteration cleaned itself up).
+                if GriptapeNodes.ObjectManager().attempt_get_object_by_name(flow_name) is None:
+                    continue
+                delete_result = await GriptapeNodes.ahandle_request(DeleteFlowRequest(flow_name=flow_name))
+                if not isinstance(delete_result, DeleteFlowResultSuccess):
+                    logger.error(
+                        "Failed to delete iteration flow '%s' (iteration %d): %s. This flow may leak into a "
+                        "subsequent save; it is tagged transient so it will not be serialized, but it remains "
+                        "in engine memory.",
+                        flow_name,
+                        iteration_index,
+                        delete_result.result_details,
+                    )
+
     async def _execute_loop_iterations_locally(  # noqa: C901, PLR0912, PLR0915
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
@@ -2934,62 +2966,72 @@ class NodeExecutor:
         """
         # Step 1: Deserialize N flow instances from the serialized flow
         # Save the current context and restore it after each deserialization to prevent
-        # iteration flows from becoming children of each other
+        # iteration flows from becoming children of each other.
+        #
+        # The deserialize loop runs INSIDE the try so its finally tears down every iteration flow
+        # already created even if a later deserialization raises. Each flow is appended to
+        # deserialized_flows the instant it is created, so the cleanup set is always complete —
+        # if deserialization of iteration k raises, flows 0..k-1 are still deleted. (The iteration
+        # flows are also tagged transient at packaging time, so a mid-run save can never bake them
+        # into the workflow even in the window before cleanup runs.)
         deserialized_flows = []
         context_manager = GriptapeNodes.ContextManager()
         saved_context_flow = context_manager.get_current_flow() if context_manager.has_current_flow() else None
 
         # Suppress events during deserialization to prevent sending them to websockets
         event_manager = GriptapeNodes.EventManager()
-        with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
-            for iteration_index in range(total_iterations):
-                # Restore context before each deserialization to ensure all iteration flows
-                # are created at the same level (not as children of each other)
-                if saved_context_flow is not None:
-                    # Pop any flows that were pushed during previous iteration
-                    while (
-                        context_manager.has_current_flow() and context_manager.get_current_flow() != saved_context_flow
+        try:
+            with EventSuppressionContext(event_manager, LOOP_EVENTS_TO_SUPPRESS):
+                for iteration_index in range(total_iterations):
+                    # Restore context before each deserialization to ensure all iteration flows
+                    # are created at the same level (not as children of each other)
+                    if saved_context_flow is not None:
+                        # Pop any flows that were pushed during previous iteration
+                        while (
+                            context_manager.has_current_flow()
+                            and context_manager.get_current_flow() != saved_context_flow
+                        ):
+                            context_manager.pop_flow()
+
+                    deserialize_request = DeserializeFlowFromCommandsRequest(
+                        serialized_flow_commands=package_result.serialized_flow_commands
+                    )
+                    deserialize_result = GriptapeNodes.handle_request(deserialize_request)
+                    if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
+                        msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
+                        raise TypeError(msg)
+
+                    deserialized_flows.append(
+                        (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
+                    )
+
+                    # Pop the deserialized flow from the context stack to prevent it from staying there
+                    # Deserialization pushes the flow onto the stack, but we don't want iteration flows
+                    # to remain on the stack after deserialization
+                    if (
+                        context_manager.has_current_flow()
+                        and context_manager.get_current_flow().name == deserialize_result.flow_name
                     ):
                         context_manager.pop_flow()
+            logger.info("Successfully deserialized %d flow instances for parallel execution", total_iterations)
+            # Step 2: Define the per-iteration coroutine
+            packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
 
-                deserialize_request = DeserializeFlowFromCommandsRequest(
-                    serialized_flow_commands=package_result.serialized_flow_commands
-                )
-                deserialize_result = GriptapeNodes.handle_request(deserialize_request)
-                if not isinstance(deserialize_result, DeserializeFlowFromCommandsResultSuccess):
-                    msg = f"Failed to deserialize flow for iteration {iteration_index}. Error: {deserialize_result.result_details}"
-                    raise TypeError(msg)
+            async def run_single_iteration(
+                flow_name: str, iteration_index: int, start_node_name: str
+            ) -> tuple[int, bool]:
+                """Run a single iteration flow and return success status."""
+                # Suppress execution events during parallel iteration to prevent flooding websockets
+                with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
+                    start_subflow_request = StartLocalSubflowRequest(
+                        flow_name=flow_name,
+                        start_node=start_node_name,
+                        pickle_control_flow_result=False,
+                    )
+                    start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
+                    success = isinstance(start_subflow_result, StartLocalSubflowResultSuccess)
+                    return iteration_index, success
 
-                deserialized_flows.append(
-                    (iteration_index, deserialize_result.flow_name, deserialize_result.node_name_mappings)
-                )
-
-                # Pop the deserialized flow from the context stack to prevent it from staying there
-                # Deserialization pushes the flow onto the stack, but we don't want iteration flows
-                # to remain on the stack after deserialization
-                if (
-                    context_manager.has_current_flow()
-                    and context_manager.get_current_flow().name == deserialize_result.flow_name
-                ):
-                    context_manager.pop_flow()
-        logger.info("Successfully deserialized %d flow instances for parallel execution", total_iterations)
-        # Step 2: Define the per-iteration coroutine
-        packaged_start_node_name = self.get_node_parameter_mappings(package_result, "start").node_name
-
-        async def run_single_iteration(flow_name: str, iteration_index: int, start_node_name: str) -> tuple[int, bool]:
-            """Run a single iteration flow and return success status."""
-            # Suppress execution events during parallel iteration to prevent flooding websockets
-            with EventSuppressionContext(event_manager, EXECUTION_EVENTS_TO_SUPPRESS):
-                start_subflow_request = StartLocalSubflowRequest(
-                    flow_name=flow_name,
-                    start_node=start_node_name,
-                    pickle_control_flow_result=False,
-                )
-                start_subflow_result = await GriptapeNodes.ahandle_request(start_subflow_request)
-                success = isinstance(start_subflow_result, StartLocalSubflowResultSuccess)
-                return iteration_index, success
-
-        try:
             # Step 3: Set input values on start nodes for each iteration
             for iteration_index, _, node_name_mappings in deserialized_flows:
                 parameter_values = parameter_values_per_iteration[iteration_index]
@@ -3032,23 +3074,39 @@ class NodeExecutor:
                         )
 
             logger.info("Successfully set input values for %d iterations", total_iterations)
-            # Step 4: Run all iterations concurrently
+            # Step 4: Run all iterations concurrently.
+            # Wrap the coroutines in real Tasks so that if THIS coroutine is cancelled mid-run
+            # (e.g. the user cancels the flow), we can cancel each iteration task AND await it before
+            # falling through to the finally that deletes the iteration flows. Each iteration unwinds
+            # its isolated subflow machine on cancellation (see on_start_local_subflow_request), so
+            # awaiting them here guarantees no body-node task is still running when its flow is
+            # deleted. gather(return_exceptions=True) alone would not await the children on cancel.
             iteration_tasks = [
-                run_single_iteration(
-                    flow_name,
-                    iteration_index,
-                    node_name_mappings.get(packaged_start_node_name),
+                asyncio.ensure_future(
+                    run_single_iteration(
+                        flow_name,
+                        iteration_index,
+                        node_name_mappings.get(packaged_start_node_name),
+                    )
                 )
                 for iteration_index, flow_name, node_name_mappings in deserialized_flows
             ]
-            iteration_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+            try:
+                iteration_task_results = await asyncio.gather(*iteration_tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                for task in iteration_tasks:
+                    task.cancel()
+                # Let every iteration finish unwinding (tearing down its isolated machine) before the
+                # finally deletes the flows out from under them.
+                await asyncio.gather(*iteration_tasks, return_exceptions=True)
+                raise
 
             # Step 5: Collect successful and failed iterations
             successful_iterations = []
             failed_iteration_indices = []
             failed_iteration_errors = {}  # Map iteration_index -> error
 
-            for idx, result in enumerate(iteration_results):
+            for idx, result in enumerate(iteration_task_results):
                 if isinstance(result, Exception):
                     # Exception doesn't include iteration_index, use enumerate index
                     failed_iteration_indices.append(idx)
@@ -3083,7 +3141,7 @@ class NodeExecutor:
                 if failed_idx not in iteration_results:
                     iteration_results[failed_idx] = None
 
-            # Step 7: Extract last iteration values BEFORE cleanup (flows deleted in finally block)
+            # Step 7: Extract last iteration values BEFORE cleanup (deleted in finally)
             last_iteration_values = self.get_last_iteration_values_for_packaged_nodes(
                 deserialized_flows=deserialized_flows,
                 package_result=package_result,
@@ -3091,23 +3149,13 @@ class NodeExecutor:
             )
 
             return iteration_results, successful_iterations, last_iteration_values
-
         finally:
-            # Step 8: Cleanup - delete all iteration flows
-            # Suppress events during deletion to prevent sending them to websockets
-            with EventSuppressionContext(event_manager, {DeleteFlowResultSuccess, DeleteFlowResultFailure}):
-                for iteration_index, flow_name, _ in deserialized_flows:
-                    delete_request = DeleteFlowRequest(flow_name=flow_name)
-                    delete_result = await GriptapeNodes.ahandle_request(delete_request)
-                    if not isinstance(delete_result, DeleteFlowResultSuccess):
-                        logger.warning(
-                            "Failed to delete iteration flow '%s' (iteration %d): %s",
-                            flow_name,
-                            iteration_index,
-                            delete_result.result_details,
-                        )
+            # Cleanup - delete every iteration flow created above, on ALL exit paths
+            # (success, raise, cancellation). deserialized_flows is complete because each flow is
+            # appended immediately after creation, inside this try.
+            await self._delete_iteration_flows(deserialized_flows, event_manager)
 
-    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913
+    async def _execute_loop_iterations_via_subprocess(  # noqa: PLR0913, PLR0917
         self,
         package_result: PackageNodesAsSerializedFlowResultSuccess,
         total_iterations: int,

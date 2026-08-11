@@ -81,24 +81,16 @@ from typing import Any
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import DataNode
 
+
 class MyNode(DataNode):
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self.category = "Category"
         self.description = "Description"
 
-        self.add_parameter(Parameter(
-            name="input",
-            input_types=["str"],
-            type="str",
-            tooltip="Input parameter"
-        ))
+        self.add_parameter(Parameter(name="input", input_types=["str"], type="str", tooltip="Input parameter"))
 
-        self.add_parameter(Parameter(
-            name="output",
-            output_type="str",
-            tooltip="Output parameter"
-        ))
+        self.add_parameter(Parameter(name="output", output_type="str", tooltip="Output parameter"))
 
     def process(self) -> None:
         val = self.get_parameter_value("input").upper()
@@ -112,7 +104,7 @@ class MyNode(DataNode):
 - **[Parameter UI Reference](parameter_ui_reference.md)** — Parameter type to widget mapping, supported `ui_options` keys, and traits
 - **[Execution and Lifecycle](execution_and_lifecycle.md)** — Lifecycle callbacks and asynchronous API integration patterns
 - **[Working with the Project System](project_system.md)** — Saving files through situations, macros, and `ProjectFileParameter`
-- **[Best Practices and Error Handling](error_handling.md)** — Secrets, imports, validation, error handling, and logging
+- **[Best Practices and Error Handling](error_handling.md)** — Secrets, imports, parameter payload size, validation, error handling, and logging
 - **[Authoring Libraries](authoring_libraries.md)** — Library manifests, declarations, dependency management, and contributing to the standard library
 - **[Custom Widgets](custom_widgets.md)** — Custom JavaScript widget components and the widget testbed
 - **[Patterns and Examples](examples.md)** — Advanced patterns from production nodes and quick-reference material

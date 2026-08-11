@@ -6,6 +6,7 @@ import logging
 import pickle
 import re
 import sys
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field, fields, is_dataclass
 from datetime import UTC, datetime
@@ -42,6 +43,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowRegistry,
     WorkflowShape,
 )
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     EngineInitializationProgress,
     GetEngineVersionRequest,
@@ -103,6 +105,9 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     GetPublishOptionsRequest,
     GetPublishOptionsResultFailure,
     GetPublishOptionsResultSuccess,
+    GetVariableSubstitutionEnabledRequest,
+    GetVariableSubstitutionEnabledResultFailure,
+    GetVariableSubstitutionEnabledResultSuccess,
     GetWorkflowInfoRequest,
     GetWorkflowInfoResultFailure,
     GetWorkflowInfoResultSuccess,
@@ -186,9 +191,6 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     WorkflowInfoSummary,
     WorkflowStatus,
 )
-from griptape_nodes.retained_mode.griptape_nodes import (
-    GriptapeNodes,
-)
 from griptape_nodes.retained_mode.managers.fitness_problems.workflows import (
     InvalidDependencyVersionStringProblem,
     InvalidLibraryVersionStringProblem,
@@ -218,6 +220,7 @@ if TYPE_CHECKING:
 
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.events.node_events import SerializedNodeCommands, SetLockNodeStateRequest
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -241,7 +244,7 @@ class WorkflowRegistrationResult(NamedTuple):
     failed: list[str]
 
 
-class WorkflowManager:
+class WorkflowManager(EngineScoped):
     WORKFLOW_METADATA_HEADER: ClassVar[str] = "script"
     MAX_MINOR_VERSION_DEVIATION: ClassVar[int] = (
         100  # TODO: https://github.com/griptape-ai/griptape-nodes/issues/1219 <- make the versioning enforcement softer after we get a release going
@@ -346,7 +349,8 @@ class WorkflowManager:
         creation_date: datetime  # When workflow was originally created
         branched_from: str | None  # Workflow this was branched from (if any)
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._workflow_file_path_to_info = {}
         self._squelch_workflow_altered_count = 0
         self._referenced_workflow_stack = []
@@ -423,6 +427,10 @@ class WorkflowManager:
         event_manager.assign_manager_to_request_type(
             SetWorkflowMetadataRequest,
             self.on_set_workflow_metadata_request,
+        )
+        event_manager.assign_manager_to_request_type(
+            GetVariableSubstitutionEnabledRequest,
+            self.on_get_variable_substitution_enabled_request,
         )
         event_manager.assign_manager_to_request_type(
             SetVariableSubstitutionEnabledRequest,
@@ -513,14 +521,28 @@ class WorkflowManager:
         Defaults to True so existing workflows that have never set the flag get
         substitution without any migration.
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
             return True
         workflow_name = context_manager.get_current_workflow_name()
         # Return the stored value, or True if this workflow has never set the flag.
         return self._variable_substitution_enabled.get(workflow_name, True)
+
+    def on_get_variable_substitution_enabled_request(
+        self,
+        request: GetVariableSubstitutionEnabledRequest,  # noqa: ARG002
+    ) -> ResultPayload:
+        """Return whether variable substitution is enabled for the current workflow."""
+        context_manager = self.engine.context_manager
+        if not context_manager.has_current_workflow():
+            return GetVariableSubstitutionEnabledResultFailure(
+                result_details="Attempted to get variable substitution enabled. Failed because no workflow is active."
+            )
+        enabled = self.is_variable_substitution_enabled()
+        return GetVariableSubstitutionEnabledResultSuccess(
+            result_details=f"Variable substitution is {'enabled' if enabled else 'disabled'} for the current workflow.",
+            enabled=enabled,
+        )
 
     def on_set_variable_substitution_enabled_request(
         self, request: SetVariableSubstitutionEnabledRequest
@@ -532,9 +554,7 @@ class WorkflowManager:
         call into build_workflow() so the flag is restored on every subsequent load,
         including direct script execution.
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if not context_manager.has_current_workflow():
             return SetVariableSubstitutionEnabledResultFailure(
                 result_details="Attempted to set variable substitution enabled. Failed because no workflow is active."
@@ -560,7 +580,7 @@ class WorkflowManager:
 
         try:
             default_workflow_section = "app_events.on_app_initialization_complete.workflows_to_register"
-            config_mgr = GriptapeNodes.ConfigManager()
+            config_mgr = self.engine.config_manager
 
             if workflows_to_register is None:
                 workflows_to_register = []
@@ -759,7 +779,7 @@ class WorkflowManager:
 
     async def _ensure_workflow_context_established(self) -> None:
         """Ensure there's a current workflow and flow context after workflow execution."""
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
 
         # First check: Do we have a current workflow? If not, that's a critical failure.
         if not context_manager.has_current_workflow():
@@ -775,14 +795,14 @@ class WorkflowManager:
             )
 
             top_level_flow_request = GetTopLevelFlowRequest()
-            top_level_flow_result = await GriptapeNodes.ahandle_request(top_level_flow_request)
+            top_level_flow_result = await self.engine.ahandle_request(top_level_flow_request)
 
             if (
                 isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess)
                 and top_level_flow_result.flow_name is not None
             ):
                 # Push the flow to the context stack permanently using FlowManager
-                flow_manager = GriptapeNodes.FlowManager()
+                flow_manager = self.engine.flow_manager
                 flow_obj = flow_manager.get_flow_by_name(top_level_flow_result.flow_name)
                 context_manager.push_flow(flow_obj)
                 details = f"Workflow execution completed. Set '{top_level_flow_result.flow_name}' as current context."
@@ -795,7 +815,7 @@ class WorkflowManager:
 
     async def run_workflow(self, relative_file_path: str) -> WorkflowExecutionResult:
         # Resolve path using utility function
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        workspace_path = self.engine.config_manager.workspace_path
         complete_file_path = resolve_workspace_path(Path(relative_file_path), workspace_path)
         try:
             async with await anyio.open_file(Path(complete_file_path), encoding="utf-8") as file:
@@ -872,7 +892,7 @@ class WorkflowManager:
             # behavior where a missing prereq block was survivable.
             return None
         for lib_ref in load_metadata_result.metadata.node_libraries_referenced:
-            register_result = await GriptapeNodes.ahandle_request(
+            register_result = await self.engine.ahandle_request(
                 RegisterLibraryFromFileRequest(
                     library_name=lib_ref.library_name,
                     perform_discovery_if_not_found=True,
@@ -913,7 +933,7 @@ class WorkflowManager:
 
             # Start with a clean slate.
             clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-            clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
+            clear_all_result = await self.engine.ahandle_request(clear_all_request)
             if not clear_all_result.succeeded():
                 details = f"Failed to clear the existing object state when trying to run '{complete_file_path}'."
                 return RunWorkflowFromScratchResultFailure(result_details=details)
@@ -969,21 +989,21 @@ class WorkflowManager:
         # run_with_clean_slate=True, replacement is the explicitly requested behavior, so
         # only warn when clobbering the context was NOT asked for.
         context_warning = None
-        if not request.run_with_clean_slate and GriptapeNodes.ContextManager().has_current_workflow():
-            context_warning = f"Started a new workflow '{request.workflow_name}' but a workflow '{GriptapeNodes.ContextManager().get_current_workflow_name()}' was already in the Current Context. Replacing the old with the new."
+        if not request.run_with_clean_slate and self.engine.context_manager.has_current_workflow():
+            context_warning = f"Started a new workflow '{request.workflow_name}' but a workflow '{self.engine.context_manager.get_current_workflow_name()}' was already in the Current Context. Replacing the old with the new."
 
         # Squelch any ResultPayloads that indicate the workflow was changed, because we are loading it.
         with WorkflowManager.WorkflowSquelchContext(self):
             if request.run_with_clean_slate:
                 # Start with a clean slate.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
+                clear_all_result = await self.engine.ahandle_request(clear_all_request)
                 if not clear_all_result.succeeded():
                     details = f"Failed to clear the existing object state when preparing to run workflow '{request.workflow_name}'."
                     return RunWorkflowFromRegistryResultFailure(result_details=details)
 
             # Let's run under the assumption that this Workflow will become our Current Context; if we fail, it will revert.
-            GriptapeNodes.ContextManager().push_workflow(request.workflow_name)
+            self.engine.context_manager.push_workflow(request.workflow_name)
             # run file
             execution_result = await self.run_workflow(relative_file_path=relative_file_path)
 
@@ -995,7 +1015,7 @@ class WorkflowManager:
 
                 # Attempt to clear everything out, as we modified the engine state getting here.
                 clear_all_request = ClearAllObjectStateRequest(i_know_what_im_doing=True)
-                clear_all_result = await GriptapeNodes.ahandle_request(clear_all_request)
+                clear_all_result = await self.engine.ahandle_request(clear_all_request)
 
                 # The clear-all above here wipes the ContextManager, so no need to do a pop_workflow().
                 return RunWorkflowFromRegistryResultFailure(result_details=ResultDetails(*result_messages))
@@ -1013,7 +1033,7 @@ class WorkflowManager:
         Self-guarding: paths inside the workspace are discovered by directory scan and need
         no config entry, so this is a no-op for them.
         """
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
         try:
             canonicalize_for_identity(full_path).relative_to(canonicalize_for_identity(config_manager.workspace_path))
         except ValueError:
@@ -1115,9 +1135,9 @@ class WorkflowManager:
         # `DeleteFlowRequest` calls can still push a flow context (they require an
         # active workflow). Non-active deletes (e.g. published-workflow subprocess
         # cleanup) skip this and go straight to the registry/file cleanup.
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == request.name:
-            GriptapeNodes.clear_current_workflow_data()
+            self.engine.clear_current_workflow_data()
         try:
             workflow = WorkflowRegistry.delete_workflow_by_name(request.name)
         except Exception as e:
@@ -1132,7 +1152,7 @@ class WorkflowManager:
                     message=f"Successfully deleted unsaved workflow: {request.name}", level=logging.INFO
                 )
             )
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
         try:
             config_manager.delete_user_workflow(workflow_file_path)
         except Exception as e:
@@ -1146,7 +1166,7 @@ class WorkflowManager:
             workspace_only=False,
             deletion_behavior=DeletionBehavior.PREFER_RECYCLE_BIN,
         )
-        delete_result = await GriptapeNodes.ahandle_request(delete_request)
+        delete_result = await self.engine.ahandle_request(delete_request)
         if isinstance(delete_result, DeleteFileResultFailure):
             details = f"Failed to delete workflow file with path '{workflow_file_path}'. {delete_result.result_details}"
             return DeleteWorkflowResultFailure(result_details=details)
@@ -1187,7 +1207,7 @@ class WorkflowManager:
             if str(source_dir) not in ("", "."):
                 requested_file_name = f"{source_dir}/{sanitized_stem}"
 
-        save_workflow_request = await GriptapeNodes.ahandle_request(
+        save_workflow_request = await self.engine.ahandle_request(
             SaveWorkflowRequest(file_name=requested_file_name, display_name=display_name)
         )
 
@@ -1300,7 +1320,7 @@ class WorkflowManager:
         # Also skip when the key is unchanged (e.g. renaming to the same on-disk name) so we
         # don't delete the file we just saved.
         if source is not None and new_workflow_name != old_workflow_name:
-            delete_workflow_result = await GriptapeNodes.ahandle_request(DeleteWorkflowRequest(name=old_workflow_name))
+            delete_workflow_result = await self.engine.ahandle_request(DeleteWorkflowRequest(name=old_workflow_name))
             if isinstance(delete_workflow_result, DeleteWorkflowResultFailure):
                 return (
                     f"Attempted to rename workflow '{old_workflow_name}' to '{new_workflow_name}'. "
@@ -1309,7 +1329,7 @@ class WorkflowManager:
 
         # If the renamed workflow is the current context, update the context name so the
         # heartbeat and other callers reflect the new registry key immediately.
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.set_current_workflow_name(new_workflow_name)
 
@@ -1321,7 +1341,7 @@ class WorkflowManager:
         Matches the key construction in on_load_workflow_metadata_request, which uses
         workspace_path.joinpath() without resolving symlinks.
         """
-        return str(GriptapeNodes.ConfigManager().workspace_path.joinpath(file_path))
+        return str(self.engine.config_manager.workspace_path.joinpath(file_path))
 
     def _build_workflow_info_payload(self, wf_info: WorkflowInfo) -> WorkflowInfoSummary:
         """Build a WorkflowInfoSummary from a WorkflowInfo, collating problems for display."""
@@ -1423,7 +1443,7 @@ class WorkflowManager:
 
         # Failure: no identifier and no current context
         if workflow_name is None and file_path is None:
-            context_manager = GriptapeNodes.ContextManager()
+            context_manager = self.engine.context_manager
             if not context_manager.has_current_workflow():
                 return GetWorkflowRunCommandResultFailure(
                     result_details=(
@@ -1472,7 +1492,7 @@ class WorkflowManager:
         complete_file_path = WorkflowRegistry.get_complete_file_path(relative_file_path)
 
         # Failure: workflow file does not exist or is not a file (use GetFileInfoRequest for consistency)
-        get_file_info_result = GriptapeNodes.handle_request(
+        get_file_info_result = self.engine.handle_request(
             GetFileInfoRequest(path=relative_file_path, workspace_only=True)
         )
         if isinstance(get_file_info_result, GetFileInfoResultFailure):
@@ -1526,7 +1546,7 @@ class WorkflowManager:
         return GetWorkflowRunCommandResultSuccess(
             run_command=run_command,
             workflow_shape=workflow_shape,
-            engine_os=GriptapeNodes.OSManager()._get_platform_name(),
+            engine_os=self.engine.os_manager._get_platform_name(),
             result_details=ResultDetails(message=f"Run command: {run_command}", level=logging.DEBUG),
         )
 
@@ -1687,7 +1707,7 @@ class WorkflowManager:
             return MoveWorkflowResultFailure(result_details=details)
         old_relative_path = workflow.file_path
 
-        config_manager = GriptapeNodes.ConfigManager()
+        config_manager = self.engine.config_manager
 
         # Get current file path
         current_file_path = WorkflowRegistry.get_complete_file_path(old_relative_path)
@@ -1740,7 +1760,7 @@ class WorkflowManager:
             if old_registry_key != new_registry_key:
                 WorkflowRegistry.rekey_workflow(old_registry_key, new_registry_key)
                 self._rekey_substitution_flag(old_registry_key, new_registry_key)
-                context_manager = GriptapeNodes.ContextManager()
+                context_manager = self.engine.context_manager
                 if (
                     context_manager.has_current_workflow()
                     and context_manager.get_current_workflow_name() == old_registry_key
@@ -1781,9 +1801,9 @@ class WorkflowManager:
         # (observed on Windows, engine cold start). Without this gate, the dependency
         # check below would race LibraryRegistry and return LibraryNotRegisteredProblem
         # for libraries that are milliseconds from being registered.
-        await GriptapeNodes.LibraryManager()._libraries_loading_complete.wait()
+        await self.engine.library_manager._libraries_loading_complete.wait()
         # Let us go into the darkness.
-        complete_file_path = GriptapeNodes.ConfigManager().workspace_path.joinpath(request.file_name)
+        complete_file_path = self.engine.config_manager.workspace_path.joinpath(request.file_name)
         str_path = str(complete_file_path)
         if not await anyio.Path(complete_file_path).is_file():
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
@@ -1816,9 +1836,13 @@ class WorkflowManager:
             for line in matches[0].group("content").splitlines(keepends=True)
         )
 
+        # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a
+        # formatting-preserving document model that costs ~20x more per header. Only the
+        # save path (_generate_workflow_metadata_header) needs tomlkit, to keep the
+        # formatting of headers it rewrites.
         try:
-            toml_doc = tomlkit.parse(metadata_content_toml)
-        except Exception as err:
+            toml_doc = tomllib.loads(metadata_content_toml)
+        except tomllib.TOMLDecodeError as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
@@ -1832,8 +1856,8 @@ class WorkflowManager:
         tool_header = "tool"
         griptape_nodes_header = "griptape-nodes"
         try:
-            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]  # type: ignore (this is the only way I could find to get tomlkit to do the dotted notation correctly)
-        except Exception as err:
+            griptape_nodes_tool_section = toml_doc[tool_header][griptape_nodes_header]
+        except (KeyError, TypeError) as err:
             self._workflow_file_path_to_info[str(str_path)] = WorkflowManager.WorkflowInfo(
                 status=WorkflowManager.WorkflowStatus.UNUSABLE,
                 workflow_path=str_path,
@@ -1878,7 +1902,7 @@ class WorkflowManager:
             workflow_metadata.last_modified_date = WorkflowManager.EPOCH_START
             problems.append(MissingLastModifiedDateProblem(default_date=str(WorkflowManager.EPOCH_START)))
 
-        list_libraries_result = await GriptapeNodes.ahandle_request(
+        list_libraries_result = await self.engine.ahandle_request(
             ListRegisteredLibrariesRequest(broadcast_result=False)
         )
 
@@ -1927,9 +1951,7 @@ class WorkflowManager:
 
             # Get library metadata (we know library is registered, so no error logging)
             library_metadata_request = GetLibraryMetadataRequest(library=library_name)
-            library_metadata_result = GriptapeNodes.LibraryManager().get_library_metadata_request(
-                library_metadata_request
-            )
+            library_metadata_result = self.engine.library_manager.get_library_metadata_request(library_metadata_request)
 
             if not isinstance(library_metadata_result, GetLibraryMetadataResultSuccess):
                 # Should not happen since we verified library is registered, but handle gracefully
@@ -2028,8 +2050,8 @@ class WorkflowManager:
             )
 
         # Check for workflow version-based compatibility issues and add to problems
-        workflow_version_issues = (
-            await GriptapeNodes.VersionCompatibilityManager().check_workflow_version_compatibility(workflow_metadata)
+        workflow_version_issues = await self.engine.version_compatibility_manager.check_workflow_version_compatibility(
+            workflow_metadata
         )
         for issue in workflow_version_issues:
             problems.append(issue.problem)
@@ -2056,20 +2078,22 @@ class WorkflowManager:
         )
 
     async def register_workflows_from_config(self, config_section: str) -> None:
-        workflows_to_register = GriptapeNodes.ConfigManager().get_config_value(config_section)
+        workflows_to_register = self.engine.config_manager.get_config_value(config_section)
         if workflows_to_register:
             await self.register_list_of_workflows(workflows_to_register)
 
     async def register_list_of_workflows(self, workflows_to_register: list[str]) -> None:
         await self._process_workflows_for_registration(workflows_to_register)
 
-    async def _register_workflow(self, workflow_to_register: str) -> bool:
+    def _register_workflow(self, workflow_to_register: str, workflow_metadata: WorkflowMetadata) -> bool:
         """Registers a workflow from a file.
 
         Args:
-            config_mgr: The ConfigManager instance to use for path resolution.
-            workflow_mgr: The WorkflowManager instance to use for workflow registration.
             workflow_to_register: The path to the workflow file to register.
+            workflow_metadata: Metadata already loaded from that file by the caller.
+                Passed in rather than re-read here: loading it parses the file's TOML
+                header, and the caller has to do that anyway to decide the file is
+                registerable, so re-reading would parse every workflow twice.
 
         Returns:
             bool: True if the workflow was successfully registered, False otherwise.
@@ -2079,36 +2103,11 @@ class WorkflowManager:
         # On one hand, we want the user to know how a specific workflow fared, but also not let them think it was registered when it wasn't.
         # TODO: https://github.com/griptape-ai/griptape-nodes/issues/996
 
-        # Attempt to extract the metadata out of the workflow.
-        load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_to_register))
-        load_metadata_result = await self.on_load_workflow_metadata_request(load_metadata_request)
-        if not load_metadata_result.succeeded():
-            # SKIP IT
-            return False
-
-        if not isinstance(load_metadata_result, LoadWorkflowMetadataResultSuccess):
-            err_str = (
-                f"Attempted to register workflow '{workflow_to_register}', but failed to extract metadata. SKIPPING IT."
-            )
-            logger.error(err_str)
-            return False
-
-        workflow_metadata = load_metadata_result.metadata
-
-        # Prepend the image paths appropriately.
-        if workflow_metadata.image is not None:
-            if workflow_metadata.is_griptape_provided:
-                workflow_metadata.image = workflow_metadata.image
-            else:
-                # For user workflows, the image should be just the filename, not a full path
-                # The frontend now sends just filenames, so we don't need to prepend the workspace path
-                workflow_metadata.image = workflow_metadata.image
-
         # Register it as a success.
         workflow_register_request = RegisterWorkflowRequest(
             metadata=workflow_metadata, file_name=str(workflow_to_register)
         )
-        workflow_register_result = GriptapeNodes.handle_request(workflow_register_request)
+        workflow_register_result = self.engine.handle_request(workflow_register_request)
         if not isinstance(workflow_register_result, RegisterWorkflowResultSuccess):
             err_str = f"Error attempting to register workflow '{workflow_to_register}': {workflow_register_result}. SKIPPING IT."
             logger.error(err_str)
@@ -2181,7 +2180,7 @@ class WorkflowManager:
         )
 
     @staticmethod
-    def _workspace_relative_path(absolute_or_relative_path: str) -> str:
+    def _workspace_relative_path(absolute_or_relative_path: str, engine: Engine) -> str:
         """Return the workspace-relative form of a path, or the absolute path if outside.
 
         Used post-write to reconcile registry state with the actual on-disk
@@ -2189,7 +2188,7 @@ class WorkflowManager:
         is ``foo_v001.py`` while the request asked for ``foo.py``).
         """
         path = Path(absolute_or_relative_path)
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        workspace_path = engine.config_manager.workspace_path
         try:
             relative = canonicalize_for_identity(path).relative_to(canonicalize_for_identity(workspace_path))
         except ValueError:
@@ -2250,7 +2249,7 @@ class WorkflowManager:
         # actual disk-full surface as IO_ERROR from the write.
         check_dir = self._probe_parent_for_disk_check(destination)
         if check_dir is not None:
-            config_manager = GriptapeNodes.ConfigManager()
+            config_manager = self.engine.config_manager
             min_space_gb = config_manager.get_config_value("minimum_disk_space_gb_workflows")
             if not OSManager.check_available_disk_space(check_dir, min_space_gb):
                 error_msg = OSManager.format_disk_space_error(check_dir)
@@ -2315,7 +2314,7 @@ class WorkflowManager:
 
     async def on_save_workflow_request(self, request: SaveWorkflowRequest) -> ResultPayload:  # noqa: C901, PLR0912, PLR0915
         # Determine save target (file path, name, metadata)
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
         current_workflow_name = (
             context_manager.get_current_workflow_name() if context_manager.has_current_workflow() else None
         )
@@ -2383,13 +2382,13 @@ class WorkflowManager:
         )
 
         # Serialize current flow and get shape
-        top_level_flow_result = await GriptapeNodes.ahandle_request(GetTopLevelFlowRequest())
+        top_level_flow_result = await self.engine.ahandle_request(GetTopLevelFlowRequest())
         if not isinstance(top_level_flow_result, GetTopLevelFlowResultSuccess):
             details = f"Attempted to save workflow '{relative_file_path}'. Failed when requesting top level flow."
             return SaveWorkflowResultFailure(result_details=details)
         top_level_flow_name = top_level_flow_result.flow_name
 
-        serialized_flow_result = await GriptapeNodes.ahandle_request(
+        serialized_flow_result = await self.engine.ahandle_request(
             SerializeFlowToCommandsRequest(flow_name=top_level_flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
@@ -2470,7 +2469,7 @@ class WorkflowManager:
         # `foo_v001.py` from a `foo.py` request; the registry must key by what
         # ended up on disk, not what was asked for.
         if save_target.destination is not None:
-            written_relative = self._workspace_relative_path(save_file_result.file_path)
+            written_relative = self._workspace_relative_path(save_file_result.file_path, self.engine)
             if written_relative != relative_file_path:
                 relative_file_path = written_relative
                 registry_key = derive_registry_key(relative_file_path)
@@ -2503,7 +2502,7 @@ class WorkflowManager:
                 self._rekey_substitution_flag(unsaved_source_key, registry_key)
                 rekeyed_workflow = WorkflowRegistry.get_workflow_by_name(registry_key)
                 rekeyed_workflow.file_path = relative_file_path
-            for workflow_context_state in GriptapeNodes.ContextManager()._workflow_stack:
+            for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == unsaved_source_key:
                     workflow_context_state._name = registry_key
             registered_workflows = WorkflowRegistry.list_workflows()
@@ -2562,7 +2561,7 @@ class WorkflowManager:
         Returns:
             A unique filename that doesn't exist in the workspace
         """
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        workspace_path = self.engine.config_manager.workspace_path
         base_path = workspace_path.joinpath(f"{base_name}.py")
         if not base_path.exists():
             return base_name
@@ -2824,7 +2823,7 @@ class WorkflowManager:
         the macro identified — minus builtins, which ProjectManager
         re-derives at resolve time and rejects caller overrides for.
         """
-        result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(result, GetSituationResultSuccess):
             msg = (
                 f"Attempted to build a versioned save destination. "
@@ -2855,7 +2854,7 @@ class WorkflowManager:
         # of OS.
         absolute_path = Path(WorkflowRegistry.get_complete_file_path(file_path)).as_posix()
 
-        match_result = GriptapeNodes.handle_request(
+        match_result = self.engine.handle_request(
             AttemptMatchPathAgainstMacroRequest(
                 parsed_macro=parsed_macro,
                 file_path=absolute_path,
@@ -2922,7 +2921,7 @@ class WorkflowManager:
         mismatch so the user can correct the situation if it doesn't reflect
         their intent.
         """
-        result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(result, GetSituationResultSuccess):
             return  # Missing situation surfaces as a load failure elsewhere; nothing useful to warn about here.
 
@@ -3083,7 +3082,7 @@ class WorkflowManager:
         file_name = Path(file_path).stem
 
         # Serialize the subflow.
-        serialized_flow_result = await GriptapeNodes.ahandle_request(
+        serialized_flow_result = await self.engine.ahandle_request(
             SerializeFlowToCommandsRequest(flow_name=request.flow_name, include_create_flow_command=True)
         )
         if not isinstance(serialized_flow_result, SerializeFlowToCommandsResultSuccess):
@@ -3167,7 +3166,7 @@ class WorkflowManager:
         """Generate workflow metadata from serialized commands."""
         # Get the engine version
         engine_version_request = GetEngineVersionRequest()
-        engine_version_result = GriptapeNodes.handle_request(request=engine_version_request)
+        engine_version_result = self.engine.handle_request(request=engine_version_request)
         if not isinstance(engine_version_result, GetEngineVersionResultSuccess):
             details = f"Failed getting the engine version for workflow '{file_name}'."
             raise TypeError(details)
@@ -3184,7 +3183,7 @@ class WorkflowManager:
         metadata_name = display_name if display_name is not None else str(file_name)
 
         direct_libs: list[LibraryNameAndVersion] = list(serialized_flow_commands.node_dependencies.libraries)
-        all_libs = GriptapeNodes.LibraryManager().resolve_transitive_library_deps(direct_libs)
+        all_libs = self.engine.library_manager.resolve_transitive_library_deps(direct_libs)
 
         return WorkflowMetadata(
             name=metadata_name,
@@ -5572,7 +5571,7 @@ class WorkflowManager:
         """
         workflow_shape: dict[str, Any] = {"input": {}, "output": {}}
 
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         if flow_name is None:
             result = flow_manager.on_get_top_level_flow_request(GetTopLevelFlowRequest())
             if result.failed():
@@ -5651,7 +5650,7 @@ class WorkflowManager:
         return WorkflowShape(inputs=input_node_params, outputs=output_node_params)
 
     def on_get_publish_options_request(self, request: GetPublishOptionsRequest) -> ResultPayload:
-        event_handler_mappings = GriptapeNodes.LibraryManager().get_registered_event_handlers(
+        event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
             request_type=PublishWorkflowRequest
         )
         publishing_handler = event_handler_mappings.get(request.publisher_name)
@@ -5671,7 +5670,7 @@ class WorkflowManager:
     async def on_publish_workflow_request(self, request: PublishWorkflowRequest) -> ResultPayload:
         try:
             publisher_name = request.publisher_name
-            event_handler_mappings = GriptapeNodes.LibraryManager().get_registered_event_handlers(
+            event_handler_mappings = self.engine.library_manager.get_registered_event_handlers(
                 request_type=type(request)
             )
             publishing_handler = event_handler_mappings.get(publisher_name)
@@ -5699,7 +5698,7 @@ class WorkflowManager:
                     "Saving as a new and registered workflow before proceeding on publish attempt."
                 )
                 logger.info(details)
-            await GriptapeNodes.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
+            await self.engine.ahandle_request(SaveWorkflowRequest(file_name=workflow_file_name))
 
             result = await asyncio.to_thread(publishing_handler.handler, request)
             if isinstance(result, PublishWorkflowResultSuccess) and not result.skip_published_workflow_registration:
@@ -5786,7 +5785,7 @@ class WorkflowManager:
         if request.flow_name is not None:
             flow_name = request.flow_name
         else:
-            flow_name = GriptapeNodes.ContextManager().get_current_flow().name
+            flow_name = self.engine.context_manager.get_current_flow().name
 
         # Execute the import
         return await self._execute_workflow_import(request, workflow, flow_name)
@@ -5824,12 +5823,12 @@ class WorkflowManager:
         # Check target flow
         flow_name = request.flow_name
         if flow_name is None:
-            if not GriptapeNodes.ContextManager().has_current_flow():
+            if not self.engine.context_manager.has_current_flow():
                 details = f"Attempted to import workflow '{request.workflow_name}' into Current Context. Failed because Current Context was empty"
                 return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
         else:
             # Validate that the specified flow exists
-            flow_manager = GriptapeNodes.FlowManager()
+            flow_manager = self.engine.flow_manager
             try:
                 flow_manager.get_flow_by_name(flow_name)
             except KeyError:
@@ -5855,13 +5854,13 @@ class WorkflowManager:
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
         # Get current flows before importing
-        obj_manager = GriptapeNodes.ObjectManager()
+        obj_manager = self.engine.object_manager
         flows_before = set(obj_manager.get_filtered_subset(type=ControlFlow).keys())
 
         # Execute the workflow within the target flow context.
         # When track_as_referenced is True, wrap in ReferencedWorkflowContext so the flow
         # serializes as an import command. When False, the flow serializes as inline content.
-        with GriptapeNodes.ContextManager().flow(flow_name):
+        with self.engine.context_manager.flow(flow_name):
             if request.track_as_referenced:
                 with self.ReferencedWorkflowContext(self, request.workflow_name):
                     workflow_result = await self.run_workflow(workflow_file_path)
@@ -5880,14 +5879,16 @@ class WorkflowManager:
             details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because no new flow was created"
             return ImportWorkflowAsReferencedSubFlowResultFailure(result_details=details)
 
-        created_flow_name = self._select_top_level_imported_flow(new_flows, flow_name, request.workflow_name)
+        created_flow_name = self._select_top_level_imported_flow(
+            new_flows, flow_name, request.workflow_name, self.engine
+        )
 
         # Apply imported flow metadata if provided
         if request.imported_flow_metadata:
             set_metadata_request = SetFlowMetadataRequest(
                 flow_name=created_flow_name, metadata=request.imported_flow_metadata
             )
-            set_metadata_result = GriptapeNodes.handle_request(set_metadata_request)
+            set_metadata_result = self.engine.handle_request(set_metadata_request)
 
             if not isinstance(set_metadata_result, SetFlowMetadataResultSuccess):
                 details = f"Attempted to import workflow '{request.workflow_name}' as referenced sub flow. Failed because metadata could not be applied to created flow '{created_flow_name}'"
@@ -5905,7 +5906,9 @@ class WorkflowManager:
         )
 
     @staticmethod
-    def _select_top_level_imported_flow(new_flows: set[str], parent_flow_name: str, workflow_name: str) -> str:
+    def _select_top_level_imported_flow(
+        new_flows: set[str], parent_flow_name: str, workflow_name: str, engine: Engine
+    ) -> str:
         """Select the top-level flow among those created by importing a referenced workflow.
 
         A workflow that contains node groups (ForEach, etc.) imports as more than one flow: its
@@ -5916,11 +5919,12 @@ class WorkflowManager:
             new_flows: Names of the flows created during the import.
             parent_flow_name: The flow the workflow was imported into (the import target).
             workflow_name: Name of the imported workflow, for diagnostics.
+            engine: The engine whose FlowManager resolves flow parentage.
 
         Returns:
             The name of the top-level imported flow.
         """
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = engine.flow_manager
         top_level_flows = [flow for flow in new_flows if flow_manager.get_parent_flow(flow) == parent_flow_name]
 
         if len(top_level_flows) == 1:
@@ -5930,7 +5934,7 @@ class WorkflowManager:
         # import. Fall back to a deterministic (sorted) choice rather than hash-ordered set iteration,
         # and log for diagnosis.
         candidates = top_level_flows or list(new_flows)
-        selected = sorted(candidates)[0]
+        selected = min(candidates)
         logger.warning(
             "Import of '%s' created %d flow(s) with %d parented to target '%s'; expected exactly one "
             "top-level flow. Using '%s'. All new flows: %s",
@@ -6449,10 +6453,8 @@ class WorkflowManager:
         def patch_class(class_type: type, instance: Any) -> None:
             """Patch a single class instance to use stable namespace."""
             module = getmodule(class_type)
-            if module and GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
-                stable_namespace = GriptapeNodes.LibraryManager().get_stable_namespace_for_dynamic_module(
-                    module.__name__
-                )
+            if module and self.engine.library_manager.is_dynamic_module(module.__name__):
+                stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(module.__name__)
                 if stable_namespace:
                     # Patch class __module__ (affects pickle class reference)
                     if class_type.__module__ != stable_namespace:
@@ -6513,11 +6515,11 @@ class WorkflowManager:
             """Collect import statement for a single class."""
             module = getmodule(class_type)
             if module and module.__name__ not in global_modules_set:
-                if GriptapeNodes.LibraryManager().is_dynamic_module(module.__name__):
+                if self.engine.library_manager.is_dynamic_module(module.__name__):
                     # Use stable namespace for dynamic modules. Route into deferred_imports
                     # so the caller can emit these inside build_workflow() after
                     # RegisterLibraryFromFileRequest has added the library to sys.path.
-                    stable_namespace = GriptapeNodes.LibraryManager().get_stable_namespace_for_dynamic_module(
+                    stable_namespace = self.engine.library_manager.get_stable_namespace_for_dynamic_module(
                         module.__name__
                     )
                     if stable_namespace:
@@ -6547,7 +6549,7 @@ class WorkflowManager:
     ) -> ResultPayload:
         """Register workflows from a configuration section."""
         try:
-            workflows_to_register = GriptapeNodes.ConfigManager().get_config_value(request.config_section)
+            workflows_to_register = self.engine.config_manager.get_config_value(request.config_section)
             if not workflows_to_register:
                 details = f"No workflows found in configuration section '{request.config_section}'"
                 return RegisterWorkflowsFromConfigResultSuccess(
@@ -6578,8 +6580,6 @@ class WorkflowManager:
         Returns:
             WorkflowRegistrationResult with succeeded and failed workflow names
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         succeeded = []
         failed = []
 
@@ -6589,7 +6589,7 @@ class WorkflowManager:
         # LibraryManager._collect_library_workflow_files before this scan runs. Sandbox
         # libraries are intentionally left scannable so in-development workflows appear.
         library_exclusion_roots: list[Path] = []
-        for library_info in GriptapeNodes.LibraryManager()._library_file_path_to_info.values():
+        for library_info in self.engine.library_manager._library_file_path_to_info.values():
             if library_info.is_sandbox:
                 continue
             library_exclusion_roots.append(Path(library_info.library_path).parent.resolve())
@@ -6649,7 +6649,7 @@ class WorkflowManager:
             workflow_name = str(workflow_file.name)
 
             # Emit loading event
-            GriptapeNodes.EventManager().put_event(
+            self.engine.event_manager.put_event(
                 AppEvent(
                     payload=EngineInitializationProgress(
                         phase=InitializationPhase.WORKFLOWS,
@@ -6666,7 +6666,7 @@ class WorkflowManager:
             if result_name:
                 succeeded.append(result_name)
                 # Emit success event
-                GriptapeNodes.EventManager().put_event(
+                self.engine.event_manager.put_event(
                     AppEvent(
                         payload=EngineInitializationProgress(
                             phase=InitializationPhase.WORKFLOWS,
@@ -6680,7 +6680,7 @@ class WorkflowManager:
             else:
                 failed.append(str(workflow_file))
                 # Emit failure event
-                GriptapeNodes.EventManager().put_event(
+                self.engine.event_manager.put_event(
                     AppEvent(
                         payload=EngineInitializationProgress(
                             phase=InitializationPhase.WORKFLOWS,
@@ -6701,8 +6701,6 @@ class WorkflowManager:
         Returns:
             Workflow name if registered successfully, None if failed or skipped
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # Parse metadata once and use it for both registration check and actual registration
         load_metadata_request = LoadWorkflowMetadata(file_name=str(workflow_file))
         load_metadata_result = await self.on_load_workflow_metadata_request(load_metadata_request)
@@ -6712,7 +6710,7 @@ class WorkflowManager:
             return None
 
         # Convert to relative path if the workflow is under workspace_path before checking registry
-        config_mgr = GriptapeNodes.ConfigManager()
+        config_mgr = self.engine.config_manager
         workspace_path = config_mgr.workspace_path
 
         if workflow_file.is_relative_to(workspace_path):
@@ -6728,10 +6726,9 @@ class WorkflowManager:
             logger.debug("Skipping already registered workflow: %s", workflow_file)
             return None
 
-        # Register workflow using existing method with parsed metadata available
-        # The _register_workflow method will re-parse metadata, but this is acceptable
-        # since we've already validated it's parseable and the duplicate work is minimal
-        if await self._register_workflow(file_path_to_register):
+        # Hand the already-parsed metadata to the registrar so the file's TOML header is
+        # read once per workflow rather than twice.
+        if self._register_workflow(file_path_to_register, load_metadata_result.metadata):
             return registry_key
         return None
 

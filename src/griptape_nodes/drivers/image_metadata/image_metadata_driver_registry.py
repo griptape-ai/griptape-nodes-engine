@@ -3,14 +3,13 @@
 from typing import ClassVar
 
 from griptape_nodes.drivers.image_metadata.base_image_metadata_driver import BaseImageMetadataDriver
-from griptape_nodes.utils.metaclasses import SingletonMeta
 
 
-class ImageMetadataDriverRegistry(metaclass=SingletonMeta):
+class ImageMetadataDriverRegistry:
     """Registry for image metadata injection drivers.
 
     Provides centralized registration and lookup of metadata injection drivers
-    based on image format. Follows singleton pattern to ensure single registry instance.
+    based on image format.
     """
 
     _drivers: ClassVar[list[BaseImageMetadataDriver]] = []
@@ -22,8 +21,7 @@ class ImageMetadataDriverRegistry(metaclass=SingletonMeta):
         Args:
             driver: Driver instance to register
         """
-        instance = cls()
-        instance._drivers.append(driver)
+        cls._drivers.append(driver)
 
     @classmethod
     def get_driver_for_format(cls, format_str: str) -> BaseImageMetadataDriver | None:
@@ -35,8 +33,7 @@ class ImageMetadataDriverRegistry(metaclass=SingletonMeta):
         Returns:
             Driver instance or None if no driver supports format
         """
-        instance = cls()
-        for driver in instance._drivers:
+        for driver in cls._drivers:
             if format_str in driver.get_supported_formats():
                 return driver
         return None
@@ -48,8 +45,7 @@ class ImageMetadataDriverRegistry(metaclass=SingletonMeta):
         Returns:
             Set of format strings supported by any registered driver
         """
-        instance = cls()
         formats = set()
-        for driver in instance._drivers:
+        for driver in cls._drivers:
             formats.update(driver.get_supported_formats())
         return formats

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Any
-from unittest.mock import MagicMock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -71,13 +71,12 @@ class TestGetWorkerForLibrary:
             requires_worker=True,
         )
 
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn:
-            mock_gtn.WorkerManager.return_value.get_worker_for_key.return_value = (
-                worker_engine_id,
-                worker_request_topic,
-            )
-            mgr._library_file_path_to_info["/some/path.json"] = lib_info
-            result = mgr.get_worker_for_library("my_lib")
+        cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = (
+            worker_engine_id,
+            worker_request_topic,
+        )
+        mgr._library_file_path_to_info["/some/path.json"] = lib_info
+        result = mgr.get_worker_for_library("my_lib")
 
         assert result == (worker_engine_id, worker_request_topic)
 
@@ -92,10 +91,9 @@ class TestGetWorkerForLibrary:
             requires_worker=False,
         )
 
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn:
-            mock_gtn.WorkerManager.return_value.get_worker_for_key.return_value = None
-            mgr._library_file_path_to_info["/some/path.json"] = lib_info
-            result = mgr.get_worker_for_library("my_lib")
+        cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = None
+        mgr._library_file_path_to_info["/some/path.json"] = lib_info
+        result = mgr.get_worker_for_library("my_lib")
 
         assert result is None
 
@@ -110,12 +108,11 @@ class TestGetWorkerForLibrary:
             requires_worker=True,
         )
 
-        with patch("griptape_nodes.retained_mode.managers.library_manager.GriptapeNodes") as mock_gtn:
-            mock_gtn.WorkerManager.return_value.get_worker_for_key.return_value = None
-            mgr._library_file_path_to_info["/some/path.json"] = lib_info
+        cast("MagicMock", mgr._worker_manager).get_worker_for_key.return_value = None
+        mgr._library_file_path_to_info["/some/path.json"] = lib_info
 
-            with pytest.raises(RuntimeError, match="requires a dedicated worker"):
-                mgr.get_worker_for_library("my_lib")
+        with pytest.raises(RuntimeError, match="requires a dedicated worker"):
+            mgr.get_worker_for_library("my_lib")
 
 
 class TestOnLibraryLoadedNotification:

@@ -21,6 +21,13 @@ if TYPE_CHECKING:
     # Circular import: flow_events <-> workflow_events
     from griptape_nodes.retained_mode.events.workflow_events import ImportWorkflowAsReferencedSubFlowRequest
 
+# Flow-metadata flag marking a flow as a runtime-only artifact the engine must never serialize.
+# A flow tagged with ``metadata[TRANSIENT_KEY] = True`` is skipped by the flow serializer, so it is
+# never baked into a saved workflow. Used for execution-time artifacts that are recreated on every
+# run and torn down after: SubflowWorkflowNode's imported subflows and the per-iteration loop-body
+# flows the iterative executor deserializes.
+TRANSIENT_KEY = "transient"
+
 
 class FlowMetadataExtractionFailureReason(StrEnum):
     """Reasons why flow metadata extraction from image failed."""

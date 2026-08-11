@@ -116,6 +116,8 @@ They exist to make common parameter patterns **simple, consistent, and runtime-m
 - Built-in UI options for file browser, webcam capture, and mask editing
 - Consistent behavior across all image-handling nodes
 
+This also keeps parameter values small: `ImageUrlArtifact` holds a short URL string, while the generic alternative `ImageArtifact` inlines the image's entire byte payload into WebSocket traffic, and into saved workflows unless the parameter is declared `serializable=False` — see [Parameter Payload Size](error_handling.md#parameter-payload-size).
+
 **Basic Usage:**
 
 ```python
@@ -135,7 +137,7 @@ self.add_parameter(
     ParameterImage(
         name="output_image",
         tooltip="Generated image result",
-        allow_input=False,   # Output only
+        allow_input=False,  # Output only
         allow_property=False,
     )
 )
@@ -168,6 +170,7 @@ def __init__(self, **kwargs) -> None:
     # Initialize visibility based on default model
     self._initialize_parameter_visibility()
 
+
 def _initialize_parameter_visibility(self) -> None:
     """Initialize parameter visibility based on default model."""
     model = self.get_parameter_value("model") or "default"
@@ -175,6 +178,7 @@ def _initialize_parameter_visibility(self) -> None:
         self.show_parameter_by_name("input_image")
     else:
         self.hide_parameter_by_name("input_image")
+
 
 def after_value_set(self, parameter: Parameter, value: Any) -> None:
     """Update visibility when model changes."""
@@ -216,6 +220,7 @@ self.add_parameter(
 
 **Why `ParameterImage` is better:**
 
+- **Small parameter values:** Declares `ImageUrlArtifact`, not `ImageArtifact` — see [Parameter Payload Size](error_handling.md#parameter-payload-size)
 - **Standardized type conversion logic:** Handles ImageArtifact, ImageUrlArtifact, and string inputs consistently
 - **Built-in UI features:** File browser, webcam capture, mask editing
 - **Less boilerplate:** Automatically configures types and options
@@ -241,6 +246,9 @@ self.add_parameter(
 - Enforce their corresponding `*UrlArtifact` `type` / `output_type` (e.g., `AudioUrlArtifact`, `VideoUrlArtifact`, `ThreeDUrlArtifact`).
 - These helpers primarily provide UI options (file browser / capture / editing / expanders). If you need coercion from e.g. `str` → artifact, supply `converters` and/or handle it in your node's `before_value_set()` / `process()` logic.
 - Follow the same patterns as `ParameterImage` for these media types.
+- **Audio:** `ParameterAudio` matters for payload size the same way `ParameterImage` does — `AudioArtifact` (the generic alternative) inlines its entire byte payload into WebSocket traffic, and into saved workflows unless the parameter is declared `serializable=False`; `AudioUrlArtifact` holds only a short URL. See [Parameter Payload Size](error_handling.md#parameter-payload-size).
+- **Video:** there is no raw-bytes `VideoArtifact` class, so that name carries no payload-size risk. Declare `VideoUrlArtifact` in new nodes — it's the type actually produced, and connection type-checking matches type names exactly, so `"VideoArtifact"` and `"VideoUrlArtifact"` are *not* interchangeable. Some libraries list both in `input_types` to accept either spelling.
+- **3D:** `ThreeDArtifact` holds raw bytes too, so prefer `ThreeDUrlArtifact` (which `Parameter3D` enforces). See [Parameter Payload Size](error_handling.md#parameter-payload-size).
 
 #### `ParameterButton`
 
@@ -265,6 +273,7 @@ Buttons must be wrapped in a `ParameterButtonGroup` container:
 from griptape_nodes.exe_types.core_types import ParameterButtonGroup
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload
+
 
 class MyNode(DataNode):
     def __init__(self, **kwargs) -> None:
@@ -503,7 +512,7 @@ Parameter(
     type="str",
     tooltip="Search term to find models",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"placeholder_text": "e.g., llama, bert, stable-diffusion"}
+    ui_options={"placeholder_text": "e.g., llama, bert, stable-diffusion"},
 )
 ```
 
@@ -516,7 +525,7 @@ Parameter(
     type="list[dict]",
     tooltip="Search results with full information",
     allowed_modes={ParameterMode.OUTPUT},
-    ui_options={"is_full_width": True}
+    ui_options={"is_full_width": True},
 )
 ```
 
@@ -529,22 +538,35 @@ Parameter(
     type="str",
     tooltip="Description of desired output",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"multiline": True, "placeholder_text": "Describe what you want..."}
+    ui_options={"multiline": True, "placeholder_text": "Describe what you want..."},
 )
 ```
 
-### File Upload with Browser
+### File Path with Browser
+
+To let the user pick a file or directory from disk, add the `FileSystemPicker` trait to a `str` parameter. The parameter's value is the chosen path:
 
 ```python
+from griptape_nodes.traits.file_system_picker import FileSystemPicker
+
 Parameter(
-    name="image",
-    input_types=["ImageArtifact", "ImageUrlArtifact", "str"],
-    type="ImageArtifact",
-    tooltip="Input image file",
+    name="config_path",
+    type="str",
+    tooltip="Path to the configuration file",
     allowed_modes={ParameterMode.INPUT, ParameterMode.PROPERTY},
-    ui_options={"clickable_file_browser": True}
+    traits={
+        FileSystemPicker(
+            allow_files=True,
+            allow_directories=False,
+            file_extensions=[".json", ".yaml"],
+        )
+    },
 )
 ```
+
+`FileSystemPicker` defaults to directories only, so pass `allow_files=True` when you want a file picker. It also supports `multiple`, `workspace_only`, size limits, and include/exclude patterns — see [Parameter UI Reference](parameter_ui_reference.md#traits).
+
+Media parameters work differently. `ParameterImage`, `ParameterAudio`, `ParameterVideo`, and `Parameter3D` each provide their own click-to-browse upload in the media viewer (`clickable_file_browser`, on by default), and the picked file is uploaded and handed to your node as a `*UrlArtifact` rather than a path string. Reach for those helpers for media instead of a `str` path — see [`ParameterImage`](#parameterimage-recommended-for-image-parameters) above.
 
 ## Advanced Parameter Patterns
 
@@ -572,6 +594,7 @@ Update parameter choices at runtime:
 
 ```python
 from griptape_nodes.traits.options import Options
+
 
 def _update_option_choices(self, param_name: str, choices: list, default_value: str):
     """Update Options trait choices dynamically."""
@@ -601,6 +624,8 @@ One consequence of always-replace: a replaced parameter's stored *property* valu
 #### Walkthrough — Multi-model image generation (hypothetical)
 
 > **Note on this example.** The `MultiModelImageGenerator` node used below is **hypothetical** — it does not exist in Griptape today, and this walkthrough is not a description of how any shipped node works. We use a hypothetical consolidated node here because it's the kind of node an author might build *on top of* `ParameterTransitionComponent`, and it makes the "switching between shapes" story concrete for an artist audience.
+>
+> It illustrates the mechanics of type narrowing, not a recommendation about parameter types. `reference_image` is typed `ImageArtifact` below purely because it makes the SDXL-vs-SD3 signature change easy to follow. A real node would declare `ImageUrlArtifact` — see [Parameter Payload Size](error_handling.md#parameter-payload-size).
 
 **The hypothetical node.** `MultiModelImageGenerator` has a **Model** dropdown offering **FLUX**, **SDXL**, and **Stable Diffusion 3**, plus a "— none —" option for an unconfigured starting state. Every model shares some parameters; each has its own extras. Here's the parameter surface per model:
 
@@ -714,19 +739,19 @@ The component manages individual parameters by name. If your dynamic surface use
 
 ### Advanced ParameterList Usage
 
-Include both individual and list types for maximum flexibility:
+Include both individual and list types for maximum flexibility. `ImageArtifact` entries here are for accepting connections from older workflows only — declare new list parameters against `ImageUrlArtifact` (see [Parameter Payload Size](error_handling.md#parameter-payload-size)):
 
 ```python
 self.add_parameter(
     ParameterList(
         name="images",
         input_types=[
-            "ImageArtifact",
             "ImageUrlArtifact",
+            "ImageArtifact",  # legacy input compatibility only
             "str",
             "list",
-            "list[ImageArtifact]",
             "list[ImageUrlArtifact]",
+            "list[ImageArtifact]",  # legacy input compatibility only
         ],
         default_value=[],
         tooltip="Input images (up to 10 images total)",
@@ -747,6 +772,7 @@ Parameters appear in the UI in the order they are added via `add_parameter()`. T
 ```python
 from griptape_nodes.exe_types.node_types import SuccessFailureNode
 from griptape_nodes.exe_types.param_types.parameter_image import ParameterImage
+
 
 class ColorMatch(SuccessFailureNode):
     """Transfer colors from a reference image to a target image."""

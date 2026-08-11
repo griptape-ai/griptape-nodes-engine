@@ -2,6 +2,7 @@ import logging
 from typing import Any, NamedTuple
 
 from griptape_nodes.common.macro_parser.exceptions import MacroResolutionError
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultPayload
 from griptape_nodes.retained_mode.events.variable_events import (
     CreateVariableRequest,
@@ -53,7 +54,6 @@ from griptape_nodes.retained_mode.events.variable_events import (
     SubstitutableSource,
     VariableDetails,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.variable_types import (
     FlowVariable,
@@ -118,10 +118,11 @@ def _project_type_mismatch(new_type: str, current_value: Any) -> str | None:
     return _project_value_mismatch(new_type, current_value)
 
 
-class VariablesManager:
+class VariablesManager(EngineScoped):
     """Manager for variables with scoped access control."""
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         # Storage for flow-scoped variables: one VariableLayer per flow, lazily created.
         self._flow_layers: dict[str, VariableLayer] = {}
         # Storage for global variables: single VariableLayer.
@@ -201,7 +202,7 @@ class VariablesManager:
         """Get the starting flow name, using Context Manager if None."""
         if starting_flow is not None:
             # Validate that the specified flow exists
-            flow_manager = GriptapeNodes.FlowManager()
+            flow_manager = self.engine.flow_manager
             try:
                 flow_manager.get_parent_flow(starting_flow)  # This will raise if flow doesn't exist
             except Exception as e:
@@ -210,7 +211,7 @@ class VariablesManager:
             return starting_flow
 
         # Get current flow from Context Manager
-        context_manager = GriptapeNodes.ContextManager()
+        context_manager = self.engine.context_manager
 
         if not context_manager.has_current_flow():
             msg = "No starting flow specified and no current flow in Context Manager"
@@ -220,7 +221,7 @@ class VariablesManager:
 
     def _get_flow_hierarchy(self, starting_flow: str) -> list[str]:
         """Get the flow hierarchy from starting flow up to root."""
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
 
         hierarchy = []
         current_flow = starting_flow
@@ -282,7 +283,7 @@ class VariablesManager:
 
     def _effective_project_id(self, project_id: str | None) -> str | None:
         """Resolve None → current project id; returns None when no project is available."""
-        return GriptapeNodes.ProjectManager().resolve_project_id(project_id)
+        return self.engine.project_manager.resolve_project_id(project_id)
 
     def _get_project_variable(self, name: str, *, project_id: str | None) -> FlowVariable | None:
         """Resolve a single project-layer variable (computed namespace first, then stored layer).
@@ -302,7 +303,7 @@ class VariablesManager:
         # non-computed name and catching ValueError would conflate "unknown name" with any
         # other ValueError the resolution might raise, silently violating the
         # computed-shadows-stored contract once stored entries exist.
-        project_manager = GriptapeNodes.ProjectManager()
+        project_manager = self.engine.project_manager
         if name in project_manager.project_computed_names(project_id=effective):
             try:
                 return project_manager.resolve_project_variable(name, project_id=effective)
@@ -360,7 +361,7 @@ class VariablesManager:
         effective = self._effective_project_id(project_id)
         if effective is None:
             return
-        error = GriptapeNodes.ProjectManager().persist_project_variables(effective)
+        error = self.engine.project_manager.persist_project_variables(effective)
         if error is not None:
             logger.warning("Project variable change for project '%s' not persisted: %s", effective, error)
 
@@ -373,7 +374,7 @@ class VariablesManager:
         effective = self._effective_project_id(project_id)
         if effective is None:
             return []
-        computed = GriptapeNodes.ProjectManager().project_computed_names(project_id=effective)
+        computed = self.engine.project_manager.project_computed_names(project_id=effective)
         names = sorted(computed)
         project_layer = self._project_layers.get(effective)
         if project_layer is not None:
@@ -392,7 +393,7 @@ class VariablesManager:
         effective = self._effective_project_id(project_id)
         if effective is None:
             return frozenset()
-        return GriptapeNodes.ProjectManager().project_computed_names(project_id=effective)
+        return self.engine.project_manager.project_computed_names(project_id=effective)
 
     def _collect_resolvable_project_variables(
         self, seen: set[str], *, project_id: str | None
@@ -1234,19 +1235,21 @@ class VariablesManager:
         from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
         from griptape_nodes.exe_types.variable_resolver import VariableResolver
 
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self.engine.flow_manager
         if flow_manager.check_for_existing_running_flow():
             # Mid-run: downstream UNRESOLVED nodes pick up new values naturally via ResolveSubstitutionRequest.
             return
 
         connections = flow_manager.get_connections()
 
-        for obj in list(GriptapeNodes.ObjectManager()._name_to_objects.values()):
+        for obj in list(self.engine.object_manager._name_to_objects.values()):
             if not isinstance(obj, BaseNode):
                 continue
             if obj.state not in (NodeResolutionState.RESOLVED, NodeResolutionState.RESOLVING):
                 continue
             for param in obj.parameters:
+                if not param.allow_variable_substitution:
+                    continue
                 value = obj.parameter_values.get(param.name, param.default_value)
                 if any(VariableResolver.references_variable(value, name) for name in variable_names):
                     obj.make_node_unresolved(

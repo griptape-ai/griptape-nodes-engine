@@ -175,7 +175,7 @@ plugins:
           - development/custom_nodes/parameter_ui_reference.md: Parameter type to widget mapping, supported ui_options keys, and traits
           - development/custom_nodes/execution_and_lifecycle.md: Lifecycle callbacks and asynchronous API integration patterns
           - development/custom_nodes/project_system.md: Saving files from nodes through the project system (situations, macros, ProjectFileParameter)
-          - development/custom_nodes/error_handling.md: Best practices for secrets, imports, validation, error handling, and logging
+          - development/custom_nodes/error_handling.md: Best practices for secrets, imports, parameter payload size, validation, error handling, and logging
           - development/custom_nodes/authoring_libraries.md: Library manifests, declarations, dependency management, and contributing to the standard library
           - development/custom_nodes/custom_widgets.md: Custom JavaScript widget components and the widget testbed
           - development/custom_nodes/examples.md: Advanced patterns from production nodes and quick-reference material

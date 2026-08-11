@@ -46,12 +46,15 @@ MODEL_CHOICES_ARGS = [
     {"name": "claude-opus-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": True},
     {"name": "claude-haiku-4-5", "icon": "logos/anthropic.svg", "args": _CLAUDE_ARGS, "vision": False},
     # Google
+    {"name": "gemini-3.6-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
+    {"name": "gemini-3.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
+    {"name": "gemini-3.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     {"name": "gemini-3.1-pro", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-3.1-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": False},
-    {"name": "gemini-3-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": False},
+    {"name": "gemini-3.1-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
+    {"name": "gemini-3-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     {"name": "gemini-2.5-pro", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
-    {"name": "gemini-2.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": False},
-    {"name": "gemini-2.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": False},
+    {"name": "gemini-2.5-flash", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
+    {"name": "gemini-2.5-flash-lite", "icon": "logos/google.svg", "args": _GEMINI_ARGS, "vision": True},
     # OpenAI
     {"name": "gpt-5.2", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": True},
     {"name": "gpt-5.2-chat", "icon": "logos/openai.svg", "args": _OPENAI_ARGS, "vision": False},
@@ -92,11 +95,14 @@ IMAGE_MODEL_CHOICES: list[str] = [str(model["name"]) for model in IMAGE_MODEL_CH
 # deprecation notice to the user.
 DEPRECATED_MODELS = {
     # Anthropic
-    "claude-3-7-sonnet": "claude-sonnet-4-6",
+    "claude-3-7-sonnet": "claude-sonnet-5",
     "claude-3-5-haiku": "claude-haiku-4-5",
-    "claude-sonnet-4-20250514": "claude-sonnet-4-6",
+    "claude-sonnet-4-20250514": "claude-sonnet-5",
+    "claude-4-5-sonnet": "claude-sonnet-5",
+    "claude-sonnet-4-6": "claude-sonnet-5",
+    "claude-opus-4-7": "claude-opus-5",
     # Bedrock
-    "amazon.titan-text-premier-v1": "claude-sonnet-4-6",
+    "amazon.titan-text-premier-v1": "claude-sonnet-5",
     # Azure OpenAI
     "gpt-4.5-preview": "gpt-4.1",
     "o1-mini": "o3-mini",

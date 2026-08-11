@@ -267,7 +267,7 @@ If you have an existing node that manually handles API key switching, here's how
 ```python
 def __init__(self, **kwargs: Any) -> None:
     super().__init__(**kwargs)
-    
+
     # Manual toggle parameter
     self.add_parameter(
         ParameterBool(
@@ -276,7 +276,7 @@ def __init__(self, **kwargs: Any) -> None:
             # ... lots of configuration ...
         )
     )
-    
+
     # Manual message
     self.add_node_element(
         ParameterMessage(
@@ -284,6 +284,7 @@ def __init__(self, **kwargs: Any) -> None:
             # ... lots of configuration ...
         )
     )
+
 
 def after_value_set(self, parameter: Parameter, value: Any) -> None:
     if parameter.name == "api_key_provider":
@@ -294,6 +295,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
         else:
             self.hide_message_by_name("set_api_key")
     return super().after_value_set(parameter, value)
+
 
 def _validate_api_key(self) -> tuple[str, bool]:
     use_user_api = self.get_parameter_value("api_key_provider") or False
@@ -311,9 +313,10 @@ from griptape_nodes.exe_types.param_components.api_key_provider_parameter import
     ApiKeyValidationResult,
 )
 
+
 def __init__(self, **kwargs: Any) -> None:
     super().__init__(**kwargs)
-    
+
     # Component handles everything
     self._api_key_provider = ApiKeyProviderParameter(
         node=self,
@@ -323,16 +326,19 @@ def __init__(self, **kwargs: Any) -> None:
     )
     self._api_key_provider.add_parameters()
 
+
 def after_value_set(self, parameter: Parameter, value: Any) -> None:
     self._api_key_provider.after_value_set(parameter, value)
     return super().after_value_set(parameter, value)
 
+
 def _validate_api_key(self) -> ApiKeyValidationResult:
     return self._api_key_provider.validate_api_key()
 
+
 def _process(self) -> None:
     validation_result = self._validate_api_key()
-    
+
     # Build headers - always use proxy API
     headers = {
         "Authorization": f"Bearer {validation_result.proxy_api_key}",
@@ -340,7 +346,7 @@ def _process(self) -> None:
     }
     if validation_result.user_api_key:
         headers["X-GTC-PROXY-AUTH-API-KEY"] = validation_result.user_api_key
-    
+
     # Always use proxy endpoint
     # ... make API call with headers ...
 ```

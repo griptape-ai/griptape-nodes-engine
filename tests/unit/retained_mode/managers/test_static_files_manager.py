@@ -368,7 +368,10 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         """Create StaticFilesManager instance with mocked dependencies."""
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config_manager, secrets_manager=mock_secrets_manager, event_manager=None
+                config_manager=mock_config_manager,
+                secrets_manager=mock_secrets_manager,
+                event_manager=None,
+                engine=Mock(),
             )
             manager.storage_driver = Mock()
             return manager
@@ -547,7 +550,6 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         resolved_path = Path("/mock/workspace/outputs/file.png")
 
@@ -557,7 +559,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultSuccess(
                 result_details="resolved",
@@ -587,12 +589,11 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultFailure,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultFailure(
                 result_details="missing variables",
@@ -636,7 +637,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.get_config_value.return_value = "local"
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
-            manager = StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+            manager = StaticFilesManager(
+                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+            )
         return manager
 
     def test_resolve_returns_path_and_policy_on_success(self, mock_static_files_manager: StaticFilesManager) -> None:
@@ -650,7 +653,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -681,11 +683,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config_manager = Mock()
         mock_config_manager.get_config_value.return_value = str(workspace_dir)
         mock_config_manager.workspace_path = workspace_dir
+        mock_static_files_manager.config_manager = mock_config_manager
 
-        with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
-        ):
+        with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
 
         assert result is not None
@@ -699,11 +699,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         import logging
 
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultFailure(result_details="situation not found"),
             ),
@@ -728,7 +727,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             SituationTemplate,
         )
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -738,7 +736,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultSuccess(situation=situation, result_details="ok"),
             ),
@@ -769,7 +767,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetSituationResultSuccess,
             PathResolutionFailureReason,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -795,7 +792,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             raise AssertionError(msg)
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
@@ -818,7 +815,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -854,8 +850,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")

@@ -24,7 +24,7 @@ Use this node when you want to:
 
 ### Parameters
 
-- **audio**: The captured audio output (AudioArtifact)
+- **audio**: The captured audio output (AudioUrlArtifact)
 
 ### Outputs
 
@@ -44,7 +44,7 @@ A simple workflow to record and transcribe audio:
 - The node requires microphone permissions in your browser
 - Audio is captured in real-time
 - The quality of the recording depends on your microphone and system settings
-- The node supports various audio formats through the AudioArtifact interface
+- Whatever format your browser records in, the capture is saved to a file and output as an AudioUrlArtifact
 
 ## Common Issues
 

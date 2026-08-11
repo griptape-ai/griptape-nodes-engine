@@ -14,6 +14,7 @@ from griptape_nodes.common.manifests.manifest import (
     ProjectTemplateManifestEntry,
 )
 from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     GetEngineVersionRequest,
     GetEngineVersionResultSuccess,
@@ -35,28 +36,30 @@ from griptape_nodes.retained_mode.events.project_events import (
     ListProjectTemplatesRequest,
     ListProjectTemplatesResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.project_events import ProjectTemplateInfo
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class ManifestManager:
+class ManifestManager(EngineScoped):
     """Builds manifests describing the engine's registered libraries and project templates.
 
     The manager owns no persistent state. It assembles a manifest on demand by
     querying the existing library and project registries through their events.
     """
 
-    def __init__(self, event_manager: EventManager) -> None:
+    def __init__(self, event_manager: EventManager, *, engine: Engine | None = None) -> None:
         """Initialize the ManifestManager.
 
         Args:
             event_manager: The EventManager instance to use for event handling.
+            engine: The owning Engine, used to resolve peer managers.
         """
+        super().__init__(engine)
         event_manager.assign_manager_to_request_type(GenerateManifestRequest, self.on_generate_manifest_request)
 
     async def on_generate_manifest_request(
@@ -67,7 +70,7 @@ class ManifestManager:
         # catalog (aggregated from library declarations) is requested.
         library_names: list[str] = []
         if request.include_libraries or request.include_model_catalog:
-            list_result = await GriptapeNodes.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
+            list_result = await self.engine.ahandle_request(ListRegisteredLibrariesRequest(broadcast_result=False))
             if not isinstance(list_result, ListRegisteredLibrariesResultSuccess):
                 return GenerateManifestResultFailure(
                     result_details=f"Attempted to generate manifest. Failed to list registered libraries: {list_result.result_details}"
@@ -88,7 +91,7 @@ class ManifestManager:
             # System builtins (the always-loaded default project) are included:
             # they are real templates an engine can be working in, so consumers
             # picking from the manifest must be able to reference them.
-            projects_result = await GriptapeNodes.ahandle_request(
+            projects_result = await self.engine.ahandle_request(
                 ListProjectTemplatesRequest(include_system_builtins=True, broadcast_result=False)
             )
             if not isinstance(projects_result, ListProjectTemplatesResultSuccess):
@@ -124,7 +127,7 @@ class ManifestManager:
         """
         entries: list[LibraryManifestEntry] = []
         for name in library_names:
-            metadata_result = await GriptapeNodes.ahandle_request(
+            metadata_result = await self.engine.ahandle_request(
                 GetLibraryMetadataRequest(library=name, broadcast_result=False)
             )
             metadata = None
@@ -137,7 +140,7 @@ class ManifestManager:
                     metadata_result.result_details,
                 )
 
-            source_result = await GriptapeNodes.ahandle_request(
+            source_result = await self.engine.ahandle_request(
                 GetLibrarySourceInfoRequest(library=name, broadcast_result=False)
             )
             path = None
@@ -178,7 +181,7 @@ class ManifestManager:
         providers: dict[str, ModelProviderManifestEntry] = {}
         models: dict[str, ModelManifestEntry] = {}
         for name in library_names:
-            metadata_result = await GriptapeNodes.ahandle_request(
+            metadata_result = await self.engine.ahandle_request(
                 GetLibraryMetadataRequest(library=name, broadcast_result=False)
             )
             if not isinstance(metadata_result, GetLibraryMetadataResultSuccess):
@@ -240,14 +243,14 @@ class ManifestManager:
     def _resolve_engine_id(self) -> str | None:
         """Resolve the engine's identifier, or None when it cannot be determined."""
         try:
-            return GriptapeNodes.EngineIdentityManager().engine_id
+            return self.engine.engine_identity_manager.engine_id
         except Exception:
             logger.warning("Could not resolve engine id while generating manifest.", exc_info=True)
             return None
 
     async def _resolve_engine_version(self) -> str | None:
         """Resolve the engine version string, or None when it cannot be determined."""
-        version_result = await GriptapeNodes.ahandle_request(GetEngineVersionRequest(broadcast_result=False))
+        version_result = await self.engine.ahandle_request(GetEngineVersionRequest(broadcast_result=False))
         if isinstance(version_result, GetEngineVersionResultSuccess):
             return f"{version_result.major}.{version_result.minor}.{version_result.patch}"
         logger.warning(

@@ -20,6 +20,7 @@ Use `GriptapeNodes.SecretsManager()` to access API keys and secrets:
 ```python
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+
 class MyNode(DataNode):
     SERVICE_NAME = "MyService"
     API_KEY_NAME = "MY_SERVICE_API_KEY"
@@ -37,6 +38,23 @@ class MyNode(DataNode):
 - Use `SecretsManager().get_secret()` to retrieve secrets
 - Define `API_KEY_NAME` as a class constant for consistency
 - Always validate that the secret exists before using it
+
+### Parameter Payload Size
+
+A parameter value can end up fully embedded in two places:
+
+- **Saved workflow files.** The workflow serializer writes unique parameter values inline into the saved `.py` file, with no size limit — whatever Python state the value holds gets written out whole.
+- **WebSocket events.** Parameter values traveling in request/response events are serialized and sent to every connected client (the editor UI, the MCP server).
+
+Neither path checks the size of the value first, so by default a large value bloats both the saved workflow file and the traffic to every connected client. Store large binary data (images, audio, video, 3D assets, model weights) by reference — a file path or URL — rather than inlining the bytes, wherever the node's underlying API allows it.
+
+`Parameter(serializable=False)` (see [Parameter Attributes](parameters.md#parameter-attributes)) covers **only the first path**. It keeps a value out of saved workflow files — the right choice for values that should never persist, such as drivers, file handles, and large transient buffers — but it has no effect on the second: the value is still sent to every connected client. There is no per-parameter opt-out of the WebSocket path, so keeping the value small is the only lever you have over it.
+
+!!! warning "Keep parameter values small"
+
+    `griptape.artifacts.BlobArtifact` stores raw bytes, and `ImageArtifact` / `AudioArtifact` both subclass it — so a node using one of these as a parameter type sends the entire byte payload to every connected client, and writes it into saved workflows unless the parameter is declared `serializable=False`. Use `ImageUrlArtifact` / `AudioUrlArtifact` instead (the `ParameterImage` / `ParameterAudio` helper classes enforce them — see [Parameters](parameters.md#parameterimage-recommended-for-image-parameters)), which hold only a short URL string no matter how large the file they point to is.
+
+    Raw bytes aren't confined to `BlobArtifact` and its subclasses — `ThreeDArtifact` holds them too (though does not send its bytes over the WebSocket). Judge a parameter by the size of the value it will actually hold, not by whether its type name looks safe.
 
 ### Import Best Practices
 
@@ -58,6 +76,7 @@ def _get_image_data(self, image_artifact):
 # At top of file
 from PIL import Image
 from io import BytesIO
+
 
 def _get_image_data(self, image_artifact):
     img = Image.open(BytesIO(image_bytes))
@@ -227,9 +246,7 @@ def validate_before_node_run(self) -> list[Exception] | None:
     if model == "advanced":
         images = self.get_parameter_list_value("images") or []
         if len(images) > MAX_IMAGES:
-            exceptions.append(ValueError(
-                f"{self.name}: Maximum {MAX_IMAGES} images allowed, got {len(images)}"
-            ))
+            exceptions.append(ValueError(f"{self.name}: Maximum {MAX_IMAGES} images allowed, got {len(images)}"))
 
     return exceptions if exceptions else None
 ```
@@ -280,6 +297,7 @@ def _set_safe_defaults(self) -> None:
     self.parameter_output_values["status"] = "error"
     self.parameter_output_values["count"] = 0
 
+
 def process(self) -> None:
     try:
         # Processing logic
@@ -297,6 +315,7 @@ Use `urllib.parse.urljoin()` for safe URL building:
 ```python
 from urllib.parse import urljoin
 import os
+
 
 def __init__(self, **kwargs):
     super().__init__(**kwargs)
@@ -320,6 +339,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
 def _log(self, message: str) -> None:
     """Safe logging with exception suppression."""
     with suppress(Exception):
@@ -335,6 +355,7 @@ from copy import deepcopy
 import json
 
 PROMPT_TRUNCATE_LENGTH = 100
+
 
 def _log_request(self, payload: dict[str, Any]) -> None:
     """Log request with sanitized sensitive data."""

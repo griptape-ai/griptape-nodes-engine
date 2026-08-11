@@ -64,6 +64,7 @@ from griptape_nodes.files.path_utils import (
     sanitize_path_string,
     strip_surrounding_quotes,
 )
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import ResultDetails, ResultPayload
 from griptape_nodes.retained_mode.events.os_events import (
     CopyFileRequest,
@@ -141,7 +142,6 @@ from griptape_nodes.retained_mode.events.resource_events import (
     RegisterResourceTypeResultSuccess,
 )
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import write_sidecar
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes, logger
 from griptape_nodes.retained_mode.managers.artifact_providers import WriteVettingPolicy
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.resource_types.compute_resource import ComputeBackend, ComputeResourceType
@@ -155,6 +155,7 @@ if TYPE_CHECKING:
 from griptape_nodes.utils.image_preview import create_image_preview_from_bytes
 
 console = Console()
+logger = logging.getLogger("griptape_nodes")
 
 # Maximum number of indexed candidates to try when CREATE_NEW policy is used
 MAX_INDEXED_CANDIDATES = 1000
@@ -291,7 +292,7 @@ class WindowsSpecialFolderResult(NamedTuple):
     remaining_parts: list[str] | None
 
 
-class OSManager:
+class OSManager(EngineScoped):
     """A class to manage OS-level scenarios.
 
     Making its own class as some runtime environments and some customer requirements may dictate this as optional.
@@ -372,7 +373,8 @@ class OSManager:
         remaining = parts[1:] if len(parts) > 1 else []
         return WindowsSpecialFolderResult(special_path=special_path, remaining_parts=remaining)
 
-    def __init__(self, event_manager: EventManager | None = None):
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None):
+        super().__init__(engine)
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(
                 request_type=OpenAssociatedFileRequest, callback=self.on_open_associated_file_request
@@ -476,7 +478,7 @@ class OSManager:
 
     def _get_workspace_path(self) -> Path:
         """Get the workspace path from config."""
-        return GriptapeNodes.ConfigManager().workspace_path
+        return self.engine.config_manager.workspace_path
 
     def _get_windows_special_folder_path(self, csidl: int) -> Path:
         """Get Windows special folder path using Shell API.
@@ -610,7 +612,7 @@ class OSManager:
             MacroResolutionFailure: Details about resolution failure (missing variables, etc.)
             str: Successfully resolved absolute path string (success path; last)
         """
-        result = GriptapeNodes.handle_request(
+        result = self.engine.handle_request(
             GetPathForMacroRequest(
                 parsed_macro=macro_path.parsed_macro,
                 variables=macro_path.variables,
@@ -712,7 +714,7 @@ class OSManager:
         Returns:
             Tuple of (is_workspace_path, relative_or_absolute_path)
         """
-        workspace = GriptapeNodes.ConfigManager().workspace_path
+        workspace = self.engine.config_manager.workspace_path
 
         # Canonicalize both sides so ~ / env vars / symlinks / relative spellings
         # all compare equal. Non-existent paths don't raise; the resolvable
@@ -907,7 +909,7 @@ class OSManager:
             → Raises ValueError (batch and frame_num both unresolved)
         """
         # Partially resolve to identify unresolved variables
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         partial = partial_resolve(parsed_macro.template, parsed_macro.segments, variables, secrets_manager)
 
         # Get unresolved variables (optional variables already filtered out)
@@ -1019,7 +1021,7 @@ class OSManager:
             Variables: {"outputs": "/path"}
             → Returns 123
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
 
         # Normalize path separators to POSIX form before reverse-matching. The
         # macro template uses `/` by convention, but the filename comes from
@@ -1317,7 +1319,7 @@ class OSManager:
                 Files: []
                 Returns: 1 (start with index 1)
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         index_var_name = index_var.info.name
 
         # Check if index variable is optional
@@ -1593,7 +1595,7 @@ class OSManager:
             # Cache workspace path and resolved workspace to avoid repeated lookups/resolutions
             # Only resolve workspace if we need it for relative paths or absolute paths
             need_relative_paths = request.workspace_only is True
-            workspace_path = GriptapeNodes.ConfigManager().workspace_path
+            workspace_path = self.engine.config_manager.workspace_path
             if need_relative_paths or request.include_absolute_path:
                 resolved_workspace = canonicalize_for_identity(workspace_path)
             else:
@@ -2015,9 +2017,7 @@ class OSManager:
                 filename_pattern=filename_pattern,
             )
 
-        resolve_result = GriptapeNodes.handle_request(
-            GetPathForMacroRequest(parsed_macro=parsed_directory, variables={})
-        )
+        resolve_result = self.engine.handle_request(GetPathForMacroRequest(parsed_macro=parsed_directory, variables={}))
         if not isinstance(resolve_result, GetPathForMacroResultSuccess):
             return ScanSequencesResultFailure(
                 failure_reason=SequenceScanFailureReason.INVALID_TEMPLATE,
@@ -2186,7 +2186,7 @@ class OSManager:
 
             # Only check workspace directory for absolute local paths
             if path_obj.is_absolute():
-                config_manager = GriptapeNodes.ConfigManager()
+                config_manager = self.engine.config_manager
                 static_dir = config_manager.workspace_path
 
                 try:
@@ -2197,7 +2197,7 @@ class OSManager:
                     pass
                 else:
                     # File is in static directory, construct URL directly
-                    static_base_url = GriptapeNodes.StaticFilesManager().static_server_base_url
+                    static_base_url = self.engine.static_files_manager.static_server_base_url
                     static_url = f"{static_base_url}/workspace/{file_relative_to_static}"
                     msg = f"Image already in workspace directory, returning URL: {static_url}"
                     logger.debug(msg)
@@ -2279,7 +2279,7 @@ class OSManager:
         next_index = self._scan_for_next_available_index(parsed_macro, variables, index_info)
 
         # Resolve path with the index
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
         try:
             if next_index is None:
                 # Optional index variable with base filename available
@@ -2437,7 +2437,7 @@ class OSManager:
         # sniffed_ext also implies ``request.content`` is bytes; downstream code
         # relies on that.
         sniffed_ext = (
-            GriptapeNodes.ArtifactManager().sniff_extension(request.content)
+            self.engine.artifact_manager.sniff_extension(request.content)
             if isinstance(request.content, bytes)
             else None
         )
@@ -2488,9 +2488,9 @@ class OSManager:
         if (
             isinstance(content, bytes)
             and not request.skip_metadata_injection
-            and GriptapeNodes.ConfigManager().get_config_value("auto_inject_workflow_metadata")
+            and self.engine.config_manager.get_config_value("auto_inject_workflow_metadata")
         ):
-            content = GriptapeNodes.ArtifactManager().prepare_content_for_write(content, file_path.name)
+            content = self.engine.artifact_manager.prepare_content_for_write(content, file_path.name)
 
         # Now attempt the write, based on our collision (existing file) policy.
         match request.existing_file_policy:
@@ -2644,7 +2644,7 @@ class OSManager:
                         start_idx = starting_index if starting_index is not None else 1
 
                     # Try indexed candidates on-demand (up to max attempts)
-                    secrets_manager = GriptapeNodes.SecretsManager()
+                    secrets_manager = self.engine.secrets_manager
                     attempted_count = 0
 
                     for idx in range(start_idx, start_idx + MAX_INDEXED_CANDIDATES):
@@ -2837,7 +2837,7 @@ class OSManager:
         Raises ``StagingFailedError`` on any failure, tagged with the
         ``FileIOFailureReason`` that would have appeared in the request result.
         """
-        situation_result = GriptapeNodes.handle_request(
+        situation_result = self.engine.handle_request(
             GetSituationRequest(situation_name=BuiltInSituation.SAVE_TEMP_FILE)
         )
         if not isinstance(situation_result, GetSituationResultSuccess):
@@ -2853,9 +2853,7 @@ class OSManager:
             msg = f"Attempted to write temp file. Failed to parse SAVE_TEMP_FILE macro: {exc}"
             raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH) from exc
 
-        path_result = GriptapeNodes.handle_request(
-            GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables)
-        )
+        path_result = self.engine.handle_request(GetPathForMacroRequest(parsed_macro=parsed_macro, variables=variables))
         if not isinstance(path_result, GetPathForMacroResultSuccess):
             msg = f"Attempted to write temp file. Failed to resolve SAVE_TEMP_FILE macro: {path_result.result_details}"
             raise StagingFailedError(msg, FileIOFailureReason.INVALID_PATH)
@@ -2929,7 +2927,7 @@ class OSManager:
         except OSError as exc:
             logger.error("Attempted to truncate staged codec-vet temp at '%s'. Failed: %s", staged_path, exc)
 
-        delete_result = GriptapeNodes.handle_request(
+        delete_result = self.engine.handle_request(
             DeleteFileRequest(
                 path=staged_path,
                 workspace_only=False,
@@ -2970,7 +2968,7 @@ class OSManager:
         falling through would let a policy variant added without updating
         this switch bless every write that reached it.
         """
-        artifact_manager = GriptapeNodes.ArtifactManager()
+        artifact_manager = self.engine.artifact_manager
         policy = artifact_manager.get_write_vetting_policy(sniffed_ext)
         denial: CheckpointDenial | None = None
 
@@ -3859,7 +3857,7 @@ class OSManager:
 
         https://stackoverflow.com/a/50924863
         """
-        if not GriptapeNodes.OSManager().is_windows():
+        if not OSManager.is_windows():
             return
 
         long_path = Path(normalize_path_for_platform(Path(path)))
@@ -4297,8 +4295,9 @@ class OSManager:
     def _register_system_resources_direct(self) -> None:
         """Register OS, CPU, and Compute resource types directly during initialization.
 
-        This method is called during __init__ and uses the event_manager directly
-        to avoid singleton recursion issues with GriptapeNodes.handle_request.
+        This method is called during __init__ and uses the event_manager directly so
+        registration does not re-enter the full request pipeline before the engine has
+        finished wiring itself up.
         """
         self._attempt_generate_os_resources_direct()
         self._attempt_generate_cpu_resources_direct()
@@ -4307,7 +4306,8 @@ class OSManager:
     def _handle_request_direct(self, request: Any) -> Any:
         """Handle a request directly through the event_manager during initialization.
 
-        This bypasses GriptapeNodes.handle_request to avoid singleton recursion.
+        Dispatches straight to the registered callback, skipping the result broadcast and
+        re-entrancy the full request path would add while the engine is still constructing.
         """
         request_type = type(request)
         callback = self._event_manager._request_type_to_manager.get(request_type)
@@ -4425,7 +4425,7 @@ class OSManager:
         # Register OS resource type
         os_resource_type = OSResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=os_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error("Attempted to register OS resource type. Failed due to resource type registration failure")
@@ -4440,7 +4440,7 @@ class OSManager:
         # Register CPU resource type
         cpu_resource_type = CPUResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=cpu_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error("Attempted to register CPU resource type. Failed due to resource type registration failure")
@@ -4460,7 +4460,7 @@ class OSManager:
         create_request = CreateResourceInstanceRequest(
             resource_type_name="OSResourceType", capabilities=os_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(
@@ -4479,7 +4479,7 @@ class OSManager:
         create_request = CreateResourceInstanceRequest(
             resource_type_name="CPUResourceType", capabilities=cpu_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(
@@ -4494,7 +4494,7 @@ class OSManager:
         # Register Compute resource type
         compute_resource_type = ComputeResourceType()
         register_request = RegisterResourceTypeRequest(resource_type=compute_resource_type)
-        result = GriptapeNodes.handle_request(register_request)
+        result = self.engine.handle_request(register_request)
 
         if not isinstance(result, RegisterResourceTypeResultSuccess):
             logger.error(
@@ -4514,7 +4514,7 @@ class OSManager:
         create_request = CreateResourceInstanceRequest(
             resource_type_name="ComputeResourceType", capabilities=compute_capabilities
         )
-        result = GriptapeNodes.handle_request(create_request)
+        result = self.engine.handle_request(create_request)
 
         if not isinstance(result, CreateResourceInstanceResultSuccess):
             logger.error(

@@ -27,7 +27,6 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries.duplicate_
 from griptape_nodes.retained_mode.managers.resource_components.resource_instance import (
     Requirements,
 )
-from griptape_nodes.utils.metaclasses import SingletonMeta
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -35,6 +34,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
     from griptape_nodes.node_library.library_declarations import ResolvedModel
+    from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
 
 logger = logging.getLogger("griptape_nodes")
@@ -239,8 +239,13 @@ class LibrarySchema(BaseModel):
     widgets: list[WidgetDefinition] | None = None
 
 
-class LibraryRegistry(metaclass=SingletonMeta):
-    """Singleton registry to manage many libraries."""
+class LibraryRegistry:
+    """Process-global registry of libraries and the node classes they contain.
+
+    Registration imports library modules into `sys.modules` and hands out the resulting
+    `type[BaseNode]` classes, so this state is inherently process-wide: every engine in
+    the process shares the same imported modules and must share the same registry.
+    """
 
     _libraries: ClassVar[dict[str, Library]] = {}
     _node_aliases: ClassVar[dict[str, Library]] = {}
@@ -252,9 +257,10 @@ class LibraryRegistry(metaclass=SingletonMeta):
     def _clear(cls) -> None:
         """Drop every registered library and its tracking state.
 
-        Used by tests to reset the singleton between cases. Centralizes the store
-        list here so renaming a `ClassVar` updates this one method rather than
-        silently degrading callers that would otherwise clear stores by name.
+        This is the deliberate reset for this process-global registry: `tests/e2e/conftest.py`
+        calls it between cases. Centralizes the store list here so renaming a `ClassVar`
+        updates this one method rather than silently degrading callers that would otherwise
+        clear stores by name.
         """
         cls._libraries.clear()
         cls._node_aliases.clear()
@@ -269,26 +275,22 @@ class LibraryRegistry(metaclass=SingletonMeta):
         mark_as_default_library: bool = False,
         advanced_library: AdvancedNodeLibrary | None = None,
     ) -> Library:
-        instance = cls()
-
-        if library_data.name in instance._libraries:
+        if library_data.name in cls._libraries:
             msg = f"Library '{library_data.name}' already registered."
             raise KeyError(msg)
         library = Library(
             library_data=library_data, is_default_library=mark_as_default_library, advanced_library=advanced_library
         )
-        instance._libraries[library_data.name] = library
+        cls._libraries[library_data.name] = library
         return library
 
     @classmethod
-    def unregister_library(cls, library_name: str) -> None:
-        instance = cls()
-
-        if library_name not in instance._libraries:
+    def unregister_library(cls, library_name: str, *, event_manager: EventManager) -> None:
+        if library_name not in cls._libraries:
             msg = f"Library '{library_name}' was requested to be unregistered, but it wasn't registered in the first place."
             raise KeyError(msg)
 
-        library = instance._libraries[library_name]
+        library = cls._libraries[library_name]
         advanced_library = library.get_advanced_library()
 
         # Teardown hook — called before any deregistration.
@@ -303,15 +305,7 @@ class LibraryRegistry(metaclass=SingletonMeta):
                 )
                 # Continue — a failing teardown must not prevent unregistration.
 
-        # Deregister tracked handlers. Lazy import required: library_registry is part of the
-        # import chain griptape_nodes → workflow_registry → library_registry, so a top-level
-        # import of GriptapeNodes here would create a circular dependency.
-        from griptape_nodes.retained_mode.griptape_nodes import (
-            GriptapeNodes,
-        )  # circular: griptape_nodes → workflow_registry → library_registry
-
-        event_manager = GriptapeNodes.EventManager()
-
+        # Deregister tracked handlers.
         if library._registered_app_event_listeners:
             for event_type, listener in library._registered_app_event_listeners:
                 event_manager.remove_listener_for_app_event(event_type, listener)
@@ -331,23 +325,20 @@ class LibraryRegistry(metaclass=SingletonMeta):
         cls.unregister_widgets_for_library(library_name)
 
         # Now delete the library from the registry.
-        del instance._libraries[library_name]
+        del cls._libraries[library_name]
 
     @classmethod
     def get_library(cls, name: str) -> Library:
-        instance = cls()
-        if name not in instance._libraries:
+        if name not in cls._libraries:
             msg = f"Library '{name}' not found"
             raise KeyError(msg)
-        return instance._libraries[name]
+        return cls._libraries[name]
 
     @classmethod
     def list_libraries(cls) -> list[str]:
-        instance = cls()
-
         # Put the default libraries first.
-        default_libraries = [k for k, v in instance._libraries.items() if v.is_default_library()]
-        other_libraries = [k for k, v in instance._libraries.items() if not v.is_default_library()]
+        default_libraries = [k for k, v in cls._libraries.items() if v.is_default_library()]
+        other_libraries = [k for k, v in cls._libraries.items() if not v.is_default_library()]
         sorted_list = default_libraries + other_libraries
         return sorted_list
 
@@ -373,14 +364,12 @@ class LibraryRegistry(metaclass=SingletonMeta):
         cls, library_name: str, widget_name: str
     ) -> DuplicateWidgetRegistrationProblem | None:
         """Register a widget from a library. Returns a LibraryProblem if registration fails."""
-        instance = cls()
-
         # Initialize the set for this library if needed
-        if library_name not in instance._registered_widgets:
-            instance._registered_widgets[library_name] = set()
+        if library_name not in cls._registered_widgets:
+            cls._registered_widgets[library_name] = set()
 
         # Check if widget is already registered for this library
-        if widget_name in instance._registered_widgets[library_name]:
+        if widget_name in cls._registered_widgets[library_name]:
             logger.error(
                 "Attempted to register widget '%s' from library '%s', but a widget with that name from that library was already registered",
                 widget_name,
@@ -389,35 +378,31 @@ class LibraryRegistry(metaclass=SingletonMeta):
             return DuplicateWidgetRegistrationProblem(widget_name=widget_name, library_name=library_name)
 
         # Register the widget
-        instance._registered_widgets[library_name].add(widget_name)
+        cls._registered_widgets[library_name].add(widget_name)
         return None
 
     @classmethod
     def unregister_widgets_for_library(cls, library_name: str) -> None:
         """Unregister all widgets for a library (used during library unload)."""
-        instance = cls()
-        if library_name in instance._registered_widgets:
-            del instance._registered_widgets[library_name]
+        if library_name in cls._registered_widgets:
+            del cls._registered_widgets[library_name]
 
     @classmethod
     def get_libraries_with_node_type(cls, node_type: str) -> list[str]:
-        instance = cls()
         libraries = []
-        for library_name, library in instance._libraries.items():
+        for library_name, library in cls._libraries.items():
             if library.has_node_type(node_type):
                 libraries.append(library_name)
         return libraries
 
     @classmethod
     def get_library_for_node_type(cls, node_type: str, specific_library_name: str | None = None) -> Library:
-        instance = cls()
-
         if specific_library_name is None:
             # Find its library.
             libraries_with_node_type = LibraryRegistry.get_libraries_with_node_type(node_type)
             if len(libraries_with_node_type) == 1:
                 specific_library_name = libraries_with_node_type[0]
-                dest_library = instance.get_library(specific_library_name)
+                dest_library = cls.get_library(specific_library_name)
             elif len(libraries_with_node_type) > 1:
                 msg = f"Attempted to create a node of type '{node_type}' with no library name specified. The following libraries have nodes in them with the same name: {libraries_with_node_type}. In order to disambiguate, specify the library this node should come from."
                 raise KeyError(msg)
@@ -426,7 +411,7 @@ class LibraryRegistry(metaclass=SingletonMeta):
                 raise KeyError(msg)
         else:
             # See if the library exists.
-            dest_library = instance.get_library(specific_library_name)
+            dest_library = cls.get_library(specific_library_name)
 
         return dest_library
 
@@ -438,11 +423,7 @@ class LibraryRegistry(metaclass=SingletonMeta):
         metadata: dict[Any, Any] | None = None,
         specific_library_name: str | None = None,
     ) -> BaseNode:
-        instance = cls()
-
-        dest_library = instance.get_library_for_node_type(
-            node_type=node_type, specific_library_name=specific_library_name
-        )
+        dest_library = cls.get_library_for_node_type(node_type=node_type, specific_library_name=specific_library_name)
 
         with cls.constructing_node():
             return dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
@@ -489,11 +470,10 @@ class LibraryRegistry(metaclass=SingletonMeta):
         Returns:
             Dictionary mapping category names to their JSON Schema dicts
         """
-        instance = cls()
         schemas = {}
 
         # Get explicit schemas from loaded libraries
-        for library in instance._libraries.values():
+        for library in cls._libraries.values():
             library_data = library.get_library_data()
             if library_data.settings:
                 for setting in library_data.settings:
@@ -513,6 +493,46 @@ class LibraryRegistry(metaclass=SingletonMeta):
         return schemas
 
 
+class NodeTypeEntry:
+    """A node type registered in a Library, resolved to its class on demand.
+
+    Holds the node's class name plus either an already-imported class (eager
+    registration) or a zero-argument loader that imports the class on first
+    ``resolve()`` (lazy registration). Either way the resolved class is cached,
+    so a node's module is imported at most once. When registered lazily, the
+    module is imported the first time the class is actually needed (node
+    creation, execution, or introspection) rather than at library load time, so
+    startup never pays the import cost of node modules that are never used, and
+    an import failure surfaces to whichever caller first resolves the entry.
+    """
+
+    def __init__(
+        self,
+        class_name: str,
+        *,
+        node_class: type[BaseNode] | None = None,
+        loader: Callable[[], type[BaseNode]] | None = None,
+    ) -> None:
+        self.class_name = class_name
+        self._resolved = node_class
+        self._loader = loader
+
+    def resolve(self) -> type[BaseNode]:
+        """Return the node class, importing its module on first use for a lazy entry.
+
+        Not thread-safe: assumes resolution happens on a single thread (the event loop).
+        Concurrent callers could each run the loader (a double import). This holds today
+        because lazy entries are only resolved on the event loop -- workers force eager
+        loading, so their entries are already resolved before any threaded access.
+        """
+        if self._resolved is None:
+            if self._loader is None:
+                msg = f"Node type '{self.class_name}' has neither a resolved class nor a loader."
+                raise RuntimeError(msg)
+            self._resolved = self._loader()
+        return self._resolved
+
+
 class Library:
     """A collection of nodes curated by library author.
 
@@ -521,8 +541,9 @@ class Library:
 
     _library_data: LibrarySchema
     _is_default_library: bool
-    # Maintain fast lookups for node class name to class and to its metadata.
-    _node_types: dict[str, type[BaseNode]]
+    # Fast lookup from node class name to its registration entry (which resolves
+    # the class on demand -- see NodeTypeEntry) and to its metadata.
+    _node_types: dict[str, NodeTypeEntry]
     _node_metadata: dict[str, NodeMetadata]
     _advanced_library: AdvancedNodeLibrary | None
     # Tracks handlers registered on behalf of this library so they can be
@@ -583,8 +604,27 @@ class Library:
             library=self, node_class_name=node_class_as_str
         )
 
-        self._node_types[node_class_as_str] = node_class
+        self._node_types[node_class_as_str] = NodeTypeEntry(node_class_as_str, node_class=node_class)
         self._node_metadata[node_class_as_str] = metadata
+        return library_problem
+
+    def register_lazy_node_type(
+        self, node_class_name: str, metadata: NodeMetadata, loader: Callable[[], type[BaseNode]]
+    ) -> LibraryProblem | None:
+        """Register a node type without importing its module yet.
+
+        The class is imported on first use via ``loader`` (see ``NodeTypeEntry``),
+        so an import failure surfaces when the node is first created rather than
+        at library load time. The registry key is the caller-supplied
+        ``node_class_name`` (the library JSON's declared class name), since the
+        class is not imported here to read its ``__name__``. Returns a
+        LibraryProblem if registration fails (e.g. a cross-library name
+        collision), or None if all clear.
+        """
+        library_problem = LibraryRegistry.register_node_type_from_library(library=self, node_class_name=node_class_name)
+
+        self._node_types[node_class_name] = NodeTypeEntry(class_name=node_class_name, loader=loader)
+        self._node_metadata[node_class_name] = metadata
         return library_problem
 
     def unregister_node_type(self, node_class_name: str) -> None:
@@ -634,10 +674,13 @@ class Library:
         metadata: dict[Any, Any] | None = None,
     ) -> BaseNode:
         """Create a new node instance of the specified type."""
-        node_class = self._node_types.get(node_type)
-        if not node_class:
+        if not self.has_node_type(node_type):
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
             raise KeyError(msg)
+        # Resolve the class, importing its module now if it was registered lazily.
+        # An import failure propagates to the caller (e.g. the CreateNode handler,
+        # which substitutes an Error Proxy node carrying the failure reason).
+        node_class = self._node_types[node_type].resolve()
         # Inject the metadata ABOUT the node from the Library
         # into the node's metadata blob.
         if metadata is None:
@@ -676,10 +719,13 @@ class Library:
         For callers that need the class itself, e.g. classmethod checks like
         `allow_outgoing_connection_by_class`, rather than an instance produced
         by `create_node`.
+
+        Imports the node's module now if it was registered lazily; the import
+        failure propagates to the caller.
         """
         if node_type not in self._node_types:
             raise KeyError(self._library_data.name, node_type)
-        return self._node_types[node_type]
+        return self._node_types[node_type].resolve()
 
     def get_categories(self) -> list[dict[str, CategoryDefinition]]:
         return self._library_data.categories
@@ -701,6 +747,11 @@ class Library:
     def get_nodes_by_base_type(self, base_type: type) -> list[str]:
         """Get all node types in this library that are subclasses of the specified base type.
 
+        Resolving a lazily-registered node type imports its module, so the first call on a
+        lazily-loaded library imports every node module in it (to test each against
+        ``base_type``); a node whose module fails to import is skipped rather than aborting
+        the scan. Callers on the event loop should be aware this can block on those imports.
+
         Args:
             base_type: The base class to filter by (e.g., StartNode, ControlNode)
 
@@ -708,7 +759,18 @@ class Library:
             List of node type names that extend the base type
         """
         matching_nodes = []
-        for node_type, node_class in self._node_types.items():
+        for node_type, entry in self._node_types.items():
+            try:
+                node_class = entry.resolve()
+            except (ImportError, AttributeError, TypeError):
+                logger.debug(
+                    "Skipping node type '%s' in library '%s' while scanning for base type '%s': module failed to import.",
+                    node_type,
+                    self._library_data.name,
+                    base_type.__name__,
+                    exc_info=True,
+                )
+                continue
             if issubclass(node_class, base_type):
                 matching_nodes.append(node_type)
         return matching_nodes

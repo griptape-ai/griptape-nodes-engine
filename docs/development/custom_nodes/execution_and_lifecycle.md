@@ -43,6 +43,7 @@ from griptape_nodes.exe_types.node_types import ControlNode
 POLLING_INTERVAL = 10  # seconds (use API-recommended value)
 MAX_POLLING_ATTEMPTS = 60  # 10 minutes max
 
+
 class MyAsyncNode(ControlNode):
     async def aprocess(self) -> None:
         """Process the request asynchronously."""
@@ -113,6 +114,7 @@ For integrations built on synchronous libraries, override `process()` and yield 
 ```python
 from griptape_nodes.exe_types.node_types import ControlNode, AsyncResult
 
+
 class MyBlockingNode(ControlNode):
     def process(self) -> AsyncResult | None:
         """Yield the blocking work to a background thread."""
@@ -159,12 +161,7 @@ def _submit_task(self, params: dict[str, Any], headers: dict[str, str]) -> dict[
     """Submit task and return response with task_id."""
     payload = self._build_payload(params)
 
-    response = requests.post(
-        self.API_BASE_URL,
-        json=payload,
-        headers=headers,
-        timeout=DEFAULT_TIMEOUT
-    )
+    response = requests.post(self.API_BASE_URL, json=payload, headers=headers, timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
 
     response_data = response.json()
@@ -178,6 +175,7 @@ def _submit_task(self, params: dict[str, Any], headers: dict[str, str]) -> dict[
 POLLING_INTERVAL = 10  # seconds (use API-recommended value)
 MAX_POLLING_ATTEMPTS = 60  # 10 minutes max
 
+
 def _poll_for_completion(self, task_id: str, headers: dict[str, str]) -> str | None:
     """Poll API for task completion and return result identifier."""
     query_url = "https://api.example.com/v1/query/task"
@@ -189,7 +187,7 @@ def _poll_for_completion(self, task_id: str, headers: dict[str, str]) -> str | N
             query_url,
             headers=headers,
             params={"task_id": task_id},  # Use query params, not path
-            timeout=DEFAULT_TIMEOUT
+            timeout=DEFAULT_TIMEOUT,
         )
         response.raise_for_status()
 
@@ -216,12 +214,7 @@ def _retrieve_result(self, file_id: str, headers: dict[str, str]) -> str:
     """Retrieve download URL from result identifier."""
     retrieve_url = "https://api.example.com/v1/files/retrieve"
 
-    response = requests.get(
-        retrieve_url,
-        headers=headers,
-        params={"file_id": file_id},
-        timeout=DEFAULT_TIMEOUT
-    )
+    response = requests.get(retrieve_url, headers=headers, params={"file_id": file_id}, timeout=DEFAULT_TIMEOUT)
     response.raise_for_status()
 
     response_data = response.json()
@@ -247,6 +240,7 @@ When a node can operate in multiple modes depending on which inputs are connecte
 IMAGE2VIDEO_URL = "https://api.example.com/v1/videos/image2video"
 TEXT2VIDEO_URL = "https://api.example.com/v1/videos/text2video"
 
+
 def _process(self):
     image_data = self._get_image_data("start_frame")
     has_images = image_data is not None
@@ -269,12 +263,15 @@ This avoids requiring image inputs when the user wants text-only generation, and
 
 ### Image Artifact Conversion to Base64
 
+The `ImageArtifact` branch below exists to keep working with values that may still arrive from older saved workflows or upstream nodes that haven't been updated. New parameters should declare `ImageUrlArtifact` (via `ParameterImage`) rather than `ImageArtifact` — see [Parameter Payload Size](error_handling.md#parameter-payload-size).
+
 **CRITICAL: Localhost URL Handling**
 
 When sending images to external APIs, ImageUrlArtifact URLs from static storage are localhost and inaccessible to external services. Always detect and convert localhost URLs to base64:
 
 ```python
 import base64
+
 
 def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> str:
     """Convert image artifact to URL or base64 data URI."""
@@ -284,19 +281,18 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
         url = image_artifact.value
 
         # Localhost URLs must be converted to base64 for external APIs
-        if url.startswith(('http://localhost', 'http://127.0.0.1',
-                          'https://localhost', 'https://127.0.0.1')):
+        if url.startswith(("http://localhost", "http://127.0.0.1", "https://localhost", "https://127.0.0.1")):
             self._log(f"Converting localhost URL to base64: {url[:100]}...")
             response = requests.get(url, timeout=30)
             response.raise_for_status()
             image_bytes = response.content
 
             # Detect MIME type from headers
-            mime_type = response.headers.get('content-type', 'image/jpeg')
-            if not mime_type.startswith('image/'):
-                mime_type = 'image/jpeg'
+            mime_type = response.headers.get("content-type", "image/jpeg")
+            if not mime_type.startswith("image/"):
+                mime_type = "image/jpeg"
 
-            base64_data = base64.b64encode(image_bytes).decode('utf-8')
+            base64_data = base64.b64encode(image_bytes).decode("utf-8")
             return f"data:{mime_type};base64,{base64_data}"
 
         # Public URLs can be passed through
@@ -306,12 +302,12 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
     # ImageArtifact - use .base64 property (preferred method)
     if isinstance(image_artifact, ImageArtifact):
         # PREFERRED: Use built-in properties
-        if hasattr(image_artifact, 'base64') and hasattr(image_artifact, 'mime_type'):
+        if hasattr(image_artifact, "base64") and hasattr(image_artifact, "mime_type"):
             base64_data = image_artifact.base64  # Raw base64 (no prefix)
             mime_type = image_artifact.mime_type  # e.g., 'image/jpeg'
 
             # Check if already has data URI prefix
-            if base64_data.startswith('data:'):
+            if base64_data.startswith("data:"):
                 self._log("Using ImageArtifact.base64 (already has data URI)")
                 return base64_data
 
@@ -321,13 +317,13 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
 
         # FALLBACK: Manual byte extraction
         self._log("Falling back to manual base64 encoding")
-        if hasattr(image_artifact, 'value') and hasattr(image_artifact.value, 'read'):
+        if hasattr(image_artifact, "value") and hasattr(image_artifact.value, "read"):
             image_artifact.value.seek(0)
             image_bytes = image_artifact.value.read()
-        elif hasattr(image_artifact, 'data'):
+        elif hasattr(image_artifact, "data"):
             if isinstance(image_artifact.data, bytes):
                 image_bytes = image_artifact.data
-            elif hasattr(image_artifact.data, 'read'):
+            elif hasattr(image_artifact.data, "read"):
                 image_artifact.data.seek(0)
                 image_bytes = image_artifact.data.read()
             else:
@@ -340,17 +336,14 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
         try:
             from PIL import Image
             from io import BytesIO
+
             img = Image.open(BytesIO(image_bytes))
-            format_to_mime = {
-                'JPEG': 'image/jpeg',
-                'PNG': 'image/png',
-                'WEBP': 'image/webp'
-            }
-            mime_type = format_to_mime.get(img.format, 'image/jpeg')
+            format_to_mime = {"JPEG": "image/jpeg", "PNG": "image/png", "WEBP": "image/webp"}
+            mime_type = format_to_mime.get(img.format, "image/jpeg")
         except Exception:
             pass
 
-        base64_data = base64.b64encode(image_bytes).decode('utf-8')
+        base64_data = base64.b64encode(image_bytes).decode("utf-8")
         return f"data:{mime_type};base64,{base64_data}"
 
     raise ValueError("Unsupported artifact type")
@@ -369,8 +362,8 @@ def _get_image_data(self, image_artifact: ImageArtifact | ImageUrlArtifact) -> s
 ```python
 Parameter(
     name="image_input",
-    input_types=["ImageArtifact", "ImageUrlArtifact"],  # Accept both
-    type="ImageArtifact",
+    input_types=["ImageUrlArtifact", "ImageArtifact"],  # ImageArtifact: legacy input compatibility only
+    type="ImageUrlArtifact",
     tooltip="Image input (file or URL)",
     ui_options={"clickable_file_browser": True},  # Enable file browser
 )
@@ -378,17 +371,16 @@ Parameter(
 
 ### Multi-Image Input Validation
 
-When nodes accept multiple image parameters, use a reusable validation method with clear parameter identification:
+When nodes accept multiple image parameters, use a reusable validation method with clear parameter identification. As above, the `ImageArtifact` branch is legacy-input handling, not a reason to declare new parameters against `ImageArtifact`:
 
 ```python
-def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact,
-                    param_name: str) -> list[Exception]:
+def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact, param_name: str) -> list[Exception]:
     """Validate image with parameter name in error messages."""
     exceptions = []
 
     if isinstance(image_artifact, ImageArtifact):
         # Get image bytes
-        if hasattr(image_artifact, 'value') and hasattr(image_artifact.value, 'read'):
+        if hasattr(image_artifact, "value") and hasattr(image_artifact.value, "read"):
             image_artifact.value.seek(0)
             image_bytes = image_artifact.value.read()
             image_artifact.value.seek(0)
@@ -398,33 +390,33 @@ def _validate_image(self, image_artifact: ImageArtifact | ImageUrlArtifact,
         # Validate size
         size_mb = len(image_bytes) / (1024 * 1024)
         if size_mb >= 20:
-            exceptions.append(ValueError(
-                f"{self.name}: {param_name} size must be < 20MB (current: {size_mb:.1f}MB)"
-            ))
+            exceptions.append(ValueError(f"{self.name}: {param_name} size must be < 20MB (current: {size_mb:.1f}MB)"))
 
         # Validate format and dimensions
         try:
             from PIL import Image
             from io import BytesIO
+
             img = Image.open(BytesIO(image_bytes))
 
-            if img.format not in ['JPEG', 'PNG', 'WEBP']:
-                exceptions.append(ValueError(
-                    f"{self.name}: {param_name} format must be JPG, PNG, or WebP (current: {img.format})"
-                ))
+            if img.format not in ["JPEG", "PNG", "WEBP"]:
+                exceptions.append(
+                    ValueError(f"{self.name}: {param_name} format must be JPG, PNG, or WebP (current: {img.format})")
+                )
 
             width, height = img.size
             short_edge = min(width, height)
             if short_edge <= 300:
-                exceptions.append(ValueError(
-                    f"{self.name}: {param_name} short edge must be > 300px (current: {short_edge}px)"
-                ))
+                exceptions.append(
+                    ValueError(f"{self.name}: {param_name} short edge must be > 300px (current: {short_edge}px)")
+                )
         except ImportError:
             self._log("PIL not available for validation")
         except Exception as e:
             self._log(f"Error validating {param_name}: {e}")
 
     return exceptions
+
 
 def validate_before_node_run(self) -> list[Exception] | None:
     """Validate all image parameters."""
@@ -465,7 +457,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
             resolution_param = self.get_parameter_by_name("resolution")
             if resolution_param:
                 for child in resolution_param.children:
-                    if hasattr(child, 'choices'):
+                    if hasattr(child, "choices"):
                         child.choices = ADVANCED_MODEL_RESOLUTIONS
                         break
         else:
@@ -476,7 +468,7 @@ def after_value_set(self, parameter: Parameter, value: Any) -> None:
             resolution_param = self.get_parameter_by_name("resolution")
             if resolution_param:
                 for child in resolution_param.children:
-                    if hasattr(child, 'choices'):
+                    if hasattr(child, "choices"):
                         child.choices = STANDARD_RESOLUTIONS
                         break
                 self.set_parameter_value("resolution", "720P")
@@ -642,15 +634,17 @@ def _submit_task(self, params: dict, headers: dict) -> dict:
     self._log(f"Task submission response: {json.dumps(response_data, indent=2)}")
     return response_data
 
+
 # Payload Sizes - Log data sizes before sending
 def _log_request(self, payload: dict) -> None:
     if "first_frame_image" in payload:
         img_len = len(payload.get("first_frame_image", ""))
-        self._log(f"first_frame_image data length: {img_len} chars (~{img_len/1024:.1f}KB)")
+        self._log(f"first_frame_image data length: {img_len} chars (~{img_len / 1024:.1f}KB)")
 
     if "last_frame_image" in payload:
         img_len = len(payload.get("last_frame_image", ""))
-        self._log(f"last_frame_image data length: {img_len} chars (~{img_len/1024:.1f}KB)")
+        self._log(f"last_frame_image data length: {img_len} chars (~{img_len / 1024:.1f}KB)")
+
 
 # Error Responses - Log full API error details
 def _poll_for_completion(self, task_id: str, headers: dict) -> str:
@@ -663,15 +657,16 @@ def _poll_for_completion(self, task_id: str, headers: dict) -> str:
         error_msg = status_data.get("error_message", "Unknown error")
         raise RuntimeError(f"Task failed: {error_msg}")
 
+
 # Processing Paths - Log which code path is executed
 def _get_image_data(self, image_artifact) -> str:
     if isinstance(image_artifact, ImageUrlArtifact):
-        if url.startswith('http://localhost'):
+        if url.startswith("http://localhost"):
             self._log(f"Converting localhost URL to base64: {url[:100]}...")
         else:
             self._log(f"Using public URL: {url[:100]}...")
     elif isinstance(image_artifact, ImageArtifact):
-        if hasattr(image_artifact, 'base64'):
+        if hasattr(image_artifact, "base64"):
             self._log(f"Using ImageArtifact.base64 with mime_type: {mime_type}")
         else:
             self._log("Falling back to manual base64 encoding")
@@ -709,15 +704,10 @@ def _get_image_data(self, image_artifact) -> str:
 
 ```python
 # ✅ CORRECT: Query parameter
-response = requests.get(
-    "https://api.example.com/v1/query/task",
-    params={"task_id": task_id}
-)
+response = requests.get("https://api.example.com/v1/query/task", params={"task_id": task_id})
 
 # ❌ INCORRECT: Path parameter (unless API specifies this)
-response = requests.get(
-    f"https://api.example.com/v1/query/task/{task_id}"
-)
+response = requests.get(f"https://api.example.com/v1/query/task/{task_id}")
 ```
 
 **When Documentation is Inaccessible:**
