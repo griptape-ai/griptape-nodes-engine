@@ -1,8 +1,8 @@
 """Regression tests for the interactive GUI path.
 
-AddNodesToNodeGroupRequest must automatically pull the paired End node into the group
-when a BaseIterativeStartNode is added (path #2 described in the bug report — the GUI
-sends only the Start node name).
+An iterative Start/End pair must never be split across a group boundary: adding either
+half to a group automatically pulls in its counterpart. The GUI sends only the name of
+whichever node the user selected, so both directions matter.
 """
 
 from __future__ import annotations
@@ -173,6 +173,37 @@ class TestAddNodesToGroupIterativePath:
         assert start.name in group.metadata["node_names_in_group"]
         assert end.name in group.metadata["node_names_in_group"]
 
+    def test_start_node_is_pulled_into_group_automatically(self) -> None:
+        """Mirror of the Start case: grouping only the End node must also group its Start."""
+        start, end = self._build_paired_nodes()
+        group = self._build_group()
+
+        result = GriptapeNodes.handle_request(
+            AddNodesToNodeGroupRequest(
+                node_names=[end.name],
+                node_group_name=group.name,
+            )
+        )
+
+        assert isinstance(result, AddNodesToNodeGroupResultSuccess), result
+        assert start.parent_group is group
+        assert end.parent_group is group
+        assert start.name in group.nodes
+        assert end.name in group.nodes
+        assert result.node_names_added == [end.name, start.name]
+
+    def test_untethered_nodes_pull_in_nothing(self) -> None:
+        """An iterative node with no counterpart wired up must not pull in anything."""
+        lone_start = _MockIterativeStartNode("LoneStart")
+        lone_end = _MockIterativeEndNode("LoneEnd")
+        _register(lone_start)
+        _register(lone_end)
+        group = self._build_group()
+
+        nodes_added = group.add_nodes_to_group([lone_start, lone_end])
+
+        assert [n.name for n in nodes_added] == [lone_start.name, lone_end.name]
+
     def test_result_node_names_added_contains_both(self) -> None:
         """AddNodesToNodeGroupResultSuccess.node_names_added reports both nodes."""
         start, end = self._build_paired_nodes()
@@ -242,6 +273,17 @@ class TestAddNodesToGroupIterativePath:
         assert end.parent_group is group
         assert [n.name for n in nodes_added] == [start.name, end.name]
 
+    def test_group_pulls_in_start_node_without_going_through_manager(self) -> None:
+        """Mirror: the reverse direction is also enforced at the group layer."""
+        start, end = self._build_paired_nodes()
+        group = self._build_group()
+
+        nodes_added = group.add_nodes_to_group([end])
+
+        assert start.name in group.nodes
+        assert start.parent_group is group
+        assert [n.name for n in nodes_added] == [end.name, start.name]
+
     def test_group_returns_only_requested_node_when_end_already_present(self) -> None:
         """add_nodes_to_group must not re-report an End node that is already in the group."""
         start, end = self._build_paired_nodes()
@@ -251,6 +293,18 @@ class TestAddNodesToGroupIterativePath:
         nodes_added = group.add_nodes_to_group([start])
 
         assert [n.name for n in nodes_added] == [start.name]
+
+    def test_group_returns_only_requested_node_when_start_already_present(self) -> None:
+        """Mirror: an End node must not re-report a Start node already in the group."""
+        start, end = self._build_paired_nodes()
+        group = self._build_group()
+        group.add_nodes_to_group([start])
+        # Start pulled End in, so remove End to isolate the reverse direction.
+        group.remove_nodes_from_group([end])
+
+        nodes_added = group.add_nodes_to_group([end])
+
+        assert [n.name for n in nodes_added] == [end.name]
 
     def test_plain_node_has_no_side_effects(self) -> None:
         """Adding a plain (non-iterative) node does not change the node_names_added list size."""

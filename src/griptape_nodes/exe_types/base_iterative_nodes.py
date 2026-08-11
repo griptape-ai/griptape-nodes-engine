@@ -950,6 +950,12 @@ class BaseIterativeEndNode(BaseNode):
         self._results_list = []
         self._output_results_list()
 
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must join a node group whenever this End node does."""
+        if self.start_node is None:
+            return []
+        return [self.start_node]
+
     def after_incoming_connection(
         self,
         source_node: BaseNode,

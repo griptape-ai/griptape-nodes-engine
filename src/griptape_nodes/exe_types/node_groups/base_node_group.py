@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
+from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterMode,
@@ -91,13 +91,13 @@ class BaseNodeGroup(BaseNode):
         self.metadata["node_names_in_group"] = list(node_names_in_group)
 
     def _expand_with_tethered_nodes(self, nodes: list[BaseNode]) -> list[BaseNode]:
-        """Add any tethered companions (e.g. an iterative Start node's paired End node).
+        """Add any tethered companions, so an iterative Start/End pair is never split.
 
         Companions already in the requested list or already in this group are skipped.
         """
         expanded = list(nodes)
         for node in nodes:
-            if not isinstance(node, BaseIterativeStartNode):
+            if not isinstance(node, BaseIterativeStartNode | BaseIterativeEndNode):
                 continue
             for companion in node.get_nodes_to_group_with():
                 if companion in expanded:
