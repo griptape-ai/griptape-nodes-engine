@@ -1902,6 +1902,14 @@ class SuccessFailureNode(BaseNode):
 
     def get_next_control_output(self) -> Parameter | None:
         """Determine which control output to follow based on execution result."""
+        # A locked node never executes, so it has no result to branch on this run. Whatever
+        # _execution_succeeded holds is left over from a previous run (it is only ever written by
+        # _set_status_results and reset by _clear_execution_status, both reached via process()).
+        # Follow the success path so locking a node to freeze its outputs doesn't route down
+        # Failed or dead-end the control flow.
+        if self.lock:
+            return self.control_parameter_out
+
         if self._execution_succeeded is None:
             # Execution hasn't completed yet
             self.stop_flow = True

@@ -119,6 +119,12 @@ class AppInitializationComplete(AppPayload):
     # taken from the first entry in libraries_to_register. Multiple workers can run
     # simultaneously for different libraries.
     is_worker: bool = False
+    # URL of a static file server the host process already runs for this workspace. When set,
+    # the engine points its storage drivers at that server instead of starting one of its own,
+    # so asset URLs outlive this engine. Leave unset when the host serves nothing: the engine
+    # then serves the workspace itself, which is the path that goes away once every shipped
+    # host provides a server (see the fallback in StaticFilesManager).
+    static_server_base_url: str | None = None
 
 
 @dataclass

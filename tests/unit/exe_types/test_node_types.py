@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
-from griptape_nodes.exe_types.node_types import AsyncResult, TrackedParameterOutputValues
+from griptape_nodes.exe_types.node_types import AsyncResult, SuccessFailureNode, TrackedParameterOutputValues
 
 from .mocks import MockNode
 
@@ -226,3 +226,49 @@ class TestErrorProxyNode:
         assert message.markdown is True
         assert "**Permission denied**" in message.value
         assert "Ask your admin to enable Labs nodes." in message.value
+
+
+class TestLockedSuccessFailureNodeRouting:
+    """A locked SuccessFailureNode must route down Succeeded, not Failed or nowhere.
+
+    A locked node never executes, so ``_execution_succeeded`` is never written for the current
+    run. It is only assigned by ``_set_status_results`` and reset by ``_clear_execution_status``,
+    both reached through ``process()``. So the attribute holds whatever the *previous* run left:
+    ``None`` if the node never ran (which used to set ``stop_flow`` and dead-end the branch), or a
+    stale ``False`` if the node failed before being locked (which used to route down Failed).
+    """
+
+    @staticmethod
+    def _locked_node() -> SuccessFailureNode:
+        node = SuccessFailureNode(name="locked_branch")
+        node.lock = True
+        return node
+
+    def test_locked_node_that_never_ran_follows_success_path(self) -> None:
+        """``_execution_succeeded is None`` must not set stop_flow when the node is locked."""
+        node = self._locked_node()
+        assert node._execution_succeeded is None
+
+        assert node.get_next_control_output() is node.control_parameter_out
+        assert node.stop_flow is False
+
+    def test_locked_node_with_stale_failure_follows_success_path(self) -> None:
+        """A stale ``False`` from a run before the lock must not route down Failed."""
+        node = self._locked_node()
+        node._execution_succeeded = False
+
+        assert node.get_next_control_output() is node.control_parameter_out
+
+    def test_unlocked_node_still_routes_on_its_result(self) -> None:
+        """Unlocked nodes keep their normal success/failure/not-yet-run routing."""
+        node = SuccessFailureNode(name="unlocked_branch")
+
+        node._execution_succeeded = False
+        assert node.get_next_control_output() is node.failure_output
+
+        node._execution_succeeded = True
+        assert node.get_next_control_output() is node.control_parameter_out
+
+        node._execution_succeeded = None
+        assert node.get_next_control_output() is None
+        assert node.stop_flow is True
