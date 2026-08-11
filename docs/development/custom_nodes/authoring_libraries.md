@@ -137,10 +137,11 @@ engine generates the node type for you:
 ]
 ```
 
-| Field | Meaning |
-| `node_type` | The name the node is registered under. This is what appears in saved workflows. |
-| `workflow_path` | Path to the saved workflow `.py`, relative to `griptape_nodes_library.json`. |
-| `metadata` | The same node metadata block the `nodes` array uses: category, description, display name, etc. |
+| Field           | Meaning                                                                                        |
+| --------------- | ---------------------------------------------------------------------------------------------- |
+| `node_type`     | The name the node is registered under. This is what appears in saved workflows.                |
+| `workflow_path` | Path to the saved workflow `.py`, relative to `griptape_nodes_library.json`.                   |
+| `metadata`      | The same node metadata block the `nodes` array uses: category, description, display name, etc. |
 
 **The workflow needs a Start Flow node and an End Flow node.** Those are what define the node's
 parameters:
@@ -152,7 +153,8 @@ parameters:
 
 A parameter name used by exactly one Start Flow or End Flow node keeps its bare name. If two Start
 Flow nodes both expose `prompt`, both parameters are qualified with their node name instead
-(`Start Flow.prompt`, `Start Flow_2.prompt`) so neither is lost. A name that appears on both a Start
+(`Start_Flow.prompt`, `Start_Flow_2.prompt`) so neither is lost. Spaces in the node name become
+underscores, because parameter names cannot contain whitespace. A name that appears on both a Start
 Flow node and an End Flow node becomes a single parameter that is both an input and an output.
 
 When the node runs, the engine loads the workflow as a child subflow of the node's own flow, copies
@@ -164,6 +166,10 @@ into a saved workflow, so nothing about the node's internals leaks into your use
 metadata header at the top of the workflow file, which the editor writes on save. A workflow with no
 saved shape (no Start Flow and End Flow nodes, or a hand-written file with no header) is reported as
 a library problem and its node is not registered.
+
+The workflow is also registered as a workflow in its own right, so it shows up in the editor's
+workflow picker. To keep a workflow that only exists to back a node out of that list, set
+`is_internal = true` in its metadata header.
 
 ### Library and Node Declarations
 

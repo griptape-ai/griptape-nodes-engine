@@ -11,11 +11,12 @@ from griptape_nodes.exe_types.core_types import ParameterMode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
     WorkflowNodeDefinitionError,
+    WorkflowNodeRoutingError,
     WorkflowParameterRoute,
     build_workflow_node_class,
     build_workflow_node_surface,
     flatten_shape_section,
-    match_shape_nodes,
+    pair_shape_nodes,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
 
@@ -73,10 +74,26 @@ class TestFlattenShapeSection:
         routes = flatten_shape_section(section)
 
         assert routes == {
-            "Start A.text": WorkflowParameterRoute("Start A", "text"),
+            "Start_A.text": WorkflowParameterRoute("Start A", "text"),
             "only_a": WorkflowParameterRoute("Start A", "only_a"),
-            "Start B.text": WorkflowParameterRoute("Start B", "text"),
+            "Start_B.text": WorkflowParameterRoute("Start B", "text"),
         }
+
+    def test_qualifier_replaces_whitespace(self) -> None:
+        """Parameter names cannot contain whitespace, and Start/End node names routinely do."""
+        section = {"Start Flow": {"text": _param("text")}, "Start Flow_1": {"text": _param("text")}}
+
+        routes = flatten_shape_section(section)
+
+        assert set(routes) == {"Start_Flow.text", "Start_Flow_1.text"}
+        assert not any(char.isspace() for name in routes for char in name)
+
+    def test_qualifier_collision_is_rejected(self) -> None:
+        """Two node names that differ only by whitespace would produce one parameter name."""
+        section = {"Start Flow": {"text": _param("text")}, "Start_Flow": {"text": _param("text")}}
+
+        with pytest.raises(WorkflowNodeDefinitionError, match="collides with"):
+            flatten_shape_section(section)
 
     def test_result_is_order_independent(self) -> None:
         forward = {"Start A": {"text": _param("text")}, "Start B": {"text": _param("text")}}
@@ -126,25 +143,32 @@ class TestBuildWorkflowNodeSurface:
             build_workflow_node_surface(_metadata(shape))
 
 
-class TestMatchShapeNodes:
+class TestPairShapeNodes:
     def test_exact_names(self) -> None:
-        assert match_shape_nodes(["Start Flow"], ["Start Flow"]) == {"Start Flow": "Start Flow"}
+        assert pair_shape_nodes(["Start Flow"], ["Start Flow"], role="Start Flow") == {"Start Flow": "Start Flow"}
 
     def test_deduplicated_rename(self) -> None:
-        assert match_shape_nodes(["Start Flow"], ["Start Flow_1"]) == {"Start Flow": "Start Flow_1"}
+        assert pair_shape_nodes(["Start Flow"], ["Start Flow_1"], role="Start Flow") == {"Start Flow": "Start Flow_1"}
 
-    def test_exact_match_wins_over_rename(self) -> None:
-        matches = match_shape_nodes(["Start Flow"], ["Start Flow_1", "Start Flow"])
+    def test_prefix_overlapping_names_are_not_cross_wired(self) -> None:
+        """A renamed node can collide textually with a different declared name.
 
-        assert matches == {"Start Flow": "Start Flow"}
+        A workflow declaring both "Start Flow" and "Start Flow_1", imported into a canvas that
+        already has a "Start Flow", gets renamed to "Start Flow_1" and "Start Flow_2". Matching by
+        name would hand "Start Flow_1" to the wrong declared node and swap the two routes.
+        """
+        paired = pair_shape_nodes(["Start Flow", "Start Flow_1"], ["Start Flow_1", "Start Flow_2"], role="Start Flow")
+
+        assert paired == {"Start Flow": "Start Flow_1", "Start Flow_1": "Start Flow_2"}
 
     def test_each_declared_name_claims_a_distinct_live_name(self) -> None:
-        matches = match_shape_nodes(["Start A", "Start B"], ["Start A_1", "Start B_1"])
+        paired = pair_shape_nodes(["Start A", "Start B"], ["Start A_1", "Start B_1"], role="Start Flow")
 
-        assert matches == {"Start A": "Start A_1", "Start B": "Start B_1"}
+        assert paired == {"Start A": "Start A_1", "Start B": "Start B_1"}
 
-    def test_unmatched_declared_name_is_absent(self) -> None:
-        assert match_shape_nodes(["Start Flow", "Other"], ["Start Flow"]) == {"Start Flow": "Start Flow"}
+    def test_count_mismatch_is_rejected(self) -> None:
+        with pytest.raises(WorkflowNodeRoutingError, match="lists 2 of them but the loaded copy has 1"):
+            pair_shape_nodes(["Start Flow", "Other"], ["Start Flow"], role="Start Flow")
 
 
 class TestBuildWorkflowNodeClass:
@@ -222,6 +246,31 @@ class TestBuildWorkflowNodeClass:
         assert "subflow_name" not in node.metadata
         assert node.metadata["workflow_node"] is True
 
+    def test_colliding_shape_produces_a_constructible_node(self) -> None:
+        """Qualified names must survive add_parameter, which rejects whitespace.
+
+        Testing the flattening in isolation is not enough: node names routinely contain spaces, so a
+        qualified name built from a raw node name makes the generated node type uncreatable.
+        """
+        shape = WorkflowShape(
+            inputs={
+                "Start Flow": {"text": _param("text")},
+                "Start Flow_1": {"text": _param("text")},
+            },
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        node_class = build_workflow_node_class(
+            node_type="ShoutTwiceWorkflow",
+            workflow_file_path=Path("/library/shout_twice_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+
+        node = node_class(name="Shout Twice")
+
+        assert node.get_parameter_by_name("Start_Flow.text") is not None
+        assert node.get_parameter_by_name("Start_Flow_1.text") is not None
+        assert node.get_parameter_by_name("result") is not None
+
 
 class TestEditorPreviewMetadata:
     """The editor renders these nodes with its subflow-preview wrapper keyed off node metadata.
@@ -248,8 +297,31 @@ class TestEditorPreviewMetadata:
 
         registry_key = node.metadata["_workflow_file_value"]
         assert WorkflowRegistry.has_workflow_with_name(registry_key)
-        # Backing workflows are hidden from the editor's workflow picker.
-        assert WorkflowRegistry.get_workflow_by_name(registry_key).metadata.is_internal is True
+
+    def test_workflow_is_internal_flag_is_respected_not_overridden(self, tmp_path: Path) -> None:
+        """The workflow's own is_internal flag wins.
+
+        Overriding it would race the library's own `workflows` registration and silently hide a
+        workflow the author had listed deliberately.
+        """
+        workflow_path = tmp_path / "shout_workflow.py"
+        workflow_path.write_text("# placeholder\n", encoding="utf-8")
+        shape = WorkflowShape(
+            inputs={"Start Flow": {"text": _param("text")}},
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        metadata = _metadata(shape)
+        assert metadata.is_internal is False, "sanity: the fixture does not opt into hiding"
+        node_class = build_workflow_node_class(
+            node_type="ShoutWorkflow",
+            workflow_file_path=workflow_path,
+            workflow_metadata=metadata,
+        )
+
+        node = node_class(name="Shout It")
+
+        registry_key = node.metadata["_workflow_file_value"]
+        assert WorkflowRegistry.get_workflow_by_name(registry_key).metadata.is_internal is False
 
     def test_missing_workflow_file_leaves_preview_unavailable(self) -> None:
         shape = WorkflowShape(

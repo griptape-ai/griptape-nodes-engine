@@ -67,6 +67,10 @@ class WorkflowNodeDefinitionError(Exception):
     """Raised when a workflow file cannot back a node type."""
 
 
+class WorkflowNodeRoutingError(RuntimeError):
+    """Raised when a node's parameters cannot be matched to the copy of the workflow it loaded."""
+
+
 class WorkflowParameterRoute(NamedTuple):
     """Where a surface parameter reads from or writes to inside the workflow."""
 
@@ -94,6 +98,16 @@ class WorkflowNodeSurfaceParameter(NamedTuple):
     output_route: WorkflowParameterRoute | None
 
 
+def _sanitize_for_parameter_name(workflow_node_name: str) -> str:
+    """Collapse whitespace in a workflow node name so it can be used inside a parameter name.
+
+    `BaseNode.add_parameter` rejects parameter names containing whitespace, and Start/End node names
+    routinely contain spaces ("Start Flow"), so a qualified name built from a raw node name would be
+    impossible to add.
+    """
+    return "_".join(workflow_node_name.split())
+
+
 def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowParameterRoute]:
     """Flatten one half of a workflow shape into surface parameter names.
 
@@ -101,6 +115,10 @@ def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowP
     than one node is qualified as ``<node name>.<parameter name>`` for every node that uses it, so
     the result never depends on iteration order. Control parameters are dropped: the generated node
     supplies its own control flow.
+
+    Raises:
+        WorkflowNodeDefinitionError: Two workflow parameters claim the same surface name, which would
+            otherwise surface as a duplicate-parameter crash when the node is created.
     """
     nodes_using_name: dict[str, list[str]] = {}
     for workflow_node_name, parameters in section.items():
@@ -117,7 +135,16 @@ def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowP
             if len(nodes_using_name[parameter_name]) == 1:
                 surface_name = parameter_name
             else:
-                surface_name = f"{workflow_node_name}{QUALIFIED_NAME_SEPARATOR}{parameter_name}"
+                qualifier = _sanitize_for_parameter_name(workflow_node_name)
+                surface_name = f"{qualifier}{QUALIFIED_NAME_SEPARATOR}{parameter_name}"
+            existing = routes.get(surface_name)
+            if existing is not None:
+                msg = (
+                    f"Attempted to expose '{workflow_node_name}.{parameter_name}' on a node. Failed because it "
+                    f"collides with '{existing.workflow_node_name}.{existing.parameter_name}', which also maps to "
+                    f"'{surface_name}'. Rename one of the parameters or one of the nodes in the workflow."
+                )
+                raise WorkflowNodeDefinitionError(msg)
             routes[surface_name] = WorkflowParameterRoute(
                 workflow_node_name=workflow_node_name, parameter_name=parameter_name
             )
@@ -168,43 +195,46 @@ def build_workflow_node_surface(workflow_metadata: WorkflowMetadata) -> dict[str
     return surface
 
 
-def match_shape_nodes(declared_names: Sequence[str], live_names: Iterable[str]) -> dict[str, str]:
+def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], role: str) -> dict[str, str]:
     """Pair the Start/End node names in a saved shape with their names in an imported subflow.
 
-    Importing a workflow renames any node whose name is already taken elsewhere in the session,
-    appending a ``_N`` suffix, so the saved shape's node names can be stale. An exact name match
-    wins; a declared name otherwise claims the first unclaimed live name that looks like a
-    de-duplicated spelling of it.
+    Importing a workflow renames any node whose name is already taken elsewhere in the session, so
+    declared names cannot be matched to live names by string: a renamed node can collide textually
+    with a *different* declared name ("Start Flow" becoming "Start Flow_1" in a workflow that itself
+    declares a "Start Flow_1"), which would cross-wire the two.
+
+    Both sequences are in node creation order, because the saved shape was built by walking the flow
+    and importing replays node creation in that same order. Pair them positionally instead.
+
+    Raises:
+        WorkflowNodeRoutingError: The loaded copy does not have the expected number of nodes, so
+            positions cannot be trusted.
     """
-    remaining = list(live_names)
-    matches: dict[str, str] = {}
-
-    for declared_name in declared_names:
-        if declared_name in remaining:
-            matches[declared_name] = declared_name
-            remaining.remove(declared_name)
-
-    for declared_name in declared_names:
-        if declared_name in matches:
-            continue
-        renamed = next((live_name for live_name in remaining if live_name.startswith(f"{declared_name}_")), None)
-        if renamed is not None:
-            matches[declared_name] = renamed
-            remaining.remove(renamed)
-
-    return matches
+    if len(declared_names) != len(live_names):
+        msg = (
+            f"Attempted to match the workflow's {role} nodes to the copy that was loaded. Failed because the "
+            f"workflow lists {len(declared_names)} of them but the loaded copy has {len(live_names)}. "
+            "Open the workflow in the editor and save it so its stored inputs and outputs match its nodes."
+        )
+        raise WorkflowNodeRoutingError(msg)
+    return dict(zip(declared_names, live_names, strict=True))
 
 
 def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: WorkflowMetadata) -> str:
     """Register `workflow_file_path` in the workflow registry if it is not there already.
 
-    Returns the registry key the workflow is available under. Registration is idempotent and
-    happens lazily, at execution time, because the registry is cleared and rebuilt when the
+    Returns the registry key the workflow is available under. Registration is idempotent, and is
+    also re-attempted before each run, because the registry is cleared and rebuilt when the
     workspace changes while a library's node types survive that reload.
 
-    The entry is marked internal so a workflow that exists only to back a node does not show up
-    in the editor's workflow picker. A library that also lists the file in its ``workflows`` array
-    registers it through the normal path first, and that entry wins.
+    The workflow's own `is_internal` flag is respected rather than overridden: a library author who
+    wants a node-backing workflow kept out of the editor's workflow picker sets `is_internal = true`
+    in the workflow's metadata header. Overriding it here would race the library's own `workflows`
+    registration and silently hide a workflow the author had listed deliberately.
+
+    Raises:
+        KeyError: The key was claimed concurrently.
+        ValueError: The workflow file is no longer on disk.
     """
     registry_key = derive_registry_key(str(workflow_file_path))
     if WorkflowRegistry.has_workflow_with_name(registry_key):
@@ -212,7 +242,7 @@ def ensure_workflow_registered(workflow_file_path: Path, workflow_metadata: Work
 
     WorkflowRegistry.generate_new_workflow(
         registry_key=registry_key,
-        metadata=workflow_metadata.model_copy(update={"is_internal": True}),
+        metadata=workflow_metadata,
         file_path=str(workflow_file_path),
     )
     return registry_key
@@ -304,7 +334,7 @@ class WorkflowNode(ControlNode):
             )
             raise RuntimeError(msg)  # noqa: TRY004 - the lookup failed at run time; this is not a type error
 
-        registry_key = ensure_workflow_registered(self.workflow_file_path, self.workflow_metadata)
+        registry_key = self._register_workflow()
         import_result = await GriptapeNodes.ahandle_request(
             ImportWorkflowAsReferencedSubFlowRequest(
                 workflow_name=registry_key,
@@ -321,6 +351,17 @@ class WorkflowNode(ControlNode):
 
         self.metadata[SUBFLOW_NAME_KEY] = import_result.created_flow_name
         return import_result.created_flow_name
+
+    def _register_workflow(self) -> str:
+        """Return the backing workflow's registry key, registering it if it is not registered yet."""
+        try:
+            return ensure_workflow_registered(self.workflow_file_path, self.workflow_metadata)
+        except (KeyError, ValueError) as err:
+            msg = (
+                f"Attempted to load the workflow at '{self.workflow_file_path}' for node '{self.name}'. "
+                f"Failed because the workflow could not be registered: {err}"
+            )
+            raise WorkflowNodeRoutingError(msg) from err
 
     def _discard_subflow(self) -> None:
         """Delete this node's subflow if it is still live, and stop tracking it."""
@@ -342,8 +383,15 @@ class WorkflowNode(ControlNode):
         """Map each surface parameter onto the parameter it addresses in the imported subflow.
 
         The saved shape's node names can be stale (an import renames nodes whose names are already
-        taken), so the Start/End nodes are re-read from the live subflow and paired back up with
-        the declared names.
+        taken), so the Start/End nodes are re-read from the live subflow and paired back up with the
+        declared ones by position.
+
+        Every declared route must resolve. A route that silently dropped out would let the run report
+        success while an input was never delivered or an output never collected.
+
+        Raises:
+            WorkflowNodeRoutingError: A declared parameter is not present on the node it was paired
+                with, meaning the loaded copy does not match the workflow's stored shape.
         """
         flow = GriptapeNodes.FlowManager().get_flow_by_name(subflow_name)
         live_start_nodes = [node.name for node in flow.nodes.values() if isinstance(node, StartNode)]
@@ -352,18 +400,46 @@ class WorkflowNode(ControlNode):
         declared_start_nodes = _declared_route_nodes(surface.input_route for surface in self.workflow_surface.values())
         declared_end_nodes = _declared_route_nodes(surface.output_route for surface in self.workflow_surface.values())
 
-        start_node_names = match_shape_nodes(declared_start_nodes, live_start_nodes)
-        end_node_names = match_shape_nodes(declared_end_nodes, live_end_nodes)
+        start_node_names = pair_shape_nodes(declared_start_nodes, live_start_nodes, role="Start Flow")
+        end_node_names = pair_shape_nodes(declared_end_nodes, live_end_nodes, role="End Flow")
 
         live_routes = WorkflowNodeLiveRoutes(inputs={}, outputs={})
         for surface_name, surface_parameter in self.workflow_surface.items():
-            input_route = _relocate_route(surface_parameter.input_route, start_node_names)
-            if input_route is not None:
-                live_routes.inputs[surface_name] = input_route
-            output_route = _relocate_route(surface_parameter.output_route, end_node_names)
-            if output_route is not None:
-                live_routes.outputs[surface_name] = output_route
+            if surface_parameter.input_route is not None:
+                live_routes.inputs[surface_name] = self._relocate_route(
+                    surface_parameter.input_route, start_node_names, flow, surface_name
+                )
+            if surface_parameter.output_route is not None:
+                live_routes.outputs[surface_name] = self._relocate_route(
+                    surface_parameter.output_route, end_node_names, flow, surface_name
+                )
         return live_routes
+
+    def _relocate_route(
+        self,
+        route: WorkflowParameterRoute,
+        node_names: dict[str, str],
+        flow: ControlFlow,
+        surface_name: str,
+    ) -> WorkflowParameterRoute:
+        """Point `route` at the corresponding node in the loaded copy of the workflow."""
+        live_node_name = node_names.get(route.workflow_node_name)
+        live_node = flow.nodes.get(live_node_name) if live_node_name is not None else None
+        if live_node is None:
+            msg = (
+                f"Attempted to connect '{surface_name}' on node '{self.name}' to the workflow it runs. Failed "
+                f"because the workflow's '{route.workflow_node_name}' node is missing from the copy that was "
+                "loaded. Open the workflow in the editor and save it to refresh its stored inputs and outputs."
+            )
+            raise WorkflowNodeRoutingError(msg)
+        if live_node.get_parameter_by_name(route.parameter_name) is None:
+            msg = (
+                f"Attempted to connect '{surface_name}' on node '{self.name}' to the workflow it runs. Failed "
+                f"because '{live_node_name}' has no '{route.parameter_name}' parameter. Open the workflow in the "
+                "editor and save it to refresh its stored inputs and outputs."
+            )
+            raise WorkflowNodeRoutingError(msg)
+        return route._replace(workflow_node_name=live_node_name)
 
     def _apply_inputs(self, subflow_name: str, live_routes: WorkflowNodeLiveRoutes) -> None:
         for surface_name, route in live_routes.inputs.items():
@@ -386,15 +462,16 @@ class WorkflowNode(ControlNode):
     def _collect_outputs(self, subflow_name: str, live_routes: WorkflowNodeLiveRoutes) -> None:
         flow = GriptapeNodes.FlowManager().get_flow_by_name(subflow_name)
         for surface_name, route in live_routes.outputs.items():
-            end_node = flow.nodes.get(route.workflow_node_name)
-            if end_node is None:
-                continue
+            end_node = flow.nodes[route.workflow_node_name]
             # A node that ran publishes to parameter_output_values; fall back to the stored value
             # for parameters an End Flow node only receives as input.
             if route.parameter_name in end_node.parameter_output_values:
                 value = end_node.parameter_output_values[route.parameter_name]
             else:
                 value = end_node.get_parameter_value(route.parameter_name)
+            # None is published rather than skipped. These parameters are a fixed part of the node
+            # type, so a downstream node is already wired to them and needs to see that this run
+            # produced nothing rather than keep reading the previous run's value.
             self.parameter_output_values[surface_name] = value
 
 
@@ -456,15 +533,6 @@ def _declared_route_nodes(routes: Iterable[WorkflowParameterRoute | None]) -> li
         if route is not None and route.workflow_node_name not in node_names:
             node_names.append(route.workflow_node_name)
     return node_names
-
-
-def _relocate_route(route: WorkflowParameterRoute | None, node_names: dict[str, str]) -> WorkflowParameterRoute | None:
-    if route is None:
-        return None
-    live_node_name = node_names.get(route.workflow_node_name)
-    if live_node_name is None:
-        return None
-    return route._replace(workflow_node_name=live_node_name)
 
 
 def _get_flow_or_none(flow_name: str) -> ControlFlow | None:
