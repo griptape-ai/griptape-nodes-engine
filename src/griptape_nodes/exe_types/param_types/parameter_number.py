@@ -40,6 +40,7 @@ class ParameterNumber(Parameter):
         min_val: float | None = None,
         max_val: float | None = None,
         validate_min_max: bool = False,
+        soft_limits: bool = False,
         accept_any: bool = True,
         hide: bool | None = None,
         hide_label: bool = False,
@@ -79,6 +80,9 @@ class ParameterNumber(Parameter):
             min_val: Minimum value for constraints (None to disable constraints)
             max_val: Maximum value for constraints (None to disable constraints)
             validate_min_max: Whether to validate min/max with error
+            soft_limits: Whether the slider's min_val/max_val are soft. When True the range only sizes
+                the slider track and values typed outside it are accepted; when False (the default)
+                out-of-range values are rejected. Requires slider=True.
             accept_any: Whether to accept any input type and convert to number (default: True)
             hide: Whether to hide the entire parameter
             hide_label: Whether to hide the parameter label
@@ -132,7 +136,13 @@ class ParameterNumber(Parameter):
 
         # Set up constraint traits based on parameters
         self._setup_constraint_traits(
-            name=name, traits=traits, slider=slider, min_val=min_val, max_val=max_val, validate_min_max=validate_min_max
+            name=name,
+            traits=traits,
+            slider=slider,
+            min_val=min_val,
+            max_val=max_val,
+            validate_min_max=validate_min_max,
+            soft_limits=soft_limits,
         )
 
         # Call parent with explicit parameters, following ControlParameter pattern
@@ -229,6 +239,7 @@ class ParameterNumber(Parameter):
         min_val: float | None,
         max_val: float | None,
         validate_min_max: bool,
+        soft_limits: bool,
     ) -> None:
         """Set up constraint traits based on parameters.
 
@@ -239,6 +250,7 @@ class ParameterNumber(Parameter):
             min_val: Minimum value
             max_val: Maximum value
             validate_min_max: Whether to validate min/max with error
+            soft_limits: Whether the slider's min/max only size the track (see ParameterNumber.__init__)
         """
         # Validation rules
         if slider and (min_val is None or max_val is None):
@@ -246,6 +258,9 @@ class ParameterNumber(Parameter):
             raise ValueError(msg)
         if validate_min_max and (min_val is None or max_val is None):
             msg = f"{name}: If validate_min_max is True, both min_val and max_val must be provided"
+            raise ValueError(msg)
+        if soft_limits and not slider:
+            msg = f"{name}: soft_limits only applies to sliders, so slider must be True"
             raise ValueError(msg)
 
         # Set up traits based on parameters
@@ -256,7 +271,7 @@ class ParameterNumber(Parameter):
 
         # Add constraint trait based on priority: Slider > MinMax > Clamp
         if slider and min_val is not None and max_val is not None:
-            traits.add(Slider(min_val=min_val, max_val=max_val))
+            traits.add(Slider(min_val=min_val, max_val=max_val, soft_limits=soft_limits))
         elif validate_min_max and min_val is not None and max_val is not None:
             traits.add(MinMax(min_val=min_val, max_val=max_val))
         elif min_val is not None or max_val is not None:
@@ -268,6 +283,7 @@ class ParameterNumber(Parameter):
         # Store min/max values for runtime property access
         self._min_val = min_val
         self._max_val = max_val
+        self._soft_limits = soft_limits
 
     @property
     def slider(self) -> bool:
@@ -286,12 +302,28 @@ class ParameterNumber(Parameter):
                 raise ValueError(msg)
             # Find existing constraint traits and replace with slider
             self._remove_constraint_traits()
-            self.add_trait(Slider(min_val=min_val, max_val=max_val))
+            self.add_trait(Slider(min_val=min_val, max_val=max_val, soft_limits=getattr(self, "_soft_limits", False)))
         else:
             # Remove slider trait
             slider_traits = self.find_elements_by_type(Slider)
             for trait in slider_traits:
                 self.remove_trait(trait)
+
+    @property
+    def soft_limits(self) -> bool:
+        """Whether the active Slider trait treats its range as a soft limit."""
+        for trait in self.find_elements_by_type(Slider):
+            return trait.soft_limits
+        return False
+
+    @soft_limits.setter
+    def soft_limits(self, value: bool) -> None:
+        """Set whether the slider's range is a soft limit."""
+        if value and not self.slider:
+            msg = f"{self.name}: Cannot enable soft_limits without a slider"
+            raise ValueError(msg)
+        self._soft_limits = value
+        self._update_constraint_traits()
 
     @property
     def min_val(self) -> float | None:
@@ -379,7 +411,9 @@ class ParameterNumber(Parameter):
             max_val_float: float = max_val  # type: ignore[assignment]
             # Python will naturally coerce int to float if needed (no precision loss for reasonable values)
             self._remove_constraint_traits()
-            self.add_trait(Slider(min_val=min_val_float, max_val=max_val_float))
+            self.add_trait(
+                Slider(min_val=min_val_float, max_val=max_val_float, soft_limits=getattr(self, "_soft_limits", False))
+            )
         elif self.validate_min_max:
             # Checked above: both min_val and max_val are available when validate_min_max is enabled.
             # Type narrowing: assign to variables after None check so type checker understands

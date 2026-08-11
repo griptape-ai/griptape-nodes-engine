@@ -32,7 +32,8 @@ All Parameter attributes:
 Add functionality via `add_trait()`:
 
 - **Options**: `Options(choices=list[str] | list[tuple[str, Any]], show_search: bool = True, search_filter: str = "")`
-- **Slider**: `Slider(min_val: float, max_val: float)`
+- **Slider**: `Slider(min_val: float, max_val: float, soft_limits: bool = False)` — `soft_limits=True` makes the range a
+    soft limit: it sizes the slider track, but values typed outside it are accepted rather than rejected.
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
 - **FileSystemPicker**: `FileSystemPicker(...)` (file/directory selection UI)
@@ -89,6 +90,9 @@ They exist to make common parameter patterns **simple, consistent, and runtime-m
     - `Slider(min_val, max_val)` if `slider=True`
     - `MinMax(min_val, max_val)` if `validate_min_max=True`
     - `Clamp(min_val, max_val)` if `min_val` and `max_val` are provided
+- `soft_limits`: only valid alongside `slider=True`. Makes the slider's range a soft limit — the track still spans
+    `min_val`–`max_val`, but a value typed outside it is accepted instead of raising. Also readable/settable at runtime
+    via the `soft_limits` property.
 
 #### `ParameterJson`
 

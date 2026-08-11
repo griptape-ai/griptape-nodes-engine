@@ -69,6 +69,7 @@ For each parameter, the editor picks a widget in this order:
 | `progress_bar` | Render the value as a progress bar instead of an editable input (for values a node reports, like 0–100). |
 
 For a bounded slider, use the `Slider` trait rather than writing `ui_options["slider"]` by hand — the trait also validates the range.
+Pass `soft_limits=True` when the range should only size the slider track, so a user can still type a value beyond it.
 
 ### Image types
 
@@ -119,17 +120,17 @@ For a bounded slider, use the `Slider` trait rather than writing `ui_options["sl
 
 Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and, where relevant, the `ui_options` keys it manages — set the trait rather than the keys.
 
-| Trait                | Typical types             | What it does                                                                                          | `ui_options` it writes                                   |
-| -------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `Options`            | `str`, any                | Dropdown constrained to fixed choices, with optional search.                                          | `simple_dropdown`, `show_search`, `search_filter`        |
-| `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                | `multi_options`                                          |
-| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`; out-of-range values fail validation.                          | `slider`                                                 |
-| `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                          | —                                                        |
-| `Button`             | `button`                  | Configures a button's label, variant, size, and click behavior.                                       | `button_label`, `variant`, `size`, `state`, `full_width` |
-| `ColorPicker`        | `str`                     | Color swatch that opens a color picker; validates the format (`"hex"`, etc.).                         | `color_picker`                                           |
-| `FileSystemPicker`   | `str`                     | Browse button that opens a file/directory picker with filtering options.                              | `fileSystemPicker`                                       |
-| `NumbersSelector`    | `dict`                    | Min/max/step numeric range selector.                                                                  | `numbers_selector`                                       |
-| `CompareImagesTrait` | `dict`                    | Validates the two-image dict shape used by the comparison slider (pair with `ui_options["compare"]`). | —                                                        |
-| `Widget`             | any                       | Replaces the built-in widget with a custom widget shipped by a library.                               | `widget`, `library`                                      |
+| Trait                | Typical types             | What it does                                                                                           | `ui_options` it writes                                   |
+| -------------------- | ------------------------- | ------------------------------------------------------------------------------------------------------ | -------------------------------------------------------- |
+| `Options`            | `str`, any                | Dropdown constrained to fixed choices, with optional search.                                           | `simple_dropdown`, `show_search`, `search_filter`        |
+| `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                 | `multi_options`                                          |
+| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`. Out-of-range values fail validation unless `soft_limits=True`. | `slider`                                                 |
+| `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                           | —                                                        |
+| `Button`             | `button`                  | Configures a button's label, variant, size, and click behavior.                                        | `button_label`, `variant`, `size`, `state`, `full_width` |
+| `ColorPicker`        | `str`                     | Color swatch that opens a color picker; validates the format (`"hex"`, etc.).                          | `color_picker`                                           |
+| `FileSystemPicker`   | `str`                     | Browse button that opens a file/directory picker with filtering options.                               | `fileSystemPicker`                                       |
+| `NumbersSelector`    | `dict`                    | Min/max/step numeric range selector.                                                                   | `numbers_selector`                                       |
+| `CompareImagesTrait` | `dict`                    | Validates the two-image dict shape used by the comparison slider (pair with `ui_options["compare"]`).  | —                                                        |
+| `Widget`             | any                       | Replaces the built-in widget with a custom widget shipped by a library.                                | `widget`, `library`                                      |
 
 See the [Traits section of the Parameters reference](parameters.md#traits) for constructor signatures and examples.
