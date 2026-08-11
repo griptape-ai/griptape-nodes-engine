@@ -576,3 +576,66 @@ class TestParallelResolutionNodeDoneWhenTaskCompletes:
         assert dag_node.node_state == NodeState.ERRORED
         assert context.workflow_state == WorkflowState.ERRORED
         assert context.error_message is not None
+
+
+class TestLockedNodeIsNeverQueuedOrExecuted:
+    """A locked node is frozen: it must never be dispatched, and its outputs must survive.
+
+    The lock used to be checked only in ``build_node_states`` (which marked the node DONE without
+    removing its *name* from the priority queue) and in ``pop_done_states`` (which runs at the end
+    of ``on_update``, after the execute loop). So ``get_next_node`` popped a name that should never
+    have been queued and ran the node anyway -- after ``silent_clear()`` had already wiped the
+    frozen outputs it was supposed to preserve. The gate now lives in ``_try_queue_waiting_node``.
+    """
+
+    @staticmethod
+    def _context_with_locked_leaf() -> ParallelResolutionContext:
+        """A context with one locked WAITING leaf node, eligible for queueing but for the lock."""
+        node = MagicMock(spec=BaseNode)
+        node.name = "locked"
+        node.lock = True
+        node.state = NodeResolutionState.RESOLVED
+
+        graph = DirectedGraph()
+        graph.add_node("locked")
+
+        dag_builder = DagBuilder()
+        dag_builder.graphs["locked"] = graph
+        dag_builder.node_to_reference["locked"] = DagNode(node_reference=node, node_state=NodeState.WAITING)
+
+        return ParallelResolutionContext("flow", max_nodes_in_parallel=5, dag_builder=dag_builder)
+
+    def test_locked_node_is_marked_done_and_not_queued(self) -> None:
+        """The queueing gate must divert a locked node to DONE instead of into the priority queue."""
+        context = self._context_with_locked_leaf()
+
+        ExecuteDagState._try_queue_waiting_node(context, "locked")
+
+        assert context.node_to_reference["locked"].node_state == NodeState.DONE
+        assert "locked" not in context.node_priority_queue._queued_nodes
+        assert "locked" not in context.node_priority_queue._blocked_nodes
+
+    @pytest.mark.asyncio
+    async def test_locked_node_is_never_executed(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """``on_update`` must not create an execution task for a locked node."""
+        context = self._context_with_locked_leaf()
+
+        execute_node = AsyncMock()
+        monkeypatch.setattr(ExecuteDagState, "execute_node", execute_node)
+        # handle_done_nodes touches the full engine (events, connections, library registry); stub it
+        # so this stays a focused scheduler unit test.
+        monkeypatch.setattr(ExecuteDagState, "handle_done_nodes", AsyncMock())
+
+        await ExecuteDagState.on_update(context)
+
+        execute_node.assert_not_awaited()
+        assert not context.task_to_node, "a task was created for a locked node"
+
+    def test_build_node_states_does_not_mutate_node_state(self) -> None:
+        """``build_node_states`` is a query: it reports leaves without mutating execution state."""
+        context = self._context_with_locked_leaf()
+
+        result = ExecuteDagState.build_node_states(context)
+
+        assert result.leaf_nodes == {"locked"}
+        assert context.node_to_reference["locked"].node_state == NodeState.WAITING
