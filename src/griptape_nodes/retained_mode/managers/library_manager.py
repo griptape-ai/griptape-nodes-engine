@@ -5767,14 +5767,20 @@ class LibraryManager(EngineScoped):
         library_dir = Path(library_file_path).parent.absolute()
 
         # Check if library is in a monorepo (multiple libraries in same git repository)
-        if await asyncio.to_thread(is_monorepo, library_dir):
+        try:
+            in_monorepo = await asyncio.to_thread(is_monorepo, library_dir)
+        except GitError as e:
+            details = f"Attempted to check for updates for Library '{library_name}'. Failed because the repository layout could not be determined: {e}"
+            return CheckLibraryUpdateResultFailure(result_details=details)
+
+        if in_monorepo:
             details = (
                 f"Library '{library_name}' is in a monorepo with multiple libraries. Updates must be managed manually."
             )
             logger.info(details)
-            # Get git info for the response
-            git_remote = await asyncio.to_thread(get_git_remote, library_dir)
-            git_ref = await asyncio.to_thread(get_current_ref, library_dir)
+            # Get git info for the response. Informational only here, so a git failure must not
+            # turn the successful "monorepo, update manually" answer into a failure.
+            git_remote, git_ref = await asyncio.to_thread(get_git_info, library_dir)
             current_version = library.get_metadata().library_version
             return CheckLibraryUpdateResultSuccess(
                 has_update=False,
@@ -5810,7 +5816,11 @@ class LibraryManager(EngineScoped):
             return CheckLibraryUpdateResultFailure(result_details=details)
 
         # Get local commit SHA
-        local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+        try:
+            local_commit = await asyncio.to_thread(get_local_commit_sha, library_dir)
+        except GitError as e:
+            details = f"Failed to read the local commit for Library '{library_name}': {e}"
+            return CheckLibraryUpdateResultFailure(result_details=details)
 
         # If the current ref does not exist on the remote (e.g. a local-only branch that has
         # not been pushed, or a detached HEAD on a bare commit), there is nothing on the remote
@@ -6061,7 +6071,7 @@ class LibraryManager(EngineScoped):
 
         return new_version
 
-    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901
+    async def update_library_request(self, request: UpdateLibraryRequest) -> ResultPayload:  # noqa: C901, PLR0911
         """Update a library to the latest version using the appropriate git strategy.
 
         Automatically detects whether the library uses branch-based or tag-based workflow:
@@ -6084,7 +6094,13 @@ class LibraryManager(EngineScoped):
         library_dir = validation_result.library_dir
 
         # Check if library is in a monorepo (multiple libraries in same git repository)
-        if await asyncio.to_thread(is_monorepo, library_dir):
+        try:
+            in_monorepo = await asyncio.to_thread(is_monorepo, library_dir)
+        except GitError as e:
+            details = f"Cannot update Library '{library_name}'. Failed because the repository layout could not be determined: {e}"
+            return UpdateLibraryResultFailure(result_details=details)
+
+        if in_monorepo:
             details = f"Cannot update Library '{library_name}'. Repository contains multiple libraries and must be updated manually."
             return UpdateLibraryResultFailure(result_details=details)
 

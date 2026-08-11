@@ -8,6 +8,7 @@ import os
 import subprocess
 import tempfile
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -296,6 +297,22 @@ _GIT_MISSING_MESSAGE = (
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 
 
+@cache
+def _log_git_env_override(name: str, inherited: str, default: str) -> None:
+    """Report that an inherited environment variable displaced a git hardening default.
+
+    Cached so a launcher that sets one of these permanently produces one line per distinct
+    value rather than one line per git invocation.
+    """
+    logger.warning(
+        "Inherited %s=%r from the environment, overriding the Griptape Nodes default of %r. "
+        "Library installs and updates will use the inherited setting.",
+        name,
+        inherited,
+        default,
+    )
+
+
 def _git_env() -> dict[str, str]:
     """Build the environment for a git subprocess.
 
@@ -308,13 +325,20 @@ def _git_env() -> dict[str, str]:
     by default, but leaves unrecognized ones permitted for a directly invoked command.
 
     An inherited value wins for both, letting a launcher opt back into prompting or admit
-    a transport this list omits.
+    a transport this list omits. Because that also lets a launcher turn off the transport
+    restriction, an override is logged so it is visible rather than silent.
     """
-    return {
+    defaults = {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
-        **os.environ,
     }
+
+    for name, default in defaults.items():
+        inherited = os.environ.get(name)
+        if inherited is not None and inherited != default:
+            _log_git_env_override(name, inherited, default)
+
+    return {**defaults, **os.environ}
 
 
 def _reject_option_like(value: str, description: str, error_cls: type[GitError]) -> None:
@@ -345,7 +369,12 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
             env=_git_env(),
             stdin=subprocess.DEVNULL,
             capture_output=True,
-            text=True,
+            # git writes paths, refs, and messages as UTF-8 regardless of the process locale,
+            # so decode as UTF-8 rather than letting the platform's preferred encoding decide.
+            # errors="replace" keeps an undecodable byte from turning into a UnicodeDecodeError
+            # that escapes as something other than a GitError.
+            encoding="utf-8",
+            errors="replace",
             check=False,
         )
     except FileNotFoundError as e:
@@ -477,13 +506,21 @@ def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
     values are needed: those functions each re-run is_git_repository(), and each raises
     where this one degrades to None.
 
+    This runs for every library on every metadata load, where git details are informational
+    and a library must still load without them. A missing git installation therefore reports
+    "unavailable" here instead of raising the way the single-value accessors do.
+
     Returns:
         tuple[str | None, str | None]: (git_remote, git_ref), each None if unavailable.
     """
     if not is_git_repository(library_path):
         return None, None
 
-    return _remote_url(library_path), _describe_head(library_path)
+    try:
+        return _remote_url(library_path), _describe_head(library_path)
+    except GitNotFoundError:
+        logger.debug("Reporting no git details for %s: git is not installed", library_path)
+        return None, None
 
 
 def get_git_remote(library_path: Path) -> str | None:
@@ -636,6 +673,7 @@ def _resolve_update_upstream(library_path: Path) -> str:
     Raises:
         GitRepositoryError: If validation fails.
         GitPullError: If repository state is invalid for update.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update: {library_path} is not a git repository"
@@ -674,6 +712,7 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
     upstream = _resolve_update_upstream(library_path)
 
@@ -707,6 +746,7 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the tag update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update tag: {library_path} is not a git repository"
@@ -761,6 +801,7 @@ def update_library_git(library_path: Path, *, overwrite_existing: bool = False) 
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update: {library_path} is not a git repository"
@@ -793,6 +834,7 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
     Raises:
         GitRepositoryError: If the path is not a valid git repository.
         GitRefError: If the branch switch operation fails.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot switch branch: {library_path} is not a git repository"
@@ -841,6 +883,7 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
     Raises:
         GitRepositoryError: If the path is not a valid git repository.
         GitRefError: If the switch operation fails.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot switch ref: {library_path} is not a git repository"
@@ -889,6 +932,7 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
 
     Raises:
         GitCloneError: If cloning fails or target path already exists.
+        GitNotFoundError: If git is not installed.
     """
     # The clone runs in a throwaway directory (see _run_git_detached), so git would resolve a
     # relative target against that directory and the clone would be discarded with it. Anchor to
@@ -970,6 +1014,7 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
 
     Raises:
         GitCloneError: If the checkout fails or library metadata is invalid.
+        GitNotFoundError: If git is not installed.
     """
     _reject_option_like(remote_url, "git URL", GitCloneError)
     _reject_option_like(ref, "ref", GitCloneError)
@@ -1044,6 +1089,7 @@ def remote_ref_exists(remote_url: str, ref: str) -> bool:
 
     Raises:
         GitRemoteError: If the remote cannot be queried.
+        GitNotFoundError: If git is not installed.
     """
     _reject_option_like(remote_url, "git URL", GitRemoteError)
     _reject_option_like(ref, "ref", GitRemoteError)

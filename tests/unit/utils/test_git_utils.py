@@ -14,6 +14,7 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.git_utils import (
+    _GIT_ALLOWED_PROTOCOLS,
     GitCloneError,
     GitError,
     GitNotFoundError,
@@ -21,6 +22,7 @@ from griptape_nodes.utils.git_utils import (
     GitRefError,
     GitRemoteError,
     GitRepositoryError,
+    _git_env,
     clone_repository,
     extract_repo_name_from_url,
     get_current_ref,
@@ -668,6 +670,66 @@ class TestCloneRepositoryWorkingDirectory:
             clone_repository("weirdhelper::whatever", temp_dir / "clone")
 
         assert not marker.exists()
+
+    def test_clone_repository_rejects_ext_transport_url(self, temp_dir: Path) -> None:
+        """Test that an 'ext::<command>' URL cannot make git run an arbitrary shell command.
+
+        The ext transport hands its argument to a shell, so a URL reaching it is remote code
+        execution. The marker file proves the command never ran, rather than only that the
+        clone reported failure.
+        """
+        marker = temp_dir / "ext-ran"
+
+        with pytest.raises(GitCloneError):
+            clone_repository(f'ext::sh -c "touch {marker}"', temp_dir / "clone")
+
+        assert not marker.exists()
+
+
+class TestGitEnvironment:
+    """Test the environment git subprocesses are given."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_git_env_pins_the_transport_allowlist_and_disables_prompting(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that the hardening defaults are present when nothing is inherited."""
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        monkeypatch.delenv("GIT_TERMINAL_PROMPT", raising=False)
+
+        env = _git_env()
+
+        assert env["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    def test_git_env_lets_an_inherited_value_override_a_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that a launcher can admit a transport the allowlist omits."""
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+        monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
+
+        env = _git_env()
+
+        assert env["GIT_ALLOW_PROTOCOL"] == "https"
+        assert env["GIT_TERMINAL_PROMPT"] == "1"
+
+    def test_git_env_reaches_the_subprocess(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that the built environment is what git actually runs with.
+
+        Without this, the allowlist could be computed correctly and never passed along.
+        """
+        monkeypatch.delenv("GIT_ALLOW_PROTOCOL", raising=False)
+        origin = make_origin_repo(temp_dir / "origin")
+
+        with patch("griptape_nodes.utils.git_utils.subprocess.run", wraps=subprocess.run) as mock_run:
+            clone_repository(str(origin), temp_dir / "clone")
+
+        assert mock_run.call_args_list
+        for call in mock_run.call_args_list:
+            assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
+            assert call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
 
 
 class TestGetGitInfo:
@@ -1361,6 +1423,19 @@ class TestGitNotInstalled:
             pytest.raises(GitError),
         ):
             remote_ref_exists("https://example.com/user/repo.git", "main")
+
+    def test_get_git_info_reports_no_details_when_git_is_missing(self, temp_dir: Path) -> None:
+        """Test that get_git_info degrades instead of raising, so a library still loads without git.
+
+        This runs on every metadata load, where git details are informational.
+        """
+        (temp_dir / ".git").mkdir()
+
+        with patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError):
+            git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
 
 
 class TestParseCommitDatetime:
