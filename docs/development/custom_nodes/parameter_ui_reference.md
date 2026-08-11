@@ -119,17 +119,33 @@ For a bounded slider, use the `Slider` trait rather than writing `ui_options["sl
 
 Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `traits={...}` on the parameter. Each row lists what the trait renders and, where relevant, the `ui_options` keys it manages — set the trait rather than the keys.
 
-| Trait                | Typical types             | What it does                                                                                          | `ui_options` it writes                                   |
-| -------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- | -------------------------------------------------------- |
-| `Options`            | `str`, any                | Dropdown constrained to fixed choices, with optional search.                                          | `simple_dropdown`, `show_search`, `search_filter`        |
-| `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                | `multi_options`                                          |
-| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`; out-of-range values fail validation.                          | `slider`                                                 |
-| `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                          | —                                                        |
-| `Button`             | `button`                  | Configures a button's label, variant, size, and click behavior.                                       | `button_label`, `variant`, `size`, `state`, `full_width` |
-| `ColorPicker`        | `str`                     | Color swatch that opens a color picker; validates the format (`"hex"`, etc.).                         | `color_picker`                                           |
-| `FileSystemPicker`   | `str`                     | Browse button that opens a file/directory picker with filtering options.                              | `fileSystemPicker`                                       |
-| `NumbersSelector`    | `dict`                    | Min/max/step numeric range selector.                                                                  | `numbers_selector`                                       |
-| `CompareImagesTrait` | `dict`                    | Validates the two-image dict shape used by the comparison slider (pair with `ui_options["compare"]`). | —                                                        |
-| `Widget`             | any                       | Replaces the built-in widget with a custom widget shipped by a library.                               | `widget`, `library`                                      |
+| Trait                | Typical types             | What it does                                                                                          | `ui_options` it writes                                                          |
+| -------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| `Options`            | `str`, any                | Dropdown of fixed choices, with optional search. Can also accept free text (see below).               | `simple_dropdown`, `show_search`, `search_filter`, `allow_user_created_options` |
+| `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                | `multi_options`                                                                 |
+| `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`; out-of-range values fail validation.                          | `slider`                                                                        |
+| `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                          | —                                                                               |
+| `Button`             | `button`                  | Configures a button's label, variant, size, and click behavior.                                       | `button_label`, `variant`, `size`, `state`, `full_width`                        |
+| `ColorPicker`        | `str`                     | Color swatch that opens a color picker; validates the format (`"hex"`, etc.).                         | `color_picker`                                                                  |
+| `FileSystemPicker`   | `str`                     | Browse button that opens a file/directory picker with filtering options.                              | `fileSystemPicker`                                                              |
+| `NumbersSelector`    | `dict`                    | Min/max/step numeric range selector.                                                                  | `numbers_selector`                                                              |
+| `CompareImagesTrait` | `dict`                    | Validates the two-image dict shape used by the comparison slider (pair with `ui_options["compare"]`). | —                                                                               |
+| `Widget`             | any                       | Replaces the built-in widget with a custom widget shipped by a library.                               | `widget`, `library`                                                             |
 
 See the [Traits section of the Parameters reference](parameters.md#traits) for constructor signatures and examples.
+
+### Dropdowns that accept free text
+
+By default `Options` constrains the value to `choices`: anything else is snapped back to the first choice, and assigning it directly fails validation. Pass `allow_user_created_options=True` to turn the choices into suggestions instead:
+
+```python
+Parameter(
+    name="model",
+    type="str",
+    tooltip="Pick a suggested model or type your own id",
+    traits={Options(choices=SUGGESTED_MODELS, allow_user_created_options=True)},
+    default_value=SUGGESTED_MODELS[0],
+)
+```
+
+The dropdown still filters `choices` as the user types, but text matching no choice is offered as a `Use "..."` row and stored verbatim. Reach for this when the list is a convenience rather than the full set of valid values — a model id the provider added after the node shipped, a user's own fine-tune. Leave it off when an unrecognized value would fail at run time; a dropdown that rejects bad input up front beats a node that errors mid-flow.

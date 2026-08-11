@@ -28,14 +28,23 @@ class Options(Trait):
     element_id: str = field(default_factory=lambda: "Options")
     show_search: bool = field(default=True)
     search_filter: str = field(default="")
+    _allow_user_created_options: bool = field(default=False)
 
-    def __init__(self, *, choices: list | None = None, show_search: bool = True, search_filter: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        choices: list | None = None,
+        show_search: bool = True,
+        search_filter: str = "",
+        allow_user_created_options: bool = False,
+    ) -> None:
         super().__init__()
         # Set choices through property to ensure dual sync from the start
         if choices is not None:
             self.choices = choices
         self.show_search = show_search
         self.search_filter = search_filter
+        self._allow_user_created_options = allow_user_created_options
 
     @property
     def choices(self) -> list:
@@ -85,6 +94,25 @@ class Options(Trait):
             # Write choices to ui_options (this gets serialized and survives reload)
             self._parent.ui_options["simple_dropdown"] = value  # type: ignore[attr-defined]
 
+    @property
+    def allow_user_created_options(self) -> bool:
+        """Whether a value outside ``choices`` is kept, with ui_options as primary source of truth.
+
+        Read priority matches the choices property, for the same reason plus one more:
+        Parameter.ui_options lets a manually-set entry override what a trait publishes, so
+        ui_options is what the editor actually renders from. Reading it here keeps the engine
+        from snapping back a value the widget just offered.
+
+        1. FIRST: ui_options["allow_user_created_options"] (what the editor sees)
+        2. FALLBACK: the constructor argument (used before trait attachment)
+        """
+        if self._parent and hasattr(self._parent, "ui_options"):
+            ui_options = getattr(self._parent, "ui_options", None)
+            if isinstance(ui_options, dict) and "allow_user_created_options" in ui_options:
+                return bool(ui_options["allow_user_created_options"])
+
+        return self._allow_user_created_options
+
     @classmethod
     def get_trait_keys(cls) -> list[str]:
         return ["options", "models"]
@@ -95,6 +123,12 @@ class Options(Trait):
             # The property reads from ui_options first, ensuring we use post-deserialization
             # choices data instead of stale trait field data. This prevents the bug where
             # selected values revert to first choice after save/reload.
+
+            # In user-created mode the choices are suggestions, so a value the user typed
+            # is kept as-is instead of being snapped back to the first choice.
+            if self.allow_user_created_options:
+                return value
+
             if value not in self.choices:
                 return self.choices[0]
             return value
@@ -105,6 +139,11 @@ class Options(Trait):
         def validator(param: Parameter, value: Any) -> None:  # noqa: ARG001
             # CRITICAL: This validator uses self.choices property (not _choices field)
             # Same reasoning as converter - use live ui_options data after deserialization
+
+            # In user-created mode any value is allowed, so there is nothing to check.
+            if self.allow_user_created_options:
+                return
+
             if value not in self.choices:
                 msg = "Choice not allowed"
                 raise ValueError(msg)
@@ -125,9 +164,11 @@ class Options(Trait):
 
         Using _choices directly breaks this cycle while still providing the correct
         initial choices for UI rendering. The property-based sync handles runtime updates.
+        _allow_user_created_options is read directly for the same reason.
         """
         return {
             "simple_dropdown": self._choices,
             "show_search": self.show_search,
             "search_filter": self.search_filter,
+            "allow_user_created_options": self._allow_user_created_options,
         }

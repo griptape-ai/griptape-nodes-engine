@@ -31,7 +31,7 @@ All Parameter attributes:
 
 Add functionality via `add_trait()`:
 
-- **Options**: `Options(choices=list[str] | list[tuple[str, Any]], show_search: bool = True, search_filter: str = "")`
+- **Options**: `Options(choices=list[str] | list[tuple[str, Any]], show_search: bool = True, search_filter: str = "", allow_user_created_options: bool = False)`
 - **Slider**: `Slider(min_val: float, max_val: float)`
 - **Button**: `Button(label: str = "", variant=..., size=..., button_link=... | on_click=..., get_button_state=...)`
 - **ColorPicker**: `ColorPicker(format="hex")`
