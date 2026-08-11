@@ -4207,7 +4207,7 @@ class TestResolveWorkspaceDirForProjectId:
     async def test_unloaded_workspace_dir_expands_env_var_before_anchoring(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An env var in workspace_dir expands BEFORE the relative/absolute decision, so it is not mis-anchored.
+        """An env var in workspace_dir expands BEFORE the relative/absolute decision, so it lands where declared.
 
         `Path("${VAR}/ws").is_absolute()` is False, so deciding absoluteness first would join the
         whole thing onto the project directory and hand back a path with a literal `${VAR}` component

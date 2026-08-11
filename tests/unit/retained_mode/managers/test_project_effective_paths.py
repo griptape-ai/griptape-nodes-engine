@@ -259,12 +259,12 @@ class TestEffectiveProjectPathsThroughEngine:
         but is not a usable project file. Both must decline instead of falling back to the workspace
         default, or a caller asking about a project it does not have would be told a plausible path.
         """
-        unparseable = tmp_path / "junk" / PROJECT_FILE_NAME
-        unparseable.parent.mkdir(parents=True, exist_ok=True)
-        unparseable.write_text("name: [unclosed\n", encoding="utf-8")
+        unparsable = tmp_path / "junk" / PROJECT_FILE_NAME
+        unparsable.parent.mkdir(parents=True, exist_ok=True)
+        unparsable.write_text("name: [unclosed\n", encoding="utf-8")
 
         assert await engine.project_manager.resolve_libraries_root_for_project_id("no-such-project") is None
-        assert await engine.project_manager.resolve_libraries_root_for_project_id(str(unparseable)) is None
+        assert await engine.project_manager.resolve_libraries_root_for_project_id(str(unparsable)) is None
 
     def test_unresolvable_declaration_fails_the_load_with_the_field_and_its_line(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
