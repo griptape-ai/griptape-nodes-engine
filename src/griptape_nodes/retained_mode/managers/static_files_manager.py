@@ -99,17 +99,16 @@ class StaticFilesManager(EngineScoped):
         self.storage_backend = config_manager.get_config_value("storage_backend", default=StorageBackend.LOCAL)
         workspace_directory = config_manager.workspace_path
 
-        # Capture any explicit base URL override now; leave the underlying field None otherwise
-        # so on_app_initialization_complete can derive the URL from the OS-assigned port. A set
-        # value here (including one that equals the server defaults) is the signal for "user
-        # override" and short-circuits the port refresh.
-        configured_base_url = config_manager.get_config_value("static_server_base_url")
-        self._static_server_base_url: str | None = (
-            configured_base_url.rstrip("/") if configured_base_url is not None else None
-        )
-        base_url = (
-            f"{self._static_server_base_url}{STATIC_SERVER_URL}" if self._static_server_base_url is not None else None
-        )
+        # Where the workspace is served, resolved in on_app_initialization_complete. Staying None
+        # until then is also what tells that handler it has not settled this yet, so a second
+        # initialization pass in the same process doesn't start a second server.
+        self._static_server_base_url: str | None = None
+
+        # Seed the driver with any configured override so URLs built before initialization
+        # completes still point at the tunnel or proxy fronting the server. The handler re-reads
+        # it, so an override from a project activated after this manager was constructed counts.
+        configured_base_url = self._configured_base_url()
+        base_url = f"{configured_base_url}{STATIC_SERVER_URL}" if configured_base_url is not None else None
 
         match self.storage_backend:
             case StorageBackend.GTC:
@@ -169,10 +168,11 @@ class StaticFilesManager(EngineScoped):
 
     @property
     def static_server_base_url(self) -> str:
-        """Base URL for the static server.
+        """Base URL of the static server serving this workspace.
 
-        Resolved during ``on_app_initialization_complete`` once the server has bound to a
-        port. Reading this before that event fires indicates a startup-ordering bug.
+        Resolved during ``on_app_initialization_complete``, either from the server the host
+        process provided or from the one this engine started. Reading it before that event
+        fires is a startup-ordering bug.
         """
         if self._static_server_base_url is None:
             msg = "static_server_base_url accessed before on_app_initialization_complete resolved it."
@@ -416,23 +416,58 @@ class StaticFilesManager(EngineScoped):
             result_details="Successfully created static file download URL",
         )
 
-    def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        # Start static server in daemon thread if enabled
-        if isinstance(self.storage_driver, LocalStorageDriver):
+    def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        if not isinstance(self.storage_driver, LocalStorageDriver):
+            return
+
+        if payload.static_server_base_url is not None:
+            # The host process serves this workspace and told us where. Pointing at its server
+            # keeps asset URLs valid for as long as the host runs, rather than only as long as
+            # this engine does.
+            self._static_server_base_url = payload.static_server_base_url.rstrip("/")
+            logger.debug("Using host-provided static server at %s", self._static_server_base_url)
+        elif self._static_server_base_url is not None:
+            # Initialization can complete more than once per process: a workflow executor
+            # broadcasts it for its own run. Where the workspace is served is already settled.
+            logger.debug("Static server already settled at %s", self._static_server_base_url)
+        else:
+            # No host-provided server, so serve the workspace here.
+            #
+            # This is the path that disappears once every shipped host serves the workspace
+            # itself and sets static_server_base_url on the initialization payload. At that
+            # point this branch and servers/static.py both go away, and a workspace with no
+            # host-provided server simply has no server.
+            #
             # Pre-bind to port 0 (or the configured port) so the OS assigns a free port before
             # the server thread starts. This lets us know the actual port immediately with no
             # race condition between discovering the port and uvicorn binding to it.
             sock = bind_free_socket(STATIC_SERVER_HOST, STATIC_SERVER_PORT)
             actual_port = sock.getsockname()[1]
 
-            # When there's no explicit override, derive the base URL from the bind host and
-            # the OS-assigned port. An override set in __init__ (e.g. an ngrok tunnel, reverse
-            # proxy, or `ssh -L` tunnel on a different port) is taken verbatim.
-            if self._static_server_base_url is None:
+            # An override (e.g. an ngrok tunnel, reverse proxy, or `ssh -L` tunnel on a
+            # different port) fronts the server we just bound, so it is advertised verbatim.
+            # Otherwise the URL follows the bind host and the OS-assigned port.
+            configured_base_url = self._configured_base_url()
+            if configured_base_url is None:
                 self._static_server_base_url = f"http://{STATIC_SERVER_HOST}:{actual_port}"
-            self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
+            else:
+                self._static_server_base_url = configured_base_url
 
             threading.Thread(target=start_static_server, args=(sock,), daemon=True, name="static-server").start()
+            logger.info("Serving workspace static files at %s", self._static_server_base_url)
+
+        self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
+
+    def _configured_base_url(self) -> str | None:
+        """Return the configured static server base URL, normalized, or None when unset.
+
+        A configured value means a tunnel or reverse proxy fronts the server, so it is what
+        gets advertised rather than the address the server binds to.
+        """
+        configured_base_url = self.config_manager.get_config_value("static_server_base_url")
+        if configured_base_url is None:
+            return None
+        return configured_base_url.rstrip("/")
 
     def save_static_file(
         self,
