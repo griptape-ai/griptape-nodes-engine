@@ -1410,6 +1410,38 @@ class TestGitNotInstalled:
         ):
             yield
 
+    def test_a_git_that_cannot_be_run_is_reported_as_a_missing_git(self, temp_dir: Path) -> None:
+        """Test that a non-executable git on PATH reads as a missing git rather than an OS error.
+
+        subprocess raises PermissionError rather than FileNotFoundError for this, and which()
+        skips it for the same reason, so there is no runnable git either way.
+        """
+        bin_dir = temp_dir / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "git").write_text("#!/bin/sh\nexit 0\n")
+        (bin_dir / "git").chmod(0o644)
+        (temp_dir / ".git").mkdir()
+
+        with (
+            patch.dict(os.environ, {"PATH": str(bin_dir)}, clear=False),
+            pytest.raises(GitNotFoundError, match="git was not found on PATH"),
+        ):
+            get_current_tag(temp_dir)
+
+    def test_an_unexplained_start_failure_is_still_a_git_error(self, temp_dir: Path) -> None:
+        """Test that an OS error with no specific diagnosis still reaches callers as a GitError.
+
+        Callers guard on GitError, so a raw OS error escaping here would surface as an unhandled
+        crash rather than a failed request.
+        """
+        (temp_dir / ".git").mkdir()
+
+        with (
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=OSError("too many open files")),
+            pytest.raises(GitError, match="Could not start git"),
+        ):
+            get_current_tag(temp_dir)
+
     @pytest.mark.usefixtures("git_uninstalled")
     def test_reader_raises_git_not_found_error_naming_git_as_a_requirement(self, temp_dir: Path) -> None:
         """Test that get_current_tag raises GitNotFoundError naming git as a requirement when git is missing."""
@@ -1468,8 +1500,23 @@ class TestVanishedRepository:
         with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
             shutil.rmtree(clone)
 
-            with pytest.raises(GitRepositoryError, match="no longer there"):
+            with pytest.raises(GitRepositoryError, match="no folder exists"):
                 has_uncommitted_changes(clone)
+
+    def test_mutator_names_a_path_that_is_a_file_rather_than_a_folder(self, temp_dir: Path) -> None:
+        """Test that a file where a repository should be is reported as such.
+
+        subprocess raises a different error for this than for a missing directory, so it needs
+        its own path to a GitError.
+        """
+        not_a_folder = temp_dir / "library"
+        not_a_folder.write_text("")
+
+        with (
+            patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True),
+            pytest.raises(GitRepositoryError, match="no folder exists"),
+        ):
+            has_uncommitted_changes(not_a_folder)
 
     def test_accessor_reports_no_answer_rather_than_raising(self, temp_dir: Path) -> None:
         """Test that a query accessor treats a deleted folder as "no answer", as it does a detached HEAD."""
