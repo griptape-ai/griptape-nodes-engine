@@ -1435,10 +1435,9 @@ class TestGitNotInstalled:
         crash rather than a failed request.
         """
         (temp_dir / ".git").mkdir()
-
         with (
             patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=OSError("too many open files")),
-            pytest.raises(GitError, match="Could not start git"),
+            pytest.raises(GitError, match="Failed due to: too many open files"),
         ):
             get_current_tag(temp_dir)
 
@@ -1473,6 +1472,20 @@ class TestGitNotInstalled:
         (temp_dir / ".git").mkdir()
 
         git_remote, git_ref = get_git_info(temp_dir)
+
+        assert git_remote is None
+        assert git_ref is None
+
+    def test_get_git_info_reports_no_details_on_any_git_failure(self, temp_dir: Path) -> None:
+        """Test that get_git_info degrades for a git failure it has no specific diagnosis for.
+
+        Its callers on the metadata-load path have no guard, so the "never raises" contract has to
+        hold for every failure, not only for a git that is missing outright.
+        """
+        (temp_dir / ".git").mkdir()
+
+        with patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=OSError("too many open files")):
+            git_remote, git_ref = get_git_info(temp_dir)
 
         assert git_remote is None
         assert git_ref is None

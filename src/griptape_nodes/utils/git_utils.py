@@ -357,13 +357,17 @@ def _reject_option_like(value: str, description: str, error_cls: type[GitError])
         raise error_cls(msg)
 
 
-def _spawn_failure_error(cwd: Path | None, error: OSError) -> GitError:
-    """Explain why a git subprocess could not be started.
+def _git_os_error(cwd: Path | None, error: OSError) -> GitError:
+    """Explain an OS-level failure to run git.
 
     subprocess reports a missing git, a git that cannot be run, and an unusable working directory
     with different sibling OSError types, so the cause has to be established afterwards from what
-    is actually missing. Every outcome is a GitError: callers guard on that, and a raw OS error
-    escaping here would reach a request handler unhandled.
+    is actually missing. Anything left over kept the exact OS error for the log: it covers both a
+    git that never started and one that started and then hit something like fd exhaustion mid-run,
+    which are indistinguishable from here.
+
+    Every outcome is a GitError: callers guard on that, and a raw OS error escaping here would
+    reach a request handler unhandled.
     """
     # which() also rejects a git that is present but not executable, which is the same problem
     # from the caller's point of view: there is no git this process can run.
@@ -374,7 +378,7 @@ def _spawn_failure_error(cwd: Path | None, error: OSError) -> GitError:
         msg = f"Cannot run git in {cwd}: no folder exists at that path."
         return GitRepositoryError(msg)
 
-    msg = f"Could not start git in {cwd}: {error}"
+    msg = f"Attempted to run git in {cwd}. Failed due to: {error}"
     return GitError(msg)
 
 
@@ -384,7 +388,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
     Raises:
         GitNotFoundError: If no runnable git is on PATH.
         GitRepositoryError: If cwd is not a directory.
-        GitError: If git cannot be started for any other reason.
+        GitError: If git cannot be run for any other reason.
     """
     try:
         return subprocess.run(  # noqa: S603
@@ -402,7 +406,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
             check=False,
         )
     except OSError as e:
-        raise _spawn_failure_error(cwd, e) from e
+        raise _git_os_error(cwd, e) from e
 
 
 def _run_git(
@@ -427,6 +431,7 @@ def _run_git(
         error_cls: If the command exits non-zero.
         GitNotFoundError: If no runnable git is on PATH.
         GitRepositoryError: If cwd is not a directory.
+        GitError: If git cannot be run for any other reason.
     """
     result = _git(args, cwd)
     if result.returncode != 0:
@@ -445,6 +450,7 @@ def _try_git(args: list[str], cwd: Path | None = None) -> str | None:
 
     Raises:
         GitNotFoundError: If no runnable git is on PATH.
+        GitError: If git cannot be run for any other reason.
     """
     try:
         result = _git(args, cwd)
@@ -468,7 +474,8 @@ def _run_git_detached(args: list[str], *, error_msg: str, error_cls: type[GitErr
 
     Raises:
         error_cls: If the command exits non-zero.
-        GitNotFoundError: If git is not installed.
+        GitNotFoundError: If no runnable git is on PATH.
+        GitError: If git cannot be run for any other reason.
     """
     with tempfile.TemporaryDirectory() as neutral_dir:
         return _run_git(args, error_msg=error_msg, cwd=Path(neutral_dir), error_cls=error_cls)
@@ -539,8 +546,8 @@ def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
     where this one degrades to None.
 
     This runs for every library on every metadata load, where git details are informational
-    and a library must still load without them. A missing git installation therefore reports
-    "unavailable" here instead of raising the way the single-value accessors do.
+    and a library must still load without them. Every git failure therefore reports
+    "unavailable" here, rather than raising the way the single-value accessors do.
 
     Returns:
         tuple[str | None, str | None]: (git_remote, git_ref), each None if unavailable.
@@ -550,8 +557,8 @@ def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
 
     try:
         return _remote_url(library_path), _describe_head(library_path)
-    except GitNotFoundError:
-        logger.debug("Reporting no git details for %s: git is not installed", library_path)
+    except GitError as e:
+        logger.debug("Reporting no git details for %s: %s", library_path, e)
         return None, None
 
 
