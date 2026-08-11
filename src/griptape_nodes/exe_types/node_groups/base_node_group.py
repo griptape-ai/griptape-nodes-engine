@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeStartNode
 from griptape_nodes.exe_types.core_types import (
     Parameter,
     ParameterMode,
@@ -59,16 +60,22 @@ class BaseNodeGroup(BaseNode):
             group_settings_params.append(parameter.name)
             self.metadata[GROUP_SETTINGS_PARAMS_METADATA_KEY] = group_settings_params
 
-    def add_nodes_to_group(self, nodes: list[BaseNode]) -> None:
+    def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to this group.
 
         Args:
             nodes: A list of nodes to add to this group
+
+        Returns:
+            The nodes actually added, including any tethered companions pulled in.
         """
+        nodes = self._expand_with_tethered_nodes(nodes)
         self._add_nodes_to_group_dict(nodes)
 
         node_names_in_group = set(self.nodes.keys())
         self.metadata["node_names_in_group"] = list(node_names_in_group)
+
+        return nodes
 
     def remove_nodes_from_group(self, nodes: list[BaseNode]) -> None:
         """Remove nodes from this group.
@@ -82,6 +89,24 @@ class BaseNodeGroup(BaseNode):
 
         node_names_in_group = set(self.nodes.keys())
         self.metadata["node_names_in_group"] = list(node_names_in_group)
+
+    def _expand_with_tethered_nodes(self, nodes: list[BaseNode]) -> list[BaseNode]:
+        """Add any tethered companions (e.g. an iterative Start node's paired End node).
+
+        Companions already in the requested list or already in this group are skipped.
+        """
+        expanded = list(nodes)
+        for node in nodes:
+            if not isinstance(node, BaseIterativeStartNode):
+                continue
+            for companion in node.get_nodes_to_group_with():
+                if companion in expanded:
+                    continue
+                if companion.name in self.nodes:
+                    continue
+                expanded.append(companion)
+
+        return expanded
 
     def _add_nodes_to_group_dict(self, nodes: list[BaseNode]) -> None:
         """Add nodes to the group's node dictionary."""

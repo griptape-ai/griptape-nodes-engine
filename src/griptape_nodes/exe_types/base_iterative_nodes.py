@@ -454,6 +454,12 @@ class BaseIterativeStartNode(BaseNode):
             self.parameter_output_values[IterativeNodeParam.INDEX.value] = current_index
             self.publish_update_to_parameter(IterativeNodeParam.INDEX.value, current_index)
 
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must join a node group whenever this Start node does."""
+        if self.end_node is None:
+            return []
+        return [self.end_node]
+
     def _initialize_loop(self) -> None:
         """Initialize the loop with fresh parameter values."""
         # Reset all state for fresh loop execution

@@ -228,6 +228,30 @@ class TestAddNodesToGroupIterativePath:
         assert result.node_names_added.count(end.name) == 0  # not re-added
         assert result.node_names_added.count(start.name) == 1
 
+    def test_group_pulls_in_end_node_without_going_through_manager(self) -> None:
+        """The pairing rule is enforced by BaseNodeGroup itself, not by NodeManager.
+
+        Calling add_nodes_to_group directly must still group the End node and report it.
+        """
+        start, end = self._build_paired_nodes()
+        group = self._build_group()
+
+        nodes_added = group.add_nodes_to_group([start])
+
+        assert end.name in group.nodes
+        assert end.parent_group is group
+        assert [n.name for n in nodes_added] == [start.name, end.name]
+
+    def test_group_returns_only_requested_node_when_end_already_present(self) -> None:
+        """add_nodes_to_group must not re-report an End node that is already in the group."""
+        start, end = self._build_paired_nodes()
+        group = self._build_group()
+        group.add_nodes_to_group([end])
+
+        nodes_added = group.add_nodes_to_group([start])
+
+        assert [n.name for n in nodes_added] == [start.name]
+
     def test_plain_node_has_no_side_effects(self) -> None:
         """Adding a plain (non-iterative) node does not change the node_names_added list size."""
         plain = MockNode("PlainNode")

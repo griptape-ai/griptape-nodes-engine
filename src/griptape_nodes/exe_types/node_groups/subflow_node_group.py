@@ -678,11 +678,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         super().after_value_set(parameter, value)
         self.subflow_execution_component.after_value_set(parameter, value)
 
-    def add_nodes_to_group(self, nodes: list[BaseNode]) -> None:
+    def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to the group and track their connections.
 
         Args:
             nodes: List of nodes to add to the group
+
+        Returns:
+            The nodes actually added, including any tethered companions pulled in.
         """
         from griptape_nodes.retained_mode.events.node_events import (
             MoveNodeToNewFlowRequest,
@@ -690,6 +693,7 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+        nodes = self._expand_with_tethered_nodes(nodes)
         self._remove_nodes_from_existing_parents(nodes)
         self._add_nodes_to_group_dict(nodes)
 
@@ -713,6 +717,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.metadata["node_names_in_group"] = list(node_names_in_group)
         self.remap_to_internal(nodes, connections)
         self._map_external_connections_for_nodes(nodes, connections, node_names_in_group)
+
+        return nodes
 
     def _map_external_connections_for_nodes(
         self, nodes: list[BaseNode], connections: Connections, node_names_in_group: set[str]

@@ -1014,12 +1014,7 @@ class NodeManager(EngineScoped):
         return node_group
 
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
-        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
-
-        For any BaseIterativeStartNode in the list whose paired end_node is not already
-        in the group and not already in the requested list, the end_node is appended to
-        the final list so that Start and End always land in the group together.
-        """
+        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup."""
         flow_result = self._get_flow_for_node_group_operation(request.flow_name)
         if isinstance(flow_result, AddNodesToNodeGroupResultFailure):
             return flow_result
@@ -1034,27 +1029,13 @@ class NodeManager(EngineScoped):
             return node_group_result
         node_group = node_group_result
 
-        # Build the final node list, pulling in any paired End nodes that are missing.
-        final_nodes: list[BaseNode] = list(nodes)
-        for node in nodes:
-            if not isinstance(node, BaseIterativeStartNode):
-                continue
-            end_node = node.end_node
-            if end_node is None:
-                continue
-            if end_node in final_nodes:
-                continue
-            if end_node.name in node_group.nodes:
-                continue
-            final_nodes.append(end_node)
-
         try:
-            node_group.add_nodes_to_group(final_nodes)
+            nodes_added = node_group.add_nodes_to_group(nodes)
         except Exception as err:
             details = f"Attempted to add nodes '{request.node_names}' to NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return AddNodesToNodeGroupResultFailure(result_details=details)
 
-        node_names_added = [n.name for n in final_nodes]
+        node_names_added = [n.name for n in nodes_added]
         details = f"Successfully added nodes '{node_names_added}' to NodeGroup '{request.node_group_name}'"
         return AddNodesToNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
