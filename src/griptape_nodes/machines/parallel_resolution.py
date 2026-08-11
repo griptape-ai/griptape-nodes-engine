@@ -354,6 +354,14 @@ class ExecuteDagState(State):
 
         dag_node = context.node_to_reference[node_name]
 
+        # A locked node is frozen: it never executes and keeps its existing output values.
+        # Mark it DONE here rather than queueing it, so pop_done_states propagates those frozen
+        # outputs and advances control flow. Gating at queue time (rather than at dispatch) is
+        # what keeps it out of the priority queue entirely.
+        if dag_node.node_reference.lock:
+            dag_node.node_state = NodeState.DONE
+            return
+
         # Only check nodes that are currently waiting
         if dag_node.node_state == NodeState.WAITING:
             can_queue = context.dag_builder.can_queue_control_node(dag_node)
@@ -426,12 +434,7 @@ class ExecuteDagState(State):
         canceled_nodes = set()
         for node in leaf_nodes:
             node_reference = context.node_to_reference[node]
-            # If the node is locked, mark it as done so it skips execution
-            if node_reference.node_reference.lock:
-                node_reference.node_state = NodeState.DONE
-                continue
-            node_state = node_reference.node_state
-            if node_state == NodeState.CANCELED:
+            if node_reference.node_state == NodeState.CANCELED:
                 canceled_nodes.add(node)
         return NodeStatesResult(canceled_nodes=canceled_nodes, leaf_nodes=leaf_nodes)
 
