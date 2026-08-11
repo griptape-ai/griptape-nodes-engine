@@ -4246,7 +4246,7 @@ class TestSaveWorkflowOverwriteProtection:
         return tmp_path.resolve()
 
     @pytest.fixture(autouse=True)
-    def setup_default_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> "Generator[None, None, None]":
+    def setup_default_project(self, temp_dir: Path, griptape_nodes: Engine) -> "Generator[None, None, None]":
         """Load + activate the default project template, then force the workspace.
 
         Same ordering as TestCreateVersionedWorkflow: activate first so
@@ -4294,7 +4294,7 @@ class TestSaveWorkflowOverwriteProtection:
 
     @staticmethod
     def _save(
-        griptape_nodes: GriptapeNodes,
+        griptape_nodes: Engine,
         *,
         file_name: str,
         current_workflow_name: str,
@@ -4337,7 +4337,7 @@ class TestSaveWorkflowOverwriteProtection:
         context_manager.push_workflow(workflow_name=current_workflow_name)
         try:
             with (
-                patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+                patch.object(workflow_manager.engine, "ahandle_request", side_effect=fake_ahandle_request),
                 patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
             ):
                 return asyncio.run(
@@ -4349,7 +4349,7 @@ class TestSaveWorkflowOverwriteProtection:
             if context_manager.has_current_workflow():
                 context_manager.pop_workflow()
 
-    def test_self_save_with_dotted_name_succeeds(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_self_save_with_dotted_name_succeeds(self, griptape_nodes: Engine, temp_dir: Path) -> None:
         """Re-saving the open workflow succeeds even with ``overwrite_existing=False``.
 
         ``%d.%m_%H.%M`` is the engine's own default auto-generated name, so a
@@ -4377,7 +4377,7 @@ class TestSaveWorkflowOverwriteProtection:
             assert "# original" not in stub_path.read_text()
 
     def test_collision_with_different_workflow_reports_policy_no_overwrite(
-        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+        self, griptape_nodes: Engine, temp_dir: Path
     ) -> None:
         """Saving onto another workflow's file fails with the typed reason and leaves it intact.
 
@@ -4404,7 +4404,7 @@ class TestSaveWorkflowOverwriteProtection:
             # The other workflow's file is untouched.
             assert victim_path.read_text() == "# theirs"
 
-    def test_collision_overwrites_when_permitted(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+    def test_collision_overwrites_when_permitted(self, griptape_nodes: Engine, temp_dir: Path) -> None:
         """``overwrite_existing=True`` (the default) still replaces the other workflow's file."""
         from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
 
