@@ -686,6 +686,22 @@ class TestCloneRepositoryWorkingDirectory:
 
         assert not marker.exists()
 
+    def test_clone_repository_reports_a_deleted_working_directory_as_a_clone_failure(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that anchoring a relative target fails cleanly when the working directory is gone.
+
+        Anchoring reads the working directory, so a directory deleted from under the process has
+        to surface as a clone failure rather than a raw OS error the caller has no guard for.
+        """
+        workdir = temp_dir / "workdir"
+        workdir.mkdir()
+        monkeypatch.chdir(workdir)
+        workdir.rmdir()
+
+        with pytest.raises(GitCloneError):
+            clone_repository("https://example.com/user/repo.git", Path("clone"))
+
 
 class TestGitEnvironment:
     """Test the environment git subprocesses are given."""

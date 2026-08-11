@@ -977,7 +977,13 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
     # relative target against that directory and the clone would be discarded with it. Anchor to
     # the caller's working directory instead, before anything else reads the path. Deliberately
     # not canonicalize_for_io: it applies the Windows \\?\ long-path prefix, which git rejects.
-    target_path = target_path.absolute()
+    try:
+        target_path = target_path.absolute()
+    except OSError as e:
+        # Anchoring a relative path reads the working directory, which fails if that directory
+        # has been deleted from under the process.
+        msg = f"Attempted to clone {git_url} to {target_path}. Failed due to: {e}"
+        raise GitCloneError(msg) from e
 
     if target_path.exists():
         msg = f"Cannot clone: target path {target_path} already exists"
