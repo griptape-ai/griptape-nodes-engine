@@ -22,6 +22,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
     sanitize_path_string,
     strip_surrounding_quotes,
+    unexpanded_references,
 )
 
 
@@ -280,6 +281,73 @@ class TestPathNeedsExpansion:
     def test_relative_path_no_expansion(self) -> None:
         """Test that relative paths without special chars don't need expansion."""
         assert path_needs_expansion("relative/path") is False
+
+
+class TestUnexpandedReferences:
+    """Tests for unexpanded_references: what `expand_path` could not supply a value for."""
+
+    def test_fully_expanded_path_reports_nothing(self) -> None:
+        """A path with no delimited references left comes back with both lists empty."""
+        result = unexpanded_references("/studio/libraries")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_braced_variable_left_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `${NAME}` that expand_path could not resolve is reported by name."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_reports_nothing_once_the_variable_is_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same value expands cleanly when the variable has a value."""
+        monkeypatch.setenv("GTN_TEST_PRESENT", "/studio")
+
+        result = unexpanded_references(expand_path("${GTN_TEST_PRESENT}/libs"))
+
+        assert result.variables == []
+
+    def test_reports_macro_tokens_separately(self) -> None:
+        """A `{NAME}` token is reported as a macro token, which expand_path never touches."""
+        result = unexpanded_references("{outputs}/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == ["outputs"]
+
+    def test_braced_variable_is_not_double_reported_as_a_macro_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`${NAME}` contains `{NAME}`, so the macro scan must skip what the env scan already claimed."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_bare_dollar_name_is_not_reported(self) -> None:
+        """A bare `$NAME` stays literal: it is indistinguishable from a real folder like `$Recycle.Bin`."""
+        result = unexpanded_references("$Recycle.Bin/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_every_reference_in_one_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A value with several problems reports all of them, so a caller can show the whole picture."""
+        monkeypatch.delenv("GTN_TEST_ONE", raising=False)
+        monkeypatch.delenv("GTN_TEST_TWO", raising=False)
+
+        result = unexpanded_references("${GTN_TEST_ONE}/{outputs}/${GTN_TEST_TWO}")
+
+        assert result.variables == ["GTN_TEST_ONE", "GTN_TEST_TWO"]
+        assert result.macro_tokens == ["outputs"]
+
+    def test_accepts_a_path_object(self) -> None:
+        """expand_path returns a Path, so the helper takes one without the caller stringifying it."""
+        result = unexpanded_references(Path("{outputs}/libs"))
+
+        assert result.macro_tokens == ["outputs"]
 
 
 class TestResolvePathSafely:

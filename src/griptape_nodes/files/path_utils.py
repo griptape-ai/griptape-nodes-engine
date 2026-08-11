@@ -40,6 +40,19 @@ _WINDOWS_UNC_PATTERN = re.compile(_WINDOWS_UNC_MATCH_PATTERN)
 _MACOS_VOLUME_PATTERN = re.compile(_MACOS_VOLUME_MATCH_PATTERN)
 _LINUX_MOUNT_PATTERN = re.compile(_LINUX_MOUNT_MATCH_PATTERN)
 
+# Brace/percent-delimited references that survive `expand_path` because nothing supplied a value.
+# Only the unambiguously DELIMITED env forms are matched: a bare `$NAME` is indistinguishable from a
+# real directory name (`$Recycle.Bin`), so it stays literal. See `unexpanded_references`.
+_UNEXPANDED_ENV_BRACED_MATCH_PATTERN = r"\$\{([^{}]+)\}"
+_UNEXPANDED_ENV_PERCENT_MATCH_PATTERN = r"%([A-Za-z_][A-Za-z0-9_]*)%"
+# A `{NAME}` macro reference, matched only when NOT preceded by `$` so that the `${NAME}` env form
+# above is not reported twice. The lookbehind is what couples these three patterns: they are one scan.
+_UNEXPANDED_MACRO_MATCH_PATTERN = r"(?<!\$)\{([^{}]+)\}"
+
+_UNEXPANDED_ENV_BRACED_PATTERN = re.compile(_UNEXPANDED_ENV_BRACED_MATCH_PATTERN)
+_UNEXPANDED_ENV_PERCENT_PATTERN = re.compile(_UNEXPANDED_ENV_PERCENT_MATCH_PATTERN)
+_UNEXPANDED_MACRO_PATTERN = re.compile(_UNEXPANDED_MACRO_MATCH_PATTERN)
+
 # Windows MAX_PATH limit. Retained for documentation/reference only: the historical
 # 260-char threshold at which the \\?\ prefix becomes strictly necessary. We no longer
 # gate on it -- _apply_windows_long_path_prefix applies the prefix unconditionally on
@@ -382,6 +395,52 @@ def path_needs_expansion(path_str: str) -> bool:
     is_absolute = Path(path_str).is_absolute()
     starts_with_tilde = path_str.startswith("~")
     return has_env_vars or is_absolute or starts_with_tilde
+
+
+class UnexpandedReferences(NamedTuple):
+    """Delimited references still present in a path after `expand_path` ran over it.
+
+    Attributes:
+        variables: Names from `${NAME}` / `%NAME%` references that expanded to nothing.
+        macro_tokens: Names from `{NAME}` tokens, which `expand_path` never touches.
+    """
+
+    variables: list[str]
+    macro_tokens: list[str]
+
+
+def unexpanded_references(path: str | Path) -> UnexpandedReferences:
+    """Report the delimited references an `expand_path` call left behind.
+
+    The counterpart to `path_needs_expansion`: that asks whether a raw value needs expanding, this
+    asks what expansion could not supply. Call it on `expand_path`'s OUTPUT. A caller that finds
+    anything here knows the path has no real answer yet and can name what is missing, instead of
+    treating `${LIBS}` or `{outputs}` as a directory name.
+
+    Reporting only, no policy: whether a `{NAME}` macro token is legal in a given field is the
+    caller's rule (they are not legal in project path fields; see `resolve_project_path_field`), and
+    whether an unsupplied variable is fatal depends on the caller too.
+
+    Two deliberate limits:
+    - A bare `$NAME` is NOT reported. `os.path.expandvars` accepts that form, but an unexpanded
+      `$Recycle.Bin` is indistinguishable from a real directory of that name, so it stays literal.
+      Only `${NAME}` and `%NAME%` are unambiguous enough to call out.
+    - `%NAME%` is only expanded by `os.path.expandvars` on Windows, so on other platforms it is
+      reported even when the variable IS set. That is the honest answer: the value did not expand.
+
+    Args:
+        path: The already-expanded path (or any string) to scan.
+
+    Returns:
+        An `UnexpandedReferences`; both lists empty means the value expanded fully.
+    """
+    path_str = str(path)
+    variables = [
+        *(match.group(1) for match in _UNEXPANDED_ENV_BRACED_PATTERN.finditer(path_str)),
+        *(match.group(1) for match in _UNEXPANDED_ENV_PERCENT_PATTERN.finditer(path_str)),
+    ]
+    macro_tokens = [match.group(1) for match in _UNEXPANDED_MACRO_PATTERN.finditer(path_str)]
+    return UnexpandedReferences(variables=variables, macro_tokens=macro_tokens)
 
 
 def resolve_path_safely(path: Path) -> Path:

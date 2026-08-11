@@ -17,7 +17,12 @@ from griptape_nodes.common.project_templates.loader import (
     load_yaml_with_line_tracking,
 )
 from griptape_nodes.common.project_templates.project import ProjectTemplate
-from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath, select_project_path
+from griptape_nodes.common.project_templates.project_path import (
+    PerPlatformProjectPath,
+    ResolvedProjectPath,
+    resolve_project_path_field,
+    select_project_path,
+)
 from griptape_nodes.common.project_templates.situation import (
     SituationFilePolicy,
     SituationPolicy,
@@ -51,6 +56,7 @@ __all__ = [
     "ProjectValidationProblemSeverity",
     "ProjectValidationStatus",
     "ProjectVariableDef",
+    "ResolvedProjectPath",
     "SituationFilePolicy",
     "SituationPolicy",
     "SituationTemplate",
@@ -60,6 +66,7 @@ __all__ = [
     "load_partial_project_template",
     "load_project_template_from_yaml",
     "load_yaml_with_line_tracking",
+    "resolve_project_path_field",
     "schema_major_or_none",
     "select_project_path",
 ]

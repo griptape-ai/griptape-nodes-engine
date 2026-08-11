@@ -147,8 +147,10 @@ def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
             obj: CommentedMap or CommentedSeq from ruamel.yaml (has lc attribute)
             path: Current field path for tracking
 
-        Note: Only CommentedMap/CommentedSeq objects have line tracking.
-        Plain dicts/lists and scalars don't have lc attributes.
+        Note: Only CommentedMap/CommentedSeq objects have their own `lc`. A scalar value
+        has none, so its line comes from its KEY's position in the parent map -- without
+        that, a plain `libraries_dir: "..."` line could never be pointed at, and most
+        fields in a project file are scalars.
         """
         # Track line number for this object
         line = obj.lc.line + 1  # Convert to 1-indexed
@@ -160,6 +162,8 @@ def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
                 child_path = f"{path}.{key}" if path else key
                 if isinstance(value, CommentedMap | CommentedSeq):
                     track_lines(value, child_path)
+                else:
+                    _track_scalar_key_line(obj, key, child_path, line_info)
         elif isinstance(obj, CommentedSeq):
             for i, item in enumerate(obj):
                 child_path = f"{path}[{i}]"
@@ -171,6 +175,19 @@ def load_yaml_with_line_tracking(yaml_text: str) -> YAMLParseResult:
         track_lines(data, "")
 
     return YAMLParseResult(data=data, line_info=line_info)
+
+
+def _track_scalar_key_line(parent: CommentedMap, key: Any, field_path: str, line_info: YAMLLineInfo) -> None:
+    """Record the line of a scalar entry from its key's position in the parent mapping.
+
+    ruamel stores key positions on the parent's `lc.data`, which is populated for anything it
+    parsed but absent on a CommentedMap built in memory. An untracked key is simply left
+    unrecorded -- callers already treat a missing line as "no line to point at".
+    """
+    key_positions = parent.lc.data
+    if key_positions is None or key not in key_positions:
+        return
+    line_info.add_mapping(field_path, key_positions[key][0] + 1)
 
 
 def _inject_names_from_keys(data: dict[str, Any], section_field: str) -> None:

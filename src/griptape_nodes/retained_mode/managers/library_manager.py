@@ -231,6 +231,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_DIRECTORY_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     LIBRARY_DEPENDENCY_INSTALL_BEHAVIOR_KEY,
@@ -3647,10 +3648,7 @@ class LibraryManager(EngineScoped):
         if libraries_root is not None:
             libraries_path = libraries_root
         else:
-            libraries_path = resolve_workspace_path(
-                Path(get_dot_value(merged, "libraries_directory")),
-                config_mgr.configured_global_workspace_path(),
-            )
+            libraries_path = config_mgr.default_libraries_root(get_dot_value(merged, LIBRARIES_DIRECTORY_KEY))
 
         actions = await asyncio.gather(
             *(self._plan_one_library_provisioning(download, libraries_path) for download in downloads)
