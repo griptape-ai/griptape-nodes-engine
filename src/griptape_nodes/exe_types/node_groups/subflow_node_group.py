@@ -730,6 +730,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             connections: Connections object from FlowManager
             node_names_in_group: Set of all node names currently in the group
         """
+        # TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5272): Skip hidden iterative
+        # tether params here. When a Start/End pair straddles the group boundary, proxying their tethers
+        # deletes the originals and every replacement hop is rejected, destroying the pairing.
+
         # Group outgoing connections by (source_node, source_parameter) to reuse proxy parameters
         # Skip connections that already go to the NodeGroup itself (existing proxy parameters)
         outgoing_by_source: dict[tuple[str, str], list[Connection]] = {}
