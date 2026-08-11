@@ -122,6 +122,7 @@ Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `t
 | Trait                | Typical types             | What it does                                                                                          | `ui_options` it writes                                                          |
 | -------------------- | ------------------------- | ----------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | `Options`            | `str`, any                | Dropdown of fixed choices, with optional search. Can also accept free text (see below).               | `simple_dropdown`, `show_search`, `search_filter`, `allow_user_created_options` |
+| `Suggestions`        | `str`                     | Text field with typeahead; the choices are hints and the value is never constrained (see below).      | `suggestions`                                                                   |
 | `MultiOptions`       | `list`                    | Multi-select dropdown.                                                                                | `multi_options`                                                                 |
 | `Slider`             | `int`, `float`            | Slider between `min_val` and `max_val`; out-of-range values fail validation.                          | `slider`                                                                        |
 | `Clamp`              | `int`, `float`, sequences | Clamps the value into range on assignment. No UI of its own.                                          | —                                                                               |
@@ -134,7 +135,15 @@ Traits live in `griptape_nodes.traits` and are attached with `add_trait()` or `t
 
 See the [Traits section of the Parameters reference](parameters.md#traits) for constructor signatures and examples.
 
-### Dropdowns that accept free text
+### Choosing between a dropdown, a loose dropdown, and a typeahead
+
+Three widgets offer a list of values. They differ in who is in charge, the list or the user.
+
+| You want the user to                                     | Use                                             | Renders as                                      |
+| -------------------------------------------------------- | ----------------------------------------------- | ----------------------------------------------- |
+| pick one of N values, and nothing else                   | `Options(choices=...)`                          | Dropdown; unlisted values are rejected          |
+| mostly pick, but occasionally paste a value of their own | `Options(..., allow_user_created_options=True)` | Dropdown, plus a `Use "..."` row for typed text |
+| mostly type, with the list as a hint                     | `Suggestions(choices=...)`                      | Text field; matches appear as they type         |
 
 By default `Options` constrains the value to `choices`: anything else is snapped back to the first choice, and assigning it directly fails validation. Pass `allow_user_created_options=True` to turn the choices into suggestions instead:
 
@@ -148,4 +157,32 @@ Parameter(
 )
 ```
 
-The dropdown still filters `choices` as the user types, but text matching no choice is offered as a `Use "..."` row and stored verbatim. Reach for this when the list is a convenience rather than the full set of valid values — a model id the provider added after the node shipped, a user's own fine-tune. Leave it off when an unrecognized value would fail at run time; a dropdown that rejects bad input up front beats a node that errors mid-flow.
+The dropdown still filters `choices` as the user types, but text matching no choice is offered as a `Use "..."` row and stored verbatim.
+
+`Suggestions` is the other way round. The parameter is an ordinary text field, and the choices only surface once there is something to match:
+
+```python
+from griptape_nodes.traits.suggestions import Suggestion, Suggestions
+
+Parameter(
+    name="model",
+    type="str",
+    tooltip="Pick a suggested model or type your own id",
+    traits={
+        Suggestions(
+            choices=[
+                Suggestion("gpt-4.1", label="GPT-4.1", subtitle="OpenAI"),
+                "claude-sonnet-4-5",
+            ]
+        )
+    },
+)
+```
+
+Choices are plain strings, or `Suggestion` rows when a row needs a friendly `label`, a `subtitle`, or an `icon`. Only `name` is ever stored: the decoration dresses up the row in the list, and picking a row fills the field with `name`. Because the value is never constrained, `Suggestions` adds no converter and no validator, so updating its `choices` at run time cannot invalidate a value the node already holds.
+
+Rule of thumb: reach for a loose dropdown or a typeahead when the list is a convenience rather than the full set of valid values, such as a model id the provider added after the node shipped, or a user's own fine-tune. Stay with a plain `Options` when an unrecognized value would fail at run time; a dropdown that rejects bad input up front beats a node that errors mid-flow.
+
+!!! warning "Do not put `Options` and `Suggestions` on the same parameter"
+
+    Both write the key the editor uses to pick a widget. The dropdown wins and the suggestions are silently ignored.
