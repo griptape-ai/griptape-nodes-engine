@@ -11,9 +11,32 @@ description: Drive or verify Griptape Nodes. Use for anything touching a Griptap
 scripts. Every script in `scripts/` has two forms:
 
 - `gtn-foo.sh` — macOS and Linux (bash). Run directly: `./gtn-foo.sh --flag value`.
-- `gtn-foo.ps1` — Windows (native PowerShell, no WSL/Git Bash needed). Run via
-  `pwsh`, with PowerShell-style named parameters instead of `--flags`:
-  `pwsh ./gtn-foo.ps1 -Flag value`.
+- `gtn-foo.ps1` — Windows. Runs on the `powershell.exe` (5.1) that ships with
+  every Windows install — `pwsh` (PowerShell 7) is **not** required, and
+  isn't present by default. Named parameters instead of `--flags`:
+  `powershell -File .\gtn-foo.ps1 -Flag value`. If the default execution
+  policy (`Restricted`) blocks this, that's expected on a fresh machine — see
+  the note below.
+
+Verified on a real Windows 11 box with only stock `powershell.exe` 5.1: every
+`.ps1` script here parses and runs. Getting there surfaced two 5.1-specific
+gotchas worth knowing if you edit these files:
+
+- **Save `.ps1` files as UTF-8 with a BOM.** Without one, `powershell.exe`
+  5.1 decodes the file using the system codepage instead of UTF-8. Any
+  non-ASCII character sitting inside a real string literal (not a comment,
+  not a here-string body — those survived fine) silently corrupts from that
+  byte onward and the parser reports wildly misleading errors dozens of lines
+  later. Concretely: an em dash inside a `Write-Error`/`Write-Log` message
+  string broke two of these scripts until a BOM was added; `pwsh`
+  (PowerShell 7) never had this problem because it defaults to UTF-8
+  regardless of BOM. All scripts here now carry a BOM — keep it if you edit
+  them.
+- **`Restricted` is the default execution policy** on a fresh Windows
+  install, which blocks all `.ps1` execution outright, including these
+  scripts. Either run with `-ExecutionPolicy Bypass` per-invocation (affects
+  only that one process, nothing persistent), or set the policy once:
+  `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser`.
 
 Examples throughout this doc show the `.sh` form; on Windows, swap the
 extension and flag style. The one exception is the raw `dev-browser <<EOF ...
@@ -47,7 +70,7 @@ ${CLAUDE_SKILL_DIR}/scripts/gtn-install-prereqs.sh   # macOS/Linux
 ```
 
 ```powershell
-pwsh ${CLAUDE_SKILL_DIR}/scripts/gtn-install-prereqs.ps1   # Windows
+powershell -File ${CLAUDE_SKILL_DIR}/scripts/gtn-install-prereqs.ps1   # Windows
 ```
 
 It installs `ffmpeg`, `python3`, `node`/`npm`, and the `dev-browser` CLI
@@ -60,7 +83,7 @@ package) — it only checks for these and tells you what's missing.
 
 | Tool | Check | Notes |
 |---|---|---|
-| `dev-browser` CLI | `dev-browser --help` | Only strictly needed for the Web pathway — the Desktop pathway attaches to the already-running app's own browser, not dev-browser's |
+| `dev-browser` CLI | `dev-browser --help` | Only strictly needed for the Web pathway — the Desktop pathway attaches to the already-running app's own browser, not dev-browser's. Has no native **Windows on ARM** build (only win32-x64) — confirmed by its postinstall crashing outright on a win32-arm64 VM; the installer script detects this and skips the attempt with a clear message instead of leaving a broken half-install |
 | `ffmpeg` | `ffmpeg -version` | Needs the `mpdecimate` filter and `libx264`, both in a standard build |
 | `python3` | `python3 --version` | Ships with macOS; installed by the script elsewhere |
 | Griptape Nodes Desktop app | see per-OS install-path notes in `gtn-desktop-up.sh`/`.ps1` | Install normally, for the Desktop pathway. On Linux/Windows, set `GTN_DESKTOP_BIN` (`$env:GTN_DESKTOP_BIN` on Windows) if it's installed somewhere the scripts don't guess |
@@ -400,7 +423,7 @@ ${CLAUDE_SKILL_DIR}/scripts/gtn-record-screen.sh --secs 10 --out /tmp/window.mp4
 ```
 
 ```powershell
-pwsh ${CLAUDE_SKILL_DIR}/scripts/gtn-record-screen.ps1 -Secs 10 -Out C:\temp\window.mp4
+powershell -File ${CLAUDE_SKILL_DIR}/scripts/gtn-record-screen.ps1 -Secs 10 -Out C:\temp\window.mp4
 ```
 
 **macOS**: needs Screen Recording permission for the terminal (System Settings
@@ -420,12 +443,54 @@ as long as the script prints an `out=` line.
 **Linux**: tries Wayland (`wf-recorder`) first, then falls back to X11
 (`ffmpeg x11grab`) if the session isn't Wayland or `wf-recorder` isn't
 installed. `wf-recorder` only works on wlroots compositors (Sway, Hyprland,
-river) — on GNOME/KDE Wayland, run from an X11/XWayland session instead. No
-permission prompt to handle either way. Best-effort, not exercised against a
-real install.
+river) — GNOME/KDE Wayland need the X11 fallback instead. No permission
+prompt to handle either way.
 
-**Windows**: uses `ffmpeg`'s `gdigrab`. No permission prompt to handle. Best-effort,
-not exercised against a real install.
+Verified end-to-end on a real Ubuntu/GNOME/Wayland VM, reached only over
+plain SSH (no graphical login of its own): the script backfills
+`DISPLAY`/`WAYLAND_DISPLAY`/`XDG_SESSION_TYPE`/`XAUTHORITY` from
+`systemctl --user show-environment` when the shell doesn't already have them
+(a bare SSH session never inherits them, even though the desktop session
+genuinely has them) — without this it can't find a display at all, and
+without also backfilling `XAUTHORITY` specifically, X11 clients fail with
+"Authorization required, but no authorization protocol specified". With that
+fixed, `x11grab` against the XWayland display (`:0` here) produces a real,
+non-crashing recording (correct duration, resolution, and — via the XFixes
+extension, which tracks the pointer globally regardless of Wayland/X11 — a
+live cursor overlay).
+
+**But on GNOME (and almost certainly KDE) Wayland, the X11 fallback cannot
+capture any actual window content at all, full stop** — not desktop chrome,
+not X11-native client windows either. Confirmed directly: launched
+`gnome-calculator` forced onto X11 (`GDK_BACKEND=x11`), verified with
+`xwininfo -root -tree` that a real, correctly-positioned XWayland window
+existed (`"Calculator" 410x666+755+283`), then recorded — still solid black,
+cursor only. The reason is architectural, not a config problem: GNOME's
+XWayland runs in **rootless mode** (confirmed via its process args:
+`Xwayland :0 -rootless ...`), meaning individual client surfaces are handed
+directly to mutter for compositing and the XWayland root window itself is
+never painted with real pixels — there is no composited framebuffer at the
+X11 level for `x11grab` to read, by design. This isn't specific to this VM;
+rootless is the standard, near-universal XWayland mode on modern Wayland
+compositors. Practically: **on GNOME/KDE Wayland, there is currently no
+working native-screen-recording path in this skill** — `wf-recorder` doesn't
+support non-wlroots compositors, and the X11 fallback that's supposed to
+cover that gap doesn't actually work either. Use the CDP-based recording
+pathways (`gtn-record.sh`, the "Drive it" screenshot pattern) instead; they
+capture page content directly and are unaffected by any of this. A genuine
+fix would need a portal-based capture flow (PipeWire + `xdg-desktop-portal`),
+which is a real scripting effort of its own and out of scope here.
+
+**Windows**: uses `ffmpeg`'s `gdigrab`. No permission prompt to handle, but
+**must run from an interactive desktop session** (a real console/RDP login).
+Confirmed on a real Windows 11 VM: a shell reached via OpenSSH-as-a-Windows-service
+lands in Session 0 (`query session` shows it separate from the Session 1
+console the desktop actually runs in) — `gdigrab` fails there with `Failed to
+capture image (error 5)` (access denied) because Session 0 has no access to
+the interactive desktop's frame buffer. This is standard Windows Session 0
+isolation, not a bug in this script, and it does not affect the CDP-based
+pathways (`gtn-record.ps1`, the "Drive it" screenshot pattern) — those render
+the page content itself and work fine even from such a shell.
 
 ## Storage: scratch vs permanent
 

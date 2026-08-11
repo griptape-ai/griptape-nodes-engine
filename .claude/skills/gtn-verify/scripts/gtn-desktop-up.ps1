@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Bring Griptape Nodes Desktop up with CDP exposed on port 9222 and wait until
 # the editor frame has attached. Idempotent: exits immediately if CDP is
 # already live.
@@ -8,7 +8,7 @@
 #
 # Windows only — see gtn-desktop-up.sh for macOS/Linux.
 #
-#   pwsh ./gtn-desktop-up.ps1
+#   powershell -File ./gtn-desktop-up.ps1
 #
 # Set $env:GTN_DESKTOP_BIN if the app isn't found automatically (Velopack's
 # per-user install path below is a best guess, not verified against a real
@@ -33,7 +33,10 @@ function Test-CdpUp {
 function Test-EditorAttached {
     try {
         $targets = Invoke-RestMethod -Uri "$Cdp/json/list" -TimeoutSec 3
-        return ($targets | Where-Object { $_.url -like "gtn-editor://*" }).Count -gt 0
+        # @() forces array context — Where-Object returns $null for zero matches
+        # and a bare (non-array) object for exactly one, and Set-StrictMode
+        # throws PropertyNotFoundStrict on .Count for either without this.
+        return @($targets | Where-Object { $_.url -like "gtn-editor://*" }).Count -gt 0
     } catch {
         return $false
     }
@@ -72,14 +75,14 @@ function Stop-DesktopGracefully {
 if (Test-CdpUp) {
     Write-Output "cdp=already-live port=$Port"
 } else {
-    if ((Get-DesktopProcesses).Count -gt 0) {
+    if (@(Get-DesktopProcesses).Count -gt 0) {
         Write-Error "quitting running app (no CDP port)..." -ErrorAction Continue
         Stop-DesktopGracefully
         for ($i = 0; $i -lt 20; $i++) {
-            if ((Get-DesktopProcesses).Count -eq 0) { break }
+            if (@(Get-DesktopProcesses).Count -eq 0) { break }
             Start-Sleep -Seconds 1
         }
-        $remaining = Get-DesktopProcesses
+        $remaining = @(Get-DesktopProcesses)
         if ($remaining.Count -gt 0) {
             Write-Error "graceful quit timed out, force killing" -ErrorAction Continue
             $remaining | Stop-Process -Force

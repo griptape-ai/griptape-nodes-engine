@@ -11,10 +11,17 @@
 #
 # Linux: tries Wayland first (wf-recorder), then falls back to X11 (ffmpeg
 #   x11grab). wf-recorder only works on wlroots-based compositors (Sway,
-#   Hyprland, river) — it does not support the portal-based capture GNOME/KDE
-#   Wayland require. On those desktops, run this from an X11 session (or
-#   XWayland) instead. This path is best effort and has not been exercised
-#   against a real Linux install of the app.
+#   Hyprland, river). On GNOME/KDE Wayland neither path actually works:
+#   wf-recorder doesn't support those compositors, and the X11/XWayland
+#   fallback produces a real, non-crashing recording that is nonetheless
+#   solid black — confirmed live (Ubuntu/GNOME/Wayland): GNOME's XWayland
+#   runs rootless, so individual client surfaces go straight to the Wayland
+#   compositor and the XWayland root window this reads from is never
+#   actually painted with pixels, even for a real, correctly-positioned
+#   XWayland client window verified via `xwininfo`. This is architectural,
+#   not fixable from here — use the CDP-based recording pathways instead on
+#   those desktops. A real X11 session (not XWayland) does not have this
+#   problem, since there the root window is genuinely composited.
 #
 # Windows: use gtn-record-screen.ps1 instead (ffmpeg gdigrab).
 set -euo pipefail
@@ -102,7 +109,11 @@ record_linux_x11() {
   local x11_display="${DISPLAY_IDX:-${DISPLAY:-:0}}"
   local size=""
   if command -v xdpyinfo >/dev/null 2>&1; then
-    size=$(DISPLAY="${x11_display}" xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')
+    # || true: xdpyinfo failing (missing X auth, wrong display, etc.) makes
+    # the pipeline's status non-zero, and pipefail would otherwise propagate
+    # that into `size=$(...)` and kill the whole script here via set -e
+    # instead of falling through to the size-detection-failed warning below.
+    size=$(DISPLAY="${x11_display}" xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}') || true
   fi
   if [[ -z "${size}" ]]; then
     echo "warn: could not detect display size (xdpyinfo missing or failed), defaulting to 1920x1080" >&2
@@ -124,6 +135,27 @@ record_linux_x11() {
 }
 
 record_linux() {
+  # A non-graphical shell (e.g. reached over plain SSH) doesn't inherit
+  # DISPLAY/WAYLAND_DISPLAY/XDG_SESSION_TYPE from the desktop session even
+  # when one is genuinely running — those only ever lived in that session's
+  # own processes' environments. Confirmed on a real Ubuntu/GNOME/Wayland box:
+  # an SSH shell sees XDG_SESSION_TYPE=tty and empty DISPLAY, while
+  # `systemctl --user show-environment` (desktop environments import their
+  # session vars into it at login) correctly reports both. Backfill from
+  # there before deciding which backend to use.
+  if [[ -z "${DISPLAY:-}" && -z "${WAYLAND_DISPLAY:-}" ]]; then
+    while IFS='=' read -r key value; do
+      case "${key}" in
+        # XAUTHORITY too — without it, an X11 client (xdpyinfo, ffmpeg
+        # x11grab) can reach the display but fails with "Authorization
+        # required, but no authorization protocol specified", confirmed live.
+        DISPLAY|WAYLAND_DISPLAY|XDG_SESSION_TYPE|XAUTHORITY)
+          [[ -z "${!key:-}" ]] && export "${key}=${value}"
+          ;;
+      esac
+    done < <(systemctl --user show-environment 2>/dev/null)
+  fi
+
   if [[ "${XDG_SESSION_TYPE:-}" == "wayland" ]] && command -v wf-recorder >/dev/null 2>&1; then
     record_linux_wayland
   elif [[ -n "${DISPLAY:-}" || -n "${DISPLAY_IDX}" ]]; then

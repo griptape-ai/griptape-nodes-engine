@@ -1,8 +1,8 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Record the actual Windows screen, including native window chrome, menus and
 # file dialogs that CDP screenshots cannot see.
 #
-#   pwsh ./gtn-record-screen.ps1 [-Secs N] [-Out PATH] [-NoFocus]
+#   powershell -File ./gtn-record-screen.ps1 [-Secs N] [-Out PATH] [-NoFocus]
 #
 # Uses ffmpeg's gdigrab. There is no macOS-style permission prompt to probe
 # for on Windows, so this just runs.
@@ -41,5 +41,15 @@ Write-Error "recording screen for ${Secs}s..." -ErrorAction Continue
     -f gdigrab -framerate 30 -i desktop `
     -t $Secs -c:v libx264 -preset veryfast -pix_fmt yuv420p -vf "scale=1600:-2" `
     $Out
+
+# $ErrorActionPreference = "Stop" does not catch a non-zero exit from a
+# native executable in Windows PowerShell 5.1 — without this check the
+# script would print a false "out=" success line even when ffmpeg failed
+# (confirmed: gdigrab returning "Failed to capture image" still fell through
+# to here).
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "ERROR: ffmpeg failed (exit $LASTEXITCODE)"
+    exit 1
+}
 
 Write-Output "out=$Out secs=$Secs"

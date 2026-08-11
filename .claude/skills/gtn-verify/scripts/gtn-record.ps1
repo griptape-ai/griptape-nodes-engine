@@ -1,8 +1,8 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Record page content from Griptape Nodes to an mp4, by capturing a JPEG frame
 # loop over CDP and encoding with ffmpeg.
 #
-#   pwsh ./gtn-record.ps1 [-Target desktop|web] [-Secs N] [-Fps N] [-Out PATH]
+#   powershell -File ./gtn-record.ps1 [-Target desktop|web] [-Secs N] [-Fps N] [-Out PATH]
 #
 # Captures page pixels only — no native window chrome. Use gtn-record-screen.ps1
 # for that.
@@ -62,7 +62,16 @@ $loop
     $script | & dev-browser --browser $WebProfile --timeout $ScriptTimeout
 }
 
-$count = (Get-ChildItem -Path "$Tmp\gtnrec_*.jpg" -ErrorAction SilentlyContinue).Count
+# A crash partway through would still leave some frames on disk, which the
+# frame-count check below can't catch by itself — check the exit code too.
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "ERROR: dev-browser failed (exit $LASTEXITCODE)"
+    exit 1
+}
+
+# @() forces array context — see gtn-encode.ps1 for why this matters under
+# Set-StrictMode.
+$count = @(Get-ChildItem -Path "$Tmp\gtnrec_*.jpg" -ErrorAction SilentlyContinue).Count
 if ($count -eq 0) {
     Write-Error "ERROR: no frames captured"
     exit 1
@@ -75,6 +84,13 @@ if ($count -eq 0) {
     -framerate $Fps -start_number 0 -i "$Tmp\gtnrec_%05d.jpg" `
     -c:v libx264 -pix_fmt yuv420p -vf "scale=1280:-2" `
     $Out
+
+# See gtn-record-screen.ps1 for why this check matters — without it, a failed
+# ffmpeg run would still fall through and delete the source frames below.
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "ERROR: ffmpeg failed (exit $LASTEXITCODE)"
+    exit 1
+}
 
 Remove-Item -Path "$Tmp\gtnrec_*.jpg" -ErrorAction SilentlyContinue
 Write-Output "frames=$count fps=$Fps out=$Out"

@@ -1,7 +1,7 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Check for and install the CLI prerequisites this skill needs on Windows.
 #
-#   pwsh ./gtn-install-prereqs.ps1 [-DryRun]
+#   powershell -File ./gtn-install-prereqs.ps1 [-DryRun]
 #
 # Installs: ffmpeg, python3, node/npm, the dev-browser CLI (+ its bundled
 # Chromium). Prefers winget (built into Windows 10 1709+/11); falls back to
@@ -62,6 +62,17 @@ function Install-Package {
     }
 }
 
+function Update-SessionPath {
+    # winget/choco update the Machine/User Path in the registry and broadcast
+    # a change notification, but that never reaches an already-running
+    # process's own $env:Path — so a probe run immediately after an install,
+    # in this same script, would otherwise report a false "not found" even
+    # though the install genuinely succeeded.
+    $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+    $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+    $env:Path = "$machinePath;$userPath"
+}
+
 function Test-AndInstall {
     param([string]$Name, [scriptblock]$Probe, [scriptblock]$InstallFn)
     if (& $Probe) {
@@ -69,6 +80,7 @@ function Test-AndInstall {
     } else {
         Write-Log "[missing] $Name — installing..."
         & $InstallFn | Out-Null
+        Update-SessionPath
         if (& $Probe) {
             Write-Log "[installed] $Name"
         } else {
@@ -91,9 +103,16 @@ Test-AndInstall -Name "npm" `
 
 if (Get-Command dev-browser -ErrorAction SilentlyContinue) {
     Write-Log "[ok] dev-browser"
+} elseif ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+    # dev-browser's postinstall only ships native downloads for win32-x64 (and
+    # the darwin/linux platforms) — on win32-arm64 it fails with a confusing
+    # "Unsupported platform" crash mid-install and leaves a half-installed
+    # node_modules behind. Skip the attempt and say why instead.
+    Write-Log "[FAILED] dev-browser — no win32-arm64 build is published; the Web pathway and dev-browser-based recording won't work on Windows on ARM. The Desktop pathway doesn't depend on it."
 } elseif (Get-Command npm -ErrorAction SilentlyContinue) {
     Write-Log "[missing] dev-browser — installing via npm..."
     Invoke-Run @("npm", "install", "-g", "dev-browser") | Out-Null
+    Update-SessionPath
     if (Get-Command dev-browser -ErrorAction SilentlyContinue) {
         Write-Log "[installed] dev-browser — fetching its bundled Chromium..."
         Invoke-Run @("dev-browser", "install") | Out-Null

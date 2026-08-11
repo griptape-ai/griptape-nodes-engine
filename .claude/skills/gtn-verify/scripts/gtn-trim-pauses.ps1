@@ -1,8 +1,8 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Collapse static "thinking pause" stretches out of an already-recorded video,
 # without touching moving sections.
 #
-#   pwsh ./gtn-trim-pauses.ps1 -In IN.mp4 -Out OUT.mp4 [-Sensitivity low|medium|high]
+#   powershell -File ./gtn-trim-pauses.ps1 -In IN.mp4 -Out OUT.mp4 [-Sensitivity low|medium|high]
 #
 # See gtn-trim-pauses.sh for the mechanism (mpdecimate + setpts) and the
 # meaning of the per-sensitivity thresholds — identical here.
@@ -32,5 +32,12 @@ switch ($Sensitivity) {
     -vf "mpdecimate=hi=${Hi}:lo=${Lo}:frac=${Frac},setpts=N/FRAME_RATE/TB" `
     -an `
     $Out
+
+# $ErrorActionPreference = "Stop" does not catch a non-zero exit from a
+# native executable in Windows PowerShell 5.1 — check explicitly.
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "ERROR: ffmpeg failed (exit $LASTEXITCODE)"
+    exit 1
+}
 
 Write-Output "sensitivity=$Sensitivity out=$Out"

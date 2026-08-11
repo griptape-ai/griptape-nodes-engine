@@ -1,7 +1,7 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Sweep this skill's own scratch files out of dev-browser's tmp dir.
 #
-#   pwsh ./gtn-clean-scratch.ps1
+#   powershell -File ./gtn-clean-scratch.ps1
 #
 # See gtn-clean-scratch.sh for why this exists — this is the same sweep,
 # scoped to the same "gtn"/"gtnrec_" prefixes.
@@ -11,7 +11,11 @@ $ErrorActionPreference = "Stop"
 
 $Tmp = "$HOME\.dev-browser\tmp"
 
-$files = Get-ChildItem -Path "$Tmp\*" -Include "gtn*.png", "gtn*.jpg", "gtnrec_*.jpg" -File -ErrorAction SilentlyContinue
+# @() forces array context — a bare Get-ChildItem result is $null for zero
+# matches or a single non-array object for exactly one match, and
+# Set-StrictMode throws PropertyNotFoundStrict on .Count for either later
+# without this.
+$files = @(Get-ChildItem -Path "$Tmp\*" -Include "gtn*.png", "gtn*.jpg", "gtnrec_*.jpg" -File -ErrorAction SilentlyContinue)
 
 if (-not $files) {
     Write-Output "nothing to clean"

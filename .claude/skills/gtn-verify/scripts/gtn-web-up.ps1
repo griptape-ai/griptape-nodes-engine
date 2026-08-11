@@ -1,4 +1,4 @@
-#!/usr/bin/env pwsh
+﻿#!/usr/bin/env pwsh
 # Open the hosted Griptape Nodes editor in the persistent `gtn-web` Chromium
 # profile and report whether it is signed in.
 #
@@ -35,3 +35,11 @@ if (needsLogin) {
 "@
 
 $script | & dev-browser --browser $WebProfile --timeout 90
+
+# A PowerShell script's own exit code defaults to 0 regardless of the last
+# native command's exit code unless propagated explicitly — without this, a
+# failed dev-browser run would still report success to any caller checking
+# $LASTEXITCODE/%ERRORLEVEL%.
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
