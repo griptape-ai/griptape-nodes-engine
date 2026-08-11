@@ -4182,3 +4182,198 @@ class TestExecuteWorkflowImport:
         # ...and returns exactly what the helper chose.
         assert isinstance(result, ImportWorkflowAsReferencedSubFlowResultSuccess)
         assert result.created_flow_name == "ControlFlow_2"
+
+
+class TestSaveWorkflowOverwriteProtection:
+    """``overwrite_existing=False`` refuses to clobber a *different* registered workflow.
+
+    Drives ``on_save_workflow_request`` end-to-end through the real write path (only
+    flow serialization is mocked) so the ``ExistingFilePolicy.FAIL`` decision, the
+    OSManager write, and the ``FileIOFailureReason`` plumbing are all exercised.
+
+    Covers the two branches added for the overwrite-protection feature:
+    - self-save is exempt from the guard, including dotted workflow names;
+    - a genuine collision fails with the typed ``POLICY_NO_OVERWRITE`` reason, which
+      is what the frontend keys off to offer "replace it?".
+    """
+
+    @pytest.fixture
+    def temp_dir(self, tmp_path: Path) -> Path:
+        return tmp_path.resolve()
+
+    @pytest.fixture(autouse=True)
+    def setup_default_project(self, temp_dir: Path, griptape_nodes: GriptapeNodes) -> "Generator[None, None, None]":
+        """Load + activate the default project template, then force the workspace.
+
+        Same ordering as TestCreateVersionedWorkflow: activate first so
+        SetCurrentProjectRequest's internal re-derivation doesn't clobber the
+        test workspace.
+        """
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+
+        original_workspace = griptape_nodes.ConfigManager().workspace_path
+
+        project_yml = temp_dir / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        griptape_nodes.ConfigManager().workspace_path = temp_dir
+
+        yield
+
+        WorkflowRegistry._workflows.clear()
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+        griptape_nodes.ConfigManager().workspace_path = original_workspace
+
+    @staticmethod
+    def _register_saved_workflow(temp_dir: Path, *, registry_key: str, contents: str) -> Path:
+        """Materialize a saved workflow on disk + in the registry, returning its path."""
+        file_name = f"{registry_key}.py"
+        stub_path = temp_dir / file_name
+        stub_path.write_text(contents)
+        metadata = WorkflowMetadata(
+            name=registry_key,
+            schema_version=WorkflowMetadata.LATEST_SCHEMA_VERSION,
+            engine_version_created_with="test",
+            node_libraries_referenced=[],
+            creation_date=datetime.now(UTC),
+        )
+        WorkflowRegistry.generate_new_workflow(registry_key=registry_key, metadata=metadata, file_path=file_name)
+        return stub_path
+
+    @staticmethod
+    def _save(
+        griptape_nodes: GriptapeNodes,
+        *,
+        file_name: str,
+        current_workflow_name: str,
+        overwrite_existing: bool,
+    ) -> Any:
+        """Drive on_save_workflow_request with only flow serialization mocked."""
+        from griptape_nodes.retained_mode.events.flow_events import (
+            GetTopLevelFlowRequest,
+            GetTopLevelFlowResultSuccess,
+            SerializeFlowToCommandsRequest,
+            SerializeFlowToCommandsResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowRequest
+
+        workflow_manager = griptape_nodes.WorkflowManager()
+        context_manager = griptape_nodes.ContextManager()
+
+        empty_commands = SerializedFlowCommands(
+            flow_initialization_command=None,
+            serialized_node_commands=[],
+            serialized_connections=[],
+            unique_parameter_uuid_to_values={},
+            set_parameter_value_commands={},
+            set_lock_commands_per_node={},
+            sub_flows_commands=[],
+            node_dependencies=NodeDependencies(),
+            node_types_used=set(),
+        )
+
+        async def fake_ahandle_request(req: object) -> object:
+            if isinstance(req, GetTopLevelFlowRequest):
+                return GetTopLevelFlowResultSuccess(flow_name="ControlFlow_1", result_details="ok")
+            if isinstance(req, SerializeFlowToCommandsRequest):
+                return SerializeFlowToCommandsResultSuccess(
+                    serialized_flow_commands=empty_commands, result_details="ok"
+                )
+            msg = f"Unexpected request type in test: {type(req).__name__}"
+            raise AssertionError(msg)
+
+        context_manager.push_workflow(workflow_name=current_workflow_name)
+        try:
+            with (
+                patch.object(GriptapeNodes, "ahandle_request", side_effect=fake_ahandle_request),
+                patch.object(workflow_manager, "extract_workflow_shape", side_effect=ValueError("no shape")),
+            ):
+                return asyncio.run(
+                    workflow_manager.on_save_workflow_request(
+                        SaveWorkflowRequest(file_name=file_name, overwrite_existing=overwrite_existing)
+                    )
+                )
+        finally:
+            if context_manager.has_current_workflow():
+                context_manager.pop_workflow()
+
+    def test_self_save_with_dotted_name_succeeds(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """Re-saving the open workflow succeeds even with ``overwrite_existing=False``.
+
+        ``%d.%m_%H.%M`` is the engine's own default auto-generated name, so a
+        registry key with internal dots is the common case, not an edge case.
+        Re-deriving the key here (rather than comparing it directly) truncated
+        "03.07_18.30" to "03.07_18", which made a normal re-save look like a
+        collision with a different workflow and failed the save.
+        """
+        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
+
+        registry_key = "03.07_18.30"
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            stub_path = self._register_saved_workflow(temp_dir, registry_key=registry_key, contents="# original")
+
+            result = self._save(
+                griptape_nodes,
+                file_name=registry_key,
+                current_workflow_name=registry_key,
+                overwrite_existing=False,
+            )
+
+            assert isinstance(result, SaveWorkflowResultSuccess), f"self-save was refused: {result.result_details}"
+            assert Path(result.file_path) == stub_path
+            # The save really landed — the stub content is gone.
+            assert "# original" not in stub_path.read_text()
+
+    def test_collision_with_different_workflow_reports_policy_no_overwrite(
+        self, griptape_nodes: GriptapeNodes, temp_dir: Path
+    ) -> None:
+        """Saving onto another workflow's file fails with the typed reason and leaves it intact.
+
+        The typed ``failure_reason`` is the contract the frontend reads to decide
+        whether to offer "replace it?"; without it the dialog can't fire and the
+        user just sees a generic error.
+        """
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultFailure
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(temp_dir, registry_key="mine", contents="# mine")
+            victim_path = self._register_saved_workflow(temp_dir, registry_key="theirs", contents="# theirs")
+
+            result = self._save(
+                griptape_nodes,
+                file_name="theirs",
+                current_workflow_name="mine",
+                overwrite_existing=False,
+            )
+
+            assert isinstance(result, SaveWorkflowResultFailure)
+            assert result.failure_reason == FileIOFailureReason.POLICY_NO_OVERWRITE
+            # The other workflow's file is untouched.
+            assert victim_path.read_text() == "# theirs"
+
+    def test_collision_overwrites_when_permitted(self, griptape_nodes: GriptapeNodes, temp_dir: Path) -> None:
+        """``overwrite_existing=True`` (the default) still replaces the other workflow's file."""
+        from griptape_nodes.retained_mode.events.workflow_events import SaveWorkflowResultSuccess
+
+        with patch.dict(WorkflowRegistry._workflows, {}, clear=True):
+            self._register_saved_workflow(temp_dir, registry_key="mine", contents="# mine")
+            victim_path = self._register_saved_workflow(temp_dir, registry_key="theirs", contents="# theirs")
+
+            result = self._save(
+                griptape_nodes,
+                file_name="theirs",
+                current_workflow_name="mine",
+                overwrite_existing=True,
+            )
+
+            assert isinstance(result, SaveWorkflowResultSuccess)
+            assert victim_path.read_text() != "# theirs"

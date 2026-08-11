@@ -2336,27 +2336,26 @@ class WorkflowManager:
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
-        logger.debug(
-            "Save workflow post-target: scenario=%s, registry_key=%s, relative_file_path=%s",
-            save_target.scenario.value,
-            registry_key,
-            relative_file_path,
-        )
-
-        # Determine policy: saving over yourself is always allowed; anything else must not clobber.
-        is_self_save = current_workflow_name is not None and (
-            derive_registry_key(current_workflow_name) == registry_key
-        )
-        if request.allow_overwrite or is_self_save:
+        # Re-saving the workflow that's currently open is always allowed; writing over a
+        # *different* workflow's file needs the caller's explicit say-so. Both sides are
+        # already registry keys (extension stripped, separators normalized), so compare
+        # them directly — re-deriving would truncate at the first dot in names like
+        # "03.07_18.30".
+        is_self_save = current_workflow_name == registry_key
+        if request.overwrite_existing or is_self_save:
             policy = ExistingFilePolicy.OVERWRITE
         else:
             policy = ExistingFilePolicy.FAIL
 
         # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
-        # (in-place overwrite) wrapped in a ProjectFileDestination. All other
-        # scenarios carry an unresolved destination so the save_workflow
-        # situation macro resolves at write time, preserving the seed-and-retry
-        # contract for unresolved required `{x:NN}` slots.
+        # (in-place overwrite) wrapped in a ProjectFileDestination, so it is the
+        # scenario the `policy` above governs. All other scenarios carry an
+        # unresolved destination so the save_workflow situation macro resolves at
+        # write time, preserving the seed-and-retry contract for unresolved
+        # required `{x:NN}` slots — those keep the situation's own policy and
+        # intentionally ignore `policy`. That's the documented boundary: this flag
+        # guards against replacing another *registered* workflow, not against an
+        # unregistered stray .py file sitting at a freshly-computed Save-As path.
         if save_target.destination is not None:
             destination = save_target.destination
         elif save_target.file_path is not None:
@@ -2372,10 +2371,14 @@ class WorkflowManager:
             return SaveWorkflowResultFailure(result_details=msg)
 
         logger.debug(
-            "Save workflow: scenario=%s, file_name=%s, destination=%s, branched_from=%s",
+            "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
+            "self_save=%s, overwrite_existing=%s, branched_from=%s",
             save_target.scenario.value,
             file_name,
+            registry_key,
             destination.location,
+            is_self_save,
+            request.overwrite_existing,
             branched_from or "None",
         )
 
@@ -2452,7 +2455,13 @@ class WorkflowManager:
                 f"Attempted to save workflow '{relative_file_path}'. "
                 f"Failed during file generation: {save_file_result.result_details}"
             )
-            return SaveWorkflowResultFailure(result_details=details)
+            # Carry the typed reason across the family boundary so callers can tell a
+            # refused overwrite (POLICY_NO_OVERWRITE) apart from a genuine I/O failure
+            # and offer to retry with overwrite_existing=True.
+            failure_reason = None
+            if isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultFailure):
+                failure_reason = save_file_result.failure_reason
+            return SaveWorkflowResultFailure(result_details=details, failure_reason=failure_reason)
 
         workflow_metadata = save_file_result.workflow_metadata
 
