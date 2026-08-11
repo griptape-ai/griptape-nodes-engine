@@ -7043,6 +7043,61 @@ directories:
         return AsyncMock(side_effect=route)
 
     @pytest.mark.asyncio
+    async def test_binary_content_is_unusable_rather_than_a_crash(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project file read back as bytes fails the load with an explanation.
+
+        The YAML parser would raise on bytes, so _read_overlay checks the content type itself. Worth
+        pinning because the read result's `content` is typed loosely enough for this to happen.
+        """
+        from griptape_nodes.common.project_templates.validation import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.os_events import ReadFileResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultFailure,
+        )
+
+        project_path = (tmp_path / "binary.yml").resolve()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
+                return_value=ReadFileResultSuccess(
+                    content=b"\x00\x01",
+                    file_size=2,
+                    mime_type="application/octet-stream",
+                    encoding=None,
+                    result_details="ok",
+                )
+            )
+            result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert "binary content" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_read_result_type_is_unusable(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A read that answers with neither success nor a recognized failure is still reported clearly."""
+        from griptape_nodes.common.project_templates.validation import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultFailure,
+        )
+
+        project_path = (tmp_path / "odd.yml").resolve()
+        unexpected = Mock()
+        unexpected.failed.return_value = False
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=unexpected)
+            result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert "unexpected result type" in str(result.result_details)
+
+    @pytest.mark.asyncio
     async def test_no_parent_still_merges_with_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
         """A project without parent_project_path still merges on top of system defaults."""
         from griptape_nodes.retained_mode.events.project_events import (

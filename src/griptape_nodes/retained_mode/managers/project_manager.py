@@ -2292,7 +2292,15 @@ class ProjectManager(EngineScoped):
 
     @staticmethod
     def _describe_unresolved_path(resolution: ResolvedProjectPath) -> str:
-        """Phrase why a declared path field could not be resolved, for logs and result_details."""
+        """Phrase why a declared path field could not be resolved, for logs and result_details.
+
+        Only ever called with a resolution whose `path` is None. In practice that always means an
+        unresolved variable or a macro token: every caller that could hand this a `needs_anchor`
+        resolution deals with that case before describing it, and `ResolvedProjectPath` guarantees an
+        unresolved result carries some reason. Both remaining branches are therefore defensive -- they
+        exist so a new failure mode reads as "could not resolve" instead of confidently naming the
+        wrong cause, which is exactly the class of bug this PR is about.
+        """
         reasons: list[str] = []
         if resolution.unresolved_variables:
             names = ", ".join(sorted(set(resolution.unresolved_variables)))
@@ -2300,8 +2308,10 @@ class ProjectManager(EngineScoped):
         if resolution.macro_tokens:
             names = ", ".join(sorted(set(resolution.macro_tokens)))
             reasons.append(f"macro tokens are not supported in path fields: {names}")
+        if resolution.needs_anchor:
+            reasons.append("it is a relative path and the project's own directory was not available to place it in")
         if not reasons:
-            return "no value was declared"
+            return "it could not be turned into a usable path"
         return "; ".join(reasons)
 
     def _resolve_template_workspace_dir(
