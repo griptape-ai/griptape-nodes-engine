@@ -948,12 +948,14 @@ class TestStaticFilesManagerBaseUrlTrailingSlash:
 
 
 class TestStaticFilesManagerOnAppInitializationComplete:
-    """Test port handling in on_app_initialization_complete.
+    """Test static server ownership and port handling in on_app_initialization_complete.
 
-    The engine binds a free port at startup and may rewrite `static_server_base_url`
-    to reflect the OS-assigned port. That rewrite must only happen when the user has
-    not provided an explicit override, otherwise it clobbers tunnel configurations
-    (e.g. `ssh -L 8888:localhost:8124`, ngrok, reverse proxies).
+    A host process that serves the workspace itself sets `static_server_base_url` on the
+    initialization payload, and the engine must then point at that server rather than starting
+    one of its own. With no host-provided server the engine serves the workspace itself, binding
+    a free port and rewriting `static_server_base_url` to reflect the OS-assigned port. That
+    rewrite must only happen when the user has not provided an explicit override, otherwise it
+    clobbers tunnel configurations (e.g. `ssh -L 8888:localhost:8124`, ngrok, reverse proxies).
     """
 
     @pytest.fixture
@@ -977,7 +979,9 @@ class TestStaticFilesManagerOnAppInitializationComplete:
             )
         return manager
 
-    def _invoke_initialization(self, manager: StaticFilesManager, actual_port: int) -> None:
+    def _invoke_initialization(
+        self, manager: StaticFilesManager, actual_port: int, host_base_url: str | None = None
+    ) -> tuple[Mock, Mock]:
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 
         mock_sock = Mock()
@@ -987,10 +991,11 @@ class TestStaticFilesManagerOnAppInitializationComplete:
             patch(
                 "griptape_nodes.retained_mode.managers.static_files_manager.bind_free_socket",
                 return_value=mock_sock,
-            ),
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.threading.Thread"),
+            ) as bind,
+            patch("griptape_nodes.retained_mode.managers.static_files_manager.threading.Thread") as thread_cls,
         ):
-            manager.on_app_initialization_complete(AppInitializationComplete())
+            manager.on_app_initialization_complete(AppInitializationComplete(static_server_base_url=host_base_url))
+        return bind, thread_cls
 
     def test_unset_base_url_rewritten_to_actual_port(self, mock_secrets_manager: Mock) -> None:
         """When no override is configured, the OS-assigned port replaces the server's default port."""
@@ -1034,6 +1039,53 @@ class TestStaticFilesManagerOnAppInitializationComplete:
 
         with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
             _ = manager.static_server_base_url
+
+    def test_host_provided_server_is_adopted(self, mock_secrets_manager: Mock) -> None:
+        """When the host serves the workspace, the engine points at it and starts nothing."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        bind, thread_cls = self._invoke_initialization(
+            manager, actual_port=54321, host_base_url="http://localhost:8124/"
+        )
+
+        assert manager.static_server_base_url == "http://localhost:8124"
+        assert manager.storage_driver.base_url == "http://localhost:8124/workspace"
+        bind.assert_not_called()
+        thread_cls.assert_not_called()
+
+    def test_host_provided_server_wins_over_a_configured_override(self, mock_secrets_manager: Mock) -> None:
+        """The host resolves its own URL, including any override, so its answer is final."""
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        _, thread_cls = self._invoke_initialization(manager, actual_port=54321, host_base_url="http://localhost:8124")
+
+        assert manager.static_server_base_url == "http://localhost:8124"
+        thread_cls.assert_not_called()
+
+    def test_serves_workspace_when_no_host_provides_one(self, mock_secrets_manager: Mock) -> None:
+        """Legacy path: with no host-provided server the engine serves the workspace itself.
+
+        Removed once every shipped host provides one.
+        """
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        bind, thread_cls = self._invoke_initialization(manager, actual_port=54321)
+
+        bind.assert_called_once_with("localhost", 8124)
+        assert thread_cls.call_args.kwargs["name"] == "static-server"
+        assert thread_cls.call_args.kwargs["daemon"] is True
+        thread_cls.return_value.start.assert_called_once_with()
+
+    def test_repeat_initialization_does_not_start_a_second_server(self, mock_secrets_manager: Mock) -> None:
+        """Initialization completes again per workflow-executor run; one server is enough."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        self._invoke_initialization(manager, actual_port=54321)
+        bind, thread_cls = self._invoke_initialization(manager, actual_port=54322)
+
+        assert manager.static_server_base_url == "http://localhost:54321"
+        bind.assert_not_called()
+        thread_cls.assert_not_called()
 
 
 class TestStaticFilesManagerCloudCredential:

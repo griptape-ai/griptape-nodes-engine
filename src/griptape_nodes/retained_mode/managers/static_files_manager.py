@@ -95,6 +95,9 @@ class StaticFilesManager(EngineScoped):
         super().__init__(engine)
         self.config_manager = config_manager
         self.secrets_manager = secrets_manager
+        # Whether this engine started a static server of its own, so a second initialization
+        # pass in the same process doesn't start another one.
+        self._serving_static_files = False
 
         self.storage_backend = config_manager.get_config_value("storage_backend", default=StorageBackend.LOCAL)
         workspace_directory = config_manager.workspace_path
@@ -169,10 +172,11 @@ class StaticFilesManager(EngineScoped):
 
     @property
     def static_server_base_url(self) -> str:
-        """Base URL for the static server.
+        """Base URL of the static server serving this workspace.
 
-        Resolved during ``on_app_initialization_complete`` once the server has bound to a
-        port. Reading this before that event fires indicates a startup-ordering bug.
+        Resolved during ``on_app_initialization_complete``, either from the server the host
+        process published or from the one this engine started. Absent a config-file override to
+        fall back on, reading this before that event fires is a startup-ordering bug.
         """
         if self._static_server_base_url is None:
             msg = "static_server_base_url accessed before on_app_initialization_complete resolved it."
@@ -416,9 +420,28 @@ class StaticFilesManager(EngineScoped):
             result_details="Successfully created static file download URL",
         )
 
-    def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        # Start static server in daemon thread if enabled
-        if isinstance(self.storage_driver, LocalStorageDriver):
+    def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        if not isinstance(self.storage_driver, LocalStorageDriver):
+            return
+
+        if payload.static_server_base_url is not None:
+            # The host process serves this workspace and told us where. Pointing at its server
+            # keeps asset URLs valid for as long as the host runs, rather than only as long as
+            # this engine does.
+            self._static_server_base_url = payload.static_server_base_url.rstrip("/")
+            logger.debug("Using host-provided static server at %s", self._static_server_base_url)
+        elif self._serving_static_files:
+            # Initialization can complete more than once per process: a workflow executor
+            # broadcasts it for its own run. One server per engine is enough.
+            logger.debug("Static server already serving at %s", self._static_server_base_url)
+        else:
+            # No host-provided server, so serve the workspace here.
+            #
+            # This is the path that disappears once every shipped host serves the workspace
+            # itself and sets static_server_base_url on the initialization payload. At that
+            # point this branch and servers/static.py both go away, and a workspace with no
+            # host-provided server simply has no server.
+            #
             # Pre-bind to port 0 (or the configured port) so the OS assigns a free port before
             # the server thread starts. This lets us know the actual port immediately with no
             # race condition between discovering the port and uvicorn binding to it.
@@ -430,9 +453,12 @@ class StaticFilesManager(EngineScoped):
             # proxy, or `ssh -L` tunnel on a different port) is taken verbatim.
             if self._static_server_base_url is None:
                 self._static_server_base_url = f"http://{STATIC_SERVER_HOST}:{actual_port}"
-            self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
 
             threading.Thread(target=start_static_server, args=(sock,), daemon=True, name="static-server").start()
+            self._serving_static_files = True
+            logger.info("Serving workspace static files at %s", self._static_server_base_url)
+
+        self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
 
     def save_static_file(
         self,
