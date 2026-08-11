@@ -42,6 +42,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowMetadata,
     WorkflowRegistry,
     WorkflowShape,
+    find_metadata_blocks,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -627,16 +628,7 @@ class WorkflowManager(EngineScoped):
         with workflow_file_path.open("r", encoding="utf-8") as file:
             workflow_content = file.read()
 
-        # Find the metadata block.
-        regex = r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
-        matches = list(
-            filter(
-                lambda m: m.group("type") == block_name,
-                re.finditer(regex, workflow_content),
-            )
-        )
-
-        return matches
+        return find_metadata_blocks(workflow_content, block_name)
 
     def print_workflow_load_status(self, min_status: WorkflowStatus = WorkflowStatus.FLAWED) -> None:  # noqa: PLR0915
         workflow_file_paths = self.get_workflows_attempted_to_load()

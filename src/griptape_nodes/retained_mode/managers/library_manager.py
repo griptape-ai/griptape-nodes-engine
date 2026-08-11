@@ -37,6 +37,7 @@ from griptape_nodes.common.strict_mode import (
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.exe_types.workflow_node import WorkflowNodeDefinitionError, build_workflow_node_class
 from griptape_nodes.files.path_utils import canonicalize_for_identity, canonicalize_for_io, resolve_workspace_path
 from griptape_nodes.node_library.library_declarations import (
     LibraryDeclaration,
@@ -57,11 +58,13 @@ from griptape_nodes.node_library.library_registry import (
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
+    WorkflowNodeDefinition,
 )
 from griptape_nodes.node_library.library_validation import (
     detect_retired_node_declarations,
     validate_library_declarations,
 )
+from griptape_nodes.node_library.workflow_registry import WorkflowMetadataError, read_workflow_metadata
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
     AppInitializationComplete,
@@ -228,6 +231,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
     UpdateConfigCategoryProblem,
+    WorkflowNodeLoadProblem,
 )
 from griptape_nodes.retained_mode.managers.os_manager import OSManager
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
@@ -4642,6 +4646,53 @@ class LibraryManager(EngineScoped):
             library_info.problems.append(library_problem)
         return True
 
+    def _register_workflow_node(
+        self,
+        workflow_node_definition: WorkflowNodeDefinition,
+        base_dir: Path,
+        library: Library,
+        library_info: LibraryInfo,
+    ) -> bool:
+        """Generate and register a node type from a saved workflow file.
+
+        The workflow's metadata header supplies the saved input/output shape that becomes the node's
+        parameters. Returns False (recording a library problem) when the header cannot be read or
+        carries no shape.
+        """
+        workflow_file_path = resolve_workspace_path(Path(workflow_node_definition.workflow_path), base_dir)
+        try:
+            workflow_metadata = read_workflow_metadata(workflow_file_path)
+        except WorkflowMetadataError as err:
+            library_info.problems.append(
+                WorkflowNodeLoadProblem(
+                    node_type=workflow_node_definition.node_type,
+                    workflow_path=str(workflow_file_path),
+                    error_message=str(err),
+                )
+            )
+            return False
+
+        try:
+            node_class = build_workflow_node_class(
+                node_type=workflow_node_definition.node_type,
+                workflow_file_path=workflow_file_path,
+                workflow_metadata=workflow_metadata,
+            )
+        except WorkflowNodeDefinitionError as err:
+            library_info.problems.append(
+                WorkflowNodeLoadProblem(
+                    node_type=workflow_node_definition.node_type,
+                    workflow_path=str(workflow_file_path),
+                    error_message=str(err),
+                )
+            )
+            return False
+
+        library_problem = library.register_new_node_type(node_class, metadata=workflow_node_definition.metadata)
+        if library_problem is not None:
+            library_info.problems.append(library_problem)
+        return True
+
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,
         library_data: LibrarySchema,
@@ -4721,6 +4772,12 @@ class LibraryManager(EngineScoped):
                 )
 
             if node_registered:
+                any_nodes_loaded_successfully = True
+
+        # Nodes generated from saved workflow files. These need no Python module, so they are always
+        # built now rather than lazily: reading a workflow's metadata header is cheap.
+        for workflow_node_definition in library_data.workflow_nodes or []:
+            if self._register_workflow_node(workflow_node_definition, base_dir, library, library_info):
                 any_nodes_loaded_successfully = True
 
         # Register widgets and check for duplicates

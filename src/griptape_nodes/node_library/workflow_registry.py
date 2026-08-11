@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+import tomllib
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, ClassVar, NamedTuple
 
-from pydantic import BaseModel, Field, field_serializer, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_serializer, field_validator
 
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import (
@@ -15,6 +17,20 @@ from griptape_nodes.node_library.library_registry import (
 from griptape_nodes.utils.metaclasses import SingletonMeta
 
 logger = logging.getLogger("griptape_nodes")
+
+# Name of the inline metadata block that carries a workflow's metadata header.
+WORKFLOW_METADATA_BLOCK_NAME = "script"
+
+# PEP 723-style inline metadata block: a "# /// <name>" opener, comment-prefixed body lines,
+# and a "# ///" closer.
+_METADATA_BLOCK_PATTERN = re.compile(r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$")
+
+_TOOL_TABLE = "tool"
+_GRIPTAPE_NODES_TABLE = "griptape-nodes"
+
+
+class WorkflowMetadataError(Exception):
+    """Raised when a workflow file's metadata header cannot be read."""
 
 
 class LibraryNameAndNodeType(NamedTuple):
@@ -137,6 +153,75 @@ class WorkflowMetadata(BaseModel):
                 return None
         # Unexpected type - let Pydantic's normal validation handle it
         return value
+
+
+def find_metadata_blocks(workflow_content: str, block_name: str) -> list[re.Match[str]]:
+    """Return every inline metadata block in `workflow_content` whose name is `block_name`."""
+    return [match for match in _METADATA_BLOCK_PATTERN.finditer(workflow_content) if match.group("type") == block_name]
+
+
+def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
+    """Read the metadata header out of a workflow file.
+
+    Pure file parsing: no registry lookups, no engine requests, and no waiting on library
+    registration. Callers that run while libraries are still loading (the library loader itself,
+    for instance) must use this rather than `LoadWorkflowMetadata`, whose handler blocks until
+    library registration completes.
+
+    Raises:
+        WorkflowMetadataError: The file could not be read, does not carry exactly one metadata
+            header, or that header is not TOML with a valid `[tool.griptape-nodes]` table.
+    """
+    try:
+        workflow_content = workflow_file_path.read_text(encoding="utf-8")
+    except OSError as err:
+        msg = (
+            f"Attempted to read workflow metadata from '{workflow_file_path}'. "
+            f"Failed because the file could not be read: {err}"
+        )
+        raise WorkflowMetadataError(msg) from err
+
+    matches = find_metadata_blocks(workflow_content, WORKFLOW_METADATA_BLOCK_NAME)
+    if len(matches) != 1:
+        msg = (
+            f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the file has "
+            f"{len(matches)} '{WORKFLOW_METADATA_BLOCK_NAME}' metadata sections, and exactly 1 is required. "
+            "Open the workflow in the editor and save it to regenerate the header."
+        )
+        raise WorkflowMetadataError(msg)
+
+    # Strip the leading comment marker off each line to recover the raw TOML.
+    metadata_toml = "".join(
+        line[2:] if line.startswith("# ") else line[1:]
+        for line in matches[0].group("content").splitlines(keepends=True)
+    )
+
+    try:
+        toml_document = tomllib.loads(metadata_toml)
+    except tomllib.TOMLDecodeError as err:
+        msg = (
+            f"Attempted to read workflow metadata from '{workflow_file_path}'. "
+            f"Failed because the header is not valid TOML: {err}"
+        )
+        raise WorkflowMetadataError(msg) from err
+
+    try:
+        tool_section = toml_document[_TOOL_TABLE][_GRIPTAPE_NODES_TABLE]
+    except (KeyError, TypeError) as err:
+        msg = (
+            f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the header has no "
+            f"'[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]' table."
+        )
+        raise WorkflowMetadataError(msg) from err
+
+    try:
+        return WorkflowMetadata.model_validate(tool_section)
+    except ValidationError as err:
+        msg = (
+            f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the "
+            f"'[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]' table does not match the expected schema: {err}"
+        )
+        raise WorkflowMetadataError(msg) from err
 
 
 class WorkflowRegistry(metaclass=SingletonMeta):

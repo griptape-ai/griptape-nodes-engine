@@ -9,7 +9,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 ```json
 {
   "name": "Library Name",
-  "library_schema_version": "0.10.0",
+  "library_schema_version": "0.11.0",
   "settings": [
     {
       "description": "API keys required by nodes in this library",
@@ -83,6 +83,17 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
       }
     }
   ],
+  "workflow_nodes": [
+    {
+      "node_type": "UpscaleAndTag",
+      "workflow_path": "workflows/upscale_and_tag.py",
+      "metadata": {
+        "category": "image",
+        "description": "Upscales an image and tags it",
+        "display_name": "Upscale and Tag"
+      }
+    }
+  ],
   "workflows": ["workflows/example_workflow.py"],
   "is_default_library": false
 }
@@ -100,11 +111,59 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
 - **advanced_library_path**: Optional Python file declaring an `AdvancedNodeLibrary` subclass, for libraries that need to run code at load and unload, own a request type, or register node types the manifest does not list (see [Advanced Libraries](advanced_libraries.md))
+- **workflow_nodes**: Nodes generated from saved workflow files instead of Python classes. See [Nodes From Workflow Files](#nodes-from-workflow-files) below.
 - **workflows**: Template workflow files
 
 **Important:** The `secrets_to_register` array tells the system which secrets your library needs. Users will be prompted to configure these secrets through the UI or environment variables.
 
 Use flat directory structures. The engine automatically registers and loads libraries.
+
+### Nodes From Workflow Files
+
+A node does not have to be a Python class. Point a `workflow_nodes` entry at a saved workflow and the
+engine generates the node type for you:
+
+```jsonc
+"workflow_nodes": [
+  {
+    "node_type": "UpscaleAndTag",
+    "workflow_path": "workflows/upscale_and_tag.py",
+    "metadata": {
+      "category": "image",
+      "description": "Upscales an image and tags it",
+      "display_name": "Upscale and Tag"
+    }
+  }
+]
+```
+
+| Field | Meaning |
+| `node_type` | The name the node is registered under. This is what appears in saved workflows. |
+| `workflow_path` | Path to the saved workflow `.py`, relative to `griptape_nodes_library.json`. |
+| `metadata` | The same node metadata block the `nodes` array uses: category, description, display name, etc. |
+
+**The workflow needs a Start Flow node and an End Flow node.** Those are what define the node's
+parameters:
+
+- Every non-control parameter on a **Start Flow** node becomes an **input** on the node.
+- Every non-control parameter on an **End Flow** node becomes an **output** on the node.
+- The node supplies its own Flow In and Flow Out, so the workflow's control parameters are not
+    surfaced.
+
+A parameter name used by exactly one Start Flow or End Flow node keeps its bare name. If two Start
+Flow nodes both expose `prompt`, both parameters are qualified with their node name instead
+(`Start Flow.prompt`, `Start Flow_2.prompt`) so neither is lost. A name that appears on both a Start
+Flow node and an End Flow node becomes a single parameter that is both an input and an output.
+
+When the node runs, the engine loads the workflow as a child subflow of the node's own flow, copies
+the node's input values onto the Start Flow nodes, runs it, and copies the End Flow values back out
+as the node's outputs. The subflow is reused for later runs in the same session and is never written
+into a saved workflow, so nothing about the node's internals leaks into your users' files.
+
+**Save the workflow from the editor before shipping it.** The parameter shape is read out of the
+metadata header at the top of the workflow file, which the editor writes on save. A workflow with no
+saved shape (no Start Flow and End Flow nodes, or a hand-written file with no header) is reported as
+a library problem and its node is not registered.
 
 ### Library and Node Declarations
 
