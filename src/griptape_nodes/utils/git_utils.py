@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -361,6 +362,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
 
     Raises:
         GitNotFoundError: If git is not installed.
+        GitRepositoryError: If cwd no longer exists.
     """
     try:
         return subprocess.run(  # noqa: S603
@@ -378,7 +380,14 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
             check=False,
         )
     except FileNotFoundError as e:
-        raise GitNotFoundError(_GIT_MISSING_MESSAGE) from e
+        # subprocess reports a missing executable and a missing cwd with the same exception, so
+        # ask which one is actually absent rather than blaming git for a directory that was
+        # deleted between the caller's is_git_repository() check and this call.
+        if shutil.which("git") is None:
+            raise GitNotFoundError(_GIT_MISSING_MESSAGE) from e
+
+        msg = f"Cannot run git in {cwd}: that folder is no longer there."
+        raise GitRepositoryError(msg) from e
 
 
 def _run_git(
@@ -402,6 +411,7 @@ def _run_git(
     Raises:
         error_cls: If the command exits non-zero.
         GitNotFoundError: If git is not installed.
+        GitRepositoryError: If cwd no longer exists.
     """
     result = _git(args, cwd)
     if result.returncode != 0:
@@ -414,12 +424,19 @@ def _try_git(args: list[str], cwd: Path | None = None) -> str | None:
     """Run a git command and return its stripped stdout, or None if it failed.
 
     For queries where a non-zero exit is an answer rather than a fault: no upstream is
-    configured, HEAD is detached, the ref doesn't exist.
+    configured, HEAD is detached, the ref doesn't exist. A repository that was deleted
+    while the query ran belongs in that group too, so it reads as "no answer" rather than
+    propagating out of the accessors built on this.
 
     Raises:
         GitNotFoundError: If git is not installed.
     """
-    result = _git(args, cwd)
+    try:
+        result = _git(args, cwd)
+    except GitRepositoryError:
+        logger.debug("git %s found no repository in %s", " ".join(args), cwd)
+        return None
+
     if result.returncode != 0:
         logger.debug("git %s failed in %s: %s", " ".join(args), cwd, result.stderr.strip())
         return None

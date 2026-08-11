@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime
@@ -1396,34 +1397,42 @@ class TestGitNotInstalled:
         with tempfile.TemporaryDirectory() as tmpdir:
             yield Path(tmpdir)
 
+    @pytest.fixture
+    def git_uninstalled(self) -> Generator[None, None, None]:
+        """Simulate a machine with no git.
+
+        Both patches are needed: the FileNotFoundError is what subprocess raises for a missing
+        executable, and the empty which() is how git_utils tells that apart from a missing cwd.
+        """
+        with (
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
+            patch("griptape_nodes.utils.git_utils.shutil.which", return_value=None),
+        ):
+            yield
+
+    @pytest.mark.usefixtures("git_uninstalled")
     def test_reader_raises_git_not_found_error_naming_git_as_a_requirement(self, temp_dir: Path) -> None:
         """Test that get_current_tag raises GitNotFoundError naming git as a requirement when git is missing."""
         # A bare ".git" marker is enough for is_git_repository's filesystem check; no real
         # git invocation happens before the patched subprocess.run call.
         (temp_dir / ".git").mkdir()
 
-        with (
-            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
-            pytest.raises(GitNotFoundError, match="git was not found on PATH"),
-        ):
+        with pytest.raises(GitNotFoundError, match="git was not found on PATH"):
             get_current_tag(temp_dir)
 
+    @pytest.mark.usefixtures("git_uninstalled")
     def test_mutator_raises_git_not_found_error_naming_git_as_a_requirement(self) -> None:
         """Test that remote_ref_exists raises GitNotFoundError naming git as a requirement when git is missing."""
-        with (
-            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
-            pytest.raises(GitNotFoundError, match="git was not found on PATH"),
-        ):
+        with pytest.raises(GitNotFoundError, match="git was not found on PATH"):
             remote_ref_exists("https://example.com/user/repo.git", "main")
 
+    @pytest.mark.usefixtures("git_uninstalled")
     def test_git_not_found_error_is_catchable_as_git_error(self) -> None:
         """Test that callers handling the base GitError also handle a missing git."""
-        with (
-            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError),
-            pytest.raises(GitError),
-        ):
+        with pytest.raises(GitError):
             remote_ref_exists("https://example.com/user/repo.git", "main")
 
+    @pytest.mark.usefixtures("git_uninstalled")
     def test_get_git_info_reports_no_details_when_git_is_missing(self, temp_dir: Path) -> None:
         """Test that get_git_info degrades instead of raising, so a library still loads without git.
 
@@ -1431,11 +1440,47 @@ class TestGitNotInstalled:
         """
         (temp_dir / ".git").mkdir()
 
-        with patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=FileNotFoundError):
-            git_remote, git_ref = get_git_info(temp_dir)
+        git_remote, git_ref = get_git_info(temp_dir)
 
         assert git_remote is None
         assert git_ref is None
+
+
+class TestVanishedRepository:
+    """Test behavior when a repository directory is deleted out from under a git call.
+
+    subprocess reports a missing executable and a missing working directory with the same
+    exception, so these pin down that a deleted folder is never misreported as a missing git.
+    """
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_mutator_names_the_missing_folder_rather_than_blaming_git(self, temp_dir: Path) -> None:
+        """Test that a mutator reports the deleted folder, not a missing git installation."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+        # Pass is_git_repository's filesystem check, then delete the directory so the git call
+        # itself is the thing that finds it gone.
+        with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
+            shutil.rmtree(clone)
+
+            with pytest.raises(GitRepositoryError, match="no longer there"):
+                has_uncommitted_changes(clone)
+
+    def test_accessor_reports_no_answer_rather_than_raising(self, temp_dir: Path) -> None:
+        """Test that a query accessor treats a deleted folder as "no answer", as it does a detached HEAD."""
+        origin = make_origin_repo(temp_dir / "origin")
+        clone = clone_repo(origin, temp_dir / "clone")
+
+        with patch("griptape_nodes.utils.git_utils.is_git_repository", return_value=True):
+            shutil.rmtree(clone)
+
+            assert get_git_remote(clone) is None
+            assert get_git_info(clone) == (None, None)
 
 
 class TestParseCommitDatetime:
