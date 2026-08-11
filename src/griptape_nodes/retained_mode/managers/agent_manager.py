@@ -65,6 +65,7 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -128,7 +129,6 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
@@ -138,6 +138,7 @@ if TYPE_CHECKING:
     from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -335,10 +336,17 @@ class _RehydratedMessage:
     succeeded: int
 
 
-class AgentManager:
+class AgentManager(EngineScoped):
     """Owns the chat-sidebar agent runner and the engine-bundled MCP server."""
 
-    def __init__(self, static_files_manager: StaticFilesManager, event_manager: EventManager | None = None) -> None:
+    def __init__(
+        self,
+        static_files_manager: StaticFilesManager,
+        event_manager: EventManager | None = None,
+        *,
+        engine: Engine | None = None,
+    ) -> None:
+        super().__init__(engine)
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
@@ -470,7 +478,7 @@ class AgentManager:
         )
         composed = await _compose_prompt(request.input, request.url_artifacts)
 
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
 
         def emit(event: RunEvent) -> None:
             payload = _run_event_to_payload(event)
@@ -1055,11 +1063,10 @@ class AgentManager:
         parts.extend(server_rules)
         return "\n\n".join(parts)
 
-    @staticmethod
-    def _lookup_mcp_configs(server_names: list[str]) -> list[dict[str, Any]]:
+    def _lookup_mcp_configs(self, server_names: list[str]) -> list[dict[str, Any]]:
         if not server_names:
             return []
-        result = GriptapeNodes.handle_request(GetEnabledMCPServersRequest())
+        result = self.engine.handle_request(GetEnabledMCPServersRequest())
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")
             return []

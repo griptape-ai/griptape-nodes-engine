@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +26,6 @@ from griptape_nodes.retained_mode.events.library_events import (
     UpdateLibraryResultFailure,
     UpdateLibraryResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.library_manager import (
     LibraryGitOperationContext,
     LibraryManager,
@@ -36,6 +36,9 @@ from griptape_nodes.retained_mode.managers.settings import (
 )
 from griptape_nodes.utils.git_utils import GitError
 from griptape_nodes.utils.library_utils import LibraryVersionInfo
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 LIBRARY_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.library_manager"
 MIN_AGE_HOURS = 24.0
@@ -61,7 +64,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=0.0)):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
             decision = library_manager._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is False
@@ -71,9 +74,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         young_commit = datetime.now(tz=UTC) - timedelta(hours=1)
 
-        with patch.object(
-            GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-        ):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(young_commit)
 
         assert decision.enabled is True
@@ -86,9 +87,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        with patch.object(
-            GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-        ):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(old_commit)
 
         assert decision.enabled is True
@@ -100,9 +99,7 @@ class TestEvaluateUpdateAgeGate:
         """A missing commit timestamp cannot be verified, so the update is allowed (not wedged)."""
         library_manager = griptape_nodes.LibraryManager()
 
-        with patch.object(
-            GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-        ):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(None)
 
         assert decision.enabled is True
@@ -113,9 +110,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         naive_young_commit = datetime.now(tz=UTC).replace(tzinfo=None) - timedelta(hours=1)
 
-        with patch.object(
-            GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-        ):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)):
             decision = library_manager._evaluate_update_age_gate(naive_young_commit)
 
         assert decision.gated is True
@@ -126,9 +121,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
 
         with (
-            patch.object(
-                GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-            ),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             caplog.at_level("WARNING"),
         ):
             decision = library_manager._evaluate_update_age_gate(None)
@@ -142,7 +135,7 @@ class TestEvaluateUpdateAgeGate:
         library_manager = griptape_nodes.LibraryManager()
 
         with (
-            patch.object(GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=0.0)),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             caplog.at_level("WARNING"),
         ):
             decision = library_manager._evaluate_update_age_gate(None)
@@ -156,7 +149,7 @@ class TestEvaluateUpdateAgeGate:
         config_mgr = _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=config_mgr):
+        with patch.object(griptape_nodes, "_config_manager", config_mgr):
             decision = library_manager._evaluate_update_age_gate(
                 old_commit, config=MinimumReleaseAgeConfig(hours=MIN_AGE_HOURS)
             )
@@ -172,7 +165,7 @@ class TestReadMinimumReleaseAgeConfig:
     def test_reads_configured_hours(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=12.0)):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=12.0)):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=12.0)
@@ -181,7 +174,7 @@ class TestReadMinimumReleaseAgeConfig:
     def test_zero_hours_disables_the_gate(self, griptape_nodes: GriptapeNodes) -> None:
         library_manager = griptape_nodes.LibraryManager()
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=0.0)):
+        with patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
@@ -197,7 +190,7 @@ class TestReadMinimumReleaseAgeConfig:
         null_config_mgr = MagicMock()
         null_config_mgr.get_config_value.return_value = None
 
-        with patch.object(GriptapeNodes, "ConfigManager", return_value=null_config_mgr):
+        with patch.object(griptape_nodes, "_config_manager", null_config_mgr):
             config = library_manager._read_minimum_release_age_config()
 
         assert config == MinimumReleaseAgeConfig(hours=0.0)
@@ -229,9 +222,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(
-                GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-            ),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -261,9 +252,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(
-                GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-            ),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -298,7 +287,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=0.0)),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=0.0)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -332,9 +321,7 @@ class TestUpdateLibraryRequestAgeGate:
                 new=AsyncMock(return_value=self._validation_context(library_dir)),
             ),
             patch(f"{LIBRARY_MANAGER_MODULE}.is_monorepo", return_value=False),
-            patch.object(
-                GriptapeNodes, "ConfigManager", return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS)
-            ),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
             patch.object(
                 library_manager,
                 "_get_remote_target_commit_datetime",
@@ -397,6 +384,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
     async def _run_check(
         self,
         library_manager: LibraryManager,
+        griptape_nodes: GriptapeNodes,
         *,
         commit_datetime: datetime | None,
         enabled: bool,
@@ -435,9 +423,9 @@ class TestCheckLibraryUpdateRequestAgeGate:
             patch(f"{LIBRARY_MANAGER_MODULE}.clone_and_get_library_version", return_value=version_info),
             patch.object(library_manager, "_check_engine_version_compatibility", return_value=(True, "1.0.0")),
             patch.object(
-                GriptapeNodes,
-                "ConfigManager",
-                return_value=_config_manager(minimum_release_age_hours=minimum_release_age_hours),
+                griptape_nodes,
+                "_config_manager",
+                _config_manager(minimum_release_age_hours=minimum_release_age_hours),
             ),
         ):
             result = await library_manager.check_library_update_request(
@@ -453,7 +441,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
-        result = await self._run_check(library_manager, commit_datetime=young_commit, enabled=True)
+        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=young_commit, enabled=True)
 
         assert result.has_update is True
         assert result.update_gated_by_age is True
@@ -467,7 +455,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         old_commit = datetime.now(tz=UTC) - timedelta(hours=48)
 
-        result = await self._run_check(library_manager, commit_datetime=old_commit, enabled=True)
+        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=old_commit, enabled=True)
 
         assert result.has_update is True
         assert result.update_gated_by_age is False
@@ -481,7 +469,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
         library_manager = griptape_nodes.LibraryManager()
         young_commit = datetime.now(tz=UTC) - timedelta(hours=2)
 
-        result = await self._run_check(library_manager, commit_datetime=young_commit, enabled=False)
+        result = await self._run_check(library_manager, griptape_nodes, commit_datetime=young_commit, enabled=False)
 
         assert result.has_update is True
         assert result.update_gated_by_age is False
@@ -495,6 +483,7 @@ class TestCheckLibraryUpdateRequestAgeGate:
 
         result = await self._run_check(
             library_manager,
+            griptape_nodes,
             commit_datetime=young_commit,
             enabled=True,
             has_update=False,
@@ -552,12 +541,8 @@ class TestSyncLibrariesRequestAgeGate:
             raise AssertionError(error)
 
         with (
-            patch.object(
-                GriptapeNodes,
-                "ConfigManager",
-                return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS),
-            ),
-            patch.object(GriptapeNodes, "ahandle_request", new=AsyncMock(side_effect=dispatch)),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(griptape_nodes, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 
@@ -601,12 +586,8 @@ class TestSyncLibrariesRequestAgeGate:
             raise AssertionError(error)
 
         with (
-            patch.object(
-                GriptapeNodes,
-                "ConfigManager",
-                return_value=_config_manager(minimum_release_age_hours=MIN_AGE_HOURS),
-            ),
-            patch.object(GriptapeNodes, "ahandle_request", new=AsyncMock(side_effect=dispatch)),
+            patch.object(griptape_nodes, "_config_manager", _config_manager(minimum_release_age_hours=MIN_AGE_HOURS)),
+            patch.object(griptape_nodes, "ahandle_request", AsyncMock(side_effect=dispatch)),
         ):
             result = await library_manager.sync_libraries_request(SyncLibrariesRequest())
 

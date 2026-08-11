@@ -1,0 +1,216 @@
+"""Tests for the Engine object graph and how the current engine is resolved.
+
+These pin the guarantees the refactor away from a process-wide singleton was for: engines
+are independent, managers are wired to the engine that built them, and the current engine
+can be rebound for a scope without leaking into the rest of the process.
+"""
+
+import asyncio
+import threading
+
+import pytest
+
+from griptape_nodes.retained_mode.engine import (
+    Engine,
+    EngineScoped,
+    current_engine,
+    engine_scope,
+    has_current_engine,
+    reset_root_engine,
+)
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+class TestEngineIndependence:
+    def test_engines_do_not_share_managers(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        assert first.object_manager is not second.object_manager
+        assert first.event_manager is not second.event_manager
+        assert first.flow_manager is not second.flow_manager
+
+    def test_managers_are_wired_to_their_own_engine(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        assert first.flow_manager.engine is first
+        assert second.flow_manager.engine is second
+
+    def test_every_engine_scoped_manager_is_bound(self) -> None:
+        """No manager should be left resolving the engine through the module-level fallback."""
+        engine = Engine()
+
+        unbound = [
+            name
+            for name in dir(Engine)
+            if name.endswith("_manager")
+            and isinstance(manager := getattr(engine, name), EngineScoped)
+            and manager._engine is not engine
+        ]
+
+        assert unbound == []
+
+    def test_object_registered_in_one_engine_is_invisible_to_the_other(self) -> None:
+        first = Engine()
+        second = Engine()
+
+        first.object_manager.add_object_by_name("shared_name", object())
+
+        assert first.object_manager.has_object_with_name("shared_name")
+        assert not second.object_manager.has_object_with_name("shared_name")
+
+
+class TestEngineScopedFallback:
+    def test_manager_built_without_an_engine_falls_back_to_the_current_engine(self) -> None:
+        scoped = EngineScoped()
+
+        assert scoped.engine is current_engine()
+
+    def test_manager_built_with_an_engine_ignores_the_current_engine(self) -> None:
+        explicit = Engine()
+        scoped = EngineScoped(explicit)
+
+        assert scoped.engine is explicit
+        assert scoped.engine is not current_engine()
+
+
+class TestEngineScope:
+    def test_scope_binds_and_restores(self) -> None:
+        root = current_engine()
+        scoped = Engine()
+
+        with engine_scope(scoped) as bound:
+            assert bound is scoped
+            assert current_engine() is scoped
+
+        assert current_engine() is root
+
+    def test_scope_without_an_argument_builds_a_fresh_engine(self) -> None:
+        root = current_engine()
+
+        with engine_scope() as bound:
+            assert bound is not root
+            assert current_engine() is bound
+
+        assert current_engine() is root
+
+    def test_scopes_nest_and_unwind_in_order(self) -> None:
+        outer = Engine()
+        inner = Engine()
+
+        with engine_scope(outer):
+            assert current_engine() is outer
+            with engine_scope(inner):
+                assert current_engine() is inner
+            assert current_engine() is outer
+
+    def test_scope_restores_when_the_body_raises(self) -> None:
+        root = current_engine()
+
+        def explode() -> None:
+            msg = "boom"
+            raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError, match="boom"), engine_scope(Engine()):
+            explode()
+
+        assert current_engine() is root
+
+    def test_facade_follows_the_scoped_engine(self) -> None:
+        """The `GriptapeNodes` facade must resolve the scoped engine, not the root."""
+        scoped = Engine()
+
+        with engine_scope(scoped):
+            assert GriptapeNodes() is scoped
+            assert GriptapeNodes.get_instance() is scoped
+            assert GriptapeNodes.FlowManager() is scoped.flow_manager
+            assert GriptapeNodes.ObjectManager() is scoped.object_manager
+
+    @pytest.mark.asyncio
+    async def test_task_created_inside_the_scope_inherits_the_binding(self) -> None:
+        """Asyncio tasks copy the context at creation, so work spawned in a scope stays bound."""
+        scoped = Engine()
+
+        async def read_engine() -> Engine:
+            await asyncio.sleep(0)
+            return current_engine()
+
+        with engine_scope(scoped):
+            task = asyncio.create_task(read_engine())
+            observed = await task
+
+        assert observed is scoped
+
+    @pytest.mark.asyncio
+    async def test_scope_survives_an_await_in_its_body(self) -> None:
+        """Entering and exiting around an await must not trip the ContextVar token reset."""
+        root = current_engine()
+        scoped = Engine()
+
+        with engine_scope(scoped):
+            await asyncio.sleep(0)
+            assert current_engine() is scoped
+
+        assert current_engine() is root
+
+    @pytest.mark.asyncio
+    async def test_concurrent_tasks_can_hold_different_engines(self) -> None:
+        """The point of a ContextVar: two concurrent flows of control, two engines."""
+        first = Engine()
+        second = Engine()
+
+        async def observe(engine: Engine) -> Engine:
+            with engine_scope(engine):
+                await asyncio.sleep(0)
+                return current_engine()
+
+        observed = await asyncio.gather(observe(first), observe(second))
+
+        assert observed == [first, second]
+
+
+class TestRootEngine:
+    def test_root_engine_is_cached(self) -> None:
+        assert current_engine() is current_engine()
+
+    def test_reset_root_engine_builds_a_fresh_one(self) -> None:
+        first = current_engine()
+        reset_root_engine()
+
+        assert current_engine() is not first
+
+    def test_has_current_engine_does_not_build_one(self) -> None:
+        reset_root_engine()
+
+        assert has_current_engine() is False
+
+        current_engine()
+
+        assert has_current_engine() is True
+
+    def test_has_current_engine_is_true_inside_a_scope(self) -> None:
+        reset_root_engine()
+
+        with engine_scope(Engine()):
+            assert has_current_engine() is True
+
+    def test_racing_threads_share_one_root_engine(self) -> None:
+        """The lazy build is locked, so a cold start under load cannot orphan an engine."""
+        racer_count = 8
+        reset_root_engine()
+        observed: list[Engine] = []
+        start = threading.Barrier(racer_count)
+
+        def resolve() -> None:
+            start.wait()
+            observed.append(current_engine())
+
+        threads = [threading.Thread(target=resolve) for _ in range(racer_count)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        assert len(observed) == racer_count
+        assert all(engine is observed[0] for engine in observed)

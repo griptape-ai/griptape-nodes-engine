@@ -29,7 +29,7 @@ Use the GenerateImage node when:
 
 ### Outputs
 
-- **output**: The generated image as an ImageArtifact
+- **output**: The generated image as an ImageUrlArtifact
 
 ## Example
 

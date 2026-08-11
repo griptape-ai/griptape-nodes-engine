@@ -2,7 +2,7 @@ import inspect
 import logging
 from collections.abc import Callable
 from functools import wraps
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from griptape_nodes.retained_mode.events.arbitrary_python_events import RunArbitraryPythonStringRequest
 from griptape_nodes.retained_mode.events.base_events import (
@@ -49,12 +49,14 @@ from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeLockStateResultSuccess,
     CreateNodeRequest,
     CreateNodeResultFailure,
+    CreateNodeResultSuccess,
     DeleteNodeRequest,
     GetNodeMetadataRequest,
     GetNodeMetadataResultFailure,
     GetNodeMetadataResultSuccess,
     GetNodeResolutionStateRequest,
     ListParametersOnNodeRequest,
+    ListParametersOnNodeResultSuccess,
     SetLockNodeStateRequest,
     SetLockNodeStateResultFailure,
     SetLockNodeStateResultSuccess,
@@ -73,6 +75,7 @@ from griptape_nodes.retained_mode.events.parameter_events import (
     GetParameterDetailsRequest,
     GetParameterValueRequest,
     GetParameterValueResultFailure,
+    GetParameterValueResultSuccess,
     MigrateParameterRequest,
     MigrateParameterResultFailure,
     MigrateParameterResultSuccess,
@@ -292,11 +295,11 @@ class RetainedMode:
         )
         result = GriptapeNodes().handle_request(request)
         # Check if result is successful before accessing node_name
-        if hasattr(result, "node_name"):
+        if isinstance(result, CreateNodeResultSuccess):
             return result.node_name
         # You could return the result object for debugging
         logger.error("Failed to create node: %s", result)
-        return result
+        return cast("CreateNodeResultFailure", result)
 
     @classmethod
     def delete_node(
@@ -404,7 +407,7 @@ class RetainedMode:
         """
         request = SetLockNodeStateRequest(node_name=node_name, lock=lock)
         result = GriptapeNodes().handle_request(request)
-        return result
+        return cast("SetLockNodeStateResultSuccess | SetLockNodeStateResultFailure", result)
 
     @classmethod
     def batch_set_lock_node_state(
@@ -418,7 +421,7 @@ class RetainedMode:
         """
         request = BatchSetNodeLockStateRequest(node_names=node_names, lock=lock)
         result = GriptapeNodes().handle_request(request)
-        return result
+        return cast("BatchSetNodeLockStateResultSuccess | BatchSetNodeLockStateResultFailure", result)
 
     @classmethod
     def get_connections_for_node(cls, node_name: str) -> ResultPayload:
@@ -465,14 +468,14 @@ class RetainedMode:
         return result
 
     @classmethod
-    def list_params(cls, node: str) -> ResultPayload:
+    def list_params(cls, node: str) -> list[str]:
         """Lists all parameters associated with a node.
 
         Args:
             node (str): Name of the node to list parameters for.
 
         Returns:
-            ResultPayload: Contains a list of parameter names.
+            list[str]: List of parameter names.
 
         Example:
             # List all parameters on a node
@@ -480,7 +483,7 @@ class RetainedMode:
         """
         request = ListParametersOnNodeRequest(node_name=node)
         result = GriptapeNodes().handle_request(request)
-        return result.parameter_names
+        return cast("ListParametersOnNodeResultSuccess", result).parameter_names
 
     @classmethod
     def add_param(  # noqa: PLR0913, PLR0917
@@ -656,7 +659,7 @@ class RetainedMode:
         if not isinstance(get_metadata_result, GetNodeMetadataResultSuccess):
             msg = f"{reference_node_name}: Failed to get reference node's metadata: {get_metadata_result}"
             logger.warning(msg)
-            return get_metadata_result
+            return cast("GetNodeMetadataResultFailure", get_metadata_result)
 
         reference_metadata = get_metadata_result.metadata
         reference_position = reference_metadata.get("position", {"x": 0, "y": 0})
@@ -709,7 +712,7 @@ class RetainedMode:
             if not isinstance(set_metadata_result, SetNodeMetadataResultSuccess):
                 msg = f"{reference_node_name} -> {new_node_name}: Failed to set new node's position: {set_metadata_result}"
                 logger.warning(msg)
-                return set_metadata_result
+                return cast("SetNodeMetadataResultFailure", set_metadata_result)
 
             # Move the reference node to its new position
             set_reference_metadata_result = GriptapeNodes().handle_request(
@@ -718,7 +721,7 @@ class RetainedMode:
             if not isinstance(set_reference_metadata_result, SetNodeMetadataResultSuccess):
                 msg = f"{reference_node_name} -> {new_node_name}: Failed to set reference node's position: {set_reference_metadata_result}"
                 logger.warning(msg)
-                return set_reference_metadata_result
+                return cast("SetNodeMetadataResultFailure", set_reference_metadata_result)
 
         else:
             # Normal mode: Create new node relative to reference node
@@ -733,7 +736,7 @@ class RetainedMode:
             if not isinstance(set_metadata_result, SetNodeMetadataResultSuccess):
                 msg = f"{reference_node_name} -> {new_node_name}: Failed to set new node's position: {set_metadata_result}"
                 logger.warning(msg)
-                return set_metadata_result
+                return cast("SetNodeMetadataResultFailure", set_metadata_result)
 
         if lock:
             set_lock_node_state_result = cls.set_lock_node_state(node_name=reference_node_name, lock=True)
@@ -866,7 +869,7 @@ class RetainedMode:
             break_connections=break_connections,
         )
         result = GriptapeNodes().handle_request(request)
-        return result
+        return cast("MigrateParameterResultSuccess | MigrateParameterResultFailure", result)
 
     @classmethod
     @command_arg_handler(node_param_split_func=node_param_split)
@@ -975,6 +978,7 @@ class RetainedMode:
             return False, result
 
         # Navigate through indices
+        result = cast("GetParameterValueResultSuccess", result)
         curr_value = result.value
         for idx_or_key in indices:
             if isinstance(curr_value, list):
@@ -1030,6 +1034,7 @@ class RetainedMode:
             return result
 
         # Navigate to the proper location and set the value
+        result = cast("GetParameterValueResultSuccess", result)
         container = result.value
         curr = container
 
@@ -1116,6 +1121,7 @@ class RetainedMode:
 
         if result.succeeded():
             # Now see if there were any indices specified.
+            result = cast("GetParameterValueResultSuccess", result)
             curr_pos_value = result.value
             for idx_or_key in indices:
                 # What is the type of the current object in the chain?
@@ -1221,7 +1227,7 @@ class RetainedMode:
                 )
                 return result
 
-            base_container = result.value
+            base_container = cast("GetParameterValueResultSuccess", result).value
             # Start progress at the base
             curr_pos_value = base_container
             for index_ctr, idx_or_key in enumerate(indices):
@@ -1332,7 +1338,7 @@ class RetainedMode:
             results[f"{source_node} -> {target_node}"] = result
 
             # Track failures without halting execution
-            if not hasattr(result, "success") or not result.success:
+            if not hasattr(result, "success") or not getattr(result, "success", False):
                 failures.append(f"{source_node} -> {target_node}")
 
         # Add summary of failures to the results

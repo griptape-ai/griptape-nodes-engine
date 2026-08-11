@@ -29,7 +29,7 @@ class TestHandleRequestBroadcast:
             patch.object(event_mgr, "put_event") as mock_put,
             # GriptapeNodeEvent is a Pydantic model that validates its wrapped_event arg;
             # patching it here prevents the Pydantic validation from rejecting the MagicMock.
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodeEvent"),
+            patch("griptape_nodes.retained_mode.engine.GriptapeNodeEvent"),
         ):
             GriptapeNodes.handle_request(_BroadcastingRequest())
 
@@ -58,7 +58,7 @@ class TestHandleRequestBroadcast:
             patch.object(event_mgr, "handle_request", return_value=mock_result_event),
             patch.object(event_mgr, "should_suppress_event", return_value=False),
             patch.object(event_mgr, "put_event") as mock_put,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodeEvent"),
+            patch("griptape_nodes.retained_mode.engine.GriptapeNodeEvent"),
         ):
             GriptapeNodes.handle_request(ReadFileRequest(broadcast_result=True))
 
@@ -90,7 +90,7 @@ class TestAHandleRequestBroadcast:
             patch.object(event_mgr, "ahandle_request", return_value=mock_result_event),
             patch.object(event_mgr, "should_suppress_event", return_value=False),
             patch.object(event_mgr, "aput_event") as mock_aput,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodeEvent"),
+            patch("griptape_nodes.retained_mode.engine.GriptapeNodeEvent"),
         ):
             await GriptapeNodes.ahandle_request(_BroadcastingRequest())
 
@@ -121,7 +121,7 @@ class TestAHandleRequestBroadcast:
             patch.object(event_mgr, "ahandle_request", return_value=mock_result_event),
             patch.object(event_mgr, "should_suppress_event", return_value=False),
             patch.object(event_mgr, "aput_event") as mock_aput,
-            patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodeEvent"),
+            patch("griptape_nodes.retained_mode.engine.GriptapeNodeEvent"),
         ):
             await GriptapeNodes.ahandle_request(ReadFileRequest(broadcast_result=True))
 

@@ -14,6 +14,7 @@ from watchfiles import Change, PythonFilter, watch
 from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.files.path_utils import canonicalize_for_identity
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.base_events import AppEvent, ResultDetails
 from griptape_nodes.retained_mode.events.sync_events import (
@@ -26,10 +27,10 @@ from griptape_nodes.retained_mode.events.workflow_events import (
     RegisterWorkflowsFromConfigRequest,
     RegisterWorkflowsFromConfigResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
@@ -38,10 +39,13 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 
-class SyncManager:
+class SyncManager(EngineScoped):
     """Manager for syncing workflows with cloud storage."""
 
-    def __init__(self, event_manager: EventManager, config_manager: ConfigManager) -> None:
+    def __init__(
+        self, event_manager: EventManager, config_manager: ConfigManager, *, engine: Engine | None = None
+    ) -> None:
+        super().__init__(engine)
         self._active_sync_tasks: dict[str, threading.Thread] = {}
         self._watch_task: threading.Thread | None = None
         self._watching_stopped = threading.Event()
@@ -185,7 +189,7 @@ class SyncManager:
             sync_request = StartSyncAllCloudWorkflowsRequest()
 
             # Use handle_request to process through normal event system
-            result = GriptapeNodes.handle_request(sync_request)
+            result = self.engine.handle_request(sync_request)
 
             if isinstance(result, StartSyncAllCloudWorkflowsResultSuccess):
                 logger.debug(
@@ -209,7 +213,7 @@ class SyncManager:
         Raises:
             RuntimeError: If required cloud configuration is missing.
         """
-        secrets_manager = GriptapeNodes.SecretsManager()
+        secrets_manager = self.engine.secrets_manager
 
         # Get cloud storage configuration from secrets
         bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
@@ -486,14 +490,14 @@ class SyncManager:
             total_workflows=total_workflows,
         )
 
-        GriptapeNodes.EventManager().put_event(AppEvent(payload=sync_complete_event))
+        self.engine.event_manager.put_event(AppEvent(payload=sync_complete_event))
 
         # Register workflows from the synced directory
         if synced_workflows:
             logger.info("Registering %d synced workflows from configuration", len(synced_workflows))
             try:
                 register_request = RegisterWorkflowsFromConfigRequest(config_section=WORKFLOWS_TO_REGISTER_KEY)
-                register_result = GriptapeNodes.handle_request(register_request)
+                register_result = self.engine.handle_request(register_request)
 
                 if isinstance(register_result, RegisterWorkflowsFromConfigResultSuccess):
                     logger.info(
