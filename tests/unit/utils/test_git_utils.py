@@ -18,6 +18,7 @@ import pytest
 
 from griptape_nodes.utils.git_utils import (
     _GIT_ALLOWED_PROTOCOLS,
+    _GIT_TIMEOUT_SECONDS,
     GitCloneError,
     GitError,
     GitNotFoundError,
@@ -703,6 +704,33 @@ class TestCloneRepositoryWorkingDirectory:
 
         assert not marker.exists()
 
+    def test_clone_repository_rejects_a_helper_url_even_when_the_environment_allows_ext(
+        self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test that a GIT_ALLOW_PROTOCOL admitting `ext` cannot be used to reach the ext transport.
+
+        git executes the address of an `ext::` URL directly, so an inherited allowlist plus a
+        library URL from a request payload would otherwise be arbitrary command execution.
+        """
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "ext:file:https")
+        marker = temp_dir / "ext-env-ran"
+
+        with pytest.raises(GitCloneError, match="transport helper"):
+            clone_repository(f"ext::/usr/bin/touch {marker}", temp_dir / "clone")
+
+        assert not marker.exists()
+
+    def test_clone_repository_accepts_an_ipv6_url(self, temp_dir: Path) -> None:
+        """Test that the helper-URL check doesn't mistake an IPv6 literal's '::' for a helper name.
+
+        The clone still fails because nothing is listening, but it must fail on the connection
+        rather than be refused as a transport helper.
+        """
+        with pytest.raises(GitCloneError) as excinfo:
+            clone_repository("https://[::1]:9/user/repo.git", temp_dir / "clone")
+
+        assert "transport helper" not in str(excinfo.value)
+
     @pytest.mark.skipif(
         sys.platform.startswith("win"),
         reason="Windows holds a handle on the process's working directory, so it cannot be deleted.",
@@ -743,15 +771,25 @@ class TestGitEnvironment:
         assert env["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
         assert env["GIT_TERMINAL_PROMPT"] == "0"
 
-    def test_git_env_lets_an_inherited_value_override_a_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Test that a launcher can admit a transport the allowlist omits."""
-        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "https")
+    def test_git_env_overrides_an_inherited_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that the surrounding environment cannot loosen the transport allowlist.
+
+        An inherited GIT_ALLOW_PROTOCOL that re-admitted `ext` would turn a library URL into
+        arbitrary command execution, so the engine's list has to win.
+        """
+        monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "ext:https")
         monkeypatch.setenv("GIT_TERMINAL_PROMPT", "1")
 
         env = _git_env()
 
-        assert env["GIT_ALLOW_PROTOCOL"] == "https"
-        assert env["GIT_TERMINAL_PROMPT"] == "1"
+        assert env["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    def test_git_env_keeps_the_rest_of_the_environment(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Test that unrelated variables still reach git, which needs HOME, SSH_AUTH_SOCK and proxies."""
+        monkeypatch.setenv("GIT_SSH_COMMAND", "ssh -v")
+
+        assert _git_env()["GIT_SSH_COMMAND"] == "ssh -v"
 
     def test_git_env_reaches_the_subprocess(self, temp_dir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that the built environment is what git actually runs with.
@@ -768,6 +806,44 @@ class TestGitEnvironment:
         for call in mock_run.call_args_list:
             assert call.kwargs["env"]["GIT_ALLOW_PROTOCOL"] == _GIT_ALLOWED_PROTOCOLS
             assert call.kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+class TestGitTimeout:
+    """Test the ceiling on how long a single git command may run."""
+
+    @pytest.fixture
+    def temp_dir(self) -> Generator[Path, None, None]:
+        """Create a temporary directory for testing."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            yield Path(tmpdir)
+
+    def test_every_git_call_carries_a_timeout(self, temp_dir: Path) -> None:
+        """Test that no git command is started without a deadline.
+
+        A stalled transport would otherwise hold a worker thread until the engine restarts.
+        """
+        origin = make_origin_repo(temp_dir / "origin")
+
+        with patch("griptape_nodes.utils.git_utils.subprocess.run", wraps=subprocess.run) as mock_run:
+            clone_repository(str(origin), temp_dir / "clone")
+
+        assert mock_run.call_args_list
+        for call in mock_run.call_args_list:
+            assert call.kwargs["timeout"] == _GIT_TIMEOUT_SECONDS
+
+    def test_a_timeout_is_reported_as_a_git_error(self, temp_dir: Path) -> None:
+        """Test that a command that overruns its deadline reaches callers as a GitError.
+
+        Callers guard on GitError, so a bare TimeoutExpired would surface as an unhandled crash.
+        """
+        (temp_dir / ".git").mkdir()
+        timeout = subprocess.TimeoutExpired(cmd=["git", "tag"], timeout=_GIT_TIMEOUT_SECONDS)
+
+        with (
+            patch("griptape_nodes.utils.git_utils.subprocess.run", side_effect=timeout),
+            pytest.raises(GitError, match="did not finish within"),
+        ):
+            get_current_tag(temp_dir)
 
 
 class TestGetGitInfo:
@@ -1343,6 +1419,26 @@ class TestRemoteRefExists:
         origin = make_origin_repo(temp_dir / "origin")
 
         assert remote_ref_exists(str(origin), "no-such-ref") is False
+
+    def test_remote_ref_exists_does_not_match_a_ref_that_only_ends_with_the_name(self, temp_dir: Path) -> None:
+        """Test that a similarly-named branch elsewhere in the hierarchy is not counted as a hit.
+
+        ls-remote matches its trailing pattern against the tail of each ref name, so asking for
+        "main" would otherwise be answered by refs/heads/feature/main.
+        """
+        origin = make_origin_repo(temp_dir / "origin")
+        run_git(origin, "branch", "feature/main")
+        run_git(origin, "branch", "-m", "main", "trunk")
+
+        assert remote_ref_exists(str(origin), "main") is False
+        assert remote_ref_exists(str(origin), "feature/main") is True
+        assert remote_ref_exists(str(origin), "trunk") is True
+
+    def test_remote_ref_exists_does_not_match_a_glob(self, temp_dir: Path) -> None:
+        """Test that a wildcard in the requested name doesn't match a real ref."""
+        origin = make_origin_repo(temp_dir / "origin")
+
+        assert remote_ref_exists(str(origin), "ma*") is False
 
     def test_remote_ref_exists_returns_false_for_commit_sha(self, temp_dir: Path) -> None:
         """Test that False is returned for a commit SHA, since SHAs aren't advertised as named refs."""

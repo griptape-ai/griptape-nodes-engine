@@ -5,11 +5,11 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 from datetime import UTC, datetime
-from functools import cache
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
@@ -292,26 +292,20 @@ _GIT_MISSING_MESSAGE = (
     "git was not found on PATH. Griptape Nodes requires a git installation to install and update libraries."
 )
 
+# Ceiling on any single git command. Generous enough for a large library clone over a slow
+# connection, but bounded so a stalled transport fails the request instead of holding a worker
+# thread until the engine is restarted.
+_GIT_TIMEOUT_SECONDS = 600
+
 # Transports a library URL is allowed to use. Anything outside this list, notably a
 # "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
 # before a connection is attempted.
 _GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
 
-
-@cache
-def _log_git_env_override(name: str, inherited: str, default: str) -> None:
-    """Report that an inherited environment variable displaced a git hardening default.
-
-    Cached so a launcher that sets one of these permanently produces one line per distinct
-    value rather than one line per git invocation.
-    """
-    logger.warning(
-        "Inherited %s=%r from the environment, overriding the Griptape Nodes default of %r. "
-        "Library installs and updates will use the inherited setting.",
-        name,
-        inherited,
-        default,
-    )
+# git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
+# `ext` helper hands its address to a shell. The prefix is anchored and excludes "/", ":" and
+# "[" so a normal URL ("https://host/x") and an IPv6 literal ("https://[::1]/x") don't match.
+_REMOTE_HELPER_URL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
 
 
 def _git_env() -> dict[str, str]:
@@ -322,24 +316,15 @@ def _git_env() -> dict[str, str]:
     the transports git shells out to (ssh, in particular) from prompting either.
 
     Library URLs reach git from workflow and request payloads, so the transports git will
-    speak are pinned to `_GIT_ALLOWED_PROTOCOLS`. git already refuses the `ext` transport
-    by default, but leaves unrecognized ones permitted for a directly invoked command.
-
-    An inherited value wins for both, letting a launcher opt back into prompting or admit
-    a transport this list omits. Because that also lets a launcher turn off the transport
-    restriction, an override is logged so it is visible rather than silent.
+    speak are pinned to `_GIT_ALLOWED_PROTOCOLS`. Both settings override anything inherited:
+    a `GIT_ALLOW_PROTOCOL` from the surrounding environment that re-admitted `ext` would turn
+    a library URL into arbitrary command execution, so the environment does not get a vote.
     """
-    defaults = {
+    return {
+        **os.environ,
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
     }
-
-    for name, default in defaults.items():
-        inherited = os.environ.get(name)
-        if inherited is not None and inherited != default:
-            _log_git_env_override(name, inherited, default)
-
-    return {**defaults, **os.environ}
 
 
 def _reject_option_like(value: str, description: str, error_cls: type[GitError]) -> None:
@@ -354,6 +339,22 @@ def _reject_option_like(value: str, description: str, error_cls: type[GitError])
     """
     if value.startswith("-"):
         msg = f"Invalid {description}: {value!r} must not start with '-'"
+        raise error_cls(msg)
+
+
+def _reject_unsafe_url(url: str, error_cls: type[GitError]) -> None:
+    """Reject a library URL git would treat as something other than a repository address.
+
+    Checked here rather than left to `GIT_ALLOW_PROTOCOL` alone so the refusal does not depend
+    on git honoring an environment variable.
+
+    Raises:
+        error_cls: If the URL would be read as an option or as a remote helper invocation.
+    """
+    _reject_option_like(url, "git URL", error_cls)
+
+    if _REMOTE_HELPER_URL.match(url):
+        msg = f"Invalid git URL: {url!r} names a transport helper. Use an http, https, ssh, git, or file URL."
         raise error_cls(msg)
 
 
@@ -388,7 +389,7 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
     Raises:
         GitNotFoundError: If no runnable git is on PATH.
         GitRepositoryError: If cwd is not a directory.
-        GitError: If git cannot be run for any other reason.
+        GitError: If git times out or cannot be run for any other reason.
     """
     try:
         return subprocess.run(  # noqa: S603
@@ -403,8 +404,15 @@ def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
             # that escapes as something other than a GitError.
             encoding="utf-8",
             errors="replace",
+            timeout=_GIT_TIMEOUT_SECONDS,
             check=False,
         )
+    except subprocess.TimeoutExpired as e:
+        msg = (
+            f"git {args[0]} did not finish within {_GIT_TIMEOUT_SECONDS} seconds and was stopped. "
+            f"The remote may be unreachable."
+        )
+        raise GitError(msg) from e
     except OSError as e:
         raise _git_os_error(cwd, e) from e
 
@@ -431,7 +439,7 @@ def _run_git(
         error_cls: If the command exits non-zero.
         GitNotFoundError: If no runnable git is on PATH.
         GitRepositoryError: If cwd is not a directory.
-        GitError: If git cannot be run for any other reason.
+        GitError: If git times out or cannot be run for any other reason.
     """
     result = _git(args, cwd)
     if result.returncode != 0:
@@ -450,7 +458,7 @@ def _try_git(args: list[str], cwd: Path | None = None) -> str | None:
 
     Raises:
         GitNotFoundError: If no runnable git is on PATH.
-        GitError: If git cannot be run for any other reason.
+        GitError: If git times out or cannot be run for any other reason.
     """
     try:
         result = _git(args, cwd)
@@ -475,7 +483,7 @@ def _run_git_detached(args: list[str], *, error_msg: str, error_cls: type[GitErr
     Raises:
         error_cls: If the command exits non-zero.
         GitNotFoundError: If no runnable git is on PATH.
-        GitError: If git cannot be run for any other reason.
+        GitError: If git times out or cannot be run for any other reason.
     """
     with tempfile.TemporaryDirectory() as neutral_dir:
         return _run_git(args, error_msg=error_msg, cwd=Path(neutral_dir), error_cls=error_cls)
@@ -989,7 +997,7 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
         msg = f"Cannot clone: target path {target_path} already exists"
         raise GitCloneError(msg)
 
-    _reject_option_like(git_url, "git URL", GitCloneError)
+    _reject_unsafe_url(git_url, GitCloneError)
     if branch_tag_commit:
         _reject_option_like(branch_tag_commit, "ref", GitCloneError)
 
@@ -1061,7 +1069,7 @@ def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJ
         GitCloneError: If the checkout fails or library metadata is invalid.
         GitNotFoundError: If git is not installed.
     """
-    _reject_option_like(remote_url, "git URL", GitCloneError)
+    _reject_unsafe_url(remote_url, GitCloneError)
     _reject_option_like(ref, "ref", GitCloneError)
 
     with tempfile.TemporaryDirectory() as temp_dir:
@@ -1136,12 +1144,18 @@ def remote_ref_exists(remote_url: str, ref: str) -> bool:
         GitRemoteError: If the remote cannot be queried.
         GitNotFoundError: If git is not installed.
     """
-    _reject_option_like(remote_url, "git URL", GitRemoteError)
+    _reject_unsafe_url(remote_url, GitRemoteError)
     _reject_option_like(ref, "ref", GitRemoteError)
 
+    # ls-remote's trailing arguments are glob patterns matched against the tail of each ref
+    # name, so a bare "main" also matches refs/heads/feature/main. Ask for the two fully
+    # qualified spellings and compare what comes back exactly.
+    wanted = [f"refs/heads/{ref}", f"refs/tags/{ref}"]
     refs = _run_git_detached(
-        ["ls-remote", "--heads", "--tags", remote_url, ref],
+        ["ls-remote", "--heads", "--tags", remote_url, *wanted],
         error_msg=f"Failed to query remote refs from {remote_url}",
         error_cls=GitRemoteError,
     )
-    return bool(refs)
+    # Each line is "<sha>\t<refname>".
+    found = {line.partition("\t")[2].strip() for line in refs.splitlines()}
+    return bool(found & set(wanted))
