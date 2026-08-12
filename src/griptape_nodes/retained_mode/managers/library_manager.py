@@ -2055,11 +2055,23 @@ class LibraryManager(EngineScoped):
 
                 library_name = metadata_result.library_schema.name
 
+                # Entering METADATA_LOADED directly, so the DISCOVERED-phase writer that
+                # normally resolves requires_worker never runs for this registration.
+                # Resolve it here too, or a library whose manifest suggests worker mode
+                # loads in-process when registered by file path (e.g. added to a running
+                # engine from the editor) -- its advanced module would then import in the
+                # orchestrator without the worker-managed dependency environment.
+                requires_worker = self._resolve_requires_worker(
+                    lib_info.registered_path if lib_info else None,
+                    metadata_result.library_schema.metadata.declarations,
+                )
+
                 # Update or create LibraryInfo
                 if lib_info:
                     lib_info.library_name = library_name
                     lib_info.library_version = metadata_result.library_schema.metadata.library_version
                     lib_info.lifecycle_state = LibraryManager.LibraryLifecycleState.METADATA_LOADED
+                    lib_info.requires_worker = requires_worker
                 else:
                     # Create new LibraryInfo since it doesn't exist yet
                     lib_info = LibraryManager.LibraryInfo(
@@ -2070,6 +2082,7 @@ class LibraryManager(EngineScoped):
                         library_version=metadata_result.library_schema.metadata.library_version,
                         fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
                         problems=[],
+                        requires_worker=requires_worker,
                     )
                     self._library_file_path_to_info[file_path] = lib_info
             else:
@@ -2364,9 +2377,26 @@ class LibraryManager(EngineScoped):
                         # Add library directory and venv site-packages to sys.path
                         await self._add_library_paths_to_sys_path(library_data.name, file_path, base_dir)
 
-                        # Load the advanced library module if specified
+                        # Load the advanced library module if specified. Worker-delegated
+                        # libraries skip this on the orchestrator, mirroring the venv/pip and
+                        # node-import skips above and below: the module executes in this
+                        # process, its third-party imports resolve against the library venv,
+                        # and the orchestrator deliberately never created that venv -- so any
+                        # manifest dependency it imports would raise ModuleNotFoundError and
+                        # kill the registration. Nothing on the orchestrator invokes the
+                        # advanced hooks for a worker library anyway (node loading, their only
+                        # load-time caller, is skipped), and generate_new_library accepts
+                        # advanced_library=None. The worker loads the module in its own
+                        # process with the venv populated.
                         advanced_library_instance = None
-                        if library_data.advanced_library_path:
+                        skip_advanced_library = library_info.requires_worker and not self._is_worker
+                        if skip_advanced_library and library_data.advanced_library_path:
+                            logger.debug(
+                                "Skipping Advanced Library load for worker-delegated library '%s' on the "
+                                "orchestrator; the worker loads it in its own process.",
+                                library_data.name,
+                            )
+                        elif library_data.advanced_library_path:
                             try:
                                 advanced_library_instance = self._load_advanced_library_module(
                                     library_data=library_data,
