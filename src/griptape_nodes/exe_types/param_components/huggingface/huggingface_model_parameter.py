@@ -13,6 +13,7 @@ from griptape_nodes.exe_types.param_components.model_policy import (
 )
 from griptape_nodes.exe_types.param_types.parameter_button import ParameterButton
 from griptape_nodes.exe_types.param_types.parameter_string import ParameterString
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest, ListModelDownloadsResultSuccess
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
@@ -88,6 +89,10 @@ class HuggingFaceModelParameter(ABC):
         # `_refresh_policy()`. Whether enforcement is active is DERIVED from these two on read
         # (see `_gated`) rather than stored, so it cannot fall out of step with the verdicts it
         # was computed from.
+        #
+        # When this runs inside a node __init__ (the common case), the query is deferred and
+        # `_policy` holds DEFERRED_SNAPSHOT — no denials, no bus request — until the first
+        # post-construction refresh_parameters() re-queries and replaces it.
         self._gate_mode = gated
         self._policy = ModelPolicySnapshot()
         if gated is not False:
@@ -403,6 +408,15 @@ class HuggingFaceModelParameter(ABC):
     def _refresh_downloading_model_ids(self) -> None:
         # Only called from refresh_parameters() — never from inside a button
         # callback — to avoid nested handle_request() calls that cause recursion.
+        #
+        # Deferred during node __init__: a bus request issued there trips the
+        # reentrant-bus-in-init strict-mode rule and can deadlock the worker's
+        # schema probe. An empty set is benign — rows lose only their
+        # "Downloading…" subtitle until the first refresh_parameters() after
+        # construction (validate_before_node_run or the refresh button).
+        if LibraryRegistry.is_constructing_node():
+            self._downloading_model_ids = set()
+            return
         result = GriptapeNodes.handle_request(ListModelDownloadsRequest())
         if not isinstance(result, ListModelDownloadsResultSuccess):
             self._downloading_model_ids = set()

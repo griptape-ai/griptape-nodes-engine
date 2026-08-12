@@ -23,6 +23,7 @@ import pytest
 
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import NO_MODELS_PLACEHOLDER
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
     ModelAccessVerdict,
     QueryModelAccessForNodeRequest,
@@ -301,6 +302,69 @@ class TestRunPathGate:
     def test_validate_before_node_run_blocks_a_denied_selection(self) -> None:
         param = _param(gated=True)
         param.add_input_parameters()
+        param._node.set_parameter_value("model", DENIED_REPO)
+        errors = param.validate_before_node_run()
+        assert errors is not None
+        assert "not permitted" in str(errors[0])
+
+
+class TestConstructionDefersBusRequests:
+    """No bus request may be issued while a node __init__ is on the stack.
+
+    The worker's schema probe constructs every node class during library load; a bus request
+    from inside that construction fires reentrant-bus-in-init and drops the class from the
+    worker schema. In production this component always runs inside a node __init__, so its
+    policy and download queries defer until the first post-construction refresh.
+    """
+
+    def _construct_deferred(self, *, gated: bool | None) -> HuggingFaceRepoParameter:
+        with LibraryRegistry.constructing_node():
+            param = _param(gated=gated)
+            param.add_input_parameters()
+        return param
+
+    def test_construction_issues_no_bus_requests(self) -> None:
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request") as handle:
+            self._construct_deferred(gated=True)
+        handle.assert_not_called()
+
+    def test_a_deferred_gated_param_denies_nothing(self) -> None:
+        """No denials while deferred -- including the refuse-unrecognized backstop.
+
+        A naive skip that left a plain empty snapshot would refuse EVERY choice as
+        unrecognized and badge the whole dropdown "not permitted" at construction.
+        """
+        param = self._construct_deferred(gated=True)
+        assert param._policy.deferred is True
+        assert param.query_for_denial(DENIED_REPO) is None
+        assert param.query_for_denial(UNDECLARED_REPO) is None
+
+    def test_no_denial_decoration_lands_while_deferred(self) -> None:
+        param = self._construct_deferred(gated=True)
+        data = param._build_data_choices([ALLOWED_REPO, DENIED_REPO])
+        assert all(row.get("icon") != "shield-off" for row in data)
+        parameter = param._node.get_parameter_by_name("model")
+        assert parameter is not None
+        assert parameter.get_badge() is None
+
+    def test_refresh_parameters_heals_after_construction(self) -> None:
+        param = self._construct_deferred(gated=True)
+        param.refresh_parameters()
+        assert param._policy.deferred is False
+        assert param.query_for_denial(DENIED_REPO) is not None
+        assert param.query_for_denial(ALLOWED_REPO) is None
+
+    def test_auto_detect_heals_too(self) -> None:
+        """Pins the `_gate_mode is not False` refresh guard: auto-detect must re-query as well."""
+        param = self._construct_deferred(gated=None)
+        param.refresh_parameters()
+        assert param._policy.deferred is False
+        assert param.query_for_denial(DENIED_REPO) is not None
+
+    def test_the_run_path_still_blocks_a_denied_selection(self) -> None:
+        """validate_before_node_run refreshes first, so deferral cannot weaken run gating."""
+        param = self._construct_deferred(gated=True)
         param._node.set_parameter_value("model", DENIED_REPO)
         errors = param.validate_before_node_run()
         assert errors is not None

@@ -1132,3 +1132,98 @@ class TestSelectionReadingApi:
             assert param.get_badge() is not None
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+
+class TestConstructionDeferral:
+    """The snapshot fetch is skipped while a node __init__ is on the stack.
+
+    In production the component is always constructed inside a node __init__, where a bus
+    request fires the reentrant-bus-in-init strict-mode rule and can deadlock the worker's
+    schema probe (dropping the class from the worker schema). The deferred snapshot denies
+    nothing, so the caller's default survives and no denial decoration lands; enforcement is
+    restored by the re-fetch in query_for_denial before the first real verdict.
+    """
+
+    def test_construction_defers_the_query_and_keeps_the_default(self, griptape_nodes) -> None:  # noqa: ANN001
+        from unittest.mock import MagicMock
+
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_all(_checkpoint: object) -> CheckpointDenial:
+            return CheckpointDenial(failures=(CheckpointFailure(detail="Nothing enabled."),))
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_all)
+        handle = MagicMock()
+        try:
+            with (
+                patch(
+                    "griptape_nodes.exe_types.param_components.model_policy.GriptapeNodes.handle_request",
+                    handle,
+                ),
+                LibraryRegistry.constructing_node(),
+            ):
+                node, helper, param = _build_probe_node_with_component(
+                    model_choices=["alpha", "beta"], default_model="alpha"
+                )
+            handle.assert_not_called()
+            assert helper._snapshot.deferred is True
+            # Despite the deny-all policy, the default is NOT relocated -- policy was never asked.
+            assert node.get_parameter_value(param.name) == "alpha"
+            # And no denial decoration lands.
+            assert all(row.get("icon") != "shield-off" for row in param.ui_options["data"])
+            assert param.get_badge() is None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_all)
+
+    def test_query_for_denial_heals_a_deferred_snapshot(self, griptape_nodes) -> None:  # noqa: ANN001
+        """The enforcement-gap regression: run-time gating must not stay bypassed until a refresh.
+
+        This component has no validate_before_node_run equivalent, so if query_for_denial
+        answered from the deferred snapshot it would return None for everything, forever.
+        """
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            with LibraryRegistry.constructing_node():
+                _node, helper, _param = _build_probe_node_with_component(
+                    model_choices=["alpha", "beta"], default_model="beta"
+                )
+            assert helper._snapshot.deferred is True
+            assert helper.query_for_denial("alpha") is not None
+            assert helper._snapshot.deferred is False
+            assert helper.query_for_denial("beta") is None
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
+
+    def test_refresh_heals_decoration(self, griptape_nodes) -> None:  # noqa: ANN001
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        def deny_alpha(checkpoint: object) -> CheckpointDenial | None:
+            if checkpoint.attributes.get("id") == "gtc_test_alpha":  # type: ignore[attr-defined]
+                return CheckpointDenial(failures=(CheckpointFailure(detail="Alpha not enabled."),))
+            return None
+
+        griptape_nodes.EventManager().add_authorization_hook(deny_alpha)
+        try:
+            with LibraryRegistry.constructing_node():
+                _node, helper, param = _build_probe_node_with_component(
+                    model_choices=["alpha", "beta"], default_model="beta"
+                )
+            assert all(row.get("icon") != "shield-off" for row in param.ui_options["data"])
+
+            helper.refresh()
+
+            data_by_name = {row["name"]: row for row in param.ui_options["data"]}
+            assert data_by_name["alpha"]["icon"] == "shield-off"
+            assert helper._snapshot.deferred is False
+        finally:
+            griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)

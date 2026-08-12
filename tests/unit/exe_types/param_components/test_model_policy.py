@@ -8,14 +8,16 @@ in particular the one axis on which the two are ALLOWED to differ: `refuse_unrec
 
 import logging
 from dataclasses import FrozenInstanceError
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from griptape_nodes.exe_types.param_components.model_policy import (
+    DEFERRED_SNAPSHOT,
     ModelPolicySnapshot,
     query_model_policy,
 )
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
     ModelAccessVerdict,
     QueryModelAccessForNodeResultFailure,
@@ -270,6 +272,47 @@ class TestBothComponentsAgreeOnAnUnattributableDenial:
             assert component.query_for_denial("alpha") is not None
             with pytest.raises(RuntimeError):
                 component.raise_if_denied("alpha")
+
+
+class TestConstructionDeferral:
+    """During node __init__ the query is skipped entirely -- see reentrant-bus-in-init.
+
+    A bus request issued while a node __init__ is on the stack deadlocks the worker's schema
+    probe and gets the class dropped from the worker schema, so `query_model_policy` must not
+    touch the bus there. The deferred snapshot it returns instead must deny nothing: no query
+    was made, so there is no verdict (and no failure) to enforce.
+    """
+
+    def test_no_bus_request_while_constructing(self) -> None:
+        handle = MagicMock()
+        with patch(_HANDLE, handle), LibraryRegistry.constructing_node():
+            snapshot = query_model_policy("SomeNode")
+        handle.assert_not_called()
+        assert snapshot.deferred is True
+
+    def test_a_deferred_snapshot_denies_nothing_even_when_asked_to_refuse_unrecognized(self) -> None:
+        """The regression this exists for: a naive empty snapshot DOES refuse unrecognized ids.
+
+        Skipping the query without the `deferred` marker would badge every choice on a gated
+        dropdown "not permitted" at construction. Pin the contrast explicitly.
+        """
+        assert ModelPolicySnapshot().denial_for(UNKNOWN, refuse_unrecognized=True) is not None
+        assert DEFERRED_SNAPSHOT.denial_for(UNKNOWN, refuse_unrecognized=True) is None
+        assert DEFERRED_SNAPSHOT.denial_for(UNKNOWN) is None
+
+    def test_a_deferred_snapshot_is_not_fail_closed(self) -> None:
+        """Deferral is "not yet asked", not "could not answer" -- it must not read as a failure."""
+        assert DEFERRED_SNAPSHOT.failure_detail is None
+        assert DEFERRED_SNAPSHOT.declares_models is False
+
+    def test_the_query_goes_through_once_construction_ends(self) -> None:
+        verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
+        with patch(_HANDLE, return_value=_success(verdicts)):
+            with LibraryRegistry.constructing_node():
+                assert query_model_policy("SomeNode").deferred is True
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.deferred is False
+        assert snapshot.denial_for(DENIED) is _DENIAL
 
 
 class TestSnapshotIsImmutable:

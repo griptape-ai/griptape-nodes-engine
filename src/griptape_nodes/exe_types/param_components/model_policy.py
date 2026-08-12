@@ -20,6 +20,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
@@ -73,6 +74,13 @@ class ModelPolicySnapshot:
     ``provider_model_id`` to match a dropdown value against. Those denials cannot be honored
     per-row, so they are honored for the whole parameter instead -- see ``denial_for``. Dropping
     them would let an explicitly forbidden model run.
+
+    ``deferred`` is True when the query was skipped entirely because a node ``__init__`` was on
+    the stack (issuing a bus request there trips the reentrant-bus-in-init strict-mode rule and
+    can deadlock the worker's schema probe). Both tables are empty and every lookup answers "no
+    denial" -- a deferred snapshot must not read as fail-closed, because no query has failed; one
+    was never made. It is replaced wholesale by the first post-construction
+    ``query_model_policy()``.
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
@@ -81,6 +89,7 @@ class ModelPolicySnapshot:
     failure_detail: str | None = None
     has_unmatchable_entries: bool = False
     unmatchable_denials: tuple[str, ...] = ()
+    deferred: bool = False
 
     def catalog_ids_for(self, provider_model_id: str) -> tuple[str, ...]:
         """Every catalog id declared against ``provider_model_id``, in declaration order."""
@@ -96,7 +105,7 @@ class ModelPolicySnapshot:
         """
         return bool(self.catalog_ids_by_provider_id) or self.has_unmatchable_entries
 
-    def denial_for(
+    def denial_for(  # noqa: PLR0911 -- a chain of early-exit verdicts, one per snapshot state
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
     ) -> CheckpointDenial | None:
         """Return the denial for a resolved dropdown value, or ``None`` when permitted.
@@ -116,6 +125,11 @@ class ModelPolicySnapshot:
         # placeholder row badged "Model Not Permitted" would report a library-registration problem
         # as a licensing one, and hide the "download this model" message that says what to do.
         if provider_model_id is None:
+            return None
+        # A deferred snapshot has asked policy nothing, so it can deny nothing. Without this,
+        # the `refuse_unrecognized` path below would refuse every choice against the empty
+        # catalog -- badging a freshly constructed gated dropdown entirely "not permitted".
+        if self.deferred:
             return None
         if self.failure_detail is not None:
             return CheckpointDenial(failures=(CheckpointFailure(detail=self.failure_detail),))
@@ -157,8 +171,18 @@ class ModelPolicySnapshot:
         return None
 
 
+# Shared "policy not yet queried" snapshot. Frozen, so one instance serves every deferral.
+DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
+
+
 def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
     """Ask the engine which of ``node_type``'s declared models are permitted.
+
+    Returns ``DEFERRED_SNAPSHOT`` without querying when a node ``__init__`` is on the stack:
+    a bus request issued during construction trips the reentrant-bus-in-init strict-mode rule
+    and can deadlock the worker's schema probe (which gets the class dropped from the worker
+    schema). Callers hold the deferred snapshot until their first post-construction refresh
+    replaces it with a real query result.
 
     Args:
         node_type: The node class name the manifest declares ``model_usage`` against.
@@ -168,6 +192,9 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
+    if LibraryRegistry.is_constructing_node():
+        logger.debug("Deferring model-policy query for node type '%s': node __init__ in progress.", node_type)
+        return DEFERRED_SNAPSHOT
     result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
