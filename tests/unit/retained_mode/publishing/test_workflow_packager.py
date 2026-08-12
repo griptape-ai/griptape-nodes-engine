@@ -1,11 +1,16 @@
-"""Tests for WorkflowPackager transitive library dependency resolution."""
+"""Tests for WorkflowPackager: library dependency resolution and clean-rebuild publishing."""
 
 import json
 import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
+from dotenv import dotenv_values
+
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+from griptape_nodes.retained_mode.events.os_events import DeleteFileResultSuccess, WriteFileResultSuccess
+from griptape_nodes.retained_mode.events.secrets_events import GetAllSecretValuesResultSuccess
 from griptape_nodes.retained_mode.publishing.workflow_packager import WorkflowPackager
 
 
@@ -315,3 +320,333 @@ class TestCollectDependenciesEnginePin:
             result = packager.collect_dependencies(workflow)
 
         assert "griptape-nodes-engine @ git+https://github.com/griptape-ai/griptape-nodes.git@v0.92.0" in result
+
+
+def _write_file_via_real_fs(request: MagicMock) -> MagicMock:
+    """Handle a WriteFileRequest by actually writing the file, returning a success result."""
+    path = Path(request.file_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(request.content, encoding="utf-8")
+    return MagicMock(spec=WriteFileResultSuccess)
+
+
+class TestGetMergedEnvMapping:
+    """get_merged_env_mapping drops blank-valued entries from both sources."""
+
+    def test_drops_blank_workspace_entries(self, tmp_path: Path) -> None:
+        """A blank value in the workspace .env is not carried into the bundle."""
+        workspace_env = tmp_path / ".env"
+        workspace_env.write_text("GT_CLOUD_API_KEY=\nOTHER_KEY=value\n", encoding="utf-8")
+
+        with patch(
+            "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+            return_value=MagicMock(spec=GetAllSecretValuesResultSuccess, values={}),
+        ):
+            result = WorkflowPackager.get_merged_env_mapping(workspace_env)
+
+        assert "GT_CLOUD_API_KEY" not in result
+        assert result["OTHER_KEY"] == "value"
+
+    def test_drops_blank_secrets(self, tmp_path: Path) -> None:
+        """A registered-but-empty secret is not carried into the bundle."""
+        workspace_env = tmp_path / ".env"
+
+        with patch(
+            "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+            return_value=MagicMock(
+                spec=GetAllSecretValuesResultSuccess, values={"GT_CLOUD_API_KEY": "", "REAL_KEY": "abc"}
+            ),
+        ):
+            result = WorkflowPackager.get_merged_env_mapping(workspace_env)
+
+        assert "GT_CLOUD_API_KEY" not in result
+        assert result["REAL_KEY"] == "abc"
+
+    def test_blank_workspace_entry_does_not_shadow_real_secret(self, tmp_path: Path) -> None:
+        """A blank workspace entry lets the real secret value through instead of masking it."""
+        workspace_env = tmp_path / ".env"
+        workspace_env.write_text("GT_CLOUD_API_KEY=\n", encoding="utf-8")
+
+        with patch(
+            "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+            return_value=MagicMock(spec=GetAllSecretValuesResultSuccess, values={"GT_CLOUD_API_KEY": "real-key"}),
+        ):
+            result = WorkflowPackager.get_merged_env_mapping(workspace_env)
+
+        assert result["GT_CLOUD_API_KEY"] == "real-key"
+
+    def test_raises_when_secret_read_fails(self, tmp_path: Path) -> None:
+        """A failed secret read raises rather than yielding a thinner mapping."""
+        workspace_env = tmp_path / ".env"
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                return_value=MagicMock(),
+            ),
+            pytest.raises(TypeError),
+        ):
+            WorkflowPackager.get_merged_env_mapping(workspace_env)
+
+
+class TestWriteEnvFile:
+    """write_env_file rebuilds the file rather than updating it key-by-key."""
+
+    def test_removes_keys_absent_from_the_mapping(self, tmp_path: Path) -> None:
+        """A key left by an earlier publish is gone after a publish that does not include it."""
+        env_path = tmp_path / ".env"
+        env_path.write_text("GT_CLOUD_API_KEY=''\nSTALE_KEY='old'\n", encoding="utf-8")
+
+        with patch(
+            "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+            side_effect=_write_file_via_real_fs,
+        ):
+            WorkflowPackager.write_env_file(env_path, {"GT_CLOUD_API_KEY": "real-key"})
+
+        assert dotenv_values(env_path) == {"GT_CLOUD_API_KEY": "real-key"}
+
+    def test_values_round_trip_through_dotenv(self, tmp_path: Path) -> None:
+        """Values with quotes, spaces, and '#' survive the write unchanged."""
+        env_path = tmp_path / ".env"
+        mapping = {"WITH_SPACE": "a b", "WITH_QUOTE": "it's", "WITH_HASH": "a#b", "PLAIN": "abc123"}
+
+        with patch(
+            "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+            side_effect=_write_file_via_real_fs,
+        ):
+            WorkflowPackager.write_env_file(env_path, mapping)
+
+        assert dotenv_values(env_path) == mapping
+
+    def test_raises_when_the_write_fails(self, tmp_path: Path) -> None:
+        """A failed write raises instead of leaving a partial file unreported."""
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                return_value=MagicMock(),
+            ),
+            pytest.raises(TypeError),
+        ):
+            WorkflowPackager.write_env_file(tmp_path / ".env", {"KEY": "value"})
+
+
+class TestGetProcessEnvSecrets:
+    """get_process_env_secrets picks up registered secrets that exist only in the environment."""
+
+    def test_returns_registered_secret_set_only_in_the_environment(self) -> None:
+        """A registered secret exported in the shell is available to the bundle."""
+        secrets_manager = MagicMock(secrets_to_register={"GT_CLOUD_API_KEY": ""})
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.SecretsManager",
+                return_value=secrets_manager,
+            ),
+            patch.dict("os.environ", {"GT_CLOUD_API_KEY": "from-shell"}, clear=False),
+        ):
+            result = WorkflowPackager.get_process_env_secrets(exclude=set())
+
+        assert result == {"GT_CLOUD_API_KEY": "from-shell"}
+
+    def test_skips_excluded_and_unregistered_keys(self) -> None:
+        """Keys already sourced from a .env file, and unregistered env vars, are left alone."""
+        secrets_manager = MagicMock(secrets_to_register={"GT_CLOUD_API_KEY": ""})
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.SecretsManager",
+                return_value=secrets_manager,
+            ),
+            patch.dict("os.environ", {"GT_CLOUD_API_KEY": "from-shell", "UNRELATED_SECRET": "nope"}, clear=False),
+        ):
+            result = WorkflowPackager.get_process_env_secrets(exclude={"GT_CLOUD_API_KEY"})
+
+        assert result == {}
+
+    def test_skips_blank_environment_values(self) -> None:
+        """An exported-but-empty variable is not treated as a credential."""
+        secrets_manager = MagicMock(secrets_to_register={"GT_CLOUD_API_KEY": ""})
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.SecretsManager",
+                return_value=secrets_manager,
+            ),
+            patch.dict("os.environ", {"GT_CLOUD_API_KEY": ""}, clear=False),
+        ):
+            result = WorkflowPackager.get_process_env_secrets(exclude=set())
+
+        assert result == {}
+
+
+class TestWriteDownloadModelsScript:
+    """A workflow with no HuggingFace models leaves no download script behind."""
+
+    def test_removes_stale_script_when_no_models_are_needed(self, tmp_path: Path) -> None:
+        """A script from an earlier publish is deleted, not left to run again."""
+        packager = WorkflowPackager("test_workflow")
+        script_path = tmp_path / "download_models.py"
+        script_path.write_text("# from an earlier publish\n", encoding="utf-8")
+
+        def delete_it(request: MagicMock) -> MagicMock:
+            Path(request.path).unlink()
+            return MagicMock(spec=DeleteFileResultSuccess)
+
+        with (
+            patch.object(packager, "collect_huggingface_download_commands", return_value=[]),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=delete_it,
+            ),
+        ):
+            wrote = packager.write_download_models_script([], tmp_path)
+
+        assert wrote is False
+        assert not script_path.exists()
+
+    def test_raises_when_stale_script_cannot_be_removed(self, tmp_path: Path) -> None:
+        """A failed removal fails the publish rather than shipping a script that will run."""
+        packager = WorkflowPackager("test_workflow")
+        (tmp_path / "download_models.py").write_text("# from an earlier publish\n", encoding="utf-8")
+
+        with (
+            patch.object(packager, "collect_huggingface_download_commands", return_value=[]),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                return_value=MagicMock(),
+            ),
+            pytest.raises(TypeError),
+        ):
+            packager.write_download_models_script([], tmp_path)
+
+    def test_no_delete_attempted_when_no_script_exists(self, tmp_path: Path) -> None:
+        """The common case (nothing to clean up) issues no delete request."""
+        packager = WorkflowPackager("test_workflow")
+
+        with (
+            patch.object(packager, "collect_huggingface_download_commands", return_value=[]),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request"
+            ) as mock_handle,
+        ):
+            wrote = packager.write_download_models_script([], tmp_path)
+
+        assert wrote is False
+        mock_handle.assert_not_called()
+
+
+class TestStagedPublish:
+    """staged_publish makes a re-publish a clean rewrite, and a failed publish a no-op."""
+
+    def test_swaps_staging_into_place_on_success(self, tmp_path: Path) -> None:
+        """The destination ends up holding exactly what the publish wrote to staging."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+
+        with packager.staged_publish(destination) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        assert (destination / "run.py").read_text(encoding="utf-8") == "new"
+
+    def test_removes_artifacts_absent_from_the_new_publish(self, tmp_path: Path) -> None:
+        """A file left by an earlier publish does not survive into the new bundle."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "download_models.py").write_text("stale", encoding="utf-8")
+        (destination / ".env").write_text("GT_CLOUD_API_KEY=''\n", encoding="utf-8")
+
+        with packager.staged_publish(destination) as staging:
+            (staging / ".env").write_text("GT_CLOUD_API_KEY='real-key'\n", encoding="utf-8")
+
+        assert not (destination / "download_models.py").exists()
+        assert (destination / ".env").read_text(encoding="utf-8") == "GT_CLOUD_API_KEY='real-key'\n"
+
+    def test_leaves_previous_bundle_intact_on_failure(self, tmp_path: Path) -> None:
+        """A publish that raises partway through does not touch the destination."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+
+        def publish_and_fail() -> None:
+            with packager.staged_publish(destination) as staging:
+                (staging / "run.py").write_text("half-written", encoding="utf-8")
+                msg = "publish failed partway through"
+                raise RuntimeError(msg)
+
+        with pytest.raises(RuntimeError):
+            publish_and_fail()
+
+        assert (destination / "run.py").read_text(encoding="utf-8") == "previous"
+
+    def test_cleans_up_the_staging_directory(self, tmp_path: Path) -> None:
+        """The staging directory does not outlive the publish, successful or not."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+
+        with packager.staged_publish(destination) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+            staging_path = staging
+
+        assert not staging_path.exists()
+
+    def test_carries_preserved_entries_across_the_swap(self, tmp_path: Path) -> None:
+        """Opted-in entries (e.g. per-version subdirs) survive a rebuild of the bundle."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        (destination / "v1").mkdir(parents=True)
+        (destination / "v1" / "workflow.py").write_text("v1", encoding="utf-8")
+        (destination / "stale.py").write_text("stale", encoding="utf-8")
+
+        with packager.staged_publish(destination, preserve=["v1", "v2"]) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        assert (destination / "v1" / "workflow.py").read_text(encoding="utf-8") == "v1"
+        assert (destination / "run.py").exists()
+        assert not (destination / "stale.py").exists()
+
+    def test_publish_written_entry_wins_over_a_preserved_name(self, tmp_path: Path) -> None:
+        """A name the publish itself wrote is not overwritten by the previous bundle's copy."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        (destination / "v1").mkdir(parents=True)
+        (destination / "v1" / "workflow.py").write_text("old", encoding="utf-8")
+
+        with packager.staged_publish(destination, preserve=["v1"]) as staging:
+            (staging / "v1").mkdir()
+            (staging / "v1" / "workflow.py").write_text("new", encoding="utf-8")
+
+        assert (destination / "v1" / "workflow.py").read_text(encoding="utf-8") == "new"
+
+    def test_creates_a_destination_that_does_not_exist_yet(self, tmp_path: Path) -> None:
+        """A first publish into a fresh path works, including missing parent directories."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "nested" / "bundle"
+
+        with packager.staged_publish(destination) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        assert (destination / "run.py").read_text(encoding="utf-8") == "new"
+
+    def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path) -> None:
+        """A copy failure during the swap leaves the destination populated, not missing."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+
+        def publish_with_failing_copy() -> None:
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.copytree",
+                    side_effect=OSError("disk full"),
+                ),
+                packager.staged_publish(destination) as staging,
+            ):
+                (staging / "run.py").write_text("new", encoding="utf-8")
+
+        with pytest.raises(TypeError):
+            publish_with_failing_copy()
+
+        assert (destination / "run.py").read_text(encoding="utf-8") == "previous"

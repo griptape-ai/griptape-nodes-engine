@@ -15,12 +15,13 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
-from dotenv import set_key
 from dotenv.main import DotEnv
 
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
@@ -42,6 +43,9 @@ from griptape_nodes.retained_mode.events.os_events import (
     CopyFileResultSuccess,
     CopyTreeRequest,
     CopyTreeResultSuccess,
+    DeleteFileRequest,
+    DeleteFileResultSuccess,
+    DeletionBehavior,
     ReadFileRequest,
     ReadFileResultSuccess,
     WriteFileRequest,
@@ -61,6 +65,8 @@ from griptape_nodes.retained_mode.events.workflow_events import PublishWorkflowP
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.workflow_registry import Workflow
 
@@ -216,11 +222,21 @@ class WorkflowPackager:
 
     @staticmethod
     def get_merged_env_mapping(workspace_env_path: Path) -> dict[str, Any]:
-        """Merge workspace .env file with SecretsManager secrets."""
+        """Merge workspace .env file with SecretsManager secrets.
+
+        Blank-valued entries are dropped. A key present with an empty value is worse
+        than an absent key downstream: both `python-dotenv`'s ``override=False`` and
+        ``SecretsManager._load_env_files_into_environ`` test for key *presence* rather
+        than a meaningful value, so a bundled blank shadows a real value instead of
+        falling through to it. Nothing distinguishes an intentional empty secret from a
+        never-filled-in one anyway -- ``register_all_secrets`` writes every registered
+        default, empty ones included, into the global .env on install -- so on the vast
+        majority of installs a blank means "nobody ever set this".
+        """
         env_file_dict: dict[str, Any] = {}
         if workspace_env_path.exists():
             env_file = DotEnv(workspace_env_path)
-            env_file_dict = env_file.dict()
+            env_file_dict = {key: value for key, value in env_file.dict().items() if str(value or "").strip()}
 
         result = GriptapeNodes.handle_request(GetAllSecretValuesRequest())
         if not isinstance(result, GetAllSecretValuesResultSuccess):
@@ -229,22 +245,68 @@ class WorkflowPackager:
             raise TypeError(msg)
 
         for secret_name, secret_value in result.values.items():
-            if secret_name not in env_file_dict:
+            if secret_name not in env_file_dict and str(secret_value or "").strip():
                 env_file_dict[secret_name] = secret_value
 
         return env_file_dict
 
     @staticmethod
+    def get_process_env_secrets(exclude: set[str]) -> dict[str, str]:
+        """Return registered secrets whose only value lives in the process environment.
+
+        The .env files are not the only place a credential can come from:
+        ``SecretsManager.get_secret`` resolves OS environment variables ahead of both
+        files, so someone running the engine with ``GT_CLOUD_API_KEY`` exported has a
+        working setup with nothing on disk to bundle. Under the old merge behavior an
+        earlier publish's value could mask that; a bundle built fresh would simply ship
+        without the credential.
+
+        Only *registered* secret names are consulted, never the whole environment -- the
+        registered set is what the engine already treats as credential material, and
+        copying anything else would put unrelated process state into the bundle.
+        """
+        secrets_manager = GriptapeNodes.SecretsManager()
+        env_secrets: dict[str, str] = {}
+        for secret_name in secrets_manager.secrets_to_register:
+            if secret_name in exclude:
+                continue
+            value = os.environ.get(secret_name)
+            if value is not None and value.strip():
+                env_secrets[secret_name] = value
+        return env_secrets
+
+    @staticmethod
     def write_env_file(env_file_path: Path, env_file_dict: dict[str, Any]) -> None:
-        """Write a .env file from a key-value dict."""
-        env_file_path.touch(exist_ok=True)
-        for key, val in env_file_dict.items():
-            set_key(env_file_path, key, str(val))
+        """Write a .env file from a key-value dict, replacing any existing file.
+
+        Built from ``env_file_dict`` alone rather than updated key-by-key. The previous
+        implementation did ``touch(exist_ok=True)`` then ``set_key`` per key, which meant
+        a key that had dropped out of the mapping stayed in the file forever -- so a
+        re-publish could never remove a stale (notably blank) credential.
+        """
+        lines = [f"{key}={WorkflowPackager._quote_env_value(str(value))}" for key, value in env_file_dict.items()]
+        content = "\n".join(lines)
+        if content:
+            content += "\n"
+        result = GriptapeNodes.handle_request(
+            WriteFileRequest(file_path=str(env_file_path), content=content, encoding="utf-8")
+        )
+        if not isinstance(result, WriteFileResultSuccess):
+            msg = f"Failed to write environment file to '{env_file_path}'."
+            logger.error(msg)
+            raise TypeError(msg)
+
+    @staticmethod
+    def _quote_env_value(value: str) -> str:
+        """Single-quote a .env value, matching what `dotenv.set_key` wrote before."""
+        escaped = value.replace("'", "\\'")
+        return f"'{escaped}'"
 
     def write_env(self, destination: Path) -> None:
         """Write a .env file with merged secrets to the destination."""
         secrets_manager = GriptapeNodes.SecretsManager()
         env_mapping = self.get_merged_env_mapping(secrets_manager.workspace_env_path)
+        env_mapping.update(self.get_process_env_secrets(exclude=set(env_mapping)))
         env_mapping["GTN_CONFIG_WORKSPACE_DIRECTORY"] = "."
         env_mapping["GTN_ENABLE_WORKSPACE_FILE_WATCHING"] = "false"
         self.write_env_file(destination / ".env", env_mapping)
@@ -253,7 +315,14 @@ class WorkflowPackager:
 
     @staticmethod
     def write_project_template(destination: Path) -> None:
-        """Write the current project template (project.yml) to the destination."""
+        """Write the current project template (project.yml) to the destination.
+
+        A failure to *retrieve* the template is tolerated -- publishing from a session
+        with no current project is legitimate, and the bundle simply has no project.yml.
+        A failure to *write* one that was retrieved is not: project.yml governs where the
+        published workflow's outputs land, so shipping a bundle without the template that
+        was meant to be in it is a wrong bundle rather than a smaller one.
+        """
         result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
         if not isinstance(result, GetCurrentProjectResultSuccess):
             logger.warning("Could not retrieve current project template. No project.yml will be written.")
@@ -263,7 +332,9 @@ class WorkflowPackager:
             WriteFileRequest(file_path=str(destination / "project.yml"), content=project_yaml, encoding="utf-8")
         )
         if not isinstance(write_result, WriteFileResultSuccess):
-            logger.warning("Could not write project.yml to '%s'.", destination)
+            msg = f"Failed to write the project template (project.yml) to '{destination}'."
+            logger.error(msg)
+            raise TypeError(msg)
 
     # -- Dependencies --
 
@@ -586,10 +657,19 @@ dependencies = [
     def write_download_models_script(self, nodes: list[BaseNode], destination: Path) -> bool:
         """Write a download_models.py script to destination if HuggingFace models are required.
 
+        When no models are needed, an existing script is removed rather than left in
+        place. Consumers run the script if the file is present -- the Nuke gizmo runner
+        does exactly this -- so a script from an earlier publish would keep downloading
+        models the workflow no longer references, and fail the run outright if one of
+        those downloads broke. This matters when the caller writes into a destination
+        that already holds a bundle; under ``staged_publish`` the staging dir starts empty
+        and there is nothing to remove.
+
         Returns True if a script was written, False if no models are needed.
         """
         commands = self.collect_huggingface_download_commands(nodes)
         if not commands:
+            self._remove_stale_download_models_script(destination)
             return False
 
         template_path = Path(__file__).parent / "download_models_script.py"
@@ -621,6 +701,117 @@ dependencies = [
             raise TypeError(msg)
         return True
 
+    @staticmethod
+    def _remove_stale_download_models_script(destination: Path) -> None:
+        """Delete a download_models.py left by an earlier publish of the same bundle."""
+        script_path = destination / "download_models.py"
+        if not script_path.exists():
+            return
+        result = GriptapeNodes.handle_request(
+            DeleteFileRequest(
+                path=str(script_path),
+                workspace_only=False,
+                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+            )
+        )
+        if not isinstance(result, DeleteFileResultSuccess):
+            msg = (
+                f"Failed to remove the model download script left by a previous publish at '{script_path}'. "
+                f"Leaving it in place would download models this workflow no longer uses."
+            )
+            logger.error(msg)
+            raise TypeError(msg)
+
+    # -- Staging --
+
+    @contextmanager
+    def staged_publish(self, destination: Path, *, preserve: list[str] | None = None) -> Iterator[Path]:
+        """Yield a staging directory that replaces ``destination`` only if the publish succeeds.
+
+        Publishing writes many artifacts, and each writer decides for itself whether it
+        overwrites what is already there. Writing straight into a persistent destination
+        therefore accumulates: a re-publish can add and update artifacts but never remove
+        one, so content from an earlier publish survives and (for `.env` and
+        `download_models.py`) is still read or executed. Staging makes each publish a
+        clean build whose contents reflect only the current state of the world.
+
+        Wrap the *whole* publish, not just the packager. Publishers write their own
+        artifacts after ``package_to_folder`` returns, so a swap performed when the
+        packager finishes would delete the previous bundle's publisher-specific files and
+        only then write the new ones -- leaving a bundle with no entrypoint if that tail
+        failed. Yielding the staging dir for the entire publish keeps the swap at the end.
+
+        On any exception the staging directory is discarded and ``destination`` is left
+        exactly as it was, which is the property that makes a failed re-publish safe.
+
+        Args:
+            destination: The final bundle directory, replaced wholesale on success.
+            preserve: Names of top-level entries under ``destination`` to carry into the
+                new bundle. For content the publisher deliberately accumulates across
+                publishes (e.g. per-version subdirectories) rather than rebuilds. Entries
+                the publish itself wrote into staging win; missing names are skipped.
+
+        Yields:
+            The staging directory to write the bundle into.
+        """
+        staging_dir = Path(tempfile.mkdtemp(prefix="gtn-workflow-publish-"))
+        try:
+            yield staging_dir
+            self._carry_preserved_entries(destination, staging_dir, preserve or [])
+            self._swap_into_place(destination, staging_dir)
+        finally:
+            shutil.rmtree(staging_dir, ignore_errors=True)
+
+    @staticmethod
+    def _carry_preserved_entries(destination: Path, staging_dir: Path, preserve: list[str]) -> None:
+        """Copy opted-in entries from the previous bundle into staging before the swap."""
+        for name in preserve:
+            previous = destination / name
+            staged = staging_dir / name
+            if not previous.exists() or staged.exists():
+                continue
+            if previous.is_dir():
+                shutil.copytree(previous, staged)
+            else:
+                shutil.copy2(previous, staged)
+
+    @staticmethod
+    def _swap_into_place(destination: Path, staging_dir: Path) -> None:
+        """Replace destination with the staged bundle, restoring the previous one on failure.
+
+        The previous bundle is moved aside rather than deleted, so a failure partway
+        through leaves the destination populated instead of missing. `Path.replace` is
+        not usable for the swap itself: staging lives in the system temp dir, which is
+        routinely on a different filesystem than the destination, and a cross-device
+        rename fails. So this is move-aside, copy, delete-aside -- not atomic, but the
+        window where the destination is incomplete is small and never ends with the
+        destination gone.
+        """
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as err:
+            msg = f"Failed to publish the workflow bundle. Could not create the destination's parent directory: {err}"
+            logger.error(msg)
+            raise TypeError(msg) from err
+
+        previous_dir = destination.with_name(f"{destination.name}.previous-publish")
+        shutil.rmtree(previous_dir, ignore_errors=True)
+        had_previous = destination.exists()
+        if had_previous:
+            destination.replace(previous_dir)
+
+        try:
+            shutil.copytree(staging_dir, destination)
+        except OSError as err:
+            shutil.rmtree(destination, ignore_errors=True)
+            if had_previous:
+                previous_dir.replace(destination)
+            msg = f"Failed to publish the workflow bundle to '{destination}': {err}"
+            logger.error(msg)
+            raise TypeError(msg) from err
+
+        shutil.rmtree(previous_dir, ignore_errors=True)
+
     # -- Convenience: full standard bundle --
 
     def package_to_folder(self, destination: Path, workflow: Workflow) -> list[str]:
@@ -628,6 +819,11 @@ dependencies = [
 
         Copies the workflow file, referenced libraries, config, .env, static
         assets, project template, and pyproject.toml into the destination.
+
+        This writes into ``destination`` as given. Callers wanting a re-publish to be a
+        clean rewrite should wrap their whole publish in ``staged_publish`` and pass the
+        staging directory here -- see that method for why the boundary is the publish
+        rather than this function.
 
         Returns:
             List of relative library paths (for config or further use).
