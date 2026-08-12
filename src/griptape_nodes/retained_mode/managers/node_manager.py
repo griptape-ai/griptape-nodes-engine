@@ -685,11 +685,9 @@ class NodeManager(EngineScoped):
     def _describe_node_creation_failure(self, err: Exception, *, node_type: str, library_name: str | None) -> str:
         """Explain why a node could not be created, in terms the artist can act on.
 
-        A library that loaded with problems still registers, so the raw exception is usually
-        just "node type not found" and says nothing about the real cause. Two things make it
-        actionable: the library's recorded problems, and the fact that a library reloaded
-        mid-session runs its old code until the engine restarts, which is the difference between
-        an error the artist can fix and one they can only wait out.
+        A library that loaded with problems still registers, so the raw exception is usually just
+        "node type not found" and says nothing about the real cause. The library's recorded problems
+        and any pending restart name what actually went wrong.
 
         Args:
             err: The exception raised while creating the node
@@ -721,10 +719,9 @@ class NodeManager(EngineScoped):
         """The library that provides a node type, or None when it cannot be pinned to one.
 
         A create request need not name a library, so the failure path resolves the owning library
-        itself before it can report that library's problems. A node type several libraries provide
-        has no single owner to report on. A node type no library provides may still be one whose
-        module failed to import, which registers nothing but does record the failure against the
-        library that owns the node file.
+        itself before it can report that library's problems. A node type no library provides may
+        still be one whose module failed to import, which registers nothing but does record the
+        failure against the library that owns the node file.
 
         Args:
             node_type: Node type to find the providing library for

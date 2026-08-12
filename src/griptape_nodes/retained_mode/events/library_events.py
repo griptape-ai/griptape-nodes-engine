@@ -1045,8 +1045,7 @@ class UpdateLibraryResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         new_version: The new library version after update
         restart_required: True when the files on disk were updated but this engine cannot run them
             yet, because it had already imported the library's modules and Python caches those for
-            the life of the process. The update did happen; the engine is still executing the code
-            it loaded first, and only a restart picks up the new code. Provided as a structured
+            the life of the process. Only a restart picks up the new code. Provided as a structured
             field so a client can offer a restart action instead of parsing the message.
     """
 
@@ -1107,12 +1106,16 @@ class SwitchLibraryRefResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
         new_ref: The new branch or tag name after switch
         old_version: The previous library version
         new_version: The new library version after switch
+        restart_required: True when the new ref is on disk but this engine cannot run it yet,
+            because it had already imported the library's modules and Python caches those for the
+            life of the process. Only a restart picks up the new code.
     """
 
     old_ref: str
     new_ref: str
     old_version: str
     new_version: str
+    restart_required: bool = False
 
 
 @dataclass
