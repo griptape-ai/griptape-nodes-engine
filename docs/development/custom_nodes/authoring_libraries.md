@@ -151,7 +151,9 @@ parameters:
 - The node supplies its own Flow In and Flow Out, so the workflow's control parameters are not
     surfaced.
 - The End Flow node's built-in **Status** parameters (`was_successful`, `result_details`) are not
-    surfaced either. They report on the End Flow node's own run, not on anything you exposed.
+    surfaced either. They report on the End Flow node's own run, not on anything you exposed. A
+    parameter of your own with one of those names is only dropped if you also put it in a parameter
+    group named `Status`.
 
 A parameter name used by exactly one Start Flow or End Flow node keeps its bare name. If two Start
 Flow nodes both expose `prompt`, both parameters are qualified with their node name instead
