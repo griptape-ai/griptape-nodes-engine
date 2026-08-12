@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from griptape_nodes.node_library.library_declarations import LibraryDependencyDeclaration
+from griptape_nodes.node_library.library_declarations import (
+    LibraryDependencyDeclaration,
+    SuggestedWorkerMode,
+    WorkerMode,
+)
 from griptape_nodes.node_library.library_registry import (
     Dependencies,
     LibraryNameAndVersion,
@@ -808,3 +812,93 @@ class TestWorkerDelegatedAdvancedLibrarySkip:
         assert result is None
         mock_advanced.assert_called_once()
         assert mock_generate.call_args.kwargs["advanced_library"] is advanced_instance
+
+
+class TestRequiresWorkerResolvedOnFilePathRegistration:
+    """A by-file-path registration must resolve requires_worker for itself.
+
+    This path enters METADATA_LOADED directly, so the DISCOVERED-phase writer that normally
+    resolves requires_worker never runs. Without resolving it here, a library whose manifest
+    suggests worker mode loads in-process when added to a running engine from the editor --
+    and its advanced module then imports manifest dependencies against a venv the
+    orchestrator deliberately never created (the pygit2 breakage).
+    """
+
+    def _worker_mode_schema(self) -> MagicMock:
+        schema = MagicMock()
+        schema.name = "worker_mode_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.declarations = [SuggestedWorkerMode(mode=WorkerMode.WORKER)]
+        return schema
+
+    def _request(self) -> RegisterLibraryFromFileRequest:
+        return RegisterLibraryFromFileRequest(file_path="/mock.json", perform_discovery_if_not_found=False)
+
+    @pytest.mark.asyncio
+    async def test_an_existing_library_info_is_updated_in_place(self, griptape_nodes: GriptapeNodes) -> None:
+        """Discovered-but-unnamed LibraryInfo: the stale requires_worker must be overwritten.
+
+        `_library_file_path_to_info` can already hold an entry from discovery that never got a
+        library_name (so it defaulted requires_worker to False). Updating every other field
+        while leaving that one stale is how a worker library ends up loading in-process.
+        """
+        mgr = griptape_nodes.LibraryManager()
+        lib_info = LibraryManager.LibraryInfo(
+            lifecycle_state=LibraryManager.LibraryLifecycleState.DISCOVERED,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name=None,
+            fitness=LibraryManager.LibraryFitness.NOT_EVALUATED,
+            requires_worker=False,
+        )
+
+        with (
+            patch.object(
+                mgr,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(self._worker_mode_schema()),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+        ):
+            result = await mgr._establish_register_library_prerequisites(self._request())
+
+        assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
+        assert result.library_info is lib_info
+        assert lib_info.requires_worker is True
+        assert lib_info.library_name == "worker_mode_lib"
+        assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
+
+    @pytest.mark.asyncio
+    async def test_a_new_library_info_is_created_with_it(self, griptape_nodes: GriptapeNodes) -> None:
+        """Nothing discovered yet -- the freshly built LibraryInfo carries the resolved value."""
+        mgr = griptape_nodes.LibraryManager()
+
+        with (
+            patch.object(
+                mgr,
+                "load_library_metadata_from_file_request",
+                return_value=_metadata_success(self._worker_mode_schema()),
+            ),
+            patch.object(mgr, "_library_file_path_to_info", {}),
+        ):
+            result = await mgr._establish_register_library_prerequisites(self._request())
+
+        assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
+        assert result.library_info.requires_worker is True
+        assert result.library_info.lifecycle_state is LibraryManager.LibraryLifecycleState.METADATA_LOADED
+
+    @pytest.mark.asyncio
+    async def test_a_library_with_no_worker_declaration_stays_in_process(self, griptape_nodes: GriptapeNodes) -> None:
+        """The resolution must read the manifest, not default to worker mode for everyone."""
+        mgr = griptape_nodes.LibraryManager()
+        schema = self._worker_mode_schema()
+        schema.metadata.declarations = []
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "_library_file_path_to_info", {}),
+        ):
+            result = await mgr._establish_register_library_prerequisites(self._request())
+
+        assert isinstance(result, LibraryManager.RegisterLibraryPrerequisites)
+        assert result.library_info.requires_worker is False

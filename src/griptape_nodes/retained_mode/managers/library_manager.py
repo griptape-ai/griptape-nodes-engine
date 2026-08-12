@@ -2396,7 +2396,7 @@ class LibraryManager(EngineScoped):
                                 "orchestrator; the worker loads it in its own process.",
                                 library_data.name,
                             )
-                        if library_data.advanced_library_path and not skip_advanced_library:
+                        elif library_data.advanced_library_path:
                             try:
                                 advanced_library_instance = self._load_advanced_library_module(
                                     library_data=library_data,
