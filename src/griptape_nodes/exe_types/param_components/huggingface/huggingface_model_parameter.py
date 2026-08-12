@@ -16,6 +16,7 @@ from griptape_nodes.exe_types.param_types.parameter_string import ParameterStrin
 from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest, ListModelDownloadsResultSuccess
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
+from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 from griptape_nodes.traits.button import Button, ButtonDetailsMessagePayload, OnClickMessageResultPayload
 from griptape_nodes.traits.options import Options
 
@@ -88,6 +89,13 @@ class HuggingFaceModelParameter(ABC):
         # `_refresh_policy()`. Whether enforcement is active is DERIVED from these two on read
         # (see `_gated`) rather than stored, so it cannot fall out of step with the verdicts it
         # was computed from.
+        #
+        # This runs inside a node __init__, so the query is deferred — `_policy` holds
+        # DEFERRED_SNAPSHOT, no denials and no bus request — in the one case where issuing it
+        # would trip reentrant-bus-in-init: a strict-mode scope is open, meaning the worker's
+        # schema probe or node execution. Everywhere else (editor drop, workflow load,
+        # single-process engine) it queries here, so denial rows and the badge are right
+        # immediately instead of waiting for a refresh.
         self._gate_mode = gated
         self._policy = ModelPolicySnapshot()
         if gated is not False:
@@ -403,6 +411,18 @@ class HuggingFaceModelParameter(ABC):
     def _refresh_downloading_model_ids(self) -> None:
         # Only called from refresh_parameters() — never from inside a button
         # callback — to avoid nested handle_request() calls that cause recursion.
+        #
+        # Deferred only when the request would trip reentrant-bus-in-init: a node
+        # __init__ on the stack inside a strict-mode scope, i.e. the worker's schema
+        # probe (which would drop the class from the worker schema) or node execution.
+        # An editor drop or workflow load opens no scope, so the query runs and the
+        # rows carry their "Downloading…"/"Downloaded" subtitles from the moment the
+        # node appears. When it IS deferred, an empty set is benign — rows lose only
+        # the subtitle until the first refresh_parameters() after construction
+        # (validate_before_node_run or the refresh button).
+        if reentrant_bus_in_init_would_report():
+            self._downloading_model_ids = set()
+            return
         result = GriptapeNodes.handle_request(ListModelDownloadsRequest())
         if not isinstance(result, ListModelDownloadsResultSuccess):
             self._downloading_model_ids = set()

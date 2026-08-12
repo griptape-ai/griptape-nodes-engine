@@ -23,6 +23,7 @@ import pytest
 
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_model_parameter import NO_MODELS_PLACEHOLDER
 from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
     ModelAccessVerdict,
     QueryModelAccessForNodeRequest,
@@ -32,6 +33,7 @@ from griptape_nodes.retained_mode.events.access_events import (
 from griptape_nodes.retained_mode.events.model_events import ListModelDownloadsRequest
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
 from tests.unit.exe_types.mocks import MockNode
+from tests.unit.exe_types.param_components.probe_scope import constructing_under_probe
 
 DENIED_REPO = "black-forest-labs/FLUX.1-dev"
 ALLOWED_REPO = "black-forest-labs/FLUX.1-schnell"
@@ -305,3 +307,112 @@ class TestRunPathGate:
         errors = param.validate_before_node_run()
         assert errors is not None
         assert "not permitted" in str(errors[0])
+
+
+class TestConstructionDefersBusRequests:
+    """No bus request may be issued from a node __init__ that a strict-mode scope is watching.
+
+    The worker's schema probe constructs every node class during library load, inside a
+    LOAD_PROBE scope; a bus request from inside that construction fires reentrant-bus-in-init
+    and drops the class from the worker schema. So under a scope this component's policy and
+    download queries defer until the first post-construction refresh.
+
+    Construction with no scope open is the ordinary case and must still query -- see
+    ``TestConstructionWithoutAScopeStillQueries``.
+    """
+
+    def _construct_deferred(self, *, gated: bool | None) -> HuggingFaceRepoParameter:
+        with constructing_under_probe():
+            param = _param(gated=gated)
+            param.add_input_parameters()
+        return param
+
+    def test_construction_issues_no_bus_requests(self) -> None:
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request") as handle:
+            self._construct_deferred(gated=True)
+        handle.assert_not_called()
+
+    def test_a_deferred_gated_param_denies_nothing(self) -> None:
+        """No denials while deferred -- including the refuse-unrecognized backstop.
+
+        A naive skip that left a plain empty snapshot would refuse EVERY choice as
+        unrecognized and badge the whole dropdown "not permitted" at construction.
+        """
+        param = self._construct_deferred(gated=True)
+        assert param._policy.deferred is True
+        assert param.query_for_denial(DENIED_REPO) is None
+        assert param.query_for_denial(UNDECLARED_REPO) is None
+
+    def test_no_denial_decoration_lands_while_deferred(self) -> None:
+        param = self._construct_deferred(gated=True)
+        data = param._build_data_choices([ALLOWED_REPO, DENIED_REPO])
+        assert all(row.get("icon") != "shield-off" for row in data)
+        parameter = param._node.get_parameter_by_name("model")
+        assert parameter is not None
+        assert parameter.get_badge() is None
+
+    def test_refresh_parameters_heals_after_construction(self) -> None:
+        param = self._construct_deferred(gated=True)
+        param.refresh_parameters()
+        assert param._policy.deferred is False
+        assert param.query_for_denial(DENIED_REPO) is not None
+        assert param.query_for_denial(ALLOWED_REPO) is None
+
+    def test_auto_detect_heals_too(self) -> None:
+        """Pins the `_gate_mode is not False` refresh guard: auto-detect must re-query as well."""
+        param = self._construct_deferred(gated=None)
+        param.refresh_parameters()
+        assert param._policy.deferred is False
+        assert param.query_for_denial(DENIED_REPO) is not None
+
+    def test_the_run_path_still_blocks_a_denied_selection(self) -> None:
+        """validate_before_node_run refreshes first, so deferral cannot weaken run gating."""
+        param = self._construct_deferred(gated=True)
+        param._node.set_parameter_value("model", DENIED_REPO)
+        errors = param.validate_before_node_run()
+        assert errors is not None
+        assert "not permitted" in str(errors[0])
+
+
+class TestConstructionWithoutAScopeStillQueries:
+    """An editor drop or workflow load queries from __init__, so decoration is right immediately.
+
+    Outside a strict-mode scope nothing records a reentrant-bus-in-init violation and there is no
+    probe to drop the class, so deferring there bought nothing -- and cost the shield rows and the
+    download subtitles until the node was run or refreshed by hand. These pin that the deferral
+    keys off the scope and not off being in ``__init__`` at all.
+    """
+
+    def _construct_in_init(self, *, gated: bool | None = True) -> HuggingFaceRepoParameter:
+        with LibraryRegistry.constructing_node():
+            param = _param(gated=gated)
+            param.add_input_parameters()
+        return param
+
+    def test_policy_is_queried_during_construction(self) -> None:
+        param = self._construct_in_init()
+        assert param._policy.deferred is False
+        assert param.query_for_denial(DENIED_REPO) is not None
+        assert param.query_for_denial(ALLOWED_REPO) is None
+
+    def test_denial_decoration_lands_without_a_refresh(self) -> None:
+        param = self._construct_in_init()
+        by_name = {row["name"]: row for row in param._build_data_choices([ALLOWED_REPO, DENIED_REPO])}
+        assert by_name[DENIED_REPO]["icon"] == "shield-off"
+        assert by_name[DENIED_REPO]["subtitle"] == "Not permitted by your license"
+
+    def test_the_download_status_query_is_issued_too(self) -> None:
+        """The other half of the decoration: without this the rows lose their download subtitle."""
+        seen: list[type] = []
+
+        def handle_request(request: object) -> object:
+            seen.append(type(request))
+            if isinstance(request, QueryModelAccessForNodeRequest):
+                return QueryModelAccessForNodeResultSuccess(verdicts=_verdicts(), result_details="ok")
+            return object()  # not a ResultSuccess -> "nothing downloading", as in _stub_engine
+
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+        with patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=handle_request):
+            self._construct_in_init()
+        assert ListModelDownloadsRequest in seen

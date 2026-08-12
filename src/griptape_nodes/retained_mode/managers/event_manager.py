@@ -71,6 +71,38 @@ def current_request_type() -> type[RequestPayload] | None:
     return _active_request_type.get()
 
 
+def reentrant_bus_in_init_would_report() -> bool:
+    """Whether a bus request issued right now would fire ``reentrant-bus-in-init``.
+
+    Both halves of the detector's condition (see
+    ``EventManager._report_reentrant_bus_in_init``), exposed so code that runs
+    inside a node ``__init__`` can ask BEFORE issuing a request and skip it
+    rather than commit the violation. The detector and every such caller read
+    this one predicate, so "we deferred" and "it would have been reported"
+    cannot drift apart as the scopes change.
+
+    Being inside a node ``__init__`` is not sufficient on its own. ``STRICT_MODE.report``
+    no-ops when no scope is active, and scopes open in exactly two places: around the
+    worker's schema probe (LOAD_PROBE, where a violation drops the class from the worker
+    schema) and around node execution (RUNTIME_EXECUTE, where a worker violation promotes
+    the result to a failure). An ordinary ``CreateNodeRequest`` -- an editor drop, a
+    workflow load, any single-process engine, where no probe runs at all -- opens neither,
+    so a read from ``__init__`` there is free and callers should just do it. Keying a
+    deferral off ``is_constructing_node()`` alone instead makes every node in every
+    deployment pay for a hazard only the worker's probe has.
+
+    When strict mode is disabled the scope is detached (``open_scope`` keeps it off the
+    stack), so this cannot tell a probe from an editor drop. It answers True while
+    constructing in that case: with the checker off, the conservative answer is the
+    safe one.
+    """
+    if not LibraryRegistry.is_constructing_node():
+        return False
+    if not STRICT_MODE.enabled:
+        return True
+    return STRICT_MODE.current_scope() is not None
+
+
 # Result types that should NOT trigger a flush request.
 #
 # Add result types to this set if they should never trigger a flush (typically because they ARE
@@ -520,8 +552,13 @@ class EventManager(EngineScoped):
         the worker thread during library load. LibraryRegistry sets a
         ContextVar around create_node so every __init__ body in the
         hierarchy is covered.
+
+        The condition lives in ``reentrant_bus_in_init_would_report`` rather
+        than inline, because engine components that legitimately read state
+        from a node ``__init__`` consult the same predicate to decide whether
+        to defer. One owner, so the two answers cannot disagree.
         """
-        if not LibraryRegistry.is_constructing_node():
+        if not reentrant_bus_in_init_would_report():
             return
         rule = RULES["reentrant-bus-in-init"]
         # Subject attribution lives on the violation's ``subject`` field,
