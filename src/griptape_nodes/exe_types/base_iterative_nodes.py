@@ -455,7 +455,7 @@ class BaseIterativeStartNode(BaseNode):
             self.publish_update_to_parameter(IterativeNodeParam.INDEX.value, current_index)
 
     def get_nodes_to_group_with(self) -> list[BaseNode]:
-        """Nodes that must join a node group whenever this Start node does."""
+        """Nodes that must share this Start node's group membership, on add and on remove."""
         if self.end_node is None:
             return []
         return [self.end_node]
@@ -951,7 +951,7 @@ class BaseIterativeEndNode(BaseNode):
         self._output_results_list()
 
     def get_nodes_to_group_with(self) -> list[BaseNode]:
-        """Nodes that must join a node group whenever this End node does."""
+        """Nodes that must share this End node's group membership, on add and on remove."""
         if self.start_node is None:
             return []
         return [self.start_node]

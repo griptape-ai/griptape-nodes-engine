@@ -17,9 +17,12 @@ from griptape_nodes.exe_types.base_iterative_nodes import (
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_groups.base_node_group import BaseNodeGroup
+from griptape_nodes.exe_types.node_groups.subflow_node_group import SubflowNodeGroup
 from griptape_nodes.retained_mode.events.node_events import (
     AddNodesToNodeGroupRequest,
     AddNodesToNodeGroupResultSuccess,
+    RemoveNodeFromNodeGroupRequest,
+    RemoveNodeFromNodeGroupResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from tests.unit.exe_types.mocks import MockNode
@@ -98,7 +101,10 @@ class _MockIterativeStartNode(BaseIterativeStartNode):
 
 
 class _ConcreteGroup(BaseNodeGroup):
-    """Minimal concrete BaseNodeGroup for testing."""
+    """Minimal concrete BaseNodeGroup for testing.
+
+    A plain group is a visual grouping with no subflow, so it must NOT tether.
+    """
 
     def run(self) -> None:
         pass
@@ -108,6 +114,27 @@ class _ConcreteGroup(BaseNodeGroup):
 
     def process(self) -> None:
         return None
+
+
+class _ConcreteSubflowGroup(SubflowNodeGroup):
+    """Minimal concrete SubflowNodeGroup: tethering is scoped to groups that own a subflow.
+
+    `_create_subflow` is a no-op so `subflow_name` stays unset and the per-node
+    MoveNodeToNewFlowRequest loop is skipped — group membership is what these tests exercise,
+    not flow relocation.
+    """
+
+    def _create_subflow(self) -> None:
+        return
+
+    async def aprocess(self) -> None:
+        return
+
+    def run(self) -> None:
+        pass
+
+    def initialize(self) -> None:
+        pass
 
 
 def _register(obj: BaseNode) -> None:
@@ -143,9 +170,9 @@ class TestAddNodesToGroupIterativePath:
         _register(end)
         return start, end
 
-    def _build_group(self) -> _ConcreteGroup:
-        """Build a group and register it in the ObjectManager."""
-        group = _ConcreteGroup("TestGroup")
+    def _build_group(self) -> _ConcreteSubflowGroup:
+        """Build a subflow group and register it in the ObjectManager."""
+        group = _ConcreteSubflowGroup("TestGroup")
         _register(group)
         return group
 
@@ -298,13 +325,32 @@ class TestAddNodesToGroupIterativePath:
         """Mirror: an End node must not re-report a Start node already in the group."""
         start, end = self._build_paired_nodes()
         group = self._build_group()
+        # Adding Start pulls End in as well, so both are already present here.
         group.add_nodes_to_group([start])
-        # Start pulled End in, so remove End to isolate the reverse direction.
-        group.remove_nodes_from_group([end])
 
         nodes_added = group.add_nodes_to_group([end])
 
         assert [n.name for n in nodes_added] == [end.name]
+        assert start.name in group.nodes
+
+    def test_companion_follows_its_partner_between_groups(self) -> None:
+        """Reparenting a Start node moves its End node along, leaving no split across groups.
+
+        The old group must not keep advertising a node it no longer holds.
+        """
+        start, end = self._build_paired_nodes()
+        group_a = self._build_group()
+        group_b = _ConcreteSubflowGroup("TestGroupB")
+        _register(group_b)
+        group_a.add_nodes_to_group([start])
+
+        nodes_added = group_b.add_nodes_to_group([start])
+
+        assert {n.name for n in nodes_added} == {start.name, end.name}
+        assert start.parent_group is group_b
+        assert end.parent_group is group_b
+        assert group_a.nodes == {}
+        assert group_a.metadata["node_names_in_group"] == []
 
     def test_plain_node_has_no_side_effects(self) -> None:
         """Adding a plain (non-iterative) node does not change the node_names_added list size."""
@@ -322,3 +368,251 @@ class TestAddNodesToGroupIterativePath:
         assert isinstance(result, AddNodesToNodeGroupResultSuccess)
         assert result.node_names_added == [plain.name]
         assert plain.parent_group is group
+
+
+class TestRemoveNodesFromGroupIterativePath:
+    """Verify that removal is the mirror of addition: the pair leaves the group together."""
+
+    @pytest.fixture(autouse=True)
+    def _setup_context(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        """Push a workflow and flow context so group-operation helpers can find a current flow."""
+        GriptapeNodes.ContextManager().push_workflow(workflow_name="test_workflow")
+        flow = ControlFlow(name="test_flow")
+        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+        GriptapeNodes.ContextManager().push_flow(flow)
+
+    def _build_grouped_pair(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode, _ConcreteSubflowGroup]:
+        """Build a tethered Start/End pair already sitting inside a subflow group."""
+        start = _MockIterativeStartNode("TestStartNode")
+        end = _MockIterativeEndNode("TestEndNode")
+        start.end_node = end
+        end.start_node = start
+        _register(start)
+        _register(end)
+        group = _ConcreteSubflowGroup("TestGroup")
+        _register(group)
+        group.add_nodes_to_group([start])
+        return start, end, group
+
+    def test_remove_start_node_also_removes_end_node(self) -> None:
+        """Removing only the Start node must not orphan its End node inside the group."""
+        start, end, group = self._build_grouped_pair()
+
+        result = GriptapeNodes.handle_request(
+            RemoveNodeFromNodeGroupRequest(
+                node_names=[start.name],
+                node_group_name=group.name,
+            )
+        )
+
+        assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess), result
+        assert group.nodes == {}
+        assert start.parent_group is None
+        assert end.parent_group is None
+        assert group.metadata["node_names_in_group"] == []
+        assert set(result.node_names_removed) == {start.name, end.name}
+        assert result.node_group_name == group.name
+
+    def test_remove_end_node_also_removes_start_node(self) -> None:
+        """Mirror: removing only the End node must also pull its Start node out."""
+        start, end, group = self._build_grouped_pair()
+
+        result = GriptapeNodes.handle_request(
+            RemoveNodeFromNodeGroupRequest(
+                node_names=[end.name],
+                node_group_name=group.name,
+            )
+        )
+
+        assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess), result
+        assert group.nodes == {}
+        assert start.parent_group is None
+        assert end.parent_group is None
+
+    def test_remove_does_not_duplicate_when_both_named(self) -> None:
+        """Naming both halves explicitly removes each exactly once."""
+        start, end, group = self._build_grouped_pair()
+
+        result = GriptapeNodes.handle_request(
+            RemoveNodeFromNodeGroupRequest(
+                node_names=[start.name, end.name],
+                node_group_name=group.name,
+            )
+        )
+
+        assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess)
+        assert result.node_names_removed.count(start.name) == 1
+        assert result.node_names_removed.count(end.name) == 1
+
+    def test_remove_ignores_companion_outside_this_group(self) -> None:
+        """A companion this group does not own must not be reported as removed from it.
+
+        Grouping the Start node normally pulls the End node in too, so build the split state
+        directly: only the Start node is a member, while the pair stays tethered.
+        """
+        start = _MockIterativeStartNode("TestStartNode")
+        end = _MockIterativeEndNode("TestEndNode")
+        start.end_node = end
+        end.start_node = start
+        _register(start)
+        _register(end)
+        group = _ConcreteSubflowGroup("TestGroup")
+        _register(group)
+        group._add_nodes_to_group_dict([start])
+
+        nodes_removed = group.remove_nodes_from_group([start])
+
+        assert [n.name for n in nodes_removed] == [start.name]
+        assert end.parent_group is None
+
+    def test_remove_plain_node_has_no_side_effects(self) -> None:
+        """Removing a plain (non-iterative) node pulls nothing else out."""
+        plain = MockNode("PlainNode")
+        other = MockNode("OtherNode")
+        _register(plain)
+        _register(other)
+        group = _ConcreteSubflowGroup("TestGroup")
+        _register(group)
+        group.add_nodes_to_group([plain, other])
+
+        result = GriptapeNodes.handle_request(
+            RemoveNodeFromNodeGroupRequest(
+                node_names=[plain.name],
+                node_group_name=group.name,
+            )
+        )
+
+        assert isinstance(result, RemoveNodeFromNodeGroupResultSuccess)
+        assert result.node_names_removed == [plain.name]
+        assert plain.parent_group is None
+        assert other.name in group.nodes
+
+
+class TestPlainNodeGroupDoesNotTether:
+    """Tethering is scoped to subflow groups; a plain BaseNodeGroup groups exactly what it is asked to.
+
+    A plain group is a visual grouping with no subflow of its own, so a Start/End pair spanning its
+    boundary costs nothing. Only subflow groups relocate nodes into a real flow, which is what makes
+    a split pair a problem worth auto-correcting.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_context(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        """Push a workflow and flow context so group-operation helpers can find a current flow."""
+        GriptapeNodes.ContextManager().push_workflow(workflow_name="test_workflow")
+        flow = ControlFlow(name="test_flow")
+        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+        GriptapeNodes.ContextManager().push_flow(flow)
+
+    def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
+        start = _MockIterativeStartNode("TestStartNode")
+        end = _MockIterativeEndNode("TestEndNode")
+        start.end_node = end
+        end.start_node = start
+        _register(start)
+        _register(end)
+        return start, end
+
+    def test_plain_group_does_not_pull_in_end_node(self) -> None:
+        """Adding a Start node to a plain group leaves its End node alone."""
+        start, end = self._build_paired_nodes()
+        group = _ConcreteGroup("PlainGroup")
+        _register(group)
+
+        nodes_added = group.add_nodes_to_group([start])
+
+        assert [n.name for n in nodes_added] == [start.name]
+        assert end.name not in group.nodes
+        assert end.parent_group is None
+
+    def test_plain_group_does_not_pull_out_end_node(self) -> None:
+        """Removing a Start node from a plain group leaves its End node in place."""
+        start, end = self._build_paired_nodes()
+        group = _ConcreteGroup("PlainGroup")
+        _register(group)
+        group.add_nodes_to_group([start, end])
+
+        nodes_removed = group.remove_nodes_from_group([start])
+
+        assert [n.name for n in nodes_removed] == [start.name]
+        assert end.name in group.nodes
+        assert end.parent_group is group
+
+    def test_remove_reports_only_nodes_that_were_members(self) -> None:
+        """A non-member is skipped, so it must not be reported as removed.
+
+        The handler forwards this list to the GUI as `node_names_removed`; including a node that
+        never left would make the GUI unparent something still in the group.
+        """
+        start, _ = self._build_paired_nodes()
+        stranger = MockNode(name="StrangerNode")
+        _register(stranger)
+        group = _ConcreteGroup("PlainGroup")
+        _register(group)
+        group.add_nodes_to_group([start])
+
+        nodes_removed = group.remove_nodes_from_group([start, stranger])
+
+        assert [n.name for n in nodes_removed] == [start.name]
+
+
+class TestCrossGroupMoveKeepsTetheredCompanion:
+    """Moving one half of a tethered pair out of a subflow group must not orphan the other half.
+
+    The destination asks the source to release the node it was given; a subflow source releases the
+    companion too. Those extra releases have to land in the destination, or the companion ends up in
+    no group at all while the GUI is told nothing about it.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_context(self, griptape_nodes: GriptapeNodes) -> None:  # noqa: ARG002
+        """Push a workflow and flow context so group-operation helpers can find a current flow."""
+        GriptapeNodes.ContextManager().push_workflow(workflow_name="test_workflow")
+        flow = ControlFlow(name="test_flow")
+        GriptapeNodes.ObjectManager().add_object_by_name(flow.name, flow)
+        GriptapeNodes.ContextManager().push_flow(flow)
+
+    def _build_paired_nodes(self) -> tuple[_MockIterativeStartNode, _MockIterativeEndNode]:
+        start = _MockIterativeStartNode("TestStartNode")
+        end = _MockIterativeEndNode("TestEndNode")
+        start.end_node = end
+        end.start_node = start
+        _register(start)
+        _register(end)
+        return start, end
+
+    def test_plain_destination_absorbs_companion_released_by_subflow_source(self) -> None:
+        """A plain group does not tether, but must still keep whatever the source hands it."""
+        start, end = self._build_paired_nodes()
+        source = _ConcreteSubflowGroup("SourceGroup")
+        _register(source)
+        source.add_nodes_to_group([start])
+        assert end.parent_group is source
+
+        destination = _ConcreteGroup("DestinationGroup")
+        _register(destination)
+        nodes_added = destination.add_nodes_to_group([start])
+
+        # The companion followed its partner rather than being ejected into no group at all.
+        assert {n.name for n in nodes_added} == {start.name, end.name}
+        assert start.parent_group is destination
+        assert end.parent_group is destination
+        assert end.name in destination.nodes
+        assert end.name in destination.metadata["node_names_in_group"]
+        assert source.nodes == {}
+
+    def test_move_between_subflow_groups_keeps_pair_together(self) -> None:
+        """Same guarantee when both ends are subflow groups, which tether on add as well."""
+        start, end = self._build_paired_nodes()
+        source = _ConcreteSubflowGroup("SourceGroup")
+        _register(source)
+        source.add_nodes_to_group([start])
+
+        destination = _ConcreteSubflowGroup("DestinationGroup")
+        _register(destination)
+        nodes_added = destination.add_nodes_to_group([start])
+
+        assert {n.name for n in nodes_added} == {start.name, end.name}
+        assert start.parent_group is destination
+        assert end.parent_group is destination
+        assert source.nodes == {}

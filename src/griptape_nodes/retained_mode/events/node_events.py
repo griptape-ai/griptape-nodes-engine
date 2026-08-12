@@ -1055,7 +1055,17 @@ class RemoveNodeFromNodeGroupRequest(RequestPayload):
 @dataclass
 @PayloadRegistry.register
 class RemoveNodeFromNodeGroupResultSuccess(WorkflowAlteredMixin, ResultPayloadSuccess):
-    """Nodes removed from NodeGroup successfully."""
+    """Nodes removed from NodeGroup successfully.
+
+    Fields:
+        node_names_removed: The complete list of node names that ended up removed from the
+            group, including any side-effect removals (e.g. the paired End node that is
+            automatically pulled out when a BaseIterativeStartNode is ungrouped).
+        node_group_name: Name of the NodeGroup that the nodes were removed from.
+    """
+
+    node_names_removed: list[str] = field(default_factory=list)
+    node_group_name: str = ""
 
 
 @dataclass

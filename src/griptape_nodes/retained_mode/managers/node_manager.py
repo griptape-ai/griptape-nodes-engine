@@ -833,20 +833,50 @@ class NodeManager(EngineScoped):
         if request.parent_group_name:
             try:
                 parent_group = self.get_node_by_name(request.parent_group_name)
-                if isinstance(parent_group, BaseNodeGroup):
-                    parent_group.add_nodes_to_group([node])
-                else:
-                    logger.warning(
-                        "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
-                        node.name,
-                        request.parent_group_name,
-                    )
             except KeyError:
+                parent_group = None
                 logger.warning(
                     "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
                     node.name,
                     request.parent_group_name,
                 )
+
+            if parent_group is not None and not isinstance(parent_group, BaseNodeGroup):
+                logger.warning(
+                    "Attempted to add node '%s' to '%s'. Failed because it is not a BaseNodeGroup.",
+                    node.name,
+                    request.parent_group_name,
+                )
+            elif isinstance(parent_group, BaseNodeGroup):
+                # add_nodes_to_group can fail mid-way (a SubflowNodeGroup raises RuntimeError when the
+                # per-node MoveNodeToNewFlowRequest fails). Keep node creation recoverable rather than
+                # letting that escape after the node is already registered, matching node_names_to_add below.
+                try:
+                    parent_group.add_nodes_to_group([node])
+                except Exception as err:
+                    group_failure = (
+                        f"Created the node, but could not add it to group '{request.parent_group_name}': {err}"
+                    )
+                    logger.warning(
+                        "Attempted to add node '%s' to parent group '%s'. Failed with error: %s",
+                        node.name,
+                        request.parent_group_name,
+                        err,
+                    )
+                    # A failed add leaves the node listed as a member without having been moved into
+                    # the group's subflow. Release it so the node ends up plainly ungrouped instead of
+                    # half-joined, and so the reported parent_group_name below matches reality.
+                    try:
+                        parent_group.remove_nodes_from_group([node])
+                    except Exception as cleanup_err:
+                        logger.error(
+                            "Attempted to release node '%s' from group '%s' after a failed add. Failed with error: %s. The node may still be listed as a member of the group.",
+                            node.name,
+                            request.parent_group_name,
+                            cleanup_err,
+                        )
+                    details = f"{details}. {group_failure}"
+                    log_level = logging.WARNING
 
         # Special handling for paired classes (e.g., create a Start node and it automatically creates a corresponding End node already connected).
         if isinstance(node, BaseIterativeStartNode) and not request.initial_setup:
@@ -1014,7 +1044,15 @@ class NodeManager(EngineScoped):
         return node_group
 
     def on_add_nodes_to_node_group_request(self, request: AddNodesToNodeGroupRequest) -> ResultPayload:
-        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup."""
+        """Handle AddNodeToNodeGroupRequest to add a node to an existing NodeGroup.
+
+        In a SubflowNodeGroup, tethered nodes travel together: adding an iterative Start node also
+        adds its paired End node (and vice versa), so the pair is never split across the subflow
+        boundary. The GUI sends only the node the user selected, so the group layer enforces this
+        rather than the caller. A plain BaseNodeGroup has no flow of its own and groups exactly what
+        it was asked for. Either way `node_names_added` reports what actually happened, which may be
+        more than was requested. Removal mirrors this — see on_remove_node_from_node_group_request.
+        """
         flow_result = self._get_flow_for_node_group_operation(request.flow_name)
         if isinstance(flow_result, AddNodesToNodeGroupResultFailure):
             return flow_result
@@ -1104,7 +1142,13 @@ class NodeManager(EngineScoped):
         return node_group
 
     def on_remove_node_from_node_group_request(self, request: RemoveNodeFromNodeGroupRequest) -> ResultPayload:
-        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup."""
+        """Handle RemoveNodeFromNodeGroupRequest to remove nodes from an existing NodeGroup.
+
+        Mirrors the add path. In a SubflowNodeGroup, removing an iterative Start node also removes
+        its paired End node (and vice versa), so the pair never ends up split with one half still in
+        the group. A plain BaseNodeGroup removes exactly what it was asked for, skipping any node
+        that is not a member. `node_names_removed` reports what actually left the group.
+        """
         flow_result = self._get_flow_for_remove_operation(request.flow_name)
         if isinstance(flow_result, RemoveNodeFromNodeGroupResultFailure):
             return flow_result
@@ -1120,14 +1164,20 @@ class NodeManager(EngineScoped):
         node_group = node_group_result
 
         try:
-            node_group.remove_nodes_from_group(nodes)
-        except ValueError as err:
+            nodes_removed = node_group.remove_nodes_from_group(nodes)
+        except (ValueError, RuntimeError) as err:
+            # ValueError: a requested node is not a member. RuntimeError: a SubflowNodeGroup could not
+            # move a node back to the parent flow, which tether expansion makes likelier by doubling
+            # the moves per request.
             details = f"Attempted to remove nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'. Failed with error: {err}"
             return RemoveNodeFromNodeGroupResultFailure(result_details=details)
 
-        details = f"Successfully removed nodes '{request.node_names}' from NodeGroup '{request.node_group_name}'"
+        node_names_removed = [n.name for n in nodes_removed]
+        details = f"Successfully removed nodes '{node_names_removed}' from NodeGroup '{request.node_group_name}'"
         return RemoveNodeFromNodeGroupResultSuccess(
             result_details=ResultDetails(message=details, level=logging.DEBUG),
+            node_names_removed=node_names_removed,
+            node_group_name=request.node_group_name,
         )
 
     def cancel_conditionally(
