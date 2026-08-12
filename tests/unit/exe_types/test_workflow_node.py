@@ -7,7 +7,8 @@ from typing import Any
 
 import pytest
 
-from griptape_nodes.exe_types.core_types import ParameterMode
+from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
+from griptape_nodes.exe_types.node_types import EndNode, StartNode
 from griptape_nodes.exe_types.workflow_node import (
     WorkflowNode,
     WorkflowNodeDefinitionError,
@@ -19,6 +20,8 @@ from griptape_nodes.exe_types.workflow_node import (
     pair_shape_nodes,
 )
 from griptape_nodes.node_library.workflow_registry import WorkflowMetadata, WorkflowRegistry, WorkflowShape
+from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 CONTROL_TYPE = "parametercontroltype"
 
@@ -47,6 +50,37 @@ def _metadata(shape: WorkflowShape | None) -> WorkflowMetadata:
         node_libraries_referenced=[],
         workflow_shape=shape,
     )
+
+
+def _build_live_subflow() -> str:
+    """Create a flow standing in for an imported workflow, and return its name.
+
+    Mirrors what an import produces for the shape used by `TestResolveLiveRoutes`: a parameterless
+    Start Flow node, a Start Flow node exposing `text`, and an End Flow node exposing `result`, all
+    renamed because their original names were already taken on the canvas.
+    """
+    GriptapeNodes.ContextManager().push_workflow(workflow_name="workflow_node_live_routes")
+    flow_result = GriptapeNodes.handle_request(
+        CreateFlowRequest(parent_flow_name=None, flow_name="Subflow", set_as_new_context=False)
+    )
+    assert isinstance(flow_result, CreateFlowResultSuccess), flow_result
+
+    flow = GriptapeNodes.FlowManager().get_flow_by_name(flow_result.flow_name)
+    flow.add_node(StartNode(name="Start Flow_1"))
+
+    start_with_text = StartNode(name="Start Flow_2")
+    start_with_text.add_parameter(
+        Parameter(name="text", tooltip="text tooltip", type="str", allowed_modes={ParameterMode.OUTPUT})
+    )
+    flow.add_node(start_with_text)
+
+    end_node = EndNode(name="End Flow_1")
+    end_node.add_parameter(
+        Parameter(name="result", tooltip="result tooltip", type="str", allowed_modes={ParameterMode.INPUT})
+    )
+    flow.add_node(end_node)
+
+    return flow_result.flow_name
 
 
 class TestFlattenShapeSection:
@@ -111,11 +145,13 @@ class TestBuildWorkflowNodeSurface:
 
         surface = build_workflow_node_surface(_metadata(shape))
 
-        assert list(surface) == ["text", "result"]
-        assert surface["text"].input_route == WorkflowParameterRoute("Start Flow", "text")
-        assert surface["text"].output_route is None
-        assert surface["result"].output_route == WorkflowParameterRoute("End Flow", "result")
-        assert surface["result"].input_route is None
+        assert list(surface.parameters) == ["text", "result"]
+        assert surface.parameters["text"].input_route == WorkflowParameterRoute("Start Flow", "text")
+        assert surface.parameters["text"].output_route is None
+        assert surface.parameters["result"].output_route == WorkflowParameterRoute("End Flow", "result")
+        assert surface.parameters["result"].input_route is None
+        assert surface.start_node_names == ["Start Flow"]
+        assert surface.end_node_names == ["End Flow"]
 
     def test_name_on_both_sides_carries_both_routes(self) -> None:
         shape = WorkflowShape(
@@ -125,9 +161,29 @@ class TestBuildWorkflowNodeSurface:
 
         surface = build_workflow_node_surface(_metadata(shape))
 
-        assert list(surface) == ["value"]
-        assert surface["value"].input_route == WorkflowParameterRoute("Start Flow", "value")
-        assert surface["value"].output_route == WorkflowParameterRoute("End Flow", "value")
+        assert list(surface.parameters) == ["value"]
+        assert surface.parameters["value"].input_route == WorkflowParameterRoute("Start Flow", "value")
+        assert surface.parameters["value"].output_route == WorkflowParameterRoute("End Flow", "value")
+
+    def test_parameterless_nodes_still_count_toward_the_shape(self) -> None:
+        """A Start Flow node that only carries control flow is invisible in the parameter surface.
+
+        It is still one of the nodes the live subflow gets paired against by position, so dropping it
+        from `start_node_names` would make every run of the node fail the pairing count check.
+        """
+        shape = WorkflowShape(
+            inputs={
+                "Start Flow": {"exec_out": _param("exec_out", CONTROL_TYPE)},
+                "Start Flow_1": {"text": _param("text")},
+            },
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+
+        surface = build_workflow_node_surface(_metadata(shape))
+
+        assert list(surface.parameters) == ["text", "result"]
+        assert surface.start_node_names == ["Start Flow", "Start Flow_1"]
+        assert surface.end_node_names == ["End Flow"]
 
     def test_missing_shape_rejected(self) -> None:
         with pytest.raises(WorkflowNodeDefinitionError, match="no saved input and output shape"):
@@ -169,6 +225,37 @@ class TestPairShapeNodes:
     def test_count_mismatch_is_rejected(self) -> None:
         with pytest.raises(WorkflowNodeRoutingError, match="lists 2 of them but the loaded copy has 1"):
             pair_shape_nodes(["Start Flow", "Other"], ["Start Flow"], role="Start Flow")
+
+
+class TestResolveLiveRoutes:
+    """Routes are re-pointed at the imported copy of the workflow before every run."""
+
+    def test_parameterless_start_node_is_counted_and_skipped(self) -> None:
+        """A Start Flow node carrying only control flow contributes no route but still holds a slot.
+
+        Pairing is positional, so the parameterless node has to be counted on the declared side or
+        every run of the node fails the count check even though the saved shape is correct.
+        """
+        shape = WorkflowShape(
+            inputs={
+                "Start Flow": {"exec_out": _param("exec_out", CONTROL_TYPE)},
+                "Start Flow_1": {"text": _param("text")},
+            },
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        node_class = build_workflow_node_class(
+            node_type="ShoutWorkflow",
+            workflow_file_path=Path("/library/shout_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+        node = node_class(name="Shout It")
+        subflow_name = _build_live_subflow()
+
+        live_routes = node._resolve_live_routes(subflow_name)
+
+        # The import renamed every node, so each declared name resolves one position along.
+        assert live_routes.inputs == {"text": WorkflowParameterRoute("Start Flow_2", "text")}
+        assert live_routes.outputs == {"result": WorkflowParameterRoute("End Flow_1", "result")}
 
 
 class TestBuildWorkflowNodeClass:

@@ -35,7 +35,7 @@ from griptape_nodes.retained_mode.events.workflow_events import (
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Sequence
     from pathlib import Path
 
     from griptape_nodes.node_library.workflow_registry import NodeParametersMapping, ParameterMinimalDict
@@ -98,6 +98,20 @@ class WorkflowNodeSurfaceParameter(NamedTuple):
     output_route: WorkflowParameterRoute | None
 
 
+class WorkflowNodeSurface(NamedTuple):
+    """Everything the generated node type derives from a workflow's saved shape.
+
+    `start_node_names` and `end_node_names` list every Start/End node the shape records, including
+    ones that expose no parameters of their own, because they are what the live subflow's nodes are
+    paired against by position. Deriving them from `parameters` instead would miss a Start Flow node
+    that only carries control flow.
+    """
+
+    parameters: dict[str, WorkflowNodeSurfaceParameter]
+    start_node_names: list[str]
+    end_node_names: list[str]
+
+
 def _sanitize_for_parameter_name(workflow_node_name: str) -> str:
     """Collapse whitespace in a workflow node name so it can be used inside a parameter name.
 
@@ -151,10 +165,12 @@ def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowP
     return routes
 
 
-def build_workflow_node_surface(workflow_metadata: WorkflowMetadata) -> dict[str, WorkflowNodeSurfaceParameter]:
+def build_workflow_node_surface(workflow_metadata: WorkflowMetadata) -> WorkflowNodeSurface:
     """Derive the generated node's parameter surface from a workflow's saved shape.
 
-    Inputs come first so they render above the outputs on the canvas.
+    Inputs come first so they render above the outputs on the canvas. The shape's Start/End node
+    lists are carried through as-is, so a node that exposes no parameters of its own still counts
+    toward the positional pairing done at run time.
 
     Raises:
         WorkflowNodeDefinitionError: The workflow carries no saved shape, meaning it has no Start
@@ -192,7 +208,11 @@ def build_workflow_node_surface(workflow_metadata: WorkflowMetadata) -> dict[str
             )
         else:
             surface[surface_name] = existing._replace(output_route=route)
-    return surface
+    return WorkflowNodeSurface(
+        parameters=surface,
+        start_node_names=list(workflow_shape.inputs),
+        end_node_names=list(workflow_shape.outputs),
+    )
 
 
 def pair_shape_nodes(declared_names: Sequence[str], live_names: Sequence[str], role: str) -> dict[str, str]:
@@ -259,8 +279,8 @@ class WorkflowNode(ControlNode):
     workflow_file_path: ClassVar[Path]
     # Metadata read from that workflow's header at library load time.
     workflow_metadata: ClassVar[WorkflowMetadata]
-    # Surface parameter name -> the workflow parameters it is wired to.
-    workflow_surface: ClassVar[dict[str, WorkflowNodeSurfaceParameter]]
+    # The parameter surface and Start/End node lists derived from the workflow's saved shape.
+    workflow_surface: ClassVar[WorkflowNodeSurface]
 
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
@@ -272,7 +292,7 @@ class WorkflowNode(ControlNode):
         self.metadata[WORKFLOW_NODE_KEY] = True
         self._publish_workflow_registry_key()
 
-        for surface_name, surface_parameter in self.workflow_surface.items():
+        for surface_name, surface_parameter in self.workflow_surface.parameters.items():
             self.add_parameter(_build_surface_parameter(surface_name, surface_parameter))
 
     def _publish_workflow_registry_key(self) -> None:
@@ -397,23 +417,21 @@ class WorkflowNode(ControlNode):
         live_start_nodes = [node.name for node in flow.nodes.values() if isinstance(node, StartNode)]
         live_end_nodes = [node.name for node in flow.nodes.values() if isinstance(node, EndNode)]
 
-        declared_start_nodes = _declared_route_nodes(surface.input_route for surface in self.workflow_surface.values())
-        declared_end_nodes = _declared_route_nodes(surface.output_route for surface in self.workflow_surface.values())
+        start_node_names = pair_shape_nodes(self.workflow_surface.start_node_names, live_start_nodes, role="Start Flow")
+        end_node_names = pair_shape_nodes(self.workflow_surface.end_node_names, live_end_nodes, role="End Flow")
 
-        start_node_names = pair_shape_nodes(declared_start_nodes, live_start_nodes, role="Start Flow")
-        end_node_names = pair_shape_nodes(declared_end_nodes, live_end_nodes, role="End Flow")
-
-        live_routes = WorkflowNodeLiveRoutes(inputs={}, outputs={})
-        for surface_name, surface_parameter in self.workflow_surface.items():
+        input_routes: dict[str, WorkflowParameterRoute] = {}
+        output_routes: dict[str, WorkflowParameterRoute] = {}
+        for surface_name, surface_parameter in self.workflow_surface.parameters.items():
             if surface_parameter.input_route is not None:
-                live_routes.inputs[surface_name] = self._relocate_route(
+                input_routes[surface_name] = self._relocate_route(
                     surface_parameter.input_route, start_node_names, flow, surface_name
                 )
             if surface_parameter.output_route is not None:
-                live_routes.outputs[surface_name] = self._relocate_route(
+                output_routes[surface_name] = self._relocate_route(
                     surface_parameter.output_route, end_node_names, flow, surface_name
                 )
-        return live_routes
+        return WorkflowNodeLiveRoutes(inputs=input_routes, outputs=output_routes)
 
     def _relocate_route(
         self,
@@ -524,15 +542,6 @@ def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeS
         allowed_modes=allowed_modes,
         ui_options=definition.get("ui_options"),
     )
-
-
-def _declared_route_nodes(routes: Iterable[WorkflowParameterRoute | None]) -> list[str]:
-    """Return the distinct workflow node names referenced by `routes`, in first-seen order."""
-    node_names: list[str] = []
-    for route in routes:
-        if route is not None and route.workflow_node_name not in node_names:
-            node_names.append(route.workflow_node_name)
-    return node_names
 
 
 def _get_flow_or_none(flow_name: str) -> ControlFlow | None:

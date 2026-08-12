@@ -160,6 +160,14 @@ def find_metadata_blocks(workflow_content: str, block_name: str) -> list[re.Matc
     return [match for match in _METADATA_BLOCK_PATTERN.finditer(workflow_content) if match.group("type") == block_name]
 
 
+def strip_metadata_comment_prefixes(metadata_block: re.Match[str]) -> str:
+    """Recover the raw TOML from a metadata block by dropping the comment marker off each line."""
+    return "".join(
+        line[2:] if line.startswith("# ") else line[1:]
+        for line in metadata_block.group("content").splitlines(keepends=True)
+    )
+
+
 def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
     """Read the metadata header out of a workflow file.
 
@@ -191,10 +199,7 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
         raise WorkflowMetadataError(msg)
 
     # Strip the leading comment marker off each line to recover the raw TOML.
-    metadata_toml = "".join(
-        line[2:] if line.startswith("# ") else line[1:]
-        for line in matches[0].group("content").splitlines(keepends=True)
-    )
+    metadata_toml = strip_metadata_comment_prefixes(matches[0])
 
     try:
         toml_document = tomllib.loads(metadata_toml)

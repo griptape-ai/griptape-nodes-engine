@@ -43,6 +43,7 @@ from griptape_nodes.node_library.workflow_registry import (
     WorkflowRegistry,
     WorkflowShape,
     find_metadata_blocks,
+    strip_metadata_comment_prefixes,
 )
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.app_events import (
@@ -1823,10 +1824,7 @@ class WorkflowManager(EngineScoped):
             return LoadWorkflowMetadataResultFailure(result_details=details)
 
         # Now attempt to parse out the metadata section, stripped of comment prefixes.
-        metadata_content_toml = "".join(
-            line[2:] if line.startswith("# ") else line[1:]
-            for line in matches[0].group("content").splitlines(keepends=True)
-        )
+        metadata_content_toml = strip_metadata_comment_prefixes(matches[0])
 
         # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a
         # formatting-preserving document model that costs ~20x more per header. Only the
