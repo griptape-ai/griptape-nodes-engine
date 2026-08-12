@@ -6,7 +6,8 @@ usable node type whose parameters mirror the workflow's saved shape, and running
 execute the workflow and hand its End Flow values back as node outputs.
 
 The fixture library ships ``shout_workflow.py`` (Start -> Shout -> End), regenerate it with
-``uv run python scripts/generate_shout_workflow_fixture.py`` when the workflow file format changes.
+``uv run python tests/e2e/fixtures/generate_shout_workflow_fixture.py`` when the workflow file format
+changes.
 """
 
 from __future__ import annotations

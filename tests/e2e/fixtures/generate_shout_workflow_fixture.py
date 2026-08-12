@@ -1,9 +1,14 @@
-"""Generate tests/e2e/fixtures/workflow_node_library/shout_workflow.py.
+"""Generate `workflow_node_library/shout_workflow.py`, the saved workflow the e2e test points a node at.
 
-Run with `uv run python scripts/generate_shout_workflow_fixture.py` from the repo root when the
-workflow file format changes. Builds the Start -> Shout -> End graph in-process and emits it
-through the real workflow generator, so the committed fixture always matches what saving a workflow
-from the editor produces.
+Run with `uv run python tests/e2e/fixtures/generate_shout_workflow_fixture.py` from the repo root when
+the workflow file format changes.
+
+The fixture is committed rather than built during the test run on purpose: it pins what a *saved*
+workflow looks like on disk, so a change to the metadata header, the stored workflow shape, or the
+workflow generator shows up as a failing test instead of silently producing a file the node code can
+no longer read. This script builds the Start -> Shout -> End graph in-process and emits it through
+the real workflow generator, so the committed fixture always matches what saving from the editor
+produces.
 """
 
 from __future__ import annotations
@@ -31,7 +36,7 @@ from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, C
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.utils.version_utils import engine_version
 
-LIBRARY_DIR = Path(__file__).resolve().parents[1] / "tests" / "e2e" / "fixtures" / "workflow_node_library"
+LIBRARY_DIR = Path(__file__).resolve().parent / "workflow_node_library"
 LIBRARY_JSON = LIBRARY_DIR / "griptape_nodes_library.json"
 NODE_FILE = LIBRARY_DIR / "workflow_node_nodes.py"
 WORKFLOW_PATH = LIBRARY_DIR / "shout_workflow.py"
