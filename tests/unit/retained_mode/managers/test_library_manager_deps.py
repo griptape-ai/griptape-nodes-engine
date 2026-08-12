@@ -711,3 +711,100 @@ class TestDownloadLibraryRequestAutoRegister:
         assert isinstance(result, DownloadLibraryResultFailure)
         assert "downloaded but failed to register" in str(result.result_details)
         assert "fake-library" in str(result.result_details)
+
+
+class TestWorkerDelegatedAdvancedLibrarySkip:
+    """The orchestrator must not import a worker-delegated library's advanced module.
+
+    The advanced module executes in the engine process and its third-party imports
+    resolve against the library venv -- which the orchestrator deliberately never
+    creates for worker-delegated libraries (the worker installs its own deps). Before
+    the skip, any manifest dependency imported by the advanced module raised
+    ModuleNotFoundError on the orchestrator and hard-failed the registration.
+    """
+
+    def _make_schema(self, *, advanced_library_path: str | None) -> MagicMock:
+        schema = MagicMock()
+        schema.name = "test_lib"
+        schema.metadata.library_version = "1.0.0"
+        schema.metadata.declarations = []
+        schema.advanced_library_path = advanced_library_path
+        schema.settings = None
+        return schema
+
+    def _make_lib_info(
+        self, *, state: LibraryManager.LibraryLifecycleState, requires_worker: bool
+    ) -> LibraryManager.LibraryInfo:
+        return LibraryManager.LibraryInfo(
+            lifecycle_state=state,
+            library_path="/mock.json",
+            is_sandbox=False,
+            library_name="test_lib",
+            library_version="1.0.0",
+            fitness=LibraryManager.LibraryFitness.GOOD,
+            requires_worker=requires_worker,
+        )
+
+    @pytest.mark.asyncio
+    async def test_orchestrator_skips_advanced_module_for_worker_delegated_library(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        mgr = griptape_nodes.LibraryManager()
+        lib_info = self._make_lib_info(
+            state=LibraryManager.LibraryLifecycleState.WORKER_DELEGATED, requires_worker=True
+        )
+        schema = self._make_schema(advanced_library_path="lib_advanced.py")
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "_add_library_paths_to_sys_path", new=AsyncMock()),
+            patch.object(mgr, "_load_advanced_library_module") as mock_advanced,
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry.generate_new_library",
+                return_value=MagicMock(),
+            ) as mock_generate,
+        ):
+            result = await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        assert result is None
+        mock_advanced.assert_not_called()
+        # The library still registers -- with no advanced instance -- so the editor and
+        # workflow loading see it while the worker loads the real module in its process.
+        assert mock_generate.call_args.kwargs["advanced_library"] is None
+        assert lib_info.lifecycle_state is LibraryManager.LibraryLifecycleState.WORKER_PENDING
+
+    @pytest.mark.asyncio
+    async def test_in_process_library_still_loads_the_advanced_module(self, griptape_nodes: GriptapeNodes) -> None:
+        """Pins the non-worker path: the skip must key on worker delegation, not fire always."""
+        mgr = griptape_nodes.LibraryManager()
+        lib_info = self._make_lib_info(
+            state=LibraryManager.LibraryLifecycleState.DEPENDENCIES_INSTALLED, requires_worker=False
+        )
+        schema = self._make_schema(advanced_library_path="lib_advanced.py")
+        advanced_instance = MagicMock()
+
+        with (
+            patch.object(mgr, "load_library_metadata_from_file_request", return_value=_metadata_success(schema)),
+            patch.object(mgr, "_add_library_paths_to_sys_path", new=AsyncMock()),
+            patch.object(mgr, "_load_advanced_library_module", return_value=advanced_instance) as mock_advanced,
+            patch.object(mgr, "_attempt_load_nodes_from_library"),
+            patch.object(mgr, "_library_file_path_to_info", {"/mock.json": lib_info}),
+            patch(
+                "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry.generate_new_library",
+                return_value=MagicMock(),
+            ) as mock_generate,
+        ):
+            result = await mgr._progress_library_through_lifecycle(
+                library_info=lib_info,
+                file_path="/mock.json",
+                request=RegisterLibraryFromFileRequest(file_path="/mock.json"),
+            )
+
+        assert result is None
+        mock_advanced.assert_called_once()
+        assert mock_generate.call_args.kwargs["advanced_library"] is advanced_instance
