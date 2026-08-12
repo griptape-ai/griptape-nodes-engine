@@ -17,6 +17,7 @@ import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.runner import RunEvent, TextDelta, ThinkingDelta, ToolCall, ToolResult
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -27,6 +28,10 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.retained_mode.events.agent_events import (
+    AgentStreamEvent,
+    AgentThinkingEvent,
+    AgentToolCallEvent,
+    AgentToolResultEvent,
     CancelAgentRequest,
     CancelAgentResultSuccess,
     ConfigureAgentRequest,
@@ -69,6 +74,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _friendly_list_models_error,
     _message_has_image_url,
     _rehydrate_history,
+    _run_event_to_payload,
 )
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
@@ -210,6 +216,41 @@ class TestOnHandleCancelAgentRequest:
         # The event is set via call_soon_threadsafe; yield once so it runs.
         await asyncio.sleep(0)
         assert cancel_event.is_set()
+
+
+class TestRunEventToPayload:
+    """Every streamed payload carries the thread id so clients can route it."""
+
+    def test_text_delta_becomes_stream_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(TextDelta(delta="hi"), "thread-1")
+
+        assert payload == AgentStreamEvent(thread_id="thread-1", token="hi")  # noqa: S106 - a streamed text token
+
+    def test_thinking_delta_becomes_thinking_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(ThinkingDelta(delta="pondering"), "thread-1")
+
+        assert payload == AgentThinkingEvent(thread_id="thread-1", delta="pondering")
+
+    def test_tool_call_becomes_tool_call_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolCall(tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'), "thread-1"
+        )
+
+        assert payload == AgentToolCallEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'
+        )
+
+    def test_tool_result_becomes_tool_result_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolResult(tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True), "thread-1"
+        )
+
+        assert payload == AgentToolResultEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True
+        )
+
+    def test_unmapped_event_kind_is_dropped(self) -> None:
+        assert _run_event_to_payload(RunEvent(), "thread-1") is None
 
 
 @dataclass
