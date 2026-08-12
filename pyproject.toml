@@ -1,6 +1,6 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.97.0"
+version = "0.98.0"
 description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12.0, <3.14"
@@ -36,7 +36,6 @@ dependencies = [
   "ruamel.yaml>=0.18.15",
   "asyncio-thread-runner>=1.0",
   "portalocker>=2.10.0",
-  "pygit2>=1.19.0",
   "send2trash>=2.1.0",
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
@@ -136,6 +135,15 @@ ignore = [
 "tests/*" = ["S101", "D104", "TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
+# Example libraries shipped with the Advanced Libraries doc. Authors copy these files
+# verbatim, so the exemptions live here rather than as noqa noise in the examples.
+# INP001: a docs folder is not an importable package.
+# N807: the dunder-named locals are the point -- module-level `__getattr__` is PEP 562,
+# and the `__init__` built inside the class factory has to be named `__init__`.
+# TID251: node libraries are the intended audience for the GriptapeNodes facade, as the
+# ban message itself says.
+"docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
+"docs/development/custom_nodes/example_request_handler_library/**" = ["INP001", "TID251"]
 
 # TID251 allowlist for the GriptapeNodes facade. Two groups, and the difference matters.
 #

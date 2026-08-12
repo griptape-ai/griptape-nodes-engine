@@ -38,10 +38,27 @@ class TestDeriveRegistryKey:
             ("subdir/my_workflow.py", "subdir/my_workflow"),
             ("a/b/deep_workflow.py", "a/b/deep_workflow"),
             ("windows\\path\\workflow.py", "windows/path/workflow"),
+            # Case is preserved on every platform.
+            ("MyFlow.py", "MyFlow"),
+            ("UPPER/MixedCase.py", "UPPER/MixedCase"),
+            # Only the final suffix is stripped. `%d.%m_%H.%M` is the engine's own
+            # default auto-generated workflow name, so internal dots are common.
+            ("03.07_18.30.py", "03.07_18.30"),
+            ("subdir/03.07_18.30.py", "subdir/03.07_18.30"),
         ],
     )
     def test_known_inputs(self, input_path: str, expected: str) -> None:
         assert derive_registry_key(input_path) == expected
+
+    def test_not_idempotent_on_dotted_names(self) -> None:
+        """Applying the helper to an already-derived dotted key truncates it.
+
+        Callers holding a registry key (e.g. ``ContextManager.get_current_workflow_name()``)
+        must compare it directly rather than re-deriving. Pinned so the trap stays visible.
+        """
+        key = derive_registry_key("03.07_18.30.py")
+        assert key == "03.07_18.30"
+        assert derive_registry_key(key) == "03.07_18"
 
 
 class TestWorkflowRegistry:

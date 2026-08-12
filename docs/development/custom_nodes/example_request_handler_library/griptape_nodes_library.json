@@ -1,0 +1,33 @@
+{
+  "name": "Colorspace Service Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates a library that owns a request type and serves it to its own nodes and to other libraries.",
+    "library_version": "0.1.0",
+    "engine_version": "0.97.0",
+    "tags": ["demo", "request-handler"]
+  },
+  "categories": [
+    {
+      "color": {
+        "title": "Color",
+        "description": "Colorspace conversion",
+        "color": "border-teal-500",
+        "icon": "Palette"
+      }
+    }
+  ],
+  "advanced_library_path": "advanced_library.py",
+  "nodes": [
+    {
+      "class_name": "ConvertColorspaceNode",
+      "file_path": "nodes.py",
+      "metadata": {
+        "category": "color",
+        "description": "Converts a color between RGB and HSV by calling this library's own request handler.",
+        "display_name": "Convert Colorspace"
+      }
+    }
+  ]
+}
