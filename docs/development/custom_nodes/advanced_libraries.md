@@ -162,15 +162,82 @@ def get_request_handlers(self) -> list[tuple[type[RequestPayload], Callable]]: .
 
 Returns `(request_type, handler)` pairs the engine registers on your behalf, and
 deregisters automatically when your library unloads. Both sync and async handlers work.
+This is how a library exposes a service its own nodes, other libraries, and external
+clients can all call.
+
+There are three pieces to build. See
+[the worked example](#example-a-library-that-serves-a-request-type) for all of them in
+context.
+
+**1. Define the payloads.** A request type and at least one result type, each a dataclass
+registered with `PayloadRegistry` so it can be resolved by name over the WebSocket and
+MCP surfaces:
 
 ```python
-def get_request_handlers(self):
-    return [
-        (ConvertColorspaceRequest, self._handle_convert_colorspace),
-    ]
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceRequest(RequestPayload):
+    color: tuple[float, float, float]
+    source: str
+    target: str
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
+    color: tuple[float, float, float]
+
+
+@dataclass
+@PayloadRegistry.register
+class ConvertColorspaceResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
+    pass
 ```
 
-Constraints:
+Put them in their own module that both your advanced library and your nodes import. The
+library directory is on `sys.path` by the time either loads, so a plain
+`import colorspace_events` resolves, and both files get the same module object and
+therefore the same payload classes. Give that module a distinctive name: every library
+directory lands on the same `sys.path`, so `events.py` risks resolving to another
+library's file.
+
+**2. Return the pair from the hook.**
+
+```python
+def get_request_handlers(self) -> list[tuple[type[RequestPayload], Callable]]:
+    return [(ConvertColorspaceRequest, self._handle_convert_colorspace)]
+```
+
+Annotate the return with a bare `Callable`. The base class declares
+`Callable[[RequestPayload], ResultPayload]`, and a handler annotated with your concrete
+request type is not assignable to that, because parameter types are contravariant.
+Keeping the handler's own annotation precise is worth more than matching the base
+signature exactly.
+
+**3. Dispatch it.** Any caller in the orchestrator process sends the request through the
+normal bus and gets your result back:
+
+```python
+result = GriptapeNodes.handle_request(ConvertColorspaceRequest(color=(1.0, 0.0, 0.0), source="rgb", target="hsv"))
+if result.failed():
+    msg = f"Attempted to convert a color in '{self.name}'. Failed because {result.result_details}"
+    raise RuntimeError(msg)
+
+success = cast("ConvertColorspaceResultSuccess", result)
+```
+
+Two rules for callers:
+
+- **Dispatch from `process`, never from `__init__`.** A node constructor that sends a
+    request trips the `reentrant-bus-in-init` strict-mode rule, and it can deadlock
+    against handlers that await engine startup. See
+    [Strict Mode Reference](strict_mode.md).
+- **Always handle failure.** The providing library might not be installed, might have
+    failed to load, or might have been unloaded. In those cases the request has no handler
+    at all, and the engine returns a generic failure result rather than your library's
+    failure type. Check `result.failed()` before narrowing to your success type.
+
+Constraints on the mechanism:
 
 - **Your library must own the request type.** Define the `RequestPayload` subclass in
     your own package.
@@ -304,10 +371,33 @@ Prefer synthesizing definitions anyway, for two reasons:
     cross-library collision check as declared ones, and generated names collide just as
     easily. Prefix them.
 
-## Example library
+## Examples
 
-A complete, working library that registers four node types from a JSON file while
-declaring none in its manifest:
+Two complete, working libraries. Copy either folder into your workspace's `libraries`
+directory, register it through the editor's library settings, and restart the engine.
+
+### Example: a library that serves a request type
+
+A library that owns `ConvertColorspaceRequest`, serves it from its advanced library, and
+consumes it from its own node:
+
+- [`griptape_nodes_library.json`](example_request_handler_library/griptape_nodes_library.json):
+    manifest declaring one node and the advanced library
+- [`colorspace_events.py`](example_request_handler_library/colorspace_events.py): the
+    request and result payloads, registered with `PayloadRegistry`
+- [`advanced_library.py`](example_request_handler_library/advanced_library.py): returns the
+    handler from `get_request_handlers` and implements it
+- [`nodes.py`](example_request_handler_library/nodes.py): a node that dispatches the
+    request from `process()` and handles failure
+
+Add a **Convert Colorspace** node, set `color` to `[0, 0.5, 1]` with `source` `rgb` and
+`target` `hsv`, and run it. Any other library in the same engine can now send
+`ConvertColorspaceRequest` and get the same answer.
+
+### Example: a library that registers node types dynamically
+
+A library that registers four node types from a JSON file while declaring none in its
+manifest:
 
 - [`griptape_nodes_library.json`](example_dynamic_library/griptape_nodes_library.json):
     manifest with `"nodes": []` and one declared category
@@ -318,7 +408,6 @@ declaring none in its manifest:
 - [`generated_nodes.py`](example_dynamic_library/generated_nodes.py): module
     `__getattr__` that builds each `DataNode` subclass on demand
 
-Copy the folder into your workspace's `libraries` directory, register it through the
-editor's library settings, and restart the engine. You should see a **Dynamic** category
-with four nodes. Add an entry to `node_specs.json` reusing an existing `operator` value,
-restart, and a fifth node appears with no change to the manifest or the Python.
+You should see a **Dynamic** category with four nodes. Add an entry to `node_specs.json`
+reusing an existing `operator` value, restart, and a fifth node appears with no change to
+the manifest or the Python.
