@@ -74,6 +74,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointAttribute,
     CheckpointSubjectType,
 )
+from griptape_nodes.utils.exception_utils import readable_exception_message
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -239,7 +240,7 @@ class AccessManager(EngineScoped):
         try:
             library = LibraryRegistry.get_library_for_node_type(node_type, specific_library_name)
         except KeyError as exc:
-            detail = exc.args[0] if exc.args else str(exc)
+            detail = readable_exception_message(exc)
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
                 f"Failed because the library could not be resolved: {detail}"
@@ -249,7 +250,7 @@ class AccessManager(EngineScoped):
         try:
             node_metadata = library.get_node_metadata(node_type)
         except KeyError as exc:
-            library_name = exc.args[0] if exc.args else specific_library_name
+            library_name = library.get_library_data().name
             msg = (
                 f"Attempted to query model access for node type '{node_type}'. "
                 f"Failed because it is not registered in library '{library_name}'."

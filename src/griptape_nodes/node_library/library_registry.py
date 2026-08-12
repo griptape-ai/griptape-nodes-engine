@@ -710,7 +710,8 @@ class Library:
 
     def get_node_metadata(self, node_type: str) -> NodeMetadata:
         if node_type not in self._node_metadata:
-            raise KeyError(self._library_data.name, node_type)
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise KeyError(msg)
         return self._node_metadata[node_type]
 
     def get_node_class(self, node_type: str) -> type[BaseNode]:
@@ -724,7 +725,8 @@ class Library:
         failure propagates to the caller.
         """
         if node_type not in self._node_types:
-            raise KeyError(self._library_data.name, node_type)
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise KeyError(msg)
         return self._node_types[node_type].resolve()
 
     def get_categories(self) -> list[dict[str, CategoryDefinition]]:
