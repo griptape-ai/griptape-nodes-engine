@@ -1,0 +1,23 @@
+{
+  "name": "Dynamic Nodes Demo",
+  "library_schema_version": "0.10.0",
+  "metadata": {
+    "author": "Griptape",
+    "description": "Demonstrates registering node types without enumerating them in this file. The 'nodes' list is empty; the advanced library synthesizes one NodeDefinition per entry in node_specs.json before the engine's loader runs.",
+    "library_version": "0.1.0",
+    "engine_version": "0.97.0",
+    "tags": ["demo", "dynamic"]
+  },
+  "categories": [
+    {
+      "dynamic": {
+        "title": "Dynamic",
+        "description": "Node types synthesized at library load time",
+        "color": "border-purple-500",
+        "icon": "Sparkles"
+      }
+    }
+  ],
+  "advanced_library_path": "advanced_library.py",
+  "nodes": []
+}

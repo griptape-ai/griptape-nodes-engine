@@ -99,6 +99,7 @@ Bundle nodes into libraries for sharing. Create `griptape_nodes_library.json`:
 - **widgets**: Register custom JS widget components (see [Custom Widgets](custom_widgets.md))
 - **categories**: Group nodes in UI with colors and icons
 - **nodes**: List node classes, file paths, and metadata
+- **advanced_library_path**: Optional Python file declaring an `AdvancedNodeLibrary` subclass, for libraries that need to run code at load and unload, own a request type, or register node types the manifest does not list (see [Advanced Libraries](advanced_libraries.md))
 - **workflows**: Template workflow files
 
 **Important:** The `secrets_to_register` array tells the system which secrets your library needs. Users will be prompted to configure these secrets through the UI or environment variables.
