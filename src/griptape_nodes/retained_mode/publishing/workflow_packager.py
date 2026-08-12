@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import uuid
 from contextlib import contextmanager
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urlparse
@@ -735,10 +736,12 @@ dependencies = [
 
         Args:
             destination: The final bundle directory, replaced wholesale on success.
-            preserve: Names of top-level entries under ``destination`` to carry into the
-                new bundle, for content the publisher deliberately accumulates across
-                publishes (e.g. per-version subdirectories). Entries the publish itself
-                wrote into staging win; missing names are skipped.
+            preserve: Top-level entry names under ``destination`` to carry into the new
+                bundle, for content the publisher deliberately accumulates across publishes.
+                Each is a literal name or an ``fnmatch`` pattern, so a publisher holding an
+                open-ended set of entries can pass ``"v*"`` rather than enumerating them.
+                Entries the publish itself wrote into staging win; patterns matching nothing
+                are skipped.
 
         Yields:
             The staging directory to write the bundle into.
@@ -763,15 +766,28 @@ dependencies = [
     @classmethod
     def _carry_preserved_entries(cls, destination: Path, staging_dir: Path, preserve: list[str]) -> None:
         """Copy opted-in entries from the previous bundle into staging before the swap."""
-        for name in preserve:
+        for name in cls._match_preserved_names(destination, preserve):
             previous = destination / name
             staged = staging_dir / name
-            if not previous.exists() or staged.exists():
+            if staged.exists():
                 continue
             if previous.is_dir():
                 cls.copy_tree(previous, staged, ignore_patterns=[])
             else:
                 cls.copy_file(previous, staged)
+
+    @staticmethod
+    def _match_preserved_names(destination: Path, preserve: list[str]) -> list[str]:
+        """Resolve ``preserve`` names and patterns against the previous bundle's entries.
+
+        Matching is done against the directory listing rather than by globbing, so a
+        pattern cannot reach outside the bundle it is preserving from.
+        """
+        if not preserve or not destination.is_dir():
+            return []
+        return sorted(
+            entry.name for entry in destination.iterdir() if any(fnmatch(entry.name, pattern) for pattern in preserve)
+        )
 
     @classmethod
     def _swap_into_place(cls, destination: Path, staging_dir: Path, previous_dir: Path) -> None:

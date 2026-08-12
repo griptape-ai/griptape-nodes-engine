@@ -616,6 +616,36 @@ class TestStagedPublish:
         assert (destination / "run.py").exists()
         assert not (destination / "stale.py").exists()
 
+    def test_carries_entries_matching_a_preserve_pattern(self, tmp_path: Path) -> None:
+        """A pattern preserves an open-ended set of entries without enumerating them."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        for version in ("v1", "v2", "v3"):
+            (destination / version).mkdir(parents=True)
+            (destination / version / "workflow.py").write_text(version, encoding="utf-8")
+        (destination / "stale.py").write_text("stale", encoding="utf-8")
+
+        with packager.staged_publish(destination, preserve=["v*"]) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        for version in ("v1", "v2", "v3"):
+            assert (destination / version / "workflow.py").read_text(encoding="utf-8") == version
+        assert not (destination / "stale.py").exists()
+
+    def test_preserve_pattern_does_not_reach_outside_the_bundle(self, tmp_path: Path) -> None:
+        """Patterns match the bundle's own entries, so traversal cannot pull in a sibling."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (tmp_path / "outside.py").write_text("outside", encoding="utf-8")
+
+        with packager.staged_publish(destination, preserve=["../outside.py", "*"]) as staging:
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        assert not (destination / "outside.py").exists()
+        assert not (destination / ".." / "bundle" / "outside.py").exists()
+        assert (tmp_path / "outside.py").exists()
+
     def test_publish_written_entry_wins_over_a_preserved_name(self, tmp_path: Path) -> None:
         """A name the publish itself wrote is not overwritten by the previous bundle's copy."""
         packager = WorkflowPackager("test_workflow")
