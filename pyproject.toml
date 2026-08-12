@@ -36,7 +36,6 @@ dependencies = [
   "ruamel.yaml>=0.18.15",
   "asyncio-thread-runner>=1.0",
   "portalocker>=2.10.0",
-  "pygit2>=1.19.0",
   "send2trash>=2.1.0",
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
