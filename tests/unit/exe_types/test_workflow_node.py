@@ -317,6 +317,33 @@ class TestBuildWorkflowNodeClass:
         assert text_param is not None
         assert text_param.allowed_modes == {ParameterMode.INPUT}
 
+    def test_mutable_defaults_are_not_shared_between_instances(self) -> None:
+        """The shape lives on the generated type, so its defaults have to be copied per instance.
+
+        A Parameter keeps its default value by reference. Handing every instance the same list would
+        let one node's edit show up on every other node of the same type.
+        """
+        shape = WorkflowShape(
+            inputs={"Start Flow": {"items": _param("items", "list", default_value=["a"])}},
+            outputs={"End Flow": {"result": _param("result")}},
+        )
+        node_class = build_workflow_node_class(
+            node_type="ListWorkflow",
+            workflow_file_path=Path("/library/list_workflow.py"),
+            workflow_metadata=_metadata(shape),
+        )
+
+        first = node_class(name="First")
+        second = node_class(name="Second")
+
+        first_items = first.get_parameter_by_name("items")
+        second_items = second.get_parameter_by_name("items")
+        assert first_items is not None
+        assert second_items is not None
+        first_items.default_value.append("b")
+        assert second_items.default_value == ["a"]
+        assert shape.inputs["Start Flow"]["items"]["default_value"] == ["a"]
+
     def test_stale_subflow_name_is_dropped_on_construction(self) -> None:
         shape = WorkflowShape(
             inputs={"Start Flow": {"text": _param("text")}},

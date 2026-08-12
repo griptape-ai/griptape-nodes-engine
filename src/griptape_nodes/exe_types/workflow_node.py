@@ -14,6 +14,7 @@ The generated node types are ordinary ``BaseNode`` subclasses built by
 from __future__ import annotations
 
 import logging
+from copy import deepcopy
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from griptape_nodes.exe_types.core_types import Parameter, ParameterMode, ParameterTypeBuiltin
@@ -90,7 +91,8 @@ class WorkflowNodeSurfaceParameter(NamedTuple):
 
     A name that appears on both a Start Flow node and an End Flow node carries both routes, so a
     single parameter serves as input and output (matching how the workflow itself passes it
-    through).
+    through). Its type, tooltip, and UI options come from the Start Flow node's copy; the End Flow
+    node's copy of the same name supplies only the output route.
     """
 
     definition: ParameterMinimalDict
@@ -295,24 +297,6 @@ class WorkflowNode(ControlNode):
         for surface_name, surface_parameter in self.workflow_surface.parameters.items():
             self.add_parameter(_build_surface_parameter(surface_name, surface_parameter))
 
-    def _publish_workflow_registry_key(self) -> None:
-        """Register the backing workflow and record its key so the editor can preview it.
-
-        Registration happens here, rather than only at execution time, so the workflow can be
-        previewed before the node has ever run. Failure is not fatal: the node stays usable and the
-        preview is simply unavailable until the next run re-registers the workflow.
-        """
-        try:
-            self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
-                self.workflow_file_path, self.workflow_metadata
-            )
-        except (KeyError, ValueError):
-            logger.warning(
-                "Node '%s' could not register its workflow '%s' for preview; it will be registered on the next run.",
-                self.name,
-                self.workflow_file_path,
-            )
-
     def after_node_deleted(self) -> None:
         self._discard_subflow()
 
@@ -331,6 +315,24 @@ class WorkflowNode(ControlNode):
             raise RuntimeError(msg)  # noqa: TRY004 - the workflow failed at run time; this is not a type error
 
         self._collect_outputs(subflow_name, live_routes)
+
+    def _publish_workflow_registry_key(self) -> None:
+        """Register the backing workflow and record its key so the editor can preview it.
+
+        Registration happens at construction, rather than only at execution time, so the workflow can
+        be previewed before the node has ever run. Failure is not fatal: the node stays usable and the
+        preview is simply unavailable until the next run re-registers the workflow.
+        """
+        try:
+            self.metadata[WORKFLOW_FILE_VALUE_KEY] = ensure_workflow_registered(
+                self.workflow_file_path, self.workflow_metadata
+            )
+        except (KeyError, ValueError):
+            logger.warning(
+                "Node '%s' could not register its workflow '%s' for preview; it will be registered on the next run.",
+                self.name,
+                self.workflow_file_path,
+            )
 
     async def _load_subflow(self) -> str:
         """Return the name of this node's live subflow, importing the workflow if needed.
@@ -523,7 +525,10 @@ def _is_control_parameter(definition: ParameterMinimalDict) -> bool:
 
 
 def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeSurfaceParameter) -> Parameter:
-    definition = surface_parameter.definition
+    # The definition lives on the generated node type, shared by every instance of it, while a
+    # Parameter holds onto its default value by reference. Copying keeps one node's edit to a list or
+    # dict default out of every other node of the same type.
+    definition = deepcopy(surface_parameter.definition)
     allowed_modes: set[ParameterMode] = set()
     if surface_parameter.input_route is not None:
         allowed_modes.add(ParameterMode.INPUT)
