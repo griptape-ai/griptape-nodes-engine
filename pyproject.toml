@@ -135,6 +135,12 @@ ignore = [
 "tests/*" = ["S101", "D104", "TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
+# Example library shipped with the Advanced Libraries doc. Authors copy these files
+# verbatim, so the exemptions live here rather than as noqa noise in the example.
+# INP001: a docs folder is not an importable package.
+# N807: the dunder-named locals are the point -- module-level `__getattr__` is PEP 562,
+# and the `__init__` built inside the class factory has to be named `__init__`.
+"docs/development/custom_nodes/example_dynamic_library/**" = ["INP001", "N807"]
 
 # TID251 allowlist for the GriptapeNodes facade. Two groups, and the difference matters.
 #
