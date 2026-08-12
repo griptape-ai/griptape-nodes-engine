@@ -37,6 +37,7 @@ def _param(name: str, param_type: str = "str", **overrides: Any) -> dict[str, An
         "mode_allowed_input": True,
         "mode_allowed_property": True,
         "mode_allowed_output": True,
+        "parent_element_name": None,
     }
     definition.update(overrides)
     return definition
@@ -98,6 +99,24 @@ class TestFlattenShapeSection:
         section = {"Start Flow": {"exec_out": _param("exec_out", CONTROL_TYPE), "text": _param("text")}}
 
         assert list(flatten_shape_section(section)) == ["text"]
+
+    def test_end_node_status_parameters_dropped(self) -> None:
+        """Every End Flow node carries these, and they describe that node's run rather than an output."""
+        section = {
+            "End Flow": {
+                "was_successful": _param("was_successful", "bool", parent_element_name="Status"),
+                "result_details": _param("result_details", parent_element_name="Status"),
+                "result": _param("result"),
+            }
+        }
+
+        assert list(flatten_shape_section(section)) == ["result"]
+
+    def test_status_names_outside_the_status_group_are_kept(self) -> None:
+        """Only the Status group's copies are dropped, not an author's own parameter of that name."""
+        section = {"End Flow": {"was_successful": _param("was_successful", "bool")}}
+
+        assert list(flatten_shape_section(section)) == ["was_successful"]
 
     def test_collision_qualifies_every_side(self) -> None:
         section = {

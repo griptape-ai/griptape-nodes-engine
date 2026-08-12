@@ -150,6 +150,8 @@ parameters:
 - Every non-control parameter on an **End Flow** node becomes an **output** on the node.
 - The node supplies its own Flow In and Flow Out, so the workflow's control parameters are not
     surfaced.
+- The End Flow node's built-in **Status** parameters (`was_successful`, `result_details`) are not
+    surfaced either. They report on the End Flow node's own run, not on anything you exposed.
 
 A parameter name used by exactly one Start Flow or End Flow node keeps its bare name. If two Start
 Flow nodes both expose `prompt`, both parameters are qualified with their node name instead
@@ -160,7 +162,7 @@ Flow node and an End Flow node becomes a single parameter that is both an input 
 When the node runs, the engine loads the workflow as a child subflow of the node's own flow, copies
 the node's input values onto the Start Flow nodes, runs it, and copies the End Flow values back out
 as the node's outputs. The subflow is reused for later runs in the same session and is never written
-into a saved workflow, so nothing about the node's internals leaks into your users' files.
+into a saved workflow, so your users' files carry the node, not a copy of the workflow behind it.
 
 **Save the workflow from the editor before shipping it.** The parameter shape is read out of the
 metadata header at the top of the workflow file, which the editor writes on save. A workflow with no

@@ -87,9 +87,9 @@ def test_workflow_node_registers_with_shape_derived_parameters(
 
     assert isinstance(node, WorkflowNode), f"Expected a workflow-backed node, got {type(node).__name__}"
     # `text` comes from the workflow's Start Flow node, `result` from its End Flow node. Control
-    # parameters in the shape are dropped in favor of the node's own control flow.
-    assert node.get_parameter_by_name("text") is not None
-    assert node.get_parameter_by_name("result") is not None
+    # parameters in the shape are dropped in favor of the node's own control flow, and so is the End
+    # Flow node's Status group, which reports on that node's run rather than on the workflow's output.
+    assert [parameter.name for parameter in node.parameters] == ["exec_in", "exec_out", "text", "result"]
     assert node.get_parameter_by_name("exec_out") is node.control_parameter_out
 
 

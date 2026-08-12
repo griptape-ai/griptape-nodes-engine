@@ -47,9 +47,17 @@ logger = logging.getLogger("griptape_nodes")
 # workflow expose the same parameter name.
 QUALIFIED_NAME_SEPARATOR = "."
 
-# Node-metadata key holding the name of the live imported subflow. Runtime-only: the subflow is
-# tagged transient so it never round-trips through a save, which makes any value present at load
-# time stale. The editor reads it to offer a "view the subflow" affordance during a session.
+# The parameters `ExecutionStatusComponent` puts on every End Flow node, and the group it puts them
+# in. They report on the End Flow node's own execution rather than on anything the workflow's author
+# chose to expose, so the generated node drops them the way it drops control parameters.
+STATUS_GROUP_NAME = "Status"
+STATUS_PARAMETER_NAMES = frozenset({"was_successful", "result_details"})
+
+# Node-metadata key holding the name of the live imported subflow, matching the key
+# `SubflowNodeGroup` writes so the editor's subflow preview can read either. Session-scoped: the
+# subflow itself is tagged transient and is never serialized, and `__init__` drops this key, so a
+# value a save happened to bake into a file is inert when that file is loaded. The editor reads it to
+# offer a "view the subflow" affordance during a session.
 SUBFLOW_NAME_KEY = "subflow_name"
 
 # Node-metadata flag the editor uses to recognize a node that runs a workflow. Presence of this key
@@ -129,8 +137,9 @@ def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowP
 
     A parameter name used by exactly one Start/End node keeps its bare name. A name used by more
     than one node is qualified as ``<node name>.<parameter name>`` for every node that uses it, so
-    the result never depends on iteration order. Control parameters are dropped: the generated node
-    supplies its own control flow.
+    the result never depends on iteration order. Control parameters and the End Flow node's Status
+    parameters are dropped: the generated node supplies its own control flow and reports its own
+    status.
 
     Raises:
         WorkflowNodeDefinitionError: Two workflow parameters claim the same surface name, which would
@@ -139,14 +148,14 @@ def flatten_shape_section(section: NodeParametersMapping) -> dict[str, WorkflowP
     nodes_using_name: dict[str, list[str]] = {}
     for workflow_node_name, parameters in section.items():
         for parameter_name, definition in parameters.items():
-            if _is_control_parameter(definition):
+            if not _is_surfaced_parameter(parameter_name, definition):
                 continue
             nodes_using_name.setdefault(parameter_name, []).append(workflow_node_name)
 
     routes: dict[str, WorkflowParameterRoute] = {}
     for workflow_node_name, parameters in section.items():
         for parameter_name, definition in parameters.items():
-            if _is_control_parameter(definition):
+            if not _is_surfaced_parameter(parameter_name, definition):
                 continue
             if len(nodes_using_name[parameter_name]) == 1:
                 surface_name = parameter_name
@@ -287,9 +296,9 @@ class WorkflowNode(ControlNode):
     def __init__(self, name: str, metadata: dict[Any, Any] | None = None) -> None:
         super().__init__(name, metadata)
 
-        # The imported subflow is an execution-time artifact tracked through node metadata. It is
-        # never serialized, so anything present at load time is stale (or, after a copy/paste,
-        # belongs to a different node).
+        # The imported subflow is an execution-time artifact tracked through node metadata. The
+        # subflow it names is transient and never serialized, so any name that reaches us here is
+        # stale (or, after a copy/paste, belongs to a different node).
         self.metadata.pop(SUBFLOW_NAME_KEY, None)
         self.metadata[WORKFLOW_NODE_KEY] = True
         self._publish_workflow_registry_key()
@@ -520,8 +529,11 @@ def build_workflow_node_class(
     )
 
 
-def _is_control_parameter(definition: ParameterMinimalDict) -> bool:
-    return definition.get("type") == ParameterTypeBuiltin.CONTROL_TYPE.value
+def _is_surfaced_parameter(parameter_name: str, definition: ParameterMinimalDict) -> bool:
+    """Whether a parameter in the workflow's shape becomes a parameter on the generated node."""
+    is_control = definition.get("type") == ParameterTypeBuiltin.CONTROL_TYPE.value
+    is_status = parameter_name in STATUS_PARAMETER_NAMES and definition.get("parent_element_name") == STATUS_GROUP_NAME
+    return not is_control and not is_status
 
 
 def _build_surface_parameter(surface_name: str, surface_parameter: WorkflowNodeSurfaceParameter) -> Parameter:
