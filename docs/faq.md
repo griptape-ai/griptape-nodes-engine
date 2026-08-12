@@ -1,5 +1,9 @@
 # Frequently Asked Questions
 
+!!! tip
+
+    Chasing a specific problem or error? See [Troubleshooting](troubleshooting.md) for commonly encountered issues and how to recover from them.
+
 ## Where is my workspace (where do my files save)?
 
 Files such as saved workflows, etc., are saved in a the Workspace Directory.
@@ -51,7 +55,7 @@ gtn config show
 
 ## How do I install the Advanced Media Library after Initial Setup?
 
-For the broader story on installing and managing libraries (including non-Advanced-Media libraries), see [Libraries](libraries.md).
+For the broader story on installing and managing libraries (including non-Advanced-Media libraries), see [Libraries](guides/libraries.md).
 
 If you initially declined to install the Advanced Media Library during setup but now want to add it, you can do so by running:
 
@@ -112,24 +116,6 @@ gtn self update
 gtn libraries sync
 ```
 
-## I'm seeing `failed to locate pyvenv.cfg: The system cannot find the file specified.` - What should I do?
-
-It is possible, that during a previous uninstall things were not _fully_ uninstalled. Simply perform an uninstall again, and then [re-install](installation.md).
-
-## I'm seeing `Attempted to create a Flow with a parent 'None', but no parent with that name could be found.` - What should I do?
-
-The good news is, this is usually harmless, and you can usually disregard it. If you're getting it in a way that stops work, please restart your engine, and that should take care of it.
-
-That said, we apologize for this elusive bug. We're working to catch and fix it as soon as possible. If you are so inclined, we'd be grateful if you wanted to [log a bug](https://github.com/griptape-ai/griptape-nodes/issues/new?template=bug_report.yml&title=Attempted%20to%20create%20flow%20with%20a%20parent%20%27None%27) and provide any context around what may have led to the issue when you see it!
-
-## I'm receiving an error when trying to run Griptape Nodes: `ssl.SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1000)` - What should I do?
-
-The Python installation on your machine may not have access to verified SSL certificates. To remedy:
-
-1. Reinstall Python using the python.org installer. As of this writing, Griptape Nodes requires Python 3.12.
-1. At the end of the installation, select to "Install Certificates".
-    1. If not available in the installer, run `/Applications/Python\ 3.12/Install\ Certificates.command`
-
 ## Where can I provide feedback or ask questions?
 
 You can connect with us through several channels:
@@ -143,11 +129,14 @@ These same links are also available as the three icons in the footer (bottom rig
 ## How can I test out unreleased features?
 
 If you're interested in testing out unreleased features, you can install the pre-release builds of Griptape Nodes.
-Updates are now published to the [latest](https://github.com/griptape-ai/griptape-nodes/releases/tag/latest) tag twice a day.
 
 !!! warning
 
     Pre-release builds are not guaranteed to be stable and may contain bugs or incomplete features. Use them at your own risk.
+
+If you use Griptape Nodes Desktop, switch the **Release Channel** to **Nightly** in [App Settings](guides/desktop/app_settings.md#release-channels). Nightly builds are published daily and bundle pre-release engine and editor builds along with the app. You can switch back to **Stable** at any time, without reinstalling.
+
+If you install the engine yourself, the pre-release engine is published to the [latest](https://github.com/griptape-ai/griptape-nodes/releases/tag/latest) tag twice a day.
 
 To switch to the pre-release update channel, run the following commands:
 

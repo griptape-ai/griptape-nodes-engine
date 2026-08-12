@@ -5,7 +5,7 @@ import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
@@ -23,10 +23,17 @@ from griptape_nodes.retained_mode.events.project_events import (
     AttemptMapAbsolutePathToProjectRequest,
     AttemptMapAbsolutePathToProjectResultSuccess,
     AttemptMatchPathAgainstMacroRequest,
+    AttemptMatchPathAgainstMacroResultFailure,
     AttemptMatchPathAgainstMacroResultSuccess,
+    GetAllSituationsForProjectRequest,
+    GetAllSituationsForProjectResultFailure,
+    GetAllSituationsForProjectResultSuccess,
     GetPathForMacroRequest,
     GetPathForMacroResultFailure,
     GetPathForMacroResultSuccess,
+    GetSituationRequest,
+    GetSituationResultFailure,
+    GetSituationResultSuccess,
     GetStateForMacroRequest,
     GetStateForMacroResultFailure,
     GetStateForMacroResultSuccess,
@@ -102,6 +109,385 @@ class TestProjectManagerMacroHandlers:
         assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
         assert result.match_failure is None
         assert result.extracted_variables == {"file_name": "test.txt"}
+
+    def test_match_path_auto_resolve_off_treats_builtins_as_unknowns(self, project_manager: ProjectManager) -> None:
+        """Default ``auto_resolve_builtins=False`` keeps the handler from anchoring builtins.
+
+        ``extract_variables`` is greedy: without an anchor value for
+        ``workspace_dir``, the matcher consumes it as the empty string and
+        ``file_name_base`` absorbs the entire leading path. The whole-string
+        match technically "succeeds", but the resulting dict is structurally
+        wrong — the workspace boundary was lost. This is precisely why
+        workflow_manager opts into auto-resolution, and why the default has
+        to leave existing callers' strict contract untouched.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+
+        request = AttemptMatchPathAgainstMacroRequest(
+            parsed_macro=parsed_macro,
+            file_path="/projects/demo/my_workflow.py",
+            known_variables={},
+            # auto_resolve_builtins defaults to False — handler must NOT inject builtins.
+        )
+
+        result = project_manager.on_match_path_against_macro_request(request)
+
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        # Greedy match with no workspace anchor: workspace_dir defaults to empty,
+        # file_name_base absorbs the leading path. Documents the wrong-but-syntactically-valid
+        # extraction that the auto-resolve flag exists to prevent.
+        assert result.extracted_variables == {
+            "workspace_dir": "",
+            "file_name_base": "projects/demo/my_workflow",
+            "file_extension": "py",
+        }
+
+    def test_match_path_auto_resolve_on_supplies_builtin_anchors(self, tmp_path: Path) -> None:
+        """``auto_resolve_builtins=True`` lets the handler resolve ``{workspace_dir}`` itself.
+
+        Drives the handler through ``handle_request`` against a real loaded project
+        so the builtin resolver can actually return a workspace value. Without the
+        flag, this same macro/path pair fails (see ``test_match_path_auto_resolve_off``);
+        with it, the handler injects ``workspace_dir`` and the match succeeds.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        workspace = tmp_path.resolve()
+        original_workspace = GriptapeNodes.ConfigManager().workspace_path
+        project_yml = workspace / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        # SetCurrentProjectRequest re-derives workspace_path; force it back.
+        GriptapeNodes.ConfigManager().workspace_path = workspace
+
+        try:
+            # Macro templates use forward-slash separators (the cross-platform
+            # convention). On Windows the OS-native absolute path comes back
+            # with backslashes; normalize to POSIX so the static-text
+            # comparison between `{workspace_dir}` and the next segment lines
+            # up regardless of OS. The match handler POSIX-normalizes its
+            # auto-resolved directory builtins, so both sides agree on
+            # separator without the caller having to inject workspace_dir.
+            parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+            absolute_path = (workspace / "my_workflow.py").as_posix()
+
+            request = AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=parsed_macro,
+                file_path=absolute_path,
+                known_variables={},
+                auto_resolve_builtins=True,
+            )
+
+            result = GriptapeNodes.handle_request(request)
+
+            assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+            assert result.match_failure is None
+            assert result.extracted_variables is not None
+            assert result.extracted_variables.get("file_name_base") == "my_workflow"
+            assert result.extracted_variables.get("file_extension") == "py"
+            # workspace_dir was supplied by the handler — auto-resolution made the match possible.
+            assert "workspace_dir" in result.extracted_variables
+        finally:
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+            GriptapeNodes.ConfigManager().workspace_path = original_workspace
+
+    def test_match_path_auto_resolve_rejects_conflicting_caller_override(self, tmp_path: Path) -> None:
+        """Caller-supplied builtin overrides that disagree with the project are rejected.
+
+        Pins the shared "no silent override of builtins" policy: every handler
+        that mixes user-supplied variables with project-derived builtins refuses
+        to let the caller silently shadow the builtin. The match handler hits the
+        same conflict-detection helper as ``GetPathForMacroRequest`` and
+        ``GetStateForMacroRequest``, so the rejection shape is consistent across
+        the public API surface.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.events.project_events import (
+            AttemptMatchPathAgainstMacroResultFailure,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        workspace = tmp_path.resolve()
+        original_workspace = GriptapeNodes.ConfigManager().workspace_path
+        project_yml = workspace / "project_template.yml"
+        project_yml.write_text(DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE))
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+        GriptapeNodes.ConfigManager().workspace_path = workspace
+
+        try:
+            # Caller asserts workspace_dir is "/elsewhere" — different from the real workspace.
+            # Under the unified policy this is a contract violation, not a silent override.
+            parsed_macro = ParsedMacro("{workspace_dir}/{file_name_base}.{file_extension}")
+            request = AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=parsed_macro,
+                file_path="/elsewhere/my_workflow.py",
+                known_variables={"workspace_dir": "/elsewhere"},
+                auto_resolve_builtins=True,
+            )
+
+            result = GriptapeNodes.handle_request(request)
+
+            # Hard failure (not a match-failure result_success): caller violated
+            # the "no override of builtins" contract that all macro handlers share.
+            assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+            assert "workspace_dir" in str(result.result_details)
+        finally:
+            GriptapeNodes.handle_request(SetCurrentProjectRequest(project_id=None))
+            GriptapeNodes.ConfigManager().workspace_path = original_workspace
+
+    def test_match_path_auto_resolve_supplies_non_directory_builtin_verbatim(
+        self,
+        project_manager: ProjectManager,
+        tmp_path: Path,
+    ) -> None:
+        """Auto-resolved non-directory builtins pass through without POSIX normalization.
+
+        ``on_attempt_match_path_against_macro_request`` POSIX-normalizes
+        auto-resolved *directory* builtins so reverse-match works on Windows
+        (macros use forward-slash separators). Non-directory builtins like
+        ``workflow_name`` are just strings; the normalization loop gates on
+        ``builtin_info.is_directory`` and skips them, so their value reaches
+        the extractor verbatim.
+
+        Existing coverage exercises directory builtins only
+        (``test_match_path_auto_resolve_on_supplies_builtin_anchors``,
+        ``test_match_path_auto_resolve_rejects_conflicting_caller_override``).
+        This test locks the non-directory branch — a future "always
+        normalize" simplification would silently corrupt workflow names.
+        """
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # A current workflow named `My Cool Workflow` — the space is deliberate:
+        # a POSIX-normalization pass would leave the space alone, but if a future
+        # refactor pushed non-directory builtins through `Path(...).as_posix()`
+        # by mistake, backslash handling could mangle the value. Distinctive
+        # enough to catch that class of regression.
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = True
+        mock_context_manager.get_current_workflow_name.return_value = "My Cool Workflow"
+        project_manager._engine = MagicMock()
+        project_manager._engine.context_manager = mock_context_manager
+
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        # Register a synthetic project so `on_get_current_project_request` succeeds
+        # and the auto-resolve branch actually runs.
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+        project_manager._successfully_loaded_project_templates[SYSTEM_DEFAULTS_KEY] = project_info
+        project_manager._current_project_id = SYSTEM_DEFAULTS_KEY
+
+        parsed_macro = ParsedMacro("{workflow_name}/render.png")
+        request = AttemptMatchPathAgainstMacroRequest(
+            parsed_macro=parsed_macro,
+            file_path="My Cool Workflow/render.png",
+            known_variables={},
+            auto_resolve_builtins=True,
+        )
+
+        result = project_manager.on_match_path_against_macro_request(request)
+
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        assert result.extracted_variables is not None
+        # workflow_name was supplied by auto-resolve AND passed through unchanged —
+        # the POSIX-normalization loop's `is_directory` gate skipped it.
+        assert result.extracted_variables["workflow_name"] == "My Cool Workflow"
+
+    def test_resolve_builtins_into_bag_flags_directory_path_conflict(
+        self, project_manager: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Directory builtins compare via ``resolve_path_safely``; disagreeing paths conflict.
+
+        Companion to
+        ``test_resolve_builtins_into_bag_flags_non_directory_string_conflict``
+        below. Directory builtins (``workspace_dir``, ``project_dir``, …) run
+        both sides through ``resolve_path_safely`` before comparing, so
+        different spellings of the same path don't false-alarm. This test
+        pins the branch where the paths are genuinely different, which the
+        rule *must* catch.
+
+        Currently this branch is only hit transitively via
+        ``test_match_path_auto_resolve_rejects_conflicting_caller_override``;
+        the direct-unit test locks it against a "just use string compare for
+        everything" simplification.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # The resolved builtin for `workspace_dir` is a real path so the
+        # `resolve_path_safely` comparison has something concrete to work with.
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        # Caller asserts a directory that isn't the workspace.
+        bag = cast("dict[str, Any]", {"workspace_dir": "/completely/different/path"})
+        result = project_manager._resolve_builtins_into_bag(bag, ["workspace_dir"], project_info)
+
+        # `resolve_path_safely` normalizes both sides and picks up the disagreement.
+        assert "workspace_dir" in result.conflicts
+        assert result.unavailable == {}
+
+    def test_resolve_builtins_into_bag_records_unavailable_when_no_workflow(
+        self,
+        project_manager: ProjectManager,
+        tmp_path: Path,
+    ) -> None:
+        """Builtins whose resolver raises are recorded in ``unavailable``, not treated as conflicts.
+
+        ``_get_builtin_variable_value`` raises ``RuntimeError('No current
+        workflow')`` for ``workflow_name`` / ``workflow_dir`` when no
+        workflow context is active. The helper must catch that and add the
+        name to ``unavailable`` (with the exception attached) so callers can
+        report the missing precondition. Currently this branch is untested.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # No current workflow → workflow_name / workflow_dir resolvers raise RuntimeError.
+        mock_context_manager = Mock()
+        mock_context_manager.has_current_workflow.return_value = False
+        project_manager._engine = MagicMock()
+        project_manager._engine.context_manager = mock_context_manager
+
+        cast("Mock", project_manager._config_manager).workspace_path = tmp_path.resolve()
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        bag = cast("dict[str, Any]", {})
+        result = project_manager._resolve_builtins_into_bag(
+            bag,
+            ["workflow_name", "workflow_dir", "workspace_dir"],
+            project_info,
+        )
+
+        # workflow_* resolvers both raised — recorded as unavailable with the exception attached.
+        assert "workflow_name" in result.unavailable
+        assert "workflow_dir" in result.unavailable
+        assert isinstance(result.unavailable["workflow_name"], RuntimeError)
+        assert "No current workflow" in str(result.unavailable["workflow_name"])
+        # workspace_dir resolves fine → not in unavailable, and injected into the bag.
+        assert "workspace_dir" not in result.unavailable
+        assert bag["workspace_dir"] == str(tmp_path.resolve())
+        # Unavailable is not a conflict — callers distinguish the two.
+        assert result.conflicts == set()
+
+    def test_resolve_builtins_into_bag_flags_non_directory_string_conflict(
+        self, project_manager: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Non-directory builtins compare as strings; mismatched values are flagged as conflicts.
+
+        Directory builtins (``workspace_dir`` etc.) compare via
+        ``resolve_path_safely`` so two spellings of the same path don't
+        false-alarm; non-directory builtins (``workflow_name``,
+        ``project_name``, etc.) compare verbatim. Pins the string-compare
+        branch of ``_resolve_builtins_into_bag``: a caller-supplied
+        ``static_files_dir`` that disagrees with the resolved value
+        is reported as a conflict.
+        """
+        from griptape_nodes.common.project_templates.validation import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            DEFAULT_PROJECT_TEMPLATE as DEFAULT_TEMPLATE_FROM_MODULE,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import (
+            SYSTEM_DEFAULTS_KEY,
+            ProjectInfo,
+        )
+
+        # The mock config from the fixture returns a Mock for any config key —
+        # we need a concrete string so the conflict comparison is meaningful.
+        cast("Mock", project_manager._config_manager).get_config_value.return_value = "staticfiles"
+
+        project_info = ProjectInfo(
+            project_id=SYSTEM_DEFAULTS_KEY,
+            template=DEFAULT_TEMPLATE_FROM_MODULE,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            project_file_path=tmp_path / "synthetic.yml",
+            project_base_dir=tmp_path,
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+        # Caller asserts a value that disagrees with the resolved builtin.
+        bag = cast("dict[str, Any]", {"static_files_dir": "user-overridden-value"})
+        result = project_manager._resolve_builtins_into_bag(bag, ["static_files_dir"], project_info)
+
+        # String compare picked up the disagreement → conflict recorded.
+        assert "static_files_dir" in result.conflicts
+        # No values were available beyond what was supplied / the unresolved branch.
+        assert result.unavailable == {}
 
 
 class TestProjectManagerInitialization:
@@ -207,10 +593,7 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("/workspace/output.txt")
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    def test_builtin_workflow_name_resolves_correctly(
-        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
-    ) -> None:
+    def test_builtin_workflow_name_resolves_correctly(self, project_manager_with_template: ProjectManager) -> None:
         """Test that {workflow_name} builtin resolves from ContextManager."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
@@ -219,7 +602,8 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
 
@@ -232,16 +616,14 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager.has_current_workflow.assert_called_once()
         mock_context_manager.get_current_workflow_name.assert_called_once()
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    def test_builtin_workflow_name_no_current_workflow(
-        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
-    ) -> None:
+    def test_builtin_workflow_name_no_current_workflow(self, project_manager_with_template: ProjectManager) -> None:
         """Test that {workflow_name} raises RuntimeError when no current workflow."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
 
@@ -274,10 +656,8 @@ class TestProjectManagerBuiltinVariables:
         assert "project_name not yet implemented" in str(result.result_details)
 
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_builtin_workflow_dir_resolves_correctly(
         self,
-        mock_griptape_nodes: Mock,
         mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
@@ -287,7 +667,8 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "my_workflow"
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow = Mock()
         mock_workflow.file_path = "my_project/my_workflow.json"
@@ -302,16 +683,14 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result, GetPathForMacroResultSuccess)
         assert result.resolved_path == Path("/workspace/my_project/output.txt")
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    def test_builtin_workflow_dir_no_current_workflow(
-        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
-    ) -> None:
+    def test_builtin_workflow_dir_no_current_workflow(self, project_manager_with_template: ProjectManager) -> None:
         """Test that required {workflow_dir} fails when there is no current workflow."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_dir}/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -325,9 +704,8 @@ class TestProjectManagerBuiltinVariables:
         assert isinstance(result.result_details, ResultDetails)
         assert "No current workflow" in str(result.result_details)
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_builtin_workflow_dir_optional_skipped_when_no_workflow(
-        self, mock_griptape_nodes: Mock, project_manager_with_template: ProjectManager
+        self, project_manager_with_template: ProjectManager
     ) -> None:
         """Test that optional {workflow_dir?:/} is skipped (not an error) when no current workflow."""
         from griptape_nodes.common.macro_parser import ParsedMacro
@@ -336,7 +714,8 @@ class TestProjectManagerBuiltinVariables:
 
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_dir?:/}staticfiles/output.txt")
         request = GetPathForMacroRequest(parsed_macro=parsed_macro, variables={})
@@ -347,10 +726,8 @@ class TestProjectManagerBuiltinVariables:
         assert result.resolved_path == Path("staticfiles/output.txt")
 
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_builtin_workflow_dir_unregistered_workflow_fails(
         self,
-        mock_griptape_nodes: Mock,
         mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
@@ -360,7 +737,8 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
 
@@ -377,10 +755,8 @@ class TestProjectManagerBuiltinVariables:
         assert "workflow_5" in str(result.result_details)
 
     @patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry")
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_builtin_workflow_dir_optional_skipped_when_workflow_unregistered(
         self,
-        mock_griptape_nodes: Mock,
         mock_workflow_registry: Mock,
         project_manager_with_template: ProjectManager,
     ) -> None:
@@ -392,7 +768,8 @@ class TestProjectManagerBuiltinVariables:
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = True
         mock_context_manager.get_current_workflow_name.return_value = "workflow_5"
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_template._engine = MagicMock()
+        project_manager_with_template._engine.context_manager = mock_context_manager
 
         mock_workflow_registry.get_workflow_by_name.side_effect = KeyError("workflow_5")
 
@@ -781,16 +1158,11 @@ class TestProjectManagerGetStateForMacro:
         assert "inputs" in result.conflicting_variables
         assert result.can_resolve is False
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_get_state_for_macro_builtin_variable_satisfied(
-        self, mock_griptape_nodes: Mock, project_manager_with_current_project: ProjectManager
+        self, project_manager_with_current_project: ProjectManager
     ) -> None:
         """Test GetStateForMacro with satisfied builtin variable."""
         from griptape_nodes.common.macro_parser import ParsedMacro
-
-        mock_config_manager = Mock()
-        mock_config_manager.get_config_value.return_value = "/workspace"
-        mock_griptape_nodes.ConfigManager.return_value = mock_config_manager
 
         parsed_macro = ParsedMacro("{workspace_dir}/output.txt")
 
@@ -802,16 +1174,16 @@ class TestProjectManagerGetStateForMacro:
         assert result.satisfied_variables == {"workspace_dir"}
         assert result.can_resolve is True
 
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     def test_get_state_for_macro_builtin_variable_fails(
-        self, mock_griptape_nodes: Mock, project_manager_with_current_project: ProjectManager
+        self, project_manager_with_current_project: ProjectManager
     ) -> None:
         """Test GetStateForMacro fails when builtin variable cannot be resolved."""
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         mock_context_manager = Mock()
         mock_context_manager.has_current_workflow.return_value = False
-        mock_griptape_nodes.ContextManager.return_value = mock_context_manager
+        project_manager_with_current_project._engine = MagicMock()
+        project_manager_with_current_project._engine.context_manager = mock_context_manager
 
         parsed_macro = ParsedMacro("{workflow_name}_output.txt")
 
@@ -1242,11 +1614,12 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes.ContextManager()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             # Test path inside outputs directory
             absolute_path = project_base / "outputs" / "renders" / "file.png"
@@ -1295,11 +1668,12 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             # Test path outside project
             absolute_path = Path("/Users/test/Downloads/file.png")
@@ -1364,11 +1738,12 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             # Test path inside outputs/inputs subdirectory (should match outputs, not inputs)
             absolute_path = project_base / "outputs" / "inputs" / "file.png"
@@ -1417,11 +1792,12 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow needed for this test
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             # Test path exactly at outputs directory
             absolute_path = project_base / "outputs"
@@ -1468,11 +1844,12 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes.ConfigManager() and ContextManager()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             # Test path inside project_base_dir but not in any defined directory
             absolute_path = project_base / "random_folder" / "file.txt"
@@ -1531,16 +1908,16 @@ class TestProjectManagerAttemptMapAbsolutePathToProject:
         cast("Mock", project_manager._config_manager).workspace_path = project_base
 
         # Mock GriptapeNodes - workflow_name will fail because no workflow
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(project_manager, "_engine", mock_engine):
+            cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = str(project_base)
             mock_config.workspace_path = project_base
-            mock_gn.ConfigManager.return_value = mock_config
 
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False  # No workflow available
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             absolute_path = project_base / "outputs" / "file.png"
 
@@ -1571,6 +1948,7 @@ situations:
     @pytest.fixture
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -1655,7 +2033,6 @@ situations:
     async def test_load_project_denied_by_policy_is_not_cached(self, pm: ProjectManager, tmp_path: Path) -> None:
         """A LoadProject denial blocks the load: the project is not cached as usable."""
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
             AuthorizationCheckpoint,
             CheckpointDenial,
@@ -1678,16 +2055,12 @@ situations:
                 return CheckpointDenial(failures=(CheckpointFailure(detail="Ask your admin to grant this project."),))
             return None
 
-        event_manager = GriptapeNodes.EventManager()
-        event_manager.add_authorization_hook(deny)
-        try:
-            with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-                mock_file_instance = Mock()
-                mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
-                mock_file_cls.return_value = mock_file_instance
-                result = await pm._load_and_cache_project_template(project_path, persist_path=False)
-        finally:
-            event_manager.remove_authorization_hook(deny)
+        cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.side_effect = deny
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+            mock_file_cls.return_value = mock_file_instance
+            result = await pm._load_and_cache_project_template(project_path, persist_path=False)
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
         assert "Ask your admin to grant this project." in str(result.result_details)
@@ -1736,16 +2109,20 @@ situations:
 
     @pytest.mark.asyncio
     async def test_load_workspace_project_read_failure_keeps_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
-        """A file read failure leaves system defaults as current project."""
-        from griptape_nodes.files.file import FileLoadError
-        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        """A file read failure leaves system defaults as current project.
+
+        _load_workspace_project now delegates to _load_and_cache_project_template, which
+        reads via ReadFileRequest. Make the seed path a directory: it passes the
+        _resolve_project_file_path existence check but fails the file read, so the
+        delegated load returns a failure and the seed activation is skipped.
+        """
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
 
         self._setup_system_defaults(pm, str(tmp_path))
 
-        # Create the file so the existence check passes
+        # A directory at the seed path exists but cannot be read as a file.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.mkdir()
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -1757,17 +2134,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(
-                side_effect=FileLoadError(
-                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
-                    result_details="permission denied",
-                )
-            )
-            mock_file_cls.return_value = mock_file_instance
-
-            await pm._load_workspace_project()
+        await pm._load_workspace_project()
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
@@ -1778,8 +2145,10 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
+        # Invalid YAML on disk: the delegated loader reads it via ReadFileRequest, fails
+        # to parse it into an overlay, and returns a failure without activating.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.write_text("not: valid: yaml: ][")
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -1791,12 +2160,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: ][")
-            mock_file_cls.return_value = mock_file_instance
-
-            await pm._load_workspace_project()
+        await pm._load_workspace_project()
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
@@ -1875,6 +2239,154 @@ situations:
         await pm.on_app_initialization_complete(AppInitializationComplete())
 
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_activates_seed_without_touching_defaults(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A seeded boot project is activated directly; the system-defaults gate is never consulted.
+
+        Regression guard for the boot ordering: with a project_file/workspace seed present,
+        on_app_initialization_complete activates the seed instead of first activating
+        SYSTEM_DEFAULTS_KEY. So a license policy that denies the defaults rest state does not
+        block boot -- the ACTIVATE_PROJECT checkpoint is never evaluated for SYSTEM_DEFAULTS_KEY.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        activated_subject_ids: list[str] = []
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT:
+                activated_subject_ids.append(checkpoint.subject_id)
+                if checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                    return CheckpointDenial(
+                        failures=(CheckpointFailure(detail="No license covers the default project."),)
+                    )
+            return None
+
+        cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.side_effect = deny_defaults
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=self.VALID_PROJECT_YAML)
+            mock_file_cls.return_value = mock_file_instance
+
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == str(workspace_project_path)
+        assert pm._initialization_complete is True
+        # The defaults rest state was never activated, so its (denying) gate was never hit.
+        assert SYSTEM_DEFAULTS_KEY not in activated_subject_ids
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_falls_back_to_defaults_when_seed_fails(
+        self, pm: ProjectManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A seed that resolves but fails to load falls back to activating system defaults."""
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # File exists so the seed path resolves, but its YAML cannot be parsed.
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with (
+            patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls,
+            caplog.at_level(logging.ERROR, logger="griptape_nodes"),
+        ):
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
+            mock_file_cls.return_value = mock_file_instance
+
+            await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is True
+        # The seed was resolved and attempted before the fallback: prove the ordering,
+        # not just the endpoint (which a never-attempted seed would also satisfy).
+        error_messages = [r.message for r in caplog.records if r.levelno == logging.ERROR]
+        assert any(
+            str(workspace_project_path) in msg and "Falling back to system defaults" in msg for msg in error_messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_app_initialization_complete_does_not_complete_when_no_seed_and_defaults_denied(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """With no seed and a policy that denies system defaults, boot cannot complete.
+
+        This is the genuinely locked-out case: nothing is reachable, so the engine
+        surfaces the failure rather than pretending to have activated a project.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+            AuthorizationCheckpoint,
+            CheckpointAction,
+            CheckpointDenial,
+            CheckpointFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        # No project_file seed and no workspace griptape-nodes-project.yml on disk.
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | list | None:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        def deny_defaults(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            if checkpoint.action == CheckpointAction.ACTIVATE_PROJECT and checkpoint.subject_id == SYSTEM_DEFAULTS_KEY:
+                return CheckpointDenial(failures=(CheckpointFailure(detail="No license covers the default project."),))
+            return None
+
+        cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.side_effect = deny_defaults
+        await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        # The denied activation left the current project untouched and boot short-circuited.
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
+        assert pm._initialization_complete is False
 
     @pytest.mark.asyncio
     async def test_load_workspace_project_uses_project_file_setting(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -1971,6 +2483,134 @@ situations:
 
         assert pm._current_project_id == str(workspace_project_path)
 
+    @pytest.mark.asyncio
+    async def test_seed_child_inherits_parent_situations_and_directories(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """A child activated as the boot seed inherits its parent's situations/directories.
+
+        Regression for the bug where the seed loader merged only onto system defaults and
+        dropped the parent chain (so a child seed lost its parent's situations/directories
+        until a manual Reload from Disk). The seed now loads through the shared
+        parent-chain-aware loader, so inheritance resolves on boot.
+        """
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        # Parent (registered elsewhere) defines a situation + directory the child does not.
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "situations:\n"
+            "  save_prompt:\n"
+            "    macro: '{prompts}/{file_name_base}.{file_extension}'\n"
+            "    policy:\n"
+            "      on_collision: create_new\n"
+            "      create_dirs: true\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+        await pm._load_and_cache_project_template(parent_path, persist_path=False)
+
+        # Child is the workspace seed and declares only its parent link + an env var.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Child\n"
+            "id: child-xyz\n"
+            "parent_project_id: 'parent-abc'\n"
+            "environment:\n"
+            "  SHOW: child\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return []
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        # Activation resolves the workspace via adjacent project config; return no
+        # workspace_directory so the decision falls through to the global default.
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        await pm._load_workspace_project()
+
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        # Inherited from the parent (would be absent under the old defaults-only merge).
+        assert "save_prompt" in child_info.template.situations
+        assert "prompts" in child_info.template.directories
+        # The child's own override is still applied.
+        assert child_info.template.environment.get("SHOW") == "child"
+
+    @pytest.mark.asyncio
+    async def test_seed_child_resolves_id_parent_registered_only_in_config(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """Boot resolves a child seed's id-parent that lives only in projects_to_register.
+
+        Covers the ordering fix: on_app_initialization_complete builds the boot id-index
+        before activating the seed, so an id-based parent that has not been loaded yet
+        (only registered in projects_to_register) is still locatable when the seed's
+        parent chain resolves.
+        """
+        from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+
+        # Child is the workspace-dir seed; only the parent is in projects_to_register.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\nname: Child\nid: child-xyz\nparent_project_id: 'parent-abc'\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_path)]
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        await pm.on_app_initialization_complete(AppInitializationComplete())
+
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        assert "prompts" in child_info.template.directories
+        # The boot id-index is boot-only and cleared once loading finishes.
+        assert pm._boot_id_to_file_path == {}
+
 
 class TestLoadSelectsDefaultByMajor:
     """End-to-end: loading a project file merges it onto the default for its OWN major.
@@ -1995,6 +2635,7 @@ name: Modern Project
     @pytest.fixture
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -2054,6 +2695,7 @@ name: Legacy Project
     @pytest.fixture
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -3475,8 +4117,9 @@ class TestResolveWorkspaceDirForProjectId:
         read_failure = ReadFileResultFailure(
             failure_reason=FileIOFailureReason.FILE_NOT_FOUND, result_details="not found"
         )
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(return_value=read_failure)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            mock_engine.ahandle_request = AsyncMock(return_value=read_failure)
 
             probe = await pm._read_overlay(missing_file, record_status=False)
             assert missing_file not in pm._registered_template_status
@@ -3914,6 +4557,7 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
 
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_secrets = Mock()
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
@@ -4101,23 +4745,32 @@ class TestProjectManagerProjectWorkspaces:
     async def test_activation_sets_libraries_root_override_from_inherited_parent(self, tmp_path: Path) -> None:
         """Activating a child pins the libraries root to the parent's dir (the sharing seam).
 
-        End-to-end wiring test for _activate_project's libraries block: activation must call
-        decide_libraries_root (which walks the parent chain) and push the result into
+        End-to-end wiring test for _activate_project's libraries block: activation must walk the
+        parent chain (from disk, via _decide_libraries_root_from_disk) and push the result into
         set_libraries_root_override, so resolved_libraries_root() then returns the shared tree. The
         child declares no libraries_dir of its own; the parent declares "./libraries", so the child
         inherits the PARENT's dir. Guards against the override being dropped, ordered wrongly relative
         to clear_project_layers, or fed the wrong value -- none of which the isolated
-        decide_libraries_root tests would catch.
+        libraries-root tests would catch.
+
+        Inheritance is resolved from the on-disk YAML (not the loaded template) so a child's shared
+        libraries tree does not depend on whether the parent is loaded; the parent here is present on
+        disk / projects_to_register but is deliberately NOT seeded into the live registry, exercising
+        the registry-independent path that fixes #5149.
         """
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
-        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
-        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateResultFailure,
+            SetCurrentProjectRequest,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectInfo
 
-        parent_file = tmp_path / "parent" / "project.yml"
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
         parent_file.parent.mkdir()
         parent_file.touch()
-        child_file = tmp_path / "parent" / "child" / "project.yml"
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
         child_file.parent.mkdir()
         child_file.touch()
 
@@ -4125,38 +4778,209 @@ class TestProjectManagerProjectWorkspaces:
         mock_config.project_config = {}
         mock_config.env_config = {}
         mock_config.merged_config = {}
-        self._config_for_workspace_lookup(mock_config, {}, tmp_path)
-        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
-        # griptape_nodes_config.json, so it must return a real dict (not a Mock) for the child's
-        # branch-4 workspace inheritance. The child inherits the parent's workspace here (neither
-        # declares workspace_dir), which is orthogonal to the libraries_dir seam under test.
-        mock_config.read_config_file.return_value = {}
 
-        # Parent declares libraries_dir "./libraries"; child inherits (declares none).
-        parent_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "P", "libraries_dir": "./libraries"})
+        def get_config_value(key: str, *_args: object, default: object = None, **_kwargs: object) -> object:
+            if key == "project_workspaces":
+                return {}
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_file), str(child_file)]
+            return default
+
+        mock_config.get_config_value.side_effect = get_config_value
+        mock_config.workspace_path = tmp_path
+        # No adjacent config on any chain node: the parent-workspace walk reads each ancestor's
+        # griptape_nodes_config.json, so it must return a real dict (not a Mock).
+        mock_config.read_config_file.return_value = {}
+        mock_config.read_env_config.return_value = {}
+
+        # Model the on-disk overlays the disk walk reads: parent declares libraries_dir, child
+        # declares only its parent link. _read_overlay and the registered-path scan are stubbed
+        # so the walk resolves the parent from "disk" without a real ReadFileRequest.
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        path_to_overlay = {
+            _canon(parent_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="P", libraries_dir="./libraries"
+            ),
+            _canon(child_file): TestResolveWorkspaceDirForProjectId._make_overlay(project_id="C", parent_id="P"),
+        }
+
+        async def fake_read_overlay(project_file_path: Path, *, record_status: bool = True) -> object:  # noqa: ARG001
+            overlay = path_to_overlay.get(_canon(project_file_path))
+            if overlay is None:
+                return LoadProjectTemplateResultFailure(validation=validation, result_details="not found")
+            return validation, overlay
+
+        # Only the CHILD is loaded into the live registry; the parent is resolved from disk.
         child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(update={"id": "C", "parent_project_id": "P"})
         pm = self._make_project_manager_with_project(child_file, mock_config)
-        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
-        # Re-key the child's registry entry to its opaque id (parent link resolves by id), and add parent.
+        pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
+        pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
         del pm._successfully_loaded_project_templates[str(child_file)]
-        for pid, f, tmpl in [("P", parent_file, parent_template), ("C", child_file, child_template)]:
-            pm._successfully_loaded_project_templates[pid] = ProjectInfo(
-                project_id=pid,
-                project_file_path=f,
-                project_base_dir=f.parent,
-                template=tmpl,
-                validation=validation,
-                parsed_situation_schemas=pm._parse_situation_macros(tmpl.situations, validation),
-                parsed_directory_schemas=pm._parse_directory_macros(tmpl.directories, validation),
-            )
+        pm._successfully_loaded_project_templates["C"] = ProjectInfo(
+            project_id="C",
+            project_file_path=child_file,
+            project_base_dir=child_file.parent,
+            template=child_template,
+            validation=validation,
+            parsed_situation_schemas=pm._parse_situation_macros(child_template.situations, validation),
+            parsed_directory_schemas=pm._parse_directory_macros(child_template.directories, validation),
+        )
 
         await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
 
         # The override is set to the PARENT's libraries dir, resolved against the parent -- not the
-        # child's own dir, and not None (which would fall back to the workspace-relative default).
+        # child's own dir, and not None (which would fall back to the workspace-relative default) --
+        # even though the parent is NOT in the live registry.
         mock_config.set_libraries_root_override.assert_called_once_with(
             Path(str(canonicalize_for_identity(parent_file.parent / "libraries")))
         )
+
+    @staticmethod
+    def _build_child_pm_with_unloaded_parent(  # noqa: PLR0913
+        tmp_path: Path,
+        *,
+        parent_overlay_kwargs: dict[str, Any],
+        child_overlay_kwargs: dict[str, Any] | None = None,
+        project_workspaces: dict[str, str] | None = None,
+        configured_root: str | None = None,
+        child_adjacent_config: dict | None = None,
+    ) -> "tuple[ProjectManager, Mock, Path, Path]":
+        """Build a pm whose child is loaded but whose parent lives only on disk (#5149 setup).
+
+        Models the frozen-worker registry: the child is in the live registry, the parent is
+        readable from disk / projects_to_register but NOT loaded. Returns (pm, mock_config,
+        parent_file, child_file). The disk walk's _read_overlay and registered-path scan are
+        stubbed, so the parent resolves without a real ReadFileRequest.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectInfo
+
+        parent_file = tmp_path / "parent" / "griptape-nodes-project.yml"
+        parent_file.parent.mkdir(parents=True)
+        parent_file.touch()
+        child_file = tmp_path / "parent" / "child" / "griptape-nodes-project.yml"
+        child_file.parent.mkdir(parents=True)
+        child_file.touch()
+
+        mock_config = Mock()
+        mock_config.project_config = child_adjacent_config or {}
+        mock_config.env_config = {}
+        mock_config.merged_config = {}
+
+        def get_config_value(
+            key: str, *_args: object, default: object = None, config_source: str = "", **_kw: object
+        ) -> object:
+            if key == "project_workspaces":
+                return project_workspaces or {}
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_file), str(child_file)]
+            if key == "workspace_directory" and config_source == "user_config":
+                return configured_root
+            return default
+
+        mock_config.get_config_value.side_effect = get_config_value
+        mock_config.workspace_path = tmp_path
+        mock_config.read_config_file.return_value = {}
+        mock_config.read_env_config.return_value = {}
+
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        path_to_overlay = {
+            _canon(parent_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="P", **parent_overlay_kwargs
+            ),
+            _canon(child_file): TestResolveWorkspaceDirForProjectId._make_overlay(
+                project_id="C", parent_id="P", **(child_overlay_kwargs or {})
+            ),
+        }
+
+        async def fake_read_overlay(project_file_path: Path, *, record_status: bool = True) -> object:  # noqa: ARG001
+            overlay = path_to_overlay.get(_canon(project_file_path))
+            if overlay is None:
+                return LoadProjectTemplateResultFailure(validation=validation, result_details="not found")
+            return validation, overlay
+
+        child_template = DEFAULT_PROJECT_TEMPLATE.model_copy(
+            update={"id": "C", "parent_project_id": "P", **(child_overlay_kwargs or {})}
+        )
+        mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
+        pm = ProjectManager(mock_event_manager, mock_config, Mock())
+        pm._read_overlay = fake_read_overlay  # type: ignore[method-assign]
+        pm._resolve_registered_entry_paths = lambda _entries: [_canon(parent_file), _canon(child_file)]  # type: ignore[method-assign]
+        pm._successfully_loaded_project_templates["C"] = ProjectInfo(
+            project_id="C",
+            project_file_path=child_file,
+            project_base_dir=child_file.parent,
+            template=child_template,
+            validation=validation,
+            parsed_situation_schemas=pm._parse_situation_macros(child_template.situations, validation),
+            parsed_directory_schemas=pm._parse_directory_macros(child_template.directories, validation),
+        )
+        return pm, mock_config, parent_file, child_file
+
+    @pytest.mark.asyncio
+    async def test_activation_child_inherits_unloaded_parent_workspace(self, tmp_path: Path) -> None:
+        """#5149 regression: a child inherits its parent's workspace even when the parent is NOT loaded.
+
+        The parent declares workspace_dir "./" (its own dir). With the parent absent from the live
+        registry (the frozen-worker state), the old live branch-4 walk missed it and the child fell
+        to the global default. The disk walk resolves the parent from projects_to_register, so
+        set_workspace_override is called with the PARENT's dir regardless of load state.
+        """
+        from griptape_nodes.files.path_utils import canonicalize_for_identity as _canon
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={"workspace_dir": "./"},
+            configured_root="/global/ws",
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        mock_config.set_workspace_override.assert_called_once_with(Path(str(_canon(parent_file.parent))))
+
+    @pytest.mark.asyncio
+    async def test_activation_child_adjacent_workspace_beats_parent_and_is_unpinned(self, tmp_path: Path) -> None:
+        """A child's OWN adjacent workspace_directory (branch 3) wins over parent inheritance and is unpinned.
+
+        Branch 3 must be preserved by the disk path: when the child declares its own
+        workspace_directory, no override is applied (apply_override=False) so the workspace config
+        layer can re-point workspace_path, and the parent chain is never consulted.
+        """
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, _parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={"workspace_dir": "./"},
+            configured_root="/global/ws",
+            child_adjacent_config={"workspace_directory": "/child/explicit/ws"},
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        # Branch 3 is unpinned: no override is layered on top of the adjacent workspace_directory.
+        mock_config.set_workspace_override.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_activation_child_falls_to_global_when_no_ancestor_workspace(self, tmp_path: Path) -> None:
+        """No false positive: a child whose (unloaded) parent declares no workspace uses the global default."""
+        from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
+
+        pm, mock_config, _parent_file, _child_file = self._build_child_pm_with_unloaded_parent(
+            tmp_path,
+            parent_overlay_kwargs={},
+            configured_root="/global/ws",
+        )
+
+        await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id="C"))
+
+        # Branch 5 pins the RAW configured workspace_directory (canonicalization happens inside the
+        # real set_workspace_override, which is mocked here), so assert the unmodified config value.
+        mock_config.set_workspace_override.assert_called_once_with(Path("/global/ws"))
 
     @pytest.mark.asyncio
     async def test_activation_clears_libraries_root_override_when_none_in_chain(self, tmp_path: Path) -> None:
@@ -4254,16 +5078,17 @@ class TestProjectManagerProjectWorkspaces:
             parsed_directory_schemas=pm._parse_directory_macros(DEFAULT_PROJECT_TEMPLATE.directories, validation),
         )
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
-            mock_gn.WorkflowManager.return_value = Mock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
+            mock_engine.workflow_manager = Mock()
 
             # Activate the pinned project: the project layer adds pinned-lib, firing a reload.
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(pinned_file)))
             assert state["project_layer_active"] is True
 
-            mock_gn.ahandle_request.reset_mock()
+            mock_engine.ahandle_request.reset_mock()
 
             # Switch to system defaults: clear_project_layers drops the pinned-lib layer.
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=SYSTEM_DEFAULTS_KEY))
@@ -4272,7 +5097,7 @@ class TestProjectManagerProjectWorkspaces:
         assert state["project_layer_active"] is False
         assert mock_config.get_config_value(LIBRARIES_TO_REGISTER_KEY) == ["base-lib"]
         # ...and the reload fired on the switch to actually unload the pinned library.
-        mock_gn.ahandle_request.assert_called_once()
+        mock_engine.ahandle_request.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_unknown_project_id_remerges_after_clearing_layers(self, tmp_path: Path) -> None:
@@ -4300,9 +5125,10 @@ class TestProjectManagerProjectWorkspaces:
         pm = ProjectManager(mock_event_manager, mock_config, Mock())
         pm._initialization_complete = True
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(unknown_file)))
 
         mock_config.clear_project_layers.assert_called_once()
@@ -4328,12 +5154,13 @@ class TestProjectManagerProjectWorkspaces:
 
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock()
             await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
-            mock_gn.ahandle_request.assert_not_called()
-            mock_gn.WorkflowManager.assert_not_called()
+            mock_engine.ahandle_request.assert_not_called()
+            mock_engine.workflow_manager.refresh_workflow_registry.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_initialization_complete_same_workspace_reloads_libraries_only(self, tmp_path: Path) -> None:
@@ -4361,14 +5188,15 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         mock_workflow_manager = Mock()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
-            mock_gn.WorkflowManager.return_value = mock_workflow_manager
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
+            mock_engine.workflow_manager = mock_workflow_manager
 
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
 
-        mock_gn.ahandle_request.assert_called_once()
+        mock_engine.ahandle_request.assert_called_once()
         mock_workflow_manager.refresh_workflow_registry.assert_not_called()
         assert not result.altered_workflow_state
 
@@ -4403,10 +5231,11 @@ class TestProjectManagerProjectWorkspaces:
         from griptape_nodes.retained_mode.events.project_events import SetCurrentProjectRequest
 
         mock_workflow_manager = Mock()
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
-            mock_gn.WorkflowManager.return_value = mock_workflow_manager
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=ReloadAllLibrariesResultSuccess(result_details="ok"))
+            mock_engine.workflow_manager = mock_workflow_manager
 
             # Simulate workspace changing after config is applied
             def side_effect_set_workspace_override(_: object) -> None:
@@ -4417,7 +5246,7 @@ class TestProjectManagerProjectWorkspaces:
 
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(project_file)))
 
-        mock_gn.ahandle_request.assert_called_once()
+        mock_engine.ahandle_request.assert_called_once()
         mock_workflow_manager.refresh_workflow_registry.assert_called_once()
         assert result.altered_workflow_state
 
@@ -4448,9 +5277,10 @@ class TestProjectManagerProjectWorkspaces:
             SetCurrentProjectResultFailure,
         )
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReloadAllLibrariesResultFailure(result_details="reload failed")
             )
 
@@ -4584,11 +5414,11 @@ class TestRegisterProjectPath:
         """If the project_id is already registered, set_config_value is not called."""
         project_id = "/path/to/project.yml"
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = [project_id]
-            mock_gn.ConfigManager.return_value = mock_config
 
             pm._register_project_path(project_id)
 
@@ -4596,11 +5426,11 @@ class TestRegisterProjectPath:
 
     def test_register_exception_is_swallowed(self, pm: ProjectManager) -> None:
         """A config manager exception does not propagate out of _register_project_path."""
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.side_effect = RuntimeError("config failure")
-            mock_gn.ConfigManager.return_value = mock_config
 
             # Should not raise
             pm._register_project_path("/path/to/project.yml")
@@ -4633,11 +5463,11 @@ situations:
     @pytest.mark.asyncio
     async def test_empty_list_does_nothing(self, pm: ProjectManager) -> None:
         """An empty projects_to_register list results in no load attempts."""
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = []
-            mock_gn.ConfigManager.return_value = mock_config
 
             with patch.object(pm, "on_load_project_template_request", new=AsyncMock()) as mock_load:
                 await pm._load_registered_projects()
@@ -4646,11 +5476,11 @@ situations:
     @pytest.mark.asyncio
     async def test_none_config_return_does_nothing(self, pm: ProjectManager) -> None:
         """None from config (treated as empty via 'or []') results in no load attempts."""
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = None
-            mock_gn.ConfigManager.return_value = mock_config
 
             with patch.object(pm, "on_load_project_template_request", new=AsyncMock()) as mock_load:
                 await pm._load_registered_projects()
@@ -4678,11 +5508,11 @@ situations:
         )
         pm._successfully_loaded_project_templates[existing_path] = project_info
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_config = Mock()
             mock_config.get_config_value.return_value = [existing_path]
-            mock_gn.ConfigManager.return_value = mock_config
 
             with patch.object(pm, "on_load_project_template_request", new=AsyncMock()) as mock_load:
                 await pm._load_registered_projects()
@@ -4704,9 +5534,10 @@ situations:
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
                     file_size=len(yaml_content),
@@ -4743,12 +5574,13 @@ situations:
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
+        mock_engine = MagicMock()
         with (
-            patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
+            patch.object(pm, "_engine", mock_engine),
             patch.object(pm, "_register_project_path") as mock_register,
         ):
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
                     file_size=len(yaml_content),
@@ -4840,9 +5672,10 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=yaml_content,
                     file_size=len(yaml_content),
@@ -5021,9 +5854,10 @@ situations:
 
         absolute_path = (tmp_path / "project.yml").resolve()
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
                     file_size=len(self.VALID_PROJECT_YAML),
@@ -5086,9 +5920,10 @@ situations:
         absolute_path = (tmp_path / "project.yml").resolve()
         tilde_path = Path("~/project.yml")
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
                     file_size=len(self.VALID_PROJECT_YAML),
@@ -5348,11 +6183,12 @@ class TestProjectEnvironmentVariableRecursion:
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_name}_suffix"})
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             result = pm.on_get_path_for_macro_request(
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{WF}/x.png"), variables={})
@@ -5368,11 +6204,12 @@ class TestProjectEnvironmentVariableRecursion:
             environment={},
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             result = pm.on_get_path_for_macro_request(
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
@@ -5388,11 +6225,12 @@ class TestProjectEnvironmentVariableRecursion:
             environment={},
             directories={"inputs": "{workflow_dir}/inputs"},
         )
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             result = pm.on_get_path_for_macro_request(
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
@@ -5408,20 +6246,21 @@ class TestProjectEnvironmentVariableRecursion:
             environment={},
             directories={"inputs": "{workflow_dir?:/}inputs"},
         )
+        mock_engine = MagicMock()
         with (
-            patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn,
-            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_registry,
+            patch.object(pm, "_engine", mock_engine),
+            patch("griptape_nodes.retained_mode.managers.project_manager.WorkflowRegistry") as mock_workflow_registry,
         ):
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = True
             mock_context.get_current_workflow_name.return_value = "my_workflow"
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             mock_workflow = Mock()
             mock_workflow.file_path = "my_project/my_workflow.json"
-            mock_registry.get_workflow_by_name.return_value = mock_workflow
-            mock_registry.get_complete_file_path.return_value = "/workspace/my_project/my_workflow.json"
+            mock_workflow_registry.get_workflow_by_name.return_value = mock_workflow
+            mock_workflow_registry.get_complete_file_path.return_value = "/workspace/my_project/my_workflow.json"
 
             result = pm.on_get_path_for_macro_request(
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{inputs}/img.png"), variables={})
@@ -5434,11 +6273,12 @@ class TestProjectEnvironmentVariableRecursion:
         from griptape_nodes.common.macro_parser import ParsedMacro
 
         pm = self._make_pm_with_template(environment={"WF": "{workflow_dir?:/}sub"})
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
             mock_context = Mock()
             mock_context.has_current_workflow.return_value = False
-            mock_gn.ContextManager.return_value = mock_context
+            mock_engine.context_manager = mock_context
 
             result = pm.on_get_path_for_macro_request(
                 GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{WF}/x.png"), variables={})
@@ -5840,9 +6680,10 @@ directories:
         files = {
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.replace('parent_project_path: "{parent}"\n', "").format(),
         }
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -5866,9 +6707,10 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -5898,9 +6740,10 @@ directories:
             grandchild_path: self.GRANDCHILD_PROJECT_YAML_TEMPLATE.format(parent=child_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=grandchild_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -5927,9 +6770,10 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent="../base.yml"),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -5946,9 +6790,10 @@ directories:
         self_path = (tmp_path / "self.yml").resolve()
         files = {self_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=self_path.as_posix())}
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=self_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -5969,9 +6814,10 @@ directories:
             b_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=a_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -5989,9 +6835,10 @@ directories:
         child_path = (tmp_path / "child.yml").resolve()
         files = {child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=missing_parent.as_posix())}
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -6026,9 +6873,10 @@ directories:
             child_path: child_yaml,
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -6063,9 +6911,10 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent="../base.yml"),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             base_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=base_path))
             child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -6102,9 +6951,10 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent="./base.yml"),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=base_path))
             child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -6132,9 +6982,10 @@ directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -6183,9 +7034,10 @@ directories:
             grandchild_path: grandchild_yaml,
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=grandchild_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -6234,9 +7086,10 @@ file_extension_directories:
             child_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -6264,9 +7117,10 @@ file_extension_directories:
             sibling_b_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=base_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             a_result = await pm.on_load_project_template_request(
                 LoadProjectTemplateRequest(project_path=sibling_a_path)
             )
@@ -6297,9 +7151,10 @@ file_extension_directories:
             c_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent=a_path.as_posix()),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -6320,9 +7175,10 @@ file_extension_directories:
             b_path: self.CHILD_PROJECT_YAML_TEMPLATE.format(parent="./a.yml"),
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=a_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -6412,9 +7268,10 @@ directories:
         )
 
         files = {parent_path: parent_yaml}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
         assert isinstance(result, LoadProjectTemplateResultSuccess)
 
@@ -6623,9 +7480,10 @@ directories:
 
         # Round-trip: reload the child and confirm the inherited description is cleared.
         files = {parent_path: parent_yaml, child_path: child_path.read_text()}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             child_load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
         assert isinstance(child_load, LoadProjectTemplateResultSuccess)
         assert child_load.template.directories["outputs"].description is None
@@ -6830,9 +7688,10 @@ parent_project_path: "{grandparent_path.as_posix()}"
             grandparent_path: grandparent_yaml,
             parent_path: parent_yaml,
         }
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             gp_load = await pm.on_load_project_template_request(
                 LoadProjectTemplateRequest(project_path=grandparent_path)
             )
@@ -7056,9 +7915,10 @@ situations:
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
                     file_size=len(self.VALID_PROJECT_YAML),
@@ -7095,9 +7955,10 @@ situations:
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
                     file_size=len(self.VALID_PROJECT_YAML),
@@ -7193,9 +8054,10 @@ situations:
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = AsyncMock(
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
                 return_value=ReadFileResultSuccess(
                     content=self.VALID_PROJECT_YAML,
                     file_size=len(self.VALID_PROJECT_YAML),
@@ -7288,9 +8150,10 @@ directories:
             child_path: child_yaml,
         }
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7321,9 +8184,10 @@ directories:
         )
         files = {child_path: child_yaml}
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7355,9 +8219,10 @@ directories:
         )
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7387,9 +8252,10 @@ directories:
         )
         files = {base_path: self.BASE_PROJECT_YAML, child_path: child_yaml}
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7463,6 +8329,7 @@ situations:
     @pytest.fixture
     def pm(self) -> ProjectManager:
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -7553,9 +8420,12 @@ situations:
 
     @pytest.mark.asyncio
     async def test_unloadable_workspace_project_is_failure(self, pm: ProjectManager, tmp_path: Path) -> None:
-        """A project file that resolves but fails to load returns Failure (still on system defaults)."""
-        from griptape_nodes.files.file import FileLoadError
-        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        """A project file that resolves but fails to load returns Failure (still on system defaults).
+
+        The seed loads through _load_and_cache_project_template (ReadFileRequest). A directory
+        at the seed path passes the existence check but fails the file read, so activation
+        never takes and the handler returns Failure.
+        """
         from griptape_nodes.retained_mode.events.project_events import (
             ActivateWorkspaceProjectRequest,
             ActivateWorkspaceProjectResultFailure,
@@ -7564,9 +8434,9 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
-        # File exists so the path resolves, but the read fails so activation cannot take.
+        # A directory at the seed path exists (path resolves) but cannot be read as a file.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
-        workspace_project_path.write_text(self.VALID_PROJECT_YAML)
+        workspace_project_path.mkdir()
 
         def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
             if key == "project_file":
@@ -7578,17 +8448,7 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(
-                side_effect=FileLoadError(
-                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
-                    result_details="permission denied",
-                )
-            )
-            mock_file_cls.return_value = mock_file_instance
-
-            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
 
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
@@ -7612,6 +8472,8 @@ situations:
 
         self._setup_system_defaults(pm, str(tmp_path))
 
+        # Malformed YAML on disk: the delegated loader reads it via ReadFileRequest and
+        # fails to parse it, so the handler surfaces the failure detail.
         workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
         workspace_project_path.write_text("not: valid: yaml: : :\n  - broken")
 
@@ -7625,16 +8487,73 @@ situations:
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
         cast("Mock", pm._config_manager).workspace_path = tmp_path
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
-            mock_file_instance = Mock()
-            mock_file_instance.aread_text = AsyncMock(return_value="not: valid: yaml: : :\n  - broken")
-            mock_file_cls.return_value = mock_file_instance
-
-            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
 
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert str(workspace_project_path) in str(result.result_details)
         assert "Failed because" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_activate_child_seed_resolves_id_parent_registered_only_in_config(
+        self, pm: ProjectManager, tmp_path: Path
+    ) -> None:
+        """The app-orchestrator seam resolves a child seed's id-parent that is only registered.
+
+        This is the seam GUI boot drives (on_activate_workspace_project_request runs before
+        _load_registered_projects, so the live registry is empty). The seed's parent chain
+        must still resolve via the boot id-index that _load_workspace_project builds, so a
+        child whose parent lives only in projects_to_register inherits the parent's
+        directories on boot rather than silently dropping them.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultSuccess,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import WORKSPACE_PROJECT_FILE
+        from griptape_nodes.retained_mode.managers.settings import PROJECTS_TO_REGISTER_KEY
+
+        self._setup_system_defaults(pm, str(tmp_path))
+
+        parent_dir = tmp_path / "parent"
+        parent_dir.mkdir()
+        parent_path = parent_dir / "griptape-nodes-project.yml"
+        parent_path.write_text(
+            "project_template_schema_version: '1.0.0'\n"
+            "name: Parent\n"
+            "id: parent-abc\n"
+            "directories:\n"
+            "  prompts:\n"
+            "    path_macro: prompts\n"
+        )
+
+        # Child is the workspace-dir seed; only the parent is in projects_to_register, so
+        # it is NOT in the live registry when the seam runs.
+        child_path = tmp_path / WORKSPACE_PROJECT_FILE
+        child_path.write_text(
+            "project_template_schema_version: '1.0.0'\nname: Child\nid: child-xyz\nparent_project_id: 'parent-abc'\n"
+        )
+
+        def get_config_value_side_effect(key: str, **_: object) -> object:
+            if key == "project_file":
+                return None
+            if key == PROJECTS_TO_REGISTER_KEY:
+                return [str(parent_path)]
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+        cast("Mock", pm._config_manager).read_config_file.return_value = {}
+
+        result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultSuccess)
+        assert pm._current_project_id == "child-xyz"
+        child_info = pm._successfully_loaded_project_templates["child-xyz"]
+        assert "prompts" in child_info.template.directories
+        # The boot id-index is boot-only and cleared once the seed load finishes.
+        assert pm._boot_id_to_file_path == {}
 
 
 class TestProjectId:
@@ -7692,6 +8611,7 @@ parent_project_id: "ghost-parent-id"
     @pytest.fixture
     def pm(self, tmp_path: Path) -> ProjectManager:
         mock_event_manager = Mock()
+        mock_event_manager.evaluate_authorization_checkpoint.return_value = None
         mock_config_manager = Mock()
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
@@ -7749,9 +8669,10 @@ parent_project_id: "ghost-parent-id"
 
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7775,9 +8696,10 @@ parent_project_id: "ghost-parent-id"
 
         project_path = (tmp_path / "legacy.yml").resolve()
         files = {project_path: self.LEGACY_NO_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
         assert isinstance(result, LoadProjectTemplateResultSuccess)
@@ -7796,9 +8718,10 @@ parent_project_id: "ghost-parent-id"
         path_a = (tmp_path / "a.yml").resolve()
         path_b = (tmp_path / "b.yml").resolve()
         files = {path_a: self.EXPLICIT_ID_YAML, path_b: self.EXPLICIT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             first = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=path_a))
             second = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=path_b))
 
@@ -7821,9 +8744,10 @@ parent_project_id: "ghost-parent-id"
 
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             first = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
             second = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
@@ -7996,9 +8920,10 @@ parent_project_id: "ghost-parent-id"
 
         project_path = (tmp_path / "explicit.yml").resolve()
         files = {project_path: self.EXPLICIT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             load = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
         assert isinstance(load, LoadProjectTemplateResultSuccess)
 
@@ -8033,9 +8958,10 @@ parent_project_id: "ghost-parent-id"
         parent_path = (tmp_path / "parent.yml").resolve()
         child_path = (tmp_path / "child.yml").resolve()
         files = {parent_path: self.PARENT_WITH_ID_YAML, child_path: self.CHILD_BY_PARENT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             parent = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
             child = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
@@ -8059,9 +8985,10 @@ parent_project_id: "ghost-parent-id"
 
         child_path = (tmp_path / "orphan.yml").resolve()
         files = {child_path: self.CHILD_MISSING_PARENT_ID_YAML}
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
         assert isinstance(result, LoadProjectTemplateResultFailure)
@@ -8085,9 +9012,10 @@ parent_project_id: "ghost-parent-id"
 
         cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
 
-        with patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes") as mock_gn:
-            mock_gn.EventManager.return_value.evaluate_authorization_checkpoint.return_value = None
-            mock_gn.ahandle_request = self._file_router(files)
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
             await pm._load_registered_projects()
 
         # Both loaded despite the child-before-parent ordering.
@@ -8107,9 +9035,8 @@ class TestProjectActivationAuthorizationCheckpoint:
         return ProjectManager(Mock(), Mock(), Mock())
 
     @pytest.mark.asyncio
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
     async def test_denied_activation_is_rejected_and_leaves_current_project(
-        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
+        self, project_manager: ProjectManager
     ) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
             SetCurrentProjectRequest,
@@ -8118,7 +9045,7 @@ class TestProjectActivationAuthorizationCheckpoint:
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
         from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
-        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+        cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = CheckpointDenial(
             failures=(CheckpointFailure(detail="Ask your admin to grant access to acme-prod."),)
         )
         # A denying activation must roll nowhere: _activate_project never runs.
@@ -8135,10 +9062,7 @@ class TestProjectActivationAuthorizationCheckpoint:
         activate.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    async def test_empty_failure_denial_still_yields_a_reason(
-        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
-    ) -> None:
+    async def test_empty_failure_denial_still_yields_a_reason(self, project_manager: ProjectManager) -> None:
         # A hook that misuses the contract by returning a denial with no failures
         # (it should return None to allow) must still produce a reason, not an
         # empty "Failed because: " tail.
@@ -8148,7 +9072,7 @@ class TestProjectActivationAuthorizationCheckpoint:
         )
         from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
 
-        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+        cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = CheckpointDenial(
             failures=()
         )
         activate = AsyncMock()
@@ -8162,23 +9086,46 @@ class TestProjectActivationAuthorizationCheckpoint:
         activate.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch("griptape_nodes.retained_mode.managers.project_manager.GriptapeNodes")
-    async def test_system_defaults_bypasses_checkpoint(
-        self, mock_griptape_nodes: Mock, project_manager: ProjectManager
-    ) -> None:
+    async def test_system_defaults_evaluates_checkpoint(self, project_manager: ProjectManager) -> None:
         from griptape_nodes.retained_mode.events.project_events import (
             SetCurrentProjectRequest,
             SetCurrentProjectResultSuccess,
         )
-        from griptape_nodes.retained_mode.managers.project_manager import _ProjectActivationOutcome
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, _ProjectActivationOutcome
 
+        # The engine bakes in no exemption: the rest state is gated like any other
+        # project. The consumer allows it (returns None), so activation proceeds.
+        checkpoint = cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint
+        checkpoint.return_value = None
         outcome = _ProjectActivationOutcome(failure=None, workspace_changed=False)
         with patch.object(project_manager, "_activate_project", new=AsyncMock(return_value=outcome)):
             result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
 
         assert isinstance(result, SetCurrentProjectResultSuccess)
-        # The rest state is always allowed; the checkpoint is never consulted.
-        mock_griptape_nodes.EventManager.return_value.evaluate_authorization_checkpoint.assert_not_called()
+        # The checkpoint is consulted even for the rest state; the policy decides.
+        checkpoint.assert_called_once()
+        assert checkpoint.call_args.args[0].subject_id == SYSTEM_DEFAULTS_KEY
+
+    @pytest.mark.asyncio
+    async def test_system_defaults_denial_blocks_activation(self, project_manager: ProjectManager) -> None:
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+
+        # A consumer is free to deny even the rest state; the engine enforces that
+        # decision rather than exempting the defaults on its own.
+        cast("Mock", project_manager._event_manager).evaluate_authorization_checkpoint.return_value = CheckpointDenial(
+            failures=(CheckpointFailure(detail="No license covers the default project."),)
+        )
+        activate = AsyncMock()
+        with patch.object(project_manager, "_activate_project", new=activate):
+            result = await project_manager.on_set_current_project_request(SetCurrentProjectRequest(project_id=None))
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "No license covers the default project." in str(result.result_details)
+        activate.assert_not_called()
 
 
 # A minimal but realistic standalone project template used to seed an on-disk
@@ -9158,3 +10105,1121 @@ class TestImportProject:
         import_result = await pm.on_import_project_request(import_request)
         assert isinstance(import_result, ImportProjectResultSuccess)
         assert import_result.project_id in pm._successfully_loaded_project_templates
+
+
+class TestProjectManagerGetProjectChain:
+    """`get_project_chain` resolves a project and its ancestors, leaf-first."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    @staticmethod
+    def _register(
+        pm: ProjectManager,
+        project_id: str,
+        *,
+        name: str | None = None,
+        parent_id: str | None = None,
+        file: Path | None = None,
+    ) -> None:
+        """Register an id-linked project directly in the in-memory registry.
+
+        The parent link is an explicit `parent_project_id`, so the walk resolves it
+        through the registry without touching disk; `name` rides on the template so
+        each chain entry can assert a distinct display name.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
+        from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        update: dict[str, Any] = {"id": project_id, "parent_project_id": parent_id}
+        if name is not None:
+            update["name"] = name
+        template = DEFAULT_PROJECT_TEMPLATE.model_copy(update=update)
+        pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+            project_id=project_id,
+            project_file_path=file,
+            project_base_dir=file.parent if file is not None else Path("/"),
+            template=template,
+            validation=ProjectValidationInfo(status=ProjectValidationStatus.GOOD),
+            parsed_situation_schemas={},
+            parsed_directory_schemas={},
+        )
+
+    def test_chain_for_parentless_project_is_just_itself(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "solo", name="Solo")
+        pm._current_project_id = "solo"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="solo", name="Solo")]
+
+    def test_chain_walks_parents_leaf_first(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "mid", name="Mid", parent_id="root")
+        self._register(pm, "leaf", name="Leaf", parent_id="mid")
+        pm._current_project_id = "leaf"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="mid", name="Mid"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_accepts_explicit_project_id_overriding_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "root", name="Root")
+        self._register(pm, "leaf", name="Leaf", parent_id="root")
+        pm._current_project_id = "root"
+        assert pm.get_project_chain("leaf") == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="root", name="Root"),
+        ]
+
+    def test_chain_breaks_on_cycle_without_repeating(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        # a -> b -> a: the walk must terminate at the first repeated id.
+        self._register(pm, "a", name="A", parent_id="b")
+        self._register(pm, "b", name="B", parent_id="a")
+        pm._current_project_id = "a"
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="a", name="A"),
+            ProjectChainEntry(id="b", name="B"),
+        ]
+
+    def test_chain_surfaces_unregistered_parent_by_id_then_stops(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        self._register(pm, "leaf", name="Leaf", parent_id="ghost")
+        pm._current_project_id = "leaf"
+        # The unregistered parent's id is surfaced (so a policy can still match it),
+        # but it has no template to walk further and no resolved name.
+        assert pm.get_project_chain() == [
+            ProjectChainEntry(id="leaf", name="Leaf"),
+            ProjectChainEntry(id="ghost", name=None),
+        ]
+
+    def test_chain_for_unregistered_start_is_just_its_id(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectChainEntry
+
+        pm = self._pm()
+        pm._current_project_id = "missing"
+        assert pm.get_project_chain() == [ProjectChainEntry(id="missing", name=None)]
+
+    def test_chain_defaults_to_current_project(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = self._pm()
+        # __init__ registers system defaults and points the current id at them.
+        chain = pm.get_project_chain()
+        assert [entry.id for entry in chain] == [SYSTEM_DEFAULTS_KEY]
+
+
+class TestHypotheticalMacroResolution:
+    """project_id on macro requests: 'how WOULD this macro resolve if I were on project Y?'."""
+
+    @staticmethod
+    def _pm_with_two_projects() -> ProjectManager:
+        """Build a ProjectManager with a current project X and a loaded-but-not-current project Y.
+
+        Both define an {outputs} directory anchored at {project_dir}, so the same macro
+        resolves to different paths depending on which project context is selected.
+        """
+        from griptape_nodes.common.project_templates import (
+            DirectoryDefinition,
+            ProjectTemplate,
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import ProjectInfo
+
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/workspace")
+        mock_config.get_config_value.return_value = "staticfiles"
+        pm = ProjectManager(Mock(), mock_config, Mock())
+
+        from griptape_nodes.common.project_templates.situation import (
+            SituationFilePolicy,
+            SituationPolicy,
+            SituationTemplate,
+        )
+
+        for project_name, base_dir in (("project_x", Path("/projects/x")), ("project_y", Path("/projects/y"))):
+            template = ProjectTemplate(
+                project_template_schema_version="0.1.0",
+                name=project_name,
+                directories={
+                    "outputs": DirectoryDefinition(name="outputs", path_macro="{project_dir}/outputs"),
+                },
+                situations={
+                    "save_output": SituationTemplate(
+                        name="save_output",
+                        macro=f"{{outputs}}/{project_name}_{{file_name}}",
+                        policy=SituationPolicy(on_collision=SituationFilePolicy.OVERWRITE, create_dirs=True),
+                    ),
+                },
+                environment={},
+            )
+            validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+            project_id = str(base_dir / "project.yml")
+            pm._successfully_loaded_project_templates[project_id] = ProjectInfo(
+                project_id=project_id,
+                project_file_path=base_dir / "project.yml",
+                project_base_dir=base_dir,
+                template=template,
+                validation=validation,
+                parsed_situation_schemas=pm._parse_situation_macros(template.situations, validation),
+                parsed_directory_schemas=pm._parse_directory_macros(template.directories, validation),
+            )
+
+        pm._current_project_id = str(Path("/projects/x") / "project.yml")
+        return pm
+
+    def test_path_resolves_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id=project_y)
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/y/outputs/img.png")
+
+    def test_path_project_id_none_uses_current(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={})
+        )
+        assert isinstance(result, GetPathForMacroResultSuccess)
+        assert result.resolved_path == Path("/projects/x/outputs/img.png")
+
+    def test_path_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_path_for_macro_request(
+            GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/img.png"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetPathForMacroResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_state_analysis_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(
+                parsed_macro=ParsedMacro("{outputs}/{file_name}"), variables={}, project_id=project_y
+            )
+        )
+        assert isinstance(result, GetStateForMacroResultSuccess)
+        assert "outputs" in result.satisfied_variables
+        assert "file_name" in result.missing_required_variables
+        assert not result.can_resolve
+
+    def test_state_analysis_unknown_project_id_fails_cleanly(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_state_for_macro_request(
+            GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}"), variables={}, project_id="not_loaded")
+        )
+        assert isinstance(result, GetStateForMacroResultFailure)
+
+    def test_match_auto_resolve_builtins_against_hypothetical_project(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id=project_y,
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultSuccess)
+        assert result.match_failure is None
+        assert result.extracted_variables is not None
+        assert result.extracted_variables["file_name"] == "render.exr"
+
+    def test_match_auto_resolve_unknown_project_id_fails(self) -> None:
+        from griptape_nodes.common.macro_parser import ParsedMacro
+
+        pm = self._pm_with_two_projects()
+        result = pm.on_match_path_against_macro_request(
+            AttemptMatchPathAgainstMacroRequest(
+                parsed_macro=ParsedMacro("{project_dir}/{file_name}"),
+                file_path="/projects/y/render.exr",
+                known_variables={},
+                auto_resolve_builtins=True,
+                project_id="not_loaded",
+            )
+        )
+        assert isinstance(result, AttemptMatchPathAgainstMacroResultFailure)
+
+    def test_stored_project_variable_fills_macro(self) -> None:
+        """A stored project variable participates in path resolution (below caller, above env)."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"), variables={})
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc042/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_caller_supplied_value_beats_stored_project_variable(self) -> None:
+        """Precedence: caller-supplied > stored project variable."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_path_for_macro_request(
+                GetPathForMacroRequest(
+                    parsed_macro=ParsedMacro("{outputs}/{shot_code}/img.png"),
+                    variables={"shot_code": "sc999"},
+                )
+            )
+            assert isinstance(result, GetPathForMacroResultSuccess)
+            assert result.resolved_path == Path("/projects/x/outputs/sc999/img.png")
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+    def test_get_situation_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id=project_y))
+        assert isinstance(result, GetSituationResultSuccess)
+        # Each project's situation macro embeds its own name — proves the selected
+        # project's template answered, not the current one.
+        assert "project_y" in result.situation.macro
+
+    def test_get_situation_project_id_none_uses_current(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output"))
+        assert isinstance(result, GetSituationResultSuccess)
+        assert "project_x" in result.situation.macro
+
+    def test_get_situation_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_situation_request(GetSituationRequest(situation_name="save_output", project_id="not_loaded"))
+        assert isinstance(result, GetSituationResultFailure)
+        assert "not_loaded" in str(result.result_details)
+
+    def test_get_all_situations_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_get_all_situations_for_project_request(GetAllSituationsForProjectRequest(project_id=project_y))
+        assert isinstance(result, GetAllSituationsForProjectResultSuccess)
+        assert "project_y" in result.situations["save_output"]
+
+    def test_get_all_situations_unknown_project_id_fails_cleanly(self) -> None:
+        pm = self._pm_with_two_projects()
+        result = pm.on_get_all_situations_for_project_request(
+            GetAllSituationsForProjectRequest(project_id="not_loaded")
+        )
+        assert isinstance(result, GetAllSituationsForProjectResultFailure)
+
+    def test_map_absolute_path_against_hypothetical_project(self) -> None:
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/y/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path == "{outputs}/render.exr"
+
+    def test_map_absolute_path_outside_hypothetical_project_returns_none(self) -> None:
+        """A path inside CURRENT project X is outside hypothetical project Y — mapped_path None."""
+        pm = self._pm_with_two_projects()
+        project_y = str(Path("/projects/y") / "project.yml")
+        result = pm.on_attempt_map_absolute_path_to_project_request(
+            AttemptMapAbsolutePathToProjectRequest(
+                absolute_path=Path("/projects/x/outputs/render.exr"), project_id=project_y
+            )
+        )
+        assert isinstance(result, AttemptMapAbsolutePathToProjectResultSuccess)
+        assert result.mapped_path is None
+
+    def test_state_analysis_counts_stored_project_variable_satisfied(self) -> None:
+        """State analysis agrees with path resolution about stored project variables."""
+        from griptape_nodes.common.macro_parser import ParsedMacro
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer
+
+        pm = self._pm_with_two_projects()
+        project_x = str(Path("/projects/x") / "project.yml")
+        variables_manager = GriptapeNodes.VariablesManager()
+        stored_layer = VariableLayer()
+        stored_layer.set(FlowVariable(name="shot_code", owning_flow_name=None, type="str", value="sc042"))
+        variables_manager.set_project_variables(project_x, stored_layer)
+        try:
+            result = pm.on_get_state_for_macro_request(
+                GetStateForMacroRequest(parsed_macro=ParsedMacro("{outputs}/{shot_code}"), variables={})
+            )
+            assert isinstance(result, GetStateForMacroResultSuccess)
+            assert "shot_code" in result.satisfied_variables
+            assert result.can_resolve
+        finally:
+            variables_manager.remove_project_variables(project_x)
+
+
+class TestProjectVariableResolution:
+    """ProjectManager's computed-variable surface: resolve_project_variable + project_computed_names."""
+
+    @staticmethod
+    def _pm() -> ProjectManager:
+        return ProjectManager(Mock(), Mock(), Mock())
+
+    def test_computed_names_include_builtins_for_current_project(self) -> None:
+        pm = self._pm()
+        names = pm.project_computed_names(project_id=None)
+        assert "workspace_dir" in names
+        assert "project_dir" in names
+        assert "workflow_dir" in names
+
+    def test_computed_names_unknown_project_is_empty(self) -> None:
+        pm = self._pm()
+        assert pm.project_computed_names(project_id="not_loaded") == set()
+
+    def test_resolve_project_id_none_maps_to_current(self) -> None:
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = self._pm()
+        assert pm.resolve_project_id(None) == SYSTEM_DEFAULTS_KEY
+        assert pm.resolve_project_id("not_loaded") is None
+
+    def test_resolve_builtin_returns_plain_snapshot(self) -> None:
+        from griptape_nodes.retained_mode.variable_types import FlowVariable, VariablePermission
+
+        pm = self._pm()
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        assert type(variable) is FlowVariable
+        # Production stringifies the Path, so compare via str(Path) — on Windows the
+        # separators come back as backslashes.
+        assert variable.value == str(synthetic_ws)
+        assert variable.permission is VariablePermission.READ_ONLY
+
+    def test_resolve_unknown_name_raises_value_error(self) -> None:
+        pm = self._pm()
+        with pytest.raises(ValueError, match="Unknown computed project variable"):
+            pm.resolve_project_variable("not_defined_anywhere", project_id=None)
+
+    def test_resolve_unknown_project_raises_value_error(self) -> None:
+        pm = self._pm()
+        with pytest.raises(ValueError, match="not loaded"):
+            pm.resolve_project_variable("workspace_dir", project_id="not_loaded")
+
+    def test_resolve_context_not_ready_propagates(self) -> None:
+        """A builtin whose live context isn't ready raises for the caller to handle."""
+        pm = self._pm()
+
+        def blow_up(name: str, project_info: object) -> str:  # noqa: ARG001
+            msg = "context not ready"
+            raise RuntimeError(msg)
+
+        with (
+            patch.object(pm, "_get_builtin_variable_value", side_effect=blow_up),
+            pytest.raises(RuntimeError, match="context not ready"),
+        ):
+            pm.resolve_project_variable("workflow_dir", project_id=None)
+
+    def test_resolved_snapshot_serializes_cleanly(self) -> None:
+        """Regression: the snapshot must survive cattrs unstructure (no live resolver attached)."""
+        from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
+
+        pm = self._pm()
+        synthetic_ws = Path("/synthetic/ws")
+        pm._config_manager.workspace_path = synthetic_ws
+        variable = pm.resolve_project_variable("workspace_dir", project_id=None)
+        serialized = safe_unstructure(variable)
+        assert serialized["name"] == "workspace_dir"
+        # Compare via str(Path): Windows stringifies with backslash separators.
+        assert serialized["value"] == str(synthetic_ws)
+
+
+class TestWritableProjectVariables:
+    """#5142: project.yml `variables:` — schema, load-install, merge, write-through, persistence."""
+
+    # The int-typed test variable's value, shared by the YAML fixture and assertions.
+    FRAME_START = 1001
+
+    @pytest.fixture(autouse=True)
+    def _flow_context(self) -> "Any":
+        """Bootstrap a workflow + flow: variable requests resolve a starting flow before scope logic."""
+        from griptape_nodes.retained_mode.events.flow_events import CreateFlowRequest, CreateFlowResultSuccess
+        from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        gn = GriptapeNodes()
+        gn.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        gn.ContextManager().push_workflow("p4_test_wf")
+        result = gn.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="p4_test_flow", set_as_new_context=True)
+        )
+        assert isinstance(result, CreateFlowResultSuccess)
+        yield
+        gn.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+    VARIABLES_YAML = """
+variables:
+  shot_code:
+    value: sc042
+  frame_start:
+    value: 1001
+    type: int
+  facility:
+    value: mtl
+    permission: read_only
+"""
+
+    @staticmethod
+    def _write_and_load(tmp_path: Path, extra_yaml: str) -> str:
+        """Write a minimal project.yml with the given extra section, load it, return project_id."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_yml = tmp_path / "project_template.yml"
+        base_yaml = DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        project_yml.write_text(base_yaml + extra_yaml)
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        return load_result.project_id
+
+    @staticmethod
+    def _unload(project_id: str) -> None:
+        from griptape_nodes.retained_mode.events.project_events import UnregisterProjectTemplateRequest
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        GriptapeNodes.handle_request(UnregisterProjectTemplateRequest(project_id=project_id))
+
+    def test_schema_parses_value_type_permission(self) -> None:
+        from griptape_nodes.common.project_templates import ProjectVariableDef
+        from griptape_nodes.retained_mode.variable_types import VariablePermission
+
+        var = ProjectVariableDef(
+            name="frame_start", value=self.FRAME_START, type="int", permission=VariablePermission.READ_ONLY
+        )
+        assert var.value == self.FRAME_START
+        assert var.type == "int"
+        assert var.permission is VariablePermission.READ_ONLY
+        # Defaults: type str, permission read_write.
+        var2 = ProjectVariableDef(name="shot", value="sc042")
+        assert var2.type == "str"
+        assert var2.permission is VariablePermission.READ_WRITE
+
+    def test_schema_rejects_bool_and_type_mismatch(self) -> None:
+        from pydantic import ValidationError
+
+        from griptape_nodes.common.project_templates import ProjectVariableDef
+
+        # Strict value types: a YAML bool is neither a StrictStr nor a StrictInt
+        # (bool is excluded from strict int), so it fails both union branches.
+        with pytest.raises(ValidationError):
+            ProjectVariableDef(name="flag", value=True)
+        with pytest.raises(ValidationError, match="declares type 'int'"):
+            ProjectVariableDef(name="shot", value="sc042", type="int")
+
+    def test_load_installs_stored_layer(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariablePermission
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            variables_manager = GriptapeNodes.VariablesManager()
+            values = variables_manager.stored_project_variable_values(project_id)
+            assert values == {"shot_code": "sc042", "frame_start": self.FRAME_START, "facility": "mtl"}
+            stored = {v.name: v for v in variables_manager.stored_project_variables(project_id)}
+            assert stored["frame_start"].type == "int"
+            assert stored["facility"].permission is VariablePermission.READ_ONLY
+            assert stored["shot_code"].permission is VariablePermission.READ_WRITE
+        finally:
+            self._unload(project_id)
+
+    def test_unload_removes_stored_layer(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        self._unload(project_id)
+        assert GriptapeNodes.VariablesManager().stored_project_variable_values(project_id) == {}
+
+    def test_collision_with_computed_name_warns_and_is_shadowed(self, tmp_path: Path) -> None:
+        """A variable named like a builtin loads with a warning; resolution returns the builtin."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        project_yml = tmp_path / "project_template.yml"
+        base_yaml = DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+        project_yml.write_text(base_yaml + "\nvariables:\n  workspace_dir:\n    value: /hijack\n")
+        load_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=project_yml))
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        try:
+            warnings = [p for p in load_result.validation.problems if "workspace_dir" in p.message]
+            assert warnings, "expected a collision warning for workspace_dir"
+            # Resolution: computed wins — the stored /hijack value is unreachable.
+            pm = GriptapeNodes.ProjectManager()
+            resolved = pm.resolve_project_variable("workspace_dir", project_id=load_result.project_id)
+            assert resolved.value != "/hijack"
+        finally:
+            self._unload(load_result.project_id)
+
+    def test_parent_child_merge_overlay_and_tombstone(self) -> None:
+        """Child overlay: replaces one entry, tombstones another, inherits the rest."""
+        from griptape_nodes.common.project_templates import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+            load_partial_project_template,
+        )
+        from griptape_nodes.common.project_templates.project import ProjectTemplate
+
+        base_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: parent
+variables:
+  shot_code:
+    value: sc042
+  facility:
+    value: mtl
+  frame_start:
+    value: 1001
+    type: int
+"""
+        child_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: child
+variables:
+  shot_code:
+    value: sc099
+  facility: null
+"""
+        base_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        base_overlay = load_partial_project_template(base_yaml, base_validation)
+        assert base_overlay is not None
+        base = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, base_overlay, base_validation)
+
+        child_validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        child_overlay = load_partial_project_template(child_yaml, child_validation)
+        assert child_overlay is not None
+        merged = ProjectTemplate.merge(base, child_overlay, child_validation)
+
+        assert merged.variables["shot_code"].value == "sc099"  # overridden
+        assert "facility" not in merged.variables  # tombstoned
+        assert merged.variables["frame_start"].value == self.FRAME_START  # inherited
+
+    def test_merge_invalid_entry_is_validation_error_not_crash(self) -> None:
+        from griptape_nodes.common.project_templates import (
+            ProjectValidationInfo,
+            ProjectValidationStatus,
+            load_partial_project_template,
+        )
+        from griptape_nodes.common.project_templates.project import ProjectTemplate
+
+        bad_yaml = f"""
+project_template_schema_version: "{DEFAULT_PROJECT_TEMPLATE.project_template_schema_version}"
+name: bad
+variables:
+  flag:
+    value: true
+"""
+        validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
+        overlay = load_partial_project_template(bad_yaml, validation)
+        assert overlay is not None
+        merged = ProjectTemplate.merge(DEFAULT_PROJECT_TEMPLATE, overlay, validation)
+        assert "flag" not in merged.variables
+        assert any("flag" in p.field_path for p in validation.problems)
+
+    def test_set_value_writes_through_and_persists(self, tmp_path: Path) -> None:
+        """SetVariableValue on a READ_WRITE project variable mutates the layer AND the file."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="shot_code",
+                    value="sc777",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultSuccess)
+            # Layer updated:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc777"
+            # File updated (eager persistence):
+            assert "sc777" in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_read_only_project_variable_refuses_write(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="facility",
+                    value="nyc",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultFailure)
+            assert "read-only" in str(result.result_details)
+            # Unchanged in the layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["facility"] == "mtl"
+        finally:
+            self._unload(project_id)
+
+    def test_persisted_write_survives_reload(self, tmp_path: Path) -> None:
+        """Write → unload → reload from disk: the new value comes back."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        result = GriptapeNodes.handle_request(
+            SetVariableValueRequest(
+                name="shot_code", value="sc777", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id
+            )
+        )
+        assert isinstance(result, SetVariableValueResultSuccess)
+        self._unload(project_id)
+
+        reloaded_id = self._write_and_load_existing(tmp_path)
+        try:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(reloaded_id)
+            assert values["shot_code"] == "sc777"
+            # Untouched entries also survive the persist→reload round-trip.
+            assert values["frame_start"] == self.FRAME_START
+        finally:
+            self._unload(reloaded_id)
+
+    @staticmethod
+    def _write_and_load_existing(tmp_path: Path) -> str:
+        """Load the already-written project.yml (no rewrite)."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+        load_result = GriptapeNodes.handle_request(
+            LoadProjectTemplateRequest(project_path=tmp_path / "project_template.yml")
+        )
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+        return load_result.project_id
+
+    def test_delete_project_variable_writes_through_and_persists(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            DeleteVariableRequest,
+            DeleteVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                DeleteVariableRequest(name="shot_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id)
+            )
+            assert isinstance(result, DeleteVariableResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert "shot_code" not in values
+            assert "shot_code" not in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_writes_through_and_persists(self, tmp_path: Path) -> None:
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="shot_id",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert "shot_code" not in values
+            assert values["shot_id"] == "sc042"
+            assert "shot_id" in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_type_mismatched_value_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Writing a str to an int-typed project variable fails cleanly — no crash, no mutation, no file change.
+
+        The write boundary gates value-vs-declared-type agreement BEFORE mutating, because
+        persistence goes through ProjectVariableDef's strict schema: an unguarded mismatch
+        would raise at persist time, after the in-memory write was already acknowledged.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            file_before = (tmp_path / "project_template.yml").read_text()
+            result = GriptapeNodes.handle_request(
+                SetVariableValueRequest(
+                    name="frame_start",
+                    value="not_a_number",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableValueResultFailure)
+            assert "'int'" in str(result.result_details)
+            # Layer and file both untouched.
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["frame_start"] == self.FRAME_START
+            assert (tmp_path / "project_template.yml").read_text() == file_before
+        finally:
+            self._unload(project_id)
+
+    def test_unsupported_type_write_refused_cleanly(self, tmp_path: Path) -> None:
+        """Setting a project variable's type to something outside str/int fails cleanly."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="JSON",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+            assert "only support" in str(result.result_details)
+            stored = {v.name: v for v in GriptapeNodes.VariablesManager().stored_project_variables(project_id)}
+            assert stored["shot_code"].type == "str"
+        finally:
+            self._unload(project_id)
+
+    def test_type_change_disagreeing_with_value_refused_cleanly(self, tmp_path: Path) -> None:
+        """Re-typing shot_code (value 'sc042') to int fails: the stored value wouldn't agree."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableTypeRequest,
+            SetVariableTypeResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariableTypeRequest(
+                    name="shot_code",
+                    type="int",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariableTypeResultFailure)
+        finally:
+            self._unload(project_id)
+
+    def test_deprecated_batch_set_refuses_project_variable(self, tmp_path: Path) -> None:
+        """The frozen SetVariables shim refuses even a READ_WRITE project variable.
+
+        Deliberate divergence from SetVariableValueRequest (which writes through): the
+        shim is deprecated with zero senders and keeps its pre-#5142 behavior, so #5143
+        can delete it without unwinding a project write path.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariablesRequest,
+            SetVariablesResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                SetVariablesRequest(
+                    variables={"shot_code": "sc777"},
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, SetVariablesResultFailure)
+            assert "SetVariableValueRequest" in str(result.result_details)
+            # Untouched in the layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc042"
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_to_existing_stored_name_refused(self, tmp_path: Path) -> None:
+        """Renaming one stored project variable onto another is a same-layer collision."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="frame_start",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "already exists" in str(result.result_details)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc042"
+        finally:
+            self._unload(project_id)
+
+    def test_rename_project_variable_to_own_projects_reserved_name_refused(self, tmp_path: Path) -> None:
+        """The reserved gate uses the variable's OWN project, not the current one.
+
+        The loaded project declares a `dailies` directory — a computed (reserved) name in
+        THAT project only. The current project (system defaults) has no such directory, so
+        a gate that consulted the current project's reserved set (the pre-fix behavior)
+        would let this rename through, stranding a permanently-shadowed stored entry.
+        """
+        from griptape_nodes.retained_mode.events.variable_events import (
+            RenameVariableRequest,
+            RenameVariableResultFailure,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        extra_yaml = (
+            self.VARIABLES_YAML
+            + '\ndirectories:\n  dailies:\n    path_macro: "{workspace_dir}/dailies"\n    description: "Dailies"\n'
+        )
+        project_id = self._write_and_load(tmp_path, extra_yaml)
+        try:
+            # Sanity: the discriminator is real — reserved in the loaded project, not in the current one.
+            pm = GriptapeNodes.ProjectManager()
+            assert "dailies" in pm.project_computed_names(project_id=project_id)
+            assert "dailies" not in pm.project_computed_names(project_id=None)
+
+            result = GriptapeNodes.handle_request(
+                RenameVariableRequest(
+                    name="shot_code",
+                    new_name="dailies",
+                    lookup_scope=VariableScope.PROJECT_ONLY,
+                    project_id=project_id,
+                )
+            )
+            assert isinstance(result, RenameVariableResultFailure)
+            assert "reserved" in str(result.result_details)
+        finally:
+            self._unload(project_id)
+
+    def test_delete_inherited_variable_tombstones_and_survives_reload(self, tmp_path: Path) -> None:
+        """Deleting a PARENT-inherited variable emits a null tombstone that survives reload.
+
+        Child-declared deletions just omit the entry; inherited deletions must write
+        `name: null` so the parent's value doesn't resurrect on the next load.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+        from griptape_nodes.retained_mode.events.variable_events import (
+            DeleteVariableRequest,
+            DeleteVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        # Parent declares the variable; child inherits it.
+        parent_yml = tmp_path / "parent.yml"
+        parent_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE)
+            + "\nvariables:\n  studio_code:\n    value: mtl\n"
+        )
+        parent_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=parent_yml))
+        assert isinstance(parent_load, LoadProjectTemplateResultSuccess)
+
+        child_yml = tmp_path / "child.yml"
+        child_yml.write_text(
+            DEFAULT_PROJECT_TEMPLATE.to_overlay_yaml(DEFAULT_PROJECT_TEMPLATE) + "\nparent_project_path: ./parent.yml\n"
+        )
+        child_load = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+        assert isinstance(child_load, LoadProjectTemplateResultSuccess)
+        child_id = child_load.project_id
+
+        try:
+            # Inherited into the child's stored layer:
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert values.get("studio_code") == "mtl"
+
+            result = GriptapeNodes.handle_request(
+                DeleteVariableRequest(name="studio_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=child_id)
+            )
+            assert isinstance(result, DeleteVariableResultSuccess)
+            # Tombstone written (null entry), not just omitted. The dumper quotes keys.
+            assert '"studio_code": null' in child_yml.read_text()
+
+            # Reload from disk: the parent value must NOT resurrect.
+            self._unload(child_id)
+            reload_result = GriptapeNodes.handle_request(LoadProjectTemplateRequest(project_path=child_yml))
+            assert isinstance(reload_result, LoadProjectTemplateResultSuccess)
+            child_id = reload_result.project_id
+            values_after = GriptapeNodes.VariablesManager().stored_project_variable_values(child_id)
+            assert "studio_code" not in values_after
+        finally:
+            self._unload(child_id)
+            self._unload(parent_load.project_id)
+
+    def test_persist_with_no_backing_file_returns_error(self) -> None:
+        """A project with no file path (e.g. system defaults) reports it can't persist."""
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
+
+        pm = GriptapeNodes.ProjectManager()
+        error = pm.persist_project_variables(SYSTEM_DEFAULTS_KEY)
+        assert error is not None
+        assert "no backing file" in error
+
+        # And an unloaded project reports that too.
+        error = pm.persist_project_variables("never_loaded_project")
+        assert error is not None
+        assert "not loaded" in error
+
+    def test_persist_failure_logs_warning_but_write_succeeds(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The eager-persist contract: a disk failure logs a warning; the acknowledged in-memory write stands."""
+        from griptape_nodes.files.file import FileWriteError
+        from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
+        from griptape_nodes.retained_mode.events.variable_events import (
+            SetVariableValueRequest,
+            SetVariableValueResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.managers.project_manager.File.write_text",
+                    side_effect=FileWriteError(FileIOFailureReason.DISK_FULL, "disk full"),
+                ),
+                caplog.at_level(logging.WARNING, logger="griptape_nodes"),
+            ):
+                result = GriptapeNodes.handle_request(
+                    SetVariableValueRequest(
+                        name="shot_code",
+                        value="sc999",
+                        lookup_scope=VariableScope.PROJECT_ONLY,
+                        project_id=project_id,
+                    )
+                )
+            # The in-memory write is acknowledged despite the persist failure...
+            assert isinstance(result, SetVariableValueResultSuccess)
+            values = GriptapeNodes.VariablesManager().stored_project_variable_values(project_id)
+            assert values["shot_code"] == "sc999"
+            # ...and the failure is surfaced in the log, naming the project.
+            assert any("not persisted" in record.message for record in caplog.records)
+            # The file kept its pre-write content.
+            assert "sc999" not in (tmp_path / "project_template.yml").read_text()
+        finally:
+            self._unload(project_id)
+
+    def test_hypothetical_read_of_stored_variable(self, tmp_path: Path) -> None:
+        """A loaded-but-not-current project's stored variables are readable via project_id."""
+        from griptape_nodes.retained_mode.events.variable_events import (
+            GetVariableRequest,
+            GetVariableResultSuccess,
+        )
+        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+        from griptape_nodes.retained_mode.variable_types import VariableScope
+
+        project_id = self._write_and_load(tmp_path, self.VARIABLES_YAML)
+        try:
+            # Current project stays whatever it was — read the OTHER project by id.
+            result = GriptapeNodes.handle_request(
+                GetVariableRequest(name="shot_code", lookup_scope=VariableScope.PROJECT_ONLY, project_id=project_id)
+            )
+            assert isinstance(result, GetVariableResultSuccess)
+            assert result.variable.value == "sc042"
+        finally:
+            self._unload(project_id)

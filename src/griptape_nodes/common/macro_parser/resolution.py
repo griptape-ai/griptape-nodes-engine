@@ -56,7 +56,7 @@ def partial_resolve(
     template: str,
     segments: list[ParsedSegment],
     variables: MacroVariables,
-    secrets_manager: SecretsManager,
+    secrets_manager: SecretsManager | None = None,
 ) -> PartiallyResolvedMacro:
     """Partially resolve the macro template with known variables.
 
@@ -68,7 +68,10 @@ def partial_resolve(
         template: Original template string
         segments: Parsed segments from template
         variables: Variable name -> value mapping for known variables
-        secrets_manager: SecretsManager instance for resolving env vars
+        secrets_manager: SecretsManager instance for resolving env vars.
+            None disables secret access: a required variable whose value
+            references an env var ("$NAME") fails with SECRETS_UNAVAILABLE;
+            an optional one is skipped.
 
     Returns:
         PartiallyResolvedMacro with resolved and unresolved segments
@@ -76,6 +79,7 @@ def partial_resolve(
     Raises:
         MacroResolutionError: If:
             - Required variable is provided but env var resolution fails
+            - Required variable references an env var and secrets_manager is None
             - Format specifier cannot be applied to value type
     """
     resolved_segments: list[ParsedSegment] = []
@@ -116,20 +120,24 @@ def partial_resolve(
 
 
 def resolve_variable(
-    variable: ParsedVariable, variables: dict[str, str | int], secrets_manager: SecretsManager
+    variable: ParsedVariable, variables: dict[str, str | int], secrets_manager: SecretsManager | None = None
 ) -> str | None:
     """Resolve a single variable with format specs and env var resolution.
 
     Args:
         variable: The parsed variable to resolve
         variables: Variable name -> value mapping
-        secrets_manager: SecretsManager instance for resolving env vars
+        secrets_manager: SecretsManager instance for resolving env vars.
+            None disables secret access: a required variable whose value
+            references an env var ("$NAME") fails with SECRETS_UNAVAILABLE;
+            an optional one is skipped.
 
     Returns:
         Resolved string value, or None if optional variable not provided
 
     Raises:
-        MacroResolutionError: If required variable missing or env var not found
+        MacroResolutionError: If required variable missing, env var not found,
+            or env var referenced while secrets_manager is None
     """
     variable_name = variable.info.name
 
@@ -146,7 +154,14 @@ def resolve_variable(
         return None
 
     value = variables[variable_name]
-    resolved_value: str | int = resolve_env_var(value, secrets_manager)
+    try:
+        resolved_value: str | int = resolve_env_var(value, secrets_manager)
+    except MacroResolutionError as err:
+        if err.failure_reason == MacroResolutionFailureReason.SECRETS_UNAVAILABLE and not variable.info.is_required:
+            # An optional variable whose value we're not allowed to see is
+            # skipped, the same as an optional variable that wasn't provided.
+            return None
+        raise
 
     for format_spec in variable.format_specs:
         resolved_value = format_spec.apply(resolved_value)
@@ -155,18 +170,21 @@ def resolve_variable(
     return str(resolved_value)
 
 
-def resolve_env_var(value: str | int, secrets_manager: SecretsManager) -> str | int:
+def resolve_env_var(value: str | int, secrets_manager: SecretsManager | None = None) -> str | int:
     """Resolve environment variables in a value.
 
     Args:
         value: Value that may contain env var reference (e.g., "$VAR")
-        secrets_manager: SecretsManager instance for resolving env vars
+        secrets_manager: SecretsManager instance for resolving env vars.
+            None means the caller has no secrets access; env var references
+            fail with SECRETS_UNAVAILABLE rather than resolving.
 
     Returns:
         Resolved value (env var substituted if found)
 
     Raises:
-        MacroResolutionError: If value starts with $ but env var not found
+        MacroResolutionError: If value starts with $ but env var not found,
+            or if it references an env var while secrets_manager is None
     """
     if not isinstance(value, str):
         # Integer values don't contain env vars, return as-is
@@ -177,6 +195,15 @@ def resolve_env_var(value: str | int, secrets_manager: SecretsManager) -> str | 
         return value
 
     env_var_name = value[1:]
+
+    if secrets_manager is None:
+        msg = f"Value references environment variable '{env_var_name}', but no secrets access is available"
+        raise MacroResolutionError(
+            msg,
+            failure_reason=MacroResolutionFailureReason.SECRETS_UNAVAILABLE,
+            variable_name=env_var_name,
+        )
+
     env_value = secrets_manager.get_secret(env_var_name, should_error_on_not_found=False)
 
     if env_value is None:

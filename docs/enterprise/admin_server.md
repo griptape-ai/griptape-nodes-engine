@@ -12,6 +12,8 @@ A studio that deploys Griptape Nodes on-premises usually does not want every app
 
 If your application instances can already reach `cloud.griptape.ai` directly and that is acceptable for your environment, you do not need the Admin Server.
 
+For a diagram of where the Admin Server sits and what traffic flows through it, see [Architecture](../architecture.md#on-premises-configuration).
+
 ## Getting the Admin Server
 
 The Admin Server is provided to enterprise customers. [Contact Foundry](https://www.foundry.com/products/griptape/request-demo) to obtain it for your deployment.

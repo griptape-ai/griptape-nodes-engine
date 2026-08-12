@@ -2,7 +2,11 @@
 
 import logging
 
+import pytest
+
 from griptape_nodes.retained_mode.events.base_events import (
+    EventResultFailure,
+    EventResultSuccess,
     RequestPayload,
     ResultDetail,
     ResultDetails,
@@ -10,6 +14,12 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.events.os_events import ReadFileRequest
+from griptape_nodes.retained_mode.events.path_filter import apply_path_tree, build_path_tree
+from griptape_nodes.retained_mode.events.project_events import (
+    GetAllSituationsForProjectRequest,
+    GetAllSituationsForProjectResultFailure,
+    GetAllSituationsForProjectResultSuccess,
+)
 
 
 class TestBroadcastResultDefaults:
@@ -91,3 +101,158 @@ class TestResultDetailsRoundTrip:
         assert type(first) is ResultDetail
         assert isinstance(second, StrictModeViolationDetail)
         assert second.rule_id == "r2"
+
+
+class TestBuildPathTree:
+    def test_single_key(self) -> None:
+        assert build_path_tree(["a"]) == {"a": {}}
+
+    def test_nested_path(self) -> None:
+        assert build_path_tree(["a.b"]) == {"a": {"b": {}}}
+
+    def test_shared_prefix_merged(self) -> None:
+        assert build_path_tree(["a.b", "a.c"]) == {"a": {"b": {}, "c": {}}}
+
+    def test_deep_path(self) -> None:
+        assert build_path_tree(["a.b.c.d"]) == {"a": {"b": {"c": {"d": {}}}}}
+
+    def test_wildcard_path(self) -> None:
+        assert build_path_tree(["a.*.b"]) == {"a": {"*": {"b": {}}}}
+
+    def test_empty_list(self) -> None:
+        assert build_path_tree([]) == {}
+
+    def test_prefix_wins_broad_first(self) -> None:
+        # "a" (keep-whole) added before "a.b" (narrow) — broad wins.
+        assert build_path_tree(["a", "a.b"]) == {"a": {}}
+
+    def test_prefix_wins_narrow_first(self) -> None:
+        # "a.b" added before "a" — broad still wins by overwriting the subtree.
+        assert build_path_tree(["a.b", "a"]) == {"a": {}}
+
+    def test_prefix_wins_deep(self) -> None:
+        # "a.b" dominates "a.b.c" regardless of order.
+        assert build_path_tree(["a.b.c", "a.b"]) == {"a": {"b": {}}}
+        assert build_path_tree(["a.b", "a.b.c"]) == {"a": {"b": {}}}
+
+
+class TestApplyPathTree:
+    def test_non_dict_scalar_passthrough(self) -> None:
+        tree = {"a": {}}
+        assert apply_path_tree("hello", tree) == "hello"
+        assert apply_path_tree("hello", tree) is not None  # non-dict always passes through
+        assert apply_path_tree(None, tree) is None
+
+    def test_named_field_kept(self) -> None:
+        assert apply_path_tree({"a": 1, "b": 2}, {"a": {}}) == {"a": 1}
+
+    def test_unmatched_key_returns_empty_and_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            result = apply_path_tree({"a": 1}, {"z": {}})
+        assert result == {}
+        assert "z" in caplog.text
+
+    def test_nested_unmatched_key_warns_with_full_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        # "situations.nme" — top-level key exists but nested key is a typo
+        data = {"situations": {"hello": "world"}}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, build_path_tree(["situations.nme"]))
+        assert "situations.nme" in caplog.text
+
+    def test_empty_tree_returns_empty(self) -> None:
+        assert apply_path_tree({"a": 1, "b": 2}, {}) == {}
+
+    def test_nested_field(self) -> None:
+        data = {"a": {"b": 1, "c": 2}, "x": 9}
+        assert apply_path_tree(data, {"a": {"b": {}}}) == {"a": {"b": 1}}
+
+    def test_list_traversal(self) -> None:
+        data = {"items": [{"name": "x", "size": 10}, {"name": "y", "size": 20}]}
+        assert apply_path_tree(data, {"items": {"name": {}}}) == {"items": [{"name": "x"}, {"name": "y"}]}
+
+    def test_list_non_dict_items_pass_through(self) -> None:
+        data = {"tags": ["a", "b", "c"]}
+        assert apply_path_tree(data, {"tags": {"x": {}}}) == {"tags": ["a", "b", "c"]}
+
+    def test_wildcard_dict_of_objects(self) -> None:
+        data = {
+            "workflows": {
+                "/path/a": {"name": "Foo", "schema": {"big": "data"}},
+                "/path/b": {"name": "Bar", "schema": {"big": "data"}},
+            }
+        }
+        result = apply_path_tree(data, build_path_tree(["workflows.*.name"]))
+        assert result == {"workflows": {"/path/a": {"name": "Foo"}, "/path/b": {"name": "Bar"}}}
+
+    def test_wildcard_leaf_keeps_whole_value(self) -> None:
+        data = {"workflows": {"/path/a": {"name": "Foo", "schema": {"big": "data"}}}}
+        result = apply_path_tree(data, build_path_tree(["workflows.*"]))
+        assert result == {"workflows": {"/path/a": {"name": "Foo", "schema": {"big": "data"}}}}
+
+    def test_wildcard_with_named_siblings_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        data = {"a": {"x": 1}, "b": {"x": 2}}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, {"*": {"x": {}}, "meta": {}})
+        assert "named keys" in caplog.text
+        assert "meta" in caplog.text
+
+
+class TestApplyPathTreeWarningDedup:
+    def test_wildcard_typo_warns_once_with_star_path(self, caplog: pytest.LogCaptureFixture) -> None:
+        # One typo under a wildcard across many values must dedupe to a single warning
+        # reported with the "*" spelling, not one warning per resolved key.
+        data = {"workflows": {f"/path/{i}": {"name": str(i)} for i in range(50)}}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, build_path_tree(["workflows.*.nme"]))
+        matching = [r for r in caplog.records if "not found" in r.message]
+        assert len(matching) == 1
+        assert "workflows.*.nme" in matching[0].message
+
+    def test_list_typo_warns_once(self, caplog: pytest.LogCaptureFixture) -> None:
+        data = {"items": [{"name": "x"}, {"name": "y"}, {"name": "z"}]}
+        with caplog.at_level(logging.WARNING):
+            apply_path_tree(data, build_path_tree(["items.nme"]))
+        matching = [r for r in caplog.records if "not found" in r.message]
+        assert len(matching) == 1
+        assert "items.nme" in matching[0].message
+
+
+class TestEventResultDictFiltering:
+    """Integration coverage for EventResult.dict()'s fields filtering.
+
+    The path-projection helpers are unit-tested above; these exercise the wire logic
+    that wraps them: the succeeded() gate, framework-field re-add, and [] vs None.
+    """
+
+    def _success(self, fields: list[str] | None) -> dict:
+        request = GetAllSituationsForProjectRequest(fields=fields)
+        result = GetAllSituationsForProjectResultSuccess(
+            situations={"a": "macro"}, descriptions={"a": "desc"}, result_details="ok"
+        )
+        return EventResultSuccess(request=request, result=result).dict()["result"]
+
+    def test_none_returns_all_fields(self) -> None:
+        keys = self._success(fields=None)
+        assert set(keys) == {"situations", "descriptions", "result_details", "altered_workflow_state"}
+
+    def test_empty_list_returns_only_framework_fields(self) -> None:
+        keys = self._success(fields=[])
+        assert set(keys) == {"result_details", "altered_workflow_state"}
+
+    def test_selected_field_plus_framework_fields(self) -> None:
+        result = self._success(fields=["situations"])
+        assert set(result) == {"situations", "result_details", "altered_workflow_state"}
+        assert result["situations"] == {"a": "macro"}
+
+    def test_failure_result_is_never_filtered(self) -> None:
+        # A success-shaped fields filter on a failed request must not strip the exception.
+        request = GetAllSituationsForProjectRequest(fields=["situations"])
+        result = GetAllSituationsForProjectResultFailure(result_details="boom", exception=ValueError("kaboom"))
+        payload = EventResultFailure(request=request, result=result).dict()["result"]
+        assert payload["exception"]["message"] == "kaboom"
+        assert "result_details" in payload
+
+    def test_bogus_top_level_path_warns(self, caplog: pytest.LogCaptureFixture) -> None:
+        with caplog.at_level(logging.WARNING):
+            self._success(fields=["situatons"])  # typo
+        assert any("situatons" in r.message and "not found" in r.message for r in caplog.records)

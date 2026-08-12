@@ -16,7 +16,10 @@ import pytest
 
 from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.exe_types.core_types import Parameter, Trait
+from griptape_nodes.exe_types.param_components.huggingface.huggingface_repo_parameter import HuggingFaceRepoParameter
+from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from tests.unit.exe_types.mocks import MockNode
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -40,7 +43,11 @@ def patched_registry() -> Callable[[dict[str, type]], AbstractContextManager[Non
         lib.get_node_class.side_effect = lambda name: nodes[name]
 
         def _create_node(*, node_type: str, name: str, specific_library_name: str | None = None) -> Any:  # noqa: ARG001
-            return nodes[node_type](name)
+            # The real create_node sets the constructing-node flag; the probe's
+            # detectors (and the construction-time deferrals they motivated) key
+            # off it, so the mock must set it too to reproduce probe conditions.
+            with LibraryRegistry.constructing_node():
+                return nodes[node_type](name)
 
         with patch.multiple(
             "griptape_nodes.retained_mode.managers.library_manager.LibraryRegistry",
@@ -62,11 +69,14 @@ class _CleanProbe:
 
 
 class _ViolatingProbe:
-    """Node class whose __init__ triggers a correctness-class violation.
+    """Node class whose __init__ triggers a schema-dropping violation.
 
     Uses ``reentrant-bus-in-init`` because it is registered with
-    ``correctness=True``; the LOAD_PROBE skip-on-correctness gate uses
-    that flag to decide whether to drop the class from the schema.
+    ``drops_class_from_schema=True``; the LOAD_PROBE gate uses that flag
+    to decide whether to drop the class from the schema. The rule is an
+    ergonomics rule (``correctness=False``), so on the orchestrator probe
+    (``is_worker=False``) it logs at WARNING while the class is still
+    dropped.
     """
 
     parameters: list = []  # noqa: RUF012
@@ -97,12 +107,51 @@ class TestSerializeSchemasStrictMode:
         with patched_registry({"Violator": _ViolatingProbe, "Clean": _CleanProbe}):
             schemas = await manager._serialize_library_node_schemas("libA")
 
-        # Violating class dropped from output.
+        # Violating class dropped from output even though it only warns on the
+        # orchestrator: the drop is gated on drops_class_from_schema, not severity.
         assert [s.class_name for s in schemas] == ["Clean"]
 
-        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-        assert any("fixture probe violation" in r.getMessage() for r in errors)
-        assert any("class=Violator" in r.getMessage() for r in errors)
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("fixture probe violation" in r.getMessage() for r in warnings)
+        assert any("class=Violator" in r.getMessage() for r in warnings)
+
+
+class _ProbeWithHuggingFaceRepoParam(MockNode):
+    """Node whose __init__ builds the engine's HF repo dropdown — the DA3/diffusers pattern.
+
+    Regression for the reentrant-bus-in-init violations the component itself used to commit:
+    its policy and download queries fired from inside node __init__, so every library using it
+    (Depth Anything 3, diffusers, …) had its classes dropped from the worker schema.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(name=name)
+        repo_param = HuggingFaceRepoParameter(self, repo_ids=["owner/model-a"])
+        repo_param.add_input_parameters()
+
+
+class TestHuggingFaceRepoParameterSurvivesTheProbe:
+    @pytest.mark.asyncio
+    async def test_hf_param_node_is_included_and_issues_no_bus_requests(
+        self, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        module = "griptape_nodes.exe_types.param_components.huggingface"
+
+        def _refuse_bus(request: object) -> object:
+            msg = f"bus request issued during probe construction: {type(request).__name__}"
+            raise AssertionError(msg)
+
+        manager = GriptapeNodes.LibraryManager()
+        with (
+            patch(f"{module}.huggingface_repo_parameter.list_repo_revisions_in_cache", return_value=[]),
+            patch(f"{module}.huggingface_model_parameter.GriptapeNodes.handle_request", side_effect=_refuse_bus),
+            patched_registry({"HFNode": _ProbeWithHuggingFaceRepoParam}),
+        ):
+            schemas = await manager._serialize_library_node_schemas("libA")
+
+        # Before the construction-time deferral, the component's bus requests fired
+        # reentrant-bus-in-init here and the class was dropped from the schemas.
+        assert [s.class_name for s in schemas] == ["HFNode"]
 
 
 class _DummyTrait(Trait):

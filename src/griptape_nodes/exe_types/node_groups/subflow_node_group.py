@@ -6,6 +6,8 @@ from typing import TYPE_CHECKING, Any
 
 from griptape_nodes.exe_types.core_types import (
     ControlParameter,
+    ControlParameterInput,
+    ControlParameterOutput,
     Parameter,
     ParameterMode,
     ParameterTypeBuiltin,
@@ -65,6 +67,12 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         metadata: dict[Any, Any] | None = None,
     ) -> None:
         super().__init__(name, metadata)
+        self.control_in = ControlParameterInput(name="group_exec_in")
+        self.add_parameter(self.control_in)
+        self.metadata[LEFT_PARAMETERS_KEY] = [self.control_in.name]
+        self.control_out = ControlParameterOutput(name="group_exec_out")
+        self.add_parameter(self.control_out)
+        self.metadata[RIGHT_PARAMETERS_KEY] = [self.control_out.name]
         self.execution_environment = Parameter(
             name="execution_environment",
             tooltip="Environment that the group should execute in",
@@ -122,6 +130,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             metadata=subflow_metadata,
         )
         result = GriptapeNodes.handle_request(request)
+        if isinstance(result, CreateFlowResultSuccess):
+            # Final name may be different that initial name due to de-dupe.
+            self.metadata["subflow_name"] = result.flow_name
 
         if not isinstance(result, CreateFlowResultSuccess):
             logger.warning("%s failed to create subflow '%s': %s", self.name, subflow_name, result.result_details)

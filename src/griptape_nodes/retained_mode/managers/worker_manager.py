@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from griptape_nodes.bootstrap.utils.subprocess_websocket_base import WebSocketMessage
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import worker_events
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged, CurrentProjectChanged, SecretChanged
 from griptape_nodes.retained_mode.events.base_events import EventRequest
@@ -26,8 +27,8 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
     from griptape_nodes.api_client.request_client import RequestClient
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import RequestPayload
-    from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes_app")
@@ -50,8 +51,8 @@ class _WorkerTransport:
     """Transport-layer dependencies for WorkerManager.
 
     Held separately from WorkerManager so the manager can be constructed up
-    front (e.g. by the GriptapeNodes singleton) and wired to a concrete
-    transport later, once the WebSocket client and request client exist.
+    front (e.g. by the Engine) and wired to a concrete transport later, once
+    the WebSocket client and request client exist.
     """
 
     ws_outgoing_queue: asyncio.Queue
@@ -61,7 +62,7 @@ class _WorkerTransport:
     request_client: RequestClient
 
 
-class WorkerManager:
+class WorkerManager(EngineScoped):
     """Manages worker registration, heartbeating, eviction, and event routing.
 
     Encapsulates all state and logic related to worker engines on both the
@@ -97,10 +98,10 @@ class WorkerManager:
     def __init__(
         self,
         *,
-        griptape_nodes: GriptapeNodes,
+        engine: Engine,
         event_manager: EventManager,
     ) -> None:
-        self._griptape_nodes = griptape_nodes
+        super().__init__(engine)
         self._event_manager = event_manager
         self._transport: _WorkerTransport | None = None
 
@@ -132,7 +133,7 @@ class WorkerManager:
         # Set when an active session becomes available; gates worker spawning.
         self._session_ready_event: asyncio.Event = asyncio.Event()
 
-        config = griptape_nodes._config_manager
+        config = engine.config_manager
         self.heartbeat_interval_s: float = config.get_config_value(
             WORKER_HEARTBEAT_INTERVAL_KEY, default=WorkerManager.DEFAULT_HEARTBEAT_INTERVAL_S, cast_type=float
         )
@@ -209,7 +210,7 @@ class WorkerManager:
             logger.error(details)
             return worker_events.RegisterWorkerResultFailure(result_details=details)
 
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         request_topic = f"sessions/{session_id}/workers/{wid}/request"
         self._workers[wid] = WorkerRegistration(request_topic=request_topic, worker_key=request.library_name)
         self._worker_last_seen[wid] = time.monotonic()
@@ -242,7 +243,7 @@ class WorkerManager:
     ) -> worker_events.UnregisterWorkerResultSuccess | worker_events.UnregisterWorkerResultFailure:
         """Handle a worker unregister request from a worker engine."""
         wid = request.worker_engine_id
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         registration = self._workers.pop(wid, None)
         self._worker_last_seen.pop(wid, None)
         worker_key = registration.worker_key if registration else None
@@ -274,7 +275,7 @@ class WorkerManager:
             for wid in stale:
                 await self.evict_worker(wid)
 
-            session_id = self._griptape_nodes.get_session_id()
+            session_id = self.engine.get_session_id()
             for wid, registration in list(self._workers.items()):
                 hb = EventRequest(
                     request=worker_events.WorkerHeartbeatRequest(heartbeat_id=str(uuid.uuid4())),
@@ -326,8 +327,16 @@ class WorkerManager:
         # same clean env baseline a fresh engine would have. Inheriting the live os.environ
         # would bake the orchestrator's current-project env vars into the worker's restore
         # baseline, leaving the worker unable to unset them on a later project switch.
-        base_environ = self._griptape_nodes.ProjectManager().get_pre_project_environ()
-        proc = await asyncio.create_subprocess_exec(*args, env={**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())})
+        base_environ = self.engine.project_manager.get_pre_project_environ()
+        worker_environ = {**base_environ, "GTN_ENGINE_ID": str(uuid.uuid4())}
+        # Stamp the spawning orchestrator's id so the worker can report it in its discovery
+        # heartbeat (orchestrator_engine_id), letting clients identify and nest worker engines.
+        # The orchestrator always has an id by the time it spawns a worker; guard the None
+        # case anyway so a subprocess env value is never None.
+        orchestrator_engine_id = self.engine.engine_identity_manager.active_engine_id
+        if orchestrator_engine_id is not None:
+            worker_environ["GTN_ORCHESTRATOR_ENGINE_ID"] = orchestrator_engine_id
+        proc = await asyncio.create_subprocess_exec(*args, env=worker_environ)
         # Record the loop that owns this subprocess so termination can hop back to it.
         # All spawns run on the engine event-queue loop, so this is idempotent.
         self._spawn_loop = asyncio.get_running_loop()
@@ -353,7 +362,7 @@ class WorkerManager:
                 for library_name, proc in list(self._managed_worker_processes.items())
             )
         )
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         if session_id and self._transport is not None:
             for wid in list(self._workers):
                 response_topic = f"sessions/{session_id}/workers/{wid}/response"
@@ -404,7 +413,7 @@ class WorkerManager:
 
     async def evict_worker(self, worker_engine_id: str) -> None:
         """Remove a worker from the registry and unsubscribe from its response topic."""
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         registration = self._workers.pop(worker_engine_id, None)
         self._worker_last_seen.pop(worker_engine_id, None)
         lib_name = registration.worker_key if registration else None
@@ -574,7 +583,7 @@ class WorkerManager:
     async def _spawn_when_session_ready(self, library_name: str) -> None:
         """Wait for an active session then spawn a worker subprocess for the given library."""
         # If a session is already active, skip the wait entirely.
-        if not self._griptape_nodes.get_session_id():
+        if not self.engine.get_session_id():
             logger.info(
                 "Worker for library '%s' is waiting for a session to start before spawning. "
                 "Start a session (via the Griptape Nodes GUI or AppStartSessionRequest) to proceed.",
@@ -582,7 +591,7 @@ class WorkerManager:
             )
             await self._session_ready_event.wait()
             logger.info("Session started; spawning worker for library '%s'.", library_name)
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         if not session_id:
             logger.error("Session event set but no session ID available for library '%s'.", library_name)
             return
@@ -615,8 +624,8 @@ class WorkerManager:
         In orchestrator mode it subscribes to the generic "request" topic (MCP/API entry point)
         and the session request topic.
         """
-        engine_id = self._griptape_nodes.get_engine_id()
-        session_id = self._griptape_nodes.get_session_id()
+        engine_id = self.engine.get_engine_id()
+        session_id = self.engine.get_session_id()
 
         topics: list[str] = []
         if engine_id:
@@ -648,7 +657,7 @@ class WorkerManager:
         Future: consult a WorkerRegistry to select the correct worker based on event type
         or target library.
         """
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         worker_response_topic = f"sessions/{session_id}/workers/{worker_engine_id}/response"
         forwarded = event.model_copy(update={"response_topic": worker_response_topic})
         logger.debug("Forwarding %s to worker %s", type(event.request).__name__, worker_engine_id)
@@ -775,10 +784,10 @@ class WorkerManager:
 
     def _determine_response_topic(self) -> str:
         """Determine the response topic based on current session and engine IDs."""
-        session_id = self._griptape_nodes.get_session_id()
+        session_id = self.engine.get_session_id()
         if session_id:
             return f"sessions/{session_id}/response"
-        engine_id = self._griptape_nodes.get_engine_id()
+        engine_id = self.engine.get_engine_id()
         if engine_id:
             return f"engines/{engine_id}/response"
         return "response"

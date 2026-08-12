@@ -2,7 +2,7 @@
 
 !!! warning "You need to perform setup steps to use Hugging Face Diffusion Pipeline nodes"
 
-    [This guide](../../how_to/installs/hugging_face.md) will walk you through setting up a Hugging Face account, creating an access token, and installing the required models to make this node fully functional.
+    [This guide](../../guides/integrations/hugging_face.md) will walk you through setting up a Hugging Face account, creating an access token, and installing the required models to make this node fully functional.
 
 ## What are they?
 
@@ -148,7 +148,7 @@ For a deeper treatment of the underlying concepts, see the upstream [🤗 Diffus
 
 ## Common Issues
 
-- **Missing API Key**: Ensure the Hugging Face API token is set as `HUGGINGFACE_HUB_ACCESS_TOKEN`; instructions for that are in [this guide](../../how_to/installs/hugging_face.md)
+- **Missing API Key**: Ensure the Hugging Face API token is set as `HUGGINGFACE_HUB_ACCESS_TOKEN`; instructions for that are in [this guide](../../guides/integrations/hugging_face.md)
 - **Pipeline Not Found**: If you see cache errors, ensure the builder node has been executed successfully
 - **Memory Constraints**: Large models or high-resolution generation may require significant GPU memory
 - **Provider Compatibility**: Ensure your selected model is compatible with the chosen pipeline type

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import tempfile
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 from unittest.mock import patch
@@ -10,6 +13,8 @@ from unittest.mock import patch
 import pytest
 
 from griptape_nodes.utils.file_utils import (
+    _arecurse_find,
+    _AsyncWalkParams,
     atomic_write_bytes,
     find_all_files_in_directory,
     find_file_in_directory,
@@ -18,6 +23,40 @@ from griptape_nodes.utils.file_utils import (
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+
+
+class _RaisingDirEntry:
+    """Stands in for a DirEntry whose type cannot be determined.
+
+    os.DirEntry cannot be constructed or subclassed from Python, so the walk's
+    "skip the entry that will not stat" path needs a stand-in to exercise it.
+    """
+
+    def __init__(self, name: str, path: str) -> None:
+        self.name = name
+        self.path = path
+
+    def is_file(self) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+    def is_dir(self) -> bool:
+        raise PermissionError(13, "Permission denied")
+
+
+class _FakeScandir:
+    """Context-manager iterator matching the os.scandir interface the walk relies on."""
+
+    def __init__(self, entries: list[object]) -> None:
+        self._entries = entries
+
+    def __enter__(self) -> object:
+        return iter(self._entries)
+
+    def __exit__(self, *_: object) -> None:
+        return None
+
+    def __iter__(self) -> object:
+        return iter(self._entries)
 
 
 class TestFindFileInDirectory:
@@ -388,6 +427,168 @@ class TestAfindFilesRecursive:
         result = await find_files_recursive(temp_dir, "*.json", max_files=2)
 
         assert len(result) == 2  # noqa: PLR2004
+
+    @pytest.mark.asyncio
+    async def test_follows_symlinked_directories(self, temp_dir: Path) -> None:
+        """A symlinked directory is walked, so a workspace can reach content through a link.
+
+        Guards against a walk that skips links (os.walk's default), which would silently
+        stop discovering libraries or workflows reached that way.
+        """
+        real_dir = temp_dir / "real"
+        real_dir.mkdir()
+        (real_dir / "found.json").write_text("{}")
+        scan_root = temp_dir / "root"
+        scan_root.mkdir()
+        (scan_root / "linked").symlink_to(real_dir)
+
+        result = await find_files_recursive(scan_root, "*.json")
+
+        assert result == [scan_root / "linked" / "found.json"]
+
+    @pytest.mark.asyncio
+    async def test_symlink_loop_terminates(self, temp_dir: Path) -> None:
+        """A directory symlink pointing back at an ancestor terminates via the depth cap."""
+        nested = temp_dir / "a"
+        nested.mkdir()
+        (nested / "f.json").write_text("{}")
+        (nested / "loop").symlink_to(temp_dir)
+
+        result = await find_files_recursive(temp_dir, "*.json")
+
+        assert nested / "f.json" in result
+
+    @pytest.mark.asyncio
+    async def test_broken_symlink_is_skipped(self, temp_dir: Path) -> None:
+        """A dangling symlink is neither matched nor fatal to the walk."""
+        (temp_dir / "real.json").write_text("{}")
+        (temp_dir / "broken.json").symlink_to(temp_dir / "does_not_exist")
+
+        result = await find_files_recursive(temp_dir, "*.json")
+
+        assert result == [temp_dir / "real.json"]
+
+    @pytest.mark.asyncio
+    async def test_unreadable_directory_does_not_abort_walk(self, temp_dir: Path) -> None:
+        """A directory that cannot be listed is skipped, and its siblings still resolve.
+
+        Uses a patched scandir rather than chmod so the case is exercised on Windows too,
+        where permissions do not deny directory listing the same way.
+        """
+        (temp_dir / "sibling").mkdir()
+        (temp_dir / "sibling" / "found.json").write_text("{}")
+        unreadable = temp_dir / "unreadable"
+        unreadable.mkdir()
+        (unreadable / "hidden_by_permissions.json").write_text("{}")
+
+        real_scandir = os.scandir
+
+        def scandir_denying_one_dir(path: object) -> object:
+            if Path(path) == unreadable:  # type: ignore[arg-type]
+                raise PermissionError(13, "Permission denied")
+            return real_scandir(path)  # type: ignore[arg-type]
+
+        with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_denying_one_dir):
+            result = await find_files_recursive(temp_dir, "*.json")
+
+        assert result == [temp_dir / "sibling" / "found.json"]
+
+    @pytest.mark.asyncio
+    async def test_unclassifiable_entry_does_not_abort_directory(self, temp_dir: Path) -> None:
+        """An entry whose type cannot be determined is skipped, not fatal to its siblings.
+
+        Mirrors a macOS protected path, where stat-ing one entry raises while the rest of
+        the directory reads fine.
+        """
+        (temp_dir / "good.json").write_text("{}")
+        (temp_dir / "protected.json").write_text("{}")
+
+        real_scandir = os.scandir
+
+        def scandir_with_one_bad_entry(path: object) -> object:
+            entries = []
+            for entry in real_scandir(path):  # type: ignore[arg-type]
+                if entry.name == "protected.json":
+                    entries.append(_RaisingDirEntry(entry.name, entry.path))
+                else:
+                    entries.append(entry)
+            return _FakeScandir(entries)
+
+        with patch("griptape_nodes.utils.file_utils.os.scandir", side_effect=scandir_with_one_bad_entry):
+            result = await find_files_recursive(temp_dir, "*.json")
+
+        assert result == [temp_dir / "good.json"]
+
+    @pytest.mark.asyncio
+    async def test_walk_is_cancellable_between_directories(self, temp_dir: Path) -> None:
+        """Cancelling the walk stops it partway rather than running the whole tree.
+
+        The walk offloads one thread hop per directory specifically so a caller can bound
+        discovery with a timeout. Collapsing it back into a single hop for the entire tree
+        would run to completion before the cancellation was observed, so this asserts the
+        walk is actually abandoned partway through.
+        """
+        expected_total = 20
+        for index in range(expected_total):
+            subdir = temp_dir / f"dir{index:02d}"
+            subdir.mkdir()
+            (subdir / "file.json").write_text("{}")
+
+        matches: list[Path] = []
+        params = _AsyncWalkParams(
+            pattern="*.json",
+            skip_hidden=True,
+            max_depth=5,
+            max_files=None,
+            matches=matches,
+        )
+        task = asyncio.create_task(_arecurse_find(temp_dir, 0, params))
+        # Let the walk reach its first thread hop, then cancel while it is suspended.
+        await asyncio.sleep(0)
+        task.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert len(matches) < expected_total
+
+    @pytest.mark.asyncio
+    async def test_cancelling_the_walk_returns_without_awaiting_the_scan(self, temp_dir: Path) -> None:
+        """Cancellation returns promptly instead of blocking on the in-flight directory scan.
+
+        Cancelling at a directory edge is only a real bound if the await also *returns* at
+        that edge. A thread-offload that waits for its worker would make a hung mount block
+        discovery for as long as the scan takes, no matter what timeout the caller set, so
+        this pins the promptness rather than just the fact that the walk stopped early.
+        """
+        (temp_dir / "unreachable.json").write_text("{}")
+        scan_duration_s = 5.0
+
+        def hung_scan(*_args: object, **_kwargs: object) -> list[object]:
+            time.sleep(scan_duration_s)
+            return []
+
+        params = _AsyncWalkParams(
+            pattern="*.json",
+            skip_hidden=True,
+            max_depth=5,
+            max_files=None,
+            matches=[],
+        )
+
+        with patch("griptape_nodes.utils.file_utils._scan_directory", hung_scan):
+            task = asyncio.create_task(_arecurse_find(temp_dir, 0, params))
+            # Let the walk dispatch the scan, so the cancel lands while it is in flight.
+            await asyncio.sleep(0.05)
+            task.cancel()
+
+            started_at = time.perf_counter()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            elapsed_s = time.perf_counter() - started_at
+
+        # Generous bound: the point is "did not wait for the 5s scan", not a precise timing.
+        assert elapsed_s < scan_duration_s / 2
 
 
 class TestAtomicWriteBytes:

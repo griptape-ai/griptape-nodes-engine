@@ -5,6 +5,9 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from griptape_nodes.drivers.storage import StorageBackend
+from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
+from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
 from griptape_nodes.retained_mode.managers.static_files_manager import ResolvedStaticFilePath, StaticFilesManager
 
@@ -365,7 +368,10 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         """Create StaticFilesManager instance with mocked dependencies."""
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
             manager = StaticFilesManager(
-                config_manager=mock_config_manager, secrets_manager=mock_secrets_manager, event_manager=None
+                config_manager=mock_config_manager,
+                secrets_manager=mock_secrets_manager,
+                event_manager=None,
+                engine=Mock(),
             )
             manager.storage_driver = Mock()
             return manager
@@ -471,7 +477,9 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             )
 
             assert isinstance(result, CreateStaticFileDownloadUrlResultFailure)
-            assert "GT_CLOUD_API_KEY secret is not available" in result.error
+            # Names both credentials: a license-only user has no API key to set.
+            assert "no Griptape Cloud credential was found" in result.error
+            assert "GT_CLOUD_API_KEY" in result.error
 
     @pytest.mark.asyncio
     async def test_create_download_url_from_path_non_cloud_url(
@@ -542,7 +550,6 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         resolved_path = Path("/mock/workspace/outputs/file.png")
 
@@ -552,7 +559,7 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultSuccess(
                 result_details="resolved",
@@ -582,12 +589,11 @@ class TestStaticFilesManagerCreateDownloadUrlFromPath:
             CreateStaticFileDownloadUrlFromPathRequest,
             CreateStaticFileDownloadUrlResultFailure,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         request = CreateStaticFileDownloadUrlFromPathRequest(file_path="{outputs}/file.png")
 
         with patch.object(
-            GriptapeNodes,
+            mock_static_files_manager.engine,
             "handle_request",
             return_value=GetPathForMacroResultFailure(
                 result_details="missing variables",
@@ -631,7 +637,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config.get_config_value.return_value = "local"
         mock_config.workspace_path = Path("/mock/workspace")
         with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
-            manager = StaticFilesManager(config_manager=mock_config, secrets_manager=Mock(), event_manager=None)
+            manager = StaticFilesManager(
+                config_manager=mock_config, secrets_manager=Mock(), event_manager=None, engine=Mock()
+            )
         return manager
 
     def test_resolve_returns_path_and_policy_on_success(self, mock_static_files_manager: StaticFilesManager) -> None:
@@ -645,7 +653,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -676,11 +683,9 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_config_manager = Mock()
         mock_config_manager.get_config_value.return_value = str(workspace_dir)
         mock_config_manager.workspace_path = workspace_dir
+        mock_static_files_manager.config_manager = mock_config_manager
 
-        with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
-        ):
+        with patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
 
         assert result is not None
@@ -694,11 +699,10 @@ class TestStaticFilesManagerResolveStaticFilePath:
         import logging
 
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultFailure
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultFailure(result_details="situation not found"),
             ),
@@ -723,7 +727,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             SituationTemplate,
         )
         from griptape_nodes.retained_mode.events.project_events import GetSituationResultSuccess
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -733,7 +736,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
 
         with (
             patch.object(
-                GriptapeNodes,
+                mock_static_files_manager.engine,
                 "handle_request",
                 return_value=GetSituationResultSuccess(situation=situation, result_details="ok"),
             ),
@@ -764,7 +767,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetSituationResultSuccess,
             PathResolutionFailureReason,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -790,7 +792,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
             raise AssertionError(msg)
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
@@ -813,7 +815,6 @@ class TestStaticFilesManagerResolveStaticFilePath:
             GetPathForMacroResultSuccess,
             GetSituationResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         situation = SituationTemplate(
             name="save_static_file",
@@ -849,8 +850,7 @@ class TestStaticFilesManagerResolveStaticFilePath:
         mock_static_files_manager.config_manager = mock_config_manager
 
         with (
-            patch.object(GriptapeNodes, "handle_request", side_effect=handle_request),
-            patch.object(GriptapeNodes, "ConfigManager", return_value=mock_config_manager),
+            patch.object(mock_static_files_manager.engine, "handle_request", side_effect=handle_request),
             caplog.at_level(logging.WARNING, logger="griptape_nodes"),
         ):
             result = mock_static_files_manager._resolve_static_file_path("output.png")
@@ -912,7 +912,12 @@ class TestStaticFilesManagerCreateUploadUrl:
 
 
 class TestStaticFilesManagerBaseUrlTrailingSlash:
-    """Test that static_server_base_url trailing slashes are stripped."""
+    """Test that static_server_base_url trailing slashes are stripped.
+
+    Normalizing at construction keeps a configured override from reaching the storage driver as
+    `https://host//workspace`. The resolved URL is only settled once initialization completes,
+    so that is asserted in TestStaticFilesManagerOnAppInitializationComplete.
+    """
 
     @pytest.fixture
     def mock_secrets_manager(self) -> Mock:
@@ -931,7 +936,7 @@ class TestStaticFilesManagerBaseUrlTrailingSlash:
     def test_init_strips_trailing_slashes(
         self, mock_secrets_manager: Mock, configured_url: str, expected_url: str
     ) -> None:
-        """Trailing slashes on static_server_base_url are stripped during init."""
+        """Trailing slashes on static_server_base_url are stripped before the driver sees it."""
         mock_config = Mock()
         mock_config.get_config_value.side_effect = lambda key, default=None: {
             "storage_backend": "local",
@@ -939,21 +944,21 @@ class TestStaticFilesManagerBaseUrlTrailingSlash:
         }.get(key, default)
         mock_config.workspace_path = Path("/mock/workspace")
 
-        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver"):
-            manager = StaticFilesManager(
-                config_manager=mock_config, secrets_manager=mock_secrets_manager, event_manager=None
-            )
+        with patch("griptape_nodes.retained_mode.managers.static_files_manager.LocalStorageDriver") as driver_cls:
+            StaticFilesManager(config_manager=mock_config, secrets_manager=mock_secrets_manager, event_manager=None)
 
-        assert manager.static_server_base_url == expected_url
+        assert driver_cls.call_args.kwargs["base_url"] == f"{expected_url}/workspace"
 
 
 class TestStaticFilesManagerOnAppInitializationComplete:
-    """Test port handling in on_app_initialization_complete.
+    """Test static server ownership and port handling in on_app_initialization_complete.
 
-    The engine binds a free port at startup and may rewrite `static_server_base_url`
-    to reflect the OS-assigned port. That rewrite must only happen when the user has
-    not provided an explicit override, otherwise it clobbers tunnel configurations
-    (e.g. `ssh -L 8888:localhost:8124`, ngrok, reverse proxies).
+    A host process that serves the workspace itself sets `static_server_base_url` on the
+    initialization payload, and the engine must then point at that server rather than starting
+    one of its own. With no host-provided server the engine serves the workspace itself, binding
+    a free port and rewriting `static_server_base_url` to reflect the OS-assigned port. That
+    rewrite must only happen when the user has not provided an explicit override, otherwise it
+    clobbers tunnel configurations (e.g. `ssh -L 8888:localhost:8124`, ngrok, reverse proxies).
     """
 
     @pytest.fixture
@@ -977,7 +982,9 @@ class TestStaticFilesManagerOnAppInitializationComplete:
             )
         return manager
 
-    def _invoke_initialization(self, manager: StaticFilesManager, actual_port: int) -> None:
+    def _invoke_initialization(
+        self, manager: StaticFilesManager, actual_port: int, host_base_url: str | None = None
+    ) -> tuple[Mock, Mock]:
         from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 
         mock_sock = Mock()
@@ -987,10 +994,11 @@ class TestStaticFilesManagerOnAppInitializationComplete:
             patch(
                 "griptape_nodes.retained_mode.managers.static_files_manager.bind_free_socket",
                 return_value=mock_sock,
-            ),
-            patch("griptape_nodes.retained_mode.managers.static_files_manager.threading.Thread"),
+            ) as bind,
+            patch("griptape_nodes.retained_mode.managers.static_files_manager.threading.Thread") as thread_cls,
         ):
-            manager.on_app_initialization_complete(AppInitializationComplete())
+            manager.on_app_initialization_complete(AppInitializationComplete(static_server_base_url=host_base_url))
+        return bind, thread_cls
 
     def test_unset_base_url_rewritten_to_actual_port(self, mock_secrets_manager: Mock) -> None:
         """When no override is configured, the OS-assigned port replaces the server's default port."""
@@ -1034,3 +1042,179 @@ class TestStaticFilesManagerOnAppInitializationComplete:
 
         with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
             _ = manager.static_server_base_url
+
+    def test_access_before_initialization_raises_even_with_an_override(self, mock_secrets_manager: Mock) -> None:
+        """A configured override does not count as resolved: no server is known to exist yet.
+
+        This is also what lets the resolved URL stand in for "already settled" once
+        initialization completes, with no extra state to track.
+        """
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        with pytest.raises(RuntimeError, match="static_server_base_url accessed before"):
+            _ = manager.static_server_base_url
+
+    @pytest.mark.parametrize(
+        ("configured_url", "expected_url"),
+        [
+            ("http://localhost:8124/", "http://localhost:8124"),
+            ("http://localhost:8124///", "http://localhost:8124"),
+            ("https://my-tunnel.ngrok.io/", "https://my-tunnel.ngrok.io"),
+        ],
+    )
+    def test_configured_url_trailing_slashes_are_stripped(
+        self, mock_secrets_manager: Mock, configured_url: str, expected_url: str
+    ) -> None:
+        """A trailing slash must not survive into the resolved URL or the workspace path."""
+        manager = self._build_manager(mock_secrets_manager, configured_url)
+
+        self._invoke_initialization(manager, actual_port=54321)
+
+        assert manager.static_server_base_url == expected_url
+        assert manager.storage_driver.base_url == f"{expected_url}/workspace"
+
+    def test_override_configured_after_construction_is_honored(self, mock_secrets_manager: Mock) -> None:
+        """Project activation can set the override after this manager is built, before app init."""
+        manager = self._build_manager(mock_secrets_manager, None)
+        manager.config_manager.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": "local",
+            "static_server_base_url": "https://from-project.ngrok.io",
+        }.get(key, default)
+
+        self._invoke_initialization(manager, actual_port=54321)
+
+        assert manager.static_server_base_url == "https://from-project.ngrok.io"
+        assert manager.storage_driver.base_url == "https://from-project.ngrok.io/workspace"
+
+    def test_host_provided_server_is_adopted(self, mock_secrets_manager: Mock) -> None:
+        """When the host serves the workspace, the engine points at it and starts nothing."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        bind, thread_cls = self._invoke_initialization(
+            manager, actual_port=54321, host_base_url="http://localhost:8124/"
+        )
+
+        assert manager.static_server_base_url == "http://localhost:8124"
+        assert manager.storage_driver.base_url == "http://localhost:8124/workspace"
+        bind.assert_not_called()
+        thread_cls.assert_not_called()
+
+    def test_host_provided_server_wins_over_a_configured_override(self, mock_secrets_manager: Mock) -> None:
+        """The host resolves its own URL, including any override, so its answer is final."""
+        manager = self._build_manager(mock_secrets_manager, "https://my-tunnel.ngrok.io")
+
+        _, thread_cls = self._invoke_initialization(manager, actual_port=54321, host_base_url="http://localhost:8124")
+
+        assert manager.static_server_base_url == "http://localhost:8124"
+        thread_cls.assert_not_called()
+
+    def test_serves_workspace_when_no_host_provides_one(self, mock_secrets_manager: Mock) -> None:
+        """Legacy path: with no host-provided server the engine serves the workspace itself.
+
+        Removed once every shipped host provides one.
+        """
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        bind, thread_cls = self._invoke_initialization(manager, actual_port=54321)
+
+        bind.assert_called_once_with("localhost", 8124)
+        assert thread_cls.call_args.kwargs["name"] == "static-server"
+        assert thread_cls.call_args.kwargs["daemon"] is True
+        thread_cls.return_value.start.assert_called_once_with()
+
+    def test_repeat_initialization_does_not_start_a_second_server(self, mock_secrets_manager: Mock) -> None:
+        """Initialization completes again per workflow-executor run; one server is enough."""
+        manager = self._build_manager(mock_secrets_manager, None)
+
+        self._invoke_initialization(manager, actual_port=54321)
+        bind, thread_cls = self._invoke_initialization(manager, actual_port=54322)
+
+        assert manager.static_server_base_url == "http://localhost:54321"
+        bind.assert_not_called()
+        thread_cls.assert_not_called()
+
+
+class TestStaticFilesManagerCloudCredential:
+    """The `StorageBackend.GTC` arm takes a license, and refuses a missing credential.
+
+    Without these, reverting the credential resolution (or dropping the
+    no-credential guard) leaves the suite green while either breaking
+    license-only users or sending `Bearer None` to Cloud on every upload.
+    """
+
+    _BUCKET_ID = "bucket-123"
+    _LICENSE = "eyJhbGciOiJFZERTQSJ9.eyJvcmdfaWQiOiJvIn0.sig"
+
+    @pytest.fixture
+    def gtc_config_manager(self) -> Mock:
+        """A ConfigManager configured for the Griptape Cloud storage backend."""
+        mock_config = Mock()
+        mock_config.workspace_path = Path("/mock/workspace")
+        mock_config.get_config_value.side_effect = lambda key, default=None: {
+            "storage_backend": StorageBackend.GTC,
+            "static_files_directory": "staticfiles",
+            "static_server_base_url": None,
+        }.get(key, default)
+        return mock_config
+
+    def _secrets(self, secrets: dict[str, str | None]) -> Mock:
+        manager = Mock()
+        manager.get_secret.side_effect = lambda name, **_kwargs: secrets.get(name)
+        return manager
+
+    def _build(self, config_manager: Mock, secrets: dict[str, str | None]) -> StaticFilesManager:
+        return StaticFilesManager(
+            config_manager=config_manager,
+            secrets_manager=self._secrets(secrets),
+            event_manager=None,
+        )
+
+    def test_license_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """The reported bug: a license with no GT_CLOUD_API_KEY must still reach Cloud."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == self._LICENSE
+
+    def test_api_key_only_builds_cloud_driver(self, gtc_config_manager: Mock) -> None:
+        """Today's common setup is unchanged."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GT_CLOUD_API_KEY": "gt-the-key"},
+        )
+
+        assert isinstance(manager.storage_driver, GriptapeCloudStorageDriver)
+        assert manager.storage_driver.api_key == "gt-the-key"
+
+    def test_no_credential_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """A bucket but no credential must not yield a driver that sends "Bearer None"."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_no_bucket_falls_back_to_local_storage(self, gtc_config_manager: Mock) -> None:
+        """Pre-existing behavior: no bucket means local storage regardless of credential."""
+        manager = self._build(gtc_config_manager, {"GRIPTAPE_NODES_LICENSE": self._LICENSE})
+
+        assert isinstance(manager.storage_driver, LocalStorageDriver)
+
+    def test_download_url_driver_accepts_a_license(self, gtc_config_manager: Mock) -> None:
+        """`_create_cloud_storage_driver` backs the download-URL path for cloud assets."""
+        manager = self._build(
+            gtc_config_manager,
+            {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID, "GRIPTAPE_NODES_LICENSE": self._LICENSE},
+        )
+
+        driver = manager._create_cloud_storage_driver(self._BUCKET_ID)
+
+        assert driver is not None
+        assert driver.api_key == self._LICENSE
+
+    def test_download_url_driver_is_none_without_a_credential(self, gtc_config_manager: Mock) -> None:
+        """No credential yields no driver, so the caller reports the missing credential."""
+        manager = self._build(gtc_config_manager, {"GT_CLOUD_BUCKET_ID": self._BUCKET_ID})
+
+        assert manager._create_cloud_storage_driver(self._BUCKET_ID) is None

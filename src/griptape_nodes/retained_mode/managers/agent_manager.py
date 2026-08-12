@@ -25,25 +25,34 @@ import mimetypes
 import os
 import textwrap
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from http import HTTPStatus
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 import httpx
-from pydantic_ai.messages import BinaryContent, ModelMessagesTypeAdapter
+from pydantic_ai.exceptions import ModelHTTPError
+from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessagesTypeAdapter, ModelRequest, UserPromptPart
 from pydantic_ai.usage import UsageLimits
 from xdg_base_dirs import xdg_data_home
 
 from griptape_nodes.agents.pydantic_ai.image_tools import GRIPTAPE_CLOUD_BASE_URL, ImageGenerationToolsetConfig
 from griptape_nodes.agents.pydantic_ai.mcp_servers import mcp_server_from_config, streamable_http_local
 from griptape_nodes.agents.pydantic_ai.runner import (
+    DEFAULT_SKILLS_DIRECTORY,
     PydanticAgentRunner,
     RunEvent,
     TextDelta,
     ThinkingDelta,
     ToolCall,
     ToolResult,
+)
+from griptape_nodes.drivers.cloud_credentials import (
+    MISSING_CREDENTIAL_MESSAGE,
+    POLICY_DENIED_HINT,
+    is_license_credential,
+    resolve_cloud_credential,
 )
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
@@ -56,6 +65,7 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.drivers.thread_storage.local_thread_storage_driver import LocalThreadStorageDriver
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.agent_events import (
     AgentStreamEvent,
     AgentThinkingEvent,
@@ -119,16 +129,16 @@ from griptape_nodes.retained_mode.events.mcp_events import (
     GetEnabledMCPServersRequest,
     GetEnabledMCPServersResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
 from griptape_nodes.servers import bind_free_socket
 from griptape_nodes.servers.mcp import GTN_MCP_SERVER_HOST, GTN_MCP_SERVER_PORT, start_mcp_server
 
 if TYPE_CHECKING:
-    from pydantic_ai.messages import UserContent
+    from pydantic_ai.messages import ModelMessage, UserContent
     from pydantic_ai.toolsets import AbstractToolset
 
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.static_files_manager import StaticFilesManager
 
@@ -183,6 +193,35 @@ def _build_agent_instructions(*, include_image_tool: bool) -> str:
     return _AGENT_INSTRUCTIONS_BASE.format(image_tool_line=image_tool_line)
 
 
+def _cloud_http_status_of(exc: BaseException, cloud_host: str) -> int | None:
+    """Return the HTTP status of a Griptape Cloud failure, or None if it isn't one.
+
+    Two unrelated shapes reach this code: Pydantic AI's ``ModelHTTPError`` carries
+    ``status_code`` directly (the chat path), while ``httpx.HTTPStatusError`` keeps
+    it on ``response`` (the image path). The image toolset also wraps its failure in
+    ``ModelRetry`` with ``raise ... from exc``, so follow the cause chain.
+
+    Only errors from ``cloud_host`` count. An agent turn also talks to remote MCP
+    servers, which raise the same ``httpx.HTTPStatusError``; attributing their 403
+    to Griptape licensing would send the user to their Griptape administrator over
+    an expired token on their own MCP server.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, httpx.HTTPStatusError):
+            if current.request.url.host == cloud_host:
+                return current.response.status_code
+            return None
+        # ModelHTTPError has no URL, but the model is the Cloud provider whenever
+        # the caller has already confirmed the active provider is Griptape Cloud.
+        if isinstance(current, ModelHTTPError):
+            return current.status_code
+        current = current.__cause__
+    return None
+
+
 def _friendly_list_models_error(exc: Exception, base_url: str | None) -> str | None:
     """Return a user-facing message when listing a provider's models fails.
 
@@ -230,7 +269,44 @@ DEFAULT_AGENT_USAGE_LIMITS = UsageLimits(request_limit=60)
 # inlining it for the model, and the media type to assume when neither the
 # response header nor the URL extension identifies one.
 _ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+# History images are re-fetched from the local static-file server (loopback), so
+# a much shorter timeout applies: it bounds the per-turn stall when that server
+# is unreachable (e.g. its port shifted across restarts) instead of the 30s an
+# external attachment warrants.
+_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS = 5.0
 _DEFAULT_IMAGE_MEDIA_TYPE = "image/png"
+# Stands in for a replayed user turn whose only content was image attachments
+# that all failed to re-download, so the turn is never sent to the model as an
+# empty message (which some providers reject).
+_UNAVAILABLE_IMAGE_PLACEHOLDER = "[An image attached to this earlier message is no longer available.]"
+
+# Written into the workspace skills directory the first time a runner is
+# built, so users discovering the folder know what belongs in it.
+_SKILLS_README = """\
+# Agent Skills
+
+Skills placed in this directory are loaded automatically by the Griptape Nodes
+agent. Each skill lives in its own subdirectory containing a `SKILL.md` file:
+
+    .agents/skills/
+        my-skill/
+            SKILL.md
+
+`SKILL.md` starts with YAML frontmatter declaring `name` (which must match the
+directory name) and `description`, followed by the skill's instructions:
+
+    ---
+    name: my-skill
+    description: When to use this skill and what it does.
+    ---
+
+    Step-by-step guidance for the agent goes here.
+
+The agent re-scans this directory before each run, so new or edited skills
+take effect without restarting the engine.
+
+Skills here follow the Agent Skills specification: https://agentskills.io
+"""
 
 
 @dataclass
@@ -247,10 +323,30 @@ class _ActiveRun:
     loop: asyncio.AbstractEventLoop
 
 
-class AgentManager:
+@dataclass
+class _RehydratedMessage:
+    """A history message copy plus how many of its images were re-inlined.
+
+    ``attempted`` counts the ``ImageUrl`` parts found; ``succeeded`` counts those
+    whose bytes were re-downloaded, so the caller can log the aggregate.
+    """
+
+    message: ModelRequest
+    attempted: int
+    succeeded: int
+
+
+class AgentManager(EngineScoped):
     """Owns the chat-sidebar agent runner and the engine-bundled MCP server."""
 
-    def __init__(self, static_files_manager: StaticFilesManager, event_manager: EventManager | None = None) -> None:
+    def __init__(
+        self,
+        static_files_manager: StaticFilesManager,
+        event_manager: EventManager | None = None,
+        *,
+        engine: Engine | None = None,
+    ) -> None:
+        super().__init__(engine)
         self.static_files_manager = static_files_manager
         self._mcp_server_port = GTN_MCP_SERVER_PORT
 
@@ -348,9 +444,28 @@ class AgentManager:
         try:
             return await self._run_agent(request)
         except Exception as e:
-            err_msg = f"Error running agent: {e}"
+            message = self._explain_agent_run_error(e, request.provider_name)
+            err_msg = f"Error running agent: {message}"
             logger.exception(err_msg)
-            return RunAgentResultFailure(error={"message": str(e)}, result_details=err_msg)
+            return RunAgentResultFailure(error={"message": message}, result_details=err_msg)
+
+    def _explain_agent_run_error(self, exc: Exception, provider_name: str | None) -> str:
+        """Return the user-facing text for a failed agent run.
+
+        A Griptape Cloud request authenticated with a License can authenticate
+        successfully and still be refused: Cloud evaluates an entitlement policy
+        per request and answers HTTP 403. On its own that surfaces as a bare
+        "Forbidden", which reads like a bug rather than a licensing decision, so
+        name the cause. Every other error keeps its original text.
+        """
+        if self._get_provider(provider_name).type != _PROTECTED_PROVIDER_NAME:
+            return str(exc)
+        cloud_host = urlsplit(os.environ.get("GT_CLOUD_BASE_URL") or GRIPTAPE_CLOUD_BASE_URL).hostname or ""
+        if _cloud_http_status_of(exc, cloud_host) != HTTPStatus.FORBIDDEN:
+            return str(exc)
+        if not is_license_credential(resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)):
+            return str(exc)
+        return f"Griptape Cloud refused the request because {POLICY_DENIED_HINT} ({exc})"
 
     async def _run_agent(self, request: RunAgentRequest) -> ResultPayload:
         thread_id = self._validate_thread_for_run(request.thread_id)
@@ -361,9 +476,9 @@ class AgentManager:
             provider_name=request.provider_name,
             model_name=request.model_name,
         )
-        prompt = await _compose_prompt(request.input, request.url_artifacts)
+        composed = await _compose_prompt(request.input, request.url_artifacts)
 
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
 
         def emit(event: RunEvent) -> None:
             payload = _run_event_to_payload(event)
@@ -378,7 +493,14 @@ class AgentManager:
         cancel_event = asyncio.Event()
         self._active_runs[thread_id] = _ActiveRun(cancel_event=cancel_event, loop=asyncio.get_running_loop())
         try:
-            result = await runner.run(prompt, thread_id=thread_id, event_sink=emit, cancel_event=cancel_event)
+            result = await runner.run(
+                composed.live,
+                thread_id=thread_id,
+                event_sink=emit,
+                cancel_event=cancel_event,
+                persist_prompt=composed.persist,
+                history_rehydrator=_rehydrate_history,
+            )
         finally:
             # Only drop our own entry; a newer run for the same thread may have
             # replaced it (shouldn't happen for the chat sidebar, but stay safe).
@@ -684,9 +806,9 @@ class AgentManager:
         base_url = provider.base_url or ""
 
         if provider_type == _PROTECTED_PROVIDER_NAME:
-            api_key = secrets_manager.get_secret(API_KEY_ENV_VAR)
+            api_key = resolve_cloud_credential(secrets_manager, secret_name=API_KEY_ENV_VAR)
             if not api_key:
-                msg = f"Secret '{API_KEY_ENV_VAR}' not found"
+                msg = f"Attempted to start the agent. Failed because {MISSING_CREDENTIAL_MESSAGE}"
                 raise ValueError(msg)
             # Match build_griptape_cloud_model's `or` semantics: a set-but-empty
             # GT_CLOUD_BASE_URL falls back to the default rather than yielding a
@@ -717,6 +839,7 @@ class AgentManager:
             return cached
 
         workspace_root = Path(config_manager.workspace_path)
+        self._ensure_skills_directory(workspace_root)
         mcp_servers: list[AbstractToolset[Any]] = [
             streamable_http_local(
                 f"http://localhost:{self._mcp_server_port}/mcp/",
@@ -748,6 +871,25 @@ class AgentManager:
         )
         self._runner_cache[cache_key] = runner
         return runner
+
+    def _ensure_skills_directory(self, workspace_root: Path) -> None:
+        """Scaffold `<workspace>/.agents/skills` so the runner always builds a skills capability.
+
+        Called before every runner construction: the runner only attaches a
+        `SkillsCapability` when the directory exists at construction time, and
+        runners are cached, so creating the directory here guarantees skills
+        added mid-session are picked up on the next scan. Seeds a README the
+        first time so users discovering the folder know what belongs in it.
+        Failure to scaffold is logged but never blocks building the agent.
+        """
+        skills_dir = workspace_root / DEFAULT_SKILLS_DIRECTORY
+        try:
+            skills_dir.mkdir(parents=True, exist_ok=True)
+            readme = skills_dir / "README.md"
+            if not readme.exists():
+                readme.write_text(_SKILLS_README, encoding="utf-8")
+        except OSError as e:
+            logger.warning("Attempted to scaffold skills directory at %s. Failed because of: %s", skills_dir, e)
 
     def on_handle_list_agent_providers_request(self, _: ListAgentProvidersRequest) -> ResultPayload:
         return ListAgentProvidersResultSuccess(
@@ -781,6 +923,8 @@ class AgentManager:
             model=pd.model or (MODEL_CHOICES[0] if MODEL_CHOICES else "gpt-4o"),
             base_url=pd.base_url or None,
             api_key_secret_name=api_key_secret_name,
+            enabled=pd.enabled,
+            icon=pd.icon or None,
         )
         self._providers.append(provider)
         self._persist_providers()
@@ -798,6 +942,10 @@ class AgentManager:
             return UpdateAgentProviderResultFailure(
                 result_details=f"Attempted to update provider '{request.name}'. Failed because type '{pd.type}' is not a known preset id."
             )
+        if pd.enabled is False and request.name == _PROTECTED_PROVIDER_NAME:
+            return UpdateAgentProviderResultFailure(
+                result_details=f"Attempted to update provider '{request.name}'. Failed because it is a protected provider and cannot be disabled."
+            )
         if pd.type is not None:
             existing.type = pd.type
         if pd.model is not None:
@@ -807,6 +955,10 @@ class AgentManager:
         if "api_key_secret_name" in pd.model_fields_set and provider_accepts_customer_key(existing.type):
             raw = pd.api_key_secret_name or ""
             existing.api_key_secret_name = SecretsManager._apply_secret_name_compliance(raw) if raw else None
+        if pd.enabled is not None:
+            existing.enabled = pd.enabled
+        if "icon" in pd.model_fields_set:
+            existing.icon = pd.icon or None
         self._persist_providers()
         self._runner_cache.clear()
         return UpdateAgentProviderResultSuccess(result_details=f"Provider '{request.name}' updated successfully.")
@@ -911,11 +1063,10 @@ class AgentManager:
         parts.extend(server_rules)
         return "\n\n".join(parts)
 
-    @staticmethod
-    def _lookup_mcp_configs(server_names: list[str]) -> list[dict[str, Any]]:
+    def _lookup_mcp_configs(self, server_names: list[str]) -> list[dict[str, Any]]:
         if not server_names:
             return []
-        result = GriptapeNodes.handle_request(GetEnabledMCPServersRequest())
+        result = self.engine.handle_request(GetEnabledMCPServersRequest())
         if not isinstance(result, GetEnabledMCPServersResultSuccess):
             logger.warning("Could not load enabled MCP servers; agent will run without extras.")
             return []
@@ -933,7 +1084,20 @@ class AgentManager:
         return thread_id
 
 
-async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> str | list[UserContent]:
+@dataclass
+class ComposedPrompt:
+    """A user prompt in two forms: raw bytes for the live call, URLs to persist.
+
+    ``live`` inlines ``BinaryContent`` so the provider sees pixels (it cannot
+    fetch the localhost static-file URLs). ``persist`` swaps each image for an
+    ``ImageUrl`` so saved history stays small and the GUI renders thumbnails.
+    """
+
+    live: str | list[UserContent]
+    persist: str | list[UserContent]
+
+
+async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact]) -> ComposedPrompt:
     """Combine the plain text input with any attached image artifacts.
 
     Image attachments are downloaded server-side and inlined as
@@ -941,28 +1105,136 @@ async def _compose_prompt(text: str, url_artifacts: list[RunAgentRequestArtifact
     The engine fetches the bytes itself, which is why this works even when the
     static file store hands out localhost URLs the model provider cannot reach.
 
-    Returns the plain ``text`` when there are no usable image attachments,
-    otherwise a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    Returns two aligned forms of the prompt. ``live`` is the plain ``text`` (no
+    attachments) or a ``[text, BinaryContent, ...]`` sequence for ``Agent.run``.
+    ``persist`` mirrors it with each image as a lightweight ``ImageUrl`` so the
+    saved history stays small; a download that fails is dropped from both.
     """
     image_urls = [
         artifact.value for artifact in url_artifacts if artifact.type == "ImageUrlArtifact" and artifact.value
     ]
     if not image_urls:
-        return text
+        return ComposedPrompt(live=text, persist=text)
 
-    contents: list[UserContent] = []
+    live: list[UserContent] = []
+    persist: list[UserContent] = []
     if text:
-        contents.append(text)
+        live.append(text)
+        persist.append(text)
     async with httpx.AsyncClient(timeout=_ATTACHMENT_DOWNLOAD_TIMEOUT_SECONDS) as client:
         for url in image_urls:
             content = await _download_image_content(client, url)
-            if content is not None:
-                contents.append(content)
+            if content is None:
+                continue
+            live.append(content)
+            persist.append(ImageUrl(url=url))
 
     # Every download failed: fall back to plain text so the turn still runs.
-    if not any(isinstance(content, BinaryContent) for content in contents):
-        return text
-    return contents
+    if not any(isinstance(part, BinaryContent) for part in live):
+        return ComposedPrompt(live=text, persist=text)
+    return ComposedPrompt(live=live, persist=persist)
+
+
+async def _rehydrate_history(messages: list[ModelMessage]) -> list[ModelMessage]:
+    """Return a copy of ``messages`` with ``ImageUrl`` attachments re-inlined.
+
+    History stores localhost static-file URLs the external provider cannot
+    fetch, so replayed turns need the raw bytes re-inlined. A part whose
+    download fails is dropped, matching ``_compose_prompt`` behavior.
+
+    The input is never mutated: rehydrated bytes belong only to the copy fed
+    to the model, so they can never be written back to disk. Messages that
+    carry no image are returned unchanged (same object). Downloads run
+    concurrently and against a short loopback timeout so an unreachable
+    static server bounds, rather than serializes, the per-turn stall.
+    """
+    # _message_has_image_url is True only for a ModelRequest, so every entry
+    # here is safe to hand to _rehydrate_message.
+    image_requests = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if isinstance(message, ModelRequest) and _message_has_image_url(message)
+    ]
+    if not image_requests:
+        return messages
+    async with httpx.AsyncClient(timeout=_REHYDRATE_DOWNLOAD_TIMEOUT_SECONDS) as client:
+        # Rehydrate every image-bearing message concurrently so a slow or
+        # unreachable static server bounds the whole turn's stall to one
+        # timeout, not one per message.
+        results = await asyncio.gather(*(_rehydrate_message(client, message) for _, message in image_requests))
+    result_by_position = {index: result for (index, _), result in zip(image_requests, results, strict=True)}
+    rehydrated_messages: list[ModelMessage] = []
+    attempted = 0
+    succeeded = 0
+    for index, message in enumerate(messages):
+        result = result_by_position.get(index)
+        if result is None:
+            rehydrated_messages.append(message)
+            continue
+        rehydrated_messages.append(result.message)
+        attempted += result.attempted
+        succeeded += result.succeeded
+    if succeeded < attempted:
+        logger.warning(
+            "Re-inlined %d/%d history image(s) for the chat turn; the rest could not be "
+            "downloaded from the local static-file server, so the model will not see them. "
+            "This usually means the static server moved to a different port across restarts.",
+            succeeded,
+            attempted,
+        )
+    return rehydrated_messages
+
+
+async def _rehydrate_message(client: httpx.AsyncClient, message: ModelRequest) -> _RehydratedMessage:
+    """Return a copy of ``message`` with each user-prompt ``ImageUrl`` inlined.
+
+    Downloads for a message run concurrently. The result also carries how many
+    images were attempted versus successfully re-inlined so the caller can
+    report the aggregate.
+    """
+    attempted = 0
+    succeeded = 0
+    new_parts: list[Any] = []
+    for part in message.parts:
+        if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+            new_parts.append(part)
+            continue
+        images = [(index, item) for index, item in enumerate(part.content) if isinstance(item, ImageUrl)]
+        attempted += len(images)
+        downloads = await asyncio.gather(*(_download_image_content(client, image.url) for _, image in images))
+        downloaded_by_index = {index: content for (index, _), content in zip(images, downloads, strict=True)}
+        rehydrated: list[UserContent] = []
+        for index, item in enumerate(part.content):
+            if index not in downloaded_by_index:
+                rehydrated.append(item)
+                continue
+            content = downloaded_by_index[index]
+            if content is not None:
+                succeeded += 1
+                rehydrated.append(content)
+        # An image-only turn whose every image failed to re-download would
+        # otherwise become empty content, which some providers reject. Keep
+        # the turn present with a placeholder so replay still works.
+        if images and not rehydrated:
+            rehydrated.append(_UNAVAILABLE_IMAGE_PLACEHOLDER)
+        new_parts.append(replace(part, content=rehydrated))
+    return _RehydratedMessage(message=replace(message, parts=new_parts), attempted=attempted, succeeded=succeeded)
+
+
+def _message_has_image_url(message: ModelMessage) -> bool:
+    """Report whether ``message`` carries an ``ImageUrl`` in a user prompt.
+
+    Used to skip opening an HTTP client for text-only histories, the common
+    case, so rehydration only pays the download cost when there is an image.
+    """
+    if not isinstance(message, ModelRequest):
+        return False
+    for part in message.parts:
+        if not isinstance(part, UserPromptPart) or isinstance(part.content, str):
+            continue
+        if any(isinstance(item, ImageUrl) for item in part.content):
+            return True
+    return False
 
 
 async def _download_image_content(client: httpx.AsyncClient, url: str) -> BinaryContent | None:

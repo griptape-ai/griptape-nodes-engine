@@ -9,10 +9,12 @@ from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.common.macro_parser import MacroSyntaxError, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation, SituationFilePolicy
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage import StorageBackend
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.drivers.storage.local_storage_driver import LocalStorageDriver
 from griptape_nodes.files.path_utils import FilenameParts
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetPreviewForArtifactRequest,
@@ -45,7 +47,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.secrets_manager import SecretsManager
@@ -72,7 +73,7 @@ class ResolvedStaticFilePath(NamedTuple):
     file_metadata: SidecarContent | None = None
 
 
-class StaticFilesManager:
+class StaticFilesManager(EngineScoped):
     """A class to manage the creation and management of static files."""
 
     def __init__(
@@ -80,6 +81,8 @@ class StaticFilesManager:
         config_manager: ConfigManager,
         secrets_manager: SecretsManager,
         event_manager: EventManager | None = None,
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the StaticFilesManager.
 
@@ -87,32 +90,44 @@ class StaticFilesManager:
             config_manager: The ConfigManager instance to use for accessing the workspace path.
             event_manager: The EventManager instance to use for event handling.
             secrets_manager: The SecretsManager instance to use for accessing secrets.
+            engine: The owning Engine, used to resolve peer managers.
         """
+        super().__init__(engine)
         self.config_manager = config_manager
         self.secrets_manager = secrets_manager
 
         self.storage_backend = config_manager.get_config_value("storage_backend", default=StorageBackend.LOCAL)
         workspace_directory = config_manager.workspace_path
 
-        # Capture any explicit base URL override now; leave the underlying field None otherwise
-        # so on_app_initialization_complete can derive the URL from the OS-assigned port. A set
-        # value here (including one that equals the server defaults) is the signal for "user
-        # override" and short-circuits the port refresh.
-        configured_base_url = config_manager.get_config_value("static_server_base_url")
-        self._static_server_base_url: str | None = (
-            configured_base_url.rstrip("/") if configured_base_url is not None else None
-        )
-        base_url = (
-            f"{self._static_server_base_url}{STATIC_SERVER_URL}" if self._static_server_base_url is not None else None
-        )
+        # Where the workspace is served, resolved in on_app_initialization_complete. Staying None
+        # until then is also what tells that handler it has not settled this yet, so a second
+        # initialization pass in the same process doesn't start a second server.
+        self._static_server_base_url: str | None = None
+
+        # Seed the driver with any configured override so URLs built before initialization
+        # completes still point at the tunnel or proxy fronting the server. The handler re-reads
+        # it, so an override from a project activated after this manager was constructed counts.
+        configured_base_url = self._configured_base_url()
+        base_url = f"{configured_base_url}{STATIC_SERVER_URL}" if configured_base_url is not None else None
 
         match self.storage_backend:
             case StorageBackend.GTC:
                 bucket_id = secrets_manager.get_secret("GT_CLOUD_BUCKET_ID", should_error_on_not_found=False)
 
+                cloud_credential = resolve_cloud_credential(secrets_manager)
+
                 if not bucket_id:
                     logger.warning(
                         "GT_CLOUD_BUCKET_ID secret is not available, falling back to local storage. Run `gtn init` to set it up."
+                    )
+                    self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
+                elif not cloud_credential:
+                    # Without this the driver would send "Bearer None" and every
+                    # upload would fail with an opaque 401 instead of naming the
+                    # missing credential at boot.
+                    logger.warning(
+                        "Falling back to local storage because %s",
+                        MISSING_CREDENTIAL_MESSAGE,
                     )
                     self.storage_driver = LocalStorageDriver(workspace_directory, base_url=base_url)
                 else:
@@ -122,7 +137,7 @@ class StaticFilesManager:
                     self.storage_driver = GriptapeCloudStorageDriver(
                         workspace_directory,
                         bucket_id=bucket_id,
-                        api_key=secrets_manager.get_secret("GT_CLOUD_API_KEY"),
+                        api_key=cloud_credential,
                         static_files_directory=static_files_directory,
                     )
             case StorageBackend.LOCAL:
@@ -153,10 +168,11 @@ class StaticFilesManager:
 
     @property
     def static_server_base_url(self) -> str:
-        """Base URL for the static server.
+        """Base URL of the static server serving this workspace.
 
-        Resolved during ``on_app_initialization_complete`` once the server has bound to a
-        port. Reading this before that event fires indicates a startup-ordering bug.
+        Resolved during ``on_app_initialization_complete``, either from the server the host
+        process provided or from the one this engine started. Reading it before that event
+        fires is a startup-ordering bug.
         """
         if self._static_server_base_url is None:
             msg = "static_server_base_url accessed before on_app_initialization_complete resolved it."
@@ -179,7 +195,7 @@ class StaticFilesManager:
         if not extension:
             return file_path, None
 
-        registry = GriptapeNodes.ArtifactManager()._registry
+        registry = self.engine.artifact_manager._registry
         provider_classes = registry.get_provider_classes_by_format(extension)
         if not provider_classes:
             logger.debug("Skipping preview for unsupported file format: %s", file_path)
@@ -187,7 +203,7 @@ class StaticFilesManager:
 
         provider_name = provider_classes[0].get_friendly_name()
 
-        result = await GriptapeNodes.ahandle_request(
+        result = await self.engine.ahandle_request(
             GetPreviewForArtifactRequest(
                 macro_path=MacroPath(ParsedMacro(str(file_path)), {}),
                 artifact_provider_name=provider_name,
@@ -295,9 +311,9 @@ class StaticFilesManager:
             bucket_id: The bucket ID to use
 
         Returns:
-            GriptapeCloudStorageDriver instance if API key is available, None otherwise
+            GriptapeCloudStorageDriver instance if a credential is available, None otherwise
         """
-        api_key = self.secrets_manager.get_secret("GT_CLOUD_API_KEY", should_error_on_not_found=False)
+        api_key = resolve_cloud_credential(self.secrets_manager)
 
         if not api_key:
             return None
@@ -358,7 +374,7 @@ class StaticFilesManager:
             return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
         if parsed.get_variables():
-            resolve_result = GriptapeNodes.handle_request(
+            resolve_result = self.engine.handle_request(
                 GetPathForMacroRequest(parsed_macro=parsed, variables=request.macro_variables)
             )
             if not isinstance(resolve_result, GetPathForMacroResultSuccess):
@@ -372,7 +388,7 @@ class StaticFilesManager:
         if bucket_id is not None:
             driver = self._create_cloud_storage_driver(bucket_id)
             if driver is None:
-                msg = f"Attempted to create download URL for Griptape Cloud file. Failed with file_path='{file_path}' because GT_CLOUD_API_KEY secret is not available."
+                msg = f"Attempted to create download URL for Griptape Cloud file. Failed with file_path='{file_path}' because {MISSING_CREDENTIAL_MESSAGE}"
                 return CreateStaticFileDownloadUrlResultFailure(error=msg, result_details=msg)
 
             # For cloud URLs, pass the full URL to the driver
@@ -400,23 +416,58 @@ class StaticFilesManager:
             result_details="Successfully created static file download URL",
         )
 
-    def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
-        # Start static server in daemon thread if enabled
-        if isinstance(self.storage_driver, LocalStorageDriver):
+    def on_app_initialization_complete(self, payload: AppInitializationComplete) -> None:
+        if not isinstance(self.storage_driver, LocalStorageDriver):
+            return
+
+        if payload.static_server_base_url is not None:
+            # The host process serves this workspace and told us where. Pointing at its server
+            # keeps asset URLs valid for as long as the host runs, rather than only as long as
+            # this engine does.
+            self._static_server_base_url = payload.static_server_base_url.rstrip("/")
+            logger.debug("Using host-provided static server at %s", self._static_server_base_url)
+        elif self._static_server_base_url is not None:
+            # Initialization can complete more than once per process: a workflow executor
+            # broadcasts it for its own run. Where the workspace is served is already settled.
+            logger.debug("Static server already settled at %s", self._static_server_base_url)
+        else:
+            # No host-provided server, so serve the workspace here.
+            #
+            # This is the path that disappears once every shipped host serves the workspace
+            # itself and sets static_server_base_url on the initialization payload. At that
+            # point this branch and servers/static.py both go away, and a workspace with no
+            # host-provided server simply has no server.
+            #
             # Pre-bind to port 0 (or the configured port) so the OS assigns a free port before
             # the server thread starts. This lets us know the actual port immediately with no
             # race condition between discovering the port and uvicorn binding to it.
             sock = bind_free_socket(STATIC_SERVER_HOST, STATIC_SERVER_PORT)
             actual_port = sock.getsockname()[1]
 
-            # When there's no explicit override, derive the base URL from the bind host and
-            # the OS-assigned port. An override set in __init__ (e.g. an ngrok tunnel, reverse
-            # proxy, or `ssh -L` tunnel on a different port) is taken verbatim.
-            if self._static_server_base_url is None:
+            # An override (e.g. an ngrok tunnel, reverse proxy, or `ssh -L` tunnel on a
+            # different port) fronts the server we just bound, so it is advertised verbatim.
+            # Otherwise the URL follows the bind host and the OS-assigned port.
+            configured_base_url = self._configured_base_url()
+            if configured_base_url is None:
                 self._static_server_base_url = f"http://{STATIC_SERVER_HOST}:{actual_port}"
-            self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
+            else:
+                self._static_server_base_url = configured_base_url
 
             threading.Thread(target=start_static_server, args=(sock,), daemon=True, name="static-server").start()
+            logger.info("Serving workspace static files at %s", self._static_server_base_url)
+
+        self.storage_driver.base_url = f"{self._static_server_base_url}{STATIC_SERVER_URL}"
+
+    def _configured_base_url(self) -> str | None:
+        """Return the configured static server base URL, normalized, or None when unset.
+
+        A configured value means a tunnel or reverse proxy fronts the server, so it is what
+        gets advertised rather than the address the server binds to.
+        """
+        configured_base_url = self.config_manager.get_config_value("static_server_base_url")
+        if configured_base_url is None:
+            return None
+        return configured_base_url.rstrip("/")
 
     def save_static_file(
         self,
@@ -489,7 +540,7 @@ class StaticFilesManager:
         Returns:
             ResolvedStaticFilePath if situation resolution succeeds, or None on failure.
         """
-        situation_result = GriptapeNodes.handle_request(GetSituationRequest(situation_name=situation_name))
+        situation_result = self.engine.handle_request(GetSituationRequest(situation_name=situation_name))
         if not isinstance(situation_result, GetSituationResultSuccess):
             logger.warning(
                 "Project template does not include '%s' situation; static files will save to the default directory. "
@@ -508,7 +559,7 @@ class StaticFilesManager:
             logger.warning("Failed to parse %s situation macro: %s", situation_name, e)
             return None
 
-        macro_result = GriptapeNodes.handle_request(
+        macro_result = self.engine.handle_request(
             GetPathForMacroRequest(
                 parsed_macro=parsed_macro,
                 variables={"file_name_base": parts.stem, "file_extension": parts.extension},
@@ -518,7 +569,7 @@ class StaticFilesManager:
             logger.warning("Failed to resolve %s situation path: %s", situation_name, macro_result.result_details)
             return None
 
-        workspace_dir = GriptapeNodes.ConfigManager().workspace_path
+        workspace_dir = self.config_manager.workspace_path
         try:
             # Resolve both sides to ensure drive letters match on Windows (drive-relative vs absolute paths).
             workspace_relative_path = macro_result.absolute_path.resolve().relative_to(workspace_dir.resolve())

@@ -52,7 +52,9 @@ from griptape_nodes.node_library.library_declarations import (
     resolve_node_models,
 )
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.access_events import (
+    CodecAccessDirection,
     CodecAccessVerdict,
     ModelAccessVerdict,
     QueryCodecAccessRequest,
@@ -66,7 +68,6 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessRequest,
     QueryModelAccessResultSuccess,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     AuthorizationCheckpoint,
     CheckpointAction,
@@ -78,6 +79,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
 
     from griptape_nodes.node_library.library_declarations import ModelCatalogLibraryProperty, NodeDeclaration
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.events.base_events import ResultPayload
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
@@ -104,10 +106,11 @@ class _NodeResolution:
     resolved_by_id: dict[str, ResolvedModel]
 
 
-class AccessManager:
+class AccessManager(EngineScoped):
     """Answers per-candidate authorization queries via the `OFFER_MODEL` checkpoint."""
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(QueryModelAccessRequest, self.on_query_model_access_request)
             event_manager.assign_manager_to_request_type(
@@ -124,6 +127,7 @@ class AccessManager:
             candidate_model_ids=request.candidate_model_ids,
             node_type=None,
             resolved_by_id={},
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessResultSuccess(
             verdicts=verdicts,
@@ -149,6 +153,7 @@ class AccessManager:
             candidate_model_ids=candidates,
             node_type=request.node_type,
             resolved_by_id=resolution.resolved_by_id,
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessForNodeResultSuccess(
             verdicts=verdicts,
@@ -162,18 +167,22 @@ class AccessManager:
         UI offers against the same policy that gates the actual read or write.
         """
         match request.direction:
-            case "read":
+            case CodecAccessDirection.READ:
                 action = CheckpointAction.READ_VIDEO_CODEC
-            case "write":
+            case CodecAccessDirection.WRITE:
                 action = CheckpointAction.WRITE_VIDEO_CODEC
             case _:
+                # Defense in depth for stray wire-side values. StrEnum catches
+                # Python-side typos; a request deserialized from the WS boundary
+                # can still carry any string.
+                valid = ", ".join(f"'{d.value}'" for d in CodecAccessDirection)
                 msg = (
                     f"Attempted to query codec access. Failed because direction "
-                    f"'{request.direction}' is not one of 'read' or 'write'."
+                    f"'{request.direction}' is not one of {valid}."
                 )
                 return QueryCodecAccessResultFailure(result_details=msg)
 
-        event_manager = GriptapeNodes.EventManager()
+        event_manager = self.engine.event_manager
         verdicts: list[CodecAccessVerdict] = []
         for codec in request.candidate_codecs:
             attributes: dict[str, Any] = {CheckpointAttribute.ID: codec}
@@ -211,6 +220,7 @@ class AccessManager:
             candidate_model_ids=request.candidate_model_ids,
             node_type=None,
             resolved_by_id=resolved_by_id,
+            event_manager=self.engine.event_manager,
         )
         return QueryModelAccessForCatalogResultSuccess(
             verdicts=verdicts,
@@ -307,6 +317,7 @@ class AccessManager:
         candidate_model_ids: Sequence[str],
         node_type: str | None,
         resolved_by_id: dict[str, ResolvedModel],
+        event_manager: EventManager,
     ) -> list[ModelAccessVerdict]:
         """Ask the authorization hook chain once per candidate; collect one verdict each.
 
@@ -324,7 +335,6 @@ class AccessManager:
         iterations; the guard only short-circuits when a hook itself re-enters a
         guarded engine operation, not when one handler loops over candidates.
         """
-        event_manager = GriptapeNodes.EventManager()
         verdicts: list[ModelAccessVerdict] = []
         for model_id in candidate_model_ids:
             attributes: dict[str, Any] = {CheckpointAttribute.ID: model_id}

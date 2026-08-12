@@ -1,16 +1,16 @@
 [project]
 name = "griptape-nodes-engine"
-version = "0.92.0"
+version = "0.98.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12.0, <3.13"
+requires-python = ">=3.12.0, <3.14"
 dependencies = [
   "griptape>=1.10.2",
   "pydantic>=2.10.6",
   "python-dotenv>=1.0.1",
   "xdg-base-dirs>=6.0.2",
   "httpx>=0.28.0,<1.0.0",
-  "websockets>=15.0.1,<17.0.0",
+  "websockets>=15.0.1,<18.0.0",
   "tomlkit>=0.13.2",
   # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/833
   "uv>=0.6.16",
@@ -19,7 +19,11 @@ dependencies = [
   "packaging>=25.0",
   "python-multipart>=0.0.20",
   "json-repair>=0.46.1",
-  "mcp[ws]>=1.10.1",
+  # servers/mcp.py targets the 1.x low-level server API. Migrating is not just a rewrite:
+  # pydantic-ai-slim reaches mcp through fastmcp-slim[client]<4, and every fastmcp-slim release
+  # under that cap requires mcp<2.0, so asking for 2.x makes the resolve unsatisfiable.
+  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/5218
+  "mcp>=1.10.1,<2",
   "binaryornot>=0.4.4",
   "pillow>=11.3.0",
   "static-ffmpeg>=3.0",
@@ -32,7 +36,6 @@ dependencies = [
   "ruamel.yaml>=0.18.15",
   "asyncio-thread-runner>=1.0",
   "portalocker>=2.10.0",
-  "pygit2>=1.19.0",
   "send2trash>=2.1.0",
   "tenacity>=9.0.0",
   "truststore>=0.10.1",
@@ -54,15 +57,15 @@ dev = [
   "mdformat-footnote>=0.1.1",
   "mdformat-mkdocs>=4.1.2",
   "pyright>=1.1.396",
-  "ruff>=0.11.0",
+  "ruff>=0.16.0",
   "typos>=1.30.2",
 ]
 docs = [
   "mkdocs-material>=9.6.9",
   "mkdocs>=1.5.2",
   "mkdocstrings[python]>=0.29.1",
-  "mkdocs-mermaid2-plugin>=1.2.2",
   "mkdocs-llmstxt>=0.5.0",
+  "mkdocs-redirects>=1.2.2,<1.2.4",
   "pymdown-extensions>=10.17",
 ]
 test = [
@@ -71,11 +74,12 @@ test = [
   "pytest-mock>=3.14.0",
   "pytest-xdist>=3.6.1",
   "pytest-cov>=6.0.0",
+  "pytest-timeout>=2.4.0",
   "coverage>=7.0.0",
 ]
 
 [build-system]
-requires = ["uv_build>=0.7.2,<0.12"]
+requires = ["uv_build>=0.7.2,<0.13"]
 build-backend = "uv_build"
 
 [tool.uv.build-backend]
@@ -105,10 +109,10 @@ ignore = [
   "ANN003",  # Intentional
   "ANN401",  # Intentional
   "COM812",  # Intentional
-  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834 
-  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835 
+  "E501",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/834
+  "D100",    # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/835
   "BLE001",  # TODO: https://github.com/griptape-ai/griptape-nodes-engine/issues/839
-  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838 
+  "SLF001",  # TODO :https://github.com/griptape-ai/griptape-nodes-engine/issues/838
   "SIM108",  # Intentional
   "SIM110",  # Intentional
   "D105",    # Intentional
@@ -117,6 +121,7 @@ ignore = [
   "FBT003",  # Intentional
   "RET504",  # Intentional
   "PLC0415", # Intentional
+  "CPY001",  # Intentional
 ]
 
 [tool.ruff.lint.flake8-tidy-imports.banned-api]
@@ -124,11 +129,40 @@ ignore = [
 "libraries.griptape_nodes_library".msg = "Import from griptape_nodes_library instead of libraries.griptape_nodes_library"
 "libraries.griptape_nodes_advanced_media_library".msg = "Import from griptape_nodes_advanced_media_library instead of libraries.griptape_nodes_advanced_media_library"
 "libraries.griptape_cloud".msg = "Import from griptape_cloud instead of libraries.griptape_cloud"
+"griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes".msg = "Engine-internal code should take an injected Engine (see griptape_nodes.retained_mode.engine) and reach peers via self.engine, not the process-wide GriptapeNodes facade. The facade exists for saved workflow files, node libraries, and process entry points; those are allowlisted in per-file-ignores."
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["S101", "D104"]
+"tests/*" = ["S101", "D104", "TID251"]
 "libraries/**/tests/**" = ["S101", "D104", "INP001"]
 "src/griptape_nodes/retained_mode/events/*" = ["TC001"]
+
+# TID251 allowlist for the GriptapeNodes facade. Two groups, and the difference matters.
+#
+# Group 1 -- legitimate facade users. These are process entry points or the public
+# surface that separately-versioned callers bind to, so they have no Engine to be handed.
+"src/griptape_nodes/retained_mode/griptape_nodes.py" = ["TID251"]
+"src/griptape_nodes/retained_mode/retained_mode.py" = ["TID251"]
+"src/griptape_nodes/cli/**" = ["TID251"]
+"src/griptape_nodes/api_client/**" = ["TID251"]
+"src/griptape_nodes/servers/**" = ["TID251"]
+"src/griptape_nodes/bootstrap/**" = ["TID251"]
+"src/griptape_nodes/app/**" = ["TID251"]
+#
+# Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
+# Deleting an entry from this list is the definition of done; do not add new entries.
+"src/griptape_nodes/common/**" = ["TID251"]
+"src/griptape_nodes/drivers/**" = ["TID251"]
+"src/griptape_nodes/exe_types/**" = ["TID251"]
+"src/griptape_nodes/files/**" = ["TID251"]
+"src/griptape_nodes/machines/**" = ["TID251"]
+# WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
+# Making it engine-owned is its own change, since it alters what node libraries import.
+"src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
+"src/griptape_nodes/utils/**" = ["TID251"]
+"src/griptape_nodes/version_compatibility/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/file_metadata/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/publishing/**" = ["TID251"]
+"src/griptape_nodes/retained_mode/managers/artifact_providers/**" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]

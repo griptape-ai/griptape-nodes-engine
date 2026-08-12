@@ -17,12 +17,15 @@ from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
     EventRequest,
     EventResultFailure,
     EventResultSuccess,
+    ExecutionGriptapeNodeEvent,
+    ExecutionPayload,
     ProgressEvent,
     RequestPayload,
     ResultDetails,
@@ -44,10 +47,12 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Iterator
 
     from griptape_nodes.api_client.request_client import RequestClient
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
 AP = TypeVar("AP", bound=AppPayload, default=AppPayload)
+EP = TypeVar("EP", bound=ExecutionPayload, default=ExecutionPayload)
 
 
 _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
@@ -64,6 +69,38 @@ def current_request_type() -> type[RequestPayload] | None:
     this ContextVar.
     """
     return _active_request_type.get()
+
+
+def reentrant_bus_in_init_would_report() -> bool:
+    """Whether a bus request issued right now would fire ``reentrant-bus-in-init``.
+
+    Both halves of the detector's condition (see
+    ``EventManager._report_reentrant_bus_in_init``), exposed so code that runs
+    inside a node ``__init__`` can ask BEFORE issuing a request and skip it
+    rather than commit the violation. The detector and every such caller read
+    this one predicate, so "we deferred" and "it would have been reported"
+    cannot drift apart as the scopes change.
+
+    Being inside a node ``__init__`` is not sufficient on its own. ``STRICT_MODE.report``
+    no-ops when no scope is active, and scopes open in exactly two places: around the
+    worker's schema probe (LOAD_PROBE, where a violation drops the class from the worker
+    schema) and around node execution (RUNTIME_EXECUTE, where a worker violation promotes
+    the result to a failure). An ordinary ``CreateNodeRequest`` -- an editor drop, a
+    workflow load, any single-process engine, where no probe runs at all -- opens neither,
+    so a read from ``__init__`` there is free and callers should just do it. Keying a
+    deferral off ``is_constructing_node()`` alone instead makes every node in every
+    deployment pay for a hazard only the worker's probe has.
+
+    When strict mode is disabled the scope is detached (``open_scope`` keeps it off the
+    stack), so this cannot tell a probe from an editor drop. It answers True while
+    constructing in that case: with the checker off, the conservative answer is the
+    safe one.
+    """
+    if not LibraryRegistry.is_constructing_node():
+        return False
+    if not STRICT_MODE.enabled:
+        return True
+    return STRICT_MODE.current_scope() is not None
 
 
 # Result types that should NOT trigger a flush request.
@@ -86,12 +123,21 @@ class ResultContext(TypedDict, total=False):
     request_id: str | None
 
 
-class EventManager:
-    def __init__(self) -> None:
+class EventManager(EngineScoped):
+    def __init__(self, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         # Dictionary to store the SPECIFIC manager for each request type
         self._request_type_to_manager: dict[type[RequestPayload], Callable] = defaultdict(list)  # pyright: ignore[reportAttributeAccessIssue]
         # Dictionary to store ALL SUBSCRIBERS to app events.
         self._app_event_listeners: dict[type[AppPayload], set[Callable]] = {}
+        # Dictionary to store ALL SUBSCRIBERS to execution events (the live feed of
+        # ExecutionPayloads emitted during a run, e.g. AgentStreamEvent). Lets a node
+        # tap the feed while it runs and react (e.g. stream tokens to a parameter).
+        self._execution_event_listeners: dict[type[ExecutionPayload], set[Callable]] = {}
+        # put_event/aput_event dispatch this feed on whatever thread emitted the event
+        # (often a worker thread), while subscribe/unsubscribe happen on the run's
+        # thread, so guard the dict and snapshot the target set before iterating.
+        self._execution_event_listeners_lock = threading.Lock()
         # Event queue for publishing events
         self._event_queue: asyncio.Queue | None = None
         # Keep track of which thread the event loop runs on
@@ -240,6 +286,11 @@ class EventManager:
             # We're on the same thread as the event loop or no loop thread tracked, use direct method
             self._event_queue.put_nowait(event)
 
+        # Dispatch after enqueuing so a callback that re-enters put_event (e.g. writing a
+        # streamed token to a parameter) enqueues its own events *after* the triggering
+        # event, preserving source order on the queue.
+        self._dispatch_to_execution_listeners(event)
+
     async def aput_event(self, event: Any) -> None:
         """Put event into async queue from async context.
 
@@ -258,6 +309,10 @@ class EventManager:
         else:
             # We're on the same thread as the event loop or no loop thread tracked, use async method
             await self._event_queue.put(event)
+
+        # Dispatch after enqueuing so a re-entrant emission from a callback lands on the
+        # queue after its triggering event (see put_event).
+        self._dispatch_to_execution_listeners(event)
 
     def add_pre_dispatch_hook(
         self,
@@ -497,8 +552,13 @@ class EventManager:
         the worker thread during library load. LibraryRegistry sets a
         ContextVar around create_node so every __init__ body in the
         hierarchy is covered.
+
+        The condition lives in ``reentrant_bus_in_init_would_report`` rather
+        than inline, because engine components that legitimately read state
+        from a node ``__init__`` consult the same predicate to decide whether
+        to defer. One owner, so the two answers cannot disagree.
         """
-        if not LibraryRegistry.is_constructing_node():
+        if not reentrant_bus_in_init_would_report():
             return
         rule = RULES["reentrant-bus-in-init"]
         # Subject attribution lives on the violation's ``subject`` field,
@@ -626,10 +686,8 @@ class EventManager:
         context: ResultContext,
     ) -> EventResultSuccess | EventResultFailure:
         """Core logic for handling requests, shared between sync and async methods."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
-        workflow_mgr = GriptapeNodes.WorkflowManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
+        workflow_mgr = self.engine.workflow_manager
 
         with operation_depth_mgr as depth_manager:
             # Now see if the WorkflowManager was asking us to squelch altered_workflow_state commands
@@ -685,9 +743,7 @@ class EventManager:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -741,9 +797,7 @@ class EventManager:
             request: The request to handle
             result_context: The result context containing response_topic and request_id
         """
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        operation_depth_mgr = GriptapeNodes.OperationDepthManager()
+        operation_depth_mgr = self.engine.operation_depth_manager
         if result_context is None:
             result_context = ResultContext()
 
@@ -833,6 +887,92 @@ class EventManager:
 
         listener_set.add(callback)
 
+    def add_listener_to_execution_event(self, execution_event_type: type[EP], callback: Callable[[EP], None]) -> None:
+        """Subscribe to a type of execution event on the live event feed.
+
+        Execution events (``ExecutionPayload`` subclasses such as ``AgentStreamEvent``
+        and ``AgentToolCallEvent``) are emitted as events flow through
+        ``put_event``/``aput_event`` on their way to the UI. This lets a node tap that
+        feed while it runs and react in real time -- for example, appending streamed
+        agent tokens onto one of its own parameters.
+
+        The callback is invoked synchronously with the payload as each matching event
+        is emitted, on whatever thread emitted it. Keep callbacks cheap and non-blocking;
+        an exception in a callback is logged and does not interrupt event delivery. Unlike
+        ``add_listener_to_app_event``, async callbacks are not supported and are rejected
+        here rather than silently dropped at dispatch time.
+
+        Only the exact payload type is matched -- subscribing to a base class such as
+        ``ExecutionPayload`` does not receive its subclasses (this mirrors
+        ``add_listener_to_app_event``). Execution events reach subscribers even when the
+        UI consumer suppresses them (suppression is applied downstream, not here), so
+        this feed is deliberately independent of ``should_suppress_event``.
+
+        Events carry no run identifier, so a subscriber that only wants its own run's
+        events should subscribe immediately before it triggers the run and unsubscribe
+        as soon as the run returns (see ``remove_listener_for_execution_event``).
+        """
+        callback_call = type(callback).__call__
+        if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(callback_call):
+            msg = (
+                f"Attempted to subscribe to execution event '{execution_event_type.__name__}'. "
+                f"Failed because callback '{getattr(callback, '__name__', callback)}' is a coroutine "
+                f"function; execution-event listeners are invoked synchronously on the emitting "
+                f"thread and must be plain (non-async) callables."
+            )
+            raise TypeError(msg)
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(execution_event_type)
+            if listener_set is None:
+                listener_set = set()
+                self._execution_event_listeners[execution_event_type] = listener_set
+            listener_set.add(callback)
+
+    def remove_listener_for_execution_event(
+        self, execution_event_type: type[EP], callback: Callable[[EP], None]
+    ) -> None:
+        """Unsubscribe a callback previously registered with ``add_listener_to_execution_event``.
+
+        Because dispatch invokes callbacks outside the lock (a callback may re-enter
+        ``put_event``), a callback can still fire once more if a concurrent emission on
+        another thread already snapshotted the listener set before this call. Callbacks
+        must tolerate a late invocation after they have been removed.
+        """
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(execution_event_type)
+            if listener_set is not None:
+                listener_set.discard(callback)
+                if not listener_set:
+                    del self._execution_event_listeners[execution_event_type]
+
+    def _dispatch_to_execution_listeners(self, event: Any) -> None:
+        """Fan a queued execution event out to any subscribers before it reaches the UI.
+
+        Only ``ExecutionGriptapeNodeEvent``s carry an ``ExecutionPayload``; everything
+        else on the queue is ignored here. Dispatch is synchronous and best-effort so a
+        misbehaving subscriber never blocks or breaks the event queue.
+
+        Runs on the emitting thread (frequently a worker thread), so the listener set is
+        snapshotted under the lock and callbacks are invoked outside it -- holding the
+        lock across a callback that re-enters ``put_event`` would deadlock.
+        """
+        if not isinstance(event, ExecutionGriptapeNodeEvent):
+            return
+        payload = event.wrapped_event.payload
+        with self._execution_event_listeners_lock:
+            listener_set = self._execution_event_listeners.get(type(payload))
+            if not listener_set:
+                return
+            callbacks = list(listener_set)
+        for callback in callbacks:
+            try:
+                callback(payload)
+            except Exception:
+                logging.getLogger("griptape_nodes").exception(
+                    "Execution-event listener for %s raised; continuing event delivery.",
+                    type(payload).__name__,
+                )
+
     def remove_listener_for_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
     ) -> None:
@@ -879,9 +1019,7 @@ class EventManager:
                     tg.create_task(call_function(listener_callback, app_event))
 
     def _flush_tracked_parameter_changes(self) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        obj_manager = GriptapeNodes.ObjectManager()
+        obj_manager = self.engine.object_manager
         # Get all flows and their nodes
         nodes = obj_manager.get_filtered_subset(type=BaseNode)
         for node in nodes.values():

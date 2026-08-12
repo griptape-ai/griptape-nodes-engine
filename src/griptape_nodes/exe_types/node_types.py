@@ -813,7 +813,7 @@ class BaseNode(ABC):
             msg = f"Parameter '{param}' not found for removing options trait."
             raise ValueError(msg)
 
-    def _replace_param_by_name(  # noqa: PLR0913
+    def _replace_param_by_name(  # noqa: PLR0913, PLR0917
         self,
         param_name: str,
         new_param_name: str,
@@ -1011,6 +1011,12 @@ class BaseNode(ABC):
         param = self.get_parameter_by_name(param_name)
         if param is None:
             return None
+        # Scoped to ParameterList rather than ParameterContainer: the gate's checks are
+        # list-shaped (isinstance list, max_items), and no concrete non-list container exists
+        # (ParameterDictionary is abstract with no implementations). If one lands, lift this to
+        # ParameterContainer and have each subclass supply its own payload-shape check.
+        if isinstance(param, ParameterList) and self._has_connected_whole_list_value(param):
+            return self.parameter_values[param_name]
         if isinstance(param, ParameterContainer):
             value = handle_container_parameter(self, param)
             if value is not None:
@@ -1024,6 +1030,7 @@ class BaseNode(ABC):
             and VariableResolver.contains_variable_macro(value)
             and _in_aprocess.get()
             and not self._param_has_incoming_connection(param_name)
+            and param.allow_variable_substitution
         ):
             value = self._resolve_variables_in_string(value)
         return value
@@ -1119,6 +1126,8 @@ class BaseNode(ABC):
         """Runs before the entire workflow is run."""
         if VariableResolver.is_substitution_enabled():
             for param in self.parameters:
+                if not param.allow_variable_substitution:
+                    continue
                 value = self.parameter_values.get(param.name, param.default_value)
                 if VariableResolver.contains_variable_macro(value):
                     self.make_node_unresolved(
@@ -1443,18 +1452,60 @@ class BaseNode(ABC):
             return False
         return param_name in node_connections
 
+    def _has_connected_whole_list_value(self, parameter_list: ParameterList) -> bool:
+        """Whether a ParameterList was handed an entire list through a connection to the list itself.
+
+        Requiring the connection is what makes this safe to read: `parameter_values[list_name]` is a
+        write-through cache of the child rows that is NOT cleared when a row is removed, so a stale
+        entry can outlive its rows. Gating on the connection keeps that stale entry unreachable.
+
+        Warns when the incoming list overrides manually-set rows or overruns `max_items`, since both
+        are silent data loss otherwise.
+        """
+        param_name = parameter_list.name
+        if param_name not in self.parameter_values:
+            return False
+        if not self._param_has_incoming_connection(param_name):
+            return False
+
+        value = self.parameter_values[param_name]
+        if not isinstance(value, list):
+            return False
+
+        child_count = len(parameter_list.find_elements_by_type(Parameter, find_recursively=False))
+        if child_count > 0:
+            logger.warning(
+                "Node '%s' list '%s' is fed by a connection, so its %d manually-set item(s) are being ignored. "
+                "Disconnect the list to use those items instead.",
+                self.name,
+                param_name,
+                child_count,
+            )
+
+        max_items = parameter_list.max_items
+        if max_items is not None and len(value) > max_items:
+            logger.warning(
+                "Node '%s' list '%s' received %d item(s) but accepts at most %d. The extra item(s) may be dropped.",
+                self.name,
+                param_name,
+                len(value),
+                max_items,
+            )
+
+        return True
+
     def _resolve_variables_in_value(self, value: Any) -> Any:
         """Recursively substitute workflow variables in any str/dict/list value."""
         variables = VariableResolver.get_variables_if_enabled(self.name)
         if variables is None:
             return value
-        return VariableResolver.resolve_value(value, variables)
+        return VariableResolver.resolve_value(value, variables, self.name)
 
     def _resolve_variables_in_string(self, text: str) -> str:
         variables = VariableResolver.get_variables_if_enabled(self.name)
         if variables is None:
             return text
-        return VariableResolver.resolve_string(text, variables)
+        return VariableResolver.resolve_string(text, variables, self.name)
 
     def get_display_value_for_output(self, parameter_name: str, output_value: Any) -> Any:
         """Return the UI display value for an output parameter.
@@ -1537,6 +1588,9 @@ class BaseNode(ABC):
             )
         else:
             event_data = parameter.to_event(self)
+            # Mirror display-preservation guard from TrackedParameterOutputValues._emit_parameter_change_event.
+            if _in_aprocess.get() and "value" in event_data:
+                event_data["value"] = self.get_display_value_for_output(parameter.name, event_data["value"])
             # Publish the event
             event = ExecutionGriptapeNodeEvent(
                 wrapped_event=ExecutionEvent(payload=AlterElementEvent(element_details=event_data))
@@ -1692,7 +1746,9 @@ class TrackedParameterOutputValues(dict[str, Any]):
         # String values are already substituted in get_parameter_value(); this
         # handles structured types (JSON Input dicts, list outputs, etc.).
         if _in_aprocess.get():
-            value = self._node._resolve_variables_in_value(value)
+            param = self._node.get_parameter_by_name(key)
+            if param is None or param.allow_variable_substitution:
+                value = self._node._resolve_variables_in_value(value)
         super().__setitem__(key, value)
 
         # Emit if the key is newly added, or if its value actually changed.
@@ -1846,6 +1902,14 @@ class SuccessFailureNode(BaseNode):
 
     def get_next_control_output(self) -> Parameter | None:
         """Determine which control output to follow based on execution result."""
+        # A locked node never executes, so it has no result to branch on this run. Whatever
+        # _execution_succeeded holds is left over from a previous run (it is only ever written by
+        # _set_status_results and reset by _clear_execution_status, both reached via process()).
+        # Follow the success path so locking a node to freeze its outputs doesn't route down
+        # Failed or dead-end the control flow.
+        if self.lock:
+            return self.control_parameter_out
+
         if self._execution_succeeded is None:
             # Execution hasn't completed yet
             self.stop_flow = True

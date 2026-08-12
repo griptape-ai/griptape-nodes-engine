@@ -36,9 +36,13 @@ class TestGriptapeCloudFileDriver:
 
     def test_create_from_env_with_credentials(self) -> None:
         """Test creating driver from environment variables."""
+        # clear=True so a Griptape license in the developer's own environment (or
+        # hydrated from their .env by SecretsManager) can't win credential
+        # resolution and fail this test on behavior it isn't covering.
         with patch.dict(
             os.environ,
             {"GT_CLOUD_BUCKET_ID": "env-bucket", "GT_CLOUD_API_KEY": "env-key", "GT_CLOUD_BASE_URL": "https://test.ai"},
+            clear=True,
         ):
             driver = GriptapeCloudFileDriver.create_from_env()
             assert driver is not None
@@ -54,7 +58,7 @@ class TestGriptapeCloudFileDriver:
 
     def test_create_from_env_default_base_url(self) -> None:
         """Test creating driver uses default base URL when not provided."""
-        with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket", "GT_CLOUD_API_KEY": "key"}):
+        with patch.dict(os.environ, {"GT_CLOUD_BUCKET_ID": "bucket", "GT_CLOUD_API_KEY": "key"}, clear=True):
             driver = GriptapeCloudFileDriver.create_from_env()
             assert driver is not None
             assert driver.base_url == "https://cloud.griptape.ai"

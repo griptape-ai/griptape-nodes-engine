@@ -9,6 +9,7 @@ from griptape_nodes.exe_types.core_types import (
 )
 from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.base_events import (
     ResultDetails,
     ResultPayload,
@@ -27,16 +28,16 @@ from griptape_nodes.retained_mode.events.object_events import (
 from griptape_nodes.retained_mode.events.parameter_events import (
     RemoveParameterFromNodeRequest,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 
 logger = logging.getLogger("griptape_nodes")
 
 
-class ObjectManager:
+class ObjectManager(EngineScoped):
     _name_to_objects: dict[str, object]
 
-    def __init__(self, _event_manager: EventManager) -> None:
+    def __init__(self, _event_manager: EventManager, *, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self._name_to_objects = {}
         _event_manager.assign_manager_to_request_type(
             request_type=RenameObjectRequest, callback=self.on_rename_object_request
@@ -81,9 +82,9 @@ class ObjectManager:
             # Let the object's manager know. TODO: https://github.com/griptape-ai/griptape-nodes/issues/869
         match source_obj:
             case ControlFlow():
-                GriptapeNodes.FlowManager().handle_flow_rename(old_name=request.object_name, new_name=final_name)
+                self.engine.flow_manager.handle_flow_rename(old_name=request.object_name, new_name=final_name)
             case BaseNode():
-                GriptapeNodes.NodeManager().handle_node_rename(old_name=request.object_name, new_name=final_name)
+                self.engine.node_manager.handle_node_rename(old_name=request.object_name, new_name=final_name)
             case _:
                 details = f"Attempted to rename an object named '{request.object_name}', but that object wasn't of a type supported for rename."
                 logger.error(details)
@@ -112,7 +113,7 @@ class ObjectManager:
 
         try:
             # Reset global execution state first to eliminate all references before deletion
-            GriptapeNodes.FlowManager().reset_global_execution_state()
+            self.engine.flow_manager.reset_global_execution_state()
         except Exception as e:
             details = f"Attempted to reset global execution state. Failed with exception: {e}"
             logger.error(details)
@@ -121,9 +122,9 @@ class ObjectManager:
         # Tear down each active workflow: cancel its running flows, delete its child
         # flows, drain its context substack, pop it. Stack depth is typically 1.
         try:
-            context_mgr = GriptapeNodes.ContextManager()
+            context_mgr = self.engine.context_manager
             while context_mgr.has_current_workflow():
-                GriptapeNodes.clear_current_workflow_data()
+                self.engine.clear_current_workflow_data()
         except Exception as e:
             details = f"Attempted to clear all object state and delete everything. Failed with exception: {e}"
             logger.error(details)
@@ -135,10 +136,10 @@ class ObjectManager:
             return ClearAllObjectStateResultFailure(result_details=details)
 
         # Clear all local workflow variables
-        GriptapeNodes.VariablesManager().clear_object_state()
-        GriptapeNodes.WorkflowManager().clear_object_state()
+        self.engine.variables_manager.clear_object_state()
+        self.engine.workflow_manager.clear_object_state()
         # Clear all event suppression
-        GriptapeNodes.EventManager().clear_event_suppression()
+        self.engine.event_manager.clear_event_suppression()
 
         details = "Successfully cleared all object state (deleted everything)."
         return ClearAllObjectStateResultSuccess(result_details=details)
@@ -260,9 +261,9 @@ class ObjectManager:
             for child in children:
                 obj.remove_child(child)
                 if isinstance(child, BaseNode):
-                    GriptapeNodes.handle_request(DeleteNodeRequest(child.name))
+                    self.engine.handle_request(DeleteNodeRequest(child.name))
                     return
                 if isinstance(child, Parameter) and isinstance(obj, BaseNode):
-                    GriptapeNodes.handle_request(RemoveParameterFromNodeRequest(child.name, obj.name))
+                    self.engine.handle_request(RemoveParameterFromNodeRequest(child.name, obj.name))
                     return
         del self._name_to_objects[name]

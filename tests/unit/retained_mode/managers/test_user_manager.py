@@ -294,7 +294,8 @@ class TestUserManager:
             assert isinstance(org_info, OrganizationInfo)
             assert org_info.id == "test-org-uuid"
             assert org_info.name == "Test Organization"
-            mock_secrets_manager.get_secret.assert_called_once_with("GT_CLOUD_API_KEY")
+            # /api/organizations accepts a license, so the license is tried first.
+            mock_secrets_manager.get_secret.assert_any_call("GRIPTAPE_NODES_LICENSE", should_error_on_not_found=False)
 
     def test_user_organization_cached_property(self) -> None:
         """Test that user_organization property is cached and httpx.get is only called once."""
@@ -536,3 +537,24 @@ class TestUserManager:
             assert isinstance(org_info, OrganizationInfo)
             assert org_info.id == "org-1"
             assert org_info.name == "First Organization"
+
+
+class TestUserManagerCredentialScope:
+    """`user` identity stays on the API key; only `user_organization` is license-aware."""
+
+    def test_user_does_not_resolve_license(self) -> None:
+        # /api/users has no license authenticator, and an unassigned license
+        # authenticates as the org service principal, so a license here would
+        # answer "who am I" with a service account.
+        mock_secrets_manager = Mock()
+        mock_secrets_manager.get_secret.return_value = "test-api-key"
+
+        mock_response = Mock()
+        mock_response.json.return_value = {"users": [{"user_id": "u", "email": "e@example.com", "name": "N"}]}
+
+        with patch("griptape_nodes.retained_mode.managers.user_manager.httpx.get", return_value=mock_response):
+            UserManager(mock_secrets_manager).user  # noqa: B018
+
+        requested = [call.args[0] for call in mock_secrets_manager.get_secret.call_args_list]
+        assert "GRIPTAPE_NODES_LICENSE" not in requested
+        assert requested == ["GT_CLOUD_API_KEY"]

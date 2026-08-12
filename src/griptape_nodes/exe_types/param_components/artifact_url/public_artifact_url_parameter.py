@@ -11,6 +11,7 @@ from griptape.artifacts.url_artifact import UrlArtifact
 from griptape.artifacts.video_url_artifact import VideoUrlArtifact
 
 from griptape_nodes.common.parameter_hydration import hydrate_value
+from griptape_nodes.drivers.cloud_credentials import MISSING_CREDENTIAL_MESSAGE, resolve_cloud_credential
 from griptape_nodes.drivers.storage.griptape_cloud_storage_driver import GriptapeCloudStorageDriver
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode
@@ -51,7 +52,14 @@ class PublicArtifactUrlParameter:
             )
             raise ValueError(msg)
 
-        api_key = str(self._get_secret_value(self.API_KEY_NAME))
+        api_key = resolve_cloud_credential(GriptapeNodes.SecretsManager(), secret_name=self.API_KEY_NAME)
+        if not api_key:
+            msg = (
+                f"Attempted to make '{artifact_url_parameter.name}' publicly accessible. "
+                f"Failed because {MISSING_CREDENTIAL_MESSAGE}"
+            )
+            raise ValueError(msg)
+
         base = os.getenv("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
         self._storage_driver = GriptapeCloudStorageDriver(
             workspace_directory=GriptapeNodes.ConfigManager().workspace_path,
@@ -65,19 +73,46 @@ class PublicArtifactUrlParameter:
     def _get_bucket_id(cls, base_url: str, api_key: str, timeout: float | None = None) -> str:
         bucket_id: str | None = cls._get_secret_value(cls.BUCKET_ID_NAME, should_error_on_not_found=False)
 
-        if bucket_id is not None:
+        # A blank/whitespace-only secret is treated the same as an unset one: it can't
+        # point at a real bucket and, left alone, produces confusing downstream 404s from
+        # request URLs like `/api/buckets//assets/...`. Validate a configured ID with a
+        # direct GET rather than scanning `list_buckets` -- that endpoint is paginated, so
+        # a valid bucket beyond the first page would otherwise be flagged as invalid.
+        if bucket_id is not None and bucket_id.strip():
+            if not GriptapeCloudStorageDriver.bucket_exists(
+                bucket_id,
+                base_url=base_url,
+                api_key=api_key,
+                timeout=timeout,
+            ):
+                msg = (
+                    f"The {cls.BUCKET_ID_NAME} secret is configured to an invalid bucket ID "
+                    f"('{bucket_id}'). No Griptape Cloud storage bucket with that ID exists. "
+                    f"Update the {cls.BUCKET_ID_NAME} secret to a valid bucket ID, or clear it "
+                    "to auto-select a bucket."
+                )
+                raise RuntimeError(msg)
             return bucket_id
 
-        buckets = GriptapeCloudStorageDriver.list_buckets(
+        # Unset or blank secret: fall back to the organization's default bucket. That
+        # bucket is guaranteed to exist and cannot be deleted, so it's a stable fallback --
+        # unlike auto-selecting the first entry of the paginated `list_buckets` result.
+        default_bucket_id = GriptapeCloudStorageDriver.get_default_bucket_id(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout,
         )
-        if len(buckets) == 0:
-            msg = "No Griptape Cloud storage buckets found!"
+        if not default_bucket_id:
+            msg = (
+                f"The {cls.BUCKET_ID_NAME} secret is configured to a blank bucket ID "
+                "and no Griptape Cloud organization default bucket is available to fall back to. "
+                f"Set the {cls.BUCKET_ID_NAME} secret to a valid bucket ID."
+                if bucket_id is not None
+                else "No Griptape Cloud storage buckets found!"
+            )
             raise RuntimeError(msg)
 
-        return buckets[0]["bucket_id"]
+        return default_bucket_id
 
     @classmethod
     def _get_config_value(cls, key: str, default: Any | None = None) -> Any | None:

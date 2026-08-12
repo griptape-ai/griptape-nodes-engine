@@ -39,7 +39,7 @@ The JSON Extract Value node allows you to extract specific values from JSON data
 
 ```python
 # Access nested object properties
-path = "user.name"           # Gets user's name
+path = "user.name"  # Gets user's name
 path = "user.profile.email"  # Gets nested email
 ```
 
@@ -47,18 +47,18 @@ path = "user.profile.email"  # Gets nested email
 
 ```python
 # Access array elements
-path = "items[0]"            # Gets first item
-path = "items[0].title"      # Gets title of first item
-path = "users[2].name"       # Gets name of third user
+path = "items[0]"  # Gets first item
+path = "items[0].title"  # Gets title of first item
+path = "users[2].name"  # Gets name of third user
 ```
 
 ### Wildcard Operations
 
 ```python
 # Extract all values from arrays
-path = "items[*].title"      # Gets all titles from items array
-path = "users[*].name"       # Gets all names from users array
-path = "[*].assignee"        # Gets all assignees from root array
+path = "items[*].title"  # Gets all titles from items array
+path = "users[*].name"  # Gets all names from users array
+path = "[*].assignee"  # Gets all assignees from root array
 ```
 
 ### Complex Paths

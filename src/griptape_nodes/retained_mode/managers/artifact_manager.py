@@ -12,6 +12,7 @@ from pydantic import BaseModel, ValidationError
 from griptape_nodes.common.macro_parser import MacroVariables, ParsedMacro
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.files.path_utils import decompose_source_path
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import AppInitializationComplete
 from griptape_nodes.retained_mode.events.artifact_events import (
     CheckArtifactReadPermissionRequest,
@@ -81,7 +82,6 @@ from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import (
     SituationMetadata,
     SituationPolicy,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers import (
     AudioArtifactProvider,
     BaseArtifactPreviewGenerator,
@@ -90,6 +90,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers import (
     ImageArtifactProvider,
     ProviderRegistry,
     VideoArtifactProvider,
+    WriteVettingPolicy,
 )
 from griptape_nodes.retained_mode.managers.artifact_providers.artifact_schema_models import (
     ArtifactSchemas,
@@ -164,19 +165,21 @@ class PreviewSettings(BaseModel):
     generator_params: BaseGeneratorParameters  # Will be a specific BaseGeneratorParameters subclass
 
 
-class ArtifactManager:
+class ArtifactManager(EngineScoped):
     """Manages artifact operations including preview generation.
 
     Coordinates artifact type providers to handle different media formats.
     Providers are looked up by file extension for efficient routing.
     """
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         """Initialize the ArtifactManager.
 
         Args:
             event_manager: Optional event manager for handling artifact events
+            engine: The owning Engine, used to resolve peer managers.
         """
+        super().__init__(engine)
         # Provider registry for managing artifact providers
         self._registry = ProviderRegistry()
 
@@ -267,30 +270,52 @@ class ArtifactManager:
         provider = self._registry.get_or_create_provider_instance(provider_classes[0])
         return provider.prepare_content_for_write(data, file_name)
 
-    def check_write_permission(self, data: bytes, detected_format: str) -> CheckpointDenial | None:
-        """Route a pending write through the format's provider for permission checking.
+    def get_write_vetting_policy(self, detected_format: str) -> WriteVettingPolicy | None:
+        """Return the vetting mode the format's provider needs, or ``None``.
 
-        Looks up the provider that claims ``detected_format`` and asks its
-        ``check_write_permission`` hook whether the write is allowed. Providers
-        without a policy fall through to the default ``None`` (allow).
-
-        Args:
-            data: The full buffered write payload.
-            detected_format: The canonical lowercase extension returned by
-                ``sniff_extension`` for ``data`` (e.g. ``"mp4"``).
-
-        Returns:
-            A ``CheckpointDenial`` if the provider refuses the write, or
-            ``None`` when the write is permitted (including when no provider
-            handles this format).
+        Resolves the provider that claims ``detected_format`` and returns the
+        result of ``get_write_vetting_policy``. Returns ``None`` when no
+        provider handles the format -- OSManager treats that identically to a
+        provider opting out.
         """
-        provider_classes = self._registry.get_provider_classes_by_format(detected_format)
-        if not provider_classes:
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
             return None
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
-        # Handle ambiguity when multiple providers support the same extension.
-        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
-        return provider.check_write_permission(data, detected_format)
+        return provider.get_write_vetting_policy()
+
+    def check_write_format_from_bytes(
+        self,
+        data: bytes,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-bytes write vet through the format's provider.
+
+        Called by OSManager when the provider's ``get_write_vetting_policy``
+        returned ``FROM_BYTES``. Providers without a policy (or no provider at
+        all) fall through to ``None`` (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_bytes(data, detected_format)
+
+    def check_write_format_from_path(
+        self,
+        source_path: str,
+        detected_format: str,
+    ) -> CheckpointDenial | None:
+        """Route a from-path write vet through the format's provider.
+
+        Called by OSManager after staging the pending bytes at ``source_path``.
+        The provider is trusted to read ``source_path`` but must not write to
+        or delete it -- OSManager owns the staged file's lifecycle. Providers
+        without a policy (or no provider at all) fall through to ``None``
+        (allow).
+        """
+        provider = self._provider_for_format(detected_format)
+        if provider is None:
+            return None
+        return provider.check_write_format_from_path(source_path, detected_format)
 
     def check_read_permission(self, source_path: str) -> CheckpointDenial | None:
         """Route a pending read through the format's provider for permission checking.
@@ -314,13 +339,28 @@ class ArtifactManager:
         extension = Path(source_path).suffix.lstrip(".").lower()
         if not extension:
             return None
-        provider_classes = self._registry.get_provider_classes_by_format(extension)
+        provider = self._provider_for_format(extension)
+        if provider is None:
+            return None
+        return provider.check_read_permission(source_path)
+
+    def _provider_for_format(self, fmt: str) -> BaseArtifactProvider | None:
+        """Resolve the registered provider that handles ``fmt`` (empty → None).
+
+        Centralizes the "which class wins when multiple providers claim the
+        same format" decision so ``check_write_format_from_bytes``,
+        ``check_write_format_from_path``, ``check_read_permission``, and
+        (eventually) ``prepare_content_for_write`` don't drift on it.
+        Currently just "first registered class wins" per the provider
+        registry order; ambiguity handling is tracked at
+        https://github.com/griptape-ai/griptape-nodes/issues/4027.
+        """
+        if not fmt:
+            return None
+        provider_classes = self._registry.get_provider_classes_by_format(fmt)
         if not provider_classes:
             return None
-        # TODO: https://github.com/griptape-ai/griptape-nodes/issues/4027
-        # Handle ambiguity when multiple providers support the same extension.
-        provider = self._registry.get_or_create_provider_instance(provider_classes[0])
-        return provider.check_read_permission(source_path)
+        return self._registry.get_or_create_provider_instance(provider_classes[0])
 
     async def on_app_initialization_complete(self, _payload: AppInitializationComplete) -> None:
         """Handle app initialization complete event.
@@ -362,7 +402,7 @@ class ArtifactManager:
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = GriptapeNodes.handle_request(resolve_request)
+        resolve_result = self.engine.handle_request(resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GeneratePreviewResultFailure(
@@ -373,7 +413,7 @@ class ArtifactManager:
 
         # FAILURE CASE: Verify file exists
         file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
-        file_info_result = GriptapeNodes.handle_request(file_info_request)
+        file_info_result = self.engine.handle_request(file_info_request)
 
         if not isinstance(file_info_result, GetFileInfoResultSuccess):
             return GeneratePreviewResultFailure(
@@ -471,7 +511,7 @@ class ArtifactManager:
                 if isinstance(preview_file_names, str):
                     preview_path = str(destination_dir / preview_file_names)
                     delete_request = DeleteFileRequest(path=preview_path, workspace_only=False)
-                    delete_result = GriptapeNodes.handle_request(delete_request)
+                    delete_result = self.engine.handle_request(delete_request)
 
                     if delete_result.failed():
                         error_details += (
@@ -482,7 +522,7 @@ class ArtifactManager:
                     for filename in preview_file_names.values():
                         preview_path = str(destination_dir / filename)
                         delete_request = DeleteFileRequest(path=preview_path, workspace_only=False)
-                        delete_result = GriptapeNodes.handle_request(delete_request)
+                        delete_result = self.engine.handle_request(delete_request)
 
                         if delete_result.failed():
                             error_details += f". Additionally, failed to delete preview file {filename}: {delete_result.result_details}"
@@ -522,7 +562,7 @@ class ArtifactManager:
                 existing_file_policy=ExistingFilePolicy.OVERWRITE,
                 file_metadata=None,
             )
-            metadata_write_result = GriptapeNodes.handle_request(metadata_write_request)
+            metadata_write_result = self.engine.handle_request(metadata_write_request)
 
             if not isinstance(metadata_write_result, WriteFileResultSuccess):
                 return fail_with_cleanup(
@@ -613,7 +653,7 @@ class ArtifactManager:
         """
         # FAILURE CASE: Resolve source path from MacroPath
         resolve_request = ResolveMacroPathRequest(macro_path=request.macro_path)
-        resolve_result = GriptapeNodes.handle_request(resolve_request)
+        resolve_result = self.engine.handle_request(resolve_request)
 
         if not isinstance(resolve_result, ResolveMacroPathResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -624,7 +664,7 @@ class ArtifactManager:
 
         # FAILURE CASE: Verify source file exists and get its metadata
         file_info_request = GetFileInfoRequest(path=source_path, workspace_only=False)
-        file_info_result = GriptapeNodes.handle_request(file_info_request)
+        file_info_result = self.engine.handle_request(file_info_request)
 
         if not isinstance(file_info_result, GetFileInfoResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -664,7 +704,7 @@ class ArtifactManager:
 
         # Check if metadata file exists
         metadata_info_request = GetFileInfoRequest(path=metadata_path, workspace_only=False)
-        metadata_info_result = GriptapeNodes.handle_request(metadata_info_request)
+        metadata_info_result = self.engine.handle_request(metadata_info_request)
 
         metadata_exists = (
             isinstance(metadata_info_result, GetFileInfoResultSuccess) and metadata_info_result.file_entry is not None
@@ -710,7 +750,7 @@ class ArtifactManager:
             workspace_only=False,
             should_transform_image_content_to_thumbnail=False,
         )
-        read_metadata_result = await GriptapeNodes.ahandle_request(read_metadata_request)
+        read_metadata_result = await self.engine.ahandle_request(read_metadata_request)
 
         if not isinstance(read_metadata_result, ReadFileResultSuccess):
             return GetPreviewForArtifactResultFailure(
@@ -753,7 +793,7 @@ class ArtifactManager:
             # Single file case
             preview_file_path = str(destination_dir / metadata.preview_file_names)
             preview_info_request = GetFileInfoRequest(path=preview_file_path, workspace_only=False)
-            preview_info_result = GriptapeNodes.handle_request(preview_info_request)
+            preview_info_result = self.engine.handle_request(preview_info_request)
 
             if not isinstance(preview_info_result, GetFileInfoResultSuccess) or preview_info_result.file_entry is None:
                 preview_files_missing = True
@@ -762,7 +802,7 @@ class ArtifactManager:
             for filename in metadata.preview_file_names.values():
                 file_path = str(destination_dir / filename)
                 preview_file_check_request = GetFileInfoRequest(path=file_path, workspace_only=False)
-                preview_file_check_result = GriptapeNodes.handle_request(preview_file_check_request)
+                preview_file_check_result = self.engine.handle_request(preview_file_check_request)
 
                 if (
                     not isinstance(preview_file_check_result, GetFileInfoResultSuccess)
@@ -873,7 +913,12 @@ class ArtifactManager:
     def on_check_artifact_read_permission_request(
         self, request: CheckArtifactReadPermissionRequest
     ) -> CheckArtifactReadPermissionResultSuccess | CheckArtifactReadPermissionResultFailure:
-        """Handle a read-permission check request by dispatching to the provider."""
+        """Handle a read-permission check request by dispatching to the provider.
+
+        Whether the provider actually does any work is the provider's call:
+        the base ``check_read_permission`` returns ``None`` (allow), so
+        providers that don't opt in pay nothing.
+        """
         if not request.source_path:
             return CheckArtifactReadPermissionResultFailure(
                 result_details="Attempted to check read permission. Failed because no source path was provided."
@@ -1217,7 +1262,7 @@ class ArtifactManager:
         key_prefix = generator_class.get_config_key_prefix(provider_class.get_friendly_name())
 
         request = GetConfigCategoryRequest(category=key_prefix, failure_log_level=logging.DEBUG)
-        result = GriptapeNodes.handle_request(request)
+        result = self.engine.handle_request(request)
 
         # Config category doesn't exist - no settings written yet
         if not isinstance(result, GetConfigCategoryResultSuccess):
@@ -1245,7 +1290,7 @@ class ArtifactManager:
 
         # Single batched write for all parameters
         request = SetConfigCategoryRequest(category=key_prefix, contents=params)
-        GriptapeNodes.handle_request(request)
+        self.engine.handle_request(request)
 
     def _write_provider_default_settings(self, provider_class: type[BaseArtifactProvider]) -> None:
         """Write provider-level default settings (format and generator name) in one batch.
@@ -1261,7 +1306,7 @@ class ArtifactManager:
 
         category = provider_class.get_config_key_prefix()
         request = SetConfigCategoryRequest(category=category, contents=settings)
-        GriptapeNodes.handle_request(request)
+        self.engine.handle_request(request)
 
     def _validate_and_register_generator_settings(
         self, provider_class: type[BaseArtifactProvider], generator_class: type[BaseArtifactPreviewGenerator]
@@ -1339,7 +1384,7 @@ class ArtifactManager:
         generator_key = provider_class.get_preview_generator_config_key()
 
         # Check format validity
-        format_result = GriptapeNodes.handle_request(
+        format_result = self.engine.handle_request(
             GetConfigValueRequest(category_and_key=format_key, failure_log_level=logging.DEBUG)
         )
         format_valid = (
@@ -1348,7 +1393,7 @@ class ArtifactManager:
         )
 
         # Check generator validity
-        generator_result = GriptapeNodes.handle_request(
+        generator_result = self.engine.handle_request(
             GetConfigValueRequest(category_and_key=generator_key, failure_log_level=logging.DEBUG)
         )
         registered_generators = self._registry.get_preview_generators_for_provider(provider_class)
@@ -1394,7 +1439,7 @@ class ArtifactManager:
         # Step 1: Read format from config (or use default if missing)
         format_config_key = provider_class.get_preview_format_config_key()
         format_request = GetConfigValueRequest(category_and_key=format_config_key, failure_log_level=logging.DEBUG)
-        format_result = GriptapeNodes.handle_request(format_request)
+        format_result = self.engine.handle_request(format_request)
 
         if isinstance(format_result, GetConfigValueResultSuccess):
             # Config exists - use it (provider will validate later)
@@ -1408,7 +1453,7 @@ class ArtifactManager:
         generator_request = GetConfigValueRequest(
             category_and_key=generator_config_key, failure_log_level=logging.DEBUG
         )
-        generator_result = GriptapeNodes.handle_request(generator_request)
+        generator_result = self.engine.handle_request(generator_request)
 
         registered_generators = self._registry.get_preview_generators_for_provider(provider_class)
         registered_generator_names = [gen.get_friendly_name() for gen in registered_generators]
@@ -1450,7 +1495,7 @@ class ArtifactManager:
                 f"{provider_class.get_config_key_prefix()}.preview_generator_configurations.{generator_key}"
             )
             params_request = GetConfigValueRequest(category_and_key=params_config_key, failure_log_level=logging.DEBUG)
-            params_result = GriptapeNodes.handle_request(params_request)
+            params_result = self.engine.handle_request(params_request)
 
             if isinstance(params_result, GetConfigValueResultSuccess):
                 # Params exist in config - validate them through Pydantic
@@ -1550,7 +1595,7 @@ class ArtifactManager:
         """
         # Get current project
         get_project_request = GetCurrentProjectRequest()
-        project_result = GriptapeNodes.handle_request(get_project_request)
+        project_result = self.engine.handle_request(get_project_request)
 
         if not isinstance(project_result, GetCurrentProjectResultSuccess):
             msg = "No current project loaded"
@@ -1564,7 +1609,7 @@ class ArtifactManager:
 
         # Get save_griptape_nodes_preview situation template
         get_situation_request = GetSituationRequest(situation_name=BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW)
-        get_situation_result = GriptapeNodes.handle_request(get_situation_request)
+        get_situation_result = self.engine.handle_request(get_situation_request)
 
         if not isinstance(get_situation_result, GetSituationResultSuccess):
             msg = f"{BuiltInSituation.SAVE_GRIPTAPE_NODES_PREVIEW} situation not found in project template"
@@ -1587,7 +1632,7 @@ class ArtifactManager:
             parsed_macro=parsed_macro,
             variables=variables,
         )
-        path_result = GriptapeNodes.handle_request(path_request)
+        path_result = self.engine.handle_request(path_request)
 
         if not isinstance(path_result, GetPathForMacroResultSuccess):
             msg = f"Failed to resolve preview path macro: {path_result.result_details}"

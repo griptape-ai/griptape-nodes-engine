@@ -3,12 +3,11 @@ from typing import ClassVar
 from typing_extensions import TypeVar
 
 from griptape_nodes.retained_mode.events.base_events import Payload
-from griptape_nodes.utils.metaclasses import SingletonMeta
 
 T = TypeVar("T", bound=Payload, default=Payload)
 
 
-class PayloadRegistry(metaclass=SingletonMeta):
+class PayloadRegistry:
     """Registry for payload types."""
 
     _registry: ClassVar[dict[str, type[Payload]]] = {}
@@ -23,9 +22,7 @@ class PayloadRegistry(metaclass=SingletonMeta):
         Returns:
             The registered class (for decorator use)
         """
-        # Ensure we have an instance
-        instance = cls()
-        instance._registry[payload_class.__name__] = payload_class
+        cls._registry[payload_class.__name__] = payload_class
         return payload_class
 
     @classmethod
@@ -38,9 +35,7 @@ class PayloadRegistry(metaclass=SingletonMeta):
         Returns:
             The payload class or None if not found
         """
-        # Ensure we have an instance
-        instance = cls()
-        return instance._registry.get(type_name)
+        return cls._registry.get(type_name)
 
     @classmethod
     def get_registry(cls) -> dict:
@@ -49,9 +44,7 @@ class PayloadRegistry(metaclass=SingletonMeta):
         Returns:
             Dictionary of payload type name to payload class
         """
-        # Ensure we have an instance
-        instance = cls()
-        return instance._registry.copy()
+        return cls._registry.copy()
 
     # Register decorator as a classmethod
     @classmethod

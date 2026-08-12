@@ -10,6 +10,7 @@ from xdg_base_dirs import xdg_config_home
 
 from griptape_nodes.files.path_utils import resolve_workspace_path
 from griptape_nodes.node_library.library_registry import LibraryRegistry
+from griptape_nodes.retained_mode.engine import Engine, EngineScoped
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
 from griptape_nodes.retained_mode.events.artifact_events import (
     GetArtifactSchemasRequest,
@@ -59,7 +60,7 @@ logger = logging.getLogger("griptape_nodes")
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
 
 
-class ConfigManager:
+class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
 
     This class handles loading and saving configuration from multiple sources with the following precedence:
@@ -84,12 +85,14 @@ class ConfigManager:
         merged_config (dict): The merged configuration, combining all sources in precedence order.
     """
 
-    def __init__(self, event_manager: EventManager | None = None) -> None:
+    def __init__(self, event_manager: EventManager | None = None, *, engine: Engine | None = None) -> None:
         """Initialize the ConfigManager.
 
         Args:
             event_manager: The EventManager instance to use for event handling.
+            engine: The Engine this manager belongs to.
         """
+        super().__init__(engine)
         self._project_config_path: Path | None = None
         self._workspace_config_path: Path | None = None
         self._workspace_dir_override: str | None = None
@@ -174,18 +177,59 @@ class ConfigManager:
         else:
             self._libraries_root_override = str(Path(path).expanduser().resolve())
 
+    def _resolve_configured_workspace_directory(self, *, include_runtime_override: bool) -> str:
+        """Resolve workspace_directory across the config layers, in load_configs' precedence order.
+
+        Single source of truth for how workspace_directory is layered (highest priority first):
+        env var, then the runtime override (only when `include_runtime_override`), then workspace
+        config, project-adjacent config, user config, and finally the Settings default. load_configs
+        uses this WITH the override to set the active workspace_path; configured_global_workspace_path
+        uses it WITHOUT, to get the engine's workspace independent of any single project's pin. Keeping
+        both on this one helper is what stops the two precedences from drifting. The Settings default
+        always populates default_config, so a value is always returned.
+        """
+        # env is applied last in load_configs, so it is highest priority; the runtime override sits
+        # just below env and above the config files.
+        if (env_value := get_dot_value(self.env_config, "workspace_directory", None)) is not None:
+            return env_value
+        if include_runtime_override and self._workspace_dir_override is not None:
+            return self._workspace_dir_override
+        for layer in (self.workspace_config, self.project_config, self.user_config):
+            if (configured := get_dot_value(layer, "workspace_directory", None)) is not None:
+                return configured
+        return self.default_config["workspace_directory"]
+
+    def configured_global_workspace_path(self) -> Path:
+        """Return the workspace_directory as configured, EXCLUDING the runtime per-project override.
+
+        The runtime `_workspace_dir_override` is the only layer that pins the active workspace to a
+        self-contained project's own folder (workspace_dir "./"); everything else (a
+        GTN_CONFIG_WORKSPACE_DIRECTORY env var, a project-adjacent or workspace `workspace_directory`,
+        the user/default config) describes where the ENGINE's workspace lives.
+
+        This is the base for the unset-libraries_dir fallback: libraries follow an engine that
+        relocates its whole workspace via env/adjacent config, but do NOT follow a single project's
+        self-contained workspace_dir pin (so a v1 self-contained project's unset libraries still land
+        in the shared workspace `libraries/`, matching pre-v1 behavior).
+        """
+        return Path(self._resolve_configured_workspace_directory(include_runtime_override=False)).expanduser().resolve()
+
     def resolved_libraries_root(self) -> Path:
         """Return the absolute directory under which libraries install and resolve.
 
         When a libraries-root override is set (from a project's own or inherited
-        libraries_dir), it is returned verbatim. Otherwise the legacy behavior applies:
-        the workspace-relative libraries_directory config value resolved against the
-        workspace path.
+        libraries_dir), it is returned verbatim. Otherwise the fallback resolves the
+        workspace-relative libraries_directory config value against the GLOBAL configured
+        workspace (configured_global_workspace_path), NOT the active per-project workspace.
+        This keeps libraries in the shared global-workspace `libraries/` folder even for a
+        self-contained project whose workspace_dir pins the active workspace to its own folder,
+        preserving the pre-v1 shared-libraries behavior. A project opts into a project-local
+        libraries dir by declaring an explicit libraries_dir (which sets the override above).
         """
         if self._libraries_root_override is not None:
             return Path(self._libraries_root_override)
         libraries_dir = self.get_config_value("libraries_directory", default="libraries")
-        return resolve_workspace_path(Path(libraries_dir), self.workspace_path)
+        return resolve_workspace_path(Path(libraries_dir), self.configured_global_workspace_path())
 
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.
@@ -292,8 +336,10 @@ class ConfigManager:
             merged_config = merge_dicts(merged_config, self.env_config)
             logger.debug("Merged config from environment variables: %s", list(self.env_config.keys()))
 
-        # Re-assign workspace path in case env var or project config overrides it
-        self.workspace_path = merged_config["workspace_directory"]
+        # Re-assign workspace path in case env var or project config overrides it. Uses the shared
+        # precedence resolver (WITH the runtime override) so the active workspace and
+        # configured_global_workspace_path() can never disagree on layer ordering.
+        self.workspace_path = self._resolve_configured_workspace_directory(include_runtime_override=True)
 
         # Validate the full config against the Settings model.
         try:
@@ -527,9 +573,7 @@ class ConfigManager:
             return None
 
         if should_load_env_var_if_detected and isinstance(value, str) and value.startswith("$"):
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-            value = GriptapeNodes.SecretsManager().get_secret(value[1:])
+            value = self.engine.secrets_manager.get_secret(value[1:])
 
         if cast_type is not None:
             value = self._coerce_to_type(value, cast_type)
@@ -600,9 +644,7 @@ class ConfigManager:
         write_succeeded = self._write_user_config_delta(delta)
 
         if should_set_env_var_if_detected and isinstance(value, str) and value.startswith("$"):
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-            value = GriptapeNodes.SecretsManager().set_secret(value[1:], "")
+            value = self.engine.secrets_manager.set_secret(value[1:], "")
 
         # We need to fully reload the user config because we need to regenerate the merged config.
         # Also eventually need to reload registered workflows.
@@ -723,8 +765,6 @@ class ConfigManager:
         libraries without schemas get simple object types.
         """
         try:
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             # Get base settings schema and current values
             base_schema = Settings.model_json_schema()
             current_values = self.merged_config.copy()
@@ -734,7 +774,7 @@ class ConfigManager:
 
             # Get artifact schemas (dynamically generated from registered providers/generators)
             schemas_request = GetArtifactSchemasRequest()
-            schemas_result = GriptapeNodes.handle_request(schemas_request)
+            schemas_result = self.engine.handle_request(schemas_request)
 
             if not isinstance(schemas_result, GetArtifactSchemasResultSuccess):
                 result_details = f"Failed to retrieve artifact schemas: {schemas_result.result_details}"
@@ -872,10 +912,7 @@ class ConfigManager:
             worker fan-out on this so workers don't reload from a file that
             wasn't actually updated.
         """
-        # Lazy import to avoid circular dependency during initialization
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        os_manager = GriptapeNodes.OSManager()
+        os_manager = self.engine.os_manager
         config_path_str = str(USER_CONFIG_PATH)
 
         # Step 1: Check if config file exists

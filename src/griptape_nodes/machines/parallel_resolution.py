@@ -354,6 +354,14 @@ class ExecuteDagState(State):
 
         dag_node = context.node_to_reference[node_name]
 
+        # A locked node is frozen: it never executes and keeps its existing output values.
+        # Mark it DONE here rather than queueing it, so pop_done_states propagates those frozen
+        # outputs and advances control flow. Gating at queue time (rather than at dispatch) is
+        # what keeps it out of the priority queue entirely.
+        if dag_node.node_reference.lock:
+            dag_node.node_state = NodeState.DONE
+            return
+
         # Only check nodes that are currently waiting
         if dag_node.node_state == NodeState.WAITING:
             can_queue = context.dag_builder.can_queue_control_node(dag_node)
@@ -373,6 +381,15 @@ class ExecuteDagState(State):
             node_reference (DagOrchestrator.DagNode): The node to collect values for.
         """
         current_node = node_reference.node_reference
+
+        # A locked node is frozen: it is skipped for execution and keeps its existing output
+        # values so downstream nodes consume those frozen outputs. Pushing an upstream value into
+        # it would be rejected by the SetParameterValueRequest handler and escalated into a fatal
+        # error, so halt propagation into the locked node quietly instead. Mirrors the
+        # editor/manual set-parameter path, which already skips locked destination nodes.
+        if current_node.lock:
+            return
+
         connections = GriptapeNodes.FlowManager().get_connections()
 
         for parameter in current_node.parameters:
@@ -417,12 +434,7 @@ class ExecuteDagState(State):
         canceled_nodes = set()
         for node in leaf_nodes:
             node_reference = context.node_to_reference[node]
-            # If the node is locked, mark it as done so it skips execution
-            if node_reference.node_reference.lock:
-                node_reference.node_state = NodeState.DONE
-                continue
-            node_state = node_reference.node_state
-            if node_state == NodeState.CANCELED:
+            if node_reference.node_state == NodeState.CANCELED:
                 canceled_nodes.add(node)
         return NodeStatesResult(canceled_nodes=canceled_nodes, leaf_nodes=leaf_nodes)
 
@@ -605,11 +617,6 @@ class ExecuteDagState(State):
                         context.node_priority_queue.add_node(end_node_reference)
                         node_reference = end_node_reference
 
-            def on_task_done(task: asyncio.Task) -> None:
-                if task in context.task_to_node:
-                    node = context.task_to_node[task]
-                    node.node_state = NodeState.DONE
-
             # Execute the node asynchronously
             logger.debug(
                 "CREATING EXECUTION TASK for node '%s' - this should only happen once per node!",
@@ -620,10 +627,8 @@ class ExecuteDagState(State):
             node_reference.node_reference.state = NodeResolutionState.RESOLVING
 
             node_task = asyncio.create_task(ExecuteDagState.execute_node(node_reference))
-            # Add a callback to set node to done when task has finished.
             context.task_to_node[node_task] = node_reference
             node_reference.task_reference = node_task
-            node_task.add_done_callback(on_task_done)
 
             # Send an event that this is a current data node:
 
@@ -639,19 +644,19 @@ class ExecuteDagState(State):
             context.running_tasks_count -= len(done)
             # New node has finished - priorities are stale
             context.node_priority_queue.mark_priorities_stale()
-            # Check for task exceptions and handle them properly
+            # Check for task exceptions and handle them properly.
             for task in done:
+                dag_node = context.task_to_node.pop(task)
                 if task.cancelled():
                     # Task was cancelled - this is expected during flow cancellation
-                    context.task_to_node.pop(task)
+                    dag_node.node_state = NodeState.CANCELED
                     logger.info("Task execution was cancelled.")
                     return ErrorState
-                if task.exception():
-                    exc = task.exception()
-                    dag_node = context.task_to_node.get(task)
-                    node_name = dag_node.node_reference.name if dag_node else "Unknown"
+                if (exc := task.exception()) is not None:
+                    node_name = dag_node.node_reference.name
+                    dag_node.node_state = NodeState.ERRORED
 
-                    logger.exception("Error processing node '%s'", node_name)
+                    logger.error("Error processing node '%s'", node_name, exc_info=exc)
                     msg = f"Node '{node_name}' encountered a problem: {exc}"
 
                     await GriptapeNodes.EventManager().aput_event(
@@ -664,11 +669,11 @@ class ExecuteDagState(State):
                             )
                         )
                     )
-                    context.task_to_node.pop(task)
                     context.error_message = msg
                     context.workflow_state = WorkflowState.ERRORED
                     return ErrorState
-                context.task_to_node.pop(task)
+
+                dag_node.node_state = NodeState.DONE
 
         # Once a task has finished, loop back to the top.
         await ExecuteDagState.pop_done_states(context)

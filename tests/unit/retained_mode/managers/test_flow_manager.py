@@ -16,10 +16,17 @@ from griptape_nodes.exe_types.core_types import Parameter, ParameterMode
 from griptape_nodes.exe_types.node_types import BaseNode, ControlNode, DataNode, StartNode
 from griptape_nodes.machines.dag_builder import DagNodeCategories
 from griptape_nodes.retained_mode.events.flow_events import (
+    TRANSIENT_KEY,
+    CreateFlowRequest,
+    CreateFlowResultSuccess,
+    DeleteFlowRequest,
     ExtractFlowCommandsFromImageMetadataRequest,
     ExtractFlowCommandsFromImageMetadataResultFailure,
     ExtractFlowCommandsFromImageMetadataResultSuccess,
+    SerializeFlowToCommandsRequest,
+    SerializeFlowToCommandsResultSuccess,
 )
+from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -799,3 +806,148 @@ class TestClassifyNodesForDag:
         assert categories.start_nodes == []
         assert categories.control_nodes == []
         assert categories.data_sink_nodes == []
+
+
+@pytest.fixture
+def clean_object_state(griptape_nodes: GriptapeNodes) -> Generator[None, None, None]:
+    """Clear all object state around a test so leftover flows never bleed across tests.
+
+    Yield-based so the teardown clear runs even when the test body fails.
+    """
+    griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+    try:
+        yield
+    finally:
+        griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+
+
+class TestSerializeFlowSkipsTransientChildFlows:
+    """A child flow flagged ``transient`` in its metadata is omitted from serialization.
+
+    Transient flows are runtime-only artifacts (e.g. a subflow a node imports at execution time);
+    they must not be baked into the saved workflow, so ``on_serialize_flow_to_commands`` skips them
+    while still serializing ordinary child flows.
+    """
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_transient_child_flow_is_not_serialized(self, griptape_nodes: GriptapeNodes) -> None:
+        griptape_nodes.ContextManager().push_workflow("transient_wf")
+
+        parent = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
+        )
+        assert isinstance(parent, CreateFlowResultSuccess)
+        keep = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_keep", set_as_new_context=False)
+        )
+        assert isinstance(keep, CreateFlowResultSuccess)
+        transient = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_transient", set_as_new_context=False)
+        )
+        assert isinstance(transient, CreateFlowResultSuccess)
+
+        flow_manager = griptape_nodes.FlowManager()
+        flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
+
+        result = flow_manager.on_serialize_flow_to_commands(
+            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
+        )
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess)
+
+        serialized_child_flows = {sub.flow_name for sub in result.serialized_flow_commands.sub_flows_commands}
+        assert keep.flow_name in serialized_child_flows
+        assert transient.flow_name not in serialized_child_flows
+
+    @pytest.mark.usefixtures("clean_object_state")
+    def test_transient_child_flow_internal_connections_do_not_fail_serialization(
+        self, griptape_nodes: GriptapeNodes
+    ) -> None:
+        """A transient child flow with internal connections must not break the parent save.
+
+        Transient flows are skipped by node serialization, so their nodes never enter the UUID map.
+        Their connections must be skipped too — otherwise the connection pass would look up a node
+        that isn't in the map and fail the whole save with "node not found in UUID map".
+        """
+        from griptape_nodes.retained_mode.events.connection_events import CreateConnectionRequest
+        from griptape_nodes.retained_mode.events.node_events import CreateNodeRequest, CreateNodeResultSuccess
+
+        griptape_nodes.ContextManager().push_workflow("transient_conn_wf")
+        parent = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
+        )
+        assert isinstance(parent, CreateFlowResultSuccess)
+        transient = griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=parent.flow_name, flow_name="child_transient", set_as_new_context=False)
+        )
+        assert isinstance(transient, CreateFlowResultSuccess)
+
+        flow_manager = griptape_nodes.FlowManager()
+        flow_manager.get_flow_by_name(transient.flow_name).metadata[TRANSIENT_KEY] = True
+
+        # Two connected Note nodes INSIDE the transient flow (Note has connectable data params
+        # and no external deps). This mirrors a per-iteration loop-body flow's internal wiring.
+        with griptape_nodes.ContextManager().flow(transient.flow_name):
+            node_names = []
+            for desired in ("A", "B"):
+                created = griptape_nodes.handle_request(CreateNodeRequest(node_type="Note", node_name=desired))
+                assert isinstance(created, CreateNodeResultSuccess)
+                node_names.append(created.node_name)
+            griptape_nodes.handle_request(
+                CreateConnectionRequest(
+                    source_node_name=node_names[0],
+                    source_parameter_name="note",
+                    target_node_name=node_names[1],
+                    target_parameter_name="note",
+                )
+            )
+
+        # Serialization must succeed (not fail on the transient flow's internal connection) and
+        # must not include the transient flow.
+        result = flow_manager.on_serialize_flow_to_commands(
+            SerializeFlowToCommandsRequest(flow_name=parent.flow_name, include_create_flow_command=True)
+        )
+        assert isinstance(result, SerializeFlowToCommandsResultSuccess), result
+
+        serialized_child_flows = {sub.flow_name for sub in result.serialized_flow_commands.sub_flows_commands}
+        assert transient.flow_name not in serialized_child_flows
+        # No connection referencing the transient flow's nodes should have been emitted.
+        assert result.serialized_flow_commands.serialized_connections == []
+
+
+class TestDeleteIterationFlows:
+    """NodeExecutor._delete_iteration_flows tears down every tracked iteration flow.
+
+    This is the cleanup guarantee for iterative execution: whatever was deserialized must be gone
+    once the loop is no longer running, on every exit path. The helper must also tolerate a flow
+    that is already gone (e.g. a partially-run iteration cleaned itself up) without erroring.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.usefixtures("clean_object_state")
+    async def test_deletes_all_tracked_flows(self, griptape_nodes: GriptapeNodes) -> None:
+        from griptape_nodes.common.node_executor import NodeExecutor
+
+        griptape_nodes.ContextManager().push_workflow("cleanup_wf")
+        griptape_nodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="parent", set_as_new_context=True)
+        )
+
+        object_manager = griptape_nodes.ObjectManager()
+        deserialized_flows: list[tuple[int, str, dict[str, str]]] = []
+        for i in range(3):
+            created = griptape_nodes.handle_request(
+                CreateFlowRequest(parent_flow_name="parent", flow_name=f"iter_{i}", set_as_new_context=False)
+            )
+            assert isinstance(created, CreateFlowResultSuccess)
+            deserialized_flows.append((i, created.flow_name, {}))
+
+        # Delete one flow out from under the helper to prove it tolerates an already-gone flow.
+        already_gone = deserialized_flows[1][1]
+        griptape_nodes.handle_request(DeleteFlowRequest(flow_name=already_gone))
+        assert object_manager.attempt_get_object_by_name(already_gone) is None
+
+        executor = NodeExecutor.__new__(NodeExecutor)
+        await executor._delete_iteration_flows(deserialized_flows, griptape_nodes.EventManager())
+
+        for _, flow_name, _ in deserialized_flows:
+            assert object_manager.attempt_get_object_by_name(flow_name) is None

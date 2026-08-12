@@ -4,28 +4,32 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
+import shutil
 import subprocess
 import tempfile
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlparse
 
-import pygit2
-
 from griptape_nodes.utils.file_utils import find_file_in_directory
-
-# Common SSH key paths to try when SSH agent doesn't have keys loaded
-_SSH_KEY_PATHS = [
-    Path.home() / ".ssh" / "id_ed25519",
-    Path.home() / ".ssh" / "id_rsa",
-    Path.home() / ".ssh" / "id_ecdsa",
-]
 
 logger = logging.getLogger("griptape_nodes")
 
 
 class GitError(Exception):
     """Base exception for git operations."""
+
+
+class GitNotFoundError(GitError):
+    """Raised when the git executable is not available on PATH.
+
+    Subclasses GitError rather than any of the operation-specific errors below: a
+    missing git is a fault of the environment, not of the repository, remote, or
+    ref the caller happened to be working with.
+    """
 
 
 class GitRepositoryError(GitError):
@@ -53,6 +57,44 @@ class GitUrlWithRef(NamedTuple):
 
     url: str
     ref: str | None
+
+
+class LibraryJsonCheckout(NamedTuple):
+    """Result of fetching a library's JSON metadata from a git remote.
+
+    ``commit_datetime`` is the timezone-aware timestamp of the checked-out commit, or None when
+    it could not be determined.
+    """
+
+    library_version: str
+    commit_sha: str
+    commit_datetime: datetime | None
+    library_data: dict
+
+
+def parse_commit_datetime(iso_string: str) -> datetime | None:
+    """Parse a git commit timestamp in strict ISO 8601 form into a timezone-aware datetime.
+
+    Args:
+        iso_string: The commit timestamp string (e.g. from ``git log --format=%cI``).
+
+    Returns:
+        A timezone-aware datetime, or None if the string is empty or cannot be parsed. Naive
+        timestamps are assumed to be UTC.
+    """
+    iso_string = iso_string.strip()
+    if not iso_string:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(iso_string)
+    except ValueError:
+        logger.debug("Failed to parse git commit datetime %r", iso_string)
+        return None
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed
 
 
 def is_git_url(url: str) -> bool:
@@ -246,44 +288,274 @@ def is_git_repository(path: Path) -> bool:
     return False
 
 
-def _find_tag_for_commit(repo: pygit2.Repository, head_commit: object) -> str | None:
-    for tag_name in repo.references:
-        if not tag_name.startswith("refs/tags/"):
-            continue
-        tag_ref = repo.references[tag_name]
-        if hasattr(tag_ref, "peel"):
-            tag_target = tag_ref.peel(pygit2.Commit).id
-        else:
-            tag_target = tag_ref.target
-        if tag_target == head_commit:
-            return tag_name.replace("refs/tags/", "")
-    return None
+_GIT_MISSING_MESSAGE = (
+    "git was not found on PATH. Griptape Nodes requires a git installation to install and update libraries."
+)
+
+# Ceiling on any single git command. Generous enough for a large library clone over a slow
+# connection, but bounded so a stalled transport fails the request instead of holding a worker
+# thread until the engine is restarted.
+_GIT_TIMEOUT_SECONDS = 600
+
+# Transports a library URL is allowed to use. Anything outside this list, notably a
+# "<helper>::<url>" spelling that makes git exec a git-remote-<helper> binary, is refused
+# before a connection is attempted.
+_GIT_ALLOWED_PROTOCOLS = "file:git:http:https:ssh"
+
+# git reads "<helper>::<address>" as a request to exec git-remote-<helper>, and the built-in
+# `ext` helper hands its address to a shell. The prefix is anchored and excludes "/", ":" and
+# "[" so a normal URL ("https://host/x") and an IPv6 literal ("https://[::1]/x") don't match.
+_REMOTE_HELPER_URL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+.-]*::")
 
 
-def _get_ref_from_repo(repo: pygit2.Repository, library_path: Path) -> str | None:
-    # Called from get_git_info to reuse an already-open repo — do not open a new one here.
+def _git_env() -> dict[str, str]:
+    """Build the environment for a git subprocess.
+
+    The engine runs headless, so git must never block on an interactive credential
+    prompt nobody can answer. This covers git's own prompts; `_git` closes stdin to stop
+    the transports git shells out to (ssh, in particular) from prompting either.
+
+    Library URLs reach git from workflow and request payloads, so the transports git will
+    speak are pinned to `_GIT_ALLOWED_PROTOCOLS`. Both settings override anything inherited:
+    a `GIT_ALLOW_PROTOCOL` from the surrounding environment that re-admitted `ext` would turn
+    a library URL into arbitrary command execution, so the environment does not get a vote.
+    """
+    return {
+        **os.environ,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ALLOW_PROTOCOL": _GIT_ALLOWED_PROTOCOLS,
+    }
+
+
+def _reject_option_like(value: str, description: str, error_cls: type[GitError]) -> None:
+    """Reject a value git's argument parser would read as an option rather than data.
+
+    git refnames cannot begin with "-" and no git URL scheme does either, so a leading
+    "-" is always malformed input. Rejecting it keeps a caller-supplied URL or ref from
+    reaching git as a flag, where `--upload-pack=<cmd>` would run an arbitrary command.
+
+    Raises:
+        error_cls: If the value would be parsed as an option.
+    """
+    if value.startswith("-"):
+        msg = f"Invalid {description}: {value!r} must not start with '-'"
+        raise error_cls(msg)
+
+
+def _reject_unsafe_url(url: str, error_cls: type[GitError]) -> None:
+    """Reject a library URL git would treat as something other than a repository address.
+
+    Checked here rather than left to `GIT_ALLOW_PROTOCOL` alone so the refusal does not depend
+    on git honoring an environment variable.
+
+    Raises:
+        error_cls: If the URL would be read as an option or as a remote helper invocation.
+    """
+    _reject_option_like(url, "git URL", error_cls)
+
+    if _REMOTE_HELPER_URL.match(url):
+        msg = f"Invalid git URL: {url!r} names a transport helper. Use an http, https, ssh, git, or file URL."
+        raise error_cls(msg)
+
+
+def _git_os_error(cwd: Path | None, error: OSError) -> GitError:
+    """Explain an OS-level failure to run git.
+
+    subprocess reports a missing git, a git that cannot be run, and an unusable working directory
+    with different sibling OSError types, so the cause has to be established afterwards from what
+    is actually missing. Anything left over kept the exact OS error for the log: it covers both a
+    git that never started and one that started and then hit something like fd exhaustion mid-run,
+    which are indistinguishable from here.
+
+    Every outcome is a GitError: callers guard on that, and a raw OS error escaping here would
+    reach a request handler unhandled.
+    """
+    # which() also rejects a git that is present but not executable, which is the same problem
+    # from the caller's point of view: there is no git this process can run.
+    if shutil.which("git") is None:
+        return GitNotFoundError(_GIT_MISSING_MESSAGE)
+
+    if cwd is not None and not cwd.is_dir():
+        msg = f"Cannot run git in {cwd}: no folder exists at that path."
+        return GitRepositoryError(msg)
+
+    msg = f"Attempted to run git in {cwd}. Failed due to: {error}"
+    return GitError(msg)
+
+
+def _git(args: list[str], cwd: Path | None) -> subprocess.CompletedProcess[str]:
+    """Run a git command to completion without inspecting its exit code.
+
+    Raises:
+        GitNotFoundError: If no runnable git is on PATH.
+        GitRepositoryError: If cwd is not a directory.
+        GitError: If git times out or cannot be run for any other reason.
+    """
     try:
-        if repo.head_is_unborn:
-            return None
-        if repo.head_is_detached:
-            tag = _find_tag_for_commit(repo, repo.head.target)
-            if tag is not None:
-                return tag
-            return str(repo.head.target)
-        shorthand = repo.head.shorthand
-    except pygit2.GitError as e:
-        logger.debug("Failed to get current git reference for %s: %s", library_path, e)
+        return subprocess.run(  # noqa: S603
+            ["git", *args],  # noqa: S607
+            cwd=cwd,
+            env=_git_env(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            # git writes paths, refs, and messages as UTF-8 regardless of the process locale,
+            # so decode as UTF-8 rather than letting the platform's preferred encoding decide.
+            # errors="replace" keeps an undecodable byte from turning into a UnicodeDecodeError
+            # that escapes as something other than a GitError.
+            encoding="utf-8",
+            errors="replace",
+            timeout=_GIT_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as e:
+        msg = (
+            f"git {args[0]} did not finish within {_GIT_TIMEOUT_SECONDS} seconds and was stopped. "
+            f"The remote may be unreachable."
+        )
+        raise GitError(msg) from e
+    except OSError as e:
+        raise _git_os_error(cwd, e) from e
+
+
+def _run_git(
+    args: list[str],
+    *,
+    error_msg: str,
+    cwd: Path | None = None,
+    error_cls: type[GitError] = GitError,
+) -> str:
+    """Run a git command and return its stripped stdout.
+
+    Args:
+        args: Arguments to pass to git, without the leading "git".
+        error_msg: Prefix for the raised exception's message. git's stderr is appended to it.
+        cwd: Directory to run the command in.
+        error_cls: Exception type to raise when the command fails.
+
+    Returns:
+        str: The command's stdout, stripped.
+
+    Raises:
+        error_cls: If the command exits non-zero.
+        GitNotFoundError: If no runnable git is on PATH.
+        GitRepositoryError: If cwd is not a directory.
+        GitError: If git times out or cannot be run for any other reason.
+    """
+    result = _git(args, cwd)
+    if result.returncode != 0:
+        msg = f"{error_msg}: {result.stderr.strip()}"
+        raise error_cls(msg)
+    return result.stdout.strip()
+
+
+def _try_git(args: list[str], cwd: Path | None = None) -> str | None:
+    """Run a git command and return its stripped stdout, or None if it failed.
+
+    For queries where a non-zero exit is an answer rather than a fault: no upstream is
+    configured, HEAD is detached, the ref doesn't exist. A repository that was deleted
+    while the query ran belongs in that group too, so it reads as "no answer" rather than
+    propagating out of the accessors built on this.
+
+    Raises:
+        GitNotFoundError: If no runnable git is on PATH.
+        GitError: If git times out or cannot be run for any other reason.
+    """
+    try:
+        result = _git(args, cwd)
+    except GitRepositoryError:
+        logger.debug("git %s found no repository in %s", " ".join(args), cwd)
         return None
-    else:
-        return shorthand
+
+    if result.returncode != 0:
+        logger.debug("git %s failed in %s: %s", " ".join(args), cwd, result.stderr.strip())
+        return None
+    return result.stdout.strip()
+
+
+def _run_git_detached(args: list[str], *, error_msg: str, error_cls: type[GitError] = GitError) -> str:
+    """Run a git command that operates on a remote rather than a local repository.
+
+    Runs in an empty directory so the command can't inherit the repository the engine's
+    working directory happens to sit inside. git inspects that repository even for work
+    that has nothing to do with it, and refuses to run at all when it is broken or owned
+    by another user.
+
+    Raises:
+        error_cls: If the command exits non-zero.
+        GitNotFoundError: If no runnable git is on PATH.
+        GitError: If git times out or cannot be run for any other reason.
+    """
+    with tempfile.TemporaryDirectory() as neutral_dir:
+        return _run_git(args, error_msg=error_msg, cwd=Path(neutral_dir), error_cls=error_cls)
+
+
+def _head_commit_sha(library_path: Path) -> str | None:
+    """Full SHA of the commit HEAD points at, or None when HEAD is unborn."""
+    return _try_git(["rev-parse", "--verify", "-q", "HEAD"], library_path)
+
+
+def _current_branch(library_path: Path) -> str | None:
+    """Name of the checked-out branch, or None when HEAD is detached.
+
+    Reports a branch name for an unborn HEAD too, since the branch is only
+    unresolvable, not absent. Callers that need a commit check
+    ``_head_commit_sha`` first.
+    """
+    return _try_git(["symbolic-ref", "--short", "HEAD"], library_path)
+
+
+def _tag_at_head(library_path: Path) -> str | None:
+    """Name of a tag pointing at HEAD, or None when HEAD isn't tagged.
+
+    Reports the first name git lists when several tags share the commit.
+    """
+    tags = _try_git(["tag", "--points-at", "HEAD"], library_path)
+    if not tags:
+        return None
+    return tags.splitlines()[0].strip()
+
+
+def _ref_exists(library_path: Path, ref: str) -> bool:
+    """Whether a fully-qualified ref (e.g. "refs/tags/v1") exists in the repository."""
+    return _try_git(["rev-parse", "--verify", "-q", ref], library_path) is not None
+
+
+def _remote_url(library_path: Path) -> str | None:
+    """URL of the origin remote, or None when no origin is configured."""
+    return _try_git(["remote", "get-url", "origin"], library_path)
+
+
+def _upstream_ref(library_path: Path) -> str | None:
+    """Upstream of the current branch as "origin/main", or None when unset."""
+    return _try_git(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], library_path)
+
+
+def _describe_head(library_path: Path) -> str | None:
+    """Describe what HEAD points at: branch name, else tag name, else commit SHA.
+
+    Returns None when HEAD is unborn, which is the only state with nothing to name.
+    """
+    head_sha = _head_commit_sha(library_path)
+    if head_sha is None:
+        return None
+
+    branch = _current_branch(library_path)
+    if branch is not None:
+        return branch
+
+    return _tag_at_head(library_path) or head_sha
 
 
 def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
-    """Get both the git remote URL and current ref for a library in a single repo open.
+    """Get both the git remote URL and current ref for a library.
 
     Prefer this over calling get_git_remote() + get_current_ref() separately when both
-    values are needed: those functions each call is_git_repository(), discover_repository(),
-    and Repository() independently, which triples the I/O cost per library.
+    values are needed: those functions each re-run is_git_repository(), and each raises
+    where this one degrades to None.
+
+    This runs for every library on every metadata load, where git details are informational
+    and a library must still load without them. Every git failure therefore reports
+    "unavailable" here, rather than raising the way the single-value accessors do.
 
     Returns:
         tuple[str | None, str | None]: (git_remote, git_ref), each None if unavailable.
@@ -292,21 +564,10 @@ def get_git_info(library_path: Path) -> tuple[str | None, str | None]:
         return None, None
 
     try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            return None, None
-        repo = pygit2.Repository(repo_path)
-    except pygit2.GitError as e:
-        logger.debug("Failed to open git repository at %s: %s", library_path, e)
+        return _remote_url(library_path), _describe_head(library_path)
+    except GitError as e:
+        logger.debug("Reporting no git details for %s: %s", library_path, e)
         return None, None
-
-    git_remote: str | None = None
-    try:
-        git_remote = repo.remotes["origin"].url
-    except (KeyError, IndexError, pygit2.GitError) as e:
-        logger.debug("Failed to get git remote for %s: %s", library_path, e)
-
-    return git_remote, _get_ref_from_repo(repo, library_path)
 
 
 def get_git_remote(library_path: Path) -> str | None:
@@ -319,29 +580,12 @@ def get_git_remote(library_path: Path) -> str | None:
         str | None: The remote URL if found, None if not a git repository or no remote configured.
 
     Raises:
-        GitRemoteError: If an error occurs while accessing the git remote.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         return None
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            return None
-
-        repo = pygit2.Repository(repo_path)
-
-        # Access remote by indexing (raises KeyError if not found)
-        try:
-            remote = repo.remotes["origin"]
-        except (KeyError, IndexError):
-            return None
-        else:
-            return remote.url
-
-    except pygit2.GitError as e:
-        msg = f"Error getting git remote for {library_path}: {e}"
-        raise GitRemoteError(msg) from e
+    return _remote_url(library_path)
 
 
 def get_current_ref(library_path: Path) -> str | None:
@@ -354,44 +598,16 @@ def get_current_ref(library_path: Path) -> str | None:
         str | None: The current git reference (branch name, tag name, or commit SHA) if found, None if not a git repository.
 
     Raises:
-        GitRefError: If an error occurs while getting the current git reference.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         logger.debug("Path %s is not a git repository", library_path)
         return None
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            logger.debug("Could not discover git repository at %s", library_path)
-            return None
-
-        repo = pygit2.Repository(repo_path)
-
-        # Check if HEAD is unborn (no commits yet)
-        if repo.head_is_unborn:
-            logger.debug("Repository at %s has unborn HEAD (no commits)", library_path)
-            return None
-
-        # Check if HEAD is detached
-        if repo.head_is_detached:
-            # HEAD is detached - check if it's pointing to a tag
-            tag_name = get_current_tag(library_path)
-            if tag_name:
-                logger.debug("Repository at %s has detached HEAD on tag %s", library_path, tag_name)
-                return tag_name
-
-            # No tag found, return the commit SHA as fallback
-            head_commit = repo.head.target
-            logger.debug("Repository at %s has detached HEAD at commit %s", library_path, head_commit)
-            return str(head_commit)
-
-    except pygit2.GitError as e:
-        msg = f"Error getting current git reference for {library_path}: {e}"
-        raise GitRefError(msg) from e
-    else:
-        # Get the current git reference name (branch)
-        return repo.head.shorthand
+    ref = _describe_head(library_path)
+    if ref is None:
+        logger.debug("Repository at %s has unborn HEAD (no commits)", library_path)
+    return ref
 
 
 def get_current_tag(library_path: Path) -> str | None:
@@ -404,44 +620,15 @@ def get_current_tag(library_path: Path) -> str | None:
         str | None: The current tag name if found, None if not on a tag or not a git repository.
 
     Raises:
-        GitError: If an error occurs while getting the current tag.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         return None
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            return None
-
-        repo = pygit2.Repository(repo_path)
-
-        # Get the current HEAD commit
-        if repo.head_is_unborn:
-            return None
-
-        head_commit = repo.head.target
-
-        # Check all tags to see if any point to HEAD
-        for tag_name in repo.references:
-            if not tag_name.startswith("refs/tags/"):
-                continue
-
-            tag_ref = repo.references[tag_name]
-            # Handle both lightweight and annotated tags
-            if hasattr(tag_ref, "peel"):
-                tag_target = tag_ref.peel(pygit2.Commit).id
-            else:
-                tag_target = tag_ref.target
-
-            if tag_target == head_commit:
-                # Return tag name without refs/tags/ prefix
-                return tag_name.replace("refs/tags/", "")
-    except pygit2.GitError as e:
-        msg = f"Error getting current tag for {library_path}: {e}"
-        raise GitError(msg) from e
-    else:
+    if _head_commit_sha(library_path) is None:
         return None
+
+    return _tag_at_head(library_path)
 
 
 def is_on_tag(library_path: Path) -> bool:
@@ -463,29 +650,15 @@ def get_local_commit_sha(library_path: Path) -> str | None:
         library_path: The path to the library directory.
 
     Returns:
-        str | None: The full commit SHA if found, None if not a git repository or error occurs.
+        str | None: The full commit SHA if found, None if not a git repository or HEAD is unborn.
 
     Raises:
-        GitError: If an error occurs while getting the commit SHA.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         return None
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            return None
-
-        repo = pygit2.Repository(repo_path)
-
-        if repo.head_is_unborn:
-            return None
-
-        return str(repo.head.target)
-
-    except pygit2.GitError as e:
-        msg = f"Error getting commit SHA for {library_path}: {e}"
-        raise GitError(msg) from e
+    return _head_commit_sha(library_path)
 
 
 def get_git_repository_root(library_path: Path) -> Path | None:
@@ -496,35 +669,20 @@ def get_git_repository_root(library_path: Path) -> Path | None:
 
     Returns:
         Path | None: The root directory of the git repository, or None if not in a git repository.
+            A bare repository is not recognized, matching is_git_repository().
 
     Raises:
-        GitRepositoryError: If an error occurs while accessing the git repository.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         return None
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            return None
-
-        # discover_repository returns path to .git directory
-        # For a normal repo: /path/to/repo/.git
-        # For a bare repo: /path/to/repo.git
-        git_dir = Path(repo_path)
-
-        # Check if it's a bare repository
-        if git_dir.name.endswith(".git") and git_dir.is_dir():
-            repo = pygit2.Repository(repo_path)
-            if repo.is_bare:
-                return git_dir
-
-    except pygit2.GitError as e:
-        msg = f"Error getting git repository root for {library_path}: {e}"
-        raise GitRepositoryError(msg) from e
-    else:
-        # Normal repository - return parent of .git directory
-        return git_dir.parent
+    # --show-cdup is relative to library_path, so the root comes back in the caller's
+    # own path vocabulary. --show-toplevel would resolve symlinks along the way.
+    cdup = _try_git(["rev-parse", "--show-cdup"], library_path)
+    if cdup is None:
+        return None
+    return Path(os.path.normpath(library_path / cdup))
 
 
 def has_uncommitted_changes(library_path: Path) -> bool:
@@ -538,67 +696,51 @@ def has_uncommitted_changes(library_path: Path) -> bool:
 
     Raises:
         GitRepositoryError: If the path is not a valid git repository.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot check status: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot check status: {library_path} is not a git repository"
-            raise GitRepositoryError(msg)
-
-        repo = pygit2.Repository(repo_path)
-        status = repo.status()
-        return len(status) > 0
-
-    except pygit2.GitError as e:
-        msg = f"Failed to check git status at {library_path}: {e}"
-        raise GitRepositoryError(msg) from e
+    status = _run_git(
+        ["status", "--porcelain"],
+        error_msg=f"Failed to check git status at {library_path}",
+        cwd=library_path,
+        error_cls=GitRepositoryError,
+    )
+    return bool(status)
 
 
-def _validate_branch_update_preconditions(library_path: Path) -> None:
-    """Validate preconditions for branch-based update.
+def _resolve_update_upstream(library_path: Path) -> str:
+    """Validate that a branch-based update is possible and return the upstream ref name.
+
+    Returns:
+        str: The upstream of the current branch, e.g. "origin/main".
 
     Raises:
         GitRepositoryError: If validation fails.
         GitPullError: If repository state is invalid for update.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot discover repository at {library_path}"
-            raise GitRepositoryError(msg)
+    branch = _current_branch(library_path)
+    if branch is None:
+        msg = f"Repository at {library_path} has detached HEAD"
+        raise GitPullError(msg)
 
-        repo = pygit2.Repository(repo_path)
+    upstream = _upstream_ref(library_path)
+    if upstream is None:
+        msg = f"No upstream branch set for {branch} at {library_path}"
+        raise GitPullError(msg)
 
-        if repo.head_is_detached:
-            msg = f"Repository at {library_path} has detached HEAD"
-            raise GitPullError(msg)
+    if _remote_url(library_path) is None:
+        msg = f"No origin remote found for repository at {library_path}"
+        raise GitPullError(msg)
 
-        current_branch = repo.branches.get(repo.head.shorthand)
-        if current_branch is None:
-            msg = f"Cannot get current branch for repository at {library_path}"
-            raise GitPullError(msg)
-
-        if current_branch.upstream is None:
-            msg = f"No upstream branch set for {current_branch.branch_name} at {library_path}"
-            raise GitPullError(msg)
-
-        try:
-            _ = repo.remotes["origin"]
-        except (KeyError, IndexError) as e:
-            msg = f"No origin remote found for repository at {library_path}"
-            raise GitPullError(msg) from e
-
-    except pygit2.GitError as e:
-        msg = f"Git error during update at {library_path}: {e}"
-        raise GitPullError(msg) from e
+    return upstream
 
 
 def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = False) -> None:
@@ -617,8 +759,9 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
-    _validate_branch_update_preconditions(library_path)
+    upstream = _resolve_update_upstream(library_path)
 
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
@@ -627,38 +770,11 @@ def git_update_from_remote(library_path: Path, *, overwrite_existing: bool = Fal
 
         logger.warning("Discarding uncommitted changes at %s", library_path)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot update: {library_path} is not a git repository"
-            raise GitPullError(msg)
+    error_msg = f"Git error during update at {library_path}"
+    _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
+    _run_git(["reset", "--hard", upstream], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
 
-        repo = pygit2.Repository(repo_path)
-
-        # Get remote and fetch
-        remote = repo.remotes["origin"]
-        remote.fetch()
-
-        # Get upstream branch reference
-        try:
-            upstream_name = repo.branches.get(repo.head.shorthand).upstream.branch_name
-            upstream_ref = repo.references.get(f"refs/remotes/{upstream_name}")
-            if upstream_ref is None:
-                msg = f"Failed to find upstream reference {upstream_name} at {library_path}"
-                raise GitPullError(msg)
-            upstream_oid = upstream_ref.target
-        except (pygit2.GitError, AttributeError) as e:
-            msg = f"Failed to determine upstream branch at {library_path}: {e}"
-            raise GitPullError(msg) from e
-
-        # Hard reset to upstream
-        repo.reset(upstream_oid, pygit2.enums.ResetMode.HARD)
-
-        logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream_name)
-
-    except pygit2.GitError as e:
-        msg = f"Git error during update at {library_path}: {e}"
-        raise GitPullError(msg) from e
+    logger.debug("Successfully updated library at %s to match remote %s", library_path, upstream)
 
 
 def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existing: bool = False) -> None:
@@ -677,31 +793,18 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the tag update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update tag: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot discover repository at {library_path}"
-            raise GitRepositoryError(msg)
+    _reject_option_like(tag_name, "tag name", GitPullError)
 
-        repo = pygit2.Repository(repo_path)
+    if _remote_url(library_path) is None:
+        msg = f"No origin remote found for repository at {library_path}"
+        raise GitPullError(msg)
 
-        # Check for origin remote
-        try:
-            _ = repo.remotes["origin"]
-        except (KeyError, IndexError) as e:
-            msg = f"No origin remote found for repository at {library_path}"
-            raise GitPullError(msg) from e
-
-    except pygit2.GitError as e:
-        msg = f"Git error during tag update at {library_path}: {e}"
-        raise GitPullError(msg) from e
-
-    # Check for uncommitted changes
     if has_uncommitted_changes(library_path):
         if not overwrite_existing:
             msg = f"Cannot update library at {library_path}: You have uncommitted changes. Use overwrite_existing=True to discard them."
@@ -709,31 +812,23 @@ def update_to_moving_tag(library_path: Path, tag_name: str, *, overwrite_existin
 
         logger.warning("Discarding uncommitted changes at %s", library_path)
 
-    # Use pygit2 to fetch tags and checkout
-    try:
-        # Step 1: Delete local tag to allow fetch to update it (pygit2 doesn't honor +force)
-        tag_ref = f"refs/tags/{tag_name}"
-        if tag_ref in repo.references:
-            repo.references.delete(tag_ref)
-            logger.debug("Deleted local tag %s to allow force-update", tag_name)
+    error_msg = f"Git error during tag update at {library_path}"
 
-        # Step 2: Fetch all tags (will create the deleted tag with new commit)
-        remote = repo.remotes["origin"]
-        remote.fetch(refspecs=["+refs/tags/*:refs/tags/*"])
+    # --force is what makes this work for a moving tag: without it git refuses to
+    # replace a local tag whose remote counterpart now points at a new commit.
+    _run_git(["fetch", "--tags", "--force", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
 
-        # Step 3: Checkout the tag with force to discard local changes
-        if tag_ref not in repo.references:
-            msg = f"Tag {tag_name} not found at {library_path}"
-            raise GitPullError(msg)
+    tag_ref = f"refs/tags/{tag_name}"
+    if not _ref_exists(library_path, tag_ref):
+        msg = f"Tag {tag_name} not found at {library_path}"
+        raise GitPullError(msg)
 
-        strategy = pygit2.enums.CheckoutStrategy.FORCE if overwrite_existing else pygit2.enums.CheckoutStrategy.SAFE
-        repo.checkout(tag_ref, strategy=strategy)
+    checkout = ["checkout", "--detach", tag_ref]
+    if overwrite_existing:
+        checkout.insert(1, "--force")
+    _run_git(checkout, error_msg=error_msg, cwd=library_path, error_cls=GitPullError)
 
-        logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
-
-    except pygit2.GitError as e:
-        msg = f"Git error during tag update at {library_path}: {e}"
-        raise GitPullError(msg) from e
+    logger.debug("Successfully updated library at %s to tag %s", library_path, tag_name)
 
 
 def update_library_git(library_path: Path, *, overwrite_existing: bool = False) -> None:
@@ -753,37 +848,24 @@ def update_library_git(library_path: Path, *, overwrite_existing: bool = False) 
         GitRepositoryError: If the path is not a valid git repository.
         GitPullError: If the update operation fails or uncommitted changes exist
             when overwrite_existing=False.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot update: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot discover repository at {library_path}"
-            raise GitRepositoryError(msg)
+    if _current_branch(library_path) is None:
+        # Detached HEAD - likely on a tag
+        tag_name = get_current_tag(library_path)
+        if tag_name is None:
+            msg = f"Repository at {library_path} is in detached HEAD state but not on a known tag. Cannot auto-update."
+            raise GitPullError(msg)
 
-        repo = pygit2.Repository(repo_path)
-
-        # Detect workflow type
-        if repo.head_is_detached:
-            # Detached HEAD - likely on a tag
-            tag_name = get_current_tag(library_path)
-            if tag_name is None:
-                msg = f"Repository at {library_path} is in detached HEAD state but not on a known tag. Cannot auto-update."
-                raise GitPullError(msg)
-
-            logger.debug("Detected tag-based workflow for %s (tag: %s)", library_path, tag_name)
-            update_to_moving_tag(library_path, tag_name, overwrite_existing=overwrite_existing)
-        else:
-            # On a branch - use fetch + reset to match remote
-            logger.debug("Detected branch-based workflow for %s", library_path)
-            git_update_from_remote(library_path, overwrite_existing=overwrite_existing)
-
-    except pygit2.GitError as e:
-        msg = f"Git error during library update at {library_path}: {e}"
-        raise GitPullError(msg) from e
+        logger.debug("Detected tag-based workflow for %s (tag: %s)", library_path, tag_name)
+        update_to_moving_tag(library_path, tag_name, overwrite_existing=overwrite_existing)
+    else:
+        logger.debug("Detected branch-based workflow for %s", library_path)
+        git_update_from_remote(library_path, overwrite_existing=overwrite_existing)
 
 
 def switch_branch(library_path: Path, branch_name: str) -> None:
@@ -799,64 +881,40 @@ def switch_branch(library_path: Path, branch_name: str) -> None:
     Raises:
         GitRepositoryError: If the path is not a valid git repository.
         GitRefError: If the branch switch operation fails.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot switch branch: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot discover repository at {library_path}"
-            raise GitRepositoryError(msg)
+    _reject_option_like(branch_name, "branch name", GitRefError)
 
-        repo = pygit2.Repository(repo_path)
+    if _remote_url(library_path) is None:
+        msg = f"No origin remote found for repository at {library_path}"
+        raise GitRefError(msg)
 
-        # Get origin remote
-        try:
-            remote = repo.remotes["origin"]
-        except (KeyError, IndexError) as e:
-            msg = f"No origin remote found for repository at {library_path}"
-            raise GitRefError(msg) from e
+    error_msg = f"Git error during branch switch at {library_path}"
+    _run_git(["fetch", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
 
-        # Fetch from remote first
-        remote.fetch()
+    if _ref_exists(library_path, f"refs/heads/{branch_name}"):
+        _run_git(["checkout", branch_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
+        logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
+        return
 
-        # Try to find the branch locally first
-        local_branch = repo.branches.get(branch_name)
+    remote_branch_name = f"origin/{branch_name}"
+    if not _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
+        msg = f"Branch {branch_name} not found locally or on remote at {library_path}"
+        raise GitRefError(msg)
 
-        if local_branch is not None:
-            # Branch exists locally, just check it out
-            repo.checkout(local_branch)
-            logger.debug("Checked out existing local branch %s at %s", branch_name, library_path)
-            return
-
-        # Branch doesn't exist locally, try to find it on remote
-        remote_branch_name = f"origin/{branch_name}"
-        remote_branch = repo.branches.get(remote_branch_name)
-
-        if remote_branch is None:
-            msg = f"Branch {branch_name} not found locally or on remote at {library_path}"
-            raise GitRefError(msg)
-
-        # Create local tracking branch from remote
-        commit = repo.get(remote_branch.target)
-        if commit is None:
-            msg = f"Failed to get commit for remote branch {remote_branch_name} at {library_path}"
-            raise GitRefError(msg)
-
-        new_branch = repo.branches.local.create(branch_name, commit)  # type: ignore[arg-type]
-        new_branch.upstream = remote_branch
-
-        # Checkout the new branch
-        repo.checkout(new_branch)
-        logger.debug(
-            "Created and checked out tracking branch %s from %s at %s", branch_name, remote_branch_name, library_path
-        )
-
-    except pygit2.GitError as e:
-        msg = f"Git error during branch switch at {library_path}: {e}"
-        raise GitRefError(msg) from e
+    _run_git(
+        ["checkout", "-b", branch_name, "--track", remote_branch_name],
+        error_msg=error_msg,
+        cwd=library_path,
+        error_cls=GitRefError,
+    )
+    logger.debug(
+        "Created and checked out tracking branch %s from %s at %s", branch_name, remote_branch_name, library_path
+    )
 
 
 def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
@@ -872,196 +930,42 @@ def switch_branch_or_tag(library_path: Path, ref_name: str) -> None:
     Raises:
         GitRepositoryError: If the path is not a valid git repository.
         GitRefError: If the switch operation fails.
+        GitNotFoundError: If git is not installed.
     """
     if not is_git_repository(library_path):
         msg = f"Cannot switch ref: {library_path} is not a git repository"
         raise GitRepositoryError(msg)
 
-    try:
-        repo_path = pygit2.discover_repository(str(library_path))
-        if repo_path is None:
-            msg = f"Cannot switch ref: {library_path} is not a git repository"
-            raise GitRefError(msg)
+    _reject_option_like(ref_name, "ref name", GitRefError)
 
-        repo = pygit2.Repository(repo_path)
+    error_msg = f"Git error during ref switch at {library_path}"
+    # --tags fetches tags on top of the configured refspec, so one call updates
+    # remote-tracking branches and force-updates moved tags.
+    _run_git(["fetch", "--tags", "--force", "origin"], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
 
-        # Fetch both branches and tags from remote
-        remote = repo.remotes["origin"]
-        remote.fetch(refspecs=["+refs/tags/*:refs/tags/*"])
-        remote.fetch()
-
-        # Try to checkout the ref (works for both branches and tags)
-        # First check if it's a tag
-        tag_ref = f"refs/tags/{ref_name}"
-        branch_ref = f"refs/remotes/origin/{ref_name}"
-
-        if tag_ref in repo.references:
-            repo.checkout(tag_ref)
-        elif branch_ref in repo.references:
-            # For remote branches, create/update local tracking branch and checkout
-            remote_branch_name = f"origin/{ref_name}"
-            remote_branch = repo.branches.get(remote_branch_name)
-
-            if remote_branch is None:
-                msg = f"Remote branch {remote_branch_name} not found at {library_path}"
-                raise GitRefError(msg)
-
-            commit = repo.get(remote_branch.target)
-            if commit is None:
-                msg = f"Failed to get commit for remote branch {remote_branch_name} at {library_path}"
-                raise GitRefError(msg)
-
-            # Create or update local branch
-            if ref_name in repo.branches.local:
-                local_branch = repo.branches.local[ref_name]
-                local_branch.set_target(commit.id)
-            else:
-                local_branch = repo.branches.local.create(ref_name, commit)  # type: ignore[arg-type]
-
-            local_branch.upstream = remote_branch
-            repo.checkout(local_branch)
-        elif ref_name in repo.branches:
-            # Local branch
-            repo.checkout(repo.branches[ref_name])
-        else:
-            msg = f"Ref {ref_name} not found at {library_path}"
-            raise GitRefError(msg)
-
-        logger.debug("Checked out %s at %s", ref_name, library_path)
-
-    except pygit2.GitError as e:
-        msg = f"Git error during ref switch at {library_path}: {e}"
-        raise GitRefError(msg) from e
-
-
-class _CredentialCallbacks(pygit2.RemoteCallbacks):
-    """RemoteCallbacks that handle both SSH and public HTTPS authentication.
-
-    When libgit2 requests SSH credentials (either for SSH URLs or HTTPS URLs
-    rewritten via url.insteadOf git config), tries SSH key files then falls
-    back to the SSH agent. For HTTPS, returns empty credentials (sufficient
-    for public repos).
-    """
-
-    def credentials(self, url: str, username_from_url: str | None, allowed_types: int) -> object:  # type: ignore[override]
-        ssh_types = (
-            pygit2.enums.CredentialType.SSH_KEY
-            | pygit2.enums.CredentialType.SSH_CUSTOM
-            | pygit2.enums.CredentialType.SSH_MEMORY
+    remote_branch_name = f"origin/{ref_name}"
+    if _ref_exists(library_path, f"refs/tags/{ref_name}"):
+        _run_git(
+            ["checkout", "--detach", f"refs/tags/{ref_name}"],
+            error_msg=error_msg,
+            cwd=library_path,
+            error_cls=GitRefError,
         )
-        if allowed_types & ssh_types:
-            # libgit2 rewrote the HTTPS URL to SSH via a url.insteadOf git config rule,
-            # or this is an SSH URL directly. Try key files first, then agent.
-            for key_path in _SSH_KEY_PATHS:
-                pub_key_path = key_path.with_suffix(key_path.suffix + ".pub")
-                if key_path.exists() and pub_key_path.exists():
-                    logger.debug("Using SSH key from %s for %s", key_path, url)
-                    return pygit2.Keypair(username_from_url or "git", str(pub_key_path), str(key_path), "")
-            logger.debug("No SSH key files found, falling back to SSH agent for %s", url)
-            return pygit2.KeypairFromAgent(username_from_url or "git")
-
-        return pygit2.UserPass("", "")
-
-
-def _is_git_available() -> bool:
-    """Check if git CLI is available on PATH.
-
-    Returns:
-        bool: True if git CLI is available, False otherwise.
-    """
-    try:
-        subprocess.run(
-            ["git", "--version"],  # noqa: S607
-            capture_output=True,
-            check=True,
+    elif _ref_exists(library_path, f"refs/remotes/{remote_branch_name}"):
+        # -B resets an existing local branch onto the freshly fetched remote tip.
+        _run_git(
+            ["checkout", "-B", ref_name, "--track", remote_branch_name],
+            error_msg=error_msg,
+            cwd=library_path,
+            error_cls=GitRefError,
         )
-    except (subprocess.SubprocessError, FileNotFoundError):
-        return False
+    elif _ref_exists(library_path, f"refs/heads/{ref_name}"):
+        _run_git(["checkout", ref_name], error_msg=error_msg, cwd=library_path, error_cls=GitRefError)
     else:
-        return True
+        msg = f"Ref {ref_name} not found at {library_path}"
+        raise GitRefError(msg)
 
-
-def _run_git_command(args: list[str], cwd: str, error_msg: str) -> subprocess.CompletedProcess[str]:
-    """Run a git command and raise GitCloneError on failure.
-
-    Args:
-        args: Git command arguments (e.g., ["git", "init"]).
-        cwd: Working directory for the command.
-        error_msg: Error message prefix to use if command fails.
-
-    Returns:
-        subprocess.CompletedProcess: The result of the command.
-
-    Raises:
-        GitCloneError: If the command returns a non-zero exit code.
-    """
-    result = subprocess.run(  # noqa: S603
-        args,
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        msg = f"{error_msg}: {result.stderr}"
-        raise GitCloneError(msg)
-
-    return result
-
-
-def _checkout_branch_tag_or_commit(repo: pygit2.Repository, ref: str) -> None:
-    """Check out a branch, tag, or commit in a repository.
-
-    For branches, creates a local tracking branch from the remote.
-    For tags and commits, checks out in detached HEAD state.
-
-    Args:
-        repo: The pygit2 Repository object.
-        ref: The branch, tag, or commit reference to checkout.
-
-    Raises:
-        GitCloneError: If checkout fails.
-    """
-    # Try to resolve as a local branch first
-    try:
-        branch = repo.branches[ref]
-        repo.checkout(branch)
-    except (pygit2.GitError, KeyError, IndexError):
-        pass
-    else:
-        logger.debug("Checked out local branch %s", ref)
-        return
-
-    # Try to resolve as a remote branch and create local tracking branch
-    remote_ref = f"refs/remotes/origin/{ref}"
-    remote_branch_exists = remote_ref in repo.references
-
-    if remote_branch_exists:
-        remote_branch_name = f"origin/{ref}"
-        remote_branch = repo.branches.get(remote_branch_name)
-
-        if remote_branch is not None:
-            commit = repo.get(remote_branch.target)
-            if commit is None:
-                msg = f"Failed to get commit for remote branch {remote_branch_name}"
-                raise GitCloneError(msg)
-
-            # Create local tracking branch
-            local_branch = repo.branches.local.create(ref, commit)  # type: ignore[arg-type]
-            local_branch.upstream = remote_branch
-            repo.checkout(local_branch)
-            logger.debug("Checked out remote branch %s as local tracking branch", ref)
-            return
-
-    # Not a local or remote branch, try as tag or commit
-    try:
-        commit_obj = repo.revparse_single(ref)
-        repo.checkout_tree(commit_obj)
-        repo.set_head(commit_obj.id)
-        logger.debug("Checked out %s as tag or commit", ref)
-    except pygit2.GitError as e:
-        msg = f"Failed to checkout {ref}: {e}"
-        raise GitCloneError(msg) from e
+    logger.debug("Checked out %s at %s", ref_name, library_path)
 
 
 def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | None = None) -> None:
@@ -1069,30 +973,50 @@ def clone_repository(git_url: str, target_path: Path, branch_tag_commit: str | N
 
     Args:
         git_url: The git repository URL to clone (HTTPS or SSH).
-        target_path: The target directory path to clone into.
+        target_path: The target directory path to clone into. A relative path is anchored to the
+            current working directory.
         branch_tag_commit: Optional branch, tag, or commit to checkout after cloning.
 
     Raises:
         GitCloneError: If cloning fails or target path already exists.
+        GitNotFoundError: If git is not installed.
     """
+    # The clone runs in a throwaway directory (see _run_git_detached), so git would resolve a
+    # relative target against that directory and the clone would be discarded with it. Anchor to
+    # the caller's working directory instead, before anything else reads the path. Deliberately
+    # not canonicalize_for_io: it applies the Windows \\?\ long-path prefix, which git rejects.
+    try:
+        target_path = target_path.absolute()
+    except OSError as e:
+        # Anchoring a relative path reads the working directory, which fails if that directory
+        # has been deleted from under the process.
+        msg = f"Attempted to clone {git_url} to {target_path}. Failed due to: {e}"
+        raise GitCloneError(msg) from e
+
     if target_path.exists():
         msg = f"Cannot clone: target path {target_path} already exists"
         raise GitCloneError(msg)
 
-    try:
-        # Clone the repository
-        repo = pygit2.clone_repository(git_url, str(target_path), callbacks=_CredentialCallbacks())
-        if repo is None:
-            msg = f"Failed to clone repository from {git_url}"
-            raise GitCloneError(msg)
+    _reject_unsafe_url(git_url, GitCloneError)
+    if branch_tag_commit:
+        _reject_option_like(branch_tag_commit, "ref", GitCloneError)
 
-        # Checkout specific branch/tag/commit if provided
-        if branch_tag_commit:
-            _checkout_branch_tag_or_commit(repo, branch_tag_commit)
+    _run_git_detached(
+        ["clone", git_url, str(target_path)],
+        error_msg=f"Git error while cloning {git_url} to {target_path}",
+        error_cls=GitCloneError,
+    )
 
-    except pygit2.GitError as e:
-        msg = f"Git error while cloning {git_url} to {target_path}: {e}"
-        raise GitCloneError(msg) from e
+    if branch_tag_commit:
+        # A single checkout covers all three: a remote branch name becomes a local
+        # tracking branch, a tag or commit lands on a detached HEAD.
+        _run_git(
+            ["checkout", branch_tag_commit],
+            error_msg=f"Failed to checkout {branch_tag_commit} in {target_path}",
+            cwd=target_path,
+            error_cls=GitCloneError,
+        )
+        logger.debug("Checked out %s in %s", branch_tag_commit, target_path)
 
 
 def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
@@ -1128,267 +1052,86 @@ def _extract_library_version_from_json(json_path: Path, remote_url: str) -> str:
     return library_data["metadata"]["library_version"]
 
 
-def _sparse_checkout_with_git_cli(remote_url: str, ref: str) -> tuple[str, str, dict]:
-    """Perform sparse checkout using git CLI to fetch only library JSON file.
+def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> LibraryJsonCheckout:
+    """Fetch a library's JSON metadata from a git remote without a full clone.
 
-    This is the most efficient method as it only downloads files matching the sparse
-    checkout patterns, not the entire repository.
-
-    Args:
-        remote_url: The git repository URL (HTTPS or SSH).
-        ref: The git reference (branch, tag, or commit) to checkout.
-
-    Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
-
-    Raises:
-        GitCloneError: If sparse checkout fails or library metadata is invalid.
-    """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-
-        try:
-            # Initialize empty git repository
-            _run_git_command(["git", "init"], temp_dir, "Git init failed")
-
-            # Add remote
-            _run_git_command(
-                ["git", "remote", "add", "origin", remote_url],
-                temp_dir,
-                "Git remote add failed",
-            )
-
-            # Enable sparse checkout
-            _run_git_command(
-                ["git", "config", "core.sparseCheckout", "true"],
-                temp_dir,
-                "Git sparse checkout config failed",
-            )
-
-            # Configure sparse-checkout patterns
-            sparse_checkout_file = temp_path / ".git" / "info" / "sparse-checkout"
-            sparse_checkout_file.parent.mkdir(parents=True, exist_ok=True)
-            patterns = [
-                "griptape_nodes_library.json",
-                "*/griptape_nodes_library.json",
-                "*/*/griptape_nodes_library.json",
-                "griptape-nodes-library.json",
-                "*/griptape-nodes-library.json",
-                "*/*/griptape-nodes-library.json",
-            ]
-            sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
-
-            # Fetch with depth 1 (shallow clone)
-            _run_git_command(
-                ["git", "fetch", "--depth=1", "origin", ref],
-                temp_dir,
-                f"Git fetch failed for {ref}",
-            )
-
-            # Checkout the ref
-            _run_git_command(["git", "checkout", "FETCH_HEAD"], temp_dir, "Git checkout failed")
-
-            # Find the library JSON file
-            library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")
-            if library_json_path is None:
-                msg = f"No library JSON file found in sparse checkout from {remote_url}"
-                raise GitCloneError(msg)
-
-            # Extract version from JSON
-            library_version = _extract_library_version_from_json(library_json_path, remote_url)
-
-            # Get commit SHA
-            rev_parse_result = _run_git_command(
-                ["git", "rev-parse", "HEAD"],
-                temp_dir,
-                "Git rev-parse failed",
-            )
-            commit_sha = rev_parse_result.stdout.strip()
-
-            # Read the JSON data before temp directory is deleted
-            try:
-                with library_json_path.open(encoding="utf-8") as f:
-                    library_data = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
-                msg = f"Failed to read library file from {remote_url}: {e}"
-                raise GitCloneError(msg) from e
-
-        except subprocess.SubprocessError as e:
-            msg = f"Subprocess error during sparse checkout from {remote_url}: {e}"
-            raise GitCloneError(msg) from e
-
-        return (library_version, commit_sha, library_data)
-
-
-def _shallow_clone_with_pygit2(remote_url: str, ref: str) -> tuple[str, str, dict]:
-    """Perform shallow clone using pygit2 to fetch library JSON file.
-
-    This is a fallback method when git CLI is not available. It downloads all files
-    but with limited history (depth=1).
-
-    Args:
-        remote_url: The git repository URL (HTTPS or SSH).
-        ref: The git reference (branch, tag, or commit) to checkout.
-
-    Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
-
-    Raises:
-        GitCloneError: If clone fails or library metadata is invalid.
-    """
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        repo = None  # Initialize for finally block
-
-        try:
-            callbacks = _CredentialCallbacks()
-
-            # Shallow clone with depth=1
-            # Note: We don't use checkout_branch here because it only works with branches,
-            # not tags or commit SHAs. Instead, we'll fetch and checkout the ref manually.
-            repo = pygit2.clone_repository(
-                remote_url,
-                str(temp_path),
-                callbacks=callbacks,
-                depth=1,
-            )
-
-            if repo is None:
-                msg = f"Failed to clone repository from {remote_url}"
-                raise GitCloneError(msg)
-
-            # If a specific ref was requested (not HEAD), fetch and checkout that ref
-            if ref != "HEAD":
-                try:
-                    # Fetch the specific ref (works for branches, tags, and commits)
-                    remote = repo.remotes["origin"]
-                    remote.fetch([ref], callbacks=callbacks, depth=1)
-
-                    # Now resolve and checkout the ref
-                    resolved_ref = repo.revparse_single(ref)
-                    repo.checkout_tree(resolved_ref)
-                    repo.set_head(resolved_ref.id)
-                except (KeyError, pygit2.GitError) as e:
-                    msg = f"Failed to fetch and checkout ref '{ref}' in clone from {remote_url}: {e}"
-                    raise GitCloneError(msg) from e
-
-            # Find the library JSON file
-            library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")
-            if library_json_path is None:
-                msg = f"No library JSON file found in clone from {remote_url}"
-                raise GitCloneError(msg)
-
-            # Extract version from JSON
-            library_version = _extract_library_version_from_json(library_json_path, remote_url)
-
-            # Get commit SHA
-            commit_sha = str(repo.head.target)
-
-            # Read the JSON data before temp directory is deleted
-            try:
-                with library_json_path.open(encoding="utf-8") as f:
-                    library_data = json.load(f)
-            except (OSError, json.JSONDecodeError) as e:
-                msg = f"Failed to read library file from {remote_url}: {e}"
-                raise GitCloneError(msg) from e
-
-        except pygit2.GitError as e:
-            msg = f"Git error during clone from {remote_url}: {e}"
-            raise GitCloneError(msg) from e
-        finally:
-            # Release repository file handles before temp directory cleanup
-            # Critical on Windows where open handles prevent directory deletion
-            if repo is not None:
-                repo.free()
-
-        return (library_version, commit_sha, library_data)
-
-
-def sparse_checkout_library_json(remote_url: str, ref: str = "HEAD") -> tuple[str, str, dict]:
-    """Fetch library JSON file from a git repository.
-
-    This function uses the most efficient method available:
-    - If git CLI is available: uses sparse checkout (only downloads needed files)
-    - Otherwise: falls back to pygit2 shallow clone (downloads all files with depth=1)
+    Uses a sparse checkout so only files matching the library JSON patterns are
+    downloaded, rather than the whole repository.
 
     Args:
         remote_url: The git repository URL (HTTPS or SSH).
         ref: The git reference (branch, tag, or commit) to checkout. Defaults to HEAD.
 
     Returns:
-        tuple[str, str, dict]: A tuple of (library_version, commit_sha, library_data).
+        LibraryJsonCheckout: The library version, commit SHA, commit datetime, and library data.
 
     Raises:
-        GitCloneError: If the operation fails or library metadata is invalid.
+        GitCloneError: If the checkout fails or library metadata is invalid.
+        GitNotFoundError: If git is not installed.
     """
-    if _is_git_available():
-        logger.debug("Using git CLI for sparse checkout from %s", remote_url)
-        return _sparse_checkout_with_git_cli(remote_url, ref)
+    _reject_unsafe_url(remote_url, GitCloneError)
+    _reject_option_like(ref, "ref", GitCloneError)
 
-    logger.debug("Git CLI not available, using pygit2 shallow clone from %s", remote_url)
-    return _shallow_clone_with_pygit2(remote_url, ref)
-
-
-def _remote_ref_exists_with_git_cli(remote_url: str, ref: str) -> bool:
-    """Check whether a branch or tag ref exists on a remote using the git CLI.
-
-    Args:
-        remote_url: The git repository URL (HTTPS or SSH).
-        ref: The branch or tag name to look for on the remote.
-
-    Returns:
-        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
-
-    Raises:
-        GitRemoteError: If the remote cannot be queried.
-    """
-    result = subprocess.run(  # noqa: S603
-        ["git", "ls-remote", "--heads", "--tags", remote_url, ref],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        msg = f"Failed to query remote refs from {remote_url}: {result.stderr.strip()}"
-        raise GitRemoteError(msg)
-
-    return bool(result.stdout.strip())
-
-
-def _remote_ref_exists_with_pygit2(remote_url: str, ref: str) -> bool:
-    """Check whether a branch or tag ref exists on a remote using pygit2.
-
-    Args:
-        remote_url: The git repository URL (HTTPS or SSH).
-        ref: The branch or tag name to look for on the remote.
-
-    Returns:
-        bool: True if a matching branch or tag ref exists on the remote, False otherwise.
-
-    Raises:
-        GitRemoteError: If the remote cannot be queried.
-    """
-    candidate_names = {f"refs/heads/{ref}", f"refs/tags/{ref}"}
     with tempfile.TemporaryDirectory() as temp_dir:
-        repo = pygit2.init_repository(temp_dir, bare=True)
-        try:
-            remote = repo.remotes.create("origin", remote_url)
-            remote_refs = remote.ls_remotes(callbacks=_CredentialCallbacks())
-        except pygit2.GitError as e:
-            msg = f"Failed to query remote refs from {remote_url}: {e}"
-            raise GitRemoteError(msg) from e
-        finally:
-            repo.free()
+        temp_path = Path(temp_dir)
 
-    return any(remote_ref.get("name") in candidate_names for remote_ref in remote_refs)
+        def run(args: list[str], error_msg: str) -> str:
+            return _run_git(args, error_msg=error_msg, cwd=temp_path, error_cls=GitCloneError)
+
+        run(["init"], "Git init failed")
+        run(["remote", "add", "origin", remote_url], "Git remote add failed")
+        run(["config", "core.sparseCheckout", "true"], "Git sparse checkout config failed")
+
+        # Configure sparse-checkout patterns
+        sparse_checkout_file = temp_path / ".git" / "info" / "sparse-checkout"
+        sparse_checkout_file.parent.mkdir(parents=True, exist_ok=True)
+        patterns = [
+            "griptape_nodes_library.json",
+            "*/griptape_nodes_library.json",
+            "*/*/griptape_nodes_library.json",
+            "griptape-nodes-library.json",
+            "*/griptape-nodes-library.json",
+            "*/*/griptape-nodes-library.json",
+        ]
+        sparse_checkout_file.write_text("\n".join(patterns), encoding="utf-8")
+
+        run(["fetch", "--depth=1", "origin", ref], f"Git fetch failed for {ref}")
+        run(["checkout", "FETCH_HEAD"], "Git checkout failed")
+
+        library_json_path = find_file_in_directory(temp_path, "griptape[-_]nodes[-_]library.json")
+        if library_json_path is None:
+            msg = f"No library JSON file found in sparse checkout from {remote_url}"
+            raise GitCloneError(msg)
+
+        library_version = _extract_library_version_from_json(library_json_path, remote_url)
+        commit_sha = run(["rev-parse", "HEAD"], "Git rev-parse failed")
+
+        # Committer date of the checked-out commit (strict ISO 8601). This is a best-effort
+        # field for the update age gate; a failure here must not fail the whole checkout,
+        # which backs the core version-check path, so degrade to None on error.
+        commit_datetime = parse_commit_datetime(_try_git(["log", "-1", "--format=%cI", "HEAD"], temp_path) or "")
+
+        # Read the JSON data before temp directory is deleted
+        try:
+            with library_json_path.open(encoding="utf-8") as f:
+                library_data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            msg = f"Failed to read library file from {remote_url}: {e}"
+            raise GitCloneError(msg) from e
+
+        return LibraryJsonCheckout(
+            library_version=library_version,
+            commit_sha=commit_sha,
+            commit_datetime=commit_datetime,
+            library_data=library_data,
+        )
 
 
 def remote_ref_exists(remote_url: str, ref: str) -> bool:
     """Check whether a branch or tag named ``ref`` exists on a git remote.
 
-    Uses the git CLI when available and falls back to pygit2 otherwise, mirroring
-    sparse_checkout_library_json. Commit SHAs are not advertised as named refs, so a
-    detached HEAD pointing at a bare commit reports False.
+    Commit SHAs are not advertised as named refs, so a detached HEAD pointing at a
+    bare commit reports False.
 
     Args:
         remote_url: The git repository URL (HTTPS or SSH).
@@ -1399,10 +1142,20 @@ def remote_ref_exists(remote_url: str, ref: str) -> bool:
 
     Raises:
         GitRemoteError: If the remote cannot be queried.
+        GitNotFoundError: If git is not installed.
     """
-    if _is_git_available():
-        logger.debug("Using git CLI to check remote ref '%s' on %s", ref, remote_url)
-        return _remote_ref_exists_with_git_cli(remote_url, ref)
+    _reject_unsafe_url(remote_url, GitRemoteError)
+    _reject_option_like(ref, "ref", GitRemoteError)
 
-    logger.debug("Git CLI not available, using pygit2 to check remote ref '%s' on %s", ref, remote_url)
-    return _remote_ref_exists_with_pygit2(remote_url, ref)
+    # ls-remote's trailing arguments are glob patterns matched against the tail of each ref
+    # name, so a bare "main" also matches refs/heads/feature/main. Ask for the two fully
+    # qualified spellings and compare what comes back exactly.
+    wanted = [f"refs/heads/{ref}", f"refs/tags/{ref}"]
+    refs = _run_git_detached(
+        ["ls-remote", "--heads", "--tags", remote_url, *wanted],
+        error_msg=f"Failed to query remote refs from {remote_url}",
+        error_cls=GitRemoteError,
+    )
+    # Each line is "<sha>\t<refname>".
+    found = {line.partition("\t")[2].strip() for line in refs.splitlines()}
+    return bool(found & set(wanted))

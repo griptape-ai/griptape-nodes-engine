@@ -1,12 +1,14 @@
 import logging
 import os
 from collections.abc import Callable
+from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from griptape_nodes.drivers.cloud_credentials import resolve_cloud_credential
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.path_utils import get_workspace_relative_path
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy
@@ -32,14 +34,14 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Args:
             workspace_directory: The base workspace directory path.
             bucket_id: The ID of the bucket to use. Required.
-            api_key: The API key for authentication. If not provided, it will be retrieved from the environment variable "GT_CLOUD_API_KEY".
+            api_key: The credential for authentication. If not provided, it is resolved from the Griptape Nodes License, then "GT_CLOUD_API_KEY".
             static_files_directory: The directory path prefix for static files. If provided, file names will be prefixed with this path.
             **kwargs: Additional keyword arguments including base_url and headers.
         """
         super().__init__(workspace_directory)
 
         self.base_url = kwargs.get("base_url") or os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
-        self.api_key = api_key if api_key is not None else os.environ.get("GT_CLOUD_API_KEY")
+        self.api_key = api_key if api_key is not None else resolve_cloud_credential()
         self.headers = kwargs.get("headers") or {"Authorization": f"Bearer {self.api_key}"}
         self.request_timeout = kwargs.get("request_timeout")
         self.bucket_id = bucket_id
@@ -329,6 +331,78 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
 
         return response.json().get("buckets", [])
 
+    @staticmethod
+    def get_default_bucket_id(*, base_url: str, api_key: str, timeout: float | None = None) -> str | None:
+        """Return the organization's default bucket ID from Griptape Cloud.
+
+        Every organization has a default bucket that is guaranteed to exist and cannot be
+        deleted, which makes it a safe fallback when ``GT_CLOUD_BUCKET_ID`` is unset. The
+        default bucket ID is reported on the organization resource, so this reads it from
+        ``GET /api/organizations`` rather than scanning the paginated bucket list.
+
+        Args:
+            base_url: The base URL for the Griptape Cloud API.
+            api_key: The API key for authentication.
+            timeout: Optional request timeout in seconds.
+
+        Returns:
+            The default bucket ID for the caller's organization, or None if no
+            organization (or default bucket) is available.
+
+        Raises:
+            RuntimeError: If the organizations request fails.
+        """
+        headers = {"Authorization": f"Bearer {api_key}"}
+        url = urljoin(base_url, "/api/organizations")
+
+        try:
+            response = request_with_retry("GET", url, headers=headers, timeout=timeout)
+        except httpx.HTTPStatusError as e:
+            msg = f"Failed to fetch organization default bucket: {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
+
+        organizations = response.json().get("organizations", [])
+        if not organizations:
+            return None
+
+        return organizations[0].get("default_bucket_id")
+
+    @staticmethod
+    def bucket_exists(bucket_id: str, *, base_url: str, api_key: str, timeout: float | None = None) -> bool:
+        """Check whether a specific bucket exists in Griptape Cloud.
+
+        Uses a direct GET on the bucket resource rather than scanning ``list_buckets``,
+        which is paginated -- a valid bucket beyond the first page would otherwise look
+        missing. A 404 means the bucket does not exist (or is not visible to this API key);
+        any other HTTP error is surfaced so callers don't mistake it for a missing bucket.
+
+        Args:
+            bucket_id: The ID of the bucket to check.
+            base_url: The base URL for the Griptape Cloud API.
+            api_key: The API key for authentication.
+            timeout: Optional request timeout in seconds.
+
+        Returns:
+            True if the bucket exists and is accessible, False if it does not.
+
+        Raises:
+            RuntimeError: If the existence check fails for a reason other than a 404.
+        """
+        headers = {"Authorization": f"Bearer {api_key}"}
+        url = urljoin(base_url, f"/api/buckets/{bucket_id}")
+
+        try:
+            request_with_retry("GET", url, headers=headers, timeout=timeout)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == HTTPStatus.NOT_FOUND:
+                return False
+            msg = f"Failed to check bucket '{bucket_id}': {e}"
+            logger.error(msg)
+            raise RuntimeError(msg) from e
+
+        return True
+
     def delete_file(self, path: Path) -> None:
         """Delete a file from the bucket.
 
@@ -579,7 +653,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         Args:
             asset_url: Cloud asset URL to convert
             bucket_id: Bucket ID. If None, reads from GT_CLOUD_BUCKET_ID env var.
-            api_key: API key. If None, reads from GT_CLOUD_API_KEY env var.
+            api_key: Credential. If None, resolves the license, then GT_CLOUD_API_KEY.
             base_url: Cloud base URL. If None, reads from GT_CLOUD_BASE_URL env var.
             httpx_request_func: The httpx request function to use (original, not patched)
 
@@ -590,7 +664,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
         if bucket_id is None:
             bucket_id = os.environ.get("GT_CLOUD_BUCKET_ID")
         if api_key is None:
-            api_key = os.environ.get("GT_CLOUD_API_KEY")
+            api_key = resolve_cloud_credential()
         if base_url is None:
             base_url = os.environ.get("GT_CLOUD_BASE_URL", "https://cloud.griptape.ai")
 
@@ -600,7 +674,7 @@ class GriptapeCloudStorageDriver(BaseStorageDriver):
             return None
 
         if not api_key:
-            logger.debug("GT_CLOUD_API_KEY not set, skipping cloud URL conversion: %s", asset_url)
+            logger.debug("No Griptape Cloud credential set, skipping cloud URL conversion: %s", asset_url)
             return None
 
         # Extract workspace-relative path

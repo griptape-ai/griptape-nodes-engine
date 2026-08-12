@@ -15,6 +15,7 @@ from griptape_nodes.common.strict_mode import (
     StrictModeReporter,
     StrictModeScopeKind,
     StrictModeSeverity,
+    _default_severity_resolver,
 )
 from griptape_nodes.common.strict_mode_checks import RULES, StrictModeRule
 from griptape_nodes.retained_mode.events.base_events import (
@@ -201,6 +202,31 @@ class TestReporterReport:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert len(errors) == 1
         assert len(warnings) == 0
+
+    def test_drops_class_from_schema_does_not_affect_severity(self) -> None:
+        """drops_class_from_schema is a load signal, independent of severity.
+
+        An ergonomics rule (correctness=False, worker_escalation=True) that also
+        drops the class must still resolve WARNING on the orchestrator and ERROR
+        on the worker; the schema-drop flag must not force ERROR.
+        """
+        rule = StrictModeRule(
+            rule_id="fake-drops-class",
+            default_severity=StrictModeSeverity.WARNING,
+            correctness=False,
+            description="synthetic ergonomics rule that drops the class",
+            remediation_template="drops: {detail}",
+            drops_class_from_schema=True,
+        )
+        RULES[rule.rule_id] = rule
+        try:
+            orchestrator = _default_severity_resolver(rule_id=rule.rule_id, is_worker=False)
+            worker = _default_severity_resolver(rule_id=rule.rule_id, is_worker=True)
+        finally:
+            RULES.pop(rule.rule_id, None)
+
+        assert orchestrator is StrictModeSeverity.WARNING
+        assert worker is StrictModeSeverity.ERROR
 
 
 class TestSeverityResolverInjection:

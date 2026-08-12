@@ -119,6 +119,12 @@ class AppInitializationComplete(AppPayload):
     # taken from the first entry in libraries_to_register. Multiple workers can run
     # simultaneously for different libraries.
     is_worker: bool = False
+    # URL of a static file server the host process already runs for this workspace. When set,
+    # the engine points its storage drivers at that server instead of starting one of its own,
+    # so asset URLs outlive this engine. Leave unset when the host serves nothing: the engine
+    # then serves the workspace itself, which is the path that goes away once every shipped
+    # host provides a server (see the fallback in StaticFilesManager).
+    static_server_base_url: str | None = None
 
 
 @dataclass
@@ -441,6 +447,9 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
         engine_name: Human-readable engine name
         user: User information including ID, email, and name (None if not logged in)
         user_organization: User's organization information including ID and name (None if not logged in)
+        orchestrator_engine_id: Engine id of the orchestrator that spawned this engine as a
+            worker process, or None when this engine IS the orchestrator. A discovery client
+            treats a non-None value as "this is a worker engine, nest it under that orchestrator".
     """
 
     heartbeat_id: str
@@ -463,6 +472,11 @@ class EngineHeartbeatResultSuccess(ResultPayloadSuccess):
     # empty workflow list; the live EngineInitializationProgress stream fills in the detail.
     # Defaulted for backward compatibility with older clients.
     is_initializing: bool = False
+    # Set on worker engines to the id of the orchestrator that spawned them; None on the
+    # orchestrator itself. A discovery client uses this both to identify a worker engine
+    # (worker <=> orchestrator_engine_id is not None) and to nest it under its parent.
+    # Defaulted for backward compatibility with older clients.
+    orchestrator_engine_id: str | None = None
 
 
 @dataclass
