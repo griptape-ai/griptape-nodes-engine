@@ -26,6 +26,7 @@ from griptape_nodes.retained_mode.events.access_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
@@ -73,6 +74,15 @@ class ModelPolicySnapshot:
     ``provider_model_id`` to match a dropdown value against. Those denials cannot be honored
     per-row, so they are honored for the whole parameter instead -- see ``denial_for``. Dropping
     them would let an explicitly forbidden model run.
+
+    ``deferred`` is True when the query was skipped entirely because issuing it would have
+    tripped the reentrant-bus-in-init strict-mode rule -- a node ``__init__`` on the stack
+    *inside* a strict-mode scope, which in practice means the worker's schema probe or node
+    execution (see ``reentrant_bus_in_init_would_report``). Both tables are empty and every
+    lookup answers "no denial" -- a deferred snapshot must not read as fail-closed, because no
+    query has failed; one was never made. It is replaced wholesale by the next
+    ``query_model_policy()``, which for a probed node type is the first refresh after
+    construction.
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
@@ -81,6 +91,7 @@ class ModelPolicySnapshot:
     failure_detail: str | None = None
     has_unmatchable_entries: bool = False
     unmatchable_denials: tuple[str, ...] = ()
+    deferred: bool = False
 
     def catalog_ids_for(self, provider_model_id: str) -> tuple[str, ...]:
         """Every catalog id declared against ``provider_model_id``, in declaration order."""
@@ -96,7 +107,7 @@ class ModelPolicySnapshot:
         """
         return bool(self.catalog_ids_by_provider_id) or self.has_unmatchable_entries
 
-    def denial_for(
+    def denial_for(  # noqa: PLR0911 -- a chain of early-exit verdicts, one per snapshot state
         self, provider_model_id: str | None, *, refuse_unrecognized: bool = False
     ) -> CheckpointDenial | None:
         """Return the denial for a resolved dropdown value, or ``None`` when permitted.
@@ -116,6 +127,11 @@ class ModelPolicySnapshot:
         # placeholder row badged "Model Not Permitted" would report a library-registration problem
         # as a licensing one, and hide the "download this model" message that says what to do.
         if provider_model_id is None:
+            return None
+        # A deferred snapshot has asked policy nothing, so it can deny nothing. Without this,
+        # the `refuse_unrecognized` path below would refuse every choice against the empty
+        # catalog -- badging a freshly constructed gated dropdown entirely "not permitted".
+        if self.deferred:
             return None
         if self.failure_detail is not None:
             return CheckpointDenial(failures=(CheckpointFailure(detail=self.failure_detail),))
@@ -157,8 +173,23 @@ class ModelPolicySnapshot:
         return None
 
 
+# Shared "policy not yet queried" snapshot. Frozen, so one instance serves every deferral.
+DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
+
+
 def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
     """Ask the engine which of ``node_type``'s declared models are permitted.
+
+    Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
+    reentrant-bus-in-init: a node ``__init__`` on the stack inside a strict-mode scope, which
+    is the worker's schema probe (where the violation drops the class from the worker schema)
+    or node execution. Those callers hold the deferred snapshot until their first
+    post-construction refresh replaces it with a real query result.
+
+    Construction OUTSIDE such a scope -- an editor drop, a workflow load, any single-process
+    engine, where nothing observes the violation and no probe exists -- queries normally, so
+    the dropdown's denial rows and badge are correct as soon as the node appears rather than
+    only after it runs.
 
     Args:
         node_type: The node class name the manifest declares ``model_usage`` against.
@@ -168,6 +199,12 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
+    if reentrant_bus_in_init_would_report():
+        logger.debug(
+            "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
+            node_type,
+        )
+        return DEFERRED_SNAPSHOT
     result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):
         details = getattr(result, "result_details", None) or type(result).__name__
