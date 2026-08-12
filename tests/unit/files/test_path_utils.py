@@ -15,8 +15,10 @@ from griptape_nodes.files.path_utils import (
     canonicalize_to_posix,
     decompose_source_path,
     expand_path,
+    is_url,
     normalize_path_for_platform,
     parse_file_uri,
+    parse_static_server_url,
     path_needs_expansion,
     resolve_file_path,
     resolve_path_safely,
@@ -574,6 +576,151 @@ class TestParseFileUri:
         uri = "file:///very/deeply/nested/directory/structure/file.txt"
         result = parse_file_uri(uri)
         assert result == "/very/deeply/nested/directory/structure/file.txt"
+
+
+class TestIsUrl:
+    """Tests for is_url function."""
+
+    def test_http_url(self) -> None:
+        assert is_url("http://example.com/clip.mp4") is True
+
+    def test_https_url(self) -> None:
+        assert is_url("https://example.com/clip.mp4") is True
+
+    def test_static_server_url_with_cachebuster(self) -> None:
+        """The form the engine hands node outputs around in."""
+        assert is_url("http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231") is True
+
+    def test_file_uri(self) -> None:
+        """file:// counts as a URL; parse_file_uri is what converts it to a path."""
+        assert is_url("file:///outputs/clip.mp4") is True
+
+    def test_non_http_scheme(self) -> None:
+        assert is_url("s3://bucket/clip.mp4") is True
+
+    def test_windows_drive_letter_is_not_a_url(self) -> None:
+        r"""`C:\...` must stay a path -- a one-char drive letter is not a scheme."""
+        assert is_url(r"C:\Users\artist\clip.mp4") is False
+
+    def test_windows_drive_letter_with_double_slash_is_not_a_url(self) -> None:
+        """`C://...` is the case a naive `://` check gets wrong."""
+        assert is_url("C://Users/artist/clip.mp4") is False
+
+    def test_windows_drive_letter_lowercase_is_not_a_url(self) -> None:
+        assert is_url("c://Users/artist/clip.mp4") is False
+
+    def test_unix_absolute_path(self) -> None:
+        assert is_url("/outputs/clip.mp4") is False
+
+    def test_relative_path(self) -> None:
+        assert is_url("outputs/clip.mp4") is False
+
+    def test_unc_path(self) -> None:
+        assert is_url(r"\\server\share\clip.mp4") is False
+
+    def test_windows_long_path_prefix(self) -> None:
+        assert is_url(r"\\?\C:\outputs\clip.mp4") is False
+
+    def test_macro_path(self) -> None:
+        assert is_url("{outputs}/clip.mp4") is False
+
+    def test_empty_string(self) -> None:
+        assert is_url("") is False
+
+    def test_data_uri_is_not_matched(self) -> None:
+        """`data:` has no `//`, so it is not a URL by this test.
+
+        Callers that must handle data URIs check for them separately; this
+        function exists to keep URLs out of the path helpers, and a data URI
+        would never be handed to one.
+        """
+        assert is_url("data:video/mp4;base64,AAAA") is False
+
+    def test_scheme_with_plus_and_dot(self) -> None:
+        """RFC 3986 allows `+`, `.`, `-` in schemes."""
+        assert is_url("svn+ssh://host/repo") is True
+        assert is_url("view-source://example.com") is True
+
+
+class TestParseStaticServerUrl:
+    """Tests for parse_static_server_url function."""
+
+    WORKSPACE = Path("/home/artist/GriptapeNodes")
+
+    def test_maps_static_server_url_to_workspace_file(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_strips_cachebuster_query(self) -> None:
+        """The `?t=` cachebuster is HTTP addressing, not part of the filename."""
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/clip.mp4?t=1786574231",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_https_localhost(self) -> None:
+        result = parse_static_server_url(
+            "https://localhost:8124/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_any_port(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:3000/workspace/staticfiles/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "clip.mp4"
+
+    def test_nested_subdirectories(self) -> None:
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/outputs/shots/010/clip.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "outputs" / "shots" / "010" / "clip.mp4"
+
+    def test_does_not_percent_decode(self) -> None:
+        """URLs are built with `as_posix()` and no encoding, so the segment is literal.
+
+        Decoding here would disagree with the read path (StaticServerFileDriver)
+        and corrupt a filename that genuinely contains a `%`.
+        """
+        result = parse_static_server_url(
+            "http://localhost:8124/workspace/staticfiles/100%_final.mp4",
+            self.WORKSPACE,
+        )
+        assert result == self.WORKSPACE / "staticfiles" / "100%_final.mp4"
+
+    def test_rejects_remote_host(self) -> None:
+        """A remote host may serve /workspace/ but its files are not on this machine."""
+        result = parse_static_server_url("https://example.com/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_localhost_url_without_workspace_segment(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/api/health", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_localhost_url_with_empty_workspace_remainder(self) -> None:
+        result = parse_static_server_url("http://localhost:8124/workspace/", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_127_0_0_1(self) -> None:
+        """Only the `localhost` spelling is recognized, matching StaticServerFileDriver."""
+        result = parse_static_server_url("http://127.0.0.1:8124/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_plain_path(self) -> None:
+        result = parse_static_server_url("/outputs/clip.mp4", self.WORKSPACE)
+        assert result is None
+
+    def test_rejects_path_containing_workspace_segment(self) -> None:
+        """A local path that happens to contain /workspace/ is not a URL."""
+        result = parse_static_server_url("/var/workspace/clip.mp4", self.WORKSPACE)
+        assert result is None
 
 
 class TestDecomposeSourcePath:
