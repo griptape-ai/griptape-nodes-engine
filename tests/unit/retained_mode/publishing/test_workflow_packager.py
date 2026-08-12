@@ -9,9 +9,19 @@ import pytest
 from dotenv import dotenv_values
 
 from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
-from griptape_nodes.retained_mode.events.os_events import DeleteFileResultSuccess, WriteFileResultSuccess
+from griptape_nodes.retained_mode.events.os_events import (
+    DeleteFileRequest,
+    DeleteFileResultSuccess,
+    MakeDirectoryRequest,
+    RenameFileRequest,
+    WriteFileResultSuccess,
+)
 from griptape_nodes.retained_mode.events.secrets_events import GetAllSecretValuesResultSuccess
-from griptape_nodes.retained_mode.publishing.workflow_packager import WorkflowPackager
+from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.publishing.workflow_packager import (
+    DOWNLOAD_MODELS_SCRIPT_NAME,
+    WorkflowPackager,
+)
 
 
 def _make_library_data_mock(
@@ -485,7 +495,7 @@ class TestWriteDownloadModelsScript:
     def test_removes_stale_script_when_no_models_are_needed(self, tmp_path: Path) -> None:
         """A script from an earlier publish is deleted, not left to run again."""
         packager = WorkflowPackager("test_workflow")
-        script_path = tmp_path / "download_models.py"
+        script_path = tmp_path / DOWNLOAD_MODELS_SCRIPT_NAME
         script_path.write_text("# from an earlier publish\n", encoding="utf-8")
 
         def delete_it(request: MagicMock) -> MagicMock:
@@ -507,7 +517,7 @@ class TestWriteDownloadModelsScript:
     def test_raises_when_stale_script_cannot_be_removed(self, tmp_path: Path) -> None:
         """A failed removal fails the publish rather than shipping a script that will run."""
         packager = WorkflowPackager("test_workflow")
-        (tmp_path / "download_models.py").write_text("# from an earlier publish\n", encoding="utf-8")
+        (tmp_path / DOWNLOAD_MODELS_SCRIPT_NAME).write_text("# from an earlier publish\n", encoding="utf-8")
 
         with (
             patch.object(packager, "collect_huggingface_download_commands", return_value=[]),
@@ -553,13 +563,13 @@ class TestStagedPublish:
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
-        (destination / "download_models.py").write_text("stale", encoding="utf-8")
+        (destination / DOWNLOAD_MODELS_SCRIPT_NAME).write_text("stale", encoding="utf-8")
         (destination / ".env").write_text("GT_CLOUD_API_KEY=''\n", encoding="utf-8")
 
         with packager.staged_publish(destination) as staging:
             (staging / ".env").write_text("GT_CLOUD_API_KEY='real-key'\n", encoding="utf-8")
 
-        assert not (destination / "download_models.py").exists()
+        assert not (destination / DOWNLOAD_MODELS_SCRIPT_NAME).exists()
         assert (destination / ".env").read_text(encoding="utf-8") == "GT_CLOUD_API_KEY='real-key'\n"
 
     def test_leaves_previous_bundle_intact_on_failure(self, tmp_path: Path) -> None:
@@ -630,23 +640,117 @@ class TestStagedPublish:
         assert (destination / "run.py").read_text(encoding="utf-8") == "new"
 
     def test_restores_the_previous_bundle_if_the_swap_fails(self, tmp_path: Path) -> None:
-        """A copy failure during the swap leaves the destination populated, not missing."""
+        """A failure moving the new bundle into place leaves the destination populated."""
         packager = WorkflowPackager("test_workflow")
         destination = tmp_path / "bundle"
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        def publish_with_failing_copy() -> None:
+        real_rename = WorkflowPackager._rename
+        staged_bundle_moved_in = False
+
+        def fail_moving_new_bundle_into_place(source: Path, target: Path, *, failure_context: str) -> None:
+            """Fail the staging -> destination move; let the aside and restore moves through."""
+            nonlocal staged_bundle_moved_in
+            if target == destination and not staged_bundle_moved_in:
+                staged_bundle_moved_in = True
+                msg = "simulated rename failure"
+                raise TypeError(msg)
+            real_rename(source, target, failure_context=failure_context)
+
+        def publish_with_failing_swap() -> None:
             with (
-                patch(
-                    "griptape_nodes.retained_mode.publishing.workflow_packager.shutil.copytree",
-                    side_effect=OSError("disk full"),
-                ),
+                patch.object(WorkflowPackager, "_rename", staticmethod(fail_moving_new_bundle_into_place)),
                 packager.staged_publish(destination) as staging,
             ):
                 (staging / "run.py").write_text("new", encoding="utf-8")
 
         with pytest.raises(TypeError):
-            publish_with_failing_copy()
+            publish_with_failing_swap()
 
         assert (destination / "run.py").read_text(encoding="utf-8") == "previous"
+
+    def test_keeps_the_moved_aside_bundle_when_rollback_fails(self, tmp_path: Path) -> None:
+        """If the destination cannot be restored, the only copy of the bundle is not deleted."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+
+        real_rename = WorkflowPackager._rename
+
+        def fail_every_move_to_the_destination(source: Path, target: Path, *, failure_context: str) -> None:
+            """Fail both the swap and the rollback, leaving the destination missing."""
+            if target == destination:
+                msg = "simulated rename failure"
+                raise TypeError(msg)
+            real_rename(source, target, failure_context=failure_context)
+
+        def publish_with_failing_swap_and_rollback() -> None:
+            with (
+                patch.object(WorkflowPackager, "_rename", staticmethod(fail_every_move_to_the_destination)),
+                packager.staged_publish(destination) as staging,
+            ):
+                (staging / "run.py").write_text("new", encoding="utf-8")
+
+        with pytest.raises(TypeError):
+            publish_with_failing_swap_and_rollback()
+
+        moved_aside = list(tmp_path.glob("bundle.publish-*.previous"))
+        assert len(moved_aside) == 1
+        assert (moved_aside[0] / "run.py").read_text(encoding="utf-8") == "previous"
+
+    def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path) -> None:
+        """A working directory that cannot be removed is logged, not raised over."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+
+        real_handle_request = GriptapeNodes.handle_request
+
+        def fail_deletes(request: object) -> object:
+            """Report every delete as failed, leaving the working directories on disk."""
+            if isinstance(request, DeleteFileRequest):
+                return MagicMock()
+            return real_handle_request(request)  # type: ignore[arg-type]
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=fail_deletes,
+            ),
+            packager.staged_publish(destination) as staging,
+        ):
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        assert (destination / "run.py").read_text(encoding="utf-8") == "new"
+
+    def test_swap_routes_through_engine_requests(self, tmp_path: Path) -> None:
+        """Staging directory creation and the swap go through OS request handlers."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+        seen: list[type] = []
+
+        real_handle_request = GriptapeNodes.handle_request
+
+        def record(request: object) -> object:
+            seen.append(type(request))
+            return real_handle_request(request)  # type: ignore[arg-type]
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=record,
+            ),
+            packager.staged_publish(destination) as staging,
+        ):
+            (staging / "run.py").write_text("new", encoding="utf-8")
+
+        # Two renames: the previous bundle aside, then staging into place.
+        expected_renames = 2
+        assert MakeDirectoryRequest in seen
+        assert seen.count(RenameFileRequest) == expected_renames
+        assert (destination / "run.py").read_text(encoding="utf-8") == "new"

@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
@@ -46,8 +46,12 @@ from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
     DeletionBehavior,
+    MakeDirectoryRequest,
+    MakeDirectoryResultSuccess,
     ReadFileRequest,
     ReadFileResultSuccess,
+    RenameFileRequest,
+    RenameFileResultSuccess,
     WriteFileRequest,
     WriteFileResultSuccess,
 )
@@ -76,6 +80,10 @@ logger = logging.getLogger("workflow_packager")
 SELECT_FROM_PROJECT_LIBRARY_NAME = "Griptape Nodes Library"
 SELECT_FROM_PROJECT_NODE_TYPE = "SelectFromProject"
 SELECT_FROM_PROJECT_PARAM_NAME = "selected_path"
+
+# Model download script written into the bundle, and run by consumers when present
+DOWNLOAD_MODELS_SCRIPT_NAME = "download_models.py"
+DOWNLOAD_MODELS_TEMPLATE_NAME = "download_models_script.py"
 
 # TODO: Read and write operations should all be using ReadtoFile and WriteToFile.  https://github.com/griptape-ai/griptape-nodes/issues/4397
 
@@ -125,12 +133,18 @@ class WorkflowPackager:
         destination_path: str | Path,
         ignore_patterns: list[str] | None = None,
     ) -> None:
-        """Copy a directory tree using the engine's OS event system."""
+        """Copy a directory tree using the engine's OS event system.
+
+        Pass an empty ``ignore_patterns`` list to copy everything; omitting it applies the
+        default exclusions.
+        """
+        if ignore_patterns is None:
+            ignore_patterns = [".venv", "__pycache__", ".git"]
         result = GriptapeNodes.handle_request(
             CopyTreeRequest(
                 source_path=str(source_path),
                 destination_path=str(destination_path),
-                ignore_patterns=ignore_patterns or [".venv", "__pycache__", ".git"],
+                ignore_patterns=ignore_patterns,
                 dirs_exist_ok=True,
             )
         )
@@ -224,14 +238,9 @@ class WorkflowPackager:
     def get_merged_env_mapping(workspace_env_path: Path) -> dict[str, Any]:
         """Merge workspace .env file with SecretsManager secrets.
 
-        Blank-valued entries are dropped. A key present with an empty value is worse
-        than an absent key downstream: both `python-dotenv`'s ``override=False`` and
-        ``SecretsManager._load_env_files_into_environ`` test for key *presence* rather
-        than a meaningful value, so a bundled blank shadows a real value instead of
-        falling through to it. Nothing distinguishes an intentional empty secret from a
-        never-filled-in one anyway -- ``register_all_secrets`` writes every registered
-        default, empty ones included, into the global .env on install -- so on the vast
-        majority of installs a blank means "nobody ever set this".
+        Blank-valued entries are dropped: consumers test for key *presence* rather than a
+        meaningful value, so a bundled blank shadows a real value instead of falling
+        through to it.
         """
         env_file_dict: dict[str, Any] = {}
         if workspace_env_path.exists():
@@ -254,16 +263,9 @@ class WorkflowPackager:
     def get_process_env_secrets(exclude: set[str]) -> dict[str, str]:
         """Return registered secrets whose only value lives in the process environment.
 
-        The .env files are not the only place a credential can come from:
-        ``SecretsManager.get_secret`` resolves OS environment variables ahead of both
-        files, so someone running the engine with ``GT_CLOUD_API_KEY`` exported has a
-        working setup with nothing on disk to bundle. Under the old merge behavior an
-        earlier publish's value could mask that; a bundle built fresh would simply ship
-        without the credential.
-
-        Only *registered* secret names are consulted, never the whole environment -- the
-        registered set is what the engine already treats as credential material, and
-        copying anything else would put unrelated process state into the bundle.
+        ``SecretsManager.get_secret`` resolves OS environment variables ahead of both .env
+        files, so an exported credential is a working setup with nothing on disk to bundle.
+        Only *registered* secret names are consulted, never the whole environment.
         """
         secrets_manager = GriptapeNodes.SecretsManager()
         env_secrets: dict[str, str] = {}
@@ -279,10 +281,8 @@ class WorkflowPackager:
     def write_env_file(env_file_path: Path, env_file_dict: dict[str, Any]) -> None:
         """Write a .env file from a key-value dict, replacing any existing file.
 
-        Built from ``env_file_dict`` alone rather than updated key-by-key. The previous
-        implementation did ``touch(exist_ok=True)`` then ``set_key`` per key, which meant
-        a key that had dropped out of the mapping stayed in the file forever -- so a
-        re-publish could never remove a stale (notably blank) credential.
+        Built from ``env_file_dict`` alone rather than updated key-by-key, so a key absent
+        from the mapping leaves the file instead of persisting from an earlier write.
         """
         lines = [f"{key}={WorkflowPackager._quote_env_value(str(value))}" for key, value in env_file_dict.items()]
         content = "\n".join(lines)
@@ -317,11 +317,9 @@ class WorkflowPackager:
     def write_project_template(destination: Path) -> None:
         """Write the current project template (project.yml) to the destination.
 
-        A failure to *retrieve* the template is tolerated -- publishing from a session
-        with no current project is legitimate, and the bundle simply has no project.yml.
-        A failure to *write* one that was retrieved is not: project.yml governs where the
-        published workflow's outputs land, so shipping a bundle without the template that
-        was meant to be in it is a wrong bundle rather than a smaller one.
+        Failing to *retrieve* a template is legitimate (no current project) and leaves the
+        bundle without one. Failing to *write* one that was retrieved raises: project.yml
+        governs where published outputs land, so dropping it silently ships a wrong bundle.
         """
         result = GriptapeNodes.handle_request(GetCurrentProjectRequest())
         if not isinstance(result, GetCurrentProjectResultSuccess):
@@ -655,15 +653,11 @@ dependencies = [
         return commands
 
     def write_download_models_script(self, nodes: list[BaseNode], destination: Path) -> bool:
-        """Write a download_models.py script to destination if HuggingFace models are required.
+        """Write a model download script to destination if HuggingFace models are required.
 
-        When no models are needed, an existing script is removed rather than left in
-        place. Consumers run the script if the file is present -- the Nuke gizmo runner
-        does exactly this -- so a script from an earlier publish would keep downloading
-        models the workflow no longer references, and fail the run outright if one of
-        those downloads broke. This matters when the caller writes into a destination
-        that already holds a bundle; under ``staged_publish`` the staging dir starts empty
-        and there is nothing to remove.
+        When no models are needed an existing script is removed, since consumers run it
+        whenever the file is present and one from an earlier publish would download models
+        this workflow no longer references.
 
         Returns True if a script was written, False if no models are needed.
         """
@@ -672,7 +666,7 @@ dependencies = [
             self._remove_stale_download_models_script(destination)
             return False
 
-        template_path = Path(__file__).parent / "download_models_script.py"
+        template_path = Path(__file__).parent / DOWNLOAD_MODELS_TEMPLATE_NAME
         read_result = GriptapeNodes.handle_request(
             ReadFileRequest(file_path=str(template_path), workspace_only=False, encoding="utf-8")
         )
@@ -692,7 +686,7 @@ dependencies = [
         )
         write_result = GriptapeNodes.handle_request(
             WriteFileRequest(
-                file_path=str(destination / "download_models.py"), content=script_content, encoding="utf-8"
+                file_path=str(destination / DOWNLOAD_MODELS_SCRIPT_NAME), content=script_content, encoding="utf-8"
             )
         )
         if not isinstance(write_result, WriteFileResultSuccess):
@@ -703,8 +697,8 @@ dependencies = [
 
     @staticmethod
     def _remove_stale_download_models_script(destination: Path) -> None:
-        """Delete a download_models.py left by an earlier publish of the same bundle."""
-        script_path = destination / "download_models.py"
+        """Delete a model download script left by an earlier publish of the same bundle."""
+        script_path = destination / DOWNLOAD_MODELS_SCRIPT_NAME
         if not script_path.exists():
             return
         result = GriptapeNodes.handle_request(
@@ -728,42 +722,46 @@ dependencies = [
     def staged_publish(self, destination: Path, *, preserve: list[str] | None = None) -> Iterator[Path]:
         """Yield a staging directory that replaces ``destination`` only if the publish succeeds.
 
-        Publishing writes many artifacts, and each writer decides for itself whether it
-        overwrites what is already there. Writing straight into a persistent destination
-        therefore accumulates: a re-publish can add and update artifacts but never remove
-        one, so content from an earlier publish survives and (for `.env` and
-        `download_models.py`) is still read or executed. Staging makes each publish a
-        clean build whose contents reflect only the current state of the world.
+        Each writer in a publish decides for itself whether it overwrites what is already
+        there, so writing straight into a persistent destination accumulates: a re-publish
+        can add and update artifacts but never remove one. Staging makes each publish a
+        clean build whose contents reflect only the current state of the world, and leaves
+        the previous bundle untouched when a publish raises partway through.
 
         Wrap the *whole* publish, not just the packager. Publishers write their own
-        artifacts after ``package_to_folder`` returns, so a swap performed when the
-        packager finishes would delete the previous bundle's publisher-specific files and
-        only then write the new ones -- leaving a bundle with no entrypoint if that tail
-        failed. Yielding the staging dir for the entire publish keeps the swap at the end.
-
-        On any exception the staging directory is discarded and ``destination`` is left
-        exactly as it was, which is the property that makes a failed re-publish safe.
+        artifacts after ``package_to_folder`` returns, so swapping when the packager
+        finishes would delete the previous bundle's publisher-specific files and only then
+        write the new ones -- leaving a bundle with no entrypoint if that tail failed.
 
         Args:
             destination: The final bundle directory, replaced wholesale on success.
             preserve: Names of top-level entries under ``destination`` to carry into the
-                new bundle. For content the publisher deliberately accumulates across
-                publishes (e.g. per-version subdirectories) rather than rebuilds. Entries
-                the publish itself wrote into staging win; missing names are skipped.
+                new bundle, for content the publisher deliberately accumulates across
+                publishes (e.g. per-version subdirectories). Entries the publish itself
+                wrote into staging win; missing names are skipped.
 
         Yields:
             The staging directory to write the bundle into.
         """
-        staging_dir = Path(tempfile.mkdtemp(prefix="gtn-workflow-publish-"))
+        # Staged as a sibling of the destination so the swap is a same-filesystem rename.
+        # A system temp dir is routinely on another filesystem, where a rename fails and
+        # the swap would degrade to a non-atomic copy.
+        staging_dir = destination.with_name(f"{destination.name}.publish-{uuid.uuid4().hex[:8]}")
+        previous_dir = destination.with_name(f"{staging_dir.name}.previous")
+        self._make_directory(staging_dir)
         try:
             yield staging_dir
             self._carry_preserved_entries(destination, staging_dir, preserve or [])
-            self._swap_into_place(destination, staging_dir)
+            self._swap_into_place(destination, staging_dir, previous_dir)
         finally:
-            shutil.rmtree(staging_dir, ignore_errors=True)
+            self._discard_directory(staging_dir)
+            # Only once the destination is populated again. If a rollback could not put it
+            # back, previous_dir holds the sole copy of the bundle and must be kept.
+            if destination.exists():
+                self._discard_directory(previous_dir)
 
-    @staticmethod
-    def _carry_preserved_entries(destination: Path, staging_dir: Path, preserve: list[str]) -> None:
+    @classmethod
+    def _carry_preserved_entries(cls, destination: Path, staging_dir: Path, preserve: list[str]) -> None:
         """Copy opted-in entries from the previous bundle into staging before the swap."""
         for name in preserve:
             previous = destination / name
@@ -771,46 +769,75 @@ dependencies = [
             if not previous.exists() or staged.exists():
                 continue
             if previous.is_dir():
-                shutil.copytree(previous, staged)
+                cls.copy_tree(previous, staged, ignore_patterns=[])
             else:
-                shutil.copy2(previous, staged)
+                cls.copy_file(previous, staged)
 
-    @staticmethod
-    def _swap_into_place(destination: Path, staging_dir: Path) -> None:
-        """Replace destination with the staged bundle, restoring the previous one on failure.
+    @classmethod
+    def _swap_into_place(cls, destination: Path, staging_dir: Path, previous_dir: Path) -> None:
+        """Move the staged bundle onto the destination, restoring the previous one on failure.
 
-        The previous bundle is moved aside rather than deleted, so a failure partway
-        through leaves the destination populated instead of missing. `Path.replace` is
-        not usable for the swap itself: staging lives in the system temp dir, which is
-        routinely on a different filesystem than the destination, and a cross-device
-        rename fails. So this is move-aside, copy, delete-aside -- not atomic, but the
-        window where the destination is incomplete is small and never ends with the
-        destination gone.
+        The previous bundle is moved aside rather than deleted, so a failure between the
+        two moves leaves the destination populated instead of missing.
         """
-        try:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-        except OSError as err:
-            msg = f"Failed to publish the workflow bundle. Could not create the destination's parent directory: {err}"
-            logger.error(msg)
-            raise TypeError(msg) from err
-
-        previous_dir = destination.with_name(f"{destination.name}.previous-publish")
-        shutil.rmtree(previous_dir, ignore_errors=True)
         had_previous = destination.exists()
         if had_previous:
-            destination.replace(previous_dir)
+            cls._rename(destination, previous_dir, failure_context="move the previous bundle aside")
 
         try:
-            shutil.copytree(staging_dir, destination)
-        except OSError as err:
-            shutil.rmtree(destination, ignore_errors=True)
+            cls._rename(staging_dir, destination, failure_context="move the new bundle into place")
+        except TypeError:
+            # Report the failure that actually stopped the publish, not one from the
+            # rollback -- so log a failed restore rather than raising over the cause.
             if had_previous:
-                previous_dir.replace(destination)
-            msg = f"Failed to publish the workflow bundle to '{destination}': {err}"
-            logger.error(msg)
-            raise TypeError(msg) from err
+                try:
+                    cls._rename(previous_dir, destination, failure_context="restore the previous bundle")
+                except TypeError:
+                    logger.error(
+                        "Could not restore the previous bundle to '%s'. It remains at '%s'.",
+                        destination,
+                        previous_dir,
+                    )
+            raise
 
-        shutil.rmtree(previous_dir, ignore_errors=True)
+    @staticmethod
+    def _make_directory(path: Path) -> None:
+        """Create a directory using the engine's OS event system."""
+        result = GriptapeNodes.handle_request(MakeDirectoryRequest(path=str(path), create_parents=True, exist_ok=True))
+        if not isinstance(result, MakeDirectoryResultSuccess):
+            msg = f"Failed to create directory '{path}'."
+            logger.error(msg)
+            raise TypeError(msg)
+
+    @staticmethod
+    def _rename(source: Path, destination: Path, *, failure_context: str) -> None:
+        """Rename a file or directory using the engine's OS event system."""
+        result = GriptapeNodes.handle_request(
+            RenameFileRequest(old_path=str(source), new_path=str(destination), workspace_only=False)
+        )
+        if not isinstance(result, RenameFileResultSuccess):
+            msg = f"Failed to publish the workflow bundle to '{destination}'. Could not {failure_context}."
+            logger.error(msg)
+            raise TypeError(msg)
+
+    @staticmethod
+    def _discard_directory(path: Path) -> None:
+        """Delete a staging/backup directory, logging rather than raising on failure.
+
+        Called from cleanup, where the publish outcome is already decided -- a leftover
+        directory is worth a log line but must not mask the result it is cleaning up after.
+        """
+        if not path.exists():
+            return
+        result = GriptapeNodes.handle_request(
+            DeleteFileRequest(
+                path=str(path),
+                workspace_only=False,
+                deletion_behavior=DeletionBehavior.PERMANENTLY_DELETE,
+            )
+        )
+        if not isinstance(result, DeleteFileResultSuccess):
+            logger.warning("Could not remove the publish working directory '%s'.", path)
 
     # -- Convenience: full standard bundle --
 
@@ -820,10 +847,9 @@ dependencies = [
         Copies the workflow file, referenced libraries, config, .env, static
         assets, project template, and pyproject.toml into the destination.
 
-        This writes into ``destination`` as given. Callers wanting a re-publish to be a
-        clean rewrite should wrap their whole publish in ``staged_publish`` and pass the
-        staging directory here -- see that method for why the boundary is the publish
-        rather than this function.
+        Writes into ``destination`` as given. Callers wanting a re-publish to be a clean
+        rewrite should wrap their whole publish in ``staged_publish`` and pass the staging
+        directory here.
 
         Returns:
             List of relative library paths (for config or further use).

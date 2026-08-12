@@ -173,12 +173,9 @@ class SecretsManager:
         return SetSecretValueResultSuccess(result_details=f"Successfully set secret value for key: {secret_name}")
 
     def on_handle_get_all_secret_values_request(self, request: GetAllSecretValuesRequest) -> ResultPayload:  # noqa: ARG002
-        # An unreadable secrets file must not look like an empty one. Callers that
-        # *replace* something with this result -- the workflow packager rebuilding a
-        # published bundle's .env -- would otherwise turn a read failure into a silent
-        # deletion of every credential, surfacing much later as a missing-key error at
-        # run time. A file that genuinely isn't there is a different thing: that is a
-        # real "no secrets stored yet", and an empty success is the right answer.
+        # An unreadable file fails; a missing one is a real "no secrets yet" and succeeds
+        # empty, so callers replacing content with this result cannot delete credentials
+        # because of a read error.
         if ENV_VAR_PATH.exists():
             try:
                 secret_values = dotenv_values(ENV_VAR_PATH)
