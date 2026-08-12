@@ -24,6 +24,7 @@ from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+from tests.unit.exe_types.param_components.probe_scope import constructing_under_probe
 
 _HANDLE = "griptape_nodes.exe_types.param_components.model_policy.GriptapeNodes.handle_request"
 
@@ -275,20 +276,38 @@ class TestBothComponentsAgreeOnAnUnattributableDenial:
 
 
 class TestConstructionDeferral:
-    """During node __init__ the query is skipped entirely -- see reentrant-bus-in-init.
+    """The query is skipped only where issuing it would trip reentrant-bus-in-init.
 
-    A bus request issued while a node __init__ is on the stack deadlocks the worker's schema
-    probe and gets the class dropped from the worker schema, so `query_model_policy` must not
-    touch the bus there. The deferred snapshot it returns instead must deny nothing: no query
-    was made, so there is no verdict (and no failure) to enforce.
+    That rule fires for a bus request made while a node __init__ is on the stack AND a
+    strict-mode scope is open -- the worker's schema probe (where the violation drops the
+    class from the worker schema) or node execution. `query_model_policy` must not touch the
+    bus there, and the deferred snapshot it returns instead must deny nothing: no query was
+    made, so there is no verdict (and no failure) to enforce.
+
+    Construction with no scope open -- an editor drop, a workflow load, any single-process
+    engine -- must still query, because that is where the dropdown's denial rows and badge
+    come from. Deferring there is what made decoration wait for the first run.
     """
 
-    def test_no_bus_request_while_constructing(self) -> None:
+    def test_no_bus_request_while_constructing_under_a_probe_scope(self) -> None:
         handle = MagicMock()
-        with patch(_HANDLE, handle), LibraryRegistry.constructing_node():
+        with patch(_HANDLE, handle), constructing_under_probe():
             snapshot = query_model_policy("SomeNode")
         handle.assert_not_called()
         assert snapshot.deferred is True
+
+    def test_construction_outside_a_strict_mode_scope_queries_normally(self) -> None:
+        """The regression that motivated narrowing the condition.
+
+        An editor drop constructs the node with no scope open, so nothing would observe the
+        violation and no probe exists to deadlock. Skipping the query there stripped denial
+        rows and the badge until the node ran.
+        """
+        verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
+        with patch(_HANDLE, return_value=_success(verdicts)), LibraryRegistry.constructing_node():
+            snapshot = query_model_policy("SomeNode")
+        assert snapshot.deferred is False
+        assert snapshot.denial_for(DENIED) is _DENIAL
 
     def test_a_deferred_snapshot_denies_nothing_even_when_asked_to_refuse_unrecognized(self) -> None:
         """The regression this exists for: a naive empty snapshot DOES refuse unrecognized ids.
@@ -308,7 +327,7 @@ class TestConstructionDeferral:
     def test_the_query_goes_through_once_construction_ends(self) -> None:
         verdicts = [ModelAccessVerdict(model_id="md_denied", provider_model_id=DENIED, denial=_DENIAL)]
         with patch(_HANDLE, return_value=_success(verdicts)):
-            with LibraryRegistry.constructing_node():
+            with constructing_under_probe():
                 assert query_model_policy("SomeNode").deferred is True
             snapshot = query_model_policy("SomeNode")
         assert snapshot.deferred is False

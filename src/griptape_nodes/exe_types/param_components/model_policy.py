@@ -20,13 +20,13 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from griptape_nodes.node_library.library_registry import LibraryRegistry
 from griptape_nodes.retained_mode.events.access_events import (
     QueryModelAccessForNodeRequest,
     QueryModelAccessForNodeResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial, CheckpointFailure
+from griptape_nodes.retained_mode.managers.event_manager import reentrant_bus_in_init_would_report
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
@@ -75,12 +75,14 @@ class ModelPolicySnapshot:
     per-row, so they are honored for the whole parameter instead -- see ``denial_for``. Dropping
     them would let an explicitly forbidden model run.
 
-    ``deferred`` is True when the query was skipped entirely because a node ``__init__`` was on
-    the stack (issuing a bus request there trips the reentrant-bus-in-init strict-mode rule and
-    can deadlock the worker's schema probe). Both tables are empty and every lookup answers "no
-    denial" -- a deferred snapshot must not read as fail-closed, because no query has failed; one
-    was never made. It is replaced wholesale by the first post-construction
-    ``query_model_policy()``.
+    ``deferred`` is True when the query was skipped entirely because issuing it would have
+    tripped the reentrant-bus-in-init strict-mode rule -- a node ``__init__`` on the stack
+    *inside* a strict-mode scope, which in practice means the worker's schema probe or node
+    execution (see ``reentrant_bus_in_init_would_report``). Both tables are empty and every
+    lookup answers "no denial" -- a deferred snapshot must not read as fail-closed, because no
+    query has failed; one was never made. It is replaced wholesale by the next
+    ``query_model_policy()``, which for a probed node type is the first refresh after
+    construction.
     """
 
     denial_by_provider_id: dict[str, CheckpointDenial] = field(default_factory=dict)
@@ -178,11 +180,16 @@ DEFERRED_SNAPSHOT = ModelPolicySnapshot(deferred=True)
 def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPolicySnapshot:
     """Ask the engine which of ``node_type``'s declared models are permitted.
 
-    Returns ``DEFERRED_SNAPSHOT`` without querying when a node ``__init__`` is on the stack:
-    a bus request issued during construction trips the reentrant-bus-in-init strict-mode rule
-    and can deadlock the worker's schema probe (which gets the class dropped from the worker
-    schema). Callers hold the deferred snapshot until their first post-construction refresh
-    replaces it with a real query result.
+    Returns ``DEFERRED_SNAPSHOT`` without querying when the request would trip
+    reentrant-bus-in-init: a node ``__init__`` on the stack inside a strict-mode scope, which
+    is the worker's schema probe (where the violation drops the class from the worker schema)
+    or node execution. Those callers hold the deferred snapshot until their first
+    post-construction refresh replaces it with a real query result.
+
+    Construction OUTSIDE such a scope -- an editor drop, a workflow load, any single-process
+    engine, where nothing observes the violation and no probe exists -- queries normally, so
+    the dropdown's denial rows and badge are correct as soon as the node appears rather than
+    only after it runs.
 
     Args:
         node_type: The node class name the manifest declares ``model_usage`` against.
@@ -192,8 +199,11 @@ def query_model_policy(node_type: str, *, fail_closed: bool = True) -> ModelPoli
             has not adopted declarations", which is the pre-adoption status quo rather than an
             error, and the snapshot is empty.
     """
-    if LibraryRegistry.is_constructing_node():
-        logger.debug("Deferring model-policy query for node type '%s': node __init__ in progress.", node_type)
+    if reentrant_bus_in_init_would_report():
+        logger.debug(
+            "Deferring model-policy query for node type '%s': node __init__ in progress under a strict-mode scope.",
+            node_type,
+        )
         return DEFERRED_SNAPSHOT
     result = GriptapeNodes.handle_request(QueryModelAccessForNodeRequest(node_type=node_type))
     if not isinstance(result, QueryModelAccessForNodeResultSuccess):

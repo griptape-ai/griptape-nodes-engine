@@ -51,12 +51,15 @@ different value is currently permitted — resets the parameter's stored value
 to a permitted alternative via ``set_parameter_value(..., initial_setup=True)``.
 The parameter's declarative ``default_value`` is untouched.
 
-When the constructor runs inside a node ``__init__`` (the common case), the
-snapshot fetch is deferred — issuing a bus request during construction trips
-the reentrant-bus-in-init strict-mode rule and can deadlock the worker's
-schema probe. The deferred snapshot denies nothing, so the caller's default
-is kept and no denial rows or badge appear until the first ``refresh()``
-(the inline refresh button). Run-time enforcement is unaffected:
+The snapshot fetch is deferred in the one case where issuing it would trip the
+reentrant-bus-in-init strict-mode rule: a node ``__init__`` on the stack inside
+a strict-mode scope, meaning the worker's schema probe (where the violation
+drops the class from the worker schema) or node execution. Everywhere else --
+an editor drop, a workflow load, any single-process engine -- the constructor
+queries, so denial rows and the badge are right from the moment the node
+appears. When it IS deferred, the deferred snapshot denies nothing, so the
+caller's default is kept and decoration waits for the first ``refresh()`` (the
+inline refresh button). Run-time enforcement is unaffected either way:
 ``query_for_denial`` re-fetches a deferred snapshot before answering.
 
 Nodes then forward ``after_value_set`` to ``self._model_access.on_value_set(
@@ -358,9 +361,12 @@ class ModelAccessComponent:
             return None
         # A snapshot deferred at construction has never asked policy anything, so it cannot gate
         # this run -- without a re-fetch, `catalog_ids_for` below returns () for every value and
-        # enforcement is silently bypassed until the artist clicks refresh. Re-fetch now: this
-        # path runs outside node __init__ (and if it somehow doesn't, query_model_policy defers
-        # again harmlessly). Deliberately no UI rebuild here -- this can run inside aprocess,
+        # enforcement is silently bypassed until the artist clicks refresh. Deferral is now narrow
+        # (a node __init__ inside a strict-mode scope), but it still happens: the worker constructs
+        # transient nodes under RUNTIME_EXECUTE, and those reach here with a deferred snapshot.
+        # Re-fetch now: this path runs outside node __init__ (and if it somehow doesn't,
+        # query_model_policy defers again harmlessly). Deliberately no UI rebuild here -- this
+        # can run inside aprocess,
         # where mutating ui_options is a strict-mode concern; decoration heals on `refresh()`.
         if self._snapshot.deferred:
             self._snapshot = self._fetch_snapshot()
@@ -564,9 +570,10 @@ class ModelAccessComponent:
         denials known" as "no denials". A node that simply declares no models
         is a valid empty snapshot, not a failure.
 
-        During node construction the query is skipped and ``DEFERRED_SNAPSHOT``
-        comes back instead (see ``query_model_policy``); ``query_for_denial``
-        re-fetches it before its first real verdict.
+        When a node ``__init__`` is on the stack inside a strict-mode scope --
+        the worker's schema probe, or node execution -- the query is skipped and
+        ``DEFERRED_SNAPSHOT`` comes back instead (see ``query_model_policy``);
+        ``query_for_denial`` re-fetches it before its first real verdict.
         """
         return query_model_policy(type(self._node).__name__)
 
