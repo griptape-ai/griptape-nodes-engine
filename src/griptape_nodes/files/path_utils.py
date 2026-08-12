@@ -382,6 +382,70 @@ def expand_path(path_str: str) -> Path:
     return Path(expanded_user)
 
 
+class FullyExpandedPath(NamedTuple):
+    """Outcome of expanding a path string until it stops changing.
+
+    Attributes:
+        path: The expanded path.
+        stabilized: True when expansion reached a fixed point -- another pass would change nothing.
+            False means passes were still changing the value when the cap was reached, which in
+            practice means the references expand into each other in a cycle. Callers that report
+            WHY a value could not be resolved need this apart from "a variable is unset": for
+            `A=${B}` / `B=${A}` both variables ARE set, and naming either one as missing is wrong.
+    """
+
+    path: Path
+    stabilized: bool
+
+
+def expand_path_fully(path_str: str, *, max_passes: int = 8) -> FullyExpandedPath:
+    r"""Expand ~ and environment variables repeatedly until the value stops changing.
+
+    `expand_path` runs a single pass. That is right for a raw path, but a variable's VALUE can
+    itself contain a reference -- `LIBS=${ROOT}/libs` is an ordinary shape, and a `.env` read
+    without interpolation stores exactly that verbatim -- and one pass leaves the inner `${ROOT}`
+    behind.
+
+    Use this instead of `expand_path` whenever the expansion is going to be VALIDATED (see
+    `unexpanded_references`) and then used. Validating one pass and using another is how a
+    perfectly resolvable value gets reported as declaring an unset variable: the check sees
+    `${ROOT}`, while the path actually handed downstream has it filled in.
+
+    Expansion is looped over the string rather than a `Path` so intermediate values are not
+    renormalized (`/` to `\\` on Windows) between passes; the `Path` is built once at the end.
+
+    A self-referential value (`A=${A}`) is not a cycle here: `os.path.expandvars` leaves it alone,
+    so it stabilizes on the first pass and falls out as an ordinary unresolved reference. Only
+    mutual references exhaust `max_passes`.
+
+    Args:
+        path_str: Path string that may contain ~ or environment variables.
+        max_passes: Maximum expansion passes before giving up. The default is far above any real
+            reference chain; it exists to bound mutual references, not to limit depth.
+
+    Returns:
+        A `FullyExpandedPath`; check `stabilized` before trusting `path` to be fully expanded.
+
+    Examples:
+        # ROOT=/srv, LIBS=${ROOT}/libs
+        expand_path_fully("${LIBS}/griptape")
+        -> FullyExpandedPath(Path("/srv/libs/griptape"), stabilized=True)
+
+        # A=${B}, B=${A}
+        expand_path_fully("${A}/x")
+        -> FullyExpandedPath(..., stabilized=False)
+    """
+    current = path_str
+    stabilized = False
+    for _ in range(max_passes):
+        expanded = os.path.expanduser(os.path.expandvars(current))  # noqa: PTH111
+        if expanded == current:
+            stabilized = True
+            break
+        current = expanded
+    return FullyExpandedPath(path=Path(current), stabilized=stabilized)
+
+
 def path_needs_expansion(path_str: str) -> bool:
     """Return True if path contains env vars, is absolute, or starts with ~ (needs expand_path).
 
@@ -413,9 +477,13 @@ def unexpanded_references(path: str | Path) -> UnexpandedReferences:
     """Report the delimited references an `expand_path` call left behind.
 
     The counterpart to `path_needs_expansion`: that asks whether a raw value needs expanding, this
-    asks what expansion could not supply. Call it on `expand_path`'s OUTPUT. A caller that finds
-    anything here knows the path has no real answer yet and can name what is missing, instead of
-    treating `${LIBS}` or `{outputs}` as a directory name.
+    asks what expansion could not supply. A caller that finds anything here knows the path has no
+    real answer yet and can name what is missing, instead of treating `${LIBS}` or `{outputs}` as a
+    directory name.
+
+    Call it on `expand_path_fully`'s output, not `expand_path`'s: a single pass leaves the inner
+    reference of `LIBS=${ROOT}/libs` behind, so scanning it reports `ROOT` as unsupplied when it is
+    set and the value resolves fine.
 
     Reporting only, no policy: whether a `{NAME}` macro token is legal in a given field is the
     caller's rule (they are not legal in project path fields; see `resolve_project_path_field`), and
@@ -486,6 +554,41 @@ def resolve_path_safely(path: Path) -> Path:
     return Path(os.path.normpath(path))
 
 
+def _anchor_and_resolve(expanded: Path, base: Path | None) -> Path:
+    """Anchor a relative path to ``base`` (default CWD), then canonicalize it for identity.
+
+    The tail shared by ``canonicalize_for_identity`` and
+    ``canonicalize_expanded_for_identity``: the two differ only in whether they
+    sanitize and expand first, and must not drift in what they do afterwards.
+    """
+    if not expanded.is_absolute():
+        expanded = (base if base is not None else Path.cwd()) / expanded
+    return resolve_path_safely(expanded).resolve(strict=False)
+
+
+def canonicalize_expanded_for_identity(expanded: Path, *, base: Path | None = None) -> Path:
+    """Canonicalize an ALREADY-expanded path for identity, without expanding it again.
+
+    Identical to ``canonicalize_for_identity`` from the anchoring step onward; it
+    just does not sanitize or expand on the way in.
+
+    For callers that expanded the value themselves and must not have it expanded a
+    second time -- specifically, callers that VALIDATED their expansion. Handing a
+    validated string to ``canonicalize_for_identity`` would expand it again, so the
+    path returned is not the path that was checked: a value whose expansion yields
+    another reference gets reported as unresolvable while the path built from it
+    resolves fine. See ``resolve_project_path_field``.
+
+    Args:
+        expanded: A path whose ``~`` and environment variables are already expanded.
+        base: Base directory for relative paths. Defaults to ``Path.cwd()``.
+
+    Returns:
+        Canonical absolute Path.
+    """
+    return _anchor_and_resolve(expanded, base)
+
+
 def canonicalize_for_identity(path: str | Path, *, base: Path | None = None) -> Path:
     """Produce a stable path identity for use as a dict key, cache key, or ID.
 
@@ -506,11 +609,7 @@ def canonicalize_for_identity(path: str | Path, *, base: Path | None = None) -> 
     Returns:
         Canonical absolute Path.
     """
-    sanitized = sanitize_path_string(path)
-    expanded = expand_path(sanitized)
-    if not expanded.is_absolute():
-        expanded = (base if base is not None else Path.cwd()) / expanded
-    return resolve_path_safely(expanded).resolve(strict=False)
+    return _anchor_and_resolve(expand_path(sanitize_path_string(path)), base)
 
 
 def canonicalize_for_io(path: str | Path, *, base: Path | None = None) -> Path:

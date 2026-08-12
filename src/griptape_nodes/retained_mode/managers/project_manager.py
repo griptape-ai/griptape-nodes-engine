@@ -487,6 +487,24 @@ class AncestorValueLookup(NamedTuple):
     incomplete_reason: str | None
 
 
+class ParentLinkLookup(NamedTuple):
+    """Outcome of reducing a stored `parent_project_path` to a registry key.
+
+    Carries the reason alongside the miss because a `parent_project_path` can fail to resolve in
+    several distinct ways (an unset variable, a macro token, a relative value with nowhere to anchor,
+    a reference cycle) and the callers report that failure to a user. Collapsing them to a bare
+    `None` forces the caller to guess which one happened, and a guess printed as a diagnosis is worse
+    than no diagnosis.
+
+    Attributes:
+        path: Canonical path string usable as a registry key, or None when it could not be resolved.
+        reason: Artist-readable phrase describing the miss, or None when `path` is set.
+    """
+
+    path: str | None
+    reason: str | None
+
+
 class EffectiveProjectPaths(NamedTuple):
     """The two paths a project activates with, as reported on the project listing.
 
@@ -2294,12 +2312,15 @@ class ProjectManager(EngineScoped):
     def _describe_unresolved_path(resolution: ResolvedProjectPath) -> str:
         """Phrase why a declared path field could not be resolved, for logs and result_details.
 
-        Only ever called with a resolution whose `path` is None. In practice that always means an
-        unresolved variable or a macro token: every caller that could hand this a `needs_anchor`
-        resolution deals with that case before describing it, and `ResolvedProjectPath` guarantees an
-        unresolved result carries some reason. Both remaining branches are therefore defensive -- they
-        exist so a new failure mode reads as "could not resolve" instead of confidently naming the
-        wrong cause, which is exactly the class of bug this PR is about.
+        Only ever called with a resolution whose `path` is None. Every state `ResolvedProjectPath`
+        can be in gets its own phrasing, and each is reachable: callers anchored to a project's own
+        YAML see unresolved variables and macro tokens, `_resolve_parent_path_for_lookup` also
+        arrives here with `needs_anchor` (the validate handler is path-less, so a template not yet in
+        the registry has no directory of its own), and any of them can hit a reference cycle.
+
+        The empty-`reasons` fallback is the defensive one -- it exists so a state added to
+        `ResolvedProjectPath` later reads as "could not resolve" instead of confidently naming the
+        wrong cause, which is the class of bug this whole path is about.
         """
         reasons: list[str] = []
         if resolution.unresolved_variables:
@@ -2310,6 +2331,8 @@ class ProjectManager(EngineScoped):
             reasons.append(f"macro tokens are not supported in path fields: {names}")
         if resolution.needs_anchor:
             reasons.append("it is a relative path and the project's own directory was not available to place it in")
+        if resolution.reference_cycle:
+            reasons.append("its variable references expand into each other and never resolve")
         if not reasons:
             return "it could not be turned into a usable path"
         return "; ".join(reasons)
@@ -3081,10 +3104,11 @@ class ProjectManager(EngineScoped):
 
         selected_parent = select_project_path(template.parent_project_path)
         if selected_parent is not None:
-            parent_id = self._resolve_parent_path_for_lookup(selected_parent, anchor=project_path)
-            if parent_id is None:
-                msg = f"parent_project_path '{selected_parent}' is relative and no anchor could be resolved."
+            lookup = self._resolve_parent_path_for_lookup(selected_parent, anchor=project_path)
+            if lookup.path is None:
+                msg = f"parent_project_path '{selected_parent}' could not be resolved: {lookup.reason}"
                 raise ValueError(msg)
+            parent_id = lookup.path
             parent_info = self._successfully_loaded_project_templates.get(parent_id)
             if parent_info is None:
                 msg = (
@@ -3407,29 +3431,32 @@ class ProjectManager(EngineScoped):
         against `anchor` (canonicalized), and mapped to the parent's registered id;
         an unregistered legacy parent uses its canonical path string as its id
         (the legacy bridge). Returns None when there is no parent link, when a
-        per-platform path has no entry for this OS, or when a relative path has no
-        anchor to resolve against.
+        per-platform path has no entry for this OS, or when the path could not be
+        resolved -- `_resolve_parent_path_for_lookup` logs why in that last case,
+        including when `anchor` is None and the value is relative.
         """
         if template.parent_project_id is not None:
             return template.parent_project_id
         selected_parent = select_project_path(template.parent_project_path)
         if selected_parent is None:
             return None
-        resolved_path = self._resolve_parent_path_for_lookup(selected_parent, anchor)
-        if resolved_path is None:
+        lookup = self._resolve_parent_path_for_lookup(selected_parent, anchor)
+        if lookup.path is None:
             return None
-        return file_path_to_id.get(Path(resolved_path), resolved_path)
+        return file_path_to_id.get(Path(lookup.path), lookup.path)
 
-    def _resolve_parent_path_for_lookup(self, raw_parent: str, anchor: Path | str | None) -> str | None:
+    def _resolve_parent_path_for_lookup(self, raw_parent: str, anchor: Path | str | None) -> ParentLinkLookup:
         """Resolve a stored parent_project_path to a canonical registry key.
 
         Expands `~` and shell environment variables, then resolves a still-relative path against
         `anchor` (the containing template's file path), via the shared resolve_project_path_field so
-        this field agrees with workspace_dir / libraries_dir. Returns None when the path is relative
-        and no anchor was provided (we cannot form an absolute path without one), or when it declares
-        a variable nothing supplied a value for -- a link we cannot resolve is no link, and inventing
-        an anchor-relative path containing a literal `${NAME}` would silently break the parent chain
-        and every value that inherits along it.
+        this field agrees with workspace_dir / libraries_dir. A link that cannot be resolved is no
+        link: inventing an anchor-relative path containing a literal `${NAME}` would silently break
+        the parent chain and every value that inherits along it.
+
+        Every miss comes back with its reason and is logged here, including the relative-with-no-
+        anchor case -- `anchor` is legitimately None when validating a template that is not in the
+        registry yet, and a caller given a bare None cannot tell that apart from an unset variable.
 
         `anchor` is coerced to `Path` defensively because request payloads
         deserialized over the wire arrive with `project_path` as a `str`.
@@ -3440,18 +3467,19 @@ class ProjectManager(EngineScoped):
             anchor_dir = Path(anchor).parent
 
         resolution = resolve_project_path_field(raw_parent, anchor_dir)
-        if resolution.needs_anchor:
-            return None
         if resolution.path is None:
+            reason = self._describe_unresolved_path(resolution)
             logger.warning(
-                "Project '%s' declares parent_project_path as %r, which cannot be resolved (%s). "
+                "Project %s declares parent_project_path as %r, which cannot be resolved (%s). "
                 "Treating it as having no parent.",
-                anchor,
+                # A None anchor is the unregistered case, not a project literally named None: the
+                # validate handler is path-less, so a template it has never seen on disk has no file.
+                f"'{anchor}'" if anchor is not None else "being validated (it has no file of its own yet)",
                 raw_parent,
-                self._describe_unresolved_path(resolution),
+                reason,
             )
-            return None
-        return str(resolution.path)
+            return ParentLinkLookup(path=None, reason=reason)
+        return ParentLinkLookup(path=str(resolution.path), reason=None)
 
     def on_unregister_project_template_request(  # noqa: C901, PLR0912
         self, request: UnregisterProjectTemplateRequest

@@ -7706,6 +7706,42 @@ directories:
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
         assert isinstance(result, LoadProjectTemplateResultSuccess)
 
+    def test_save_refusal_names_the_real_reason_the_parent_could_not_be_resolved(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset variable in parent_project_path is reported as an unset variable.
+
+        The refusal is correct -- diffing against system defaults would bake the parent's inherited
+        values into the child's overlay. What was wrong was the explanation: every unresolvable parent
+        was reported as "is relative and no anchor could be resolved", which here is doubly false.
+        There is an anchor (the file being saved) and the value is not relative; the variable is
+        simply unset, and that is the only sentence an artist can act on.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            SaveProjectTemplateRequest,
+            SaveProjectTemplateResultFailure,
+        )
+
+        monkeypatch.delenv("GTN_TEST_SAVE_MISSING", raising=False)
+        child_path = tmp_path / "child.yml"
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "child",
+            "parent_project_path": "${GTN_TEST_SAVE_MISSING}/parent.yml",
+            "situations": {},
+            "directories": {},
+        }
+
+        result = pm.on_save_project_template_request(
+            SaveProjectTemplateRequest(project_path=child_path, template_data=template_data)
+        )
+
+        assert isinstance(result, SaveProjectTemplateResultFailure)
+        details = str(result.result_details)
+        assert "GTN_TEST_SAVE_MISSING" in details
+        assert "no anchor" not in details
+        assert not child_path.exists()
+
     def test_save_without_parent_diffs_against_system_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
         """Regression: with no parent, diff base remains DEFAULT_PROJECT_TEMPLATE."""
         from griptape_nodes.retained_mode.events.project_events import (
@@ -8296,6 +8332,43 @@ class TestValidateProjectTemplateParentChain:
         )
         assert isinstance(result, ValidateProjectTemplateResultSuccess)
         assert any(p.field_path == "parent_project_path" and "Cycle" in p.message for p in result.validation.problems)
+
+    def test_relative_parent_with_no_anchor_says_so_instead_of_going_quiet(
+        self, pm: ProjectManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A brand-new template's relative parent_project_path cannot be placed, and that is logged.
+
+        Validation is path-less: an unregistered template has no file of its own, so there is no
+        directory to resolve `../base.yml` against. The chain walk correctly stops (load-time
+        detection still applies), but it used to stop with no record at all -- the one route that can
+        reach this case skipped the reason and returned, while every sibling failure logged one. A
+        chain that silently ends looks identical to a project with no parent.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ValidateProjectTemplateRequest,
+            ValidateProjectTemplateResultSuccess,
+        )
+
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "brand new child",
+            "parent_project_path": "../base.yml",
+            "situations": {},
+            "directories": {},
+        }
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = pm.on_validate_project_template_request(
+                ValidateProjectTemplateRequest(template_data=template_data)
+            )
+
+        assert isinstance(result, ValidateProjectTemplateResultSuccess)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        matching = [m for m in warnings if "../base.yml" in m]
+        assert len(matching) == 1, warnings
+        assert "relative path" in matching[0]
+        # The reason must be the anchor, not a variable: there is no variable in this value at all.
+        assert "no value is set" not in matching[0]
 
 
 class TestPerPlatformProjectsToRegister:

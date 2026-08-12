@@ -37,6 +37,13 @@ PROJECT_FILE_NAME = "griptape-nodes-project.yml"
 ADJACENT_CONFIG_NAME = "griptape_nodes_config.json"
 LIBS_ENV_VAR = "GTN_TEST_STUDIO_LIBS"
 
+# A variable whose VALUE is itself a reference. Ordinary in a `.env` read without interpolation, and
+# the shape that one expansion pass leaves half-resolved.
+CHAIN_OUTER_ENV_VAR = "GTN_TEST_CHAIN_OUTER"
+CHAIN_INNER_ENV_VAR = "GTN_TEST_CHAIN_INNER"
+CYCLE_A_ENV_VAR = "GTN_TEST_CYCLE_A"
+CYCLE_B_ENV_VAR = "GTN_TEST_CYCLE_B"
+
 # A pinned download entry proves the provisioning preview probes the SAME libraries root the listing
 # reports. The preview payload carries no path, but its installed-version probe READS one, so the
 # plan's kind is an observable proxy for the directory it looked in.
@@ -55,6 +62,14 @@ parent_project_path: "../../{PROJECT_FILE_NAME}"
 """
 DECLARES_NOTHING_YAML = """project_template_schema_version: "0.3.3"
 name: Solo
+"""
+CHAINED_LIBRARIES_YAML = f"""project_template_schema_version: "0.3.3"
+name: Studio Chained
+libraries_dir: "${{{CHAIN_OUTER_ENV_VAR}}}/shared-libraries"
+"""
+CYCLIC_LIBRARIES_YAML = f"""project_template_schema_version: "0.3.3"
+name: Studio Cyclic
+libraries_dir: "${{{CYCLE_A_ENV_VAR}}}/shared-libraries"
 """
 
 
@@ -165,6 +180,54 @@ class TestEffectiveProjectPathsThroughEngine:
         assert libraries_root == str(canonicalize_for_identity(studio_dir / "shared-libraries"))
         assert str(base_path.parent) not in libraries_root
         assert LIBS_ENV_VAR not in libraries_root
+
+    def test_a_variable_whose_value_is_itself_a_reference_resolves_all_the_way(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, studio_dir: Path
+    ) -> None:
+        """A chained variable loads and reports its final root, rather than being called unresolvable.
+
+        `libraries_dir` names OUTER, whose value names INNER. Both are set, so there is a real answer.
+        A single expansion pass leaves `${INNER}` behind, and validating THAT while returning a
+        second, further-expanded path made the project fail to load citing INNER as having no value --
+        naming a variable that is set, for a project that is correctly configured.
+        """
+        monkeypatch.setenv(CHAIN_INNER_ENV_VAR, str(studio_dir))
+        monkeypatch.setenv(CHAIN_OUTER_ENV_VAR, f"${{{CHAIN_INNER_ENV_VAR}}}/projects")
+        chained_path = write_project(tmp_path / "chained", CHAINED_LIBRARIES_YAML)
+
+        assert isinstance(self.load(engine, chained_path), LoadProjectTemplateResultSuccess)
+        info = self.loaded_by_path(self.listing(engine))[str(chained_path)]
+
+        libraries_root = self.libraries_root_of(info)
+        assert libraries_root == str(canonicalize_for_identity(studio_dir / "projects" / "shared-libraries"))
+        assert CHAIN_INNER_ENV_VAR not in libraries_root
+        assert CHAIN_OUTER_ENV_VAR not in libraries_root
+
+    def test_a_reference_cycle_fails_the_load_as_a_cycle_not_as_a_missing_value(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Mutually referencing variables refuse the load, and say so as a cycle.
+
+        Both variables ARE set, so "no value is set for A" would be false. Expansion cannot finish,
+        which is a different problem with a different fix, and the artist needs to be told which.
+        """
+        monkeypatch.setenv(CYCLE_A_ENV_VAR, f"${{{CYCLE_B_ENV_VAR}}}")
+        monkeypatch.setenv(CYCLE_B_ENV_VAR, f"${{{CYCLE_A_ENV_VAR}}}")
+        cyclic_path = write_project(tmp_path / "cyclic", CYCLIC_LIBRARIES_YAML)
+
+        assert isinstance(self.load(engine, cyclic_path), LoadProjectTemplateResultFailure)
+        listing = self.listing(engine)
+
+        assert self.loaded_by_path(listing) == {}
+        failed = [info for info in listing.failed_to_load if info.project_id == str(cyclic_path)]
+        assert len(failed) == 1
+        assert failed[0].libraries_root is None
+
+        problems = [p for p in failed[0].validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "cycle" in problems[0].message or "each other" in problems[0].message
+        assert "no value is set" not in problems[0].message
+        assert problems[0].line_number is not None
 
     def test_child_reports_the_libraries_root_it_inherits_from_its_parent(self, engine: Engine, tmp_path: Path) -> None:
         """libraries_dir inherits down the chain, anchored to the DECLARING project's directory.

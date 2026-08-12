@@ -3,18 +3,16 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, NamedTuple
+from pathlib import Path
+from typing import NamedTuple
 
 from griptape_nodes.common.project_templates.directory import PerPlatformPathBase
 from griptape_nodes.files.path_utils import (
-    canonicalize_for_identity,
-    expand_path,
+    canonicalize_expanded_for_identity,
+    expand_path_fully,
     sanitize_path_string,
     unexpanded_references,
 )
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -54,23 +52,30 @@ class ResolvedProjectPath(NamedTuple):
     """Outcome of resolving a declared project path field to an absolute path.
 
     Exactly one of these states holds:
-    - `path` is set and both lists are empty: the field resolved.
+    - `path` is set, both lists are empty, and neither flag is set: the field resolved.
     - `path` is None and at least one list is non-empty: the field declares a variable nothing
       supplied a value for, so there IS no answer. Callers must report this rather than substitute a
       guess -- a wrong path labelled "declared" is worse for users than an honest "unknown".
+    - `path` is None and `needs_anchor` is set: the value is relative and there was nowhere to put it.
+    - `path` is None and `reference_cycle` is set: the value's references expand into each other, so
+      no amount of expansion finishes. The lists are empty because no single variable is at fault --
+      every variable involved IS set, and naming one of them as missing would be a lie.
 
     Attributes:
-        path: Canonical absolute path, or None when unresolved references remain.
+        path: Canonical absolute path, or None when the field could not be resolved.
         unresolved_variables: Names from `${NAME}` / `%NAME%` references that expanded to nothing.
         macro_tokens: Names from `{NAME}` macro tokens, which these fields do not support.
         needs_anchor: True when the value is relative but no `anchor_dir` was available to
             resolve it against. Distinguishes "cannot be placed" from "declares a bad variable".
+        reference_cycle: True when expansion never reached a fixed point, i.e. the variables refer
+            to each other in a cycle.
     """
 
     path: Path | None
     unresolved_variables: list[str]
     macro_tokens: list[str]
     needs_anchor: bool = False
+    reference_cycle: bool = False
 
 
 def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> ResolvedProjectPath:
@@ -78,7 +83,9 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
 
     The supported contract for these fields, in order of application:
 
-    1. `~` and PROCESS/SHELL environment variables (`${NAME}`, `%NAME%` on Windows) are expanded.
+    1. `~` and PROCESS/SHELL environment variables (`${NAME}`, `%NAME%` on Windows) are expanded,
+       repeatedly, until the value stops changing -- a variable's value may itself contain a
+       reference (`LIBS=${ROOT}/libs`), which a single pass would leave half-expanded.
        The environment is the one the engine was launched with -- deliberately NOT the project's own
        `environment:` block, which activation applies only AFTER these fields resolve
        (`ProjectManager._activate_project` restores the outgoing project's env, resolves workspace
@@ -91,6 +98,12 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
     Expansion must precede the relative/absolute decision: `Path("${LIBS}/x").is_absolute()` is
     False, so testing absoluteness first would anchor an absolute env-var value under `anchor_dir`
     and -- when the variable is unset -- bake a literal `${LIBS}` directory into the result.
+
+    The string this validates is the string it returns. Nothing below re-expands (hence
+    `canonicalize_expanded_for_identity` rather than `canonicalize_for_identity`), because a second
+    expansion would make the reported reason describe a value the caller never receives: a field
+    whose expansion yields another reference would be refused as declaring an unset variable while
+    the path built from it resolved perfectly well.
 
     `{NAME}` macro tokens are NOT supported here (the macro system resolves `directories:`
     `path_macro` fields and node parameters, never these). They are reported rather than silently
@@ -107,7 +120,21 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
         A `ResolvedProjectPath`; check `path is None` before using it.
     """
     sanitized = sanitize_path_string(selected)
-    expanded = expand_path(sanitized)
+    fully_expanded = expand_path_fully(sanitized)
+
+    if not fully_expanded.stabilized:
+        logger.debug("Project path field %r never stopped expanding; its references cycle", selected)
+        return ResolvedProjectPath(
+            path=None,
+            unresolved_variables=[],
+            macro_tokens=[],
+            reference_cycle=True,
+        )
+
+    # Sanitized a second time because an expanded variable can carry its own quotes or a stray
+    # newline, and this is the last point they can be cleaned. It happens HERE rather than inside the
+    # canonicalize call so the value being validated below is the value that gets returned.
+    expanded = Path(sanitize_path_string(fully_expanded.path))
 
     # Anything still delimited after expansion means the value has no answer yet. Macro tokens count
     # because they are not part of this contract: reporting one lets the caller say so instead of
@@ -136,7 +163,7 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
         )
 
     return ResolvedProjectPath(
-        path=canonicalize_for_identity(expanded, base=anchor_dir),
+        path=canonicalize_expanded_for_identity(expanded, base=anchor_dir),
         unresolved_variables=[],
         macro_tokens=[],
     )

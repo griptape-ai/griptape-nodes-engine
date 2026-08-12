@@ -10,11 +10,13 @@ import pytest
 from griptape_nodes.files.path_utils import (
     FilenameParts,
     _apply_windows_long_path_prefix,
+    canonicalize_expanded_for_identity,
     canonicalize_for_identity,
     canonicalize_for_io,
     canonicalize_to_posix,
     decompose_source_path,
     expand_path,
+    expand_path_fully,
     normalize_path_for_platform,
     parse_file_uri,
     path_needs_expansion,
@@ -252,6 +254,70 @@ class TestExpandPath:
         """Test that function returns a Path object."""
         result = expand_path("~/test")
         assert isinstance(result, Path)
+
+
+class TestExpandPathFully:
+    """Tests for expand_path_fully: expansion repeated until the value stops changing."""
+
+    def test_expands_a_reference_that_expands_to_another_reference(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A variable whose VALUE contains a reference resolves all the way, which one pass cannot do."""
+        monkeypatch.setenv("GTN_TEST_INNER", "/studio")
+        monkeypatch.setenv("GTN_TEST_OUTER", "${GTN_TEST_INNER}/projects")
+
+        result = expand_path_fully("${GTN_TEST_OUTER}/libs")
+
+        assert result.path.as_posix() == "/studio/projects/libs"
+        assert result.stabilized is True
+        # The single-pass version stops one level short; that gap is the whole reason this exists.
+        assert "GTN_TEST_INNER" in str(expand_path("${GTN_TEST_OUTER}/libs"))
+
+    def test_reports_a_reference_cycle_instead_of_looping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mutually referencing variables terminate and come back as not stabilized."""
+        monkeypatch.setenv("GTN_TEST_PING", "${GTN_TEST_PONG}")
+        monkeypatch.setenv("GTN_TEST_PONG", "${GTN_TEST_PING}")
+
+        result = expand_path_fully("${GTN_TEST_PING}/libs")
+
+        assert result.stabilized is False
+
+    def test_self_reference_is_not_a_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`A=${A}` is left alone by expandvars, so it stabilizes as an ordinary unresolved reference."""
+        monkeypatch.setenv("GTN_TEST_SELF", "${GTN_TEST_SELF}")
+
+        result = expand_path_fully("${GTN_TEST_SELF}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_SELF"]
+
+    def test_plain_path_stabilizes_unchanged(self) -> None:
+        """A value with nothing to expand comes back untouched on the first pass."""
+        result = expand_path_fully("/studio/libraries")
+
+        assert result.path.as_posix() == "/studio/libraries"
+        assert result.stabilized is True
+
+    def test_expands_tilde(self) -> None:
+        """Tilde expansion still happens, same as expand_path."""
+        result = expand_path_fully("~/Documents")
+
+        assert str(result.path).startswith(str(Path.home()))
+        assert result.stabilized is True
+
+    def test_bare_dollar_name_stays_literal(self) -> None:
+        """`$Recycle.Bin` is a real Windows directory; looping must not start eating it."""
+        result = expand_path_fully("$Recycle.Bin/libs")
+
+        assert result.path.as_posix() == "$Recycle.Bin/libs"
+        assert result.stabilized is True
+
+    def test_unset_variable_is_left_in_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unset reference is not a cycle: it stops changing immediately and stays reportable."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = expand_path_fully("${GTN_TEST_MISSING}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_MISSING"]
 
 
 class TestPathNeedsExpansion:
@@ -978,6 +1044,48 @@ class TestCanonicalizeForIdentity:
 
         result = canonicalize_for_identity(link)
         assert result == target.resolve()
+
+
+class TestCanonicalizeExpandedForIdentity:
+    """Tests for canonicalize_expanded_for_identity: the same tail, without expanding again."""
+
+    def test_does_not_expand_variables(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reference that survived the caller's own expansion is left alone, not expanded here.
+
+        The point of the function: a caller that VALIDATED its expansion must get back a path built
+        from the string it checked. Expanding again would return a different path than was validated.
+        """
+        monkeypatch.setenv("GTN_TEST_LATE", "/somewhere/else")
+
+        result = canonicalize_expanded_for_identity(tmp_path / "${GTN_TEST_LATE}")
+
+        assert result.name == "${GTN_TEST_LATE}"
+        # canonicalize_for_identity, given the same value, would expand it -- hence the two functions.
+        assert canonicalize_for_identity(tmp_path / "${GTN_TEST_LATE}") != result
+
+    def test_anchors_relative_paths_to_base(self, tmp_path: Path) -> None:
+        """Relative values are placed under `base`, same as canonicalize_for_identity."""
+        result = canonicalize_expanded_for_identity(Path("sub/file.txt"), base=tmp_path)
+
+        assert result == (tmp_path / "sub" / "file.txt").resolve()
+
+    def test_defaults_relative_paths_to_cwd(self) -> None:
+        """With no `base`, a relative value lands under CWD."""
+        result = canonicalize_expanded_for_identity(Path("file.txt"))
+
+        assert result == (Path.cwd() / "file.txt").resolve()
+
+    def test_normalizes_dot_segments(self, tmp_path: Path) -> None:
+        """`.` and `..` are collapsed so two spellings of one path compare equal."""
+        result = canonicalize_expanded_for_identity(tmp_path / "a" / ".." / "b" / "." / "c.txt")
+
+        assert result == (tmp_path / "b" / "c.txt").resolve()
+
+    def test_matches_canonicalize_for_identity_when_nothing_needs_expanding(self, tmp_path: Path) -> None:
+        """The two agree on any value with nothing left to expand; only the leading steps differ."""
+        already_expanded = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_expanded_for_identity(already_expanded) == canonicalize_for_identity(already_expanded)
 
 
 class TestCanonicalizeForIo:
