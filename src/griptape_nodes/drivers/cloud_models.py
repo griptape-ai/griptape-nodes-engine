@@ -13,6 +13,7 @@ every consumer picks up the change.
 """
 
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -79,6 +80,48 @@ MODEL_CHOICES_ARGS = [
 
 MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES_ARGS]
 VISION_MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES_ARGS if model.get("vision")]
+
+
+# Keys in a MODEL_CHOICES_ARGS `args` preset that map onto Pydantic AI
+# `ModelSettings` fields. The presets also carry driver-only keys (`stream`,
+# `structured_output_strategy`) that `ModelSettings` has no slot for, so
+# consumers have to filter rather than splat the preset wholesale.
+_MODEL_SETTINGS_KEYS = ("max_tokens", "temperature", "top_p")
+
+MODEL_SETTINGS: dict[str, dict[str, Any]] = {
+    str(model["name"]): settings
+    for model in MODEL_CHOICES_ARGS
+    if (
+        settings := {
+            key: value
+            for key, value in dict(model["args"]).items()  # type: ignore[call-overload]
+            if key in _MODEL_SETTINGS_KEYS and value is not None
+        }
+    )
+}
+"""Per-model Pydantic AI ``ModelSettings``, distilled from :data:`MODEL_CHOICES_ARGS`.
+
+A model whose preset carries no settings-relevant keys is absent rather than
+mapped to an empty dict, so "unknown model" and "nothing to apply" collapse into
+one case. A ``None`` in a preset means "don't send this field" (the o-series
+``top_p``), which omitting it already achieves, so those are filtered out too.
+"""
+
+
+def model_settings_for(model_name: str) -> dict[str, Any] | None:
+    """Return a copy of the ``ModelSettings`` for a model id, or ``None`` if it has none.
+
+    Args:
+        model_name: A Griptape Cloud model id, e.g. ``"claude-opus-5"``. Ids
+            outside the catalog — a local Ollama model, a custom endpoint's
+            model — have no preset and return ``None``.
+    """
+    settings = MODEL_SETTINGS.get(model_name)
+    if not settings:
+        return None
+    # Copy: callers pass this into a model instance that may outlive the call,
+    # and the catalog dict is module-level shared state.
+    return dict(settings)
 
 
 IMAGE_MODEL_CHOICES_ARGS = [

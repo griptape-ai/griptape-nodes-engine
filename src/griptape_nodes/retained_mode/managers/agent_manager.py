@@ -528,11 +528,28 @@ class AgentManager(EngineScoped):
                 result_details="Agent run cancelled.",
             )
 
+        if result.truncated:
+            return RunAgentResultSuccess(
+                output={
+                    "text": result.output,
+                    "message_count": result.message_count,
+                    "cancelled": False,
+                    "truncated": True,
+                    "generated_image_urls": result.image_urls,
+                },
+                thread_id=result.thread_id,
+                result_details=(
+                    "The model reached its output length limit before finishing, so this reply is incomplete. "
+                    "Ask it to continue to get the rest."
+                ),
+            )
+
         return RunAgentResultSuccess(
             output={
                 "text": result.output,
                 "message_count": result.message_count,
                 "cancelled": False,
+                "truncated": False,
                 "generated_image_urls": result.image_urls,
             },
             thread_id=result.thread_id,
