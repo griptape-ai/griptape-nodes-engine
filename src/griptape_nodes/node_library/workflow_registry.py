@@ -27,10 +27,55 @@ _METADATA_BLOCK_PATTERN = re.compile(r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<
 
 _TOOL_TABLE = "tool"
 _GRIPTAPE_NODES_TABLE = "griptape-nodes"
+# How the required table is spelled in messages and in the editor's workflow-load report.
+METADATA_TABLE_PATH = f"[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]"
 
 
 class WorkflowMetadataError(Exception):
-    """Raised when a workflow file's metadata header cannot be read."""
+    """Raised when a workflow file's metadata header cannot be read.
+
+    Callers that only need to know it failed catch this. Callers that report per-stage detail, such
+    as the editor's workflow-load report, catch the subclasses below, which carry the values that
+    report displays.
+    """
+
+
+class WorkflowMetadataFileError(WorkflowMetadataError):
+    """The workflow file itself could not be read."""
+
+
+class WorkflowMetadataSectionCountError(WorkflowMetadataError):
+    """The file does not carry exactly one metadata header."""
+
+    def __init__(self, message: str, *, section_name: str, count: int) -> None:
+        super().__init__(message)
+        self.section_name = section_name
+        self.count = count
+
+
+class WorkflowMetadataTomlError(WorkflowMetadataError):
+    """The metadata header is not valid TOML."""
+
+    def __init__(self, message: str, *, error_message: str) -> None:
+        super().__init__(message)
+        self.error_message = error_message
+
+
+class WorkflowMetadataMissingTableError(WorkflowMetadataError):
+    """The metadata header carries no `[tool.griptape-nodes]` table."""
+
+    def __init__(self, message: str, *, section_path: str) -> None:
+        super().__init__(message)
+        self.section_path = section_path
+
+
+class WorkflowMetadataSchemaError(WorkflowMetadataError):
+    """The `[tool.griptape-nodes]` table does not match `WorkflowMetadata`."""
+
+    def __init__(self, message: str, *, section_path: str, error_message: str) -> None:
+        super().__init__(message)
+        self.section_path = section_path
+        self.error_message = error_message
 
 
 class LibraryNameAndNodeType(NamedTuple):
@@ -173,12 +218,15 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
 
     Pure file parsing: no registry lookups, no engine requests, and no waiting on library
     registration. Callers that run while libraries are still loading (the library loader itself,
-    for instance) must use this rather than `LoadWorkflowMetadata`, whose handler blocks until
-    library registration completes.
+    for instance) can use this directly; `LoadWorkflowMetadata`'s handler wraps it with the file
+    checks, dependency checks, and per-stage problem reporting the editor needs.
 
     Raises:
-        WorkflowMetadataError: The file could not be read, does not carry exactly one metadata
-            header, or that header is not TOML with a valid `[tool.griptape-nodes]` table.
+        WorkflowMetadataFileError: The file could not be read.
+        WorkflowMetadataSectionCountError: The file does not carry exactly one metadata header.
+        WorkflowMetadataTomlError: The header is not valid TOML.
+        WorkflowMetadataMissingTableError: The header has no `[tool.griptape-nodes]` table.
+        WorkflowMetadataSchemaError: That table does not match the expected schema.
     """
     try:
         workflow_content = workflow_file_path.read_text(encoding="utf-8")
@@ -187,7 +235,7 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
             f"Attempted to read workflow metadata from '{workflow_file_path}'. "
             f"Failed because the file could not be read: {err}"
         )
-        raise WorkflowMetadataError(msg) from err
+        raise WorkflowMetadataFileError(msg) from err
 
     matches = find_metadata_blocks(workflow_content, WORKFLOW_METADATA_BLOCK_NAME)
     if len(matches) != 1:
@@ -196,11 +244,13 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
             f"{len(matches)} '{WORKFLOW_METADATA_BLOCK_NAME}' metadata sections, and exactly 1 is required. "
             "Open the workflow in the editor and save it to regenerate the header."
         )
-        raise WorkflowMetadataError(msg)
+        raise WorkflowMetadataSectionCountError(msg, section_name=WORKFLOW_METADATA_BLOCK_NAME, count=len(matches))
 
-    # Strip the leading comment marker off each line to recover the raw TOML.
     metadata_toml = strip_metadata_comment_prefixes(matches[0])
 
+    # tomllib, not tomlkit: this is a read-only path, and tomlkit builds a formatting-preserving
+    # document model that costs ~20x more per header. Only the save path needs tomlkit, to keep the
+    # formatting of headers it rewrites.
     try:
         toml_document = tomllib.loads(metadata_toml)
     except tomllib.TOMLDecodeError as err:
@@ -208,25 +258,25 @@ def read_workflow_metadata(workflow_file_path: Path) -> WorkflowMetadata:
             f"Attempted to read workflow metadata from '{workflow_file_path}'. "
             f"Failed because the header is not valid TOML: {err}"
         )
-        raise WorkflowMetadataError(msg) from err
+        raise WorkflowMetadataTomlError(msg, error_message=str(err)) from err
 
     try:
         tool_section = toml_document[_TOOL_TABLE][_GRIPTAPE_NODES_TABLE]
     except (KeyError, TypeError) as err:
         msg = (
             f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the header has no "
-            f"'[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]' table."
+            f"'{METADATA_TABLE_PATH}' table."
         )
-        raise WorkflowMetadataError(msg) from err
+        raise WorkflowMetadataMissingTableError(msg, section_path=METADATA_TABLE_PATH) from err
 
     try:
         return WorkflowMetadata.model_validate(tool_section)
     except ValidationError as err:
         msg = (
             f"Attempted to read workflow metadata from '{workflow_file_path}'. Failed because the "
-            f"'[{_TOOL_TABLE}.{_GRIPTAPE_NODES_TABLE}]' table does not match the expected schema: {err}"
+            f"'{METADATA_TABLE_PATH}' table does not match the expected schema: {err}"
         )
-        raise WorkflowMetadataError(msg) from err
+        raise WorkflowMetadataSchemaError(msg, section_path=METADATA_TABLE_PATH, error_message=str(err)) from err
 
 
 class WorkflowRegistry(metaclass=SingletonMeta):
