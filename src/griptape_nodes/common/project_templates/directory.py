@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sys
-from typing import TYPE_CHECKING, Any, Self
+from typing import TYPE_CHECKING, Any, NamedTuple, Self
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -41,7 +41,7 @@ class PerPlatformPathBase(BaseModel):
 
     def select(self) -> str | None:
         """Return the value for the active platform, falling back to `default`."""
-        active = _active_platform_key()
+        active = active_platform_key()
         if active == "linux" and self.linux is not None:
             return self.linux
         if active == "darwin" and self.darwin is not None:
@@ -55,8 +55,14 @@ class PerPlatformPathMacro(PerPlatformPathBase):
     """Per-platform path macro mapping for directory definitions."""
 
 
-def _active_platform_key() -> str:
-    """Map sys.platform to one of the per-platform mapping keys."""
+def active_platform_key() -> str:
+    """Map sys.platform to one of the per-platform mapping keys, or `""` if it has none.
+
+    An empty return is not an error -- it means this platform cannot be named in a per-platform
+    mapping at all, because `PerPlatformPathBase` forbids keys outside `linux`/`darwin`/`windows`.
+    `select()` reads it as "go straight to `default`", and callers phrasing an error should read it as
+    "`default` is the only remedy available here".
+    """
     if sys.platform.startswith("win"):
         return "windows"
     if sys.platform.startswith("darwin"):
@@ -66,18 +72,39 @@ def _active_platform_key() -> str:
     return ""
 
 
-def describe_active_platform() -> str:
-    """Name the active platform the way a `select()`-failed message should name it.
+class ActivePlatform(NamedTuple):
+    """The active platform as a `select()`-failed message needs to talk about it.
 
-    `sys.platform` is the wrong string to show someone who has to act on the message: it says
-    `win32`, while the key they need to add to their YAML is `windows`. Report the mapping key
-    instead, so "no path for this platform (windows)" names something that appears in the file.
+    Both fields come from one `active_platform_key()` call on purpose. A message has to name the
+    platform *and* propose a fix, and those two halves are only consistent if they agree on which
+    platform is active -- naming `windows` while suggesting the remedy for a keyless platform is
+    worse than either mistake alone.
 
-    Falls back to `sys.platform` only on a platform `_active_platform_key` has no key for, where the
-    raw name is the honest answer -- no per-platform entry can match it, so `default` is the only fix
-    and naming a key would imply one exists.
+    Attributes:
+        key: The mapping key for this platform, or `""` if it has none.
+        display: How to name this platform to a user who has to edit the YAML.
     """
-    return _active_platform_key() or sys.platform
+
+    key: str
+    display: str
+
+
+def active_platform() -> ActivePlatform:
+    """Describe the active platform for a message a user has to act on.
+
+    `sys.platform` is the wrong string to show them: it says `win32`, while the key they need to add
+    to their YAML is `windows`. Report the mapping key instead, so "no path for this platform
+    (windows)" names something that can appear in the file.
+
+    On a platform with no key, `sys.platform` would be worse than useless rather than merely
+    imprecise: `extra="forbid"` rejects any key that is not `linux`/`darwin`/`windows`, so naming
+    `freebsd13` points at a fix that fails validation. Say it is unsupported and keep the raw name
+    only as parenthetical detail, which is still what someone would quote in a bug report.
+    """
+    key = active_platform_key()
+    if key:
+        return ActivePlatform(key=key, display=key)
+    return ActivePlatform(key="", display=f"unsupported ({sys.platform})")
 
 
 class DirectoryDefinition(BaseModel):

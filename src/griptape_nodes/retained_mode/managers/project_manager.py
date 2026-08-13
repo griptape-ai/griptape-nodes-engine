@@ -37,8 +37,8 @@ from griptape_nodes.common.project_templates import (
     ProjectVariableDef,
     ResolvedProjectPath,
     SituationTemplate,
+    active_platform,
     default_template_for_version,
-    describe_active_platform,
     load_partial_project_template,
     resolve_project_path_field,
     schema_major_or_none,
@@ -2306,11 +2306,21 @@ class ProjectManager(EngineScoped):
         has already refused such an overlay. One condition should not have two sets of user-facing
         strings: the unreachable copy is by definition untested, so it can drift from the reachable
         one without anything noticing.
+
+        The remedy depends on whether this platform can be named at all. On a platform with no
+        mapping key, "add an entry for this one" is advice that cannot be followed -- the schema
+        forbids any key outside `linux`/`darwin`/`windows`, so the suggested fix would fail
+        validation and `default` is the only way out.
         """
+        platform = active_platform()
+        remedy = (
+            "Add a 'default' entry for the platforms you did not name, or an entry for this one."
+            if platform.key
+            else "Add a 'default' entry: this platform has no key of its own, so 'default' is the only way to name it."
+        )
         return (
             f"Attempted to resolve '{field_name}' for this project. Failed because it lists no path "
-            f"for this platform ({describe_active_platform()}) and no 'default'. Add a 'default' "
-            f"entry for the platforms you did not name, or an entry for this one."
+            f"for this platform ({platform.display}) and no 'default'. {remedy}"
         )
 
     def _unresolvable_field_message(self, field_name: str, selected: str, resolution: ResolvedProjectPath) -> str:

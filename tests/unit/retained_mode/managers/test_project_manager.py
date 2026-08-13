@@ -8492,7 +8492,7 @@ situations:
         # OS-specific resources, and falls into `os.uname()` on Linux/Mac branches.
         # On a Windows CI host with `sys.platform` faked to "linux", that crashes.
         monkeypatch.setattr(
-            "griptape_nodes.common.project_templates.directory._active_platform_key",
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
             lambda: "linux",
         )
         entry = {
@@ -9034,7 +9034,7 @@ class TestProjectPathFieldValidation:
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
 
         monkeypatch.setattr(
-            "griptape_nodes.common.project_templates.directory._active_platform_key",
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
             lambda: "windows",
         )
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
@@ -9053,6 +9053,42 @@ class TestProjectPathFieldValidation:
         assert len(problems) == 1
         assert "no path for this platform (windows) and no 'default'" in problems[0].message
         assert sys.platform not in problems[0].message
+
+    @pytest.mark.asyncio
+    async def test_platform_with_no_key_is_told_default_is_the_only_remedy(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a platform the schema cannot name, the message must not suggest naming it.
+
+        `PerPlatformProjectPath` sets `extra="forbid"`, so on FreeBSD there is no key to add -- a
+        message reading "no path for this platform (freebsd13) ... or an entry for this one" describes
+        a fix that fails validation, which is the same confidently-wrong-cause failure this whole
+        field-resolution path exists to avoid. `default` is the only way out, and the message says so.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setattr(
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
+            lambda: "",
+        )
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            "libraries_dir:\n"
+            '  darwin: "/Volumes/fast/libs"\n'
+            '  linux: "/mnt/fast/libs"\n'
+            '  windows: "Z:\\\\fast\\\\libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert f"no path for this platform (unsupported ({sys.platform})) and no 'default'" in problems[0].message
+        assert "or an entry for this one" not in problems[0].message
+        assert "'default' is the only way to name it" in problems[0].message
 
     @pytest.mark.asyncio
     async def test_every_broken_field_is_reported_in_one_load(
