@@ -41,6 +41,7 @@ from .unresolved_model_provider_usage_reference_problem import UnresolvedModelPr
 from .unresolved_model_usage_reference_problem import UnresolvedModelUsageReferenceProblem
 from .update_config_category_problem import UpdateConfigCategoryProblem
 from .venv_creation_failed_problem import VenvCreationFailedProblem
+from .workflow_node_load_problem import WorkflowNodeLoadProblem
 
 __all__ = [
     "AdvancedLibraryLoadFailureProblem",
@@ -84,4 +85,5 @@ __all__ = [
     "UnresolvedModelUsageReferenceProblem",
     "UpdateConfigCategoryProblem",
     "VenvCreationFailedProblem",
+    "WorkflowNodeLoadProblem",
 ]

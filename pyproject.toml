@@ -94,7 +94,9 @@ pythonpath = ["libraries/griptape_nodes_library"]
 
 [tool.ruff]
 line-length = 120
-extend-exclude = ["libraries/**/templates/*.py"]
+# Engine-generated workflow files. Their formatting is whatever the workflow generator emits, so
+# reformatting them would mean the committed copy no longer matches a real save.
+extend-exclude = ["libraries/**/templates/*.py", "tests/e2e/fixtures/**/*_workflow.py"]
 
 
 [tool.ruff.lint]
@@ -201,6 +203,9 @@ venv = ".venv"
 include = ["."]
 exclude = [
   "libraries/**/templates/*",
+  # Engine-generated workflow files. The generator emits untyped request/result chains, so these are
+  # checked by running them, not by pyright.
+  "tests/e2e/fixtures/**/*_workflow.py",
   ".venv",
   "GriptapeNodes",
   "**/node_modules",

@@ -24,7 +24,7 @@ from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
 
 @pytest.fixture(autouse=True)
@@ -89,11 +89,19 @@ def materialize_library() -> Callable[..., Path]:
     Rewrites the fixture JSON's ``engine_version`` to the running engine version so
     ``IncompatibleEngineVersionCheck`` never marks the library UNUSABLE on a version bump,
     optionally overrides the library ``name`` (needed when two tests register the same
-    fixture under distinct names), copies the node file, and returns the written
+    fixture under distinct names), copies the node file plus any ``extra_files`` the library
+    references (workflow files, for instance), and returns the written
     ``griptape_nodes_library.json`` path.
     """
 
-    def _materialize(target_dir: Path, *, template: Path, node_file: Path, name: str | None = None) -> Path:
+    def _materialize(
+        target_dir: Path,
+        *,
+        template: Path,
+        node_file: Path,
+        name: str | None = None,
+        extra_files: Sequence[Path] | None = None,
+    ) -> Path:
         target_dir.mkdir(parents=True, exist_ok=True)
         schema = json.loads(template.read_text())
         if name is not None:
@@ -102,6 +110,8 @@ def materialize_library() -> Callable[..., Path]:
         library_json = target_dir / "griptape_nodes_library.json"
         library_json.write_text(json.dumps(schema, indent=2))
         (target_dir / node_file.name).write_text(node_file.read_text())
+        for extra_file in extra_files or ():
+            (target_dir / extra_file.name).write_text(extra_file.read_text())
         return library_json
 
     return _materialize

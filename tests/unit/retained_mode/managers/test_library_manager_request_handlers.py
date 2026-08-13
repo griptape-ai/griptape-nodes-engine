@@ -51,6 +51,7 @@ def _make_library(advanced_library: AdvancedNodeLibrary | None = None) -> Librar
     schema.is_default_library = False
     schema.name = "TestLib"
     schema.nodes = []
+    schema.workflow_nodes = []
     schema.widgets = []
     schema.config_categories = []
     return Library(library_data=schema, advanced_library=advanced_library)
