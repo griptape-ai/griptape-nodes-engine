@@ -492,6 +492,45 @@ class TestParameter:
 
         assert value == "seed-trait-direct"
 
+    def test_remove_converter_detaches_by_identity(self) -> None:
+        param = Parameter(name="test", input_types=["str"], type="str", output_type="str", tooltip="test")
+        first = lambda value: f"{value}-first"  # noqa: E731
+        second = lambda value: f"{value}-second"  # noqa: E731
+        param.add_converter(first)
+        param.add_converter(second)
+
+        param.remove_converter(first)
+
+        assert param.converters == [second]
+
+    def test_remove_converter_raises_when_not_attached(self) -> None:
+        """A caller must not be left believing a conversion it still runs has been removed."""
+        param = Parameter(name="test", input_types=["str"], type="str", output_type="str", tooltip="test")
+
+        with pytest.raises(ValueError, match="no directly-attached converter"):
+            param.remove_converter(lambda value: value)
+
+    def test_remove_converter_leaves_trait_converters_alone(self) -> None:
+        """Trait converters are not directly attached; they go away with the trait."""
+
+        class _Suffixer(Trait):
+            @classmethod
+            def get_trait_keys(cls) -> list[str]:
+                return ["suffixer"]
+
+            def converters_for_trait(self) -> list[Callable[[Any], Any]]:
+                return [lambda value: f"{value}-trait"]
+
+        param = Parameter(name="test", input_types=["str"], type="str", output_type="str", tooltip="test")
+        param.add_trait(_Suffixer())
+        direct = lambda value: f"{value}-direct"  # noqa: E731
+        param.add_converter(direct)
+
+        param.remove_converter(direct)
+
+        assert not param.has_directly_attached_converters
+        assert len(param.converters) == 1
+
     def test_settable_property(self) -> None:
         """Test that settable property works correctly and is included in serialization."""
         # Test default value

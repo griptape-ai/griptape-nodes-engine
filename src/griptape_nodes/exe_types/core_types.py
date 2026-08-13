@@ -2127,6 +2127,26 @@ class Parameter(BaseNodeElement, UIOptionsMixin):
         """
         self._converters.append(converter)
 
+    def remove_converter(self, converter: Callable[[Any], Any]) -> None:
+        """Detach a directly-attached converter, by identity.
+
+        The counterpart to ``add_converter``, for a caller that has to take back
+        a conversion another component installed -- e.g. a node whose dropdown
+        serves two vocabularies, where the component's own rewrite rules only
+        hold for one of them. Trait converters are not reachable from here:
+        remove the trait instead.
+
+        Raises:
+            ValueError: if ``converter`` is not among this parameter's
+                directly-attached converters. Silently ignoring that would let a
+                caller believe a conversion it still runs has been removed.
+        """
+        try:
+            self._converters.remove(converter)
+        except ValueError as error:
+            msg = f"Parameter '{self.name}' has no directly-attached converter {converter!r} to remove."
+            raise ValueError(msg) from error
+
     def is_incoming_type_allowed(self, incoming_type: str | None) -> bool:
         if incoming_type is None:
             return False

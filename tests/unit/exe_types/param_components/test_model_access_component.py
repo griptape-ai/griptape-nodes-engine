@@ -875,6 +875,76 @@ class TestReinstallOptions:
         finally:
             griptape_nodes.EventManager().remove_authorization_hook(deny_alpha)
 
+    def test_reinstall_replaces_the_existing_options_trait(self) -> None:
+        """``add_trait`` appends, so reinstalling without removing leaves a stale trait behind.
+
+        Two ``Options`` traits mean an ambiguous dropdown and, worse, two
+        converters: the stale one goes on rewriting assignments against whatever
+        choices it was left holding.
+        """
+        _node, component, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"], default_model="alpha"
+        )
+        assert len(param.find_elements_by_type(Options)) == 1
+
+        component.reinstall_options()
+
+        assert len(param.find_elements_by_type(Options)) == 1
+
+    def test_reinstall_takes_the_dropdown_back_from_another_vocabulary(self) -> None:
+        """A node that pointed the dropdown elsewhere gets the component's choices back.
+
+        ``BaseNode._update_option_choices`` writes ``ui_options["simple_dropdown"]``,
+        which is what ``Options.choices`` reads in preference to the trait's own
+        field. Reinstalling has to rewrite that key, or the foreign vocabulary goes
+        on shadowing the component's -- including the deprecated keys a stored
+        legacy value needs in order to reach the migration converter.
+        """
+        node, component, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Alpha": "alpha"},
+        )
+
+        # A provider selector swaps in another provider's model list, then puts the
+        # component's own back.
+        node._update_option_choices(param="model", choices=["llama3.2"], default="llama3.2")
+        component.reinstall_options()
+
+        options = param.find_elements_by_type(Options)[0]
+        assert options.choices == ["alpha", "beta", "Alpha"]
+
+        node.set_parameter_value("model", "Alpha")
+        assert node.get_parameter_value("model") == "alpha"
+
+
+class TestLegacyValueConverter:
+    """The migration converter is detachable by a node whose dropdown serves a second vocabulary."""
+
+    def test_converter_handle_is_the_attached_converter(self) -> None:
+        _node, component, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Alpha": "alpha"},
+        )
+
+        assert component.legacy_value_converter in param.converters
+
+    def test_removing_the_handle_stops_the_migration(self) -> None:
+        node, component, param = _build_probe_node_with_component(
+            model_choices=["alpha", "beta"],
+            default_model="alpha",
+            deprecated_values={"Alpha": "alpha"},
+        )
+
+        param.remove_converter(component.legacy_value_converter)
+        node.set_parameter_value("model", "Alpha")
+
+        # The value survives untranslated: the caller that detached the converter
+        # owns what happens to it now, and can still ask through migrate_value.
+        assert node.get_parameter_value("model") == "Alpha"
+        assert component.migrate_value("Alpha") == "alpha"
+
 
 class TestDeprecatedValuesValidation:
     """deprecated_values is validated at construction, same as the component's other preconditions."""

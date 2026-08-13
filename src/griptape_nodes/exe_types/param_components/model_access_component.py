@@ -120,6 +120,8 @@ from griptape_nodes.traits.options import Options
 logger = logging.getLogger("griptape_nodes")
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.retained_mode.managers.authorization_checkpoint import CheckpointDenial
@@ -269,17 +271,44 @@ class ModelAccessComponent:
         """
         return self._node.get_parameter_value(self._parameter.name)
 
+    @property
+    def legacy_value_converter(self) -> Callable[[Any], Any]:
+        """The migration this component attached to the parameter, as a detachable handle.
+
+        A node whose dropdown serves a second vocabulary -- a provider selector
+        that swaps in a third-party provider's own model list, say -- cannot let
+        this run against that vocabulary: the deprecated keys are this
+        component's provider ids, and another provider may genuinely serve one of
+        them under its own meaning. Such a node detaches this with
+        ``Parameter.remove_converter`` and reinstalls the migration behind its own
+        check, calling ``migrate_value`` for the vocabulary this component owns.
+        """
+        return self._convert_legacy_value
+
     def reinstall_options(self) -> None:
         """Reinstall the ``Options`` trait and reapply decoration + badge.
 
         Nodes that remove and later re-add ``Options`` on the model parameter
         (e.g. after a driver connection is dropped) call this to put the
-        component's state back. Idempotent: safe to call when ``Options`` is
-        already present -- ``add_trait`` will replace the existing instance.
+        component's state back. Idempotent: any ``Options`` trait already on the
+        parameter is removed first, because ``add_trait`` appends rather than
+        replaces and the stale instance would keep governing conversion.
+
+        The choices are written back into ``ui_options["simple_dropdown"]`` as well.
+        ``Parameter.ui_options`` merges each trait's options *underneath* any
+        manually-set keys and returns a fresh dict, so a freshly-added ``Options``
+        trait cannot displace a ``simple_dropdown`` another caller wrote there --
+        and that key is exactly what ``Options.choices`` reads. Without this, a
+        node that pointed the dropdown at another vocabulary through
+        ``BaseNode._update_option_choices`` would go on shadowing this component's
+        choices, including the deprecated keys a stored legacy value needs in
+        order to reach the migration converter.
         """
         parameter = self._parameter
+        for trait in parameter.find_elements_by_type(Options):
+            parameter.remove_trait(trait_type=trait)
         parameter.add_trait(Options(choices=self._dropdown_choices()))
-        parameter.update_ui_options(self._build_ui_options())
+        parameter.update_ui_options({**self._build_ui_options(), "simple_dropdown": self._dropdown_choices()})
         self.on_value_changed(self._node.get_parameter_value(parameter.name))
 
     def on_value_changed(self, value: Any) -> None:
