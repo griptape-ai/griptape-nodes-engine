@@ -238,6 +238,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
+from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -693,7 +694,7 @@ class NodeManager(EngineScoped):
             node_type: Node type that was being created, used to find the library when unnamed
             library_name: Library the node type was requested from, if the caller named one
         """
-        message = str(err)
+        message = readable_exception_message(err)
 
         resolved_library_name = library_name
         if resolved_library_name is None:
@@ -782,7 +783,12 @@ class NodeManager(EngineScoped):
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            details = f"Could not create Node '{final_node_name}' of type '{request.node_type}': {err}"
+            # A node's __init__ comes from a separately versioned library, so this renders whatever
+            # it raised rather than only exceptions the engine controls.
+            details = (
+                f"Could not create Node '{final_node_name}' of type '{request.node_type}': "
+                f"{readable_exception_message(err)}"
+            )
             logger.error(details)
 
             # Check if we should create an Error Proxy node instead of failing

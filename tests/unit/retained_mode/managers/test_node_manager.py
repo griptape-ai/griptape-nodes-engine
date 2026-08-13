@@ -1109,6 +1109,18 @@ class TestNodeCreationFailureDescription:
 
         assert description == "node __init__ blew up"
 
+    def test_description_unquotes_a_sentence_raised_as_a_key_error(self, griptape_nodes: GriptapeNodes) -> None:
+        # A node's __init__ lives in a separately versioned library and can raise a sentence as a
+        # bare KeyError (`BaseNode.set_parameter_value` does). str() would repr that sentence, so
+        # the artist would read their error wrapped in quotes.
+        description = griptape_nodes.NodeManager()._describe_node_creation_failure(
+            KeyError("Attempted to set value for Parameter 'prompt' but no such Parameter could be found."),
+            node_type="Whatever",
+            library_name="library-with-no-problems",
+        )
+
+        assert description == "Attempted to set value for Parameter 'prompt' but no such Parameter could be found."
+
     def test_description_tells_the_artist_to_restart_after_a_mid_session_reload(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
