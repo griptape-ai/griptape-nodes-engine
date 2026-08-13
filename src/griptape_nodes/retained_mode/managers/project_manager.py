@@ -1013,12 +1013,7 @@ class ProjectManager(EngineScoped):
                 unresolvable_fields.append(field_name)
                 validation.add_error(
                     field_path=field_name,
-                    message=(
-                        f"Attempted to resolve '{field_name}' for this project. Failed because it "
-                        f"lists no path for this platform ({describe_active_platform()}) and no "
-                        f"'default'. Add a 'default' entry for the platforms you did not name, or an "
-                        f"entry for this one."
-                    ),
+                    message=self._platform_gap_message(field_name),
                     line_number=overlay.line_info.get_line(field_name),
                 )
                 continue
@@ -1028,10 +1023,7 @@ class ProjectManager(EngineScoped):
                 unresolvable_fields.append(field_name)
                 validation.add_error(
                     field_path=field_name,
-                    message=(
-                        f"Attempted to resolve '{field_name}' declared as '{selected}'. Failed "
-                        f"because {self._describe_unresolved_path(resolution)}."
-                    ),
+                    message=self._unresolvable_field_message(field_name, selected, resolution),
                     line_number=overlay.line_info.get_line(field_name),
                 )
 
@@ -1098,16 +1090,15 @@ class ProjectManager(EngineScoped):
             # A mapping with no key for this OS and no `default` names no parent we can locate; it
             # is an error, not "no parent here", because the child would otherwise load against the
             # system defaults and quietly lose everything the parent was supposed to supply.
-            # _read_overlay already refuses such an overlay, so this is defense in depth.
+            # _read_overlay already refuses such an overlay, so both failure branches below are
+            # defense in depth. They borrow their wording from the reachable copy in
+            # _validate_declared_path_fields rather than phrasing it again -- an unreachable message
+            # is an untested message, and two spellings of one condition drift.
             selected_parent = select_project_path(overlay.parent_project_path)
             if selected_parent is None:
                 validation.add_error(
                     field_path=parent_link_field,
-                    message=(
-                        f"Attempted to resolve this project's parent from parent_project_path. Failed "
-                        f"because it lists no path for this platform ({describe_active_platform()}) "
-                        f"and no 'default'."
-                    ),
+                    message=self._platform_gap_message(parent_link_field),
                     line_number=overlay.line_info.get_line(parent_link_field),
                 )
                 return None
@@ -1119,10 +1110,7 @@ class ProjectManager(EngineScoped):
             if parent_resolution.path is None:
                 validation.add_error(
                     field_path=parent_link_field,
-                    message=(
-                        f"Attempted to resolve this project's parent from parent_project_path "
-                        f"'{selected_parent}'. Failed because {self._describe_unresolved_path(parent_resolution)}."
-                    ),
+                    message=self._unresolvable_field_message(parent_link_field, selected_parent, parent_resolution),
                     line_number=overlay.line_info.get_line(parent_link_field),
                 )
                 return None
@@ -2310,6 +2298,32 @@ class ProjectManager(EngineScoped):
         return resolution
 
     @staticmethod
+    def _platform_gap_message(field_name: str) -> str:
+        """Phrase a per-platform mapping that names no path for this OS and has no `default`.
+
+        Shared by `_validate_declared_path_fields`, which is the copy users actually reach, and the
+        defense-in-depth check in `_resolve_parent_chain`, which cannot fire because `_read_overlay`
+        has already refused such an overlay. One condition should not have two sets of user-facing
+        strings: the unreachable copy is by definition untested, so it can drift from the reachable
+        one without anything noticing.
+        """
+        return (
+            f"Attempted to resolve '{field_name}' for this project. Failed because it lists no path "
+            f"for this platform ({describe_active_platform()}) and no 'default'. Add a 'default' "
+            f"entry for the platforms you did not name, or an entry for this one."
+        )
+
+    def _unresolvable_field_message(self, field_name: str, selected: str, resolution: ResolvedProjectPath) -> str:
+        """Phrase a declared path field that resolved to nothing, naming the value and the cause.
+
+        Shared with `_resolve_parent_chain` for the same reason as `_platform_gap_message`.
+        """
+        return (
+            f"Attempted to resolve '{field_name}' declared as '{selected}'. Failed because "
+            f"{self._describe_unresolved_path(resolution)}."
+        )
+
+    @staticmethod
     def _describe_unresolved_path(resolution: ResolvedProjectPath) -> str:
         """Phrase why a declared path field could not be resolved, for logs and result_details.
 
@@ -2334,6 +2348,11 @@ class ProjectManager(EngineScoped):
             reasons.append("it is a relative path and the project's own directory was not available to place it in")
         if resolution.reference_cycle:
             reasons.append("its variable references expand into each other and never resolve")
+        if resolution.quoted_expansion:
+            reasons.append(
+                "a variable it references expanded to a quoted value, which is not a usable path "
+                "(remove the quotes from the variable's value, not from this field)"
+            )
         if not reasons:
             return "it could not be turned into a usable path"
         return "; ".join(reasons)

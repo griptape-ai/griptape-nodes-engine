@@ -312,6 +312,9 @@ def sanitize_path_string(path: str | Path) -> str:
     return path_str
 
 
+_QUOTE_CHARACTERS = ("'", '"')
+
+
 def strip_surrounding_quotes(path: str) -> str:
     """Remove surrounding quotes from path string.
 
@@ -324,6 +327,44 @@ def strip_surrounding_quotes(path: str) -> str:
     if (path.startswith('"') and path.endswith('"')) or (path.startswith("'") and path.endswith("'")):
         return path[1:-1]
     return path
+
+
+def expansion_introduced_quoting(declared: str, expanded: str) -> bool:
+    """Report whether variable expansion put quoting into a path that the author did not write.
+
+    `strip_surrounding_quotes` only sees quotes wrapping the WHOLE string, which is the shape a
+    quoted value has before expansion. Once a variable supplies only a PREFIX, its own quotes move
+    into the interior -- `ROOT='"/mnt/studio"'` turns `${ROOT}/libs` into `"/mnt/studio"/libs`, where
+    there is nothing left to strip. The damage is not cosmetic: a leading quote makes
+    `Path.is_absolute()` False, so an absolute path silently becomes a relative one and gets anchored
+    somewhere the author never named.
+
+    Refusing beats cleaning, because an interior quote is ambiguous by then and the wrong guess is
+    silent. Two rules keep the refusal from swallowing real directory names:
+
+    - A `"` that expansion introduced is always quoting. Windows forbids it in a filename outright,
+      and it is the character shells and macOS Finder wrap paths in, so it did not come from a
+      directory called `He said "hi"`.
+    - A quote of either kind is refused only in the LEADING position, which is the one that flips
+      `is_absolute()`. An interior `'` is left alone: `/mnt/Dragon's Curse` is an ordinary directory
+      that a variable may legitimately hold, and `sanitize_path_string` documents apostrophes as a
+      supported case.
+
+    The DECLARED text is exempt from both rules. A quote someone typed into their own project.yml is
+    unambiguously theirs, and honoring it is what makes the refusal specific to expansion.
+
+    Args:
+        declared: The value as authored, after `sanitize_path_string` but BEFORE expansion.
+        expanded: The fully expanded value, after `sanitize_path_string` has run on it again. Pass
+            the settled value, not a single pass: a quote can arrive on any pass of
+            `expand_path_fully`, and a check placed before the fixed point misses the later ones.
+
+    Returns:
+        True when the caller should refuse the value rather than resolve it.
+    """
+    if expanded.count('"') > declared.count('"'):
+        return True
+    return expanded.startswith(_QUOTE_CHARACTERS) and not declared.startswith(_QUOTE_CHARACTERS)
 
 
 def normalize_path_for_platform(path: Path) -> str:

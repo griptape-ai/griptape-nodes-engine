@@ -168,8 +168,8 @@ class TestEffectiveProjectPathsThroughEngine:
     ) -> None:
         """An env-var libraries_dir resolves against the variable, not the project directory.
 
-        Before this, `Path("${VAR}/x").is_absolute()` was False, so the unexpanded value was joined
-        onto the project dir and libraries landed at `<project_dir>/${VAR}/x`.
+        Expansion happens before the relative-vs-absolute decision, so a variable holding an absolute
+        path is reported as that path and never joined onto the project directory.
         """
         base_path = write_project(tmp_path / "base", DECLARED_LIBRARIES_YAML)
 
@@ -187,9 +187,9 @@ class TestEffectiveProjectPathsThroughEngine:
         """A chained variable loads and reports its final root, rather than being called unresolvable.
 
         `libraries_dir` names OUTER, whose value names INNER. Both are set, so there is a real answer.
-        A single expansion pass leaves `${INNER}` behind, and validating THAT while returning a
-        second, further-expanded path made the project fail to load citing INNER as having no value --
-        naming a variable that is set, for a project that is correctly configured.
+        Expansion runs to a fixed point and the string that gets validated is the string that gets
+        returned, so a reference that only surfaces partway through expansion is never reported as an
+        unset variable for a project that is correctly configured.
         """
         monkeypatch.setenv(CHAIN_INNER_ENV_VAR, str(studio_dir))
         monkeypatch.setenv(CHAIN_OUTER_ENV_VAR, f"${{{CHAIN_INNER_ENV_VAR}}}/projects")

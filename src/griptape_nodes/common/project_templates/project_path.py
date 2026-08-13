@@ -10,6 +10,7 @@ from griptape_nodes.common.project_templates.directory import PerPlatformPathBas
 from griptape_nodes.files.path_utils import (
     canonicalize_expanded_for_identity,
     expand_path_fully,
+    expansion_introduced_quoting,
     sanitize_path_string,
     unexpanded_references,
 )
@@ -60,6 +61,9 @@ class ResolvedProjectPath(NamedTuple):
     - `path` is None and `reference_cycle` is set: the value's references expand into each other, so
       no amount of expansion finishes. The lists are empty because no single variable is at fault --
       every variable involved IS set, and naming one of them as missing would be a lie.
+    - `path` is None and `quoted_expansion` is set: a variable's value carried quotes that expansion
+      moved into the middle of the path. The lists are empty for the same reason as a cycle -- every
+      variable IS set, the value they produced just is not usable as a path.
 
     Attributes:
         path: Canonical absolute path, or None when the field could not be resolved.
@@ -69,6 +73,8 @@ class ResolvedProjectPath(NamedTuple):
             resolve it against. Distinguishes "cannot be placed" from "declares a bad variable".
         reference_cycle: True when expansion never reached a fixed point, i.e. the variables refer
             to each other in a cycle.
+        quoted_expansion: True when expansion introduced quote characters the author did not write,
+            per `expansion_introduced_quoting`.
     """
 
     path: Path | None
@@ -76,6 +82,7 @@ class ResolvedProjectPath(NamedTuple):
     macro_tokens: list[str]
     needs_anchor: bool = False
     reference_cycle: bool = False
+    quoted_expansion: bool = False
 
 
 def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> ResolvedProjectPath:
@@ -114,6 +121,11 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
     whose expansion yields another reference would be refused as declaring an unset variable while
     the path built from it resolved perfectly well.
 
+    Quoting that arrives WITH a variable's value is refused rather than cleaned, because by then it
+    cannot be told from a directory name; `expansion_introduced_quoting` draws that line. Quoting the
+    author wrote is still cleaned, which is why the declared text is sanitized before expansion and
+    the result sanitized again after.
+
     `{NAME}` macro tokens are NOT supported here (the macro system resolves `directories:`
     `path_macro` fields and node parameters, never these). The dependency runs the wrong way for it:
     building the macro resolution bag needs `workspace_dir` and the project's directories, which are
@@ -145,7 +157,10 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
     # Sanitized a second time because an expanded variable can carry its own quotes or a stray
     # newline, and this is the last point they can be cleaned. It happens HERE rather than inside the
     # canonicalize call so the value being validated below is the value that gets returned.
-    expanded = Path(sanitize_path_string(fully_expanded.path))
+    # Kept as a string as well: the quoting check below compares character-for-character against the
+    # declared text, and a `Path` round-trip rewrites separators before that comparison can be made.
+    sanitized_expanded = sanitize_path_string(fully_expanded.path)
+    expanded = Path(sanitized_expanded)
 
     # Anything still delimited after expansion means the value has no answer yet. Macro tokens count
     # because they are not part of this contract: reporting one lets the caller say so instead of
@@ -162,6 +177,23 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
             path=None,
             unresolved_variables=leftover.variables,
             macro_tokens=leftover.macro_tokens,
+        )
+
+    # A variable that supplied only part of the path can leave its own quotes stranded in the
+    # interior, where the sanitize above cannot see them. Refuse rather than guess: a leading quote
+    # makes the value look relative, which would anchor an absolute path under `anchor_dir` and
+    # report success while installing somewhere the project never named.
+    if expansion_introduced_quoting(sanitized, sanitized_expanded):
+        logger.debug(
+            "Project path field %r expanded to %r, which quoting made unusable as a path",
+            selected,
+            sanitized_expanded,
+        )
+        return ResolvedProjectPath(
+            path=None,
+            unresolved_variables=[],
+            macro_tokens=[],
+            quoted_expansion=True,
         )
 
     if anchor_dir is None and not expanded.is_absolute():

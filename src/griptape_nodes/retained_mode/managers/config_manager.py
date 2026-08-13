@@ -257,11 +257,18 @@ class ConfigManager(EngineScoped):
 
         Args:
             libraries_directory: The `libraries_directory` config value (absolute, or relative to
-                the global workspace). None or empty means "not configured".
+                the global workspace). Anything that is not a non-empty string means "not
+                configured" -- None and "" say so deliberately, and a non-string says it by
+                accident. The annotation names what callers SHOULD pass, not the full set of what
+                arrives: the value comes from user-editable config JSON, where nothing enforces the
+                type, so `get_config_value` can hand over an int or a list.
 
         Returns:
             The absolute directory libraries install and resolve under.
         """
+        # The isinstance half is load-bearing, not a redundant belt on the annotation: a config file
+        # with `"libraries_directory": 1` reaches here as an int, and Path(1) raises. Widening this
+        # to a string check alone would restore that crash.
         if not isinstance(libraries_directory, str) or not libraries_directory:
             libraries_directory = DEFAULT_LIBRARIES_DIRECTORY
         return resolve_workspace_path(Path(libraries_directory), self.configured_global_workspace_path())

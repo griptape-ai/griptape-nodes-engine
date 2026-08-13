@@ -8849,8 +8849,8 @@ class TestProjectPathFieldValidation:
     ) -> None:
         """`${GTN_TEST_LIBS}/libraries` with the variable unset is an error, not a fallback.
 
-        The old behavior logged a warning, discarded the declaration, and installed libraries under
-        `<workspace>/libraries` instead -- a location the project never asked for.
+        An unresolvable declaration is never quietly replaced with `<workspace>/libraries`:
+        installing libraries somewhere the project never named is worse than refusing to open.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
         from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
@@ -8957,6 +8957,64 @@ class TestProjectPathFieldValidation:
         # A nested block anchors at its first child key (`darwin:`), which is close enough for an
         # editor to jump to the offending field.
         assert problems[0].line_number == _line_of(project_yaml, "darwin:")
+
+    @pytest.mark.asyncio
+    async def test_quoted_variable_value_fails_the_load_instead_of_anchoring_under_the_project(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A variable whose value carries quotes is refused, not quietly relocated.
+
+        Quotes wrapping a whole value are cleaned, but a variable supplying only a PREFIX moves its
+        own quotes into the interior, where there is nothing left to strip. The leading quote then
+        makes an absolute path look relative, so it would be anchored under the project directory --
+        libraries installing somewhere the project never named, reported as a clean resolve.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setenv("GTN_TEST_QUOTED_ROOT", '"/mnt/studio"')
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_QUOTED_ROOT}/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "expanded to a quoted value" in problems[0].message
+        # The actionable half: the quotes are in the variable, so telling the user to edit this field
+        # would send them to the wrong file.
+        assert "remove the quotes from the variable's value" in problems[0].message
+        assert problems[0].line_number == _line_of(project_yaml, "libraries_dir:")
+
+    @pytest.mark.asyncio
+    async def test_quoted_variable_supplying_the_whole_value_still_resolves(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shape sanitizing was written for keeps working: quotes around the entire value.
+
+        Guards the boundary of the refusal above. A shell-exported `ROOT='"/mnt/studio"'` used on its
+        own is unambiguous -- the quotes surround everything, so they can be stripped -- and turning
+        that into a failed load would break the case `sanitize_path_string` exists to absorb.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        monkeypatch.setenv("GTN_TEST_QUOTED_WHOLE", f'"{tmp_path.as_posix()}/studio-libs"')
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_QUOTED_WHOLE}"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
 
     @pytest.mark.asyncio
     async def test_platform_gap_message_names_the_yaml_key_not_sys_platform(

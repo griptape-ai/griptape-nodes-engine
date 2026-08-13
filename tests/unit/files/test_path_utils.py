@@ -17,6 +17,7 @@ from griptape_nodes.files.path_utils import (
     decompose_source_path,
     expand_path,
     expand_path_fully,
+    expansion_introduced_quoting,
     normalize_path_for_platform,
     parse_file_uri,
     path_needs_expansion,
@@ -231,6 +232,34 @@ class TestStripSurroundingQuotes:
         """Test that unmatched quotes are preserved."""
         assert strip_surrounding_quotes('"test') == '"test'
         assert strip_surrounding_quotes("test'") == "test'"
+
+
+class TestExpansionIntroducedQuoting:
+    """Tests for expansion_introduced_quoting: quoting a variable brought in, not the author."""
+
+    def test_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """The case strip_surrounding_quotes cannot see: the quotes end up interior."""
+        assert expansion_introduced_quoting("${ROOT}/libs", '"/mnt/studio"/libs') is True
+
+    def test_single_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """A leading `'` flips is_absolute() exactly as `"` does, so it is refused too."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "'/mnt/studio'/libs") is True
+
+    def test_apostrophe_from_a_variable_value_is_not_flagged(self) -> None:
+        """`/mnt/Dragon's Curse` is a real directory, so an interior apostrophe must survive."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/Dragon's Curse/libs") is False
+
+    def test_apostrophe_the_author_declared_is_not_flagged(self) -> None:
+        """Quotes in the declared text are the author's intent, wherever they sit."""
+        assert expansion_introduced_quoting("'/mnt/studio'/libs", "'/mnt/studio'/libs") is False
+
+    def test_unquoted_expansion_is_not_flagged(self) -> None:
+        """The ordinary case stays ordinary."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/studio/libs") is False
+
+    def test_additional_double_quote_is_flagged_even_when_the_author_wrote_one(self) -> None:
+        """Counted rather than tested for presence, so an author's quote cannot mask a new one."""
+        assert expansion_introduced_quoting('/mnt/say"hi/${ROOT}', '/mnt/say"hi/"/opt"') is True
 
 
 class TestExpandPath:
