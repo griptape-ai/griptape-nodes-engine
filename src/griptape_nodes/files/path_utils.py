@@ -489,12 +489,21 @@ def unexpanded_references(path: str | Path) -> UnexpandedReferences:
     caller's rule (they are not legal in project path fields; see `resolve_project_path_field`), and
     whether an unsupplied variable is fatal depends on the caller too.
 
-    Two deliberate limits:
-    - A bare `$NAME` is NOT reported. `os.path.expandvars` accepts that form, but an unexpanded
-      `$Recycle.Bin` is indistinguishable from a real directory of that name, so it stays literal.
-      Only `${NAME}` and `%NAME%` are unambiguous enough to call out.
+    Three deliberate limits:
+    - A bare `$NAME` is NOT reported. `os.path.expandvars` accepts that form -- a set `$NAME` does
+      expand -- but an unexpanded `$Recycle.Bin` is indistinguishable from a real directory of that
+      name, so an unexpanded one stays literal. Only `${NAME}` and `%NAME%` are unambiguous enough to
+      call out.
     - `%NAME%` is only expanded by `os.path.expandvars` on Windows, so on other platforms it is
       reported even when the variable IS set. That is the honest answer: the value did not expand.
+      The cost is a POSIX path with two literal percent signs around a name-shaped run of characters
+      (`/srv/%share%/x`) being called out as unresolved. Requiring a leading letter or underscore
+      keeps the common encodings out of it -- `%20`, `%2F` and friends do not match -- which leaves
+      the false positive rare enough to prefer over silently creating a `%NAME%` directory on the one
+      platform where a cross-platform project.yml would not have expanded it.
+    - A variable that is SET BUT EMPTY cannot be reported. It expands to nothing and leaves no
+      delimiters behind, so by the time a value reaches here `${EMPTY}/libs` and `/libs` are the same
+      string. Callers that care must compare against the pre-expansion value themselves.
 
     Args:
         path: The already-expanded path (or any string) to scan.

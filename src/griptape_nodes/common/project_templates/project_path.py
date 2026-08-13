@@ -83,14 +83,23 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
 
     The supported contract for these fields, in order of application:
 
-    1. `~` and PROCESS/SHELL environment variables (`${NAME}`, `%NAME%` on Windows) are expanded,
-       repeatedly, until the value stops changing -- a variable's value may itself contain a
-       reference (`LIBS=${ROOT}/libs`), which a single pass would leave half-expanded.
+    1. `~` and PROCESS/SHELL environment variables are expanded, repeatedly, until the value stops
+       changing -- a variable's value may itself contain a reference (`LIBS=${ROOT}/libs`), which a
+       single pass would leave half-expanded. The accepted forms are `os.path.expandvars`'s: `$NAME`
+       and `${NAME}` everywhere, plus `%NAME%` on Windows. A bare `$NAME` IS expanded like the rest;
+       what makes it different is only that an UNEXPANDED one is not reported as missing (see
+       `unexpanded_references`), because `$Recycle.Bin` cannot be told apart from a real directory.
        The environment is the one the engine was launched with -- deliberately NOT the project's own
        `environment:` block, which activation applies only AFTER these fields resolve
        (`ProjectManager._activate_project` restores the outgoing project's env, resolves workspace
        and libraries, and only then calls `_apply_project_env`). Honoring a project's own
        `environment:` here would make a field's meaning depend on which project happens to be open.
+       That guarantee covers the project being ACTIVATED, not every caller: a project validated or
+       registered while some OTHER project is active is read against that project's applied
+       `environment:`, since `_apply_project_env` mutates `os.environ` process-wide until the
+       active project is swapped out. A value that depends on a variable only that other project
+       sets can therefore pass validation and later fail to resolve -- the window is spelled out on
+       `ProjectManager._resolve_template_path_field`.
     2. A path still relative AFTER expansion is anchored to `anchor_dir` (the directory of the YAML
        that DECLARED it), so a relative value travels with the project across machines.
     3. The result is canonicalized for identity so two spellings of one directory compare equal.
@@ -106,9 +115,11 @@ def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> Resolv
     the path built from it resolved perfectly well.
 
     `{NAME}` macro tokens are NOT supported here (the macro system resolves `directories:`
-    `path_macro` fields and node parameters, never these). They are reported rather than silently
-    becoming a directory named `{NAME}`. What counts as an unresolved reference at all is decided by
-    `unexpanded_references`, which also explains why a bare `$NAME` is left as a literal.
+    `path_macro` fields and node parameters, never these). The dependency runs the wrong way for it:
+    building the macro resolution bag needs `workspace_dir` and the project's directories, which are
+    among the values these fields produce. They are reported rather than silently becoming a directory
+    named `{NAME}`. What counts as an unresolved reference at all is decided by
+    `unexpanded_references`, which also explains which forms go unreported when they do not expand.
 
     Args:
         selected: The declared value, already reduced to one string via `select_project_path`.

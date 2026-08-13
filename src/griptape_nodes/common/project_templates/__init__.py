@@ -7,7 +7,11 @@ from griptape_nodes.common.project_templates.default_project_template import (
     default_template_for_version,
     schema_major_or_none,
 )
-from griptape_nodes.common.project_templates.directory import DirectoryDefinition, PerPlatformPathMacro
+from griptape_nodes.common.project_templates.directory import (
+    DirectoryDefinition,
+    PerPlatformPathMacro,
+    describe_active_platform,
+)
 from griptape_nodes.common.project_templates.loader import (
     ProjectOverlayData,
     YAMLLineInfo,
@@ -63,6 +67,7 @@ __all__ = [
     "YAMLLineInfo",
     "YAMLParseResult",
     "default_template_for_version",
+    "describe_active_platform",
     "load_partial_project_template",
     "load_project_template_from_yaml",
     "load_yaml_with_line_tracking",

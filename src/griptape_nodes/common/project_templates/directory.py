@@ -66,6 +66,20 @@ def _active_platform_key() -> str:
     return ""
 
 
+def describe_active_platform() -> str:
+    """Name the active platform the way a `select()`-failed message should name it.
+
+    `sys.platform` is the wrong string to show someone who has to act on the message: it says
+    `win32`, while the key they need to add to their YAML is `windows`. Report the mapping key
+    instead, so "no path for this platform (windows)" names something that appears in the file.
+
+    Falls back to `sys.platform` only on a platform `_active_platform_key` has no key for, where the
+    raw name is the honest answer -- no per-platform entry can match it, so `default` is the only fix
+    and naming a key would imply one exists.
+    """
+    return _active_platform_key() or sys.platform
+
+
 class DirectoryDefinition(BaseModel):
     """Definition of a logical directory in the project."""
 

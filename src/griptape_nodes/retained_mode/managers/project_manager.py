@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import sys
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -39,6 +38,7 @@ from griptape_nodes.common.project_templates import (
     ResolvedProjectPath,
     SituationTemplate,
     default_template_for_version,
+    describe_active_platform,
     load_partial_project_template,
     resolve_project_path_field,
     schema_major_or_none,
@@ -1015,8 +1015,9 @@ class ProjectManager(EngineScoped):
                     field_path=field_name,
                     message=(
                         f"Attempted to resolve '{field_name}' for this project. Failed because it "
-                        f"lists no path for this platform ({sys.platform}) and no 'default'. Add a "
-                        f"'default' entry for the platforms you did not name, or an entry for this one."
+                        f"lists no path for this platform ({describe_active_platform()}) and no "
+                        f"'default'. Add a 'default' entry for the platforms you did not name, or an "
+                        f"entry for this one."
                     ),
                     line_number=overlay.line_info.get_line(field_name),
                 )
@@ -1104,7 +1105,8 @@ class ProjectManager(EngineScoped):
                     field_path=parent_link_field,
                     message=(
                         f"Attempted to resolve this project's parent from parent_project_path. Failed "
-                        f"because it lists no path for this platform ({sys.platform}) and no 'default'."
+                        f"because it lists no path for this platform ({describe_active_platform()}) "
+                        f"and no 'default'."
                     ),
                     line_number=overlay.line_info.get_line(parent_link_field),
                 )
@@ -1971,9 +1973,7 @@ class ProjectManager(EngineScoped):
             return None
         return parent_path_candidate
 
-    async def resolve_libraries_root_for_project_id(
-        self, project_id: str, id_index: dict[str, Path] | None = None
-    ) -> Path | None:
+    async def resolve_libraries_root_for_project_id(self, project_id: str) -> Path | None:
         """Resolve the EXPLICIT libraries root a project would use WITHOUT loading it, or None.
 
         Offline analogue of decide_libraries_root's declaring rungs: the project's own libraries_dir
@@ -1992,13 +1992,14 @@ class ProjectManager(EngineScoped):
         A declared value that cannot be resolved does not reach here: _read_overlay rejects an
         unresolvable path field, so such a project is UNUSABLE and never gets walked.
 
+        Builds its own id -> path index. The listing does NOT come through here (it goes through
+        _effective_paths_for_project, which wants the fully-defaulted answer), so there is no caller
+        with an index to hand over and no reason to accept one until one exists.
+
         Args:
             project_id: Registry key, or a legacy id that is itself a canonical project file path.
-            id_index: Prebuilt id -> path index to reuse when resolving many projects in one pass
-                (the project listing). Built here when omitted.
         """
-        if id_index is None:
-            id_index = await self._build_unloaded_id_index()
+        id_index = await self._build_unloaded_id_index()
         project_file_path = self._project_file_path_for_id(project_id, id_index)
         if project_file_path is None:
             return None

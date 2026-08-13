@@ -8959,6 +8959,44 @@ class TestProjectPathFieldValidation:
         assert problems[0].line_number == _line_of(project_yaml, "darwin:")
 
     @pytest.mark.asyncio
+    async def test_platform_gap_message_names_the_yaml_key_not_sys_platform(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The message names the key the user must add (`windows`), not `sys.platform` (`win32`).
+
+        The two strings are the same on Linux and macOS, so every other platform-gap test passes
+        either way. Windows is the one platform where they differ, and telling someone their mapping
+        has "no path for this platform (win32)" points them at a key that does not exist in the
+        schema.
+
+        Patches the selector rather than `sys.platform` so the assertion holds on any host: a real
+        `sys.platform` of `win32` OR `linux` must be absent from the message, and neither is the
+        value being reported.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setattr(
+            "griptape_nodes.common.project_templates.directory._active_platform_key",
+            lambda: "windows",
+        )
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            "libraries_dir:\n"
+            '  darwin: "/Volumes/fast/libs"\n'
+            '  linux: "/mnt/fast/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "no path for this platform (windows) and no 'default'" in problems[0].message
+        assert sys.platform not in problems[0].message
+
+    @pytest.mark.asyncio
     async def test_every_broken_field_is_reported_in_one_load(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
