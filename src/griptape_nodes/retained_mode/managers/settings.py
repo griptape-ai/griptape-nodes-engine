@@ -364,6 +364,11 @@ class Settings(BaseModel):
         default="libraries",
         description="Path to directory for downloaded libraries. All griptape_nodes_library.json files found recursively will be auto-discovered on startup. Relative paths are interpreted relative to the workspace directory. Absolute paths are used as-is. A project may override this location via the project-template `libraries_dir` field (inheritable down the parent-project chain), which takes precedence over this value so a child project can share its parent's library install location.",
     )
+    ffmpeg_directory: str = Field(
+        category=FILE_SYSTEM,
+        default="",
+        description="Absolute path to the directory holding the ffmpeg/ffprobe binaries the engine downloads on first use. Unlike the other directory settings, this is never interpreted relative to the workspace: the ffmpeg cache belongs to the machine, not to a workspace, so it is shared across every workspace and project. Empty (the default) means `<XDG_DATA_HOME>/griptape_nodes/ffmpeg`. Point this at a directory containing a `bin/<platform>/` tree of ffmpeg binaries to use those instead of downloading.",
+    )
     app_events: AppEvents = Field(
         category=APPLICATION_EVENTS,
         default_factory=AppEvents,
