@@ -41,15 +41,34 @@ def resolve_ffmpeg_directory(configured_directory: str) -> Path:
 
     Args:
         configured_directory: The `ffmpeg_directory` config value. Empty means "use the
-            default"; anything else is taken as an absolute path, with `~` expanded.
+            default". A non-empty value must be absolute; `~` is expanded first.
 
     Returns:
         The directory that should hold `lock.file` and the `bin/<platform>/` tree.
     """
-    if configured_directory:
-        return Path(configured_directory).expanduser()
+    default_directory = xdg_data_home() / "griptape_nodes" / "ffmpeg"
 
-    return xdg_data_home() / "griptape_nodes" / "ffmpeg"
+    if not configured_directory:
+        return default_directory
+
+    configured_path = Path(configured_directory).expanduser()
+
+    # FAILURE CASE: a relative value gets resolved against the process working directory, which
+    # is not stable for the engine's lifetime. The download would land relative to the directory
+    # the engine happened to boot in, and a later lookup from anywhere else would miss it and
+    # download again. The setting is documented as absolute, so refuse rather than silently
+    # pick a location that moves.
+    if not configured_path.is_absolute():
+        logger.warning(
+            "The 'ffmpeg_directory' setting is '%s', which is not an absolute path. Using the "
+            "default location '%s' instead. Set 'ffmpeg_directory' to an absolute path to choose "
+            "where ffmpeg is stored.",
+            configured_directory,
+            default_directory,
+        )
+        return default_directory
+
+    return configured_path
 
 
 def redirect_ffmpeg_cache(directory: Path) -> None:
