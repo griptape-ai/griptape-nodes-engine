@@ -12,11 +12,16 @@ from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
 from griptape_nodes.retained_mode.events.os_events import (
     DeleteFileRequest,
     DeleteFileResultSuccess,
+    FileIOFailureReason,
     MakeDirectoryRequest,
     RenameFileRequest,
+    RenameFileResultFailure,
     WriteFileResultSuccess,
 )
-from griptape_nodes.retained_mode.events.secrets_events import GetAllSecretValuesResultSuccess
+from griptape_nodes.retained_mode.events.secrets_events import (
+    GetAllSecretValuesRequest,
+    GetAllSecretValuesResultSuccess,
+)
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.publishing.workflow_packager import (
     DOWNLOAD_MODELS_SCRIPT_NAME,
@@ -441,9 +446,9 @@ class TestWriteEnvFile:
 
 
 class TestGetProcessEnvSecrets:
-    """get_process_env_secrets picks up registered secrets that exist only in the environment."""
+    """get_process_env_secrets picks up registered secrets exported into the environment."""
 
-    def test_returns_registered_secret_set_only_in_the_environment(self) -> None:
+    def test_returns_registered_secret_set_in_the_environment(self) -> None:
         """A registered secret exported in the shell is available to the bundle."""
         secrets_manager = MagicMock(secrets_to_register={"GT_CLOUD_API_KEY": ""})
 
@@ -454,12 +459,12 @@ class TestGetProcessEnvSecrets:
             ),
             patch.dict("os.environ", {"GT_CLOUD_API_KEY": "from-shell"}, clear=False),
         ):
-            result = WorkflowPackager.get_process_env_secrets(exclude=set())
+            result = WorkflowPackager.get_process_env_secrets()
 
         assert result == {"GT_CLOUD_API_KEY": "from-shell"}
 
-    def test_skips_excluded_and_unregistered_keys(self) -> None:
-        """Keys already sourced from a .env file, and unregistered env vars, are left alone."""
+    def test_skips_unregistered_environment_variables(self) -> None:
+        """Only registered secret names are read, so unrelated process state stays out."""
         secrets_manager = MagicMock(secrets_to_register={"GT_CLOUD_API_KEY": ""})
 
         with (
@@ -469,9 +474,9 @@ class TestGetProcessEnvSecrets:
             ),
             patch.dict("os.environ", {"GT_CLOUD_API_KEY": "from-shell", "UNRELATED_SECRET": "nope"}, clear=False),
         ):
-            result = WorkflowPackager.get_process_env_secrets(exclude={"GT_CLOUD_API_KEY"})
+            result = WorkflowPackager.get_process_env_secrets()
 
-        assert result == {}
+        assert result == {"GT_CLOUD_API_KEY": "from-shell"}
 
     def test_skips_blank_environment_values(self) -> None:
         """An exported-but-empty variable is not treated as a credential."""
@@ -484,9 +489,47 @@ class TestGetProcessEnvSecrets:
             ),
             patch.dict("os.environ", {"GT_CLOUD_API_KEY": ""}, clear=False),
         ):
-            result = WorkflowPackager.get_process_env_secrets(exclude=set())
+            result = WorkflowPackager.get_process_env_secrets()
 
         assert result == {}
+
+
+class TestWriteEnv:
+    """write_env resolves its sources in the order SecretsManager.get_secret does."""
+
+    def test_exported_value_wins_over_the_workspace_env_file(self, tmp_path: Path) -> None:
+        """An exported secret is bundled ahead of a different value on disk.
+
+        ``get_secret`` resolves OS environment variables ahead of both .env files, so
+        bundling the file's value would ship a credential the live session does not use.
+        """
+        packager = WorkflowPackager("test_workflow")
+        workspace_env = tmp_path / "workspace" / ".env"
+        workspace_env.parent.mkdir()
+        workspace_env.write_text("GT_CLOUD_API_KEY='from-file'\n", encoding="utf-8")
+        destination = tmp_path / "bundle"
+        secrets_manager = MagicMock(workspace_env_path=workspace_env, secrets_to_register={"GT_CLOUD_API_KEY": ""})
+
+        def handle_request(request: MagicMock) -> MagicMock:
+            """Serve the secret read from the mock, and write files to the real filesystem."""
+            if isinstance(request, GetAllSecretValuesRequest):
+                return MagicMock(spec=GetAllSecretValuesResultSuccess, values={})
+            return _write_file_via_real_fs(request)
+
+        with (
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.SecretsManager",
+                return_value=secrets_manager,
+            ),
+            patch(
+                "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                side_effect=handle_request,
+            ),
+            patch.dict("os.environ", {"GT_CLOUD_API_KEY": "from-shell"}, clear=False),
+        ):
+            packager.write_env(destination)
+
+        assert dotenv_values(destination / ".env")["GT_CLOUD_API_KEY"] == "from-shell"
 
 
 class TestWriteDownloadModelsScript:
@@ -676,21 +719,27 @@ class TestStagedPublish:
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_rename = WorkflowPackager._rename
-        staged_bundle_moved_in = False
+        real_handle_request = GriptapeNodes.handle_request
+        staged_bundle_move_attempted = False
 
-        def fail_moving_new_bundle_into_place(source: Path, target: Path, *, failure_context: str) -> None:
-            """Fail the staging -> destination move; let the aside and restore moves through."""
-            nonlocal staged_bundle_moved_in
-            if target == destination and not staged_bundle_moved_in:
-                staged_bundle_moved_in = True
-                msg = "simulated rename failure"
-                raise TypeError(msg)
-            real_rename(source, target, failure_context=failure_context)
+        def fail_moving_new_bundle_into_place(request: object) -> object:
+            """Refuse the staging -> destination move; let the aside and restore moves through."""
+            nonlocal staged_bundle_move_attempted
+            moving_into_destination = isinstance(request, RenameFileRequest) and request.new_path == str(destination)
+            if moving_into_destination and not staged_bundle_move_attempted:
+                staged_bundle_move_attempted = True
+                return RenameFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                    result_details="simulated rename failure",
+                )
+            return real_handle_request(request)  # type: ignore[arg-type]
 
         def publish_with_failing_swap() -> None:
             with (
-                patch.object(WorkflowPackager, "_rename", staticmethod(fail_moving_new_bundle_into_place)),
+                patch(
+                    "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                    side_effect=fail_moving_new_bundle_into_place,
+                ),
                 packager.staged_publish(destination) as staging,
             ):
                 (staging / "run.py").write_text("new", encoding="utf-8")
@@ -707,18 +756,23 @@ class TestStagedPublish:
         destination.mkdir()
         (destination / "run.py").write_text("previous", encoding="utf-8")
 
-        real_rename = WorkflowPackager._rename
+        real_handle_request = GriptapeNodes.handle_request
 
-        def fail_every_move_to_the_destination(source: Path, target: Path, *, failure_context: str) -> None:
-            """Fail both the swap and the rollback, leaving the destination missing."""
-            if target == destination:
-                msg = "simulated rename failure"
-                raise TypeError(msg)
-            real_rename(source, target, failure_context=failure_context)
+        def fail_every_move_to_the_destination(request: object) -> object:
+            """Refuse both the swap and the rollback, leaving the destination missing."""
+            if isinstance(request, RenameFileRequest) and request.new_path == str(destination):
+                return RenameFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                    result_details="simulated rename failure",
+                )
+            return real_handle_request(request)  # type: ignore[arg-type]
 
         def publish_with_failing_swap_and_rollback() -> None:
             with (
-                patch.object(WorkflowPackager, "_rename", staticmethod(fail_every_move_to_the_destination)),
+                patch(
+                    "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                    side_effect=fail_every_move_to_the_destination,
+                ),
                 packager.staged_publish(destination) as staging,
             ):
                 (staging / "run.py").write_text("new", encoding="utf-8")
@@ -729,6 +783,40 @@ class TestStagedPublish:
         moved_aside = list(tmp_path.glob("bundle.publish-*.previous"))
         assert len(moved_aside) == 1
         assert (moved_aside[0] / "run.py").read_text(encoding="utf-8") == "previous"
+
+    def test_failure_names_the_destination_not_a_working_directory(self, tmp_path: Path) -> None:
+        """Every swap failure names the bundle the user published to, whichever move failed."""
+        packager = WorkflowPackager("test_workflow")
+        destination = tmp_path / "bundle"
+        destination.mkdir()
+        (destination / "run.py").write_text("previous", encoding="utf-8")
+
+        real_handle_request = GriptapeNodes.handle_request
+
+        def fail_moving_the_previous_bundle_aside(request: object) -> object:
+            """Refuse the destination -> aside move, whose target is an internal path."""
+            if isinstance(request, RenameFileRequest) and request.old_path == str(destination):
+                return RenameFileResultFailure(
+                    failure_reason=FileIOFailureReason.PERMISSION_DENIED,
+                    result_details="simulated rename failure",
+                )
+            return real_handle_request(request)  # type: ignore[arg-type]
+
+        def publish_with_failing_move_aside() -> None:
+            with (
+                patch(
+                    "griptape_nodes.retained_mode.publishing.workflow_packager.GriptapeNodes.handle_request",
+                    side_effect=fail_moving_the_previous_bundle_aside,
+                ),
+                packager.staged_publish(destination) as staging,
+            ):
+                (staging / "run.py").write_text("new", encoding="utf-8")
+
+        with pytest.raises(TypeError) as failure:
+            publish_with_failing_move_aside()
+
+        assert f"'{destination}'" in str(failure.value)
+        assert ".publish-" not in str(failure.value)
 
     def test_cleanup_failure_does_not_fail_the_publish(self, tmp_path: Path) -> None:
         """A working directory that cannot be removed is logged, not raised over."""

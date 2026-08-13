@@ -19,7 +19,7 @@ import uuid
 from contextlib import contextmanager
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NoReturn
 from urllib.parse import urlparse
 from urllib.request import url2pathname
 
@@ -261,18 +261,17 @@ class WorkflowPackager:
         return env_file_dict
 
     @staticmethod
-    def get_process_env_secrets(exclude: set[str]) -> dict[str, str]:
-        """Return registered secrets whose only value lives in the process environment.
+    def get_process_env_secrets() -> dict[str, str]:
+        """Return registered secrets exported into the process environment.
 
         ``SecretsManager.get_secret`` resolves OS environment variables ahead of both .env
-        files, so an exported credential is a working setup with nothing on disk to bundle.
-        Only *registered* secret names are consulted, never the whole environment.
+        files, so an exported credential is both a working setup with nothing on disk to
+        bundle and the value the live session uses when the two disagree. Only *registered*
+        secret names are consulted, never the whole environment.
         """
         secrets_manager = GriptapeNodes.SecretsManager()
         env_secrets: dict[str, str] = {}
         for secret_name in secrets_manager.secrets_to_register:
-            if secret_name in exclude:
-                continue
             value = os.environ.get(secret_name)
             if value is not None and value.strip():
                 env_secrets[secret_name] = value
@@ -307,7 +306,10 @@ class WorkflowPackager:
         """Write a .env file with merged secrets to the destination."""
         secrets_manager = GriptapeNodes.SecretsManager()
         env_mapping = self.get_merged_env_mapping(secrets_manager.workspace_env_path)
-        env_mapping.update(self.get_process_env_secrets(exclude=set(env_mapping)))
+        # Applied over the on-disk mapping, matching the precedence get_secret resolves
+        # with: an exported credential is what the live session uses, so it is what the
+        # bundle must ship.
+        env_mapping.update(self.get_process_env_secrets())
         env_mapping["GTN_CONFIG_WORKSPACE_DIRECTORY"] = "."
         env_mapping["GTN_ENABLE_WORKSPACE_FILE_WATCHING"] = "false"
         self.write_env_file(destination / ".env", env_mapping)
@@ -797,24 +799,19 @@ dependencies = [
         two moves leaves the destination populated instead of missing.
         """
         had_previous = destination.exists()
-        if had_previous:
-            cls._rename(destination, previous_dir, failure_context="move the previous bundle aside")
+        if had_previous and not cls._rename(destination, previous_dir):
+            cls._raise_publish_failure(destination, "move the previous bundle aside")
 
-        try:
-            cls._rename(staging_dir, destination, failure_context="move the new bundle into place")
-        except TypeError:
+        if not cls._rename(staging_dir, destination):
             # Report the failure that actually stopped the publish, not one from the
             # rollback -- so log a failed restore rather than raising over the cause.
-            if had_previous:
-                try:
-                    cls._rename(previous_dir, destination, failure_context="restore the previous bundle")
-                except TypeError:
-                    logger.error(
-                        "Could not restore the previous bundle to '%s'. It remains at '%s'.",
-                        destination,
-                        previous_dir,
-                    )
-            raise
+            if had_previous and not cls._rename(previous_dir, destination):
+                logger.error(
+                    "Could not restore the previous bundle to '%s'. It remains at '%s'.",
+                    destination,
+                    previous_dir,
+                )
+            cls._raise_publish_failure(destination, "move the new bundle into place")
 
     @staticmethod
     def _make_directory(path: Path) -> None:
@@ -826,15 +823,31 @@ dependencies = [
             raise TypeError(msg)
 
     @staticmethod
-    def _rename(source: Path, destination: Path, *, failure_context: str) -> None:
-        """Rename a file or directory using the engine's OS event system."""
+    def _rename(source: Path, destination: Path) -> bool:
+        """Rename a file or directory using the engine's OS event system, reporting success.
+
+        Reports failure by returning rather than raising: the caller drives a rollback off
+        the result, and keying that off a caught exception would make a programming error
+        here indistinguishable from a rename the OS refused.
+        """
         result = GriptapeNodes.handle_request(
             RenameFileRequest(old_path=str(source), new_path=str(destination), workspace_only=False)
         )
         if not isinstance(result, RenameFileResultSuccess):
-            msg = f"Failed to publish the workflow bundle to '{destination}'. Could not {failure_context}."
-            logger.error(msg)
-            raise TypeError(msg)
+            logger.error("Could not rename '%s' to '%s'.", source, destination)
+            return False
+        return True
+
+    @staticmethod
+    def _raise_publish_failure(destination: Path, failure_context: str) -> NoReturn:
+        """Raise a publish failure naming the bundle directory the publish was aimed at.
+
+        The paths the swap renames through are internal working directories the user never
+        configured, so the message stays on the destination regardless of which move failed.
+        """
+        msg = f"Failed to publish the workflow bundle to '{destination}'. Could not {failure_context}."
+        logger.error(msg)
+        raise TypeError(msg)
 
     @staticmethod
     def _discard_directory(path: Path) -> None:
