@@ -238,7 +238,6 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.retained_mode import RetainedMode
-from griptape_nodes.utils.exception_utils import readable_exception_message
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -694,11 +693,11 @@ class NodeManager(EngineScoped):
             node_type: Node type that was being created, used to find the library when unnamed
             library_name: Library the node type was requested from, if the caller named one
         """
-        message = readable_exception_message(err)
+        message = str(err)
 
         resolved_library_name = library_name
         if resolved_library_name is None:
-            resolved_library_name = self._library_name_for_node_type(node_type)
+            resolved_library_name = self.engine.library_manager.get_library_name_for_node_type(node_type)
         if resolved_library_name is None:
             return message
 
@@ -714,23 +713,6 @@ class NodeManager(EngineScoped):
             parts.append(stale_module_explanation)
 
         return "\n\n".join(parts)
-
-    def _library_name_for_node_type(self, node_type: str) -> str | None:
-        """The library that provides a node type, or None when it cannot be pinned to one.
-
-        A create request need not name a library, so the failure path resolves the owning library
-        itself before it can report that library's problems. A node type no library provides may
-        still be one whose module failed to import, which registers nothing but does record the
-        failure against the library that owns the node file.
-
-        Args:
-            node_type: Node type to find the providing library for
-        """
-        try:
-            library = LibraryRegistry.get_library_for_node_type(node_type)
-        except KeyError:
-            return self.engine.library_manager.get_library_name_reporting_node_import_failure(node_type)
-        return library.get_library_data().name
 
     def on_create_node_request(self, request: CreateNodeRequest) -> ResultPayload:  # noqa: C901, PLR0911, PLR0912, PLR0915
         # Validate as much as possible before we actually create one.
@@ -800,10 +782,7 @@ class NodeManager(EngineScoped):
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
-            details = (
-                f"Could not create Node '{final_node_name}' of type '{request.node_type}': "
-                f"{readable_exception_message(err)}"
-            )
+            details = f"Could not create Node '{final_node_name}' of type '{request.node_type}': {err}"
             logger.error(details)
 
             # Check if we should create an Error Proxy node instead of failing

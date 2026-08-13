@@ -7,6 +7,7 @@ import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+from griptape_nodes.node_library.library_registry import LibraryRegistryError
 from griptape_nodes.retained_mode.engine import Engine
 from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
@@ -1058,7 +1059,7 @@ class TestNodeCreationFailureDescription:
         self._record_flawed_library(griptape_nodes, tmp_path)
 
         description = griptape_nodes.NodeManager()._describe_node_creation_failure(
-            KeyError(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'"),
+            LibraryRegistryError(f"Node type 'Agent' not found in library '{self._LIBRARY_NAME}'"),
             node_type="Agent",
             library_name=self._LIBRARY_NAME,
         )
@@ -1093,7 +1094,7 @@ class TestNodeCreationFailureDescription:
         self._record_flawed_library(griptape_nodes, tmp_path)
 
         description = griptape_nodes.NodeManager()._describe_node_creation_failure(
-            KeyError("No node type 'Agent' could be found in any of the libraries registered."),
+            LibraryRegistryError("No node type 'Agent' could be found in any of the libraries registered."),
             node_type="Agent",
             library_name=None,
         )

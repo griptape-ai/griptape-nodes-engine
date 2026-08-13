@@ -139,7 +139,7 @@ class TestNodeImportProblemReporting:
         _register_library(manager, tmp_path)
 
         assert manager._library_has_node_import_problems(LIBRARY_NAME) is False
-        assert manager.get_library_name_reporting_node_import_failure("SomeNode") is None
+        assert manager.get_library_name_for_node_type("SomeNode") is None
 
     def test_import_problems_are_found_and_attributed(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         manager = griptape_nodes.LibraryManager()
@@ -152,8 +152,8 @@ class TestNodeImportProblemReporting:
         assert manager._library_has_node_import_problems(LIBRARY_NAME) is True
         # A node type whose module failed to import registers nowhere, so the recorded failure is
         # the only thing that can name its library.
-        assert manager.get_library_name_reporting_node_import_failure("SomeNode") == LIBRARY_NAME
-        assert manager.get_library_name_reporting_node_import_failure("UnrelatedNode") is None
+        assert manager.get_library_name_for_node_type("SomeNode") == LIBRARY_NAME
+        assert manager.get_library_name_for_node_type("UnrelatedNode") is None
 
 
 class TestReloadResultsReportRestart:

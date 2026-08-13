@@ -53,6 +53,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryNameAndVersion,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
@@ -949,20 +950,21 @@ class LibraryManager(EngineScoped):
             return None
         return self.collate_problems_for_lib_info(library_info)
 
-    def get_library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
-        """The library that recorded an import failure for a node type, or None when none did.
+    def get_library_name_for_node_type(self, node_type: str) -> str | None:
+        """The library that provides a node type, or None when it cannot be pinned to one.
 
-        A node type whose module failed to import registers nothing, so the recorded failure is the
-        only thing that can name its library.
+        A node type several libraries provide has no single owner. A node type no library provides
+        may still be one whose module failed to import, which registers nothing but does record the
+        failure against the library that owns the node file.
 
         Args:
-            node_type: Class name of the node type to look for
+            node_type: Node type to find the providing library for
         """
-        for library_info in self._library_file_path_to_info.values():
-            for problem in library_info.problems:
-                if isinstance(problem, NodeModuleImportProblem) and problem.class_name == node_type:
-                    return library_info.library_name
-        return None
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type)
+        except LibraryRegistryError:
+            return self._library_name_reporting_node_import_failure(node_type)
+        return library.get_library_data().name
 
     def explain_stale_module_failure(self, library_name: str) -> str | None:
         """An artist-facing explanation for an import failure caused by a mid-session reload.
@@ -981,6 +983,21 @@ class LibraryManager(EngineScoped):
             f"so the engine is still running the code it loaded first. Restart the engine to pick up "
             f"the new code."
         )
+
+    def _library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
+        """The library that recorded an import failure for a node type, or None when none did.
+
+        A node type whose module failed to import registers nothing, so the recorded failure is the
+        only thing that can name its library.
+
+        Args:
+            node_type: Class name of the node type to look for
+        """
+        for library_info in self._library_file_path_to_info.values():
+            for problem in library_info.problems:
+                if isinstance(problem, NodeModuleImportProblem) and problem.class_name == node_type:
+                    return library_info.library_name
+        return None
 
     def _explain_restart_after_reload(self, library_name: str) -> str | None:
         """The restart explanation to report after reloading a library, or None when it took cleanly.
