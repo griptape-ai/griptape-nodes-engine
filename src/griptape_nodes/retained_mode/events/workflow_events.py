@@ -15,6 +15,7 @@ from griptape_nodes.retained_mode.events.base_events import (
     WorkflowNotAlteredMixin,
 )
 from griptape_nodes.retained_mode.events.execution_events import ExecutionPayload
+from griptape_nodes.retained_mode.events.os_events import FileIOFailureReason
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 if TYPE_CHECKING:
@@ -342,8 +343,9 @@ class SaveWorkflowRequest(RequestPayload):
         pickle_control_flow_result: Whether to use pickle-based serialization for control flow results (None for default behavior)
         display_name: Optional display name (metadata.name). If provided, overrides the existing display name instead of preserving it.
         create_versioned: When True, route the save through the ``create_versioned_workflow`` situation so each save produces a new versioned file (e.g. ``my_workflow_v001.py``, ``my_workflow_v002.py``, ...). When False (default), route through ``save_workflow``, which overwrites the existing file in place.
+        overwrite_existing: When False and ``file_name`` exactly matches the registry key of a *different* already-registered workflow, the save fails with ``FileIOFailureReason.POLICY_NO_OVERWRITE`` instead of clobbering that workflow's file. When True (default), proceed with the overwrite. Re-saving the workflow that is currently open always succeeds regardless of this flag. Scope is deliberately narrow — the guard covers exact registered registry keys only, so it does not catch a key that differs by case on a case-insensitive filesystem, nor an unregistered stray ``.py`` file sitting at the computed save path; those paths defer to the ``save_workflow`` situation's own collision policy. Also has no effect when ``create_versioned=True``, since versioned saves write a new file rather than overwriting in place.
 
-    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error)
+    Results: SaveWorkflowResultSuccess (with file path) | SaveWorkflowResultFailure (save error or refused overwrite)
     """
 
     file_name: str | None = None
@@ -351,6 +353,7 @@ class SaveWorkflowRequest(RequestPayload):
     pickle_control_flow_result: bool | None = None
     display_name: str | None = None
     create_versioned: bool = False
+    overwrite_existing: bool = True
 
 
 @dataclass
@@ -405,7 +408,16 @@ class SaveWorkflowResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow save failed. Common causes: file system error, permission denied, invalid path."""
+    """Workflow save failed.
+
+    Common causes: file system error, permission denied, invalid path, workflow conflict.
+
+    Attributes:
+        failure_reason: Classification of why the save failed
+        result_details: Human-readable error message (inherited from ResultPayloadFailure)
+    """
+
+    failure_reason: FileIOFailureReason | None = None
 
 
 @dataclass
@@ -1158,7 +1170,16 @@ class SaveWorkflowFileFromSerializedFlowResultSuccess(WorkflowNotAlteredMixin, R
 @dataclass
 @PayloadRegistry.register
 class SaveWorkflowFileFromSerializedFlowResultFailure(WorkflowNotAlteredMixin, ResultPayloadFailure):
-    """Workflow file save failed. Common causes: file system error, permission denied, invalid serialized commands."""
+    """Workflow file save failed.
+
+    Common causes: file system error, permission denied, invalid serialized commands,
+    refused overwrite.
+
+    Attributes:
+        failure_reason: Classification of why the save failed
+    """
+
+    failure_reason: FileIOFailureReason | None = None
 
 
 @dataclass
