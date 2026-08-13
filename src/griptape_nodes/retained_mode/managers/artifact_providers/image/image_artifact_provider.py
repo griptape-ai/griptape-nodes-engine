@@ -19,6 +19,7 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_prov
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -45,13 +46,14 @@ class ImageArtifactProvider(BaseArtifactProvider):
     (e.g., PIL/Pillow) that are loaded lazily when the provider is instantiated.
     """
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize the image artifact provider.
 
         Args:
             registry: The ProviderRegistry that manages this provider
+            engine: The engine this provider belongs to
         """
-        super().__init__(registry)
+        super().__init__(registry, engine)
 
     @classmethod
     def get_friendly_name(cls) -> str:

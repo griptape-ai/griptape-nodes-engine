@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING, ClassVar
 
 from static_ffmpeg import run as static_ffmpeg_run
 
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_provider import (
     BaseArtifactMetadata,
     BaseArtifactProvider,
@@ -26,6 +25,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.base_artifact_preview_generator import (
         BaseArtifactPreviewGenerator,
     )
@@ -56,13 +56,14 @@ class VideoArtifactProvider(BaseArtifactProvider):
     # sits at offset 8-12; EBML/RIFF headers fit comfortably inside 12 bytes.
     _SNIFF_MIN_HEADER_BYTES: ClassVar[int] = 12
 
-    def __init__(self, registry: ProviderRegistry) -> None:
+    def __init__(self, registry: ProviderRegistry, engine: Engine | None = None) -> None:
         """Initialize the video artifact provider.
 
         Args:
             registry: The ProviderRegistry that manages this provider
+            engine: The engine this provider belongs to
         """
-        super().__init__(registry)
+        super().__init__(registry, engine)
 
     @classmethod
     def get_friendly_name(cls) -> str:
@@ -175,9 +176,8 @@ class VideoArtifactProvider(BaseArtifactProvider):
             container_format=container_format,
         )
 
-    @classmethod
     def _check_codec(
-        cls,
+        self,
         source_path: str,
         *,
         action: CheckpointAction,
@@ -206,8 +206,8 @@ class VideoArtifactProvider(BaseArtifactProvider):
         code on the read side) is expected to wrap this detail with any
         file-name framing.
         """
-        probe_data = cls._run_ffprobe(source_path)
-        codecs = cls._codecs_from_probe_data(probe_data)
+        probe_data = self._run_ffprobe(source_path)
+        codecs = self._codecs_from_probe_data(probe_data)
         if not codecs:
             return CheckpointDenial(
                 failures=(
@@ -218,7 +218,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
             )
 
         for codec in codecs:
-            denial = cls._evaluate_codec_checkpoint(
+            denial = self._evaluate_codec_checkpoint(
                 action=action,
                 codec=codec,
                 container_format=container_format,
@@ -248,9 +248,8 @@ class VideoArtifactProvider(BaseArtifactProvider):
                 codecs.append(codec)
         return codecs
 
-    @staticmethod
     def _evaluate_codec_checkpoint(
-        action: CheckpointAction, codec: str, container_format: str
+        self, action: CheckpointAction, codec: str, container_format: str
     ) -> CheckpointDenial | None:
         """Build the checkpoint and ask the event manager's hook chain for a verdict.
 
@@ -270,7 +269,7 @@ class VideoArtifactProvider(BaseArtifactProvider):
                 CheckpointAttribute.CONTAINER_FORMAT: container_format,
             },
         )
-        return GriptapeNodes.EventManager().evaluate_authorization_checkpoint(checkpoint)
+        return self.engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
 
     @classmethod
     def _run_ffprobe(cls, source_path: str) -> dict | None:
