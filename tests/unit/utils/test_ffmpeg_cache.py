@@ -22,11 +22,6 @@ from griptape_nodes.utils.ffmpeg_cache import redirect_ffmpeg_cache, resolve_ffm
 LOCK_TIMEOUT_SECONDS = 5
 
 
-def _package_contents(package_dir: Path) -> list[str]:
-    """Names directly inside `static_ffmpeg`'s package directory, ignoring bytecode caches."""
-    return sorted(entry.name for entry in package_dir.iterdir() if entry.name != "__pycache__")
-
-
 @pytest.fixture(autouse=True)
 def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     """Restore `static_ffmpeg`'s module globals after each test.
@@ -133,32 +128,38 @@ class TestRedirectFfmpegCache:
 class TestPackageDirectoryIsNeverWritten:
     """The defect in desktop#395 was a *write into `static_ffmpeg`'s own package directory*.
 
-    A read-only filesystem was only how that write became visible. The write itself happens on
-    every platform, so the first test below pins the actual defect rather than the symptom --
-    no AppImage, no FUSE mount and no Linux host required. The second reproduces the failure
-    itself, and only runs where a directory can genuinely be made unwritable.
+    A read-only filesystem was only how that write became visible. Where the write lands is
+    observable on every platform, so the first test below pins the actual defect rather than
+    the symptom -- no AppImage, no FUSE mount and no Linux host required. The second
+    reproduces the failure itself, and only runs where a directory can genuinely be made
+    unwritable.
 
     Both drive `filelock.FileLock`, the class
     `get_or_fetch_platform_executables_else_raise` constructs at `static_ffmpeg/run.py:102`,
     rather than a stand-in for it.
     """
 
-    def test_locking_does_not_touch_the_package_directory(self, tmp_path: Path) -> None:
-        """Taking the lock must create it under the redirect target, and nowhere else."""
+    def test_locking_lands_outside_the_package_directory(self, tmp_path: Path) -> None:
+        """Taking the real lock must create it under the redirect target, not in `site-packages`.
+
+        Asserts on the file the lock actually creates rather than on the state of
+        `static_ffmpeg`'s package directory, which cannot be asserted on at all: the suite
+        runs under `pytest -n auto`, and `test_ffmpeg_preview_generator` resolves ffmpeg for
+        real at module import, dropping a `lock.file` in that shared directory at a moment
+        this test cannot predict. `filelock` then leaves the file behind on POSIX -- only the
+        Windows implementation unlinks on release -- so its presence there is evidence of
+        nothing.
+        """
         package_dir = Path(static_ffmpeg.run.__file__).parent
-        before = _package_contents(package_dir)
 
         redirect_ffmpeg_cache(tmp_path)
 
-        # Asserted while the lock is held: releasing it removes the file on Windows but leaves
-        # it in place on POSIX, so its absence afterwards would prove nothing.
+        # Asserted while the lock is held, for the same release-behavior difference.
         with FileLock(static_ffmpeg.run.LOCK_FILE, timeout=LOCK_TIMEOUT_SECONDS):
             held_lock = Path(static_ffmpeg.run.LOCK_FILE)
             assert held_lock.exists()
             assert held_lock.is_relative_to(tmp_path)
-
-        assert not (package_dir / "lock.file").exists()
-        assert before == _package_contents(package_dir)
+            assert not held_lock.is_relative_to(package_dir)
 
     @pytest.mark.skipif(os.name != "posix", reason="needs POSIX permission bits to make a directory unwritable")
     @pytest.mark.skipif(os.name == "posix" and os.geteuid() == 0, reason="root bypasses permission bits")
