@@ -83,10 +83,21 @@ VISION_MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES
 
 
 # Keys in a MODEL_CHOICES_ARGS `args` preset that map onto Pydantic AI
-# `ModelSettings` fields. The presets also carry driver-only keys (`stream`,
-# `structured_output_strategy`) that `ModelSettings` has no slot for, so
-# consumers have to filter rather than splat the preset wholesale.
+# `ModelSettings` fields and are therefore forwarded to the model.
+#
+# This is an allowlist, so a preset key that is a perfectly valid ModelSettings
+# field but missing from here would be dropped on the way to the wire — the same
+# shape of bug as the one MODEL_SETTINGS exists to fix. _DRIVER_ONLY_KEYS below
+# makes the classification total: `test_every_preset_key_is_classified` fails on
+# a preset key that appears in neither tuple, so adding a key to a preset forces
+# a decision here rather than letting it silently go nowhere.
 _MODEL_SETTINGS_KEYS = ("max_tokens", "temperature", "top_p")
+
+# Preset keys that configure our driver rather than the model request.
+# `ModelSettings` has no slot for these, so consumers filter rather than splat
+# the preset wholesale. Deliberately exhaustive: a key here is knowingly not
+# forwarded, which is what distinguishes it from one that was forgotten.
+_DRIVER_ONLY_KEYS = ("stream", "structured_output_strategy")
 
 MODEL_SETTINGS: dict[str, dict[str, Any]] = {
     str(model["name"]): settings
@@ -103,8 +114,14 @@ MODEL_SETTINGS: dict[str, dict[str, Any]] = {
 
 A model whose preset carries no settings-relevant keys is absent rather than
 mapped to an empty dict, so "unknown model" and "nothing to apply" collapse into
-one case. A ``None`` in a preset means "don't send this field" (the o-series
-``top_p``), which omitting it already achieves, so those are filtered out too.
+one case. A ``None`` in a preset means "don't send this field" — today only
+``deepseek.r1-v1``'s ``top_p`` — which omitting it already achieves, so those are
+filtered out too. (The o-series also rejects ``top_p``, but its preset simply
+never sets it; see :data:`O_SERIES_MODELS`.)
+
+Resolves to the three Claude models today, since they are the only entries whose
+presets carry a ``ModelSettings`` key. Every other catalog model has no preset
+setting to apply and keeps the provider default.
 """
 
 

@@ -522,6 +522,11 @@ class AgentManager(EngineScoped):
                     "text": result.output,
                     "message_count": result.message_count,
                     "cancelled": True,
+                    # A cancelled turn is stopped before the model reports a
+                    # finish_reason, so this is False rather than unknown. Set on
+                    # every branch so a consumer can read `output.truncated`
+                    # without having to treat a missing key as False.
+                    "truncated": False,
                     "generated_image_urls": result.image_urls,
                 },
                 thread_id=result.thread_id,
