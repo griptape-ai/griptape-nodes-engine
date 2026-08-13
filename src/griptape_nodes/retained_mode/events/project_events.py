@@ -227,6 +227,19 @@ class ProjectTemplateInfo:
         current_engine_version: The running engine version, for display.
         engine_version_reason: Human-readable detail explaining an incompatibility,
             None when compatible.
+        workspace_dir: Absolute path of the workspace this project activates with,
+            resolved through the same ladder activation uses (the project's own
+            `workspace_dir`, the `project_workspaces` mapping, an environment or
+            project-adjacent setting, inheritance from the parent chain, or the
+            global default). None ONLY when the entry is not file-backed (e.g. the
+            system defaults) or its template failed to load -- never because
+            resolution was attempted and gave up. A project whose declared path
+            fields cannot be resolved does not load at all; see `validation` for
+            the field and line at fault.
+        libraries_root: Absolute path where this project's libraries install and
+            resolve from -- its own `libraries_dir`, else the nearest ancestor that
+            declares one, else the workspace-relative `libraries_directory`
+            setting. None under the same conditions as `workspace_dir`.
     """
 
     project_id: ProjectID
@@ -238,6 +251,8 @@ class ProjectTemplateInfo:
     required_engine_version: str | None = None
     current_engine_version: str | None = None
     engine_version_reason: str | None = None
+    workspace_dir: str | None = None
+    libraries_root: str | None = None
 
 
 @dataclass

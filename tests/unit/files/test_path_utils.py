@@ -10,11 +10,14 @@ import pytest
 from griptape_nodes.files.path_utils import (
     FilenameParts,
     _apply_windows_long_path_prefix,
+    canonicalize_expanded_for_identity,
     canonicalize_for_identity,
     canonicalize_for_io,
     canonicalize_to_posix,
     decompose_source_path,
     expand_path,
+    expand_path_fully,
+    expansion_introduced_quoting,
     normalize_path_for_platform,
     parse_file_uri,
     path_needs_expansion,
@@ -22,6 +25,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
     sanitize_path_string,
     strip_surrounding_quotes,
+    unexpanded_references,
 )
 
 
@@ -230,6 +234,34 @@ class TestStripSurroundingQuotes:
         assert strip_surrounding_quotes("test'") == "test'"
 
 
+class TestExpansionIntroducedQuoting:
+    """Tests for expansion_introduced_quoting: quoting a variable brought in, not the author."""
+
+    def test_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """The case strip_surrounding_quotes cannot see: the quotes end up interior."""
+        assert expansion_introduced_quoting("${ROOT}/libs", '"/mnt/studio"/libs') is True
+
+    def test_single_quoted_variable_used_as_a_prefix_is_flagged(self) -> None:
+        """A leading `'` flips is_absolute() exactly as `"` does, so it is refused too."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "'/mnt/studio'/libs") is True
+
+    def test_apostrophe_from_a_variable_value_is_not_flagged(self) -> None:
+        """`/mnt/Dragon's Curse` is a real directory, so an interior apostrophe must survive."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/Dragon's Curse/libs") is False
+
+    def test_apostrophe_the_author_declared_is_not_flagged(self) -> None:
+        """Quotes in the declared text are the author's intent, wherever they sit."""
+        assert expansion_introduced_quoting("'/mnt/studio'/libs", "'/mnt/studio'/libs") is False
+
+    def test_unquoted_expansion_is_not_flagged(self) -> None:
+        """The ordinary case stays ordinary."""
+        assert expansion_introduced_quoting("${ROOT}/libs", "/mnt/studio/libs") is False
+
+    def test_additional_double_quote_is_flagged_even_when_the_author_wrote_one(self) -> None:
+        """Counted rather than tested for presence, so an author's quote cannot mask a new one."""
+        assert expansion_introduced_quoting('/mnt/say"hi/${ROOT}', '/mnt/say"hi/"/opt"') is True
+
+
 class TestExpandPath:
     """Tests for expand_path function."""
 
@@ -251,6 +283,70 @@ class TestExpandPath:
         """Test that function returns a Path object."""
         result = expand_path("~/test")
         assert isinstance(result, Path)
+
+
+class TestExpandPathFully:
+    """Tests for expand_path_fully: expansion repeated until the value stops changing."""
+
+    def test_expands_a_reference_that_expands_to_another_reference(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A variable whose VALUE contains a reference resolves all the way, which one pass cannot do."""
+        monkeypatch.setenv("GTN_TEST_INNER", "/studio")
+        monkeypatch.setenv("GTN_TEST_OUTER", "${GTN_TEST_INNER}/projects")
+
+        result = expand_path_fully("${GTN_TEST_OUTER}/libs")
+
+        assert result.path.as_posix() == "/studio/projects/libs"
+        assert result.stabilized is True
+        # The single-pass version stops one level short; that gap is the whole reason this exists.
+        assert "GTN_TEST_INNER" in str(expand_path("${GTN_TEST_OUTER}/libs"))
+
+    def test_reports_a_reference_cycle_instead_of_looping(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Mutually referencing variables terminate and come back as not stabilized."""
+        monkeypatch.setenv("GTN_TEST_PING", "${GTN_TEST_PONG}")
+        monkeypatch.setenv("GTN_TEST_PONG", "${GTN_TEST_PING}")
+
+        result = expand_path_fully("${GTN_TEST_PING}/libs")
+
+        assert result.stabilized is False
+
+    def test_self_reference_is_not_a_cycle(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`A=${A}` is left alone by expandvars, so it stabilizes as an ordinary unresolved reference."""
+        monkeypatch.setenv("GTN_TEST_SELF", "${GTN_TEST_SELF}")
+
+        result = expand_path_fully("${GTN_TEST_SELF}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_SELF"]
+
+    def test_plain_path_stabilizes_unchanged(self) -> None:
+        """A value with nothing to expand comes back untouched on the first pass."""
+        result = expand_path_fully("/studio/libraries")
+
+        assert result.path.as_posix() == "/studio/libraries"
+        assert result.stabilized is True
+
+    def test_expands_tilde(self) -> None:
+        """Tilde expansion still happens, same as expand_path."""
+        result = expand_path_fully("~/Documents")
+
+        assert str(result.path).startswith(str(Path.home()))
+        assert result.stabilized is True
+
+    def test_bare_dollar_name_stays_literal(self) -> None:
+        """`$Recycle.Bin` is a real Windows directory; looping must not start eating it."""
+        result = expand_path_fully("$Recycle.Bin/libs")
+
+        assert result.path.as_posix() == "$Recycle.Bin/libs"
+        assert result.stabilized is True
+
+    def test_unset_variable_is_left_in_place(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unset reference is not a cycle: it stops changing immediately and stays reportable."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = expand_path_fully("${GTN_TEST_MISSING}/libs")
+
+        assert result.stabilized is True
+        assert unexpanded_references(result.path).variables == ["GTN_TEST_MISSING"]
 
 
 class TestPathNeedsExpansion:
@@ -280,6 +376,73 @@ class TestPathNeedsExpansion:
     def test_relative_path_no_expansion(self) -> None:
         """Test that relative paths without special chars don't need expansion."""
         assert path_needs_expansion("relative/path") is False
+
+
+class TestUnexpandedReferences:
+    """Tests for unexpanded_references: what `expand_path` could not supply a value for."""
+
+    def test_fully_expanded_path_reports_nothing(self) -> None:
+        """A path with no delimited references left comes back with both lists empty."""
+        result = unexpanded_references("/studio/libraries")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_braced_variable_left_behind(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A `${NAME}` that expand_path could not resolve is reported by name."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_reports_nothing_once_the_variable_is_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The same value expands cleanly when the variable has a value."""
+        monkeypatch.setenv("GTN_TEST_PRESENT", "/studio")
+
+        result = unexpanded_references(expand_path("${GTN_TEST_PRESENT}/libs"))
+
+        assert result.variables == []
+
+    def test_reports_macro_tokens_separately(self) -> None:
+        """A `{NAME}` token is reported as a macro token, which expand_path never touches."""
+        result = unexpanded_references("{outputs}/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == ["outputs"]
+
+    def test_braced_variable_is_not_double_reported_as_a_macro_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """`${NAME}` contains `{NAME}`, so the macro scan must skip what the env scan already claimed."""
+        monkeypatch.delenv("GTN_TEST_MISSING", raising=False)
+
+        result = unexpanded_references(expand_path("${GTN_TEST_MISSING}/libs"))
+
+        assert result.variables == ["GTN_TEST_MISSING"]
+        assert result.macro_tokens == []
+
+    def test_bare_dollar_name_is_not_reported(self) -> None:
+        """A bare `$NAME` stays literal: it is indistinguishable from a real folder like `$Recycle.Bin`."""
+        result = unexpanded_references("$Recycle.Bin/libs")
+
+        assert result.variables == []
+        assert result.macro_tokens == []
+
+    def test_reports_every_reference_in_one_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A value with several problems reports all of them, so a caller can show the whole picture."""
+        monkeypatch.delenv("GTN_TEST_ONE", raising=False)
+        monkeypatch.delenv("GTN_TEST_TWO", raising=False)
+
+        result = unexpanded_references("${GTN_TEST_ONE}/{outputs}/${GTN_TEST_TWO}")
+
+        assert result.variables == ["GTN_TEST_ONE", "GTN_TEST_TWO"]
+        assert result.macro_tokens == ["outputs"]
+
+    def test_accepts_a_path_object(self) -> None:
+        """expand_path returns a Path, so the helper takes one without the caller stringifying it."""
+        result = unexpanded_references(Path("{outputs}/libs"))
+
+        assert result.macro_tokens == ["outputs"]
 
 
 class TestResolvePathSafely:
@@ -910,6 +1073,48 @@ class TestCanonicalizeForIdentity:
 
         result = canonicalize_for_identity(link)
         assert result == target.resolve()
+
+
+class TestCanonicalizeExpandedForIdentity:
+    """Tests for canonicalize_expanded_for_identity: the same tail, without expanding again."""
+
+    def test_does_not_expand_variables(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A reference that survived the caller's own expansion is left alone, not expanded here.
+
+        The point of the function: a caller that VALIDATED its expansion must get back a path built
+        from the string it checked. Expanding again would return a different path than was validated.
+        """
+        monkeypatch.setenv("GTN_TEST_LATE", "/somewhere/else")
+
+        result = canonicalize_expanded_for_identity(tmp_path / "${GTN_TEST_LATE}")
+
+        assert result.name == "${GTN_TEST_LATE}"
+        # canonicalize_for_identity, given the same value, would expand it -- hence the two functions.
+        assert canonicalize_for_identity(tmp_path / "${GTN_TEST_LATE}") != result
+
+    def test_anchors_relative_paths_to_base(self, tmp_path: Path) -> None:
+        """Relative values are placed under `base`, same as canonicalize_for_identity."""
+        result = canonicalize_expanded_for_identity(Path("sub/file.txt"), base=tmp_path)
+
+        assert result == (tmp_path / "sub" / "file.txt").resolve()
+
+    def test_defaults_relative_paths_to_cwd(self) -> None:
+        """With no `base`, a relative value lands under CWD."""
+        result = canonicalize_expanded_for_identity(Path("file.txt"))
+
+        assert result == (Path.cwd() / "file.txt").resolve()
+
+    def test_normalizes_dot_segments(self, tmp_path: Path) -> None:
+        """`.` and `..` are collapsed so two spellings of one path compare equal."""
+        result = canonicalize_expanded_for_identity(tmp_path / "a" / ".." / "b" / "." / "c.txt")
+
+        assert result == (tmp_path / "b" / "c.txt").resolve()
+
+    def test_matches_canonicalize_for_identity_when_nothing_needs_expanding(self, tmp_path: Path) -> None:
+        """The two agree on any value with nothing left to expand; only the leading steps differ."""
+        already_expanded = tmp_path / "sub" / "project.yml"
+
+        assert canonicalize_expanded_for_identity(already_expanded) == canonicalize_for_identity(already_expanded)
 
 
 class TestCanonicalizeForIo:

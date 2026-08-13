@@ -3,6 +3,7 @@
 import logging
 import os
 import sys
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
@@ -13,7 +14,7 @@ if TYPE_CHECKING:
     from griptape_nodes.common.project_templates import ProjectValidationInfo
     from griptape_nodes.common.project_templates.directory import PerPlatformPathMacro
     from griptape_nodes.common.project_templates.loader import ProjectOverlayData
-    from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+    from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath, ResolvedProjectPath
     from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
 
 from griptape_nodes.common.macro_parser import MacroMatchFailureReason
@@ -39,7 +40,53 @@ from griptape_nodes.retained_mode.events.project_events import (
     GetStateForMacroResultSuccess,
     PathResolutionFailureReason,
 )
-from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
+from griptape_nodes.retained_mode.managers.project_manager import PROJECTS_TO_REGISTER_KEY, ProjectManager
+
+
+def _stub_config_for_listing(mock_config: Mock, *, global_workspace: str = "/global/ws") -> None:
+    """Give a Mock ConfigManager the minimum behavior ListProjectTemplatesRequest needs.
+
+    The listing reports each entry's effective workspace_dir and libraries_root, which runs the real
+    workspace and libraries ladders. These stubs stand in for a machine with nothing configured: no
+    registered projects, no project_workspaces overrides, no adjacent project configs -- so every
+    project lands on the global workspace and its libraries directly under it. Tests that care about
+    those inputs model them instead (see TestResolveWorkspaceDirForProjectId._build_pm).
+
+    `default_libraries_root` runs the REAL ConfigManager formula so a test asserting where libraries
+    land is not asserting against a re-implementation of the math.
+    """
+    stubbed_values = {
+        PROJECTS_TO_REGISTER_KEY: [],
+        "project_workspaces": {},
+        "workspace_directory": global_workspace,
+    }
+
+    def fake_get(key: str, **kwargs: Any) -> Any:
+        if key in stubbed_values:
+            return stubbed_values[key]
+        return kwargs.get("default")
+
+    mock_config.get_config_value.side_effect = fake_get
+    mock_config.read_env_config.return_value = {}
+    mock_config.read_config_file.return_value = {}
+    mock_config.compute_project_provisioning_config.return_value = {}
+    mock_config.configured_global_workspace_path.return_value = Path(global_workspace).expanduser().resolve()
+    mock_config.default_libraries_root.side_effect = partial(ConfigManager.default_libraries_root, mock_config)
+
+
+def _line_of(yaml_text: str, needle: str) -> int:
+    """Return the 1-indexed line of the first line containing `needle`.
+
+    Validation problems carry the line an editor should jump to. Searching the fixture for the
+    offending text keeps that assertion meaningful when a fixture gains or loses a line, instead of
+    pinning a bare number that has to be recounted by hand.
+    """
+    for line_number, line in enumerate(yaml_text.splitlines(), start=1):
+        if needle in line:
+            return line_number
+    msg = f"'{needle}' does not appear in the fixture YAML"
+    raise AssertionError(msg)
 
 
 class TestProjectManagerMacroHandlers:
@@ -1311,7 +1358,8 @@ class TestProjectManagerGetCurrentProject:
 class TestProjectManagerListProjectTemplates:
     """Test ProjectManager ListProjectTemplates request handler."""
 
-    def test_list_project_templates_empty(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_project_templates_empty(self) -> None:
         """Test ListProjectTemplates with no projects loaded."""
         from griptape_nodes.retained_mode.events.project_events import (
             ListProjectTemplatesRequest,
@@ -1321,16 +1369,18 @@ class TestProjectManagerListProjectTemplates:
         mock_config = Mock()
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         request = ListProjectTemplatesRequest(include_system_builtins=False)
-        result = pm.on_list_project_templates_request(request)
+        result = await pm.on_list_project_templates_request(request)
 
         assert isinstance(result, ListProjectTemplatesResultSuccess)
         assert result.successfully_loaded == []
         assert result.failed_to_load == []
 
-    def test_list_project_templates_successfully_loaded(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_project_templates_successfully_loaded(self) -> None:
         """Test ListProjectTemplates returns successfully loaded projects."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
@@ -1345,6 +1395,7 @@ class TestProjectManagerListProjectTemplates:
         mock_config.read_config_file_value.return_value = None
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         # Add two successfully loaded projects
@@ -1384,7 +1435,7 @@ class TestProjectManagerListProjectTemplates:
         pm._successfully_loaded_project_templates[project2_id] = project_info2
 
         request = ListProjectTemplatesRequest(include_system_builtins=False)
-        result = pm.on_list_project_templates_request(request)
+        result = await pm.on_list_project_templates_request(request)
 
         assert isinstance(result, ListProjectTemplatesResultSuccess)
         assert result.failed_to_load == []
@@ -1393,7 +1444,8 @@ class TestProjectManagerListProjectTemplates:
         project_ids = {info.project_id for info in result.successfully_loaded}
         assert project_ids == {project1_id, project2_id}
 
-    def test_list_project_templates_with_failures(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_project_templates_with_failures(self) -> None:
         """Test ListProjectTemplates returns failed projects."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.retained_mode.events.project_events import (
@@ -1404,6 +1456,7 @@ class TestProjectManagerListProjectTemplates:
         mock_config = Mock()
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         # Add a failed project to registered_template_status
@@ -1414,7 +1467,7 @@ class TestProjectManagerListProjectTemplates:
         pm._registered_template_status[failed_path] = failed_validation
 
         request = ListProjectTemplatesRequest(include_system_builtins=False)
-        result = pm.on_list_project_templates_request(request)
+        result = await pm.on_list_project_templates_request(request)
 
         assert isinstance(result, ListProjectTemplatesResultSuccess)
         assert result.successfully_loaded == []
@@ -1422,7 +1475,8 @@ class TestProjectManagerListProjectTemplates:
         assert result.failed_to_load[0].project_id == str(failed_path)
         assert result.failed_to_load[0].validation.status == ProjectValidationStatus.UNUSABLE
 
-    def test_list_project_templates_filters_system_builtins(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_project_templates_filters_system_builtins(self) -> None:
         """Test ListProjectTemplates filters system builtins when requested."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
@@ -1435,6 +1489,7 @@ class TestProjectManagerListProjectTemplates:
         mock_config = Mock()
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         # Add system defaults
@@ -1456,20 +1511,21 @@ class TestProjectManagerListProjectTemplates:
 
         # Test with include_system_builtins=False (default)
         request_no_builtins = ListProjectTemplatesRequest(include_system_builtins=False)
-        result_no_builtins = pm.on_list_project_templates_request(request_no_builtins)
+        result_no_builtins = await pm.on_list_project_templates_request(request_no_builtins)
 
         assert isinstance(result_no_builtins, ListProjectTemplatesResultSuccess)
         assert result_no_builtins.successfully_loaded == []
 
         # Test with include_system_builtins=True
         request_with_builtins = ListProjectTemplatesRequest(include_system_builtins=True)
-        result_with_builtins = pm.on_list_project_templates_request(request_with_builtins)
+        result_with_builtins = await pm.on_list_project_templates_request(request_with_builtins)
 
         assert isinstance(result_with_builtins, ListProjectTemplatesResultSuccess)
         assert len(result_with_builtins.successfully_loaded) == 1
         assert result_with_builtins.successfully_loaded[0].project_id == SYSTEM_DEFAULTS_KEY
 
-    def test_list_project_templates_mixed_state(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_project_templates_mixed_state(self) -> None:
         """Test ListProjectTemplates with mix of successful and failed projects."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
@@ -1484,6 +1540,7 @@ class TestProjectManagerListProjectTemplates:
         mock_config.read_config_file_value.return_value = None
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         # Add successful project
@@ -1514,7 +1571,7 @@ class TestProjectManagerListProjectTemplates:
         pm._registered_template_status[failed_path] = failed_validation
 
         request = ListProjectTemplatesRequest(include_system_builtins=False)
-        result = pm.on_list_project_templates_request(request)
+        result = await pm.on_list_project_templates_request(request)
 
         assert isinstance(result, ListProjectTemplatesResultSuccess)
         assert len(result.successfully_loaded) == 1
@@ -1522,7 +1579,8 @@ class TestProjectManagerListProjectTemplates:
         assert result.successfully_loaded[0].project_id == success_id
         assert result.failed_to_load[0].project_id == str(failed_path)
 
-    def test_list_marks_incompatible_engine_version(self) -> None:
+    @pytest.mark.asyncio
+    async def test_list_marks_incompatible_engine_version(self) -> None:
         """A project whose adjacent config pins an unsatisfiable engine_version is flagged incompatible."""
         from griptape_nodes.common.project_templates import ProjectValidationInfo, ProjectValidationStatus
         from griptape_nodes.common.project_templates.default_project_template import DEFAULT_PROJECT_TEMPLATE
@@ -1538,6 +1596,7 @@ class TestProjectManagerListProjectTemplates:
         mock_config.read_config_file_value.return_value = ">=99"
         mock_secrets = Mock()
         mock_event_manager = Mock()
+        _stub_config_for_listing(mock_config)
         pm = ProjectManager(mock_event_manager, mock_config, mock_secrets)
 
         project_path = Path("/test/pinned.yml")
@@ -1556,7 +1615,7 @@ class TestProjectManagerListProjectTemplates:
             parsed_directory_schemas=directory_schemas,
         )
 
-        result = pm.on_list_project_templates_request(ListProjectTemplatesRequest(include_system_builtins=False))
+        result = await pm.on_list_project_templates_request(ListProjectTemplatesRequest(include_system_builtins=False))
 
         assert isinstance(result, ListProjectTemplatesResultSuccess)
         info = result.successfully_loaded[0]
@@ -3690,6 +3749,18 @@ class TestResolveWorkspaceDirForProjectId:
 
         mock_config.read_config_file.side_effect = fake_read_config_file
 
+        # The nothing-declared libraries fallback runs the REAL ConfigManager formula over these
+        # stubbed layers, so tests assert where libraries actually land instead of re-implementing
+        # the math. compute_project_provisioning_config stands in for the merged view with the
+        # target's adjacent config, which is the layer these tests vary.
+        mock_config.configured_global_workspace_path.return_value = cls._resolved(
+            env_workspace or configured_root or default_root or "/global/ws"
+        )
+        mock_config.default_libraries_root.side_effect = partial(ConfigManager.default_libraries_root, mock_config)
+        mock_config.compute_project_provisioning_config.side_effect = lambda project_dir, _workspace_dir, **_kwargs: (
+            dir_to_config.get(Path(project_dir), {})
+        )
+
         path_to_overlay = {
             canonicalize_for_identity(Path(spec["file"])): cls._make_overlay(
                 project_id=spec["id"],
@@ -4132,6 +4203,118 @@ class TestResolveWorkspaceDirForProjectId:
         assert isinstance(probe, LoadProjectTemplateResultFailure)
         assert isinstance(recorded, LoadProjectTemplateResultFailure)
 
+    @pytest.mark.asyncio
+    async def test_unloaded_workspace_dir_expands_env_var_before_anchoring(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An env var in workspace_dir expands BEFORE the relative/absolute decision, so it lands where declared.
+
+        `Path("${VAR}/ws").is_absolute()` is False, so deciding absoluteness first would join the
+        whole thing onto the project directory and hand back a path with a literal `${VAR}` component
+        in it. Expansion has to come first.
+        """
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        env_root = tmp_path / "env-root"
+        monkeypatch.setenv("GTN_TEST_WS", str(env_root))
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "workspace_dir": "${GTN_TEST_WS}/ws"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved(str(env_root / "ws"))
+        assert "GTN_TEST_WS" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_unloaded_workspace_dir_with_unset_env_var_falls_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset env var in workspace_dir falls through to the next ladder source, not a literal path.
+
+        The value cannot be resolved, so the ladder behaves as if the project declared nothing --
+        which is what activation does -- rather than creating a directory named `${GTN_TEST_WS}`
+        under the project.
+        """
+        project_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        project_file.parent.mkdir(parents=True)
+        project_file.touch()
+        monkeypatch.delenv("GTN_TEST_WS", raising=False)
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "workspace_dir": "${GTN_TEST_WS}/ws"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/global/ws")
+
+    @pytest.mark.asyncio
+    async def test_unloaded_parent_link_expands_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A legacy parent_project_path holding an env var resolves, so inheritance follows the link."""
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+        parent_ws = tmp_path / "parent-ws"
+        monkeypatch.setenv("GTN_TEST_PARENT", str(parent_file.parent))
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "workspace_dir": str(parent_ws)},
+                {
+                    "id": "C",
+                    "file": child_file,
+                    "parent_path": "${GTN_TEST_PARENT}/griptape-nodes-project.yml",
+                    "config": {},
+                },
+            ],
+            registered=[str(parent_file), str(child_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved(str(parent_ws))
+
+    @pytest.mark.asyncio
+    async def test_unloaded_parent_link_with_unset_env_var_reports_no_parent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unresolvable parent_project_path is no link at all, not a bogus child-relative path.
+
+        Anchoring the unexpanded value would produce `<child_dir>/${GTN_TEST_PARENT}/...`, which
+        matches no project on disk -- the same dead end, but reached by inventing a path. The child
+        therefore falls back to the global default instead of inheriting anything.
+        """
+        parent_file = tmp_path / "a" / "griptape-nodes-project.yml"
+        child_file = tmp_path / "c" / "griptape-nodes-project.yml"
+        for f in (parent_file, child_file):
+            f.parent.mkdir(parents=True)
+            f.touch()
+        monkeypatch.delenv("GTN_TEST_PARENT", raising=False)
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "workspace_dir": str(tmp_path / "parent-ws")},
+                {
+                    "id": "C",
+                    "file": child_file,
+                    "parent_path": "${GTN_TEST_PARENT}/griptape-nodes-project.yml",
+                    "config": {},
+                },
+            ],
+            registered=[str(parent_file), str(child_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_workspace_dir_for_project_id("C")
+
+        assert result == self._resolved("/global/ws")
+
 
 class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
     """`resolve_libraries_root_for_project_id` resolves an UNLOADED project's libraries root.
@@ -4330,12 +4513,14 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
 
         pm._read_overlay = counting_read_overlay  # type: ignore[method-assign]
 
-        def probe(node_path: Path, overlay: "ProjectOverlayData") -> str | None:
-            return pm._resolve_template_libraries_dir(overlay.libraries_dir, node_path)
+        def probe(node_path: Path, overlay: "ProjectOverlayData") -> "ResolvedProjectPath":
+            return pm._resolve_template_path_field(overlay.libraries_dir, node_path, "libraries_dir")
 
         result = await pm._nearest_ancestor_value_offline(child_canonical, id_index, probe)
 
-        assert result == str(self._canonical(grand_file.parent / "shared-libs"))
+        # Only G declares a libraries_dir, so reaching its value proves the walk ran the full chain.
+        assert result.value == str(self._canonical(grand_file.parent / "shared-libs"))
+        assert result.incomplete_reason is None
         # The walk visits C (start), A, G -- each overlay read exactly once, none twice.
         assert read_counts, "expected the walk to read at least one overlay"
         assert max(read_counts.values()) == 1, f"a node overlay was read more than once: {read_counts}"
@@ -4412,6 +4597,195 @@ class TestResolveLibrariesRootForProjectId(TestResolveWorkspaceDirForProjectId):
         result = await pm.resolve_libraries_root_for_project_id("C")
 
         assert result == self._canonical(b_file.parent / "b-libs")
+
+
+class TestLibrariesRootPathResolution(TestResolveLibrariesRootForProjectId):
+    """How the VALUE in a libraries_dir field becomes a path.
+
+    Same offline resolver as the class above, but exercising the shared path primitives rather than
+    the inheritance ladder: `~` and `${VAR}` expansion, the deliberate bare-`$NAME` carve-out, and
+    the per-platform `default` key.
+
+    A declared value that cannot produce a path is refused at LOAD time, so a project carrying one
+    never reaches these resolvers -- see TestProjectPathFieldValidation. This harness stubs
+    `_read_overlay`, which is exactly where that refusal lives, so the fall-through assertions below
+    document the resolvers' defense-in-depth behavior rather than a reachable user-facing outcome.
+    """
+
+    @staticmethod
+    def _write_project(project_file: Path) -> Path:
+        """Create a project YAML on disk (its content is supplied via specs, not read from the file)."""
+        project_file.parent.mkdir(parents=True, exist_ok=True)
+        project_file.touch()
+        return project_file
+
+    @pytest.mark.asyncio
+    async def test_libraries_dir_expands_env_var_before_anchoring(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An env var in libraries_dir expands BEFORE the relative/absolute decision.
+
+        `Path("${VAR}/libs").is_absolute()` is False, so deciding absoluteness first would anchor the
+        whole thing under the project directory -- the bug that made the previous attempt report
+        confident wrong paths.
+        """
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+        env_root = tmp_path / "env-libs-root"
+        monkeypatch.setenv("GTN_TEST_LIBS", str(env_root))
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "${GTN_TEST_LIBS}/libs"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(env_root / "libs")
+        assert "GTN_TEST_LIBS" not in str(result)
+
+    @pytest.mark.asyncio
+    async def test_libraries_dir_expands_home(self, tmp_path: Path) -> None:
+        """`~` in libraries_dir expands to the user's home directory, not a literal `~` component."""
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "~/shared-libs"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(Path.home() / "shared-libs")
+
+    @pytest.mark.asyncio
+    async def test_bare_dollar_name_stays_literal(self, tmp_path: Path) -> None:
+        """A bare `$NAME` that expands to nothing stays a literal path component.
+
+        Regression guard for the deliberate carve-out: `$Recycle.Bin` is a real directory on Windows,
+        and only the unambiguously delimited `${NAME}` / `%NAME%` forms are treated as variables.
+        """
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "$Recycle.Bin/libs"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(project_file.parent / "$Recycle.Bin" / "libs")
+
+    @pytest.mark.asyncio
+    async def test_per_platform_default_key_resolves_on_every_platform(self, tmp_path: Path) -> None:
+        """A per-platform mapping carrying `default` resolves wherever the OS key is absent.
+
+        This is the portable escape hatch: `%VAR%` only expands on Windows and drive letters mean
+        nothing elsewhere, so a mapping that names one OS explicitly should also say what the others
+        get. Omitting `default` is what makes a platform gap a load error.
+        """
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+        other_os = tmp_path / "other-os-libs"
+        shared = tmp_path / "default-libs"
+        # Name a platform we are NOT on, plus a default -- the default is what must be selected.
+        if sys.platform.startswith("win"):
+            per_platform = PerPlatformProjectPath(linux=str(other_os), default=str(shared))
+        else:
+            per_platform = PerPlatformProjectPath(windows=str(other_os), default=str(shared))
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": per_platform}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result == self._canonical(shared)
+
+    @pytest.mark.asyncio
+    async def test_unset_env_var_yields_no_explicit_root(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An unresolvable declaration never becomes a guessed path: the resolver reports None.
+
+        Defense in depth. A project declaring this does not load (see
+        TestProjectPathFieldValidation), so the only way to reach the resolver with such a value is
+        to bypass the overlay read -- and even then it must not invent `<project_dir>/${GTN_TEST_LIBS}/libs`.
+        """
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+        monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "${GTN_TEST_LIBS}/libs"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_macro_token_yields_no_explicit_root(self, tmp_path: Path) -> None:
+        """A `{macro}` token never becomes a literal directory name (defense in depth).
+
+        These fields resolve before the project's runtime state exists, so the macro system does not
+        apply to them -- and a directory literally named `{outputs}` is nobody's intent.
+        """
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": "{outputs}/libs"}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_no_value_for_this_platform_yields_no_explicit_root(self, tmp_path: Path) -> None:
+        """A per-platform mapping with no entry for this OS and no `default` yields None (defense in depth)."""
+        from griptape_nodes.common.project_templates.project_path import PerPlatformProjectPath
+
+        project_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+        other_os = tmp_path / "other-os-libs"
+        # Set only a platform we are NOT running on, so select_project_path finds nothing.
+        if sys.platform.startswith("win"):
+            per_platform = PerPlatformProjectPath(linux=str(other_os))
+        else:
+            per_platform = PerPlatformProjectPath(windows=str(other_os))
+
+        pm = self._build_pm(
+            [{"id": "C", "file": project_file, "config": {}, "libraries_dir": per_platform}],
+            registered=[str(project_file)],
+            configured_root="/global/ws",
+        )
+        result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_inherited_value_anchors_to_the_declaring_ancestor(self, tmp_path: Path) -> None:
+        """A relative value inherited from a parent anchors to the PARENT's directory, not the child's.
+
+        This is what makes parent and child report the SAME libraries root, which is the whole point
+        of inheriting the field: one shared libraries/ tree instead of one download per child.
+        """
+        parent_file = self._write_project(tmp_path / "a" / "griptape-nodes-project.yml")
+        child_file = self._write_project(tmp_path / "c" / "griptape-nodes-project.yml")
+
+        pm = self._build_pm(
+            [
+                {"id": "A", "file": parent_file, "config": {}, "libraries_dir": "./shared-libs"},
+                {"id": "C", "file": child_file, "parent_id": "A", "config": {}},
+            ],
+            registered=[str(parent_file), str(child_file)],
+            configured_root="/global/ws",
+        )
+        parent_result = await pm.resolve_libraries_root_for_project_id("A")
+        child_result = await pm.resolve_libraries_root_for_project_id("C")
+
+        assert child_result == self._canonical(parent_file.parent / "shared-libs")
+        assert child_result == parent_result
 
 
 class TestOnResolveProjectWorkspaceRequest(TestResolveWorkspaceDirForProjectId):
@@ -6633,7 +7007,7 @@ directories:
         mock_config_manager.project_config = {}
         mock_config_manager.env_config = {}
         mock_config_manager.merged_config = {}
-        mock_config_manager.get_config_value.return_value = []
+        _stub_config_for_listing(mock_config_manager, global_workspace=str(tmp_path))
         mock_config_manager.read_config_file_value.return_value = None
         mock_config_manager.workspace_path = tmp_path
         return ProjectManager(mock_event_manager, mock_config_manager, Mock())
@@ -6667,6 +7041,61 @@ directories:
             )
 
         return AsyncMock(side_effect=route)
+
+    @pytest.mark.asyncio
+    async def test_binary_content_is_unusable_rather_than_a_crash(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project file read back as bytes fails the load with an explanation.
+
+        The YAML parser would raise on bytes, so _read_overlay checks the content type itself. Worth
+        pinning because the read result's `content` is typed loosely enough for this to happen.
+        """
+        from griptape_nodes.common.project_templates.validation import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.os_events import ReadFileResultSuccess
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultFailure,
+        )
+
+        project_path = (tmp_path / "binary.yml").resolve()
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(
+                return_value=ReadFileResultSuccess(
+                    content=b"\x00\x01",
+                    file_size=2,
+                    mime_type="application/octet-stream",
+                    encoding=None,
+                    result_details="ok",
+                )
+            )
+            result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert "binary content" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_unexpected_read_result_type_is_unusable(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A read that answers with neither success nor a recognized failure is still reported clearly."""
+        from griptape_nodes.common.project_templates.validation import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultFailure,
+        )
+
+        project_path = (tmp_path / "odd.yml").resolve()
+        unexpected = Mock()
+        unexpected.failed.return_value = False
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = AsyncMock(return_value=unexpected)
+            result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert "unexpected result type" in str(result.result_details)
 
     @pytest.mark.asyncio
     async def test_no_parent_still_merges_with_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
@@ -6921,7 +7350,9 @@ directories:
         assert isinstance(base_load, LoadProjectTemplateResultSuccess)
         assert isinstance(child_load, LoadProjectTemplateResultSuccess)
 
-        list_result = pm.on_list_project_templates_request(ListProjectTemplatesRequest(include_system_builtins=False))
+        list_result = await pm.on_list_project_templates_request(
+            ListProjectTemplatesRequest(include_system_builtins=False)
+        )
         by_id = {info.project_id: info for info in list_result.successfully_loaded}
 
         # Child's parent_project_id from the list must match the base's project_id
@@ -7274,6 +7705,42 @@ directories:
             mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=parent_path))
         assert isinstance(result, LoadProjectTemplateResultSuccess)
+
+    def test_save_refusal_names_the_real_reason_the_parent_could_not_be_resolved(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An unset variable in parent_project_path is reported as an unset variable.
+
+        The refusal is correct -- diffing against system defaults would bake the parent's inherited
+        values into the child's overlay. What was wrong was the explanation: every unresolvable parent
+        was reported as "is relative and no anchor could be resolved", which here is doubly false.
+        There is an anchor (the file being saved) and the value is not relative; the variable is
+        simply unset, and that is the only sentence an artist can act on.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            SaveProjectTemplateRequest,
+            SaveProjectTemplateResultFailure,
+        )
+
+        monkeypatch.delenv("GTN_TEST_SAVE_MISSING", raising=False)
+        child_path = tmp_path / "child.yml"
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "child",
+            "parent_project_path": "${GTN_TEST_SAVE_MISSING}/parent.yml",
+            "situations": {},
+            "directories": {},
+        }
+
+        result = pm.on_save_project_template_request(
+            SaveProjectTemplateRequest(project_path=child_path, template_data=template_data)
+        )
+
+        assert isinstance(result, SaveProjectTemplateResultFailure)
+        details = str(result.result_details)
+        assert "GTN_TEST_SAVE_MISSING" in details
+        assert "no anchor" not in details
+        assert not child_path.exists()
 
     def test_save_without_parent_diffs_against_system_defaults(self, pm: ProjectManager, tmp_path: Path) -> None:
         """Regression: with no parent, diff base remains DEFAULT_PROJECT_TEMPLATE."""
@@ -7866,6 +8333,43 @@ class TestValidateProjectTemplateParentChain:
         assert isinstance(result, ValidateProjectTemplateResultSuccess)
         assert any(p.field_path == "parent_project_path" and "Cycle" in p.message for p in result.validation.problems)
 
+    def test_relative_parent_with_no_anchor_says_so_instead_of_going_quiet(
+        self, pm: ProjectManager, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A brand-new template's relative parent_project_path cannot be placed, and that is logged.
+
+        Validation is path-less: an unregistered template has no file of its own, so there is no
+        directory to resolve `../base.yml` against. The chain walk correctly stops (load-time
+        detection still applies), but it used to stop with no record at all -- the one route that can
+        reach this case skipped the reason and returned, while every sibling failure logged one. A
+        chain that silently ends looks identical to a project with no parent.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ValidateProjectTemplateRequest,
+            ValidateProjectTemplateResultSuccess,
+        )
+
+        template_data = {
+            "project_template_schema_version": "0.3.2",
+            "name": "brand new child",
+            "parent_project_path": "../base.yml",
+            "situations": {},
+            "directories": {},
+        }
+
+        with caplog.at_level(logging.WARNING, logger="griptape_nodes"):
+            result = pm.on_validate_project_template_request(
+                ValidateProjectTemplateRequest(template_data=template_data)
+            )
+
+        assert isinstance(result, ValidateProjectTemplateResultSuccess)
+        warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+        matching = [m for m in warnings if "../base.yml" in m]
+        assert len(matching) == 1, warnings
+        assert "relative path" in matching[0]
+        # The reason must be the anchor, not a variable: there is no variable in this value at all.
+        assert "no value is set" not in matching[0]
+
 
 class TestPerPlatformProjectsToRegister:
     """`projects_to_register` accepts per-platform mappings; behavior matches plain strings on the active platform."""
@@ -7988,7 +8492,7 @@ situations:
         # OS-specific resources, and falls into `os.uname()` on Linux/Mac branches.
         # On a Windows CI host with `sys.platform` faked to "linux", that crashes.
         monkeypatch.setattr(
-            "griptape_nodes.common.project_templates.directory._active_platform_key",
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
             lambda: "linux",
         )
         entry = {
@@ -8161,13 +8665,21 @@ directories:
         assert "child_outputs" in result.template.directories
 
     @pytest.mark.asyncio
-    async def test_load_child_with_per_platform_parent_no_match_treats_as_no_parent(
+    async def test_load_child_with_per_platform_parent_no_match_is_an_error(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """When no platform key matches and no default, the child loads against system defaults instead."""
+        """No platform key matching and no `default` is a load error, not a silent reparent.
+
+        Loading such a child against the system defaults would drop everything the parent was
+        supposed to supply -- its directories, situations and libraries root -- while still reporting
+        success, so the artist would see a project that opens and behaves like a different project.
+        The `default` key exists to say what other platforms should use; omitting it expresses no
+        intent to honor.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
         from griptape_nodes.retained_mode.events.project_events import (
             LoadProjectTemplateRequest,
-            LoadProjectTemplateResultSuccess,
+            LoadProjectTemplateResultFailure,
         )
 
         monkeypatch.setattr("sys.platform", "linux")
@@ -8190,11 +8702,14 @@ directories:
             mock_engine.ahandle_request = self._file_router(files)
             result = await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=child_path))
 
-        assert isinstance(result, LoadProjectTemplateResultSuccess)
-        # Child's own directory survives.
-        assert "child_outputs" in result.template.directories
-        # System default directories present (default fallback applied).
-        assert "outputs" in result.template.directories
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "parent_project_path"]
+        assert len(problems) == 1
+        assert "no path for this platform" in problems[0].message
+        # A nested block anchors at its first child key (`darwin:`), which is where the line tracker
+        # points -- close enough for an editor to jump to the offending field.
+        assert problems[0].line_number == _line_of(child_yaml, "darwin:")
 
     @pytest.mark.asyncio
     async def test_load_child_with_per_platform_parent_falls_back_to_default(
@@ -8263,6 +8778,682 @@ directories:
         assert isinstance(result.template.parent_project_path, PerPlatformProjectPath)
         assert result.template.parent_project_path.darwin == base_path.as_posix()
         assert result.template.parent_project_path.linux == "/mnt/base.yml"
+
+
+class TestProjectPathFieldValidation:
+    """A declared path field that cannot produce a path fails the load, naming field, line and cause.
+
+    The rule, uniform across `workspace_dir`, `libraries_dir` and `parent_project_path`: ABSENT means
+    "fall through to the next source", PRESENT-but-unresolvable means the project is broken. The only
+    alternative is to discard what the user wrote and put their workspace or their libraries somewhere
+    they never named, which is how a shared project ends up silently installing a second copy of every
+    library on a teammate's machine.
+
+    These tests drive the REAL `_read_overlay` through `on_load_project_template_request` with YAML on
+    disk, because `_read_overlay` is where the check lives -- the `_build_pm` harness used by the
+    resolver tests stubs exactly that method out.
+    """
+
+    @pytest.fixture
+    def pm(self, tmp_path: Path) -> ProjectManager:
+        mock_event_manager = Mock()
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.read_config_file_value.return_value = None
+        mock_config_manager.workspace_path = tmp_path
+        _stub_config_for_listing(mock_config_manager, global_workspace=str(tmp_path / "global-ws"))
+        return ProjectManager(mock_event_manager, mock_config_manager, Mock())
+
+    @staticmethod
+    def _file_router(files: dict[Path, str]) -> AsyncMock:
+        """Build an `ahandle_request` mock that returns YAML content based on file path."""
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            ReadFileResultFailure,
+            ReadFileResultSuccess,
+        )
+
+        async def route(request: object) -> object:
+            file_path = Path(getattr(request, "file_path", ""))
+            content = files.get(file_path)
+            if content is None:
+                return ReadFileResultFailure(
+                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
+                    result_details=f"missing: {file_path}",
+                )
+            return ReadFileResultSuccess(
+                content=content,
+                file_size=len(content),
+                mime_type="text/plain",
+                encoding="utf-8",
+                result_details="ok",
+            )
+
+        return AsyncMock(side_effect=route)
+
+    async def _load(self, pm: ProjectManager, files: dict[Path, str], project_path: Path) -> Any:
+        """Load one project through the real handler, with the other files readable as ancestors."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateRequest
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
+            return await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
+
+    @pytest.mark.asyncio
+    async def test_unset_variable_in_libraries_dir_fails_the_load(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`${GTN_TEST_LIBS}/libraries` with the variable unset is an error, not a fallback.
+
+        An unresolvable declaration is never quietly replaced with `<workspace>/libraries`:
+        installing libraries somewhere the project never named is worse than refusing to open.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "no value is set for GTN_TEST_LIBS" in problems[0].message
+        assert problems[0].line_number == _line_of(project_yaml, "libraries_dir:")
+
+    @pytest.mark.asyncio
+    async def test_macro_token_in_workspace_dir_fails_the_load(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A `{macro}` token in a path field is refused rather than becoming a folder of that name.
+
+        Macros resolve against runtime state that does not exist yet when these fields are read, so
+        `{outputs}` here can only ever mean a directory literally called `{outputs}`.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\nname: Studio Project\nworkspace_dir: "{outputs}/work"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "workspace_dir"]
+        assert len(problems) == 1
+        assert "macro tokens are not supported" in problems[0].message
+        assert "outputs" in problems[0].message
+        assert problems[0].line_number == _line_of(project_yaml, "workspace_dir:")
+
+    @pytest.mark.asyncio
+    async def test_percent_reference_in_libraries_dir_fails_the_load(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `%NAME%` reference that expands to nothing fails the load on every platform.
+
+        `%NAME%` expands only on Windows, so elsewhere it never resolves at all. Either way the value
+        has no answer, and a real directory whose name happens to contain `%SHOT_CODE%` is now refused
+        rather than used literally -- the deliberate cost of treating the form as a variable.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.delenv("SHOT_CODE", raising=False)
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\nname: Studio Project\nlibraries_dir: "%SHOT_CODE%/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "no value is set for SHOT_CODE" in problems[0].message
+
+    @pytest.mark.asyncio
+    async def test_platform_gap_in_libraries_dir_fails_the_load(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A per-platform mapping with no entry for this OS and no `default` fails the load.
+
+        `default` exists precisely to say what the platforms you did not name should get. A mapping
+        that names only Windows says nothing about a Linux teammate, so there is nothing to honor and
+        nothing to guess.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setattr("sys.platform", "linux")
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            "libraries_dir:\n"
+            '  darwin: "/Volumes/fast/libs"\n'
+            '  windows: "D:/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "no path for this platform (linux) and no 'default'" in problems[0].message
+        # A nested block anchors at its first child key (`darwin:`), which is close enough for an
+        # editor to jump to the offending field.
+        assert problems[0].line_number == _line_of(project_yaml, "darwin:")
+
+    @pytest.mark.asyncio
+    async def test_quoted_variable_value_fails_the_load_instead_of_anchoring_under_the_project(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A variable whose value carries quotes is refused, not quietly relocated.
+
+        Quotes wrapping a whole value are cleaned, but a variable supplying only a PREFIX moves its
+        own quotes into the interior, where there is nothing left to strip. The leading quote then
+        makes an absolute path look relative, so it would be anchored under the project directory --
+        libraries installing somewhere the project never named, reported as a clean resolve.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setenv("GTN_TEST_QUOTED_ROOT", '"/mnt/studio"')
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_QUOTED_ROOT}/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "expanded to a quoted value" in problems[0].message
+        # The actionable half: the quotes are in the variable, so telling the user to edit this field
+        # would send them to the wrong file.
+        assert "remove the quotes from the variable's value" in problems[0].message
+        assert problems[0].line_number == _line_of(project_yaml, "libraries_dir:")
+
+    @pytest.mark.asyncio
+    async def test_quoted_variable_supplying_the_whole_value_still_resolves(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shape sanitizing was written for keeps working: quotes around the entire value.
+
+        Guards the boundary of the refusal above. A shell-exported `ROOT='"/mnt/studio"'` used on its
+        own is unambiguous -- the quotes surround everything, so they can be stripped -- and turning
+        that into a failed load would break the case `sanitize_path_string` exists to absorb.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        monkeypatch.setenv("GTN_TEST_QUOTED_WHOLE", f'"{tmp_path.as_posix()}/studio-libs"')
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_QUOTED_WHOLE}"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_platform_gap_message_names_the_yaml_key_not_sys_platform(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The message names the key the user must add (`windows`), not `sys.platform` (`win32`).
+
+        The two strings are the same on Linux and macOS, so every other platform-gap test passes
+        either way. Windows is the one platform where they differ, and telling someone their mapping
+        has "no path for this platform (win32)" points them at a key that does not exist in the
+        schema.
+
+        Patches the selector rather than `sys.platform` so the assertion holds on any host: a real
+        `sys.platform` of `win32` OR `linux` must be absent from the message, and neither is the
+        value being reported.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setattr(
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
+            lambda: "windows",
+        )
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            "libraries_dir:\n"
+            '  darwin: "/Volumes/fast/libs"\n'
+            '  linux: "/mnt/fast/libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert "no path for this platform (windows) and no 'default'" in problems[0].message
+        assert sys.platform not in problems[0].message
+
+    @pytest.mark.asyncio
+    async def test_platform_with_no_key_is_told_default_is_the_only_remedy(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """On a platform the schema cannot name, the message must not suggest naming it.
+
+        `PerPlatformProjectPath` sets `extra="forbid"`, so on FreeBSD there is no key to add -- a
+        message reading "no path for this platform (freebsd13) ... or an entry for this one" describes
+        a fix that fails validation, which is the same confidently-wrong-cause failure this whole
+        field-resolution path exists to avoid. `default` is the only way out, and the message says so.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.setattr(
+            "griptape_nodes.common.project_templates.directory.active_platform_key",
+            lambda: "",
+        )
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            "libraries_dir:\n"
+            '  darwin: "/Volumes/fast/libs"\n'
+            '  linux: "/mnt/fast/libs"\n'
+            '  windows: "Z:\\\\fast\\\\libs"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
+        assert len(problems) == 1
+        assert f"no path for this platform (unsupported ({sys.platform})) and no 'default'" in problems[0].message
+        assert "or an entry for this one" not in problems[0].message
+        assert "'default' is the only way to name it" in problems[0].message
+
+    @pytest.mark.asyncio
+    async def test_every_broken_field_is_reported_in_one_load(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """All three fields are checked, so the user fixes everything in one pass, not one per restart."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.delenv("GTN_TEST_WS", raising=False)
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'workspace_dir: "${GTN_TEST_WS}/work"\n'
+            'libraries_dir: "{outputs}/libs"\n'
+            'parent_project_path: "{project_dir}/base.yml"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        broken_fields = {p.field_path for p in result.validation.problems}
+        assert broken_fields == {"workspace_dir", "libraries_dir", "parent_project_path"}
+        for field_name in broken_fields:
+            assert field_name in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_absent_path_fields_load_normally(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """Declaring none of the three fields is not an error -- absence still means "next source"."""
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = 'project_template_schema_version: "0.3.3"\nname: Studio Project\ndirectories: {}\n'
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+
+    @pytest.mark.asyncio
+    async def test_resolvable_variable_loads_and_keeps_the_raw_value(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A variable that IS set loads, and the template keeps the unexpanded value verbatim.
+
+        Validation must not rewrite the field: the raw form is what makes the project portable to the
+        next machine, where the variable points somewhere else.
+        """
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
+
+        monkeypatch.setenv("GTN_TEST_LIBS", str(tmp_path / "studio"))
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.template.libraries_dir == "${GTN_TEST_LIBS}/libraries"
+
+    @pytest.mark.asyncio
+    async def test_child_of_project_with_unresolvable_libraries_dir_also_fails(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A broken parent brings its descendants down, with the error on the child's parent link.
+
+        This is the accepted cost of failing closed: a shared base project pinning an unset variable
+        stops loading for every project derived from it. The alternative is each of those children
+        quietly installing libraries somewhere the base never named.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+
+        monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
+        base_path = (tmp_path / "base.yml").resolve()
+        child_path = (tmp_path / "child.yml").resolve()
+        base_yaml = (
+            'project_template_schema_version: "0.3.3"\nname: Base\nlibraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+        child_yaml = (
+            f'project_template_schema_version: "0.3.3"\nname: Child\nparent_project_path: "{base_path.as_posix()}"\n'
+        )
+
+        result = await self._load(pm, {base_path: base_yaml, child_path: child_yaml}, child_path)
+
+        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        problems = [p for p in result.validation.problems if p.field_path == "parent_project_path"]
+        assert len(problems) == 1
+        assert "could not be loaded" in problems[0].message
+        assert problems[0].line_number == _line_of(child_yaml, "parent_project_path:")
+
+    @pytest.mark.asyncio
+    async def test_failed_project_is_listed_as_failed_with_no_paths(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A refused project surfaces in failed_to_load, and reports no paths at all.
+
+        The GUI needs to distinguish "here is where this project's libraries live" from "this project
+        is broken" -- so a failed entry carries its validation problems and nothing that looks like an
+        answer.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            ListProjectTemplatesResultSuccess,
+        )
+
+        monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\nname: Broken\nlibraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+        files = {project_path: project_yaml}
+        await self._load(pm, files, project_path)
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            mock_engine.ahandle_request = self._file_router(files)
+            listing = await pm.on_list_project_templates_request(
+                ListProjectTemplatesRequest(include_system_builtins=False)
+            )
+
+        assert isinstance(listing, ListProjectTemplatesResultSuccess)
+        assert listing.successfully_loaded == []
+        assert len(listing.failed_to_load) == 1
+        failed = listing.failed_to_load[0]
+        assert failed.project_id == str(project_path)
+        assert failed.workspace_dir is None
+        assert failed.libraries_root is None
+        assert any(p.field_path == "libraries_dir" for p in failed.validation.problems)
+
+
+class TestListProjectTemplatesEffectivePaths:
+    """The listing reports where each project's files and libraries actually land.
+
+    This is what #5204 asked for: `libraries_dir` is decoupled from the workspace and inherits down
+    the parent chain, so the GUI cannot derive the location from anything it already holds.
+
+    Both paths are resolved from DISK, the way activation resolves them for any project declaring a
+    parent -- never through the live merged config, whose layers belong to whichever project happens
+    to be open. `test_answers_do_not_depend_on_which_project_is_open` is the guard on that.
+    """
+
+    @pytest.fixture
+    def global_workspace(self, tmp_path: Path) -> Path:
+        return (tmp_path / "global-ws").resolve()
+
+    @pytest.fixture
+    def mock_config(self, global_workspace: Path) -> Mock:
+        mock_config_manager = Mock()
+        mock_config_manager.project_config = {}
+        mock_config_manager.env_config = {}
+        mock_config_manager.merged_config = {}
+        mock_config_manager.read_config_file_value.return_value = None
+        mock_config_manager.workspace_path = global_workspace
+        _stub_config_for_listing(mock_config_manager, global_workspace=str(global_workspace))
+        return mock_config_manager
+
+    @pytest.fixture
+    def pm(self, mock_config: Mock) -> ProjectManager:
+        return ProjectManager(Mock(), mock_config, Mock())
+
+    @staticmethod
+    def _file_router(files: dict[Path, str]) -> AsyncMock:
+        """Build an `ahandle_request` mock that returns YAML content based on file path."""
+        from griptape_nodes.retained_mode.events.os_events import (
+            FileIOFailureReason,
+            ReadFileResultFailure,
+            ReadFileResultSuccess,
+        )
+
+        async def route(request: object) -> object:
+            file_path = Path(getattr(request, "file_path", ""))
+            content = files.get(file_path)
+            if content is None:
+                return ReadFileResultFailure(
+                    failure_reason=FileIOFailureReason.FILE_NOT_FOUND,
+                    result_details=f"missing: {file_path}",
+                )
+            return ReadFileResultSuccess(
+                content=content,
+                file_size=len(content),
+                mime_type="text/plain",
+                encoding="utf-8",
+                result_details="ok",
+            )
+
+        return AsyncMock(side_effect=route)
+
+    async def _load_then_list(
+        self, pm: ProjectManager, files: dict[Path, str], load_order: list[Path]
+    ) -> dict[str, Any]:
+        """Load each project through the real handler, then list, keyed by project file path.
+
+        Both halves run against one router so the listing's own disk walks read the same YAML the
+        loads did.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            ListProjectTemplatesResultSuccess,
+            LoadProjectTemplateRequest,
+            LoadProjectTemplateResultSuccess,
+        )
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            cast("Mock", pm._event_manager).evaluate_authorization_checkpoint.return_value = None
+            mock_engine.ahandle_request = self._file_router(files)
+            for project_path in load_order:
+                load_result = await pm.on_load_project_template_request(
+                    LoadProjectTemplateRequest(project_path=project_path)
+                )
+                assert isinstance(load_result, LoadProjectTemplateResultSuccess), load_result.result_details
+            listing = await pm.on_list_project_templates_request(
+                ListProjectTemplatesRequest(include_system_builtins=False)
+            )
+
+        assert isinstance(listing, ListProjectTemplatesResultSuccess)
+        # Builtins are excluded from the request, so every entry here is file-backed; the None guard is
+        # only to key the dict by a real path.
+        return {
+            info.project_file_path: info for info in listing.successfully_loaded if info.project_file_path is not None
+        }
+
+    @pytest.mark.asyncio
+    async def test_declared_libraries_dir_is_reported_absolute(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project's own relative `libraries_dir` is reported as an absolute path under its own dir."""
+        project_path = (tmp_path / "solo" / "griptape-nodes-project.yml").resolve()
+        files = {
+            project_path: (
+                'project_template_schema_version: "0.3.3"\nname: Solo\nlibraries_dir: "./shared-libraries"\n'
+            )
+        }
+
+        by_path = await self._load_then_list(pm, files, [project_path])
+
+        info = by_path[str(project_path)]
+        assert info.libraries_root == str(canonicalize_for_identity(project_path.parent / "shared-libraries"))
+
+    @pytest.mark.asyncio
+    async def test_child_and_parent_report_the_same_libraries_root(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """An inherited `libraries_dir` anchors to the DECLARING ancestor, so the whole tree agrees.
+
+        This is the point of inheriting the field: one shared libraries tree that is downloaded once,
+        not one copy per child. A child anchoring the parent's `./libraries` to its OWN directory would
+        silently give every child a private tree.
+        """
+        base_path = (tmp_path / "base" / "griptape-nodes-project.yml").resolve()
+        child_path = (tmp_path / "base" / "shots" / "griptape-nodes-project.yml").resolve()
+        files = {
+            base_path: 'project_template_schema_version: "0.3.3"\nname: Base\nlibraries_dir: "./libraries"\n',
+            child_path: (
+                'project_template_schema_version: "0.3.3"\n'
+                "name: Child\n"
+                f'parent_project_path: "{base_path.as_posix()}"\n'
+            ),
+        }
+
+        by_path = await self._load_then_list(pm, files, [base_path, child_path])
+
+        expected = str(canonicalize_for_identity(base_path.parent / "libraries"))
+        assert by_path[str(base_path)].libraries_root == expected
+        assert by_path[str(child_path)].libraries_root == expected
+
+    @pytest.mark.asyncio
+    async def test_nothing_declared_falls_back_to_the_global_workspace_default(
+        self, pm: ProjectManager, tmp_path: Path, global_workspace: Path
+    ) -> None:
+        """With no declaration anywhere, both paths come from the engine's global workspace."""
+        project_path = (tmp_path / "plain" / "griptape-nodes-project.yml").resolve()
+        files = {project_path: 'project_template_schema_version: "0.3.3"\nname: Plain\ndirectories: {}\n'}
+
+        by_path = await self._load_then_list(pm, files, [project_path])
+
+        info = by_path[str(project_path)]
+        assert info.workspace_dir == str(global_workspace)
+        assert info.libraries_root == str(global_workspace / "libraries")
+
+    @pytest.mark.asyncio
+    async def test_libraries_directory_config_value_is_honored(
+        self, pm: ProjectManager, mock_config: Mock, tmp_path: Path, global_workspace: Path
+    ) -> None:
+        """The nothing-declared default reads `libraries_directory` from the TARGET's own config view.
+
+        A config layer that re-points `libraries_directory` has to be honored, and it has to be read
+        from the layers the target project would activate with -- which is what
+        `compute_project_provisioning_config` computes -- rather than the currently merged view.
+        """
+        mock_config.compute_project_provisioning_config.return_value = {"libraries_directory": "custom-libs"}
+        project_path = (tmp_path / "plain" / "griptape-nodes-project.yml").resolve()
+        files = {project_path: 'project_template_schema_version: "0.3.3"\nname: Plain\ndirectories: {}\n'}
+
+        by_path = await self._load_then_list(pm, files, [project_path])
+
+        assert by_path[str(project_path)].libraries_root == str(global_workspace / "custom-libs")
+
+    @pytest.mark.asyncio
+    async def test_declared_workspace_dir_wins_and_is_reported(self, pm: ProjectManager, tmp_path: Path) -> None:
+        """A project's own `workspace_dir` is the highest-priority source and is what gets reported."""
+        project_path = (tmp_path / "selfcontained" / "griptape-nodes-project.yml").resolve()
+        files = {project_path: 'project_template_schema_version: "0.3.3"\nname: Self Contained\nworkspace_dir: "./"\n'}
+
+        by_path = await self._load_then_list(pm, files, [project_path])
+
+        info = by_path[str(project_path)]
+        assert info.workspace_dir == str(project_path.parent.resolve())
+        # Nothing declares libraries_dir, so they land under the GLOBAL workspace, not this project's
+        # own workspace -- the libraries default is deliberately engine-global.
+        assert info.libraries_root is not None
+
+    @pytest.mark.asyncio
+    async def test_system_defaults_entry_reports_no_paths(self, pm: ProjectManager) -> None:
+        """The built-in defaults have no backing file, declare nothing, and are never activated."""
+        from griptape_nodes.retained_mode.events.project_events import (
+            ListProjectTemplatesRequest,
+            ListProjectTemplatesResultSuccess,
+        )
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            mock_engine.ahandle_request = self._file_router({})
+            pm._load_system_defaults()
+            listing = await pm.on_list_project_templates_request(
+                ListProjectTemplatesRequest(include_system_builtins=True)
+            )
+
+        assert isinstance(listing, ListProjectTemplatesResultSuccess)
+        file_backed = [info for info in listing.successfully_loaded if info.project_file_path is None]
+        assert len(file_backed) == 1
+        assert file_backed[0].workspace_dir is None
+        assert file_backed[0].libraries_root is None
+
+    @pytest.mark.asyncio
+    async def test_answers_do_not_depend_on_which_project_is_open(self, mock_config: Mock, tmp_path: Path) -> None:
+        """Contamination guard: one project's reported paths never move because another one is active.
+
+        The live workspace/libraries ladders read the CURRENT project's config layers. Reporting from
+        those would make the answer for project B depend on A being open -- the defect that got the
+        first attempt at this rejected. So the live layers are stubbed here to point somewhere
+        obviously wrong, and the listing is taken with each project active in turn.
+        """
+        first_path = (tmp_path / "first" / "griptape-nodes-project.yml").resolve()
+        second_path = (tmp_path / "second" / "griptape-nodes-project.yml").resolve()
+        files = {
+            first_path: 'project_template_schema_version: "0.3.3"\nname: First\nlibraries_dir: "./first-libs"\n',
+            second_path: 'project_template_schema_version: "0.3.3"\nname: Second\nlibraries_dir: "./second-libs"\n',
+        }
+        # If the listing read the live layers instead of the target's own, these would leak in.
+        mock_config.project_config = {"workspace_directory": str(tmp_path / "hijacked-workspace")}
+        mock_config.env_config = {"workspace_directory": str(tmp_path / "hijacked-workspace")}
+
+        answers = []
+        for active_project_id in [None, str(first_path), str(second_path)]:
+            fresh_pm = ProjectManager(Mock(), mock_config, Mock())
+            by_path = await self._load_then_list(fresh_pm, files, [first_path, second_path])
+            if active_project_id is not None:
+                fresh_pm._current_project_id = active_project_id
+                by_path = await self._load_then_list(fresh_pm, files, [])
+            answers.append({path: (info.workspace_dir, info.libraries_root) for path, info in by_path.items()})
+
+        assert answers[0] == answers[1] == answers[2]
+        assert answers[0][str(first_path)][1] == str(canonicalize_for_identity(first_path.parent / "first-libs"))
+        assert answers[0][str(second_path)][1] == str(canonicalize_for_identity(second_path.parent / "second-libs"))
 
 
 class TestSnapshotLibraryConfig:

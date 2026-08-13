@@ -45,6 +45,8 @@ from griptape_nodes.retained_mode.events.os_events import (
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.settings import (
+    DEFAULT_LIBRARIES_DIRECTORY,
+    LIBRARIES_DIRECTORY_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
 )
@@ -72,13 +74,11 @@ ADJACENT_CONFIG_FILENAME = "griptape_nodes_config.json"
 MANIFEST_FILENAME = "manifest.json"
 COPIED_LIBRARIES_DIRNAME = "libraries"
 
-# Top-level config key (and default) for the directory the engine clones
-# libraries_to_download into. When this sink sits inside the project base dir,
-# its downloaded (referenced) source must NOT travel in the package; the
-# importing engine re-downloads referenced libs from their pins. The default is
-# relative to the project workspace (the base dir for a self-contained project).
-LIBRARIES_DIRECTORY_KEY = "libraries_directory"
-DEFAULT_LIBRARIES_DIRECTORY = "libraries"
+# LIBRARIES_DIRECTORY_KEY / DEFAULT_LIBRARIES_DIRECTORY (imported from settings) name the directory
+# the engine clones libraries_to_download into. When this sink sits inside the project base dir, its
+# downloaded (referenced) source must NOT travel in the package; the importing engine re-downloads
+# referenced libs from their pins. The default is relative to the project workspace (the base dir for
+# a self-contained project).
 
 # Top-level config key for the project's workspace directory. The engine resolves
 # a relative libraries_directory against this (not the base dir); they coincide

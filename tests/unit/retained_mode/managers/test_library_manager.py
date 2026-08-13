@@ -5,6 +5,7 @@ import logging
 import subprocess
 import sys
 from collections.abc import Callable, Generator
+from functools import partial
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -53,6 +54,7 @@ from griptape_nodes.retained_mode.events.library_events import (
     UnloadLibraryFromRegistryResultSuccess,
 )
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager as _LibraryManager
 from griptape_nodes.retained_mode.managers.library_manager import LibraryVenvInitResult
 from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
@@ -2570,11 +2572,24 @@ class TestPreviewProjectProvisioning:
         mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=libraries_root)
         mock_config_manager = MagicMock()
         mock_config_manager.compute_project_provisioning_config.return_value = merged
+        TestPreviewProjectProvisioning._use_real_libraries_root_formula(mock_config_manager)
         with (
             patch.object(griptape_nodes, "_project_manager", mock_project_manager),
             patch.object(griptape_nodes, "_config_manager", mock_config_manager),
         ):
             yield mock_project_manager, mock_config_manager
+
+    @staticmethod
+    def _use_real_libraries_root_formula(mock_config_manager: MagicMock) -> None:
+        """Have a mocked ConfigManager compute the libraries fallback with the REAL formula.
+
+        The mock supplies the config layers (configured_global_workspace_path); production code does
+        the math. Without this, the fallback would return a MagicMock and these tests would silently
+        assert nothing about where libraries actually land.
+        """
+        mock_config_manager.default_libraries_root.side_effect = partial(
+            ConfigManager.default_libraries_root, mock_config_manager
+        )
 
     @staticmethod
     @contextlib.contextmanager
@@ -2747,6 +2762,7 @@ class TestPreviewProjectProvisioning:
         live_config = MagicMock()
         live_config.configured_global_workspace_path.return_value = global_ws
         live_config.compute_project_provisioning_config.return_value = merged
+        self._use_real_libraries_root_formula(live_config)
         mock_project_manager = MagicMock()
         mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=MagicMock())
         mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=None)

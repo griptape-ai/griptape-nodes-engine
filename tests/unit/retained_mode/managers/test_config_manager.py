@@ -231,6 +231,29 @@ class TestConfigManager:
 
             assert manager.resolved_libraries_root() == (global_ws / "libraries").resolve()
 
+    def test_default_libraries_root_falls_back_when_value_is_missing_or_empty(self, isolate_user_config: Path) -> None:
+        """An absent, empty, or non-string libraries_directory resolves to `<global workspace>/libraries`.
+
+        The fallback lives inside default_libraries_root so no caller can skip it. Without it, a
+        caller that read the value with no default of its own would pass None (crash) or "" -- and
+        `Path("")` is `Path(".")`, which would resolve the libraries root to the workspace itself and
+        install libraries on top of the user's files.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
+            workspace = Path(temp_dir) / "ws"
+            workspace.mkdir()
+            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
+            manager = ConfigManager()
+            expected = (workspace / "libraries").resolve()
+
+            assert manager.default_libraries_root(None) == expected
+            assert manager.default_libraries_root("") == expected
+            # A hand-edited config can put any JSON type here; it must not become a path component.
+            assert manager.default_libraries_root(5) == expected  # type: ignore[arg-type]
+
+            # A real value is still honored, relative to the global workspace.
+            assert manager.default_libraries_root("custom-libs") == (workspace / "custom-libs").resolve()
+
     def test_coerce_to_type_bool_from_string(self) -> None:
         """Test that _coerce_to_type correctly converts string values to bool."""
         manager = ConfigManager()

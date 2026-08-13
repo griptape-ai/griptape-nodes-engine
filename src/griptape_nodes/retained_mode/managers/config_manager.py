@@ -52,7 +52,12 @@ from griptape_nodes.retained_mode.events.os_events import (
     WriteFileResultFailure,
 )
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
-from griptape_nodes.retained_mode.managers.settings import WORKFLOWS_TO_REGISTER_KEY, Settings
+from griptape_nodes.retained_mode.managers.settings import (
+    DEFAULT_LIBRARIES_DIRECTORY,
+    LIBRARIES_DIRECTORY_KEY,
+    WORKFLOWS_TO_REGISTER_KEY,
+    Settings,
+)
 from griptape_nodes.utils.dict_utils import get_dot_value, merge_dicts, set_dot_value
 
 logger = logging.getLogger("griptape_nodes")
@@ -228,8 +233,45 @@ class ConfigManager(EngineScoped):
         """
         if self._libraries_root_override is not None:
             return Path(self._libraries_root_override)
-        libraries_dir = self.get_config_value("libraries_directory", default="libraries")
-        return resolve_workspace_path(Path(libraries_dir), self.configured_global_workspace_path())
+        return self.default_libraries_root(self.get_config_value(LIBRARIES_DIRECTORY_KEY))
+
+    def default_libraries_root(self, libraries_directory: str | None) -> Path:
+        """Resolve a workspace-relative libraries_directory value against the GLOBAL workspace.
+
+        The no-libraries_dir-declared fallback, factored out so every caller computes it the same
+        way: the live path above, the provisioning preview, and the offline resolver that reports
+        each project's effective libraries root on the project listing. Previously each open-coded
+        `resolve_workspace_path(Path(...), configured_global_workspace_path())`, which is exactly
+        the kind of duplication that lets a preview or a UI hint drift from what activation does.
+
+        The base is deliberately configured_global_workspace_path() -- the ENGINE's workspace,
+        excluding the runtime per-project override -- so this answer does NOT depend on which
+        project happens to be active. That is what makes it safe to compute for a project that is
+        not loaded. `libraries_directory` is the caller's business: it must come from the TARGET
+        project's config layers, not the merged view of whatever project is open.
+
+        A missing or empty value falls back to DEFAULT_LIBRARIES_DIRECTORY here rather than at each
+        call site: a caller that forgot its own default would otherwise hand us None and resolve the
+        libraries root to the workspace itself (`Path("")` is `Path(".")`), quietly installing
+        libraries on top of the user's workspace.
+
+        Args:
+            libraries_directory: The `libraries_directory` config value (absolute, or relative to
+                the global workspace). Anything that is not a non-empty string means "not
+                configured" -- None and "" say so deliberately, and a non-string says it by
+                accident. The annotation names what callers SHOULD pass, not the full set of what
+                arrives: the value comes from user-editable config JSON, where nothing enforces the
+                type, so `get_config_value` can hand over an int or a list.
+
+        Returns:
+            The absolute directory libraries install and resolve under.
+        """
+        # The isinstance half is load-bearing, not a redundant belt on the annotation: a config file
+        # with `"libraries_directory": 1` reaches here as an int, and Path(1) raises. Widening this
+        # to a string check alone would restore that crash.
+        if not isinstance(libraries_directory, str) or not libraries_directory:
+            libraries_directory = DEFAULT_LIBRARIES_DIRECTORY
+        return resolve_workspace_path(Path(libraries_directory), self.configured_global_workspace_path())
 
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.

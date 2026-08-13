@@ -35,9 +35,12 @@ from griptape_nodes.common.project_templates import (
     ProjectValidationProblemSeverity,
     ProjectValidationStatus,
     ProjectVariableDef,
+    ResolvedProjectPath,
     SituationTemplate,
+    active_platform,
     default_template_for_version,
     load_partial_project_template,
+    resolve_project_path_field,
     schema_major_or_none,
     select_project_path,
 )
@@ -126,6 +129,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointSubjectType,
 )
 from griptape_nodes.retained_mode.managers.settings import (
+    LIBRARIES_DIRECTORY_KEY,
     LIBRARIES_TO_DOWNLOAD_KEY,
     LIBRARIES_TO_REGISTER_KEY,
     PROJECTS_TO_REGISTER_KEY,
@@ -139,6 +143,7 @@ from griptape_nodes.retained_mode.publishing.project_packager import (
     rename_project_template,
 )
 from griptape_nodes.retained_mode.variable_types import FlowVariable, VariableLayer, VariablePermission
+from griptape_nodes.utils.dict_utils import get_dot_value
 from griptape_nodes.utils.file_utils import find_files_recursive
 from griptape_nodes.utils.version_utils import engine_version, engine_version_failure_detail
 
@@ -456,6 +461,60 @@ class WorkspaceDecision(NamedTuple):
 
     workspace_dir: Path
     apply_override: bool
+
+
+class AncestorValueLookup(NamedTuple):
+    """Outcome of walking a project's parent chain for the nearest declared value.
+
+    Three states, and keeping the last two apart is the whole point of this type:
+
+    - `value` set: an ancestor declares one, and this is it.
+    - `value` None, `incomplete_reason` None: the chain was walked to its root and nothing in it
+      declares a value. The caller may confidently fall back to its default.
+    - `value` None, `incomplete_reason` set: the walk did NOT come away with a complete picture --
+      the chain could not be seen to its root, because an ancestor's YAML is unreadable, an ancestor
+      declares a path field that cannot be resolved, a declared parent is missing, or the chain
+      cycles. A usable value may be hiding behind that break, so the caller logs the fall-through
+      rather than treating "nothing declared" as established.
+
+    Attributes:
+        value: The nearest ancestor's resolved value, or None if there was no hit.
+        incomplete_reason: Artist-readable phrase describing why the walk came away incomplete, or
+            None when the whole chain was seen and nothing in it declared a value.
+    """
+
+    value: str | None
+    incomplete_reason: str | None
+
+
+class ParentLinkLookup(NamedTuple):
+    """Outcome of reducing a stored `parent_project_path` to a registry key.
+
+    Carries the reason alongside the miss because a `parent_project_path` can fail to resolve in
+    several distinct ways (an unset variable, a macro token, a relative value with nowhere to anchor,
+    a reference cycle) and the callers report that failure to a user. Collapsing them to a bare
+    `None` forces the caller to guess which one happened, and a guess printed as a diagnosis is worse
+    than no diagnosis.
+
+    Attributes:
+        path: Canonical path string usable as a registry key, or None when it could not be resolved.
+        reason: Artist-readable phrase describing the miss, or None when `path` is set.
+    """
+
+    path: str | None
+    reason: str | None
+
+
+class EffectiveProjectPaths(NamedTuple):
+    """The two paths a project activates with, as reported on the project listing.
+
+    Both are absolute and both are always present: each resolution ladder bottoms out in an
+    unconditional default, and a project whose declared path fields could not be resolved fails to
+    load rather than reaching here.
+    """
+
+    workspace_dir: Path
+    libraries_root: Path
 
 
 class _ProvisioningConfigDirs(NamedTuple):
@@ -835,6 +894,11 @@ class ProjectManager(EngineScoped):
         records the failure in _registered_template_status, which ListProjectTemplatesRequest
         surfaces as failed_to_load. Read-only probes (e.g. resolve_workspace_dir_for_project_id)
         pass record_status=False so a transient lookup does not inject phantom failed-load entries.
+
+        This is also where a declared path field that cannot produce a path is refused
+        (_validate_declared_path_fields). Every consumer funnels through here -- the boot load,
+        activation, the offline ancestor walks and the read-only probes -- so one check means none of
+        them can substitute a different location behind the user's back.
         """
         read_request = ReadFileRequest(
             file_path=str(project_file_path),
@@ -844,44 +908,126 @@ class ProjectManager(EngineScoped):
         read_result = await self.engine.ahandle_request(read_request)
 
         if read_result.failed():
-            validation = ProjectValidationInfo(status=ProjectValidationStatus.MISSING)
-            if record_status:
-                self._registered_template_status[project_file_path] = validation
-            return LoadProjectTemplateResultFailure(
-                validation=validation,
-                result_details=f"Attempted to load project template from '{project_file_path}'. Failed because file not found",
+            return self._overlay_read_failure(
+                project_file_path,
+                ProjectValidationInfo(status=ProjectValidationStatus.MISSING),
+                "file not found",
+                record_status=record_status,
             )
 
         if not isinstance(read_result, ReadFileResultSuccess):
-            validation = ProjectValidationInfo(status=ProjectValidationStatus.UNUSABLE)
-            if record_status:
-                self._registered_template_status[project_file_path] = validation
-            return LoadProjectTemplateResultFailure(
-                validation=validation,
-                result_details=f"Attempted to load project template from '{project_file_path}'. Failed because file read returned unexpected result type",
+            return self._overlay_read_failure(
+                project_file_path,
+                ProjectValidationInfo(status=ProjectValidationStatus.UNUSABLE),
+                "file read returned unexpected result type",
+                record_status=record_status,
             )
 
         yaml_text = read_result.content
         if not isinstance(yaml_text, str):
-            validation = ProjectValidationInfo(status=ProjectValidationStatus.UNUSABLE)
-            if record_status:
-                self._registered_template_status[project_file_path] = validation
-            return LoadProjectTemplateResultFailure(
-                validation=validation,
-                result_details=f"Attempted to load project template from '{project_file_path}'. Failed because template must be text, got binary content",
+            return self._overlay_read_failure(
+                project_file_path,
+                ProjectValidationInfo(status=ProjectValidationStatus.UNUSABLE),
+                "template must be text, got binary content",
+                record_status=record_status,
             )
 
         validation = ProjectValidationInfo(status=ProjectValidationStatus.GOOD)
         overlay = load_partial_project_template(yaml_text, validation)
         if overlay is None:
-            if record_status:
-                self._registered_template_status[project_file_path] = validation
-            return LoadProjectTemplateResultFailure(
-                validation=validation,
-                result_details=f"Attempted to load project template from '{project_file_path}'. Failed because YAML could not be parsed",
+            return self._overlay_read_failure(
+                project_file_path, validation, "YAML could not be parsed", record_status=record_status
+            )
+
+        unresolvable_fields = self._validate_declared_path_fields(overlay, project_file_path, validation)
+        if unresolvable_fields:
+            return self._overlay_read_failure(
+                project_file_path,
+                validation,
+                (
+                    f"these declared paths could not be resolved: {', '.join(unresolvable_fields)}. "
+                    f"See the project's validation problems for the reason and line number of each."
+                ),
+                record_status=record_status,
             )
 
         return validation, overlay
+
+    def _overlay_read_failure(
+        self,
+        project_file_path: Path,
+        validation: ProjectValidationInfo,
+        reason: str,
+        *,
+        record_status: bool,
+    ) -> LoadProjectTemplateResultFailure:
+        """Build the failure result for an overlay that could not be read, and record it if asked.
+
+        Recording is what makes the entry show up in ListProjectTemplatesRequest's failed_to_load, so
+        the read-only probes pass record_status=False to keep a transient lookup from inventing one.
+        """
+        if record_status:
+            self._registered_template_status[project_file_path] = validation
+        return LoadProjectTemplateResultFailure(
+            validation=validation,
+            result_details=f"Attempted to load project template from '{project_file_path}'. Failed because {reason}",
+        )
+
+    def _validate_declared_path_fields(
+        self, overlay: ProjectOverlayData, project_file_path: Path, validation: ProjectValidationInfo
+    ) -> list[str]:
+        """Record an error for every declared path field that cannot produce a path.
+
+        A field that is ABSENT is not this method's business: the resolution ladders fall through to
+        the next source, which is the documented behavior. A field that is PRESENT but cannot produce
+        a path -- an unset `${VAR}` / `%VAR%`, a `{macro}` token, or a per-platform mapping with no
+        entry for this OS and no `default` -- is an error, because the only alternative is to discard
+        what the user wrote and put their workspace or their libraries somewhere else. A project that
+        installs libraries into a directory it never named is worse than a project that refuses to
+        open and says which line is wrong.
+
+        All three fields are checked even after the first error, so one load reports every broken
+        field instead of making the user fix them one restart at a time.
+
+        Anchoring uses the DECLARING file's directory. That is correct for all three: workspace_dir
+        and libraries_dir are own-node fields (ProjectTemplate.merge takes them from the overlay and
+        never inherits them from the base), and parent_project_path is by definition relative to the
+        file that names it.
+
+        Returns the names of the fields that failed, in declaration order; empty means the overlay's
+        paths are all resolvable and the caller may proceed.
+        """
+        declarations: dict[str, str | PerPlatformProjectPath | None] = {
+            "workspace_dir": overlay.workspace_dir,
+            "libraries_dir": overlay.libraries_dir,
+            "parent_project_path": overlay.parent_project_path,
+        }
+
+        unresolvable_fields: list[str] = []
+        for field_name, declared in declarations.items():
+            if declared is None:
+                continue
+
+            selected = select_project_path(declared)
+            if selected is None:
+                unresolvable_fields.append(field_name)
+                validation.add_error(
+                    field_path=field_name,
+                    message=self._platform_gap_message(field_name),
+                    line_number=overlay.line_info.get_line(field_name),
+                )
+                continue
+
+            resolution = resolve_project_path_field(selected, project_file_path.parent)
+            if resolution.path is None:
+                unresolvable_fields.append(field_name)
+                validation.add_error(
+                    field_path=field_name,
+                    message=self._unresolvable_field_message(field_name, selected, resolution),
+                    line_number=overlay.line_info.get_line(field_name),
+                )
+
+        return unresolvable_fields
 
     async def _resolve_parent_chain(  # noqa: C901, PLR0911
         self,
@@ -904,8 +1050,8 @@ class ProjectManager(EngineScoped):
            `project_file_path` so a child can name its parent with a relative path
            (e.g. `parent_project_path: ../base/griptape-nodes-project.yml`). A
            per-platform mapping is reduced to the active OS's path first; a mapping
-           with no key for this OS and no `default` is treated as no parent on this
-           platform.
+           with no key for this OS and no `default` names no parent this engine can
+           find, which is an error like any other unresolvable path field.
         3. Neither set: the base is `DEFAULT_PROJECT_TEMPLATE`.
 
         Once the parent file path is located, the parent YAML is read, recursively
@@ -940,23 +1086,35 @@ class ProjectManager(EngineScoped):
                 return None
         elif overlay.parent_project_path is not None:
             parent_link_field = "parent_project_path"
-            # Reduce the (possibly per-platform) value to a single string for the
-            # active platform. A per-platform mapping with no key matching the
-            # active OS and no `default` returns None — treat that as "no parent
-            # on this platform" and fall back to the system default base.
+            # Reduce the (possibly per-platform) value to a single string for the active platform.
+            # A mapping with no key for this OS and no `default` names no parent we can locate; it
+            # is an error, not "no parent here", because the child would otherwise load against the
+            # system defaults and quietly lose everything the parent was supposed to supply.
+            # _read_overlay already refuses such an overlay, so both failure branches below are
+            # defense in depth. They borrow their wording from the reachable copy in
+            # _validate_declared_path_fields rather than phrasing it again -- an unreachable message
+            # is an untested message, and two spellings of one condition drift.
             selected_parent = select_project_path(overlay.parent_project_path)
             if selected_parent is None:
-                logger.debug(
-                    "parent_project_path %r has no entry for the active platform and no default; "
-                    "treating as no parent on this OS",
-                    overlay.parent_project_path,
+                validation.add_error(
+                    field_path=parent_link_field,
+                    message=self._platform_gap_message(parent_link_field),
+                    line_number=overlay.line_info.get_line(parent_link_field),
                 )
-                return default_template_for_version(overlay.project_template_schema_version)
+                return None
             parent_label = selected_parent
-            parent_path_raw = Path(selected_parent)
-            if not parent_path_raw.is_absolute():
-                parent_path_raw = project_file_path.parent / parent_path_raw
-            parent_file_path = canonicalize_for_identity(parent_path_raw)
+            # Expand `~` / shell env vars BEFORE deciding relative-vs-absolute, so an absolute
+            # variable value is not anchored under this project's directory and an unset variable
+            # cannot bake a literal `${NAME}` into the parent link.
+            parent_resolution = resolve_project_path_field(selected_parent, project_file_path.parent)
+            if parent_resolution.path is None:
+                validation.add_error(
+                    field_path=parent_link_field,
+                    message=self._unresolvable_field_message(parent_link_field, selected_parent, parent_resolution),
+                    line_number=overlay.line_info.get_line(parent_link_field),
+                )
+                return None
+            parent_file_path = parent_resolution.path
         else:
             return default_template_for_version(overlay.project_template_schema_version)
 
@@ -1075,12 +1233,17 @@ class ProjectManager(EngineScoped):
             result_details=f"Resolved workspace for '{request.project_id}': {resolved}",
         )
 
-    def on_list_project_templates_request(
+    async def on_list_project_templates_request(
         self, request: ListProjectTemplatesRequest
     ) -> ListProjectTemplatesResultSuccess:
         """List all project templates that have been loaded or attempted to load.
 
         Returns separate lists for successfully loaded and failed templates.
+
+        Async because each loaded entry reports the workspace and libraries root it activates with,
+        which walks its parent chain from disk. The id -> path index that walk needs is built ONCE
+        here and shared by every entry, so a listing of N projects costs one scan of
+        projects_to_register rather than N.
         """
         successfully_loaded: list[ProjectTemplateInfo] = []
         failed_to_load: list[ProjectTemplateInfo] = []
@@ -1095,13 +1258,17 @@ class ProjectManager(EngineScoped):
             if info.project_file_path is not None
         }
 
+        id_index = await self._build_unloaded_id_index()
+
         # Gather successfully loaded templates from _successfully_loaded_project_templates
         for project_id, project_info in self._successfully_loaded_project_templates.items():
             # Skip system builtins unless requested
             if not request.include_system_builtins and project_id == SYSTEM_DEFAULTS_KEY:
                 continue
 
-            successfully_loaded.append(self._build_loaded_template_info(project_id, project_info, file_path_to_id))
+            successfully_loaded.append(
+                await self._build_loaded_template_info(project_id, project_info, file_path_to_id, id_index)
+            )
 
         # Gather failed templates from _registered_template_status.
         # These are tracked by Path, so correlate against the id-keyed registry
@@ -1127,16 +1294,18 @@ class ProjectManager(EngineScoped):
             result_details=f"Successfully listed project templates. Loaded: {len(successfully_loaded)}, Failed: {len(failed_to_load)}",
         )
 
-    def _build_loaded_template_info(
+    async def _build_loaded_template_info(
         self,
         project_id: ProjectID,
         project_info: ProjectInfo,
         file_path_to_id: dict[Path, ProjectID],
+        id_index: dict[str, Path],
     ) -> ProjectTemplateInfo:
         """Build the ProjectTemplateInfo for a successfully loaded template.
 
-        Resolves the parent's id and the project-adjacent engine-version
-        compatibility for the listing emitted to the GUI.
+        Resolves the parent's id, the project-adjacent engine-version
+        compatibility, and the workspace + libraries root this project activates
+        with, for the listing emitted to the GUI.
         """
         # Emit the parent's id so the GUI can reconstruct the hierarchy by
         # matching it against another entry's project_id. An explicit
@@ -1146,17 +1315,9 @@ class ProjectManager(EngineScoped):
         # registered, its id is its canonical path string (the legacy bridge),
         # so the canonical string is the correct fallback. Per-platform
         # mappings are reduced to the active platform's value first.
-        resolved_parent_id: str | None = None
-        if project_info.template.parent_project_id is not None:
-            resolved_parent_id = project_info.template.parent_project_id
-        else:
-            selected_parent = select_project_path(project_info.template.parent_project_path)
-            if selected_parent is not None:
-                parent_path = Path(selected_parent)
-                if not parent_path.is_absolute() and project_info.project_file_path is not None:
-                    parent_path = project_info.project_file_path.parent / parent_path
-                canonical_parent = canonicalize_for_identity(parent_path)
-                resolved_parent_id = file_path_to_id.get(canonical_parent, str(canonical_parent))
+        resolved_parent_id = self._reduce_parent_link_to_id(
+            project_info.template, project_info.project_file_path, file_path_to_id
+        )
 
         # Read the project-adjacent config's requires_engine specifier without
         # merging it into the live config, so the GUI can disable activation
@@ -1170,6 +1331,14 @@ class ProjectManager(EngineScoped):
             )
         engine_version_reason = engine_version_failure_detail(required_engine_version)
 
+        # Where this project's files and libraries actually land. Both stay None for an entry with no
+        # backing file (the system defaults), which declares nothing and is never activated.
+        effective_paths: EffectiveProjectPaths | None = None
+        if project_info.project_file_path is not None:
+            effective_paths = await self._effective_paths_for_project(
+                project_info.project_file_path, project_info.template, id_index
+            )
+
         return ProjectTemplateInfo(
             project_id=project_id,
             validation=project_info.validation,
@@ -1182,6 +1351,8 @@ class ProjectManager(EngineScoped):
             required_engine_version=required_engine_version,
             current_engine_version=engine_version,
             engine_version_reason=engine_version_reason,
+            workspace_dir=str(effective_paths.workspace_dir) if effective_paths is not None else None,
+            libraries_root=str(effective_paths.libraries_root) if effective_paths is not None else None,
         )
 
     def on_get_situation_request(
@@ -1592,12 +1763,9 @@ class ProjectManager(EngineScoped):
         replay the unpinned branch-3 config-merge re-point the live config merge would apply.
         """
         id_index = await self._build_unloaded_id_index()
-        project_file_path = id_index.get(project_id)
+        project_file_path = self._project_file_path_for_id(project_id, id_index)
         if project_file_path is None:
-            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
-            if not legacy_path_candidate.is_file():
-                return None
-            project_file_path = legacy_path_candidate
+            return None
 
         project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
         env_config = self._config_manager.read_env_config()
@@ -1644,8 +1812,15 @@ class ProjectManager(EngineScoped):
         if pre_inheritance is not None:
             return pre_inheritance
 
-        inherited = await self._inherit_workspace_from_parents_offline(project_file_path, id_index)
-        return self._decide_workspace_post_inheritance(project_file_path, inherited)
+        lookup = await self._inherit_workspace_from_parents_offline(project_file_path, id_index)
+        if lookup.incomplete_reason is not None:
+            logger.warning(
+                "Could not inherit a workspace for project '%s' from its parent chain (%s). "
+                "Falling back to the global default workspace.",
+                project_file_path,
+                lookup.incomplete_reason,
+            )
+        return self._decide_workspace_post_inheritance(project_file_path, lookup.value)
 
     async def _decide_libraries_root_from_disk(
         self, project_file_path: Path, template_libraries_dir: str | None, id_index: dict[str, Path]
@@ -1658,12 +1833,25 @@ class ProjectManager(EngineScoped):
         so a child's shared libraries/ tree is identical whether or not its parent is loaded. Returns
         None when no libraries_dir is declared anywhere in the chain (caller falls back to the
         workspace-relative default).
+
+        A chain that could not be fully walked still falls back to the workspace-relative default --
+        activation has to pick SOMETHING to run with -- but it says so in the log. That break is rare
+        by construction: a project whose parent link or path fields do not resolve fails its own load,
+        so a chain normally breaks only if an ancestor file was moved or made unreadable after the
+        descendants were registered.
         """
         if template_libraries_dir is not None:
             return Path(template_libraries_dir)
-        inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
-        if inherited is not None:
-            return Path(inherited)
+        lookup = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
+        if lookup.incomplete_reason is not None:
+            logger.warning(
+                "Could not inherit a libraries root for project '%s' from its parent chain (%s). "
+                "Falling back to the workspace-relative libraries directory.",
+                project_file_path,
+                lookup.incomplete_reason,
+            )
+        if lookup.value is not None:
+            return Path(lookup.value)
         return None
 
     def _resolve_workspace_dir(self, workspace_dir: Path) -> Path:
@@ -1711,7 +1899,7 @@ class ProjectManager(EngineScoped):
 
     async def _inherit_workspace_from_parents_offline(
         self, project_file_path: Path, id_index: dict[str, Path]
-    ) -> str | None:
+    ) -> AncestorValueLookup:
         """Offline analogue of _inherit_workspace_from_parents: walk the parent chain from disk.
 
         Resolves an ancestor's workspace without forcing that ancestor to be loaded/enabled. The
@@ -1723,10 +1911,11 @@ class ProjectManager(EngineScoped):
         starting project's own explicit sources are handled by _decide_workspace_pre_inheritance.
 
         Because the shared walker requires each node's overlay to be readable to stay on the chain, an
-        ancestor whose project YAML is unreadable is skipped even if it declares a workspace via a
-        project_workspaces override or adjacent config. This fails closed (the walk returns None and
-        the resolver falls back to the global default), matching the live walk and the offline
-        libraries walk, which already treat an unreadable/unloadable ancestor as a broken chain link.
+        ancestor whose project YAML is unreadable ends the walk even if it declares a workspace via a
+        project_workspaces override or adjacent config. That case comes back as an
+        `incomplete_reason` rather than a bare miss, so the caller can log that it is falling back to
+        the global default without a complete picture instead of implying the default was chosen
+        because the chain genuinely declared nothing.
         """
         project_workspaces = self._config_manager.get_config_value(
             "project_workspaces",
@@ -1734,15 +1923,24 @@ class ProjectManager(EngineScoped):
             default={},
         )
 
-        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> ResolvedProjectPath:
             # The ancestor's workspace_dir template field (branch 0) wins, mirroring how the ancestor
             # would resolve its own workspace as the active project; the overlay was already read by
             # the walker to follow the parent link, so the field is free to read here. Falls through
-            # to the ancestor's project_workspaces override / adjacent config when the field is unset.
-            template_workspace = self._resolve_template_workspace_dir(overlay.workspace_dir, node_path)
-            if template_workspace is not None:
-                return template_workspace
-            return self._resolve_node_explicit_workspace(node_path, project_workspaces)
+            # to the ancestor's project_workspaces override / adjacent config when the field is
+            # unset. (It cannot be set-but-unresolvable: _read_overlay would have refused the
+            # ancestor, and the walker reports that as a break in the chain.)
+            template_resolution = self._resolve_template_path_field(overlay.workspace_dir, node_path, "workspace_dir")
+            if template_resolution.path is not None:
+                return template_resolution
+            explicit_workspace = self._resolve_node_explicit_workspace(node_path, project_workspaces)
+            if explicit_workspace is not None:
+                return ResolvedProjectPath(
+                    path=Path(explicit_workspace),
+                    unresolved_variables=[],
+                    macro_tokens=[],
+                )
+            return template_resolution
 
         return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
 
@@ -1764,38 +1962,122 @@ class ProjectManager(EngineScoped):
         return parent_path_candidate
 
     async def resolve_libraries_root_for_project_id(self, project_id: str) -> Path | None:
-        """Resolve the libraries root a project would use WITHOUT loading it, or None for the default.
+        """Resolve the EXPLICIT libraries root a project would use WITHOUT loading it, or None.
 
-        Offline analogue of decide_libraries_root, used by the provisioning preview so the previewed
-        SKIP/INSTALL/OVERWRITE plan matches what activation reconciles. The id is resolved to a file
-        path the same way resolve_workspace_dir_for_project_id does. Branch 0 reads this project's own
-        libraries_dir from its on-disk overlay; branch 1 walks the parent chain offline. Returns None
-        when no libraries_dir is declared anywhere in the chain, so the caller falls back to the
-        workspace-relative libraries directory.
+        Offline analogue of decide_libraries_root's declaring rungs: the project's own libraries_dir
+        (branch 0, read from its on-disk overlay so an unloaded project still honors it), then the
+        nearest ancestor that declares one (branch 1, walked from disk so an unloaded parent still
+        counts). Both rungs run through _decide_libraries_root_from_disk, the same code activation
+        uses, so the two cannot state different paths.
+
+        None means "no explicit libraries_dir applies here" -- nothing in the chain declares one, or
+        the id resolves to no readable project file. Callers that need a directory to install into
+        supply the workspace-relative default themselves; the provisioning preview does exactly that
+        from the merged config it already holds, which is what keeps its SKIP/INSTALL/OVERWRITE plan
+        matching what activation reconciles. _effective_paths_for_project is the caller that wants the
+        fully-defaulted answer.
+
+        A declared value that cannot be resolved does not reach here: _read_overlay rejects an
+        unresolvable path field, so such a project is UNUSABLE and never gets walked.
+
+        Builds its own id -> path index. The listing does NOT come through here (it goes through
+        _effective_paths_for_project, which wants the fully-defaulted answer), so there is no caller
+        with an index to hand over and no reason to accept one until one exists.
+
+        Args:
+            project_id: Registry key, or a legacy id that is itself a canonical project file path.
         """
         id_index = await self._build_unloaded_id_index()
-        project_file_path = id_index.get(project_id)
+        project_file_path = self._project_file_path_for_id(project_id, id_index)
         if project_file_path is None:
-            legacy_path_candidate = canonicalize_for_identity(Path(project_id))
-            if not legacy_path_candidate.is_file():
-                return None
-            project_file_path = legacy_path_candidate
+            return None
 
         own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
-        if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
-            _, own_overlay = own_overlay_load
-            template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
-            if template_libraries_dir is not None:
-                return Path(template_libraries_dir)
+        if isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
+            return None
+        _, own_overlay = own_overlay_load
 
-        inherited = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
-        if inherited is not None:
-            return Path(inherited)
-        return None
+        template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
+        return await self._decide_libraries_root_from_disk(project_file_path, template_libraries_dir, id_index)
+
+    async def _effective_paths_for_project(
+        self, project_file_path: Path, template: ProjectTemplate, id_index: dict[str, Path]
+    ) -> EffectiveProjectPaths:
+        """Resolve the workspace + libraries paths a LOADED project activates with, for the listing.
+
+        Both ladders are walked from disk rather than through the live config, because that is what
+        activation itself does for any project declaring a parent
+        (_apply_workspace_and_libraries_layers) and because the live path reads the CURRENT project's
+        config layers -- which would make the answer for one project depend on which other project
+        happens to be open.
+
+        The starting project's own workspace_dir / libraries_dir come from its already-loaded
+        template, so only ancestors cost an overlay read. That is safe because both fields are
+        own-node fields: ProjectTemplate.merge takes them from the overlay alone and never inherits
+        them from the base (see merged_workspace_dir / merged_libraries_dir), so the loaded value is
+        this project's own declaration and anchoring it to this project's directory is correct.
+
+        Both values are always a real path: each ladder bottoms out in an unconditional default, and
+        a project whose declarations could not be resolved would have failed to load.
+        """
+        project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
+        env_config = self._config_manager.read_env_config()
+        template_workspace_dir = self._resolve_template_workspace_dir(template.workspace_dir, project_file_path)
+        template_libraries_dir = self._resolve_template_libraries_dir(template.libraries_dir, project_file_path)
+
+        decision = await self._decide_workspace_from_disk(
+            project_file_path, project_config, env_config, template_workspace_dir, id_index
+        )
+        libraries_root = await self._decide_libraries_root_from_disk(
+            project_file_path, template_libraries_dir, id_index
+        )
+        if libraries_root is None:
+            libraries_root = self._workspace_relative_libraries_root(project_file_path, decision)
+
+        return EffectiveProjectPaths(
+            workspace_dir=self._resolve_workspace_dir(decision.workspace_dir), libraries_root=libraries_root
+        )
+
+    def _workspace_relative_libraries_root(self, project_file_path: Path, decision: WorkspaceDecision) -> Path:
+        """Compute the nothing-declared libraries default for a target project, offline.
+
+        Resolves `libraries_directory` against the ENGINE's global workspace via
+        ConfigManager.default_libraries_root, exactly as the live
+        ConfigManager.resolved_libraries_root fallback does. The value is read from the merged view
+        the TARGET project would activate with (compute_project_provisioning_config over its own
+        project dir and the workspace it decided) rather than the live merged config, so a layer that
+        re-points libraries_directory is honored and the answer does not change depending on which
+        project happens to be open. That is the same merged view the provisioning preview reads, so
+        the two cannot disagree about where an undeclared libraries root lands.
+
+        Takes the caller's already-computed WorkspaceDecision rather than re-deciding, so resolving
+        both paths for one project walks its parent chain once.
+        """
+        project_dir = project_file_path.parent
+        merged = self._config_manager.compute_project_provisioning_config(
+            project_dir, decision.workspace_dir, apply_override=decision.apply_override
+        )
+        return self._config_manager.default_libraries_root(get_dot_value(merged, LIBRARIES_DIRECTORY_KEY))
+
+    def _project_file_path_for_id(self, project_id: str, id_index: dict[str, Path]) -> Path | None:
+        """Map an opaque project id to its file path for the offline resolvers, or None.
+
+        The id is looked up verbatim in the index (ids must never be parsed as paths), then -- for a
+        legacy project whose id IS its canonical file path string -- accepted directly when that path
+        is a readable file. Returns None when the id resolves to no project file on disk.
+        """
+        indexed_path = id_index.get(project_id)
+        if indexed_path is not None:
+            return indexed_path
+
+        legacy_path_candidate = canonicalize_for_identity(Path(project_id))
+        if not legacy_path_candidate.is_file():
+            return None
+        return legacy_path_candidate
 
     async def _inherit_libraries_dir_from_parents_offline(
         self, project_file_path: Path, id_index: dict[str, Path]
-    ) -> str | None:
+    ) -> AncestorValueLookup:
         """Offline analogue of _inherit_libraries_dir_from_parents: walk the parent chain from disk.
 
         Resolves an ancestor's libraries_dir without forcing that ancestor to be loaded/enabled. The
@@ -1805,8 +2087,8 @@ class ProjectManager(EngineScoped):
         parent: the starting project's own libraries_dir is handled by branch 0 of the caller.
         """
 
-        def probe(node_path: Path, overlay: ProjectOverlayData) -> str | None:
-            return self._resolve_template_libraries_dir(overlay.libraries_dir, node_path)
+        def probe(node_path: Path, overlay: ProjectOverlayData) -> ResolvedProjectPath:
+            return self._resolve_template_path_field(overlay.libraries_dir, node_path, "libraries_dir")
 
         return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
 
@@ -1814,9 +2096,9 @@ class ProjectManager(EngineScoped):
         self,
         project_file_path: Path,
         id_index: dict[str, Path],
-        probe: Callable[[Path, ProjectOverlayData], str | None],
-    ) -> str | None:
-        """Walk the explicit parent chain from disk and return the first probe hit, or None.
+        probe: Callable[[Path, ProjectOverlayData], ResolvedProjectPath],
+    ) -> AncestorValueLookup:
+        """Walk the explicit parent chain from disk for the nearest probe hit, reporting completeness.
 
         Shared skeleton for the offline workspace and libraries inheritance walks, used when a target
         project may not be loaded (e.g. the provisioning preview). Reads each node's overlay from disk
@@ -1824,12 +2106,21 @@ class ProjectManager(EngineScoped):
         shared _reduce_parent_link_to_id) and to probe that node. Each reduced id maps back to a file
         path through `id_index` for a parent_project_id (or a legacy path already indexed), else the
         reduced canonical path is followed directly from disk for an unregistered legacy
-        parent_project_path; an id with no index entry and no readable file fails closed (None).
+        parent_project_path.
 
         The start project is NOT probed: its own value is handled by the caller's branch 0 / the
-        earlier decide_workspace branches, so the walk begins at the parent. A node whose overlay
-        cannot be read returns None (fail-closed) -- an unreadable project YAML is not a valid chain
-        link. A visited id-set guards against a cyclic parent chain.
+        earlier decide_workspace branches, so the walk begins at the parent. A visited id-set guards
+        against a cyclic parent chain.
+
+        Crucially, a MISS and an INCOMPLETE PICTURE are reported differently. Both used to collapse to
+        None, which callers read as "no ancestor declares one, so use the default" -- turning an
+        unreadable ancestor into a confident wrong answer. Now only a chain walked all the way to its
+        root reports `incomplete_reason=None`; an ancestor that could not be loaded, a parent id that
+        maps to no file, and a cycle each say why they stopped.
+
+        A probe that comes back unresolved cannot occur: _read_overlay rejects an overlay whose path
+        fields do not resolve, so such an ancestor fails the read above and is reported as a break in
+        the chain rather than silently stepped past.
         """
         file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
 
@@ -1839,29 +2130,45 @@ class ProjectManager(EngineScoped):
         start_id = file_path_to_id.get(project_file_path)
         visited: set[ProjectID] = {start_id} if start_id is not None else set()
 
-        current_path: Path | None = project_file_path
+        current_path = project_file_path
         is_start = True
-        while current_path is not None:
+        while True:
             read_load = await self._read_overlay(current_path, record_status=False)
             if isinstance(read_load, LoadProjectTemplateResultFailure):
-                return None
+                if is_start:
+                    # The starting project's own YAML is unusable; the caller's own-overlay branch
+                    # already reported that, so this is not an ancestor-chain problem.
+                    return AncestorValueLookup(value=None, incomplete_reason=None)
+                return AncestorValueLookup(
+                    value=None,
+                    incomplete_reason=f"the parent project '{current_path}' could not be loaded",
+                )
             _, overlay = read_load
 
             if not is_start:
-                node_value = probe(current_path, overlay)
-                if node_value is not None:
-                    return node_value
+                probed = probe(current_path, overlay)
+                if probed.path is not None:
+                    return AncestorValueLookup(value=str(probed.path), incomplete_reason=None)
             is_start = False
 
             parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
             if parent_id is None:
-                return None
+                # The chain ended at its root: nothing usable in it, and nothing hidden from us.
+                return AncestorValueLookup(value=None, incomplete_reason=None)
             if parent_id in visited:
-                return None
+                return AncestorValueLookup(
+                    value=None,
+                    incomplete_reason=f"the parent chain forms a cycle at project '{parent_id}'",
+                )
             visited.add(parent_id)
 
-            current_path = self._resolve_parent_id_to_path(parent_id, id_index)
-        return None
+            parent_path = self._resolve_parent_id_to_path(parent_id, id_index)
+            if parent_path is None:
+                return AncestorValueLookup(
+                    value=None,
+                    incomplete_reason=f"parent project '{parent_id}' is declared but could not be located on disk",
+                )
+            current_path = parent_path
 
     def decide_workspace(
         self,
@@ -1890,7 +2197,10 @@ class ProjectManager(EngineScoped):
         `template_workspace_dir` is the highest-priority source: a project that declares its own
         workspace_dir beats the per-user project_workspaces mapping and the env var. The caller
         resolves the (possibly per-platform, possibly relative) raw field to an absolute path before
-        passing it, so this method and the offline resolver share the branch verbatim.
+        passing it, so this method and the offline resolver share the branch verbatim. For a project
+        that loaded, None means the field was ABSENT and nothing more: a declared value that cannot
+        produce a path is refused by _read_overlay, so the project is UNUSABLE and never reaches this
+        ladder. Branch 0 is skipped only when the project genuinely declares no workspace of its own.
 
         Branch 4 walks the project's explicit parent chain (parent_project_id / legacy
         parent_project_path, resolved through the registry) and inherits the first ancestor that
@@ -1931,24 +2241,146 @@ class ProjectManager(EngineScoped):
         inherited = self._inherit_workspace_from_parents(project_file_path)
         return self._decide_workspace_post_inheritance(project_file_path, inherited)
 
+    def _resolve_template_path_field(
+        self, raw: str | PerPlatformProjectPath | None, project_file_path: Path, field_name: str
+    ) -> ResolvedProjectPath:
+        """Resolve a template's raw workspace_dir/libraries_dir field, reporting WHY it failed.
+
+        Reduces a per-platform mapping to the active platform's value, then hands the value to the
+        shared resolve_project_path_field, which expands `~` and shell environment variables BEFORE
+        deciding relative-vs-absolute and anchors a still-relative path to the DECLARING project's
+        directory. Mirrors how parent_project_path is resolved (_resolve_parent_chain), so all three
+        path fields treat relative paths and variables identically.
+
+        This is the single source of truth for both fields; _resolve_template_workspace_dir and
+        _resolve_template_libraries_dir are `str | None` projections of it for the resolution
+        ladders, which only need "is there a usable value?".
+
+        An unset field resolves to a None path with empty reason lists -- "nothing declared", so the
+        ladder falls through to the next source.
+
+        A field that IS declared but cannot produce a path (no entry for this platform and no
+        'default', an unset variable, a macro token) cannot reach here for a project that loaded:
+        _read_overlay validates all three path fields and refuses the overlay, so the project is
+        UNUSABLE and never gets activated or listed. The warn-and-fall-through below is therefore
+        defense in depth rather than a normal outcome, and it keeps the resolvers total for callers
+        that hand them a value from somewhere other than an overlay read.
+
+        One window where load-time and activation-time answers can differ: a project registered
+        WHILE another project's `environment:` block is applied validates against that mutated
+        os.environ, whereas activation restores the launch environment before resolving. A value that
+        depends on a variable only some other project sets can therefore pass validation and then
+        fail to resolve here.
+        """
+        if raw is None:
+            return ResolvedProjectPath(path=None, unresolved_variables=[], macro_tokens=[])
+
+        selected = select_project_path(raw)
+        if selected is None:
+            logger.warning(
+                "Project '%s' declares %s as a per-platform mapping with no entry for this platform "
+                "and no 'default'. Ignoring it and falling back to the next source.",
+                project_file_path,
+                field_name,
+            )
+            return ResolvedProjectPath(path=None, unresolved_variables=[], macro_tokens=[])
+
+        resolution = resolve_project_path_field(selected, project_file_path.parent)
+        if resolution.path is None:
+            logger.warning(
+                "Project '%s' declares %s as %r, which cannot be resolved (%s). Ignoring it and "
+                "falling back to the next source.",
+                project_file_path,
+                field_name,
+                selected,
+                self._describe_unresolved_path(resolution),
+            )
+        return resolution
+
+    @staticmethod
+    def _platform_gap_message(field_name: str) -> str:
+        """Phrase a per-platform mapping that names no path for this OS and has no `default`.
+
+        Shared by `_validate_declared_path_fields`, which is the copy users actually reach, and the
+        defense-in-depth check in `_resolve_parent_chain`, which cannot fire because `_read_overlay`
+        has already refused such an overlay. One condition should not have two sets of user-facing
+        strings: the unreachable copy is by definition untested, so it can drift from the reachable
+        one without anything noticing.
+
+        The remedy depends on whether this platform can be named at all. On a platform with no
+        mapping key, "add an entry for this one" is advice that cannot be followed -- the schema
+        forbids any key outside `linux`/`darwin`/`windows`, so the suggested fix would fail
+        validation and `default` is the only way out.
+        """
+        platform = active_platform()
+        remedy = (
+            "Add a 'default' entry for the platforms you did not name, or an entry for this one."
+            if platform.key
+            else "Add a 'default' entry: this platform has no key of its own, so 'default' is the only way to name it."
+        )
+        return (
+            f"Attempted to resolve '{field_name}' for this project. Failed because it lists no path "
+            f"for this platform ({platform.display}) and no 'default'. {remedy}"
+        )
+
+    def _unresolvable_field_message(self, field_name: str, selected: str, resolution: ResolvedProjectPath) -> str:
+        """Phrase a declared path field that resolved to nothing, naming the value and the cause.
+
+        Shared with `_resolve_parent_chain` for the same reason as `_platform_gap_message`.
+        """
+        return (
+            f"Attempted to resolve '{field_name}' declared as '{selected}'. Failed because "
+            f"{self._describe_unresolved_path(resolution)}."
+        )
+
+    @staticmethod
+    def _describe_unresolved_path(resolution: ResolvedProjectPath) -> str:
+        """Phrase why a declared path field could not be resolved, for logs and result_details.
+
+        Only ever called with a resolution whose `path` is None. Every state `ResolvedProjectPath`
+        can be in gets its own phrasing, and each is reachable: callers anchored to a project's own
+        YAML see unresolved variables and macro tokens, `_resolve_parent_path_for_lookup` also
+        arrives here with `needs_anchor` (the validate handler is path-less, so a template not yet in
+        the registry has no directory of its own), and any of them can hit a reference cycle.
+
+        The empty-`reasons` fallback is the defensive one -- it exists so a state added to
+        `ResolvedProjectPath` later reads as "could not resolve" instead of confidently naming the
+        wrong cause, which is the class of bug this whole path is about.
+        """
+        reasons: list[str] = []
+        if resolution.unresolved_variables:
+            names = ", ".join(sorted(set(resolution.unresolved_variables)))
+            reasons.append(f"no value is set for {names}")
+        if resolution.macro_tokens:
+            names = ", ".join(sorted(set(resolution.macro_tokens)))
+            reasons.append(f"macro tokens are not supported in path fields: {names}")
+        if resolution.needs_anchor:
+            reasons.append("it is a relative path and the project's own directory was not available to place it in")
+        if resolution.reference_cycle:
+            reasons.append("its variable references expand into each other and never resolve")
+        if resolution.quoted_expansion:
+            reasons.append(
+                "a variable it references expanded to a quoted value, which is not a usable path "
+                "(remove the quotes from the variable's value, not from this field)"
+            )
+        if not reasons:
+            return "it could not be turned into a usable path"
+        return "; ".join(reasons)
+
     def _resolve_template_workspace_dir(
         self, raw: str | PerPlatformProjectPath | None, project_file_path: Path
     ) -> str | None:
         """Resolve a template's raw workspace_dir field to an absolute path string, or None.
 
-        Reduces a per-platform mapping to the active platform's value, resolves a relative path
-        against the project YAML's directory, and canonicalizes the result. Mirrors how
-        parent_project_path is resolved (_resolve_parent_chain), so the two fields treat relative
-        paths the same way. Returns None when the field is unset or has no value for the active
-        platform.
+        Thin projection of _resolve_template_path_field for the workspace resolution ladder. Returns
+        None when the field is unset -- and, defensively, for the declared-but-unresolvable cases that
+        _read_overlay already refuses at load time. Both mean the same thing to the ladder: fall
+        through to the next workspace source.
         """
-        selected = select_project_path(raw)
-        if selected is None:
+        resolution = self._resolve_template_path_field(raw, project_file_path, "workspace_dir")
+        if resolution.path is None:
             return None
-        candidate = Path(selected)
-        if not candidate.is_absolute():
-            candidate = project_file_path.parent / candidate
-        return str(canonicalize_for_identity(candidate))
+        return str(resolution.path)
 
     def _decide_workspace_pre_inheritance(
         self,
@@ -2098,6 +2530,12 @@ class ProjectManager(EngineScoped):
         ancestor's own dir is what makes every child point at the same parent libraries/ tree, so a
         library declared on the parent is downloaded once and reused via SKIP. See
         _inherit_libraries_dir_from_parents.
+
+        For a project that loaded, `template_libraries_dir` is None only because the field was ABSENT.
+        A declared value that cannot produce a path (unset variable, macro token, no entry for this
+        platform and no 'default') is refused by _read_overlay, so such a project is UNUSABLE and
+        never reaches this ladder -- branch 2's legacy default is never a substitute for a declaration
+        the engine failed to honor.
         """
         if template_libraries_dir is not None:
             return Path(template_libraries_dir)
@@ -2111,19 +2549,16 @@ class ProjectManager(EngineScoped):
     ) -> str | None:
         """Resolve a template's raw libraries_dir field to an absolute path string, or None.
 
-        Mirrors _resolve_template_workspace_dir: reduces a per-platform mapping to the active
-        platform's value, resolves a relative path against the project YAML's directory, and
-        canonicalizes the result. Returns None when the field is unset or has no value for the active
-        platform. This doubles as the per-node leaf primitive for the parent-chain walks, so an
-        inherited value resolves against the DECLARING node's directory.
+        Thin projection of _resolve_template_path_field, mirroring _resolve_template_workspace_dir.
+        Returns None when the field is unset -- and, defensively, for the declared-but-unresolvable
+        cases _read_overlay already refuses at load time. This doubles as the per-node leaf primitive
+        for the parent-chain walks, so an inherited value resolves against the DECLARING node's
+        directory.
         """
-        selected = select_project_path(raw)
-        if selected is None:
+        resolution = self._resolve_template_path_field(raw, project_file_path, "libraries_dir")
+        if resolution.path is None:
             return None
-        candidate = Path(selected)
-        if not candidate.is_absolute():
-            candidate = project_file_path.parent / candidate
-        return str(canonicalize_for_identity(candidate))
+        return str(resolution.path)
 
     def _inherit_libraries_dir_from_parents(self, project_file_path: Path) -> str | None:
         """Walk the explicit parent-project chain for the nearest ancestor's libraries_dir.
@@ -2699,10 +3134,11 @@ class ProjectManager(EngineScoped):
 
         selected_parent = select_project_path(template.parent_project_path)
         if selected_parent is not None:
-            parent_id = self._resolve_parent_path_for_lookup(selected_parent, anchor=project_path)
-            if parent_id is None:
-                msg = f"parent_project_path '{selected_parent}' is relative and no anchor could be resolved."
+            lookup = self._resolve_parent_path_for_lookup(selected_parent, anchor=project_path)
+            if lookup.path is None:
+                msg = f"parent_project_path '{selected_parent}' could not be resolved: {lookup.reason}"
                 raise ValueError(msg)
+            parent_id = lookup.path
             parent_info = self._successfully_loaded_project_templates.get(parent_id)
             if parent_info is None:
                 msg = (
@@ -3025,37 +3461,55 @@ class ProjectManager(EngineScoped):
         against `anchor` (canonicalized), and mapped to the parent's registered id;
         an unregistered legacy parent uses its canonical path string as its id
         (the legacy bridge). Returns None when there is no parent link, when a
-        per-platform path has no entry for this OS, or when a relative path has no
-        anchor to resolve against.
+        per-platform path has no entry for this OS, or when the path could not be
+        resolved -- `_resolve_parent_path_for_lookup` logs why in that last case,
+        including when `anchor` is None and the value is relative.
         """
         if template.parent_project_id is not None:
             return template.parent_project_id
         selected_parent = select_project_path(template.parent_project_path)
         if selected_parent is None:
             return None
-        resolved_path = self._resolve_parent_path_for_lookup(selected_parent, anchor)
-        if resolved_path is None:
+        lookup = self._resolve_parent_path_for_lookup(selected_parent, anchor)
+        if lookup.path is None:
             return None
-        return file_path_to_id.get(Path(resolved_path), resolved_path)
+        return file_path_to_id.get(Path(lookup.path), lookup.path)
 
-    def _resolve_parent_path_for_lookup(self, raw_parent: str, anchor: Path | str | None) -> str | None:
+    def _resolve_parent_path_for_lookup(self, raw_parent: str, anchor: Path | str | None) -> ParentLinkLookup:
         """Resolve a stored parent_project_path to a canonical registry key.
 
-        Resolves relative paths against `anchor` (the containing template's
-        file path). Returns None if the path is relative and no anchor was
-        provided, since we can't form an absolute path without one. Macro
-        tokens are rejected by the loader; this resolver only sees absolute
-        or anchor-relative paths.
+        Expands `~` and shell environment variables, then resolves a still-relative path against
+        `anchor` (the containing template's file path), via the shared resolve_project_path_field so
+        this field agrees with workspace_dir / libraries_dir. A link that cannot be resolved is no
+        link: inventing an anchor-relative path containing a literal `${NAME}` would silently break
+        the parent chain and every value that inherits along it.
+
+        Every miss comes back with its reason and is logged here, including the relative-with-no-
+        anchor case -- `anchor` is legitimately None when validating a template that is not in the
+        registry yet, and a caller given a bare None cannot tell that apart from an unset variable.
 
         `anchor` is coerced to `Path` defensively because request payloads
         deserialized over the wire arrive with `project_path` as a `str`.
         """
-        parent_path = Path(raw_parent)
-        if not parent_path.is_absolute():
-            if anchor is None:
-                return None
-            parent_path = Path(anchor).parent / parent_path
-        return str(canonicalize_for_identity(parent_path))
+        if anchor is None:
+            anchor_dir = None
+        else:
+            anchor_dir = Path(anchor).parent
+
+        resolution = resolve_project_path_field(raw_parent, anchor_dir)
+        if resolution.path is None:
+            reason = self._describe_unresolved_path(resolution)
+            logger.warning(
+                "Project %s declares parent_project_path as %r, which cannot be resolved (%s). "
+                "Treating it as having no parent.",
+                # A None anchor is the unregistered case, not a project literally named None: the
+                # validate handler is path-less, so a template it has never seen on disk has no file.
+                f"'{anchor}'" if anchor is not None else "being validated (it has no file of its own yet)",
+                raw_parent,
+                reason,
+            )
+            return ParentLinkLookup(path=None, reason=reason)
+        return ParentLinkLookup(path=str(resolution.path), reason=None)
 
     def on_unregister_project_template_request(  # noqa: C901, PLR0912
         self, request: UnregisterProjectTemplateRequest
