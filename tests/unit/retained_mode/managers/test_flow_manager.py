@@ -3,7 +3,9 @@
 import base64
 import itertools
 import pickle
+import sys
 import tempfile
+import types
 from collections.abc import Generator
 from pathlib import Path
 
@@ -984,8 +986,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         return str(image_path)
 
     def test_unpickles_library_value_after_reload(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        import sys
-
         library_name = "Repro Library"
         module_file = tmp_path / "set_variables_from_data.py"
         module_file.write_text(self._MODULE_SOURCE)
@@ -1019,9 +1019,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         ``gtn_dynamic_module_set_variables_from_data_py_<hash>``, which does not exist in this
         process. The unpickler remaps it to the module loaded under its stable namespace.
         """
-        import sys
-        import types
-
         volatile_name = "gtn_dynamic_module_set_variables_from_data_py_4816193767510271467"
 
         # Recreate what the old loader produced, pickle a value from it, then drop the module
@@ -1065,9 +1062,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         ``SetVariablesNode.CollisionBehavior``; legacy recovery must resolve each component
         in sequence rather than a single getattr.
         """
-        import sys
-        import types
-
         nested_source = (
             "from enum import StrEnum\n\n\n"
             "class SetVariablesNode:\n"
@@ -1116,8 +1110,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         suffixed name (B's value). Reloading in the opposite order flips ownership; both
         references must still resolve to their original classes.
         """
-        import sys
-
         source_a = 'from enum import StrEnum\n\n\nclass AlphaBehavior(StrEnum):\n    OVERWRITE = "Overwrite existing"\n'
         source_b = 'from enum import StrEnum\n\n\nclass BetaBehavior(StrEnum):\n    PRESERVE = "Preserve existing"\n'
         file_a = tmp_path / "first" / "collide.py"
@@ -1207,9 +1199,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
         """Legacy references fail safely when multiple loaded libraries match."""
-        import sys
-        import types
-
         volatile_name = "gtn_dynamic_module_set_variables_from_data_py_123456789"
         volatile_module = types.ModuleType(volatile_name)
         exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102
@@ -1246,9 +1235,6 @@ class TestExtractFlowCommandsSurvivesLibraryReload:
 
     def test_missing_library_yields_artist_readable_error(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """When no loaded library can satisfy the reference, the error names the module."""
-        import sys
-        import types
-
         volatile_name = "gtn_dynamic_module_not_installed_anywhere_py_123456789"
         volatile_module = types.ModuleType(volatile_name)
         exec(self._MODULE_SOURCE, volatile_module.__dict__)  # noqa: S102

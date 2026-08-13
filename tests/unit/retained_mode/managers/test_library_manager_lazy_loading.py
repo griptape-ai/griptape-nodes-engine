@@ -493,6 +493,84 @@ class TestStableNamespaceImportUnderLazyLoading:
         module = importlib.import_module(stable_namespace)
         assert module.SharedNode is LibraryRegistry.get_library("Shared-Pending Library").get_node_class("SharedNode")
 
+    def test_shared_namespace_survives_unload_of_the_library_that_loaded_it(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """Resolving a shared namespace through one claimant must not disown the other.
+
+        Whichever claimant's loader happens to run first turns the shared reservation into a
+        loaded module. If that promotion recorded only the triggering library as an owner, that
+        library's unload would tear the module out of sys.modules while the sibling library was
+        still using it, handing the sibling a second, non-identical copy of every class.
+        """
+        manager = griptape_nodes.LibraryManager()
+        (tmp_path / "shared.py").write_text(_NAMED_NODE_SOURCE.format(class_name="SharedNode"))
+        node = NodeDefinition(class_name="SharedNode", file_path="shared.py", metadata=_node_metadata("Shared"))
+        for library_name in ("Shared Owner Library", "Shared-Owner Library"):
+            schema = _schema(library_name, [node])
+            library = LibraryRegistry.generate_new_library(library_data=schema)
+            manager._attempt_load_nodes_from_library(
+                library_data=schema,
+                library=library,
+                base_dir=tmp_path,
+                library_info=_library_info(schema, tmp_path),
+                lazy_loading=True,
+            )
+
+        # Only the first library resolves a class, which loads the file both libraries claim.
+        first_class = LibraryRegistry.get_library("Shared Owner Library").get_node_class("SharedNode")
+        stable_namespace = "griptape_nodes.node_libraries.shared_owner_library.shared"
+        assert stable_namespace in sys.modules
+
+        manager._unregister_all_stable_module_aliases_for_library("Shared Owner Library")
+
+        # The sibling library never unloaded, so its module (and class identity) is untouched.
+        assert sys.modules[stable_namespace].SharedNode is first_class
+        assert LibraryRegistry.get_library("Shared-Owner Library").get_node_class("SharedNode") is first_class
+
+    def test_collided_reference_resolves_against_a_never_imported_file(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A pickle naming a collided namespace must reach a file lazy loading has not imported.
+
+        Which of two colliding files owns the plain namespace depends on registration order, so
+        a saved value can name the namespace this process gave to the other file. Recovery has to
+        import the lazily registered candidate; without that, the plain namespace resolves to the
+        wrong file and unpickling dies on a missing attribute instead of finding the class.
+        """
+        manager = griptape_nodes.LibraryManager()
+        loaded_dir = tmp_path / "loaded"
+        pending_dir = tmp_path / "pending"
+        for directory, class_name in ((loaded_dir, "LoadedCollide"), (pending_dir, "PendingCollide")):
+            directory.mkdir()
+            (directory / "collide.py").write_text(_NAMED_NODE_SOURCE.format(class_name=class_name))
+
+        # The eagerly loaded file wins the plain namespace; the lazily registered one is only
+        # reserved, so nothing tracked defines PendingCollide yet.
+        manager._load_module_from_file(loaded_dir / "collide.py", "Collide Library")
+        schema = _schema(
+            "Collide Library",
+            [
+                NodeDefinition(
+                    class_name="PendingCollide", file_path="pending/collide.py", metadata=_node_metadata("Pending")
+                )
+            ],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        manager._attempt_load_nodes_from_library(
+            library_data=schema,
+            library=library,
+            base_dir=tmp_path,
+            library_info=_library_info(schema, tmp_path),
+            lazy_loading=True,
+        )
+
+        base_namespace = "griptape_nodes.node_libraries.collide_library.collide"
+        payload = f"c{base_namespace}\nPendingCollide\n.".encode()
+        node_class = loads_with_library_recovery(payload)
+
+        assert node_class is library.get_node_class("PendingCollide")
+
     def test_legacy_volatile_reference_reports_missing_library_when_file_is_broken(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:

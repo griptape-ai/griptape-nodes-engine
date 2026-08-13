@@ -452,11 +452,12 @@ class PendingStableModule:
     module reference can be matched against a file lazy loading has not touched yet and so
     namespace-collision detection can treat a reservation as ownership.
 
-    ``loaders_by_library`` holds one memoized loader per library claiming the namespace. A
-    namespace has more than one claimant only when two library names sanitize identically and
-    resolve to the same file, so every claimant's loader imports that same file and any of them
-    can serve an import. Keying by library lets an unload drop exactly that library's claim and
-    keep the namespace importable while another library still claims it.
+    ``loaders_by_library`` holds one memoized loader per library that claims the namespace but
+    has not loaded the module itself yet. A namespace has more than one claimant only when two
+    library names sanitize identically and resolve to the same file, so every claimant's loader
+    imports that same file and any of them can serve an import. Keying by library lets an unload
+    drop exactly that library's claim, and lets teardown keep the namespace alive while another
+    library still claims it.
     """
 
     module_file: StableModuleFile
@@ -684,12 +685,12 @@ class LibraryManager(EngineScoped):
     #         ".../image_to_video.py" (they differ only when the file is a symlink).
     #
     _library_to_stable_modules: dict[str, set[str]]  # library_name -> set of stable_namespaces
-    # Lazily registered node files that are importable but not yet imported, keyed by stable
+    # Lazily registered node files that are claimed but not yet imported, keyed by stable
     # namespace. Populated at (lazy) library registration time and consumed by
     # StableNamespaceImportFinder so a saved workflow can import
     # `griptape_nodes.node_libraries.<lib>.<file>` before any node class from that file has
-    # been resolved. An entry is dropped as soon as its module actually loads (sys.modules
-    # satisfies imports from then on) or when the last library claiming it unloads.
+    # been resolved. A library's claim is released once it loads the module itself (sys.modules
+    # satisfies imports from then on) or unloads; the entry disappears with its last claim.
     _pending_stable_modules: dict[str, PendingStableModule]  # stable_namespace -> file and its loaders
     # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
     _stable_namespace_finder: StableNamespaceImportFinder
@@ -3260,21 +3261,24 @@ class LibraryManager(EngineScoped):
             self._pending_stable_modules[stable_namespace] = pending
         pending.loaders_by_library[library_name] = module_loader
 
-    def _unregister_pending_stable_module_loaders_for_library(self, library_name: str) -> None:
-        """Drop a library's claims on pending (never-imported) stable module loaders on unload.
-
-        A pending namespace can be claimed by more than one library, so it is only dropped once
-        its last claimant unloads. Removing it while a sibling library still claimed it would
-        leave that sibling unable to import the namespace until one of its node classes was
-        resolved, which is the exact cold-import failure lazy registration exists to prevent.
+    def _unregister_pending_stable_module_loaders_for_library(self, library_name: str) -> set[str]:
+        """Release a library's claims on pending (never-imported) stable modules.
 
         Args:
             library_name: Name of the library to clean up
+
+        Returns:
+            The stable namespaces the library gave up, so the caller can decide whether any of
+            them has lost its last owner and should be torn out of sys.modules.
         """
+        released_namespaces = set()
         for stable_namespace, pending in list(self._pending_stable_modules.items()):
-            pending.loaders_by_library.pop(library_name, None)
+            if pending.loaders_by_library.pop(library_name, None) is None:
+                continue
+            released_namespaces.add(stable_namespace)
             if not pending.loaders_by_library:
                 del self._pending_stable_modules[stable_namespace]
+        return released_namespaces
 
     def _resolve_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
         """Resolve the stable namespace to load a file under, disambiguating collisions.
@@ -3399,9 +3403,15 @@ class LibraryManager(EngineScoped):
         self._library_to_stable_modules.setdefault(library_name, set()).add(stable_namespace)
         self._stable_module_to_file[stable_namespace] = module_file
 
-        # The module is in sys.modules now; retire its pending loaders so the meta-path finder
-        # can never serve a stale module object after this one is unloaded.
-        self._pending_stable_modules.pop(stable_namespace, None)
+        # This library has loaded the module itself, so its lazy claim is satisfied and the
+        # meta-path finder must not be able to serve its loader a second time. Claims held by
+        # sibling libraries on the same namespace stay: they still depend on this module, and
+        # teardown counts their claims so this library's unload cannot strand them.
+        pending = self._pending_stable_modules.get(stable_namespace)
+        if pending is not None:
+            pending.loaders_by_library.pop(library_name, None)
+            if not pending.loaders_by_library:
+                del self._pending_stable_modules[stable_namespace]
 
         # Wire the leaf module onto its parent package for attribute-based import navigation.
         parent_name, _, child_name = stable_namespace.rpartition(".")
@@ -3414,27 +3424,25 @@ class LibraryManager(EngineScoped):
 
         A namespace can be shared: two library names that sanitize identically and point at
         the same canonical file resolve to one module. A shared namespace is only torn out
-        of sys.modules when its last owning library unloads; unloading it earlier would
-        strand the remaining library with classes that can no longer be imported or pickled.
+        of sys.modules when its last owner releases it; unloading it earlier would strand the
+        remaining library with classes that can no longer be imported or pickled. A library
+        owns a namespace either by having loaded its module or by claiming it for lazy loading,
+        so both kinds of claim have to be released before the module can go.
 
         Args:
             library_name: Name of the library to clean up
         """
-        self._unregister_pending_stable_module_loaders_for_library(library_name)
-
-        stable_namespaces = self._library_to_stable_modules.pop(library_name, set())
-        if not stable_namespaces:
+        released_namespaces = self._unregister_pending_stable_module_loaders_for_library(library_name)
+        released_namespaces |= self._library_to_stable_modules.pop(library_name, set())
+        if not released_namespaces:
             return
 
-        details = f"Unregistering {len(stable_namespaces)} stable modules for library: {library_name}"
+        details = f"Unregistering {len(released_namespaces)} stable modules for library: {library_name}"
         logger.debug(details)
 
-        for stable_namespace in stable_namespaces:
-            still_owned = any(
-                stable_namespace in owned_namespaces for owned_namespaces in self._library_to_stable_modules.values()
-            )
-            if still_owned:
-                details = f"Keeping shared stable module '{stable_namespace}': another library still owns it."
+        for stable_namespace in released_namespaces:
+            if self._stable_namespace_has_owner(stable_namespace):
+                details = f"Keeping shared stable module '{stable_namespace}': another library still claims it."
                 logger.debug(details)
                 continue
 
@@ -3450,6 +3458,20 @@ class LibraryManager(EngineScoped):
 
         details = f"Completed cleanup of stable modules for library: '{library_name}'."
         logger.debug(details)
+
+    def _stable_namespace_has_owner(self, stable_namespace: str) -> bool:
+        """Whether any library still owns a namespace, by having loaded it or by claiming it.
+
+        Args:
+            stable_namespace: Namespace to check
+
+        Returns:
+            True while at least one library depends on the namespace.
+        """
+        if any(stable_namespace in owned_namespaces for owned_namespaces in self._library_to_stable_modules.values()):
+            return True
+
+        return stable_namespace in self._pending_stable_modules
 
     def get_stable_namespace_for_dynamic_module(self, dynamic_module_name: str) -> str | None:
         """Get the stable namespace for a dynamically loaded library module name.
@@ -3563,6 +3585,11 @@ class LibraryManager(EngineScoped):
         if not self.is_dynamic_module(module_name):
             return None
 
+        # Under lazy node loading a colliding file may not be imported yet, so there would be
+        # nothing tracked to match against. Import just the pending files that could have been
+        # registered under the referenced name, leaving every unrelated node file untouched.
+        self._load_pending_modules_for_stable_namespace(module_name)
+
         candidate_namespaces = [
             stable_namespace
             for stable_namespace, module_file in sorted(self._stable_module_to_file.items())
@@ -3640,7 +3667,38 @@ class LibraryManager(EngineScoped):
             for stable_namespace, pending in self._pending_stable_modules.items()
             if pending.module_file.logical_path.name.replace(".", "_") == file_token
         ]
-        for stable_namespace in matching_namespaces:
+        self._load_pending_modules(matching_namespaces)
+
+    def _load_pending_modules_for_stable_namespace(self, module_name: str) -> None:
+        """Import pending lazy node modules that could have been registered under a namespace.
+
+        Which of two colliding files owns the plain namespace depends on the order they were
+        registered in, so a pickle written by an earlier process can name a namespace this
+        process assigned to the other file. Collided-name recovery can only match against
+        modules that are loaded, and under lazy loading a colliding file stays unimported until
+        first use, so the candidate the pickle needs may not exist yet. Importing only the
+        pending files that could answer to the referenced name keeps lazy loading intact for
+        everything else.
+
+        Args:
+            module_name: Stable namespace recorded in the pickle
+        """
+        # Snapshot first: loading a module retires its own pending entry, mutating this dict.
+        matching_namespaces = [
+            stable_namespace
+            for stable_namespace, pending in self._pending_stable_modules.items()
+            if module_name in self._possible_stable_namespaces(stable_namespace, pending.module_file)
+        ]
+        self._load_pending_modules(matching_namespaces)
+
+    def _load_pending_modules(self, stable_namespaces: list[str]) -> None:
+        """Import the given pending node modules, skipping any that no longer import cleanly.
+
+        Args:
+            stable_namespaces: Pending namespaces to import, snapshotted by the caller before
+                any loading starts because importing a module retires its own pending entry
+        """
+        for stable_namespace in stable_namespaces:
             pending = self._pending_stable_modules.get(stable_namespace)
             if pending is None:
                 continue
