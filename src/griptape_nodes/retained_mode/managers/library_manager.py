@@ -53,6 +53,7 @@ from griptape_nodes.node_library.library_registry import (
     LibraryMetadata,
     LibraryNameAndVersion,
     LibraryRegistry,
+    LibraryRegistryError,
     LibrarySchema,
     NodeDefinition,
     NodeMetadata,
@@ -565,6 +566,12 @@ class LibraryManager(EngineScoped):
     # actually loads (sys.modules satisfies imports from then on) or when its library unloads.
     _pending_stable_module_loaders: dict[str, Callable[[], ModuleType]]  # stable_namespace -> module loader
     _library_to_pending_stable_namespaces: dict[str, set[str]]  # library_name -> pending stable_namespaces
+    # Libraries whose node modules were already imported when they were unloaded. Python caches
+    # modules process-wide, so re-registering such a library cannot replace the code already in
+    # memory: the helper packages its node files import stay at the version this process first
+    # imported. Only an engine restart clears that, so these names are remembered for the life of
+    # the process and used to explain import failures the artist would otherwise see bare.
+    _libraries_reloaded_after_import: set[str]
     # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
     _stable_namespace_finder: StableNamespaceImportFinder
     # Callbacks invoked immediately before all libraries are reloaded.
@@ -581,6 +588,7 @@ class LibraryManager(EngineScoped):
         self._library_to_stable_modules = {}
         self._pending_stable_module_loaders = {}
         self._library_to_pending_stable_namespaces = {}
+        self._libraries_reloaded_after_import = set()
         self._install_stable_namespace_finder()
         # Two separate handler registration systems exist in this manager:
         #
@@ -941,6 +949,90 @@ class LibraryManager(EngineScoped):
         if library_info is None:
             return None
         return self.collate_problems_for_lib_info(library_info)
+
+    def get_library_name_for_node_type(self, node_type: str) -> str | None:
+        """The library that provides a node type, or None when it cannot be pinned to one.
+
+        A node type several libraries provide has no single owner. A node type no library provides
+        may still be one whose module failed to import, which registers nothing but does record the
+        failure against the library that owns the node file.
+
+        Args:
+            node_type: Node type to find the providing library for
+        """
+        try:
+            library = LibraryRegistry.get_library_for_node_type(node_type)
+        except LibraryRegistryError:
+            return self._library_name_reporting_node_import_failure(node_type)
+        return library.get_library_data().name
+
+    def explain_stale_module_failure(self, library_name: str) -> str | None:
+        """An artist-facing explanation for an import failure caused by a mid-session reload.
+
+        Returns None when this library has not been reloaded after its modules were imported, in
+        which case an import failure means the library itself is broken and needs no restart.
+
+        Args:
+            library_name: Name of the library whose node failed to load
+        """
+        if not self._was_reloaded_after_its_modules_were_imported(library_name):
+            return None
+
+        return (
+            f"Library '{library_name}' was reloaded after this engine had already loaded its nodes, "
+            f"so the engine is still running the code it loaded first. Restart the engine to pick up "
+            f"the new code."
+        )
+
+    def _library_name_reporting_node_import_failure(self, node_type: str) -> str | None:
+        """The library that recorded an import failure for a node type, or None when none did.
+
+        A node type whose module failed to import registers nothing, so the recorded failure is the
+        only thing that can name its library.
+
+        Args:
+            node_type: Class name of the node type to look for
+        """
+        for library_info in self._library_file_path_to_info.values():
+            for problem in library_info.problems:
+                if isinstance(problem, NodeModuleImportProblem) and problem.class_name == node_type:
+                    return library_info.library_name
+        return None
+
+    def _explain_restart_after_reload(self, library_name: str) -> str | None:
+        """The restart explanation to report after reloading a library, or None when it took cleanly.
+
+        Only speaks up when the reload actually failed to import a node module. A library whose
+        nodes took the new code needs no restart, and warning on every reload would train artists
+        to ignore the message.
+
+        Args:
+            library_name: Name of the library that was just reloaded
+        """
+        if not self._library_has_node_import_problems(library_name):
+            return None
+        return self.explain_stale_module_failure(library_name)
+
+    def _was_reloaded_after_its_modules_were_imported(self, library_name: str) -> bool:
+        """Whether this library was reloaded in this session after its node modules had loaded.
+
+        See `_libraries_reloaded_after_import` for why that leaves this process on the old code.
+
+        Args:
+            library_name: Name of the library to ask about
+        """
+        return library_name in self._libraries_reloaded_after_import
+
+    def _library_has_node_import_problems(self, library_name: str) -> bool:
+        """Whether a library's last load recorded any node module that failed to import.
+
+        Args:
+            library_name: Name of the library to ask about
+        """
+        library_info = self.get_library_info_by_library_name(library_name)
+        if library_info is None:
+            return False
+        return any(isinstance(problem, NodeModuleImportProblem) for problem in library_info.problems)
 
     def on_register_event_handler(
         self,
@@ -2926,7 +3018,11 @@ class LibraryManager(EngineScoped):
             details = f"Attempted to unload library '{request.library_name}'. Failed due to {e}"
             return UnloadLibraryFromRegistryResultFailure(result_details=details)
 
-        # Clean up all stable module aliases for this library
+        # Clean up all stable module aliases for this library. Note first whether any of its node
+        # modules had actually been imported: if so, this process is stuck with that code and the
+        # library's next load cannot replace it.
+        if self._library_to_stable_modules.get(request.library_name):
+            self._libraries_reloaded_after_import.add(request.library_name)
         self._unregister_all_stable_module_aliases_for_library(request.library_name)
 
         # Remove the library from our library info list. This prevents it from still showing
@@ -6205,10 +6301,34 @@ class LibraryManager(EngineScoped):
 
         new_version = reload_result
 
-        details = f"Successfully updated Library '{library_name}' from version {old_version} to {new_version}."
+        return self._build_library_update_result(
+            library_name=library_name, old_version=old_version, new_version=new_version
+        )
+
+    def _build_library_update_result(
+        self, *, library_name: str, old_version: str, new_version: str
+    ) -> UpdateLibraryResultSuccess:
+        """Report an update that landed on disk, flagging a restart when this engine cannot run it.
+
+        Args:
+            library_name: Name of the updated library
+            old_version: Version the library was on before the update
+            new_version: Version now on disk
+        """
+        stale_module_explanation = self._explain_restart_after_reload(library_name)
+
+        if stale_module_explanation is None:
+            details = f"Successfully updated Library '{library_name}' from version {old_version} to {new_version}."
+            return UpdateLibraryResultSuccess(old_version=old_version, new_version=new_version, result_details=details)
+
+        details = (
+            f"Updated Library '{library_name}' from version {old_version} to {new_version} on disk. "
+            f"{stale_module_explanation}"
+        )
         return UpdateLibraryResultSuccess(
             old_version=old_version,
             new_version=new_version,
+            restart_required=True,
             result_details=details,
         )
 
@@ -6266,12 +6386,48 @@ class LibraryManager(EngineScoped):
         except GitError:
             new_ref = "unknown"
 
-        details = f"Successfully switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' (version {new_version})."
+        return self._build_library_ref_switch_result(
+            library_name=library_name,
+            old_ref=old_ref,
+            new_ref=new_ref,
+            old_version=old_version,
+            new_version=new_version,
+        )
+
+    def _build_library_ref_switch_result(
+        self, *, library_name: str, old_ref: str, new_ref: str, old_version: str, new_version: str
+    ) -> SwitchLibraryRefResultSuccess:
+        """Report a ref switch that landed on disk, flagging a restart when this engine cannot run it.
+
+        Args:
+            library_name: Name of the switched library
+            old_ref: Branch or tag the library was on before the switch
+            new_ref: Branch or tag now checked out
+            old_version: Version the library was on before the switch
+            new_version: Version now on disk
+        """
+        stale_module_explanation = self._explain_restart_after_reload(library_name)
+
+        if stale_module_explanation is None:
+            details = f"Successfully switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' (version {new_version})."
+            return SwitchLibraryRefResultSuccess(
+                old_ref=old_ref,
+                new_ref=new_ref,
+                old_version=old_version,
+                new_version=new_version,
+                result_details=details,
+            )
+
+        details = (
+            f"Switched Library '{library_name}' from '{old_ref}' (version {old_version}) to '{new_ref}' "
+            f"(version {new_version}) on disk. {stale_module_explanation}"
+        )
         return SwitchLibraryRefResultSuccess(
             old_ref=old_ref,
             new_ref=new_ref,
             old_version=old_version,
             new_version=new_version,
+            restart_required=True,
             result_details=details,
         )
 

@@ -42,6 +42,20 @@ logger = logging.getLogger("griptape_nodes")
 _constructing_node: ContextVar[bool] = ContextVar("_library_registry_constructing_node", default=False)
 
 
+class LibraryRegistryError(KeyError):
+    """A library or node type could not be registered or resolved.
+
+    Subclasses ``KeyError`` because a failed lookup is what callers already handle, but renders its
+    message plainly. ``KeyError.__str__`` reprs its argument, so an artist-facing sentence raised as
+    a bare ``KeyError`` reaches a result's details wrapped in quotes.
+    """
+
+    def __str__(self) -> str:
+        if not self.args:
+            return ""
+        return str(self.args[0])
+
+
 class LibraryNameAndVersion(NamedTuple):
     library_name: str
     library_version: str
@@ -277,7 +291,7 @@ class LibraryRegistry:
     ) -> Library:
         if library_data.name in cls._libraries:
             msg = f"Library '{library_data.name}' already registered."
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
         library = Library(
             library_data=library_data, is_default_library=mark_as_default_library, advanced_library=advanced_library
         )
@@ -288,7 +302,7 @@ class LibraryRegistry:
     def unregister_library(cls, library_name: str, *, event_manager: EventManager) -> None:
         if library_name not in cls._libraries:
             msg = f"Library '{library_name}' was requested to be unregistered, but it wasn't registered in the first place."
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
 
         library = cls._libraries[library_name]
         advanced_library = library.get_advanced_library()
@@ -331,7 +345,7 @@ class LibraryRegistry:
     def get_library(cls, name: str) -> Library:
         if name not in cls._libraries:
             msg = f"Library '{name}' not found"
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
         return cls._libraries[name]
 
     @classmethod
@@ -405,10 +419,10 @@ class LibraryRegistry:
                 dest_library = cls.get_library(specific_library_name)
             elif len(libraries_with_node_type) > 1:
                 msg = f"Attempted to create a node of type '{node_type}' with no library name specified. The following libraries have nodes in them with the same name: {libraries_with_node_type}. In order to disambiguate, specify the library this node should come from."
-                raise KeyError(msg)
+                raise LibraryRegistryError(msg)
             else:
                 msg = f"No node type '{node_type}' could be found in any of the libraries registered."
-                raise KeyError(msg)
+                raise LibraryRegistryError(msg)
         else:
             # See if the library exists.
             dest_library = cls.get_library(specific_library_name)
@@ -640,7 +654,7 @@ class Library:
                 f"Node type '{node_class_name}' was requested to be unregistered from library "
                 f"'{self._library_data.name}', but it wasn't registered in the first place."
             )
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
         del self._node_types[node_class_name]
         self._node_metadata.pop(node_class_name, None)
 
@@ -661,7 +675,7 @@ class Library:
         node_metadata = self._node_metadata.get(node_type)
         if node_metadata is None:
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
         catalog = find_model_catalog(self._library_data.metadata.declarations)
         if catalog is None:
             return []
@@ -676,7 +690,7 @@ class Library:
         """Create a new node instance of the specified type."""
         if not self.has_node_type(node_type):
             msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
-            raise KeyError(msg)
+            raise LibraryRegistryError(msg)
         # Resolve the class, importing its module now if it was registered lazily.
         # An import failure propagates to the caller (e.g. the CreateNode handler,
         # which substitutes an Error Proxy node carrying the failure reason).
@@ -710,7 +724,8 @@ class Library:
 
     def get_node_metadata(self, node_type: str) -> NodeMetadata:
         if node_type not in self._node_metadata:
-            raise KeyError(self._library_data.name, node_type)
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise LibraryRegistryError(msg)
         return self._node_metadata[node_type]
 
     def get_node_class(self, node_type: str) -> type[BaseNode]:
@@ -724,7 +739,8 @@ class Library:
         failure propagates to the caller.
         """
         if node_type not in self._node_types:
-            raise KeyError(self._library_data.name, node_type)
+            msg = f"Node type '{node_type}' not found in library '{self._library_data.name}'"
+            raise LibraryRegistryError(msg)
         return self._node_types[node_type].resolve()
 
     def get_categories(self) -> list[dict[str, CategoryDefinition]]:
