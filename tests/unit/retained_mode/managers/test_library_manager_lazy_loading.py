@@ -80,6 +80,15 @@ class SiblingB(BaseNode):
         return None
 """
 
+_NAMED_NODE_SOURCE = """
+from griptape_nodes.exe_types.node_types import BaseNode
+
+
+class {class_name}(BaseNode):
+    def process(self):
+        return None
+"""
+
 
 @pytest.fixture(autouse=True)
 def _clear_registry() -> Iterator[None]:
@@ -405,3 +414,99 @@ class TestStableNamespaceImportUnderLazyLoading:
         assert marker.read_text() == "x"
         assert module.SiblingA is node_a
         assert module.SiblingB is node_b
+
+    def test_same_stem_files_stay_separately_importable(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """Two files in one library sharing a stem must both stay importable.
+
+        Both map to the same base namespace, so registering the second must disambiguate it
+        rather than take over the first's entry: a lost entry would leave a saved workflow
+        unable to import that file at all until one of its node classes happened to be used.
+        """
+        manager = griptape_nodes.LibraryManager()
+        for subdir, class_name in (("video", "CompareVideo"), ("traits", "CompareTrait")):
+            (tmp_path / subdir).mkdir()
+            (tmp_path / subdir / "compare.py").write_text(_NAMED_NODE_SOURCE.format(class_name=class_name))
+        schema = _schema(
+            "Same Stem Library",
+            [
+                NodeDefinition(
+                    class_name="CompareVideo", file_path="video/compare.py", metadata=_node_metadata("Video")
+                ),
+                NodeDefinition(
+                    class_name="CompareTrait", file_path="traits/compare.py", metadata=_node_metadata("Trait")
+                ),
+            ],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        info = _library_info(schema, tmp_path)
+        manager._attempt_load_nodes_from_library(
+            library_data=schema, library=library, base_dir=tmp_path, library_info=info, lazy_loading=True
+        )
+
+        base_namespace = "griptape_nodes.node_libraries.same_stem_library.compare"
+        pending_namespaces = sorted(manager._pending_stable_modules)
+        suffixed_namespaces = [name for name in pending_namespaces if name.startswith(f"{base_namespace}_")]
+
+        # The first registration keeps the plain namespace; the second is suffixed, not dropped.
+        assert base_namespace in pending_namespaces
+        assert len(suffixed_namespaces) == 1
+
+        # Importing either namespace loads its own file, under the name it was reserved with.
+        base_module = importlib.import_module(base_namespace)
+        suffixed_module = importlib.import_module(suffixed_namespaces[0])
+        assert base_module.__name__ == base_namespace
+        assert suffixed_module.__name__ == suffixed_namespaces[0]
+        assert {base_module.CompareVideo, suffixed_module.CompareTrait} == {
+            library.get_node_class("CompareVideo"),
+            library.get_node_class("CompareTrait"),
+        }
+
+    def test_shared_pending_namespace_survives_until_last_claimant_unloads(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A pending namespace claimed by two libraries must outlive the first unload.
+
+        Two library names that sanitize identically and point at the same node file share one
+        stable namespace. Dropping the namespace when the first of them unloads would leave the
+        survivor unable to import it, which is the cold-import failure lazy registration exists
+        to prevent.
+        """
+        manager = griptape_nodes.LibraryManager()
+        (tmp_path / "shared.py").write_text(_NAMED_NODE_SOURCE.format(class_name="SharedNode"))
+        node = NodeDefinition(class_name="SharedNode", file_path="shared.py", metadata=_node_metadata("Shared"))
+        for library_name in ("Shared Pending Library", "Shared-Pending Library"):
+            schema = _schema(library_name, [node])
+            library = LibraryRegistry.generate_new_library(library_data=schema)
+            manager._attempt_load_nodes_from_library(
+                library_data=schema,
+                library=library,
+                base_dir=tmp_path,
+                library_info=_library_info(schema, tmp_path),
+                lazy_loading=True,
+            )
+
+        stable_namespace = "griptape_nodes.node_libraries.shared_pending_library.shared"
+        assert stable_namespace in manager._pending_stable_modules
+
+        manager._unregister_all_stable_module_aliases_for_library("Shared Pending Library")
+
+        module = importlib.import_module(stable_namespace)
+        assert module.SharedNode is LibraryRegistry.get_library("Shared-Pending Library").get_node_class("SharedNode")
+
+    def test_legacy_volatile_reference_reports_missing_library_when_file_is_broken(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """An unimportable candidate file must not mask why a legacy reference failed.
+
+        Volatile recovery imports pending files whose name matches the recorded token. When such
+        a file no longer imports cleanly it is simply not a match, so the caller must still see
+        the original "nothing provides this saved reference" failure rather than an unrelated
+        import error from a file it never asked about.
+        """
+        self._register_lazy_library(griptape_nodes, tmp_path)
+
+        payload = b"cgtn_dynamic_module_broken_node_py_123456789\nBrokenNode\n."
+        with pytest.raises(ModuleNotFoundError) as excinfo:
+            loads_with_library_recovery(payload)
+
+        assert "gtn_dynamic_module_broken_node_py_123456789" in str(excinfo.value)

@@ -328,22 +328,24 @@ class StableNamespaceImportFinder(importlib.abc.MetaPathFinder, importlib.abc.Lo
         if fullname != package_root and not fullname.startswith(LibraryManager.STABLE_NAMESPACE_PREFIX):
             return None
 
-        pending_loaders = self._library_manager._pending_stable_module_loaders
-        if fullname in pending_loaders:
+        pending_modules = self._library_manager._pending_stable_modules
+        if fullname in pending_modules:
             return importlib.util.spec_from_loader(fullname, self)
 
         # Synthesize the namespace-package parents of any known stable namespace so the import
         # machinery can walk the dotted chain down to the leaf loader above. Known namespaces
         # cover both pending (lazy, not yet imported) and already-loaded library modules.
         child_prefix = f"{fullname}."
-        known_namespaces = (*pending_loaders, *self._library_manager._stable_module_to_file)
+        known_namespaces = (*pending_modules, *self._library_manager._stable_module_to_file)
         if fullname == package_root or any(namespace.startswith(child_prefix) for namespace in known_namespaces):
             return importlib.machinery.ModuleSpec(fullname, None, is_package=True)
 
         return None
 
     def create_module(self, spec: importlib.machinery.ModuleSpec) -> ModuleType:
-        module_loader = self._library_manager._pending_stable_module_loaders[spec.name]
+        pending = self._library_manager._pending_stable_modules[spec.name]
+        # Every claimant's loader imports the same file, so any of them yields the module.
+        module_loader = next(iter(pending.loaders_by_library.values()))
         return module_loader()
 
     def exec_module(self, module: ModuleType) -> None:
@@ -440,6 +442,25 @@ class StableModuleFile(NamedTuple):
 
     canonical_path: Path
     logical_path: Path
+
+
+@dataclass
+class PendingStableModule:
+    """A lazily registered node file that is importable under its stable namespace but unimported.
+
+    ``module_file`` records the paths the file will be imported from, so a legacy volatile
+    module reference can be matched against a file lazy loading has not touched yet and so
+    namespace-collision detection can treat a reservation as ownership.
+
+    ``loaders_by_library`` holds one memoized loader per library claiming the namespace. A
+    namespace has more than one claimant only when two library names sanitize identically and
+    resolve to the same file, so every claimant's loader imports that same file and any of them
+    can serve an import. Keying by library lets an unload drop exactly that library's claim and
+    keep the namespace importable while another library still claims it.
+    """
+
+    module_file: StableModuleFile
+    loaders_by_library: dict[str, Callable[[], ModuleType]]
 
 
 class LibraryGitOperationContext(NamedTuple):
@@ -663,16 +684,13 @@ class LibraryManager(EngineScoped):
     #         ".../image_to_video.py" (they differ only when the file is a symlink).
     #
     _library_to_stable_modules: dict[str, set[str]]  # library_name -> set of stable_namespaces
-    # Deferred module loaders for lazily registered node files, keyed by stable namespace.
-    # Populated at (lazy) library registration time and consumed by StableNamespaceImportFinder
-    # so a saved workflow can import `griptape_nodes.node_libraries.<lib>.<file>` before any
-    # node class from that file has been resolved. An entry is dropped as soon as its module
-    # actually loads (sys.modules satisfies imports from then on) or when its library unloads.
-    _pending_stable_module_loaders: dict[str, Callable[[], ModuleType]]  # stable_namespace -> module loader
-    # Node file each pending loader will import, so a legacy volatile module reference can be
-    # matched to (and resolved against) a file that lazy loading has not imported yet.
-    _pending_stable_module_files: dict[str, Path]  # stable_namespace -> node file it will load
-    _library_to_pending_stable_namespaces: dict[str, set[str]]  # library_name -> pending stable_namespaces
+    # Lazily registered node files that are importable but not yet imported, keyed by stable
+    # namespace. Populated at (lazy) library registration time and consumed by
+    # StableNamespaceImportFinder so a saved workflow can import
+    # `griptape_nodes.node_libraries.<lib>.<file>` before any node class from that file has
+    # been resolved. An entry is dropped as soon as its module actually loads (sys.modules
+    # satisfies imports from then on) or when the last library claiming it unloads.
+    _pending_stable_modules: dict[str, PendingStableModule]  # stable_namespace -> file and its loaders
     # Meta-path finder that resolves stable namespaces for pending (lazy) node modules.
     _stable_namespace_finder: StableNamespaceImportFinder
     _stable_module_to_file: dict[str, StableModuleFile]  # stable_namespace -> paths it was loaded from
@@ -686,9 +704,7 @@ class LibraryManager(EngineScoped):
         self._worker_manager = worker_manager
         self._library_file_path_to_info = {}
         self._library_to_stable_modules = {}
-        self._pending_stable_module_loaders = {}
-        self._pending_stable_module_files = {}
-        self._library_to_pending_stable_namespaces = {}
+        self._pending_stable_modules = {}
         self._stable_module_to_file = {}
         # Installed last so the finder only ever observes fully initialized tracking state.
         self._install_stable_namespace_finder()
@@ -3210,38 +3226,55 @@ class LibraryManager(EngineScoped):
 
     def _register_pending_stable_module_loader(
         self,
-        stable_namespace: str,
         library_name: str,
         node_file_path: Path,
         module_loader: Callable[[], ModuleType],
     ) -> None:
         """Make a lazily registered node file importable via its stable namespace.
 
+        The namespace is resolved (and reserved) here rather than at import time, so two files
+        in one library that share a stem cannot silently overwrite each other's pending entry:
+        the first registration reserves the plain namespace and the second is disambiguated,
+        exactly as the eager load path does.
+
         The loader is the same memoized per-file loader the node-class loaders share, so an
         import through StableNamespaceImportFinder and a later class resolution reuse one
         module object (and the file's top-level code runs once).
 
         Args:
-            stable_namespace: Stable namespace the file will be importable under
-            library_name: Name of the owning library (for cleanup on unload)
-            node_file_path: Node file the loader imports, recorded so legacy volatile module
-                references can be matched against files that have not been imported yet
+            library_name: Name of the owning library, recorded so unload drops only its claim
+            node_file_path: Node file the loader imports
             module_loader: Memoized zero-argument loader that imports the file's module
         """
-        self._pending_stable_module_loaders[stable_namespace] = module_loader
-        self._pending_stable_module_files[stable_namespace] = node_file_path
-        self._library_to_pending_stable_namespaces.setdefault(library_name, set()).add(stable_namespace)
+        module_file = StableModuleFile(
+            canonical_path=canonicalize_for_identity(node_file_path),
+            logical_path=canonicalize_for_io(node_file_path),
+        )
+        stable_namespace = self._resolve_stable_namespace(
+            library_name, canonical_path=module_file.canonical_path, logical_path=module_file.logical_path
+        )
+
+        pending = self._pending_stable_modules.get(stable_namespace)
+        if pending is None:
+            pending = PendingStableModule(module_file=module_file, loaders_by_library={})
+            self._pending_stable_modules[stable_namespace] = pending
+        pending.loaders_by_library[library_name] = module_loader
 
     def _unregister_pending_stable_module_loaders_for_library(self, library_name: str) -> None:
-        """Drop pending (never-imported) stable module loaders for a library on unload.
+        """Drop a library's claims on pending (never-imported) stable module loaders on unload.
+
+        A pending namespace can be claimed by more than one library, so it is only dropped once
+        its last claimant unloads. Removing it while a sibling library still claimed it would
+        leave that sibling unable to import the namespace until one of its node classes was
+        resolved, which is the exact cold-import failure lazy registration exists to prevent.
 
         Args:
             library_name: Name of the library to clean up
         """
-        pending_namespaces = self._library_to_pending_stable_namespaces.pop(library_name, set())
-        for stable_namespace in pending_namespaces:
-            self._pending_stable_module_loaders.pop(stable_namespace, None)
-            self._pending_stable_module_files.pop(stable_namespace, None)
+        for stable_namespace, pending in list(self._pending_stable_modules.items()):
+            pending.loaders_by_library.pop(library_name, None)
+            if not pending.loaders_by_library:
+                del self._pending_stable_modules[stable_namespace]
 
     def _resolve_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
         """Resolve the stable namespace to load a file under, disambiguating collisions.
@@ -3255,7 +3288,9 @@ class LibraryManager(EngineScoped):
         Loading the same file again (hot reload) is not a collision and keeps its namespace,
         including when the file previously lost a collision whose winner has since unloaded:
         a tracked file's namespace is sticky for the life of the process so already pickled
-        references and live class identities stay coherent.
+        references and live class identities stay coherent. A namespace reserved by a lazily
+        registered file counts as tracked, so registration order decides the winner under lazy
+        loading and the eventual import agrees with what was reserved.
 
         The disambiguation suffix hashes the absolute file path, so it is stable per install
         but not portable across machines; recovering pre-existing pickles for collided files
@@ -3271,11 +3306,11 @@ class LibraryManager(EngineScoped):
         """
         base_namespace = self._create_stable_namespace(library_name, logical_path)
         disambiguated = f"{base_namespace}_{self._collision_suffix(canonical_path)}"
-        existing_disambiguated = self._stable_module_to_file.get(disambiguated)
+        existing_disambiguated = self._stable_namespace_owner(disambiguated)
         if existing_disambiguated is not None and existing_disambiguated.canonical_path == canonical_path:
             return disambiguated
 
-        existing = self._stable_module_to_file.get(base_namespace)
+        existing = self._stable_namespace_owner(base_namespace)
         if existing is None or existing.canonical_path == canonical_path:
             return base_namespace
 
@@ -3288,6 +3323,30 @@ class LibraryManager(EngineScoped):
         logger.warning(details)
         return disambiguated
 
+    def _stable_namespace_owner(self, stable_namespace: str) -> StableModuleFile | None:
+        """Return the file a stable namespace belongs to, whether loaded or only reserved.
+
+        Lazily registered files reserve their namespace at registration time, before anything
+        is imported. Treating a reservation as ownership makes namespace assignment a function
+        of registration order alone, so an import that happens much later resolves to the same
+        namespace the reservation promised instead of re-deciding by load order.
+
+        Args:
+            stable_namespace: Namespace to look up
+
+        Returns:
+            The owning file's paths, or None if no file owns the namespace.
+        """
+        loaded = self._stable_module_to_file.get(stable_namespace)
+        if loaded is not None:
+            return loaded
+
+        pending = self._pending_stable_modules.get(stable_namespace)
+        if pending is not None:
+            return pending.module_file
+
+        return None
+
     def _ensure_parent_packages(self, stable_namespace: str) -> None:
         """Ensure the synthetic parent packages of a stable namespace exist in sys.modules.
 
@@ -3295,7 +3354,9 @@ class LibraryManager(EngineScoped):
         (and therefore unpickled) if every parent package is importable. Those parents are
         synthetic: there is no ``node_libraries`` package on disk. We register each missing
         parent as an empty namespace package and wire it onto its own parent so the dotted
-        import chain resolves. The real ``griptape_nodes`` package is left untouched.
+        import chain resolves. The real ``griptape_nodes`` package is never replaced in
+        sys.modules; it only gains a ``node_libraries`` attribute pointing at the synthetic
+        root package.
 
         Parents are retained on library unload deliberately: they are tiny, shared across
         libraries, and tearing them down while a sibling library still uses them would break
@@ -3338,11 +3399,9 @@ class LibraryManager(EngineScoped):
         self._library_to_stable_modules.setdefault(library_name, set()).add(stable_namespace)
         self._stable_module_to_file[stable_namespace] = module_file
 
-        # The module is in sys.modules now; retire its pending loader so the meta-path finder
+        # The module is in sys.modules now; retire its pending loaders so the meta-path finder
         # can never serve a stale module object after this one is unloaded.
-        self._pending_stable_module_loaders.pop(stable_namespace, None)
-        self._pending_stable_module_files.pop(stable_namespace, None)
-        self._library_to_pending_stable_namespaces.get(library_name, set()).discard(stable_namespace)
+        self._pending_stable_modules.pop(stable_namespace, None)
 
         # Wire the leaf module onto its parent package for attribute-based import navigation.
         parent_name, _, child_name = stable_namespace.rpartition(".")
@@ -3468,25 +3527,15 @@ class LibraryManager(EngineScoped):
         # name matches the recorded token, leaving every unrelated node file untouched.
         self._load_pending_modules_for_volatile_token(file_token)
 
-        matching_modules: list[ModuleType] = []
-        for stable_namespace, module_file in sorted(self._stable_module_to_file.items()):
-            # Match on the file's own logical name, not the namespace leaf: a module that
-            # lost a namespace collision carries a disambiguation suffix in its namespace,
-            # but its file name is still what the volatile name recorded.
-            if module_file.logical_path.name.replace(".", "_") != file_token:
-                continue
-            module = sys.modules.get(stable_namespace)
-            if module is None:
-                continue
-            if self._get_class_defined_in_module(module, class_name) is None:
-                continue
-            matching_modules.append(module)
-
-        if not matching_modules:
-            return None
-        if len(matching_modules) > 1:
-            raise AmbiguousLegacyModuleError(class_name, [module.__name__ for module in matching_modules])
-        return self._get_class_defined_in_module(matching_modules[0], class_name)
+        # Match on the file's own logical name, not the namespace leaf: a module that lost a
+        # namespace collision carries a disambiguation suffix in its namespace, but its file
+        # name is still what the volatile name recorded.
+        candidate_namespaces = [
+            stable_namespace
+            for stable_namespace, module_file in sorted(self._stable_module_to_file.items())
+            if module_file.logical_path.name.replace(".", "_") == file_token
+        ]
+        return self._resolve_class_from_stable_modules(candidate_namespaces, class_name)
 
     def resolve_collided_stable_class(self, module_name: str, class_name: str) -> Any | None:
         """Resolve a stable-namespace reference whose owning file was in a namespace collision.
@@ -3514,15 +3563,51 @@ class LibraryManager(EngineScoped):
         if not self.is_dynamic_module(module_name):
             return None
 
+        candidate_namespaces = [
+            stable_namespace
+            for stable_namespace, module_file in sorted(self._stable_module_to_file.items())
+            if module_name in self._possible_stable_namespaces(stable_namespace, module_file)
+        ]
+        return self._resolve_class_from_stable_modules(candidate_namespaces, class_name)
+
+    def _possible_stable_namespaces(self, stable_namespace: str, module_file: StableModuleFile) -> tuple[str, str]:
+        """Return every stable namespace a tracked file could have been registered under.
+
+        A file registers under its base namespace when it claims it first, or under the base
+        plus its deterministic collision suffix when another file already holds the base. Either
+        name can appear in a pickle written by an earlier process, so both count as this file's
+        possible names.
+
+        Args:
+            stable_namespace: Namespace the file is currently registered under
+            module_file: Paths the file was loaded from
+
+        Returns:
+            The file's base namespace and its collision-suffixed namespace.
+        """
+        suffix = self._collision_suffix(module_file.canonical_path)
+        base_namespace = stable_namespace.removesuffix(f"_{suffix}")
+        return (base_namespace, f"{base_namespace}_{suffix}")
+
+    def _resolve_class_from_stable_modules(self, candidate_namespaces: list[str], class_name: str) -> Any | None:
+        """Resolve a class from the one loaded stable module among candidates that defines it.
+
+        Shared by both legacy-reference recovery paths: each builds its own candidate list (by
+        legacy file token or by collided namespace), and the single-match rule that turns those
+        candidates into a class is identical.
+
+        Args:
+            candidate_namespaces: Stable namespaces that could satisfy the pickled reference
+            class_name: Plain or dotted qualified class name the pickle wants
+
+        Returns:
+            The class defined by the single matching loaded module, or None if none matches.
+
+        Raises:
+            AmbiguousLegacyModuleError: If more than one candidate module defines the class.
+        """
         matching_modules: list[ModuleType] = []
-        for stable_namespace, module_file in sorted(self._stable_module_to_file.items()):
-            # A file registers under its base namespace when it loads first, or under the
-            # base plus its deterministic collision suffix when it loads second. Either name
-            # can appear in a pickle, so both count as this file's possible names.
-            suffix = self._collision_suffix(module_file.canonical_path)
-            base_namespace = stable_namespace.removesuffix(f"_{suffix}")
-            if module_name not in (base_namespace, f"{base_namespace}_{suffix}"):
-                continue
+        for stable_namespace in candidate_namespaces:
             module = sys.modules.get(stable_namespace)
             if module is None:
                 continue
@@ -3549,16 +3634,28 @@ class LibraryManager(EngineScoped):
             file_token: File token recorded in the legacy module name, in the old
                 ``file_path.name.replace(".", "_")`` form
         """
-        # Snapshot first: loading a module retires its own pending entry, mutating these dicts.
+        # Snapshot first: loading a module retires its own pending entry, mutating this dict.
         matching_namespaces = [
             stable_namespace
-            for stable_namespace, node_file_path in self._pending_stable_module_files.items()
-            if node_file_path.name.replace(".", "_") == file_token
+            for stable_namespace, pending in self._pending_stable_modules.items()
+            if pending.module_file.logical_path.name.replace(".", "_") == file_token
         ]
         for stable_namespace in matching_namespaces:
-            module_loader = self._pending_stable_module_loaders.get(stable_namespace)
-            if module_loader is not None:
+            pending = self._pending_stable_modules.get(stable_namespace)
+            if pending is None:
+                continue
+            module_loader = next(iter(pending.loaders_by_library.values()))
+            try:
                 module_loader()
+            except ImportError as err:
+                # A node file that no longer imports cleanly is not a match, it is just an
+                # unloadable candidate. Letting the failure escape would replace the caller's
+                # "no library provides this saved value" message with an unrelated import error.
+                details = (
+                    f"Attempted to recover a saved reference to '{stable_namespace}'. Skipped it "
+                    f"because that node file could not be imported: {err}"
+                )
+                logger.warning(details)
 
     @staticmethod
     def _collision_suffix(file_path: Path) -> str:
@@ -4892,9 +4989,8 @@ class LibraryManager(EngineScoped):
         # (`griptape_nodes.node_libraries.<lib>.<file>`). With eager loading that namespace is in
         # sys.modules by now; with lazy loading it is not, so register a pending loader that the
         # StableNamespaceImportFinder resolves on first import of the namespace.
-        stable_namespace = self._create_stable_namespace(library_name, node_file_path)
         module_loader = self._get_or_create_module_loader(node_file_path, library_name, module_loaders)
-        self._register_pending_stable_module_loader(stable_namespace, library_name, node_file_path, module_loader)
+        self._register_pending_stable_module_loader(library_name, node_file_path, module_loader)
         library_problem = library.register_lazy_node_type(
             node_definition.class_name, metadata=node_definition.metadata, loader=loader
         )
