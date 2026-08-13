@@ -11,12 +11,14 @@ from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode, 
 from griptape_nodes.exe_types.connections import Direction
 from griptape_nodes.exe_types.core_types import ParameterTypeBuiltin
 from griptape_nodes.exe_types.node_types import NodeResolutionState
+from griptape_nodes.retained_mode.engine import EngineScoped
 
 if TYPE_CHECKING:
     import asyncio
 
     from griptape_nodes.exe_types.connections import Connections
     from griptape_nodes.exe_types.node_types import BaseNode
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -60,7 +62,7 @@ class DagNode:
     node_reference: BaseNode
 
 
-class DagBuilder:
+class DagBuilder(EngineScoped):
     """Handles DAG construction independently of execution state machine."""
 
     graphs: dict[str, DirectedGraph]  # Str is the name of the start node associated here.
@@ -68,7 +70,8 @@ class DagBuilder:
     graph_to_nodes: dict[str, set[str]]  # Track which nodes belong to which graph
     start_node_candidates: dict[str, dict[str, set[str]]]  # {data_node: {graph: {boundary_nodes}}}
 
-    def __init__(self) -> None:
+    def __init__(self, engine: Engine | None = None) -> None:
+        super().__init__(engine)
         self.graphs = {}
         self.node_to_reference: dict[str, DagNode] = {}
         self.graph_to_nodes = {}
@@ -100,9 +103,7 @@ class DagBuilder:
     # Complex with the inner recursive method, but it needs connections and added_nodes.
     def add_node_with_dependencies(self, node: BaseNode, graph_name: str = "default") -> list[BaseNode]:  # noqa: C901
         """Add node and all its dependencies to DAG. Returns list of added nodes."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
         added_nodes = []
         graph = self.graphs.get(graph_name, None)
         if graph is None:
@@ -254,9 +255,7 @@ class DagBuilder:
             # If there's only one graph, we aren't looking for a control flow connection from elsewhere! We can queue. We've already looked at data dependencies.
             return True
 
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
-        connections = GriptapeNodes.FlowManager().get_connections()
+        connections = self.engine.flow_manager.get_connections()
 
         control_connections = self.get_number_incoming_control_connections(node.node_reference, connections)
         # If no control connections, we can queue this! Don't worry about this.

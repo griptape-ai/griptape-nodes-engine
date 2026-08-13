@@ -28,6 +28,18 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
+def _engine_with_connections(connections: MagicMock) -> MagicMock:
+    """Build a stub engine whose flow_manager hands back `connections`.
+
+    DagBuilder resolves connections through its injected engine, so a stub engine replaces what
+    used to be a patch of the process-wide facade. Passing it explicitly also keeps the seeding
+    helpers off the real engine a bare DagBuilder would otherwise fall back to.
+    """
+    engine = MagicMock()
+    engine.flow_manager.get_connections.return_value = connections
+    return engine
+
+
 def _mock_node(name: str) -> MagicMock:
     """A BaseNode stand-in with the surface the seeding helpers touch."""
     node = MagicMock(spec=BaseNode)
@@ -80,15 +92,13 @@ class TestSeedDagFromCategories:
         flow_manager = MagicMock()
         node_manager = MagicMock()
 
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            connections = MagicMock()
-            connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = connections
+        connections = MagicMock()
+        connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(connections))
 
-            dag_builder = DagBuilder()
-            entry_nodes = ControlFlowMachine._seed_dag_from_categories(
-                start, categories, dag_builder, flow_manager, node_manager
-            )
+        entry_nodes = ControlFlowMachine._seed_dag_from_categories(
+            start, categories, dag_builder, flow_manager, node_manager
+        )
 
         # The start node plus every entry node come back so the control flow can begin.
         assert [node.name for node in entry_nodes] == ["Start", "Ctrl"]
@@ -107,13 +117,11 @@ class TestSeedDagFromCategories:
         flow_manager.is_node_connected.return_value = []
         node_manager = MagicMock()
 
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            connections = MagicMock()
-            connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = connections
+        connections = MagicMock()
+        connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(connections))
 
-            dag_builder = DagBuilder()
-            ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
 
         # A data-only sink is seeded directly so its dependencies resolve unconditionally.
         assert "Sink" in dag_builder.node_to_reference
@@ -129,13 +137,11 @@ class TestSeedDagFromCategories:
         node_manager = MagicMock()
         node_manager.get_node_by_name.side_effect = lambda name: start if name == "Start" else None
 
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            connections = MagicMock()
-            connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = connections
+        connections = MagicMock()
+        connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(connections))
 
-            dag_builder = DagBuilder()
-            ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
 
         # A gated sink is not seeded directly; it is registered as a candidate keyed by the graph
         # start so the branch stays control-gated.
@@ -149,16 +155,14 @@ class TestSeedDagFromCategories:
         flow_manager = MagicMock()
         node_manager = MagicMock()
 
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            connections = MagicMock()
-            connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = connections
+        connections = MagicMock()
+        connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(connections))
 
-            dag_builder = DagBuilder()
-            # Pre-seed the sink so PASS 2 sees it already present.
-            dag_builder.add_node(sink)
+        # Pre-seed the sink so PASS 2 sees it already present.
+        dag_builder.add_node(sink)
 
-            ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
+        ControlFlowMachine._seed_dag_from_categories(start, categories, dag_builder, flow_manager, node_manager)
 
         # Already-present sinks short-circuit before any connectivity check.
         flow_manager.is_node_connected.assert_not_called()

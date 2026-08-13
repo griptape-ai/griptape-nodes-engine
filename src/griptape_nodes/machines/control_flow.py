@@ -12,19 +12,20 @@ from griptape_nodes.exe_types.node_types import (
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNodeCategories
 from griptape_nodes.machines.fsm import FSM, State
 from griptape_nodes.machines.parallel_resolution import ParallelResolutionMachine
+from griptape_nodes.retained_mode.engine import EngineScoped, current_engine
 from griptape_nodes.retained_mode.events.base_events import ExecutionEvent, ExecutionGriptapeNodeEvent
 from griptape_nodes.retained_mode.events.execution_events import (
     ControlFlowResolvedEvent,
     CurrentControlNodeEvent,
     InvolvedNodesEvent,
 )
-from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 from griptape_nodes.retained_mode.managers.node_manager import NodeManager
 from griptape_nodes.retained_mode.managers.settings import WorkflowExecutionMode
 
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import Parameter
     from griptape_nodes.exe_types.flow import ControlFlow
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
 
 
@@ -40,7 +41,7 @@ logger = logging.getLogger("griptape_nodes")
 
 
 # This is the control flow context. Owns the Resolution Machine
-class ControlFlowContext:
+class ControlFlowContext(EngineScoped):
     flow: ControlFlow
     current_nodes: list[BaseNode]
     resolution_machine: ParallelResolutionMachine
@@ -58,7 +59,9 @@ class ControlFlowContext:
         *,
         pickle_control_flow_result: bool = False,
         is_isolated: bool = False,
+        engine: Engine | None = None,
     ) -> None:
+        super().__init__(engine)
         self.flow_name = flow_name
 
         # ALWAYS create ParallelResolutionMachine (SEQUENTIAL mode now maps to PARALLEL with max_nodes_in_parallel=1)
@@ -66,12 +69,14 @@ class ControlFlowContext:
 
         # Create isolated DagBuilder for independent subflows
         if is_isolated:
-            dag_builder = DagBuilder()
+            dag_builder = DagBuilder(self.engine)
             logger.debug("Created isolated DagBuilder for flow '%s'", flow_name)
         else:
-            dag_builder = GriptapeNodes.FlowManager().global_dag_builder
+            dag_builder = self.engine.flow_manager.global_dag_builder
 
-        self.resolution_machine = ParallelResolutionMachine(flow_name, max_nodes_in_parallel, dag_builder=dag_builder)
+        self.resolution_machine = ParallelResolutionMachine(
+            flow_name, max_nodes_in_parallel, dag_builder=dag_builder, engine=self.engine
+        )
         self.current_nodes = []
         self.pickle_control_flow_result = pickle_control_flow_result
         self.is_isolated = is_isolated
@@ -104,7 +109,7 @@ class ResolveNodeState(State):
                     )
                 )
             # Now broadcast that we have a current control node.
-            GriptapeNodes.EventManager().put_event(
+            context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=CurrentControlNodeEvent(node_name=current_node.name))
                 )
@@ -143,10 +148,10 @@ class CompleteState(State):
 
             parameter_output_values, unique_uuid_to_values = NodeManager.serialize_parameter_output_values(
                 current_node,
-                workflow_manager=GriptapeNodes.WorkflowManager(),
+                workflow_manager=context.engine.workflow_manager,
                 use_pickling=context.pickle_control_flow_result,
             )
-            GriptapeNodes.EventManager().put_event(
+            context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(
                         payload=ControlFlowResolvedEvent(
@@ -174,11 +179,16 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         *,
         pickle_control_flow_result: bool = False,
         is_isolated: bool = False,
+        engine: Engine | None = None,
     ) -> None:
-        execution_type = GriptapeNodes.ConfigManager().get_config_value(
+        # Resolve the engine once, before the context exists, so the execution-mode config and the
+        # context that runs the flow come from the same engine. Reading config off whatever engine
+        # happened to be ambient is how a run could pick up another engine's settings.
+        resolved_engine = engine if engine is not None else current_engine()
+        execution_type = resolved_engine.config_manager.get_config_value(
             "workflow_execution_mode", default=WorkflowExecutionMode.SEQUENTIAL
         )
-        max_nodes_in_parallel = GriptapeNodes.ConfigManager().get_config_value("max_nodes_in_parallel", default=5)
+        max_nodes_in_parallel = resolved_engine.config_manager.get_config_value("max_nodes_in_parallel", default=5)
 
         # SEQUENTIAL mode uses ParallelResolutionMachine with max_nodes_in_parallel=1
         if execution_type == WorkflowExecutionMode.SEQUENTIAL:
@@ -189,6 +199,7 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             max_nodes_in_parallel,
             pickle_control_flow_result=pickle_control_flow_result,
             is_isolated=is_isolated,
+            engine=resolved_engine,
         )
         super().__init__(context)
 
@@ -204,12 +215,12 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
             node.set_entry_control_parameter(None)
         # Set up to debug
         self._context.paused = debug_mode
-        flow_manager = GriptapeNodes.FlowManager()
+        flow_manager = self._context.engine.flow_manager
         flow = flow_manager.get_flow_by_name(self._context.flow_name)
         if start_node != end_node:
             # This blocks all nodes in the entire flow from running. If we're just resolving one node, we don't want to block that.
             involved_nodes = list(flow.nodes.keys())
-            GriptapeNodes.EventManager().put_event(
+            self._context.engine.event_manager.put_event(
                 ExecutionGriptapeNodeEvent(
                     wrapped_event=ExecutionEvent(payload=InvolvedNodesEvent(involved_nodes=involved_nodes))
                 )
@@ -280,8 +291,8 @@ class ControlFlowMachine(FSM[ControlFlowContext]):
         # Build with the first node (it should already be the proxy if it's part of a group)
         dag_builder.add_node_with_dependencies(start_node, start_node.name)
 
-        flow_manager = GriptapeNodes.FlowManager()
-        node_manager = GriptapeNodes.NodeManager()
+        flow_manager = self._context.engine.flow_manager
+        node_manager = self._context.engine.node_manager
         is_isolated = dag_builder is not flow_manager.global_dag_builder
 
         if is_isolated:

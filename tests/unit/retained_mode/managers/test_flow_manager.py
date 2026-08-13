@@ -6,6 +6,7 @@ import pickle
 import tempfile
 from collections.abc import Generator
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
 
 import pytest
 from PIL import Image
@@ -29,6 +30,9 @@ from griptape_nodes.retained_mode.events.flow_events import (
 from griptape_nodes.retained_mode.events.object_events import ClearAllObjectStateRequest
 from griptape_nodes.retained_mode.file_metadata.workflow_metadata import FLOW_COMMANDS_KEY
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 
 def _data_parameter(name: str = "value") -> Parameter:
@@ -946,7 +950,7 @@ class TestDeleteIterationFlows:
         griptape_nodes.handle_request(DeleteFlowRequest(flow_name=already_gone))
         assert object_manager.attempt_get_object_by_name(already_gone) is None
 
-        executor = NodeExecutor.__new__(NodeExecutor)
+        executor = NodeExecutor(engine=cast("Engine", griptape_nodes))
         await executor._delete_iteration_flows(deserialized_flows, griptape_nodes.EventManager())
 
         for _, flow_name, _ in deserialized_flows:
