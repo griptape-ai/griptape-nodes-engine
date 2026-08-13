@@ -2,8 +2,7 @@ import pytest
 from pydantic_ai.settings import ModelSettings
 
 from griptape_nodes.drivers.cloud_models import (
-    _DRIVER_ONLY_KEYS,
-    _MODEL_SETTINGS_KEYS,
+    _PRESET_KEY_KINDS,
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
     IMAGE_MODEL_CHOICES,
@@ -12,6 +11,7 @@ from griptape_nodes.drivers.cloud_models import (
     MODEL_SETTINGS,
     O_SERIES_MODELS,
     VISION_MODEL_CHOICES,
+    _PresetKeyKind,
     model_settings_for,
 )
 
@@ -83,27 +83,30 @@ class TestModelSettings:
     def test_every_preset_key_is_classified(self) -> None:
         """The reverse of the check above: nothing may fall through unclassified.
 
-        `_MODEL_SETTINGS_KEYS` is an allowlist, so a preset key that is a valid
-        `ModelSettings` field but absent from it is silently dropped instead of
-        reaching the wire — the same bug MODEL_SETTINGS exists to fix. Every key
-        in every preset must be either forwarded or knowingly driver-only.
+        Forwarding is an allowlist, so a preset key that is a valid
+        `ModelSettings` field but absent from `_PRESET_KEY_KINDS` is silently
+        dropped instead of reaching the wire — the same bug MODEL_SETTINGS exists
+        to fix. Every key in every preset must be classified one way or the other.
         """
-        classified = set(_MODEL_SETTINGS_KEYS) | set(_DRIVER_ONLY_KEYS)
         for model in MODEL_CHOICES_ARGS:
-            unclassified = set(dict(model["args"])) - classified  # type: ignore[call-overload]
+            unclassified = set(dict(model["args"])) - set(_PRESET_KEY_KINDS)  # type: ignore[call-overload]
             assert not unclassified, (
-                f"'{model['name']}' preset carries {sorted(unclassified)}, which is in neither "
-                f"_MODEL_SETTINGS_KEYS nor _DRIVER_ONLY_KEYS. Valid ModelSettings fields must be "
-                f"added to the former to reach the wire; driver-only keys to the latter."
+                f"'{model['name']}' preset carries {sorted(unclassified)}, which is absent from "
+                f"_PRESET_KEY_KINDS. Add each one as FORWARDED if it is a valid ModelSettings "
+                f"field that should reach the wire, or DRIVER_ONLY if it configures the driver."
             )
 
     def test_driver_only_keys_are_not_model_settings_fields(self) -> None:
         """A key excused as driver-only must not actually be a forwardable field."""
-        assert not set(_DRIVER_ONLY_KEYS) & set(ModelSettings.__annotations__)
+        driver_only = {key for key, kind in _PRESET_KEY_KINDS.items() if kind is _PresetKeyKind.DRIVER_ONLY}
+        assert driver_only
+        assert not driver_only & set(ModelSettings.__annotations__)
 
     def test_forwarded_keys_are_model_settings_fields(self) -> None:
         """The allowlist itself must stay valid, not just the keys presets happen to use."""
-        assert set(_MODEL_SETTINGS_KEYS) <= set(ModelSettings.__annotations__)
+        forwarded = {key for key, kind in _PRESET_KEY_KINDS.items() if kind is _PresetKeyKind.FORWARDED}
+        assert forwarded
+        assert forwarded <= set(ModelSettings.__annotations__)
 
     def test_models_without_settings_are_absent(self) -> None:
         """A lookup miss and "nothing to apply" are the same case."""

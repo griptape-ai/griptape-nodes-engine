@@ -82,22 +82,32 @@ MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES_ARGS]
 VISION_MODEL_CHOICES: list[str] = [str(model["name"]) for model in MODEL_CHOICES_ARGS if model.get("vision")]
 
 
-# Keys in a MODEL_CHOICES_ARGS `args` preset that map onto Pydantic AI
-# `ModelSettings` fields and are therefore forwarded to the model.
-#
-# This is an allowlist, so a preset key that is a perfectly valid ModelSettings
-# field but missing from here would be dropped on the way to the wire — the same
-# shape of bug as the one MODEL_SETTINGS exists to fix. _DRIVER_ONLY_KEYS below
-# makes the classification total: `test_every_preset_key_is_classified` fails on
-# a preset key that appears in neither tuple, so adding a key to a preset forces
-# a decision here rather than letting it silently go nowhere.
-_MODEL_SETTINGS_KEYS = ("max_tokens", "temperature", "top_p")
+class _PresetKeyKind(StrEnum):
+    """What a key in a MODEL_CHOICES_ARGS `args` preset is for."""
 
-# Preset keys that configure our driver rather than the model request.
-# `ModelSettings` has no slot for these, so consumers filter rather than splat
-# the preset wholesale. Deliberately exhaustive: a key here is knowingly not
-# forwarded, which is what distinguishes it from one that was forgotten.
-_DRIVER_ONLY_KEYS = ("stream", "structured_output_strategy")
+    FORWARDED = "forwarded"
+    """Maps onto a Pydantic AI `ModelSettings` field, so it reaches the model."""
+
+    DRIVER_ONLY = "driver_only"
+    """Configures our driver instead. `ModelSettings` has no slot for it."""
+
+
+# Every key any preset may carry, and which of the two it is. One mapping rather
+# than two lists, because the useful property is that the classification is
+# *total*: forwarding is an allowlist, so a key that is a perfectly valid
+# ModelSettings field but missing here gets dropped on the way to the wire —
+# the same shape of bug MODEL_SETTINGS exists to fix. An unclassified key fails
+# `test_every_preset_key_is_classified`, so adding one to a preset forces the
+# decision here rather than letting it silently go nowhere. Marking a key
+# DRIVER_ONLY is that decision made deliberately, which is what distinguishes it
+# from a key that was forgotten.
+_PRESET_KEY_KINDS: dict[str, _PresetKeyKind] = {
+    "max_tokens": _PresetKeyKind.FORWARDED,
+    "temperature": _PresetKeyKind.FORWARDED,
+    "top_p": _PresetKeyKind.FORWARDED,
+    "stream": _PresetKeyKind.DRIVER_ONLY,
+    "structured_output_strategy": _PresetKeyKind.DRIVER_ONLY,
+}
 
 MODEL_SETTINGS: dict[str, dict[str, Any]] = {
     str(model["name"]): settings
@@ -106,7 +116,7 @@ MODEL_SETTINGS: dict[str, dict[str, Any]] = {
         settings := {
             key: value
             for key, value in dict(model["args"]).items()  # type: ignore[call-overload]
-            if key in _MODEL_SETTINGS_KEYS and value is not None
+            if _PRESET_KEY_KINDS.get(key) is _PresetKeyKind.FORWARDED and value is not None
         }
     )
 }
