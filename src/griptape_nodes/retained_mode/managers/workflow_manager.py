@@ -2126,6 +2126,7 @@ class WorkflowManager(EngineScoped):
         success: bool
         error_details: str
         written_file: File | None = None
+        failure_reason: FileIOFailureReason | None = None
 
     class WorkflowSavePath(NamedTuple):
         """Unresolved workflow save destination plus its registry-relative form.
@@ -2259,7 +2260,11 @@ class WorkflowManager(EngineScoped):
             written_file = destination.write_text(content, encoding="utf-8")
         except FileWriteError as err:
             details = self._format_workflow_write_error(file_name, err.failure_reason, err.result_details)
-            return self.WriteWorkflowFileResult(success=False, error_details=details)
+            return self.WriteWorkflowFileResult(
+                success=False,
+                error_details=details,
+                failure_reason=err.failure_reason,
+            )
         return self.WriteWorkflowFileResult(success=True, error_details="", written_file=written_file)
 
     @staticmethod
@@ -2298,6 +2303,11 @@ class WorkflowManager(EngineScoped):
                 error_msg = "Path is a directory, not a file"
             case FileIOFailureReason.ENCODING_ERROR:
                 error_msg = f"Content encoding error: {details}"
+            case FileIOFailureReason.POLICY_NO_OVERWRITE:
+                error_msg = (
+                    "A different workflow already exists at this location. "
+                    "To replace it, save again with overwrite enabled."
+                )
             case _:
                 error_msg = details
         return f"Attempted to save workflow '{file_name}'. {error_msg}"
@@ -2308,6 +2318,7 @@ class WorkflowManager(EngineScoped):
         current_workflow_name = (
             context_manager.get_current_workflow_name() if context_manager.has_current_workflow() else None
         )
+
         try:
             save_target = self._determine_save_target(
                 requested_file_name=request.file_name,
@@ -2324,17 +2335,32 @@ class WorkflowManager(EngineScoped):
         branched_from = save_target.branched_from
         registry_key = derive_registry_key(relative_file_path)
 
+        # Re-saving the workflow that's currently open is always allowed; writing over a
+        # *different* workflow's file needs the caller's explicit say-so. Both sides are
+        # already registry keys (extension stripped, separators normalized), so compare
+        # them directly — re-deriving would truncate at the first dot in names like
+        # "03.07_18.30".
+        is_self_save = current_workflow_name == registry_key
+        if request.overwrite_existing or is_self_save:
+            policy = ExistingFilePolicy.OVERWRITE
+        else:
+            policy = ExistingFilePolicy.FAIL
+
         # OVERWRITE_EXISTING uses the registry's recorded file_path verbatim
-        # (in-place overwrite) wrapped in a ProjectFileDestination. All other
-        # scenarios carry an unresolved destination so the save_workflow
-        # situation macro resolves at write time, preserving the seed-and-retry
-        # contract for unresolved required `{x:NN}` slots.
+        # (in-place overwrite) wrapped in a ProjectFileDestination, so it is the
+        # scenario the `policy` above governs. All other scenarios carry an
+        # unresolved destination so the save_workflow situation macro resolves at
+        # write time, preserving the seed-and-retry contract for unresolved
+        # required `{x:NN}` slots — those keep the situation's own policy and
+        # intentionally ignore `policy`. That's the documented boundary: this flag
+        # guards against replacing another *registered* workflow, not against an
+        # unregistered stray .py file sitting at a freshly-computed Save-As path.
         if save_target.destination is not None:
             destination = save_target.destination
         elif save_target.file_path is not None:
             destination = ProjectFileDestination(
                 str(save_target.file_path),
-                existing_file_policy=ExistingFilePolicy.OVERWRITE,
+                existing_file_policy=policy,
             )
         else:
             msg = (
@@ -2344,10 +2370,14 @@ class WorkflowManager(EngineScoped):
             return SaveWorkflowResultFailure(result_details=msg)
 
         logger.debug(
-            "Save workflow: scenario=%s, file_name=%s, destination=%s, branched_from=%s",
+            "Save workflow: scenario=%s, file_name=%s, registry_key=%s, destination=%s, "
+            "self_save=%s, overwrite_existing=%s, branched_from=%s",
             save_target.scenario.value,
             file_name,
+            registry_key,
             destination.location,
+            is_self_save,
+            request.overwrite_existing,
             branched_from or "None",
         )
 
@@ -2424,7 +2454,13 @@ class WorkflowManager(EngineScoped):
                 f"Attempted to save workflow '{relative_file_path}'. "
                 f"Failed during file generation: {save_file_result.result_details}"
             )
-            return SaveWorkflowResultFailure(result_details=details)
+            # Carry the typed reason across the family boundary so callers can tell a
+            # refused overwrite (POLICY_NO_OVERWRITE) apart from a genuine I/O failure
+            # and offer to retry with overwrite_existing=True.
+            failure_reason = None
+            if isinstance(save_file_result, SaveWorkflowFileFromSerializedFlowResultFailure):
+                failure_reason = save_file_result.failure_reason
+            return SaveWorkflowResultFailure(result_details=details, failure_reason=failure_reason)
 
         workflow_metadata = save_file_result.workflow_metadata
 
@@ -2990,7 +3026,10 @@ class WorkflowManager(EngineScoped):
 
         write_result = self._write_workflow_file(destination, final_code_output, file_name)
         if not write_result.success:
-            return SaveWorkflowFileFromSerializedFlowResultFailure(result_details=write_result.error_details)
+            return SaveWorkflowFileFromSerializedFlowResultFailure(
+                result_details=write_result.error_details,
+                failure_reason=write_result.failure_reason,
+            )
 
         # Prefer the post-write location from ``_write_workflow_file`` — for
         # macro-driven saves this reflects the resolved-and-possibly-seeded
