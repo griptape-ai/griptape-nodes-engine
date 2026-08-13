@@ -15,6 +15,7 @@ strings per process).
 from __future__ import annotations
 
 import gc
+import importlib
 import pickle
 import sys
 import weakref
@@ -25,11 +26,13 @@ import pytest
 from griptape_nodes.retained_mode.managers.library_manager import (
     AmbiguousLegacyModuleError,
     LibraryManager,
-    loads_with_library_recovery,
+    StableNamespaceCollisionError,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
+    from types import ModuleType
 
     from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
@@ -152,28 +155,64 @@ class TestStableNamespaceLoading:
         assert restored_enum is reloaded.Behavior.OVERWRITE
         assert restored_widget.count == widget_count
 
-    def test_same_stem_collision_is_disambiguated(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path, caplog: pytest.LogCaptureFixture
-    ) -> None:
-        """Two different files sharing a stem get distinct namespaces and one warning."""
+    def test_same_stem_collision_raises(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """A second, different file sharing a stem with an already-loaded file raises."""
         manager = griptape_nodes.LibraryManager()
         first = _write_module(tmp_path / "video", "compare.py")
         second = _write_module(tmp_path / "traits", "compare.py")
 
         module_a = manager._load_module_from_file(first, "My Test Library")
-        module_b = manager._load_module_from_file(second, "My Test Library")
-        reloaded_b = manager._load_module_from_file(second, "My Test Library")
 
-        assert module_a.__name__ == "griptape_nodes.node_libraries.my_test_library.compare"
-        assert module_b.__name__ != module_a.__name__
-        assert module_b.__name__.startswith("griptape_nodes.node_libraries.my_test_library.compare_")
-        assert reloaded_b.__name__ == module_b.__name__
+        with pytest.raises(StableNamespaceCollisionError) as exc_info:
+            manager._load_module_from_file(second, "My Test Library")
+
         assert sys.modules[module_a.__name__] is module_a
-        assert sys.modules[reloaded_b.__name__] is reloaded_b
-        collision_warnings = [
-            record for record in caplog.records if "map to the same module namespace" in record.message
-        ]
-        assert len(collision_warnings) == 1
+        assert str(first) in str(exc_info.value)
+        assert str(second) in str(exc_info.value)
+
+    def test_rejected_claim_leaves_no_partial_state(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """A rejected claim registers nothing: no leaf module, no tracking entry, no reservation."""
+        manager = griptape_nodes.LibraryManager()
+        first = _write_module(tmp_path / "video", "compare.py")
+        second = _write_module(tmp_path / "traits", "compare.py")
+
+        module_a = manager._load_module_from_file(first, "My Test Library")
+        namespace = module_a.__name__
+
+        with pytest.raises(StableNamespaceCollisionError):
+            manager._load_module_from_file(second, "My Test Library")
+
+        leaf_prefix = "griptape_nodes.node_libraries.my_test_library."
+        assert [name for name in sys.modules if name.startswith(leaf_prefix)] == [namespace]
+        assert list(manager._stable_module_to_file) == [namespace]
+        assert manager._library_to_stable_modules["My Test Library"] == {namespace}
+        assert manager._pending_stable_modules == {}
+
+    def test_rejected_reservation_keeps_the_first_file_importable(
+        self, griptape_nodes: GriptapeNodes, tmp_path: Path
+    ) -> None:
+        """A rejected lazy reservation leaves the winner's reservation intact and still importable."""
+        manager = griptape_nodes.LibraryManager()
+        first = _write_module(tmp_path / "video", "compare.py")
+        second = _write_module(tmp_path / "traits", "compare.py")
+        module_loaders: dict[Path, Callable[[], ModuleType]] = {}
+
+        first_loader = manager._get_or_create_module_loader(first, "My Test Library", module_loaders)
+        manager._register_pending_stable_module_loader("My Test Library", first, first_loader)
+        reserved_namespace = next(iter(manager._pending_stable_modules))
+
+        second_loader = manager._get_or_create_module_loader(second, "My Test Library", module_loaders)
+        with pytest.raises(StableNamespaceCollisionError):
+            manager._register_pending_stable_module_loader("My Test Library", second, second_loader)
+
+        assert list(manager._pending_stable_modules) == [reserved_namespace]
+        assert list(manager._pending_stable_modules[reserved_namespace].loaders_by_library) == ["My Test Library"]
+        assert manager._stable_module_to_file == {}
+
+        # The surviving reservation still resolves, and to the file that claimed it.
+        imported = importlib.import_module(reserved_namespace)
+        assert imported.__file__ is not None
+        assert first.samefile(imported.__file__)
 
     def test_hot_reload_keeps_same_namespace(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """Reloading the same file reuses its namespace and replaces the module object."""
@@ -345,27 +384,6 @@ class TestVolatileDynamicModuleResolution:
 
         assert exc_info.value.candidate_modules == (first.__name__, second.__name__)
 
-    def test_collision_suffixed_module_participates_in_ambiguity_detection(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        """A module disambiguated with a collision suffix still counts as a legacy candidate.
-
-        Its namespace leaf no longer equals the legacy file stem, so matching must go through
-        the tracked file path. If it were skipped, the lookup would silently resolve to the
-        first-loaded library instead of failing safely on the ambiguity.
-        """
-        manager = griptape_nodes.LibraryManager()
-        first_file = _write_module(tmp_path / "video", "compare.py")
-        second_file = _write_module(tmp_path / "traits", "compare.py")
-        first = manager._load_module_from_file(first_file, "My Test Library")
-        second = manager._load_module_from_file(second_file, "My Test Library")
-        assert second.__name__.startswith(first.__name__ + "_"), "sanity: second module must carry a suffix"
-
-        with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
-            manager.resolve_volatile_dynamic_class("gtn_dynamic_module_compare_py_42", "Behavior")
-
-        assert exc_info.value.candidate_modules == (first.__name__, second.__name__)
-
     def test_resolves_nested_class_via_dotted_qualified_name(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
@@ -402,14 +420,16 @@ class TestVolatileDynamicModuleResolution:
     def test_hyphen_and_underscore_files_stay_distinct(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
         """'foo-bar.py' and 'foo_bar.py' had distinct volatile tokens; both must resolve exactly.
 
-        Their stable stems collapse to the same namespace (collision suffix disambiguates),
-        but their legacy tokens differ by the hyphen, so neither lookup may be ambiguous.
+        Both files sanitize to the same stable stem ('collision_behavior'), so each is loaded
+        into a library whose name does not sanitize the same as the other's, keeping their
+        stable namespaces distinct. Their legacy tokens differ by the hyphen, so neither lookup
+        may be ambiguous.
         """
         manager = griptape_nodes.LibraryManager()
         hyphen_file = _write_module(tmp_path / "first", "collision-behavior.py")
         underscore_file = _write_module(tmp_path / "second", "collision_behavior.py")
-        hyphen_module = manager._load_module_from_file(hyphen_file, "My Test Library")
-        underscore_module = manager._load_module_from_file(underscore_file, "My Test Library")
+        hyphen_module = manager._load_module_from_file(hyphen_file, "Hyphen Library")
+        underscore_module = manager._load_module_from_file(underscore_file, "Underscore Library")
 
         resolved_hyphen = manager.resolve_volatile_dynamic_class(
             "gtn_dynamic_module_collision-behavior_py_1", "Behavior"
@@ -420,141 +440,6 @@ class TestVolatileDynamicModuleResolution:
 
         assert resolved_hyphen is hyphen_module.Behavior
         assert resolved_underscore is underscore_module.Behavior
-
-
-@pytest.mark.usefixtures("restore_sys_modules")
-class TestCollidedStableNamespaceResolution:
-    """Resolving stable-namespace pickle references across collision load-order flips.
-
-    Which colliding file owns the plain base namespace and which gets the deterministic
-    suffix depends on load order. A pickle from an earlier process can therefore reference
-    either name for either file; resolution must find the class regardless.
-    """
-
-    _SOURCE_A = 'from enum import StrEnum\n\n\nclass AlphaBehavior(StrEnum):\n    OVERWRITE = "Overwrite existing"\n'
-    _SOURCE_B = 'from enum import StrEnum\n\n\nclass BetaBehavior(StrEnum):\n    PRESERVE = "Preserve existing"\n'
-
-    def _write_colliding_files(self, tmp_path: Path) -> tuple[Path, Path]:
-        first_file = tmp_path / "first" / "collide.py"
-        first_file.parent.mkdir(parents=True, exist_ok=True)
-        first_file.write_text(self._SOURCE_A)
-        second_file = tmp_path / "second" / "collide.py"
-        second_file.parent.mkdir(parents=True, exist_ok=True)
-        second_file.write_text(self._SOURCE_B)
-        return first_file, second_file
-
-    def test_pickles_from_both_collided_files_survive_reverse_load_order(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        """Values pickled under either collided name resolve after the ownership flip.
-
-        'Collision Library' and 'Collision-Library' sanitize to the same namespace segment,
-        so both files map to the same base namespace. Load A then B, record the names their
-        pickles would embed, reload in reverse order (flipping who owns the plain name), and
-        resolve both recorded references.
-        """
-        manager = griptape_nodes.LibraryManager()
-        first_file, second_file = self._write_colliding_files(tmp_path)
-
-        module_a = manager._load_module_from_file(first_file, "Collision Library")
-        module_b = manager._load_module_from_file(second_file, "Collision-Library")
-        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the first collision"
-        name_recorded_for_a = module_a.__name__
-        name_recorded_for_b = module_b.__name__
-
-        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
-        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
-        module_b2 = manager._load_module_from_file(second_file, "Collision-Library")
-        module_a2 = manager._load_module_from_file(first_file, "Collision Library")
-        assert module_b2.__name__ == name_recorded_for_a, "sanity: reverse order must flip base ownership"
-
-        resolved_a = manager.resolve_collided_stable_class(name_recorded_for_a, "AlphaBehavior")
-        resolved_b = manager.resolve_collided_stable_class(name_recorded_for_b, "BetaBehavior")
-
-        assert resolved_a is module_a2.AlphaBehavior
-        assert resolved_b is module_b2.BetaBehavior
-
-    def test_loads_with_library_recovery_survives_reverse_load_order(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        """The pickle entry point used by generated workflows recovers collided references.
-
-        This is the same flip as above, driven through loads_with_library_recovery the way
-        a saved workflow's unique-values dict decodes its parameter values.
-        """
-        manager = griptape_nodes.LibraryManager()
-        first_file, second_file = self._write_colliding_files(tmp_path)
-
-        module_a = manager._load_module_from_file(first_file, "Collision Library")
-        module_b = manager._load_module_from_file(second_file, "Collision-Library")
-        pickled_a = pickle.dumps(module_a.AlphaBehavior.OVERWRITE)
-        pickled_b = pickle.dumps(module_b.BetaBehavior.PRESERVE)
-
-        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
-        manager._unregister_all_stable_module_aliases_for_library("Collision-Library")
-        module_b2 = manager._load_module_from_file(second_file, "Collision-Library")
-        module_a2 = manager._load_module_from_file(first_file, "Collision Library")
-        assert module_b2.__name__ == module_a.__name__, "sanity: reverse order must flip base ownership"
-
-        assert loads_with_library_recovery(pickled_a) is module_a2.AlphaBehavior.OVERWRITE
-        assert loads_with_library_recovery(pickled_b) is module_b2.BetaBehavior.PRESERVE
-
-    def test_raises_when_both_collided_files_define_the_class(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        """A base-namespace reference both files can satisfy fails safely instead of guessing."""
-        manager = griptape_nodes.LibraryManager()
-        first_file = tmp_path / "first" / "collide.py"
-        first_file.parent.mkdir(parents=True, exist_ok=True)
-        first_file.write_text(_MODULE_SOURCE)
-        second_file = tmp_path / "second" / "collide.py"
-        second_file.parent.mkdir(parents=True, exist_ok=True)
-        second_file.write_text(_MODULE_SOURCE)
-
-        module_a = manager._load_module_from_file(first_file, "Collision Library")
-        module_b = manager._load_module_from_file(second_file, "Collision-Library")
-
-        with pytest.raises(AmbiguousLegacyModuleError) as exc_info:
-            manager.resolve_collided_stable_class(module_a.__name__, "Behavior")
-
-        assert exc_info.value.candidate_modules == (module_a.__name__, module_b.__name__)
-
-    def test_collision_loser_keeps_namespace_after_winner_unloads(
-        self, griptape_nodes: GriptapeNodes, tmp_path: Path
-    ) -> None:
-        """A tracked file's namespace is sticky: reloading the loser must not claim the freed base.
-
-        If the loser silently moved to the base namespace on hot reload, its old module would
-        remain registered under the suffixed name (stale classes, ambiguous legacy lookups)
-        and references already pickled under the suffixed name would drift.
-        """
-        manager = griptape_nodes.LibraryManager()
-        first_file, second_file = self._write_colliding_files(tmp_path)
-        module_a = manager._load_module_from_file(first_file, "Collision Library")
-        module_b = manager._load_module_from_file(second_file, "Collision-Library")
-        assert module_b.__name__.startswith(module_a.__name__ + "_"), "sanity: B must lose the collision"
-
-        manager._unregister_all_stable_module_aliases_for_library("Collision Library")
-        reloaded_b = manager._load_module_from_file(second_file, "Collision-Library")
-
-        assert reloaded_b.__name__ == module_b.__name__, "the loser must keep its suffixed namespace"
-        assert module_a.__name__ not in sys.modules, "the freed base namespace must stay free"
-
-    def test_returns_none_for_non_stable_namespace(self, griptape_nodes: GriptapeNodes) -> None:
-        manager = griptape_nodes.LibraryManager()
-
-        assert manager.resolve_collided_stable_class("griptape.artifacts", "TextArtifact") is None
-
-    def test_returns_none_when_no_collided_module_matches(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        manager = griptape_nodes.LibraryManager()
-        file_path = _write_module(tmp_path, "collision_behavior.py")
-        manager._load_module_from_file(file_path, "My Test Library")
-
-        resolved = manager.resolve_collided_stable_class(
-            "griptape_nodes.node_libraries.some_other_library.other_file", "Behavior"
-        )
-
-        assert resolved is None
 
 
 class TestModuleDisplayName:

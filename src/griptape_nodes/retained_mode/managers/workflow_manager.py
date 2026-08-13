@@ -4623,14 +4623,7 @@ class WorkflowManager(EngineScoped):
         return full_ast
 
     def _build_deferred_import_statements(self, deferred_imports: dict[str, set[str]]) -> list[ast.stmt]:
-        """Convert deferred library imports into guarded ast.ImportFrom statements for build_workflow().
-
-        Each import is wrapped in ``try/except ImportError`` because its only job is to
-        force-load the library module before the pickled parameter values are decoded.
-        The recorded namespace can legitimately be absent in a later process (two node
-        files colliding on one base namespace swap names when registration order flips);
-        unpickling recovers such references through loads_with_library_recovery, so a
-        missing module here must not abort the workflow.
+        """Convert deferred library imports into ast.ImportFrom statements for build_workflow().
 
         Sorted by module name (and class names within each module) for deterministic output.
         """
@@ -4641,20 +4634,8 @@ class WorkflowManager(EngineScoped):
                 names=[ast.alias(name=cls) for cls in sorted(classes)],
                 level=0,
             )
-            guarded = ast.Try(
-                body=[import_node],
-                handlers=[
-                    ast.ExceptHandler(
-                        type=ast.Name(id="ImportError", ctx=ast.Load()),
-                        name=None,
-                        body=[ast.Pass()],
-                    )
-                ],
-                orelse=[],
-                finalbody=[],
-            )
-            ast.fix_missing_locations(guarded)
-            stmts.append(guarded)
+            ast.fix_missing_locations(import_node)
+            stmts.append(import_node)
         return stmts
 
     def _generate_create_flow(

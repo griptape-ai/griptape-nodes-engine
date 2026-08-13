@@ -225,6 +225,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodeClassNotBaseNodeProblem,
     NodeClassNotFoundProblem,
     NodeModuleImportProblem,
+    NodeModuleNamespaceCollisionProblem,
     NodePermissionDeniedProblem,
     OldXdgLocationWarningProblem,
     PermissionDeniedProblem,
@@ -362,18 +363,30 @@ class AmbiguousLegacyModuleError(Exception):
         super().__init__(f"Legacy class '{class_name}' matches multiple loaded modules: {candidates}")
 
 
+class StableNamespaceCollisionError(ImportError):
+    """Raised when two different node files map to the same stable module namespace."""
+
+    def __init__(
+        self, library_name: str, stable_namespace: str, node_file_path: Path, conflicting_file_path: Path
+    ) -> None:
+        self.library_name = library_name
+        self.stable_namespace = stable_namespace
+        self.node_file_path = node_file_path
+        self.conflicting_file_path = conflicting_file_path
+        super().__init__(
+            f"Attempted to load node file '{node_file_path}' for library '{library_name}'. Failed because "
+            f"'{conflicting_file_path}' is already loaded under the same module name '{stable_namespace}'. "
+            f"Rename one of the two files so their names differ."
+        )
+
+
 class LibraryAwareUnpickler(pickle.Unpickler):
     """Unpickler that recovers library class references standard resolution cannot.
 
-    Two kinds of module reference in engine pickles need remapping through the
-    LibraryManager:
-
-    - Volatile per-process names from older engines
-      (``gtn_dynamic_module_<file>_py_<hash>``), which cannot be imported in a later
-      process.
-    - Stable namespaces whose ownership depends on load order because two node files
-      collide on the same base namespace; the name recorded by the writing process may
-      belong to the other file (or not exist) in this one.
+    Older engines executed library node files under volatile per-process module names
+    (``gtn_dynamic_module_<file>_py_<hash>``), which cannot be imported in a later process.
+    This remaps such a reference, through the LibraryManager, to the class now loaded under
+    the file's stable namespace.
 
     References to anything other than a library module resolve exactly as
     ``pickle.Unpickler`` would.
@@ -394,16 +407,6 @@ class LibraryAwareUnpickler(pickle.Unpickler):
                 referenced class.
         """
         library_manager = current_engine().library_manager
-        # Stable-namespace references resolve through collision-aware lookup first: when two
-        # node files collide on a base namespace, which file owns the plain name depends on
-        # load order, so a plain lookup could silently return the other file's class. The
-        # resolver finds the single loaded module that defines the class regardless of which
-        # namespace it currently owns, and raises AmbiguousLegacyModuleError instead of
-        # guessing when more than one collided module defines it.
-        if library_manager.is_dynamic_module(module):
-            resolved_class = library_manager.resolve_collided_stable_class(module, name)
-            if resolved_class is not None:
-                return resolved_class
         try:
             return super().find_class(module, name)
         except ModuleNotFoundError:
@@ -3233,10 +3236,10 @@ class LibraryManager(EngineScoped):
     ) -> None:
         """Make a lazily registered node file importable via its stable namespace.
 
-        The namespace is resolved (and reserved) here rather than at import time, so two files
+        The namespace is claimed (and reserved) here rather than at import time, so two files
         in one library that share a stem cannot silently overwrite each other's pending entry:
-        the first registration reserves the plain namespace and the second is disambiguated,
-        exactly as the eager load path does.
+        the first registration reserves the namespace and the second raises
+        StableNamespaceCollisionError, exactly as the eager load path does.
 
         The loader is the same memoized per-file loader the node-class loaders share, so an
         import through StableNamespaceImportFinder and a later class resolution reuse one
@@ -3246,12 +3249,15 @@ class LibraryManager(EngineScoped):
             library_name: Name of the owning library, recorded so unload drops only its claim
             node_file_path: Node file the loader imports
             module_loader: Memoized zero-argument loader that imports the file's module
+
+        Raises:
+            StableNamespaceCollisionError: If a different file already owns the namespace.
         """
         module_file = StableModuleFile(
             canonical_path=canonicalize_for_identity(node_file_path),
             logical_path=canonicalize_for_io(node_file_path),
         )
-        stable_namespace = self._resolve_stable_namespace(
+        stable_namespace = self._claim_stable_namespace(
             library_name, canonical_path=module_file.canonical_path, logical_path=module_file.logical_path
         )
 
@@ -3280,25 +3286,14 @@ class LibraryManager(EngineScoped):
                 del self._pending_stable_modules[stable_namespace]
         return released_namespaces
 
-    def _resolve_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
-        """Resolve the stable namespace to load a file under, disambiguating collisions.
+    def _claim_stable_namespace(self, library_name: str, canonical_path: Path, logical_path: Path) -> str:
+        """Claim the stable namespace a file is loaded under, rejecting a claim by a different file.
 
-        Two different files in a library can share a stem (e.g. ``video/compare.py`` and
-        ``traits/compare.py``), which would map both to the same stable namespace and make
-        the second load clobber the first in sys.modules. When that happens we append a
-        short, deterministic suffix derived from the file's identity so both modules can
-        coexist, and warn so the collision can be resolved at the source.
-
-        Loading the same file again (hot reload) is not a collision and keeps its namespace,
-        including when the file previously lost a collision whose winner has since unloaded:
-        a tracked file's namespace is sticky for the life of the process so already pickled
-        references and live class identities stay coherent. A namespace reserved by a lazily
-        registered file counts as tracked, so registration order decides the winner under lazy
-        loading and the eventual import agrees with what was reserved.
-
-        The disambiguation suffix hashes the absolute file path, so it is stable per install
-        but not portable across machines; recovering pre-existing pickles for collided files
-        is out of scope (see #4475 for the deeper import-path coupling).
+        Registration order alone decides which file gets a base namespace: whichever file
+        claims it first owns it, and a lazily reserved file counts as having claimed it even
+        before its module is imported. A re-claim by the same file, whether a hot reload or a
+        lazily reserved file finally importing, is a no-op that returns the namespace it
+        already owns. A claim by a different file is rejected outright.
 
         Args:
             library_name: Name of the library
@@ -3306,34 +3301,23 @@ class LibraryManager(EngineScoped):
             logical_path: Path as loaded, symlinks not followed (naming)
 
         Returns:
-            The stable namespace to register the module under.
+            The stable namespace the file owns.
+
+        Raises:
+            StableNamespaceCollisionError: If a different file already owns the namespace.
         """
         base_namespace = self._create_stable_namespace(library_name, logical_path)
-        disambiguated = f"{base_namespace}_{self._collision_suffix(canonical_path)}"
-        existing_disambiguated = self._stable_namespace_owner(disambiguated)
-        if existing_disambiguated is not None and existing_disambiguated.canonical_path == canonical_path:
-            return disambiguated
-
         existing = self._stable_namespace_owner(base_namespace)
-        if existing is None or existing.canonical_path == canonical_path:
-            return base_namespace
+        if existing is not None and existing.canonical_path != canonical_path:
+            raise StableNamespaceCollisionError(library_name, base_namespace, logical_path, existing.logical_path)
 
-        # Genuine collision between two distinct files: disambiguate the newcomer.
-        details = (
-            f"Two node files in library '{library_name}' map to the same module namespace "
-            f"'{base_namespace}': '{existing.logical_path}' and '{logical_path}'. Loading the latter as "
-            f"'{disambiguated}'. Rename one of the files to avoid this collision."
-        )
-        logger.warning(details)
-        return disambiguated
+        return base_namespace
 
     def _stable_namespace_owner(self, stable_namespace: str) -> StableModuleFile | None:
         """Return the file a stable namespace belongs to, whether loaded or only reserved.
 
-        Lazily registered files reserve their namespace at registration time, before anything
-        is imported. Treating a reservation as ownership makes namespace assignment a function
-        of registration order alone, so an import that happens much later resolves to the same
-        namespace the reservation promised instead of re-deciding by load order.
+        A reservation counts as ownership: a lazily registered file claims its namespace at
+        registration time, before anything is imported.
 
         Args:
             stable_namespace: Namespace to look up
@@ -3396,7 +3380,7 @@ class LibraryManager(EngineScoped):
             library_name: Name of the owning library
             module_file: Canonical and logical paths the module was loaded from. The
                 canonical path is stored for collision detection in
-                _resolve_stable_namespace, which must compare against the exact same
+                _claim_stable_namespace, which must compare against the exact same
                 canonical value it resolved with; re-deriving from module.__file__ could
                 drift (or be unset) and misclassify a hot reload as a collision.
         """
@@ -3549,9 +3533,8 @@ class LibraryManager(EngineScoped):
         # name matches the recorded token, leaving every unrelated node file untouched.
         self._load_pending_modules_for_volatile_token(file_token)
 
-        # Match on the file's own logical name, not the namespace leaf: a module that lost a
-        # namespace collision carries a disambiguation suffix in its namespace, but its file
-        # name is still what the volatile name recorded.
+        # Match on the file's own logical name, not the namespace leaf: the namespace leaf is
+        # the file's stem, while the legacy token is built from the full file name.
         candidate_namespaces = [
             stable_namespace
             for stable_namespace, module_file in sorted(self._stable_module_to_file.items())
@@ -3559,69 +3542,11 @@ class LibraryManager(EngineScoped):
         ]
         return self._resolve_class_from_stable_modules(candidate_namespaces, class_name)
 
-    def resolve_collided_stable_class(self, module_name: str, class_name: str) -> Any | None:
-        """Resolve a stable-namespace reference whose owning file was in a namespace collision.
-
-        When two node files collide on the same base namespace, which file owns the plain
-        name and which gets the deterministic suffix depends on load order. A pickle written
-        by an earlier process can therefore reference a namespace that this process assigned
-        to the other file, or a suffixed name this process never registered at all. This
-        searches every loaded stable module that could have been registered under the
-        referenced name in some load order (same base namespace) and resolves the one that
-        actually defines the class.
-
-        Args:
-            module_name: The stable-namespace module name recorded in the pickle
-            class_name: The class the pickle wants from that module. May be a dotted
-                qualified name (e.g. ``LifecycleNode.TriggerBehavior``) for nested classes.
-
-        Returns:
-            The class defined by the single matching stable module, or None if the name is
-            not a stable namespace or no loaded module matches.
-
-        Raises:
-            AmbiguousLegacyModuleError: If more than one loaded module defines the class.
-        """
-        if not self.is_dynamic_module(module_name):
-            return None
-
-        # Under lazy node loading a colliding file may not be imported yet, so there would be
-        # nothing tracked to match against. Import just the pending files that could have been
-        # registered under the referenced name, leaving every unrelated node file untouched.
-        self._load_pending_modules_for_stable_namespace(module_name)
-
-        candidate_namespaces = [
-            stable_namespace
-            for stable_namespace, module_file in sorted(self._stable_module_to_file.items())
-            if module_name in self._possible_stable_namespaces(stable_namespace, module_file)
-        ]
-        return self._resolve_class_from_stable_modules(candidate_namespaces, class_name)
-
-    def _possible_stable_namespaces(self, stable_namespace: str, module_file: StableModuleFile) -> tuple[str, str]:
-        """Return every stable namespace a tracked file could have been registered under.
-
-        A file registers under its base namespace when it claims it first, or under the base
-        plus its deterministic collision suffix when another file already holds the base. Either
-        name can appear in a pickle written by an earlier process, so both count as this file's
-        possible names.
-
-        Args:
-            stable_namespace: Namespace the file is currently registered under
-            module_file: Paths the file was loaded from
-
-        Returns:
-            The file's base namespace and its collision-suffixed namespace.
-        """
-        suffix = self._collision_suffix(module_file.canonical_path)
-        base_namespace = stable_namespace.removesuffix(f"_{suffix}")
-        return (base_namespace, f"{base_namespace}_{suffix}")
-
     def _resolve_class_from_stable_modules(self, candidate_namespaces: list[str], class_name: str) -> Any | None:
         """Resolve a class from the one loaded stable module among candidates that defines it.
 
-        Shared by both legacy-reference recovery paths: each builds its own candidate list (by
-        legacy file token or by collided namespace), and the single-match rule that turns those
-        candidates into a class is identical.
+        Used by resolve_volatile_dynamic_class to turn its candidate list (stable modules whose
+        file matches the legacy file token) into a single resolved class.
 
         Args:
             candidate_namespaces: Stable namespaces that could satisfy the pickled reference
@@ -3669,28 +3594,6 @@ class LibraryManager(EngineScoped):
         ]
         self._load_pending_modules(matching_namespaces)
 
-    def _load_pending_modules_for_stable_namespace(self, module_name: str) -> None:
-        """Import pending lazy node modules that could have been registered under a namespace.
-
-        Which of two colliding files owns the plain namespace depends on the order they were
-        registered in, so a pickle written by an earlier process can name a namespace this
-        process assigned to the other file. Collided-name recovery can only match against
-        modules that are loaded, and under lazy loading a colliding file stays unimported until
-        first use, so the candidate the pickle needs may not exist yet. Importing only the
-        pending files that could answer to the referenced name keeps lazy loading intact for
-        everything else.
-
-        Args:
-            module_name: Stable namespace recorded in the pickle
-        """
-        # Snapshot first: loading a module retires its own pending entry, mutating this dict.
-        matching_namespaces = [
-            stable_namespace
-            for stable_namespace, pending in self._pending_stable_modules.items()
-            if module_name in self._possible_stable_namespaces(stable_namespace, pending.module_file)
-        ]
-        self._load_pending_modules(matching_namespaces)
-
     def _load_pending_modules(self, stable_namespaces: list[str]) -> None:
         """Import the given pending node modules, skipping any that no longer import cleanly.
 
@@ -3714,22 +3617,6 @@ class LibraryManager(EngineScoped):
                     f"because that node file could not be imported: {err}"
                 )
                 logger.warning(details)
-
-    @staticmethod
-    def _collision_suffix(file_path: Path) -> str:
-        """Deterministic disambiguation suffix for a node file that lost a namespace collision.
-
-        The digest only needs to be a stable, low-collision suffix for a module name (not
-        security), so the algorithm choice is irrelevant; sha256 with usedforsecurity=False
-        keeps static analysis quiet about weak hashing.
-
-        Args:
-            file_path: Canonical path of the node file
-
-        Returns:
-            An 8-character hex suffix that is a pure function of the file path.
-        """
-        return hashlib.sha256(str(file_path).encode("utf-8"), usedforsecurity=False).hexdigest()[:8]
 
     @staticmethod
     def _get_class_defined_in_module(module: ModuleType, class_name: str) -> Any | None:
@@ -3849,6 +3736,8 @@ class LibraryManager(EngineScoped):
 
         Raises:
             ImportError: If the module cannot be imported
+            StableNamespaceCollisionError: If a different file already owns the file's
+                stable namespace
         """
         # The canonical (symlink-resolved) path is the file's identity for hot-reload and
         # collision detection; the logical path preserves the name the file was loaded by so
@@ -3858,7 +3747,7 @@ class LibraryManager(EngineScoped):
             logical_path=canonicalize_for_io(file_path),
         )
 
-        stable_namespace = self._resolve_stable_namespace(
+        stable_namespace = self._claim_stable_namespace(
             library_name, canonical_path=module_file.canonical_path, logical_path=module_file.logical_path
         )
         self._ensure_parent_packages(stable_namespace)
@@ -4985,6 +4874,9 @@ class LibraryManager(EngineScoped):
             node_class = self._make_node_class_loader(
                 node_file_path, node_definition.class_name, library_name, module_loaders
             )()
+        except StableNamespaceCollisionError as err:
+            self._record_namespace_collision_problem(node_definition, node_file_path, library_info, err)
+            return False
         except ImportError as err:
             root_cause = self._get_root_cause_from_exception(err)
             library_info.problems.append(
@@ -5038,8 +4930,10 @@ class LibraryManager(EngineScoped):
     ) -> bool:
         """Register a node type with a deferred loader; its module imports on first use.
 
-        Always returns True: registration itself does not import the module, so an import
-        error cannot be detected here (it surfaces when the node is first used).
+        A module-name collision is detected here at registration (claiming the file's stable
+        namespace does not require importing it), so this returns False and does not register
+        the node type when it happens. Otherwise registration does not import the module, so
+        an import error cannot be detected here (it surfaces when the node is first used).
         """
         library_name = library.get_library_data().name
         loader = self._make_node_class_loader(node_file_path, node_definition.class_name, library_name, module_loaders)
@@ -5048,13 +4942,53 @@ class LibraryManager(EngineScoped):
         # sys.modules by now; with lazy loading it is not, so register a pending loader that the
         # StableNamespaceImportFinder resolves on first import of the namespace.
         module_loader = self._get_or_create_module_loader(node_file_path, library_name, module_loaders)
-        self._register_pending_stable_module_loader(library_name, node_file_path, module_loader)
+        try:
+            self._register_pending_stable_module_loader(library_name, node_file_path, module_loader)
+        except StableNamespaceCollisionError as err:
+            self._record_namespace_collision_problem(node_definition, node_file_path, library_info, err)
+            return False
         library_problem = library.register_lazy_node_type(
             node_definition.class_name, metadata=node_definition.metadata, loader=loader
         )
         if library_problem is not None:
             library_info.problems.append(library_problem)
         return True
+
+    def _record_namespace_collision_problem(
+        self,
+        node_definition: NodeDefinition,
+        node_file_path: Path,
+        library_info: LibraryInfo,
+        err: StableNamespaceCollisionError,
+    ) -> None:
+        """Record that a node's file maps to a module name another file already claimed.
+
+        Both registration paths reach this: the eager path claims the namespace while importing
+        the module, the lazy path while reserving it, and either way the node type cannot be
+        registered under a name that belongs to a different file.
+
+        Args:
+            node_definition: Definition of the node that could not be registered
+            node_file_path: Node file whose claim was rejected
+            library_info: LibraryInfo to append the problem to
+            err: Collision raised while claiming the file's stable namespace
+        """
+        library_info.problems.append(
+            NodeModuleNamespaceCollisionProblem(
+                class_name=node_definition.class_name,
+                file_path=str(node_file_path),
+                conflicting_file_path=str(err.conflicting_file_path),
+                stable_namespace=err.stable_namespace,
+            )
+        )
+        logger.error(
+            "Attempted to load node '%s' from '%s'. Failed because '%s' is already loaded under the same "
+            "module name '%s'",
+            node_definition.class_name,
+            node_file_path,
+            err.conflicting_file_path,
+            err.stable_namespace,
+        )
 
     def _attempt_load_nodes_from_library(  # noqa: PLR0912, PLR0915, C901
         self,

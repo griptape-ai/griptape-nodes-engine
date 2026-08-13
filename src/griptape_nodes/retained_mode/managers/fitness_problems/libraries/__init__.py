@@ -27,6 +27,7 @@ from .modified_parameters_set_removed_problem import ModifiedParametersSetRemove
 from .node_class_not_base_node_problem import NodeClassNotBaseNodeProblem
 from .node_class_not_found_problem import NodeClassNotFoundProblem
 from .node_module_import_problem import NodeModuleImportProblem
+from .node_module_namespace_collision_problem import NodeModuleNamespaceCollisionProblem
 from .node_permission_denied_problem import NodePermissionDeniedProblem
 from .old_xdg_location_warning_problem import OldXdgLocationWarningProblem
 from .permission_denied_problem import PermissionDeniedProblem
@@ -70,6 +71,7 @@ __all__ = [
     "NodeClassNotBaseNodeProblem",
     "NodeClassNotFoundProblem",
     "NodeModuleImportProblem",
+    "NodeModuleNamespaceCollisionProblem",
     "NodePermissionDeniedProblem",
     "OldXdgLocationWarningProblem",
     "PermissionDeniedProblem",

@@ -30,6 +30,9 @@ from griptape_nodes.retained_mode.events.library_events import (
 from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_import_problem import (
     NodeModuleImportProblem,
 )
+from griptape_nodes.retained_mode.managers.fitness_problems.libraries.node_module_namespace_collision_problem import (
+    NodeModuleNamespaceCollisionProblem,
+)
 from griptape_nodes.retained_mode.managers.library_manager import LibraryManager, loads_with_library_recovery
 from griptape_nodes.retained_mode.managers.settings import LibrarySettings
 
@@ -415,12 +418,12 @@ class TestStableNamespaceImportUnderLazyLoading:
         assert module.SiblingA is node_a
         assert module.SiblingB is node_b
 
-    def test_same_stem_files_stay_separately_importable(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
-        """Two files in one library sharing a stem must both stay importable.
+    def test_same_stem_files_collide(self, griptape_nodes: GriptapeNodes, tmp_path: Path) -> None:
+        """Two files in one library sharing a stem collide: the first registers, the second is reported.
 
-        Both map to the same base namespace, so registering the second must disambiguate it
-        rather than take over the first's entry: a lost entry would leave a saved workflow
-        unable to import that file at all until one of its node classes happened to be used.
+        Both map to the same base namespace, so registering the second reports a namespace
+        collision problem and leaves it unregistered rather than silently taking over the
+        first's pending entry.
         """
         manager = griptape_nodes.LibraryManager()
         for subdir, class_name in (("video", "CompareVideo"), ("traits", "CompareTrait")):
@@ -444,22 +447,20 @@ class TestStableNamespaceImportUnderLazyLoading:
         )
 
         base_namespace = "griptape_nodes.node_libraries.same_stem_library.compare"
-        pending_namespaces = sorted(manager._pending_stable_modules)
-        suffixed_namespaces = [name for name in pending_namespaces if name.startswith(f"{base_namespace}_")]
+        assert list(manager._pending_stable_modules) == [base_namespace]
 
-        # The first registration keeps the plain namespace; the second is suffixed, not dropped.
-        assert base_namespace in pending_namespaces
-        assert len(suffixed_namespaces) == 1
+        # The first registration keeps the plain namespace; the second is reported, not registered.
+        assert library.has_node_type("CompareVideo")
+        assert not library.has_node_type("CompareTrait")
+        collisions = [p for p in info.problems if isinstance(p, NodeModuleNamespaceCollisionProblem)]
+        assert len(collisions) == 1
+        assert collisions[0].class_name == "CompareTrait"
+        assert collisions[0].stable_namespace == base_namespace
 
-        # Importing either namespace loads its own file, under the name it was reserved with.
+        # The surviving namespace still imports the file it was reserved with.
         base_module = importlib.import_module(base_namespace)
-        suffixed_module = importlib.import_module(suffixed_namespaces[0])
         assert base_module.__name__ == base_namespace
-        assert suffixed_module.__name__ == suffixed_namespaces[0]
-        assert {base_module.CompareVideo, suffixed_module.CompareTrait} == {
-            library.get_node_class("CompareVideo"),
-            library.get_node_class("CompareTrait"),
-        }
+        assert base_module.CompareVideo is library.get_node_class("CompareVideo")
 
     def test_shared_pending_namespace_survives_until_last_claimant_unloads(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
@@ -528,15 +529,14 @@ class TestStableNamespaceImportUnderLazyLoading:
         assert sys.modules[stable_namespace].SharedNode is first_class
         assert LibraryRegistry.get_library("Shared-Owner Library").get_node_class("SharedNode") is first_class
 
-    def test_collided_reference_resolves_against_a_never_imported_file(
+    def test_lazy_registration_reports_collision_against_an_eagerly_loaded_file(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path
     ) -> None:
-        """A pickle naming a collided namespace must reach a file lazy loading has not imported.
+        """Lazily registering a file that collides with an already-loaded file is reported.
 
-        Which of two colliding files owns the plain namespace depends on registration order, so
-        a saved value can name the namespace this process gave to the other file. Recovery has to
-        import the lazily registered candidate; without that, the plain namespace resolves to the
-        wrong file and unpickling dies on a missing attribute instead of finding the class.
+        Which of two colliding files owns the plain namespace depends on registration order: the
+        eagerly loaded file claims it first, so the lazily registered file's claim collides and
+        its node type never registers.
         """
         manager = griptape_nodes.LibraryManager()
         loaded_dir = tmp_path / "loaded"
@@ -545,8 +545,6 @@ class TestStableNamespaceImportUnderLazyLoading:
             directory.mkdir()
             (directory / "collide.py").write_text(_NAMED_NODE_SOURCE.format(class_name=class_name))
 
-        # The eagerly loaded file wins the plain namespace; the lazily registered one is only
-        # reserved, so nothing tracked defines PendingCollide yet.
         manager._load_module_from_file(loaded_dir / "collide.py", "Collide Library")
         schema = _schema(
             "Collide Library",
@@ -557,19 +555,21 @@ class TestStableNamespaceImportUnderLazyLoading:
             ],
         )
         library = LibraryRegistry.generate_new_library(library_data=schema)
+        info = _library_info(schema, tmp_path)
         manager._attempt_load_nodes_from_library(
             library_data=schema,
             library=library,
             base_dir=tmp_path,
-            library_info=_library_info(schema, tmp_path),
+            library_info=info,
             lazy_loading=True,
         )
 
-        base_namespace = "griptape_nodes.node_libraries.collide_library.collide"
-        payload = f"c{base_namespace}\nPendingCollide\n.".encode()
-        node_class = loads_with_library_recovery(payload)
-
-        assert node_class is library.get_node_class("PendingCollide")
+        assert not library.has_node_type("PendingCollide")
+        collisions = [p for p in info.problems if isinstance(p, NodeModuleNamespaceCollisionProblem)]
+        assert len(collisions) == 1
+        assert collisions[0].class_name == "PendingCollide"
+        assert collisions[0].file_path == str(pending_dir / "collide.py")
+        assert collisions[0].conflicting_file_path == str(loaded_dir / "collide.py")
 
     def test_legacy_volatile_reference_reports_missing_library_when_file_is_broken(
         self, griptape_nodes: GriptapeNodes, tmp_path: Path

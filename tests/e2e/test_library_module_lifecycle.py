@@ -3,8 +3,7 @@
 Library node files load under a stable, deterministic module name
 (``griptape_nodes.node_libraries.<lib>.<file>``) rather than a volatile per-process name derived
 from ``hash(str(path))``. This is what makes pickled parameter values (including objects
-embedded in saved-image metadata) unpickle reliably across an engine restart, and what lets two
-libraries whose sanitized names collide coexist instead of clobbering each other.
+embedded in saved-image metadata) unpickle reliably across an engine restart.
 
 The unit tests in ``tests/unit/retained_mode/managers/test_library_manager_stable_namespace.py``
 and ``test_flow_manager.py`` cover the mechanism in isolation, within one process. This suite
@@ -18,7 +17,7 @@ subprocesses wherever a real process boundary matters:
    without changing its stable namespace or leaving volatile modules behind.
 4. Sandbox lifecycle: ``RegisterSandboxNodeFromSourceRequest`` register/replace/fail/recover.
 5. Namespace collision: two differently-named libraries that sanitize to the same namespace
-   segment survive disambiguation, unload, and reverse load order.
+   segment; the first to register claims it and the second reports the collision.
 
 Every subprocess gets its own isolated ``XDG_CONFIG_HOME`` and workspace so nothing here reads
 or writes the developer's real ``~/.config/griptape_nodes`` or depends on any sibling repo.
@@ -354,17 +353,14 @@ def test_sandbox_lifecycle_register_replace_fail_recover(tmp_path: Path) -> None
     assert response["namespace_v3"] == sandbox_namespace
 
 
-def test_namespace_collision_across_libraries_survives_unload_and_reverse_reload(tmp_path: Path) -> None:
-    """Two libraries whose sanitized names collide coexist, unload cleanly, and reload reversed.
+def test_namespace_collision_across_libraries_reports_a_problem(tmp_path: Path) -> None:
+    """Two libraries whose sanitized names collide: the first registers, the second is reported.
 
     "Collision Library" and "Collision-Library" both sanitize to the safe module segment
-    "collision_library"; both declare a node file named "collide.py". Loading them in order
-    gives the first library the plain stable namespace and disambiguates the second with a
-    hash suffix. Unloading the base-namespace winner must not disturb the loser's module.
-    Unloading both and reloading in the opposite order must flip who gets the plain name, and
-    must never leave a stale leaf module behind from either lifecycle. Class references
-    pickled under the pre-flip names (plain for the winner, suffixed for the loser) must
-    still resolve to their original libraries after the flip.
+    "collision_library"; both declare a node file named "collide.py". The first library to
+    register claims the shared stable namespace and its node type loads normally. The second
+    library's node file maps to the namespace the first already claimed, so its registration
+    reports a node-module namespace collision problem and its node type never registers.
     """
     library_json_a = _materialize_library(COLLISION_LIBRARY_A_DIR, tmp_path / "library_a")
     library_json_b = _materialize_library(COLLISION_LIBRARY_B_DIR, tmp_path / "library_b")
@@ -372,38 +368,13 @@ def test_namespace_collision_across_libraries_survives_unload_and_reverse_reload
     env = _isolated_env(tmp_path / "xdg", tmp_path / "workspace")
     response = _run_driver(
         "collision",
-        {
-            "library_json_a": str(library_json_a),
-            "library_json_b": str(library_json_b),
-            "image_path": str(tmp_path / "collision.png"),
-        },
+        {"library_json_a": str(library_json_a), "library_json_b": str(library_json_b)},
         env=env,
         tmp_path=tmp_path,
     )
 
-    assert response["namespace_a1"] == COLLISION_STABLE_NAMESPACE, "first-loaded library keeps the plain namespace"
-    assert response["namespace_b1"] != COLLISION_STABLE_NAMESPACE
-    assert response["namespace_b1"].startswith(COLLISION_STABLE_NAMESPACE + "_"), "second load is disambiguated"
-    assert set(response["modules_after_first_load"]) == {response["namespace_a1"], response["namespace_b1"]}
-
-    assert response["namespace_b_after_a_unload"] == response["namespace_b1"], (
-        "unloading the winner must not disturb the loser's module"
-    )
-    assert response["modules_after_a_unload"] == [response["namespace_b1"]], (
-        "unloading the winner must leave only the loser's leaf module registered"
-    )
-    assert response["modules_after_both_unloaded"] == [], "unloading both must leave no leaf modules behind"
-
-    assert response["namespace_b2"] == COLLISION_STABLE_NAMESPACE, "reverse order flips who wins the plain namespace"
-    assert response["namespace_a2"] != COLLISION_STABLE_NAMESPACE
-    assert response["namespace_a2"].startswith(COLLISION_STABLE_NAMESPACE + "_")
-    assert set(response["modules_after_reverse_load"]) == {response["namespace_a2"], response["namespace_b2"]}
-
-    assert response["recovered_a_name"] == "CollisionNodeA"
-    assert response["recovered_a_module"] == response["namespace_a2"], (
-        "A's class, pickled under the plain namespace, must resolve to A's post-flip module"
-    )
-    assert response["recovered_b_name"] == "CollisionNodeB"
-    assert response["recovered_b_module"] == response["namespace_b2"], (
-        "B's class, pickled under the suffixed namespace, must resolve to B's post-flip module"
-    )
+    assert response["namespace_a"] == COLLISION_STABLE_NAMESPACE, "the first-registered library claims the namespace"
+    assert response["register_b_succeeded"] is False, "the second library's only node type collided"
+    assert response["library_b_has_node_type"] is False, "the colliding node type must not register"
+    assert "CollisionNodeB" in response["collision_problem"]
+    assert "collide.py" in response["collision_problem"]

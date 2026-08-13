@@ -2117,24 +2117,18 @@ class TestWorkflowManager:
         recovery_module = "griptape_nodes.retained_mode.managers.library_manager"
         assert "loads_with_library_recovery" in import_recorder.from_imports.get(recovery_module, set())
 
-    def test_deferred_import_statements_tolerate_missing_modules(self, griptape_nodes: GriptapeNodes) -> None:
-        """Deferred library imports must not abort build_workflow when a namespace is absent.
-
-        A collision-suffixed namespace recorded at save time can legitimately not exist
-        after registration order flips; the import only warms the module, and unpickling
-        recovers the reference through loads_with_library_recovery.
-        """
+    def test_deferred_import_statements_produce_plain_import_from(self, griptape_nodes: GriptapeNodes) -> None:
+        """Deferred library imports compile to plain ImportFrom statements."""
         workflow_manager = griptape_nodes.WorkflowManager()
 
         stmts = workflow_manager._build_deferred_import_statements(
-            {"griptape_nodes.node_libraries.missing_lib.gone_abcd1234": {"GhostClass"}}
+            {"griptape_nodes.node_libraries.some_lib.some_file": {"SomeClass"}}
         )
 
         assert len(stmts) == 1
+        assert isinstance(stmts[0], ast.ImportFrom)
         generated = ast.unparse(ast.Module(body=stmts, type_ignores=[]))
-        assert "from griptape_nodes.node_libraries.missing_lib.gone_abcd1234 import GhostClass" in generated
-        # Executing the guarded import against a namespace that does not exist must not raise.
-        exec(compile(ast.Module(body=stmts, type_ignores=[]), "<deferred_imports>", "exec"), {})  # noqa: S102
+        assert generated == "from griptape_nodes.node_libraries.some_lib.some_file import SomeClass"
 
 
 class TestWorkflowVariablePersistence:
