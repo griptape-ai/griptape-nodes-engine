@@ -54,6 +54,7 @@ ENV_LIBRARIES_SYNC = (
     os.getenv("GTN_LIBRARIES_SYNC", "false").lower() == "true" if os.getenv("GTN_LIBRARIES_SYNC") is not None else None
 )
 ENV_GTN_BUCKET_NAME = os.getenv("GTN_BUCKET_NAME")
+ENV_LIBRARIES_BASE_DIR = os.getenv("GTN_LIBRARIES_BASE_DIR", str(DATA_DIR / "libraries"))
 
 
 def init_system_config() -> None:

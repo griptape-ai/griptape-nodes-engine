@@ -171,14 +171,6 @@ workspace_dir: "~/Projects/marketing"                # your home directory
 
 **`{macro}` tokens are not expanded.** `{workspace_dir}`, `{project_dir}`, `{outputs}`, and any other macro token is rejected rather than substituted — the engine reports the field as unresolvable instead of creating a folder literally named `{outputs}`. Macros belong in `path_macro` and `situations.*.macro` fields, which resolve against runtime state these fields cannot depend on.
 
-**One variable is always available: `${GTN_DEFAULT_LIBRARIES_ROOT}`.** The engine publishes it at startup, so unlike `${STUDIO_LIBS}` above it needs no setup on any machine. It holds the absolute directory libraries install under by default — the same place `griptape-nodes init` puts the standard library — which makes it the portable way to point a project at this engine's existing library tree instead of downloading a second copy:
-
-```yaml
-libraries_dir: "${GTN_DEFAULT_LIBRARIES_ROOT}/shared"
-```
-
-It does not follow a project's own `libraries_dir`, since that is the field reading it. See [Variables the engine publishes](../configuration.md#variables-the-engine-publishes).
-
 Three things worth knowing before you rely on a variable:
 
 - `%NAME%` expands **only on Windows**. For a value that has to work everywhere, use `${NAME}` or the per-platform mapping form.

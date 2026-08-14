@@ -64,12 +64,6 @@ logger = logging.getLogger("griptape_nodes")
 
 USER_CONFIG_PATH = xdg_config_home() / "griptape_nodes" / "griptape_nodes_config.json"
 
-# Environment variable the engine PUBLISHES (it is never read as config input) carrying the absolute
-# directory libraries install under when no project declares a libraries_dir. Deliberately outside
-# the GTN_CONFIG_ prefix: that prefix is the highest-priority config INPUT layer, so publishing there
-# would pin the resolved path above every config file and every project override.
-DEFAULT_LIBRARIES_ROOT_ENV_VAR = "GTN_DEFAULT_LIBRARIES_ROOT"
-
 
 class ConfigManager(EngineScoped):
     """A class to manage application configuration and file pathing.
@@ -82,12 +76,7 @@ class ConfigManager(EngineScoped):
     5. Environment variables with GTN_CONFIG_ prefix (highest priority)
 
     Environment variables starting with GTN_CONFIG_ are converted to config keys by removing the prefix
-    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}). That flow is
-    input-only: nothing here writes a GTN_CONFIG_ variable back out.
-
-    The one variable this manager PUBLISHES is GTN_DEFAULT_LIBRARIES_ROOT, written once at
-    construction so project templates can reference the engine's default libraries root. See
-    _publish_default_libraries_root.
+    and converting to lowercase (e.g., GTN_CONFIG_FOO=bar becomes {"foo": "bar"}).
 
     Supports categorized configuration using dot notation (e.g., 'category.subcategory.key')
     to organize related configuration items.
@@ -114,10 +103,6 @@ class ConfigManager(EngineScoped):
         self._workspace_dir_override: str | None = None
         self._libraries_root_override: str | None = None
         self.load_configs()
-
-        # Once per engine process, before any project YAML is read. See the method docstring for why
-        # this cannot live in load_configs().
-        self._publish_default_libraries_root()
 
         self._set_log_level(self.merged_config.get("log_level", logging.INFO))
 
@@ -287,38 +272,6 @@ class ConfigManager(EngineScoped):
         if not isinstance(libraries_directory, str) or not libraries_directory:
             libraries_directory = DEFAULT_LIBRARIES_DIRECTORY
         return resolve_workspace_path(Path(libraries_directory), self.configured_global_workspace_path())
-
-    def _publish_default_libraries_root(self) -> None:
-        """Publish the default libraries root to os.environ as GTN_DEFAULT_LIBRARIES_ROOT.
-
-        Exists so a project template can write `libraries_dir: "${GTN_DEFAULT_LIBRARIES_ROOT}/shared"`
-        instead of hardcoding an absolute path per machine. `resolve_project_path_field` expands shell
-        variables in that field, and env vars are the only substitution it accepts -- `{macro}` tokens
-        are refused there because building the macro bag needs the very values those fields produce.
-
-        Publishes `default_libraries_root`, NOT `resolved_libraries_root`. The latter returns
-        `_libraries_root_override` when a project declares or inherits a libraries_dir, so publishing
-        it would make the variable's value depend on the field that reads it. The default is derived
-        from the ENGINE's workspace and is therefore an answer that exists before any project loads.
-
-        Called once from __init__, deliberately not from load_configs(), which re-runs on every
-        project activation -- by which point the override may be set, reintroducing that circularity.
-        The consequence to keep in mind: this reflects the config layers present at boot (env vars,
-        user config, defaults), so a project-adjacent or workspace config that re-points
-        libraries_directory at activation time is NOT retroactively published here.
-
-        The value must be in place before any project YAML is read, because a project naming an unset
-        variable is refused at load time and becomes unusable. __init__ runs when the Engine builds
-        its managers, well before projects load in on_app_initialization_complete.
-
-        An existing value is overwritten rather than preserved. This is a published value, so a stale
-        one left in the shell would make the variable lie about where this engine installs libraries;
-        the supported ways to move that location are the libraries_directory config value and a
-        project's libraries_dir.
-        """
-        default_root = self.default_libraries_root(self.get_config_value(LIBRARIES_DIRECTORY_KEY))
-        os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR] = str(default_root)
-        logger.debug("Published %s=%s", DEFAULT_LIBRARIES_ROOT_ENV_VAR, default_root)
 
     def clear_project_layers(self) -> None:
         """Drop all per-activation config state so the next activation starts clean.
