@@ -8,6 +8,7 @@ import httpx
 from griptape_nodes.common.project_templates.situation import BuiltInSituation
 from griptape_nodes.drivers.storage.base_storage_driver import BaseStorageDriver, CreateSignedUploadUrlResponse
 from griptape_nodes.files.file import FileLoadError
+from griptape_nodes.files.path_utils import strip_windows_long_path_prefix
 from griptape_nodes.files.project_file import ProjectFileDestination
 from griptape_nodes.retained_mode.events.os_events import ExistingFilePolicy, WriteFileRequest, WriteFileResultSuccess
 from griptape_nodes.retained_mode.file_metadata.sidecar_metadata import SidecarContent
@@ -149,11 +150,20 @@ class LocalStorageDriver(BaseStorageDriver):
 
     def create_signed_download_url(self, path: Path) -> str:
         # Resolve path, treating relative paths as workspace-relative
-        absolute_path = resolve_workspace_path(path, self.workspace_directory)
+        resolved_path = resolve_workspace_path(path, self.workspace_directory)
+
+        # Drop the Windows \\?\ long-path prefix before it reaches either branch below.
+        # canonicalize_for_io applies it unconditionally on Windows, and it breaks both of them:
+        # relative_to() reads the prefix as a different anchor, so a file inside the workspace
+        # takes the /external/ branch; and the '?' then terminates the URL path, so the browser
+        # sends everything after it as a query string and the real path never reaches the server
+        # (`/external//?/C:/...` parses as path `/external//`). The result is a broken image.
+        absolute_path = Path(strip_windows_long_path_prefix(resolved_path))
+        workspace_directory = Path(strip_windows_long_path_prefix(self.workspace_directory))
 
         # Automatically determine if the file is external to the workspace
         try:
-            workspace_relative_path = absolute_path.relative_to(self.workspace_directory.resolve())
+            workspace_relative_path = absolute_path.relative_to(workspace_directory.resolve())
             # Internal files: use workspace-relative path
             url = f"{self.base_url}/{workspace_relative_path.as_posix()}"
         except ValueError:

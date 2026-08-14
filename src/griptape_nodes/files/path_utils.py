@@ -99,6 +99,38 @@ def _apply_windows_long_path_prefix(path_str: str) -> str:
     return f"\\\\?\\{path_str}"
 
 
+def strip_windows_long_path_prefix(path: str | Path) -> str:
+    r"""Remove the Windows long-path prefix (``\\?\`` / ``\\?\UNC\``) if present.
+
+    The inverse of ``_apply_windows_long_path_prefix``, and the counterpart every
+    caller that COMPARES paths needs. ``canonicalize_for_io`` applies the prefix
+    unconditionally on Windows, but the prefix changes a path's *anchor*, not just
+    its spelling: ``PurePath(r"\\?\C:\ws\file").relative_to(r"C:\ws")`` raises
+    ``ValueError`` even though the file is plainly inside ``C:\ws``. Any
+    containment check that sees one prefixed side and one unprefixed side
+    therefore reports "outside" for a file that is inside. Strip both sides first.
+
+    Pure string manipulation, so it works on any host OS. That matters for
+    ``decompose_source_path``, which must handle a Windows path stored in project
+    metadata while running on macOS.
+
+    Args:
+        path: Path that may or may not carry the prefix.
+
+    Returns:
+        The path string without the prefix. Inputs without the prefix, and
+        non-Windows paths, are returned unchanged.
+    """
+    path_str = str(path)
+    if path_str.upper().startswith("\\\\?\\UNC\\"):
+        # \\?\UNC\server\share -> \\server\share
+        return f"\\\\{path_str[8:]}"
+    if path_str.startswith("\\\\?\\"):
+        # \\?\C:\path -> C:\path
+        return path_str[4:]
+    return path_str
+
+
 def derive_registry_key(file_path: str) -> str:
     """Derive a workflow registry key from a file path.
 
@@ -903,9 +935,18 @@ def decompose_source_path(  # noqa: C901, PLR0912
             source_file_name=source_file_name,
         )
 
-    # Check if path is within workspace
+    # Check if path is within workspace.
+    # Both sides must have the \\?\ long-path prefix stripped before comparison, the same
+    # normalization already applied to ``normalized_path`` above. The prefix changes a path's
+    # anchor, so relative_to() reports a file sitting INSIDE the workspace as outside it, and
+    # the outside-workspace branch then builds an absolute-form cache key
+    # (``C/Users/<user>/.../file.png``) alongside the correct relative one. Since
+    # canonicalize_for_io applies the prefix unconditionally on Windows, whether a caller
+    # canonicalized for I/O on the way in decided which key a file got.
     try:
-        relative_to_workspace = absolute_path.relative_to(workspace_dir)
+        relative_to_workspace = Path(strip_windows_long_path_prefix(absolute_path)).relative_to(
+            strip_windows_long_path_prefix(workspace_dir)
+        )
 
         if relative_to_workspace.parent != Path():
             source_relative_path = relative_to_workspace.parent.as_posix()
