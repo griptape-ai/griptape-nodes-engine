@@ -297,9 +297,12 @@ class VideoArtifactProvider(BaseArtifactProvider):
             result = subprocess.run(  # noqa: S603
                 [
                     ffprobe_path,
-                    # Suppress all log output
+                    # Log errors only. "quiet" would suppress the very stderr the
+                    # CalledProcessError handler below reports, leaving a probe failure
+                    # logged with no reason. JSON goes to stdout, diagnostics to stderr,
+                    # so parsing is unaffected.
                     "-v",
-                    "quiet",
+                    "error",
                     # Output as JSON for easy parsing
                     "-print_format",
                     "json",
