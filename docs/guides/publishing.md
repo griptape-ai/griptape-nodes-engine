@@ -85,8 +85,9 @@ of them to run anywhere:
     dependencies — the libraries those libraries depend on in turn, so nothing the
     workflow relies on indirectly is left out.
 - **Configuration** telling the engine which libraries to load.
-- An **`.env` file** containing your **entire** workspace environment plus **all**
-    of your configured secrets, written in plaintext. See the security warning
+- An **`.env` file** containing your **entire** workspace environment, **all** of
+    your configured secrets, and any of those secrets exported into the environment
+    of the shell you publish from, written in plaintext. See the security warning
     below.
 - A **project template** so
     [directory macros](projects/macros.md) and
@@ -100,10 +101,14 @@ of them to run anywhere:
     The packaged `.env` is **not** filtered to what the workflow uses. It merges
     your whole workspace `.env` with every secret configured in the Secrets
     Manager, in plaintext — including API keys for services this workflow never
-    touches. Anyone you hand a published folder to (or anyone on a machine where a
-    gizmo is installed) gets all of those credentials. **Review the bundled `.env`
-    and remove anything the workflow doesn't need before sharing a published
-    bundle.**
+    touches. It also picks up any of those secrets that are set as environment
+    variables in the shell you publish from, and an exported value wins over the
+    one in a file, the same way the engine itself resolves secrets. Only secret
+    names the engine already knows about are read from the environment, never your
+    whole environment. Anyone you hand a published folder to (or anyone on a
+    machine where a gizmo is installed) gets all of those credentials. **Review the
+    bundled `.env` and remove anything the workflow doesn't need before sharing a
+    published bundle.**
 
 What differs is the *shape* of the delivered result:
 
