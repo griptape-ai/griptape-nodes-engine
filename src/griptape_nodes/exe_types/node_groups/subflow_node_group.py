@@ -683,7 +683,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        nodes = self._expand_with_tethered_nodes_to_add(nodes)
+        # Pull in companions this group does not already hold, so a Start/End pair joins together.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=False)
         nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
         self._add_nodes_to_group_dict(nodes)
 
@@ -710,40 +711,31 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
 
         return nodes
 
-    def _expand_with_tethered_nodes_to_add(self, nodes: list[BaseNode]) -> list[BaseNode]:
-        """Add any tethered companions missing from this group, so a Start/End pair is never split.
+    def _expand_with_tethered_nodes(self, nodes: list[BaseNode], *, companion_must_be_member: bool) -> list[BaseNode]:
+        """Expand a node list with its tethered companions, so a Start/End pair is never split.
 
         Only subflow groups enforce this: they own a real subflow, so a split pair would leave one
         half in the subflow and the other in the parent flow. A plain BaseNodeGroup is a visual
         grouping with no flow of its own, so it groups exactly what it was asked to.
 
-        Companions already in the requested list or already in this group are skipped. A companion
-        owned by a different group follows its partner here; `_remove_nodes_from_existing_parents`
-        detaches it from the old group so no group advertises a node it no longer holds.
+        Args:
+            nodes: The requested nodes.
+            companion_must_be_member: Which direction is being expanded. On removal (`True`) only
+                companions this group currently holds can be pulled out. On addition (`False`) only
+                companions it does not already hold are worth adding — a companion owned by a
+                different group follows its partner here, and
+                `_remove_nodes_from_existing_parents` detaches it from the old owner so no group
+                advertises a node it no longer holds.
+
+        Returns:
+            The requested nodes plus any companions, with duplicates skipped.
         """
         expanded = list(nodes)
         for node in nodes:
             for companion in node.get_nodes_to_group_with():
                 if companion in expanded:
                     continue
-                if companion.name in self.nodes:
-                    continue
-                expanded.append(companion)
-
-        return expanded
-
-    def _expand_with_tethered_nodes_to_remove(self, nodes: list[BaseNode]) -> list[BaseNode]:
-        """Pull out any tethered companions this group owns, the inverse of the add-path expansion.
-
-        Without this, removing only the Start node leaves its End node behind — the same split
-        state the add path exists to prevent, reached from the other direction.
-        """
-        expanded = list(nodes)
-        for node in nodes:
-            for companion in node.get_nodes_to_group_with():
-                if companion in expanded:
-                    continue
-                if companion.name not in self.nodes:
+                if (companion.name in self.nodes) is not companion_must_be_member:
                     continue
                 expanded.append(companion)
 
@@ -958,9 +950,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        # Expand before validating: expansion only ever adds companions this group already owns,
-        # so it cannot introduce a node that _validate_nodes_in_group would reject.
-        nodes = self._expand_with_tethered_nodes_to_remove(nodes)
+        # Pull out companions this group holds, so removing a Start node does not leave its End node
+        # behind — the same split state the add path prevents, reached from the other direction.
+        # Expand before validating: restricting to current members means expansion cannot introduce a
+        # node that _validate_nodes_in_group would reject.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=True)
         self._validate_nodes_in_group(nodes)
 
         parent_flow_name = None

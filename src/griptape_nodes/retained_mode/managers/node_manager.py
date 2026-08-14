@@ -832,8 +832,10 @@ class NodeManager(EngineScoped):
         # End node can inherit the same group as its Start node.
         if request.parent_group_name:
             try:
+                # get_node_by_name raises ValueError for a missing node, not KeyError — unlike
+                # object_manager.get_object_by_name, which the _get_node_group helpers call directly.
                 parent_group = self.get_node_by_name(request.parent_group_name)
-            except KeyError:
+            except ValueError:
                 parent_group = None
                 logger.warning(
                     "Attempted to add node '%s' to parent group '%s'. Failed because group was not found.",
@@ -851,6 +853,10 @@ class NodeManager(EngineScoped):
                 # add_nodes_to_group can fail mid-way (a SubflowNodeGroup raises RuntimeError when the
                 # per-node MoveNodeToNewFlowRequest fails). Keep node creation recoverable rather than
                 # letting that escape after the node is already registered, matching node_names_to_add below.
+                # Snapshot membership so a failure can release whatever the call actually joined: an add
+                # may take in more than it was handed (tethered companions, nodes detached from a
+                # previous owner), and the raise denies us its return value.
+                members_before_add = set(parent_group.nodes)
                 try:
                     parent_group.add_nodes_to_group([node])
                 except Exception as err:
@@ -863,15 +869,16 @@ class NodeManager(EngineScoped):
                         request.parent_group_name,
                         err,
                     )
-                    # A failed add leaves the node listed as a member without having been moved into
-                    # the group's subflow. Release it so the node ends up plainly ungrouped instead of
+                    # A failed add leaves nodes listed as members without having been moved into the
+                    # group's subflow. Release them so they end up plainly ungrouped instead of
                     # half-joined, and so the reported parent_group_name below matches reality.
+                    nodes_to_release = [n for name, n in parent_group.nodes.items() if name not in members_before_add]
                     try:
-                        parent_group.remove_nodes_from_group([node])
+                        parent_group.remove_nodes_from_group(nodes_to_release)
                     except Exception as cleanup_err:
                         logger.error(
-                            "Attempted to release node '%s' from group '%s' after a failed add. Failed with error: %s. The node may still be listed as a member of the group.",
-                            node.name,
+                            "Attempted to release nodes '%s' from group '%s' after a failed add. Failed with error: %s. They may still be listed as members of the group.",
+                            [n.name for n in nodes_to_release],
                             request.parent_group_name,
                             cleanup_err,
                         )
