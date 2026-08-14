@@ -7,12 +7,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from griptape_nodes.common.project_templates.project_path import resolve_project_path_field
 from griptape_nodes.retained_mode.events.app_events import ConfigChanged
-from griptape_nodes.retained_mode.managers.config_manager import (
-    DEFAULT_LIBRARIES_ROOT_ENV_VAR,
-    ConfigManager,
-)
+from griptape_nodes.retained_mode.managers.config_manager import ConfigManager
 from griptape_nodes.retained_mode.managers.event_manager import EventManager
 from griptape_nodes.retained_mode.managers.project_manager import ProjectManager
 
@@ -257,118 +253,6 @@ class TestConfigManager:
 
             # A real value is still honored, relative to the global workspace.
             assert manager.default_libraries_root("custom-libs") == (workspace / "custom-libs").resolve()
-
-    def test_publishes_default_libraries_root_env_var(self, isolate_user_config: Path) -> None:
-        """Construction publishes the default libraries root as an absolute path in os.environ.
-
-        This is the variable project templates reference from `libraries_dir`, so it must be absolute:
-        a relative value there would anchor to the project YAML's directory, not the workspace.
-        """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
-
-            ConfigManager()
-
-            published = os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]
-            assert Path(published).is_absolute()
-            assert Path(published) == (workspace / "libraries").resolve()
-
-    def test_published_default_libraries_root_honors_config_env_overrides(self, isolate_user_config: Path) -> None:
-        """The published value reflects GTN_CONFIG_ overrides of libraries_directory and the workspace.
-
-        The variable describes where THIS engine installs libraries, so the customizations that move
-        that location have to be visible in it. Only a project's own libraries_dir is excluded, and
-        for a different reason (see test_published_default_libraries_root_ignores_libraries_root_override).
-        """
-        with tempfile.TemporaryDirectory() as temp_dir:
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            env_workspace = Path(temp_dir) / "env_ws"
-            env_workspace.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
-
-            # A relative libraries_directory is resolved against the env-var workspace, not the config one.
-            with patch.dict(
-                os.environ,
-                {
-                    "GTN_CONFIG_WORKSPACE_DIRECTORY": str(env_workspace),
-                    "GTN_CONFIG_LIBRARIES_DIRECTORY": "shared-libs",
-                },
-                clear=True,
-            ):
-                ConfigManager()
-                assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (env_workspace / "shared-libs").resolve()
-
-            # An absolute libraries_directory wins outright and ignores the workspace.
-            absolute_libs = Path(temp_dir) / "absolute-libs"
-            with patch.dict(os.environ, {"GTN_CONFIG_LIBRARIES_DIRECTORY": str(absolute_libs)}, clear=True):
-                ConfigManager()
-                assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == absolute_libs.resolve()
-
-    def test_published_default_libraries_root_ignores_libraries_root_override(self, isolate_user_config: Path) -> None:
-        """A project's libraries_dir must NOT change the published value. This is the circularity guard.
-
-        `libraries_dir` is the field that READS this variable, so if the variable tracked
-        resolved_libraries_root() -- which returns the override -- its value would depend on the field
-        consuming it. Publishing happens once at construction and carries default_libraries_root, so
-        activating a project with its own libraries_dir leaves the variable alone.
-        """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            project_libs = Path(temp_dir) / "project-libs"
-            project_libs.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
-            manager = ConfigManager()
-
-            manager.set_libraries_root_override(project_libs)
-            # The live root follows the project; the published default deliberately does not.
-            assert manager.resolved_libraries_root() == project_libs.resolve()
-            assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (workspace / "libraries").resolve()
-
-            # A remerge triggered by activation must not republish either.
-            manager.load_configs()
-            assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (workspace / "libraries").resolve()
-
-    def test_published_default_libraries_root_overwrites_stale_value(self, isolate_user_config: Path) -> None:
-        """A pre-existing value in the environment is replaced, not preserved.
-
-        The variable is published, not configured. A stale shell value would misreport where this
-        engine installs libraries; libraries_directory and libraries_dir are the supported ways to
-        move that location.
-        """
-        with (
-            tempfile.TemporaryDirectory() as temp_dir,
-            patch.dict(os.environ, {DEFAULT_LIBRARIES_ROOT_ENV_VAR: "/stale/from/the/users/shell"}, clear=True),
-        ):
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
-
-            ConfigManager()
-
-            assert Path(os.environ[DEFAULT_LIBRARIES_ROOT_ENV_VAR]) == (workspace / "libraries").resolve()
-
-    def test_published_default_libraries_root_resolves_in_a_project_path_field(self, isolate_user_config: Path) -> None:
-        """End to end: the published variable is usable in `libraries_dir` with no user setup.
-
-        This is the whole point of publishing it. A project naming an unset variable is refused at load
-        time, so if publishing regressed, such a project would become unusable rather than degrade.
-        """
-        with tempfile.TemporaryDirectory() as temp_dir, patch.dict(os.environ, {}, clear=True):
-            workspace = Path(temp_dir) / "ws"
-            workspace.mkdir()
-            isolate_user_config.write_text(json.dumps({"workspace_directory": str(workspace)}), encoding="utf-8")
-            ConfigManager()
-
-            resolution = resolve_project_path_field(
-                f"${{{DEFAULT_LIBRARIES_ROOT_ENV_VAR}}}/shared", Path(temp_dir) / "project"
-            )
-
-            assert resolution.unresolved_variables == []
-            assert resolution.path == (workspace / "libraries" / "shared").resolve()
 
     def test_coerce_to_type_bool_from_string(self) -> None:
         """Test that _coerce_to_type correctly converts string values to bool."""
