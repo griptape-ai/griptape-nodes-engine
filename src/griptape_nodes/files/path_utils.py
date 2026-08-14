@@ -114,21 +114,29 @@ def strip_windows_long_path_prefix(path: str | Path) -> str:
     ``decompose_source_path``, which must handle a Windows path stored in project
     metadata while running on macOS.
 
+    Both separator spellings are recognized (``\\?\C:\ws`` and ``//?/C:/ws``) because
+    pathlib only rewrites forward slashes to backslashes when the host is Windows, and
+    a path read back from project metadata can arrive either way.
+
     Args:
         path: Path that may or may not carry the prefix.
 
     Returns:
-        The path string without the prefix. Inputs without the prefix, and
-        non-Windows paths, are returned unchanged.
+        The path string without the prefix, keeping the caller's separator style.
+        Inputs without the prefix, and non-Windows paths, are returned unchanged.
     """
     path_str = str(path)
-    if path_str.upper().startswith("\\\\?\\UNC\\"):
+    # Detect against a backslash-only form so one branch covers both spellings, but slice
+    # the original so a forward-slash path does not come back with mixed separators.
+    detection_form = path_str.replace("/", "\\")
+    if not detection_form.startswith("\\\\?\\"):
+        return path_str
+    separator = path_str[0]
+    if detection_form.upper().startswith("\\\\?\\UNC\\"):
         # \\?\UNC\server\share -> \\server\share
-        return f"\\\\{path_str[8:]}"
-    if path_str.startswith("\\\\?\\"):
-        # \\?\C:\path -> C:\path
-        return path_str[4:]
-    return path_str
+        return f"{separator * 2}{path_str[8:]}"
+    # \\?\C:\path -> C:\path
+    return path_str[4:]
 
 
 def derive_registry_key(file_path: str) -> str:
