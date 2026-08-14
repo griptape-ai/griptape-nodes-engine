@@ -25,6 +25,7 @@ from griptape_nodes.files.path_utils import (
     resolve_path_safely,
     sanitize_path_string,
     strip_surrounding_quotes,
+    strip_windows_long_path_prefix,
     unexpanded_references,
 )
 
@@ -596,6 +597,53 @@ class TestApplyWindowsLongPathPrefix:
         assert _apply_windows_long_path_prefix("C:/x/file.txt") == "C:/x/file.txt"
 
 
+class TestStripWindowsLongPathPrefix:
+    r"""Tests for strip_windows_long_path_prefix, the inverse of the apply helper.
+
+    Like ``sanitize_path_string``, the discriminator is the path's SHAPE, not
+    ``sys.platform``: a ``\\?\`` path can be written on Windows into project
+    metadata and read back on macOS. So none of these are skipped per-platform --
+    a regression fails on any developer's machine.
+    """
+
+    def test_drive_prefix_is_stripped(self) -> None:
+        assert strip_windows_long_path_prefix(r"\\?\C:\ws\file.png") == r"C:\ws\file.png"
+
+    def test_unc_prefix_is_stripped(self) -> None:
+        assert strip_windows_long_path_prefix(r"\\?\UNC\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_unc_prefix_is_case_insensitive(self) -> None:
+        r"""``\\?\unc\`` is as valid as ``\\?\UNC\``; both must strip to the same UNC root."""
+        assert strip_windows_long_path_prefix(r"\\?\unc\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_forward_slash_drive_prefix_is_stripped(self) -> None:
+        """``//?/`` is the same prefix; only Windows pathlib rewrites it to backslashes."""
+        assert strip_windows_long_path_prefix("//?/C:/ws/file.png") == "C:/ws/file.png"
+
+    def test_forward_slash_unc_prefix_is_stripped(self) -> None:
+        """Separator style is preserved, so the result never comes back mixed."""
+        assert strip_windows_long_path_prefix("//?/UNC/server/share/file.png") == "//server/share/file.png"
+
+    def test_unprefixed_windows_path_is_unchanged(self) -> None:
+        assert strip_windows_long_path_prefix(r"C:\ws\file.png") == r"C:\ws\file.png"
+
+    def test_posix_path_is_unchanged(self) -> None:
+        assert strip_windows_long_path_prefix("/Users/james/ws/file.png") == "/Users/james/ws/file.png"
+
+    def test_bare_unc_path_is_unchanged(self) -> None:
+        """A plain UNC path has no long-path prefix to remove."""
+        assert strip_windows_long_path_prefix(r"\\server\share\file.png") == r"\\server\share\file.png"
+
+    def test_accepts_path_object(self) -> None:
+        assert strip_windows_long_path_prefix(Path("/Users/james/file.png")) == str(Path("/Users/james/file.png"))
+
+    def test_round_trips_with_apply(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Apply -> strip returns the original, for both the drive and UNC forms."""
+        monkeypatch.setattr("griptape_nodes.files.path_utils.is_windows", lambda: True)
+        for original in (r"C:\ws\file.png", r"\\server\share\file.png"):
+            assert strip_windows_long_path_prefix(_apply_windows_long_path_prefix(original)) == original
+
+
 class TestResolveFilePath:
     """Tests for resolve_file_path function."""
 
@@ -974,6 +1022,40 @@ class TestDecomposeSourcePath:
         assert result.drive_volume_mount == "server/share"
         assert result.source_relative_path is None
         assert result.source_file_name == "file.txt"
+
+    def test_long_path_prefixed_workspace_file_stays_inside_workspace(self) -> None:
+        r"""A prefixed in-workspace path must decompose exactly like the clean spelling.
+
+        Regression: the containment check compared the raw ``absolute_path`` against the
+        raw ``workspace_dir``, and ``\\?\`` changes a path's anchor rather than just its
+        spelling, so ``relative_to`` reported a file sitting inside the workspace as
+        outside it. The file then got an absolute-form preview cache key
+        (``C/Users/james/workspace/images/photo.png``) instead of the relative one, and a
+        second key for the same file appeared as soon as some caller happened to pass the
+        path through ``canonicalize_for_io`` -- which applies the prefix unconditionally
+        on Windows.
+        """
+        workspace = Path("C:/Users/james/workspace")
+        prefixed = Path("//?/C:/Users/james/workspace/images/photo.png")
+
+        result = decompose_source_path(prefixed, workspace)
+
+        # No drive component: that is what "inside the workspace" means here.
+        assert result.drive_volume_mount is None
+        assert result.source_relative_path == "images"
+        assert result.source_file_name == "photo.png"
+        assert result == decompose_source_path(Path("C:/Users/james/workspace/images/photo.png"), workspace)
+
+    def test_long_path_prefixed_workspace_dir_stays_inside_workspace(self) -> None:
+        r"""The workspace side carries the prefix just as often as the file side does."""
+        prefixed_workspace = Path("//?/C:/Users/james/workspace")
+        source = Path("C:/Users/james/workspace/images/photo.png")
+
+        result = decompose_source_path(source, prefixed_workspace)
+
+        assert result.drive_volume_mount is None
+        assert result.source_relative_path == "images"
+        assert result.source_file_name == "photo.png"
 
     def test_complex_filename_preserved(self) -> None:
         """Test that complex filenames with multiple extensions are preserved."""
