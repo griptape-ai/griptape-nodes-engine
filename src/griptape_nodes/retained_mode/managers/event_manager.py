@@ -908,9 +908,12 @@ class EventManager(EngineScoped):
         UI consumer suppresses them (suppression is applied downstream, not here), so
         this feed is deliberately independent of ``should_suppress_event``.
 
-        Events carry no run identifier, so a subscriber that only wants its own run's
-        events should subscribe immediately before it triggers the run and unsubscribe
-        as soon as the run returns (see ``remove_listener_for_execution_event``).
+        Most events carry no run identifier, so a subscriber that only wants its own
+        run's events should subscribe immediately before it triggers the run and
+        unsubscribe as soon as the run returns (see
+        ``remove_listener_for_execution_event``). The agent payloads are the exception:
+        they carry the ``thread_id`` of their conversation, so a subscriber can filter
+        on that instead.
         """
         callback_call = type(callback).__call__
         if inspect.iscoroutinefunction(callback) or inspect.iscoroutinefunction(callback_call):
