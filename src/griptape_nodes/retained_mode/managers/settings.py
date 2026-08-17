@@ -20,6 +20,13 @@ EVENTS_TO_ECHO_KEY = "app_events.events_to_echo_as_retained_mode"
 WORKER_HEARTBEAT_INTERVAL_KEY = "worker.heartbeat_interval_s"
 WORKER_HEARTBEAT_TIMEOUT_KEY = "worker.heartbeat_timeout_s"
 WORKER_HEARTBEAT_STARTUP_GRACE_KEY = "worker.heartbeat_startup_grace_s"
+# Managed execution (execution leases): when enabled, this engine acquires an
+# execution lease from an external admission authority before starting any
+# node/workflow execution, and refuses to execute if that authority is
+# unreachable (fail closed). Disabled by default: a standalone engine is not
+# brokered and runs exactly as before.
+EXECUTION_LEASE_ENABLED_KEY = "execution_lease.enabled"
+EXECUTION_LEASE_RENEW_INTERVAL_KEY = "execution_lease.renew_interval_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --

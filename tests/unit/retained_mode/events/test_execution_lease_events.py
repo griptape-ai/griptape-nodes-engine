@@ -32,7 +32,7 @@ from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
 class TestAcquireExecutionLease:
     def test_schema_version_defaults_to_latest(self) -> None:
-        request = AcquireExecutionLeaseRequest(engine_id="eng-1")
+        request = AcquireExecutionLeaseRequest(engine_id="eng-1", lease_id="lease-1")
 
         assert request.schema_version == AcquireExecutionLeaseRequest.LATEST_SCHEMA_VERSION
 
@@ -44,7 +44,7 @@ class TestAcquireExecutionLease:
 
     def test_requirements_and_machine_id_default_to_none(self) -> None:
         """Both are optional: requirements are advisory, machine_id is a v1 constant."""
-        request = AcquireExecutionLeaseRequest(engine_id="eng-1")
+        request = AcquireExecutionLeaseRequest(engine_id="eng-1", lease_id="lease-1")
 
         assert request.requirements is None
         assert request.machine_id is None
@@ -84,7 +84,7 @@ class TestLeaseLifecycleEvents:
 
     def test_acquire_release_renew_are_not_skip_the_line(self) -> None:
         """Only cancel skips the line; the rest take the normal path."""
-        assert not isinstance(AcquireExecutionLeaseRequest(engine_id="e"), SkipTheLineMixin)
+        assert not isinstance(AcquireExecutionLeaseRequest(engine_id="e", lease_id="l"), SkipTheLineMixin)
         assert not isinstance(ReleaseExecutionLeaseRequest(lease_id="l"), SkipTheLineMixin)
         assert not isinstance(RenewExecutionLeaseRequest(lease_id="l"), SkipTheLineMixin)
 
@@ -122,6 +122,7 @@ class TestWireRoundTrip:
     def test_acquire_round_trips_through_converter(self) -> None:
         request = AcquireExecutionLeaseRequest(
             engine_id="eng-1",
+            lease_id="lease-42",
             session_id="sess-1",
             scope="single_node",
             requirements={"compute": ("cuda", "present"), "min_vram_gb": (24, ">=")},
@@ -131,6 +132,7 @@ class TestWireRoundTrip:
         rebuilt = converter.structure(converter.unstructure(request), AcquireExecutionLeaseRequest)
 
         assert rebuilt.engine_id == "eng-1"
+        assert rebuilt.lease_id == "lease-42"
         assert rebuilt.session_id == "sess-1"
         assert rebuilt.scope == "single_node"
         assert rebuilt.machine_id == "gpu-box-1"
@@ -138,7 +140,7 @@ class TestWireRoundTrip:
 
     def test_unknown_fields_are_ignored(self) -> None:
         """Additive evolution: an older peer must tolerate fields it does not know."""
-        payload = converter.unstructure(AcquireExecutionLeaseRequest(engine_id="eng-1"))
+        payload = converter.unstructure(AcquireExecutionLeaseRequest(engine_id="eng-1", lease_id="lease-1"))
         payload["field_from_the_future"] = "ignored"
 
         rebuilt = converter.structure(payload, AcquireExecutionLeaseRequest)

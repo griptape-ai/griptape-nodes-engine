@@ -58,6 +58,11 @@ class AcquireExecutionLeaseRequest(RequestPayload):
 
     Args:
         engine_id: The engine requesting admission.
+        lease_id: Engine-minted unique handle for this lease. Minted by the
+            requester (not assigned by the balancer) so that a still-waiting
+            acquire is already cancellable by id; the grant echoes it, and all
+            renew/release/cancel calls name it. Balancers must reject a
+            duplicate lease_id.
         session_id: The session the execution belongs to, or None if the
             engine has no active session yet.
         scope: Short description of what the lease covers, for status display
@@ -80,6 +85,7 @@ class AcquireExecutionLeaseRequest(RequestPayload):
     LATEST_SCHEMA_VERSION: ClassVar[str] = "0.1.0"
 
     engine_id: str
+    lease_id: str
     session_id: str | None = None
     scope: str = "workflow"
     schema_version: str = LATEST_SCHEMA_VERSION
@@ -94,8 +100,7 @@ class AcquireExecutionLeaseResultSuccess(WorkflowNotAlteredMixin, ResultPayloadS
     """The lease is granted; the engine may start executing.
 
     Args:
-        lease_id: Handle for the granted lease. All subsequent renew, release,
-            and cancel calls name it.
+        lease_id: Echo of the engine-minted lease_id from the acquire request.
     """
 
     lease_id: str
