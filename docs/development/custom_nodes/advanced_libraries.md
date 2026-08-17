@@ -2,9 +2,10 @@
 
 Most libraries are fully described by their `griptape_nodes_library.json` manifest: the
 engine reads it, imports the node modules it names, and registers those classes. An
-**advanced library** is an optional Python class that lets your library run code at four
+**advanced library** is an optional Python class that lets your library run code at five
 points in its own lifecycle: before its nodes load, after they load, before it is
-unregistered, and when the engine collects request handlers.
+unregistered, when the engine collects request handlers, and when it collects
+post-dispatch hooks.
 
 This page is the author's reference for that class. For the manifest itself (metadata,
 categories, declarations, dependency management) see
@@ -24,6 +25,9 @@ list in the manifest. That is the common case and it needs no Python beyond the 
     [Registering node types without listing them](#registering-node-types-without-listing-them-in-the-manifest).
 - **Serve a request type** your library owns, so other libraries and nodes can call into
     it. See [`get_request_handlers`](#get_request_handlers).
+- **React after the engine handles a request** it already owns, such as running your own
+    step every time a workflow is saved. See
+    [`get_post_dispatch_hooks`](#get_post_dispatch_hooks).
 - **Register a competing provider** for an engine request type, such as a workflow
     publisher. See [Publishing](../../guides/publishing.md).
 
@@ -85,7 +89,8 @@ that silently does nothing. Registering a library runs, in order:
 | 8    | Registers the manifest's widgets                                    |
 | 9    | **Calls `after_library_nodes_loaded`**                              |
 | 10   | **Calls `get_request_handlers`** and registers what it returns      |
-| 11   | Computes library fitness and marks the library `LOADED`             |
+| 11   | **Calls `get_post_dispatch_hooks`** and registers what it returns   |
+| 12   | Computes library fitness and marks the library `LOADED`             |
 
 Two consequences worth internalizing:
 
@@ -96,13 +101,13 @@ Two consequences worth internalizing:
 
 Unregistering runs in the reverse spirit:
 
-| Step | What the engine does                                             |
-| ---- | ---------------------------------------------------------------- |
-| 1    | **Calls `before_library_unregistered`**                          |
-| 2    | Removes the library's app event listeners and pre-dispatch hooks |
-| 3    | Removes the request handlers it registered                       |
-| 4    | Unregisters the library's widgets                                |
-| 5    | Removes the library from the `LibraryRegistry`                   |
+| Step | What the engine does                                                            |
+| ---- | ------------------------------------------------------------------------------- |
+| 1    | **Calls `before_library_unregistered`**                                         |
+| 2    | Removes the library's app event listeners, pre-dispatch and post-dispatch hooks |
+| 3    | Removes the request handlers it registered                                      |
+| 4    | Unregisters the library's widgets                                               |
+| 5    | Removes the library from the `LibraryRegistry`                                  |
 
 ## The hooks
 
@@ -254,6 +259,79 @@ Constraints on the mechanism:
 Other code can discover what a loaded library exposes with
 `library.get_registered_request_handler_types()`, then inspect each type with
 `dataclasses.fields()` and `typing.get_type_hints()`.
+
+### `get_post_dispatch_hooks`
+
+```python
+def get_post_dispatch_hooks(self) -> list[tuple[type[RequestPayload], Callable]]: ...
+```
+
+Returns `(request_type, callback)` pairs the engine registers on your behalf, and
+deregisters when your library unloads. After the engine's own handler for that request
+type produces a result, your callback is invoked with `(request, result)`. This is how a
+library runs its own step when something happens in the engine — appending to an audit
+log, posting to a chat channel, kicking off an export — for a request type it does not
+own.
+
+It is the mirror image of [`get_request_handlers`](#get_request_handlers), and the
+difference is ownership:
+
+|                         | `get_request_handlers`         | `get_post_dispatch_hooks`                           |
+| ----------------------- | ------------------------------ | --------------------------------------------------- |
+| Claims the request type | Yes — one handler engine-wide  | No — any number of libraries may hook the same type |
+| When it runs            | *Instead of* an engine handler | *After* the engine's handler produced a result      |
+| Can change the outcome  | It **is** the outcome          | No, notification only                               |
+
+That is why you can hook `SaveWorkflowRequest`, which `WorkflowManager` already owns and
+which `get_request_handlers` would fail to claim.
+
+Both sync and async callbacks work. Return the pairs from the hook:
+
+```python
+def get_post_dispatch_hooks(self):
+    return [(SaveWorkflowRequest, self._on_workflow_saved)]
+
+
+async def _on_workflow_saved(self, request: RequestPayload, result: ResultPayload) -> None:
+    if not isinstance(result, SaveWorkflowResultSuccess):
+        return
+    await self._append_audit_line(result.file_path)
+```
+
+Constraints on the mechanism:
+
+- **Notification only.** The return value is ignored, and the callback cannot alter the
+    result or fail the operation. One that raises is logged and otherwise ignored, and it
+    does not stop other hooks on the same request.
+- **Both outcomes.** The callback fires for successes and failures alike, including a
+    failure synthesized from an exception that escaped the handler. Branch on the result
+    type to filter, as the example above does.
+- **Usually detached, sometimes not.** Whenever the engine has a live event loop the hook
+    is scheduled as a detached task, so the result reaches the editor without waiting for
+    it. Some paths have no such loop — CLI commands, bootstrap workflow runs, worker
+    threads — and there the hook runs inline and **blocks the caller until it returns**.
+    Keep hooks quick, or move slow work off-process, if they may fire on those paths.
+- **Exact type matching.** A hook registered for a request type fires for that exact type
+    only, never for its subclasses.
+- **Read-only arguments.** Do not mutate the request or the result; both are still
+    referenced by the result event the engine is about to serialize. Fields marked
+    `omit_from_result` have already been cleared on the request you receive, so a hook is
+    not a way to read them.
+- **Do not issue engine requests from a hook.** The engine's operation-depth and
+    node-execution state is process-wide, so a request sent from a hook can perturb an
+    operation that is still in flight. Do external work — HTTP, file writes — instead.
+- **Orchestrator only.** Hooks are registered on the event manager of whichever process
+    loads the library, so a worker-mode library's hooks never see requests the
+    orchestrator handled. The engine flags that combination with a
+    `PostDispatchHooksWorkerIncompatibleProblem` at load. See
+    [Node Isolation with Workers](node_isolation_with_workers.md).
+- **Not durable.** Hooks still in flight when the process exits are abandoned. Do not use
+    them where delivery has to be guaranteed.
+
+A malformed pair — a callback that is not callable, or a key that is not a request type —
+is reported as a `PostDispatchHookRegistrationProblem` and stops the rest of the list from
+registering, leaving the library `FLAWED`. Pairs registered before the bad one stay
+active, and are still removed when the library unloads.
 
 ## Registering node types without listing them in the manifest
 

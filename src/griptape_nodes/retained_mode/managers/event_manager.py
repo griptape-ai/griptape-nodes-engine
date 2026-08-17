@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import logging
 import threading
@@ -17,7 +18,7 @@ from griptape_nodes.common.strict_mode import STRICT_MODE
 from griptape_nodes.common.strict_mode_checks import RULES
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.node_library.library_registry import LibraryRegistry
-from griptape_nodes.retained_mode.engine import EngineScoped
+from griptape_nodes.retained_mode.engine import EngineScoped, engine_scope
 from griptape_nodes.retained_mode.events.base_events import (
     AppPayload,
     BaseEvent,
@@ -40,7 +41,7 @@ from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
     CheckpointDenial,
     CheckpointFailure,
 )
-from griptape_nodes.utils.async_utils import call_function
+from griptape_nodes.utils.async_utils import call_function, to_thread
 
 if TYPE_CHECKING:
     import types
@@ -48,6 +49,10 @@ if TYPE_CHECKING:
 
     from griptape_nodes.api_client.request_client import RequestClient
     from griptape_nodes.retained_mode.engine import Engine
+
+    # A post-dispatch hook observes a completed request. It may be sync or async;
+    # its return value is ignored because nothing awaits the notification.
+    PostDispatchHook = Callable[[Any, ResultPayload], None] | Callable[[Any, ResultPayload], Awaitable[None]]
 
 
 RP = TypeVar("RP", bound=RequestPayload, default=RequestPayload)
@@ -58,6 +63,39 @@ EP = TypeVar("EP", bound=ExecutionPayload, default=ExecutionPayload)
 _active_request_type: ContextVar[type[RequestPayload] | None] = ContextVar(
     "_event_manager_active_request_type", default=None
 )
+
+# (request_type, callback) pairs for the post-dispatch hooks running above this point
+# in the current logical chain. A hook task is created with this marker set, and every
+# request the hook issues inherits it, so any hook already running further up the chain
+# is skipped on a re-entrant dispatch instead of re-triggering without bound. That covers
+# both a hook re-issuing the type it subscribes to and a cycle between hooks on different
+# types. The chain is threaded explicitly into `_run_post_dispatch_hook` rather than read
+# from the context there, because each hook starts from a *fresh* context (see that
+# method) which would otherwise reset the marker to empty and make every generation
+# look like the first. Scoped to the chain rather than to the process, so it cannot
+# suppress unrelated dispatches and has no state that can leak.
+_active_post_dispatch_hooks: ContextVar[tuple[tuple[type[RequestPayload], Any], ...]] = ContextVar(
+    "_event_manager_active_post_dispatch_hooks", default=()
+)
+
+# Post-dispatch hooks are deliberately unbounded -- every result gets its own task so a
+# notification hook never misses a request. This is purely a "something is wrong" signal
+# for a hook that runs slower than requests arrive.
+POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD = 100
+
+
+def _is_async_callable(callback: Any) -> bool:
+    """Whether calling `callback` returns a coroutine.
+
+    `inspect.iscoroutinefunction` alone misses callable objects whose `__call__` is
+    async (worker_routing.RemoteHandler is one), which would otherwise be handed to a
+    thread where the coroutine it returns is never awaited.
+    """
+    if inspect.iscoroutinefunction(callback):
+        return True
+    if not callable(callback):
+        return False
+    return inspect.iscoroutinefunction(type(callback).__call__)
 
 
 def current_request_type() -> type[RequestPayload] | None:
@@ -170,6 +208,15 @@ class EventManager(EngineScoped):
         # handle_request runs on arbitrary threads, so guard the list and snapshot
         # it before iteration.
         self._pre_dispatch_hooks_lock = threading.Lock()
+        # Post-dispatch hooks, keyed by exact request type. Notification-only: they run
+        # after the result exists and cannot change it. Lists rather than sets because a
+        # callback need not be hashable -- a callable dataclass (RemoteHandler) has
+        # __hash__ set to None and would raise on set.add.
+        self._post_dispatch_hooks: dict[type[RequestPayload], list[PostDispatchHook]] = {}
+        self._post_dispatch_hooks_lock = threading.Lock()
+        # Strong references to in-flight hook tasks; asyncio only holds weak ones, so a
+        # task that is not retained here can be garbage collected mid-run (also RUF006).
+        self._inflight_post_dispatch_hook_tasks: set[asyncio.Task] = set()
         # Thread-local flags: if a hook re-enters an engine operation on this
         # thread, the corresponding chain is skipped so the hook can't keep
         # re-triggering itself into unbounded recursion. `active` guards the
@@ -385,6 +432,307 @@ class EventManager(EngineScoped):
             return None
         finally:
             self._hook_evaluation.active = False
+
+    def add_post_dispatch_hook(self, request_type: type[RP], callback: PostDispatchHook) -> None:
+        """Register a callback to run after `request_type`'s handler has produced a result.
+
+        The callback receives `(request, result)`. Whenever the engine has a live event
+        loop it is scheduled as a detached task, so it does not delay the result reaching
+        the caller and may run as long as it needs. On paths with no live engine loop --
+        CLI commands, bootstrap workflow runs, worker threads -- there is nothing to
+        detach onto, so the hook runs inline and *does* block the dispatching caller
+        until it finishes. Sync and async callbacks are both accepted. Registering the
+        same callback object twice for the same request type is a no-op.
+
+        The callback is notification-only -- it cannot alter the result or fail the
+        operation, because the result has already been returned. Specifically:
+
+        - It fires for both success and failure results, including when the handler
+          raised (in that case the payload is an equivalent `GenericResultFailure`, not
+          the identical object the client received).
+        - `request` and `result` must be treated as read-only. The same `request` object
+          is referenced by the result event still queued for the client, so mutating it
+          corrupts what the client sees.
+        - Fields marked `omit_from_result` are already `None` on the request the callback
+          sees. That scrub exists to keep sensitive and bulky values out of results, so
+          it is deliberately not undone for hooks.
+        - Matching is on the exact request type; subclasses of `request_type` do not
+          fire it.
+        - There is no ordering guarantee relative to the result reaching the client, nor
+          between separate invocations of the same hook.
+        - Hooks run regardless of `request.broadcast_result` or event suppression.
+        - A raising callback is logged and ignored; it does not stop sibling callbacks.
+        - Callbacks must not issue engine requests. Any hook already running further up
+          the same chain is skipped rather than recursing, but requests from a hook also
+          perturb operation-depth tracking for concurrent requests.
+
+        Async callbacks run on the engine event loop (or, on the inline path, a transient
+        loop that may itself be on another thread) and must not block it. Sync callbacks are handed to a
+        worker thread, so blocking in one cannot stall the loop -- but that thread comes
+        from the loop's default executor, which is shared with every other `to_thread`
+        caller in the engine. Because hook tasks are unbounded, a slow sync hook firing on
+        a high-frequency request type can occupy the pool and make unrelated engine work
+        that also needs a thread queue behind it. Keep sync callbacks quick.
+        """
+        with self._post_dispatch_hooks_lock:
+            hooks = self._post_dispatch_hooks.setdefault(request_type, [])
+            # Identity, not `in`: `in` runs `__eq__`, and a callable `@dataclass` compares
+            # by field value, so two separate libraries registering field-equal hook
+            # objects would collapse into one silently registered hook.
+            if not any(hook is callback for hook in hooks):
+                hooks.append(callback)
+
+    def remove_post_dispatch_hook(self, request_type: type[RP], callback: PostDispatchHook) -> None:
+        """Unregister a callback previously registered with `add_post_dispatch_hook`.
+
+        Removing a callback that was never registered is a no-op. Because hooks run
+        detached, an already-scheduled invocation still runs to completion -- callbacks
+        must tolerate firing once after removal.
+
+        Only the object that was registered is removed. `list.remove` would match by
+        `__eq__` and could unregister a different, field-equal hook belonging to another
+        library.
+        """
+        with self._post_dispatch_hooks_lock:
+            hooks = self._post_dispatch_hooks.get(request_type)
+            if hooks is None:
+                return
+            remaining = [hook for hook in hooks if hook is not callback]
+            if len(remaining) == len(hooks):
+                return
+            if not remaining:
+                del self._post_dispatch_hooks[request_type]
+                return
+            self._post_dispatch_hooks[request_type] = remaining
+
+    def _fire_post_dispatch_hooks(self, request: RequestPayload, result: ResultPayload) -> None:
+        """Schedule every hook registered for this request's exact type."""
+        request_type = type(request)
+
+        # Snapshot under the lock so a concurrent add/remove on another thread cannot
+        # mutate the list mid-iteration.
+        with self._post_dispatch_hooks_lock:
+            hooks = list(self._post_dispatch_hooks.get(request_type, ()))
+
+        if not hooks:
+            return
+
+        active = _active_post_dispatch_hooks.get()
+        for callback in hooks:
+            # Identity, not `(request_type, callback) in active`: membership compares with
+            # `__eq__`, and a callable `@dataclass` compares by field value, so a hook
+            # running up-chain would suppress a *different* field-equal hook belonging to
+            # another library. Same reason `add_post_dispatch_hook` dedupes by identity.
+            if any(active_type is request_type and active_cb is callback for active_type, active_cb in active):
+                logging.getLogger("griptape_nodes").debug(
+                    "Skipping post-dispatch hook '%s' for %s: it is already running further up this chain.",
+                    getattr(callback, "__name__", callback),
+                    request_type.__name__,
+                )
+                continue
+            self._schedule_post_dispatch_hook(request_type, callback, request, result, active)
+
+    def _fire_post_dispatch_hooks_for_handler_exception(self, request: RequestPayload, exception: Exception) -> None:
+        """Notify hooks that no result event will be built for this request.
+
+        Neither dispatch method catches handler exceptions -- they propagate to
+        `Engine.handle_request`, which logs and returns a synthesized failure. Without
+        this the most interesting failure mode would be invisible to hooks. The payload is
+        equivalent to the one the client receives, not the identical object, which is why
+        `add_post_dispatch_hook` says so explicitly.
+
+        The caller's `try` covers the parameter-change flush as well as the handler, so a
+        handler that returned a result and then had `_flush_tracked_parameter_changes`
+        raise also lands here. That is deliberate: the exception escapes either way, the
+        client gets a synthesized failure either way, and hooks reporting success for a
+        request the client saw fail would be worse than the coarser attribution.
+        """
+        result_details = f"Unhandled exception while processing {type(request).__name__}: {exception}"
+        # `_handle_request_core` scrubs the request on its way to building the result event,
+        # but a raising handler never gets there. Without this, hooks would be the one place
+        # an omitted field still surfaces -- and those fields are omitted precisely because
+        # they are sensitive or bulky.
+        self._scrub_omitted_request_fields(request)
+        self._fire_post_dispatch_hooks(
+            request, GenericResultFailure(exception=exception, result_details=result_details)
+        )
+
+    def _scrub_omitted_request_fields(self, request: RequestPayload) -> None:
+        """Null out the request fields marked `omit_from_result`, in place.
+
+        Mutates the request rather than copying it: the result event carries this same
+        object, so the scrub has to be visible through every reference to it.
+        """
+        for field in fields(request):
+            if field.metadata.get("omit_from_result", False):
+                setattr(request, field.name, None)
+
+    def _schedule_post_dispatch_hook(
+        self,
+        request_type: type[RequestPayload],
+        callback: PostDispatchHook,
+        request: RequestPayload,
+        result: ResultPayload,
+        inherited_chain: tuple[tuple[type[RequestPayload], Any], ...],
+    ) -> None:
+        """Hand one hook to the engine loop, or run it inline if there is no live loop.
+
+        Always targets `self._event_loop` rather than the running loop. The sync
+        `handle_request` drives async handlers on a transient `ThreadRunner` side loop
+        that stops as soon as the handler returns, so a task detached onto the *running*
+        loop can silently never run (see the ThreadRunner regression test in
+        tests/unit/app/test_app_worker.py).
+
+        `is_running()` is as load-bearing as `is_closed()`: `create_task` on an open but
+        undriven loop succeeds, returns a pending task, and never executes it. Executors
+        re-`initialize_queue` per run and nothing ever clears `_event_loop`, so a stale
+        loop from a finished `asyncio.run` is a real possibility here.
+        """
+        loop = self._event_loop
+        if loop is not None and not loop.is_closed() and loop.is_running():
+            try:
+                # call_soon_threadsafe is legal from the loop's own thread as well as
+                # from any other, so this is one path instead of two. The task itself is
+                # created on the loop thread by _spawn_post_dispatch_hook_task.
+                loop.call_soon_threadsafe(
+                    self._spawn_post_dispatch_hook_task,
+                    loop,
+                    request_type,
+                    callback,
+                    request,
+                    result,
+                    inherited_chain,
+                )
+            except RuntimeError:
+                # Lost the race with loop shutdown between the check and the call; fall
+                # through and run inline rather than dropping the notification.
+                pass
+            else:
+                return
+
+        self._run_post_dispatch_hook_inline(request_type, callback, request, result, inherited_chain)
+
+    def _spawn_post_dispatch_hook_task(  # noqa: PLR0913, PLR0917
+        self,
+        loop: asyncio.AbstractEventLoop,
+        request_type: type[RequestPayload],
+        callback: PostDispatchHook,
+        request: RequestPayload,
+        result: ResultPayload,
+        inherited_chain: tuple[tuple[type[RequestPayload], Any], ...],
+    ) -> None:
+        """Create the detached hook task. Runs on `loop`'s own thread."""
+        task = loop.create_task(
+            self._run_post_dispatch_hook(request_type, callback, request, result, inherited_chain),
+            context=contextvars.Context(),
+        )
+        self._inflight_post_dispatch_hook_tasks.add(task)
+        task.add_done_callback(self._on_post_dispatch_hook_done)
+
+        inflight = len(self._inflight_post_dispatch_hook_tasks)
+        if inflight > POST_DISPATCH_HOOK_INFLIGHT_WARNING_THRESHOLD:
+            logging.getLogger("griptape_nodes").warning(
+                "%d post-dispatch hooks are still running. Hooks are never dropped, so a hook "
+                "that runs slower than requests arrive will keep accumulating. Most recent: '%s' for %s.",
+                inflight,
+                getattr(callback, "__name__", callback),
+                request_type.__name__,
+            )
+
+    def _on_post_dispatch_hook_done(self, task: asyncio.Task) -> None:
+        """Release the task reference and surface anything the wrapper did not catch."""
+        self._inflight_post_dispatch_hook_tasks.discard(task)
+        if task.cancelled():
+            return
+        exception = task.exception()
+        if exception is not None:
+            logging.getLogger("griptape_nodes").error("Post-dispatch hook task failed.", exc_info=exception)
+
+    async def _run_post_dispatch_hook(
+        self,
+        request_type: type[RequestPayload],
+        callback: PostDispatchHook,
+        request: RequestPayload,
+        result: ResultPayload,
+        inherited_chain: tuple[tuple[type[RequestPayload], Any], ...],
+    ) -> None:
+        """Invoke one hook, isolated from the context that dispatched the request.
+
+        The task is created with a *fresh* context rather than a copy of the caller's, so
+        the hook cannot inherit the dispatching task's strict-mode scope stack. That
+        stack holds mutable scope objects: a hook that reported a violation into an
+        inherited RUNTIME_EXECUTE scope could append to `scope.violations` after (or
+        while) the node's own scope is being evaluated, and on a worker an ERROR-severity
+        violation promotes a node's success to a failure. A library's telemetry hook must
+        not be able to fail a user's node. The fresh context also keeps
+        `current_request_type()` from reporting the dispatching request inside the hook.
+
+        A fresh context drops the engine binding too, so it is re-established here from
+        the manager's own engine reference. It also drops the re-entrancy marker, which is
+        why the chain is passed in explicitly rather than read from the context here.
+        """
+        _active_post_dispatch_hooks.set((*inherited_chain, (request_type, callback)))
+
+        with engine_scope(self.engine):
+            try:
+                if _is_async_callable(callback):
+                    await callback(request, result)  # type: ignore[misc]
+                else:
+                    # Sync callbacks go to a thread: they would otherwise run inline on
+                    # the engine loop, where blocking stalls the event queue and every
+                    # in-flight request.
+                    await to_thread(callback, request, result)
+            except Exception:
+                # Fail open. The result has already been returned, so there is nothing
+                # to fail; the only correct response is to log and move on.
+                logging.getLogger("griptape_nodes").exception(
+                    "Post-dispatch hook '%s' for %s raised. The request result is unaffected.",
+                    getattr(callback, "__name__", callback),
+                    request_type.__name__,
+                )
+
+    def _run_post_dispatch_hook_inline(
+        self,
+        request_type: type[RequestPayload],
+        callback: PostDispatchHook,
+        request: RequestPayload,
+        result: ResultPayload,
+        inherited_chain: tuple[tuple[type[RequestPayload], Any], ...],
+    ) -> None:
+        """Run a hook synchronously, blocking the caller's thread until it finishes.
+
+        Blocking the caller is the guarantee; running *on* the caller's thread is not. A
+        sync callback always lands in a threadpool worker via `to_thread`, and when this
+        is reached from inside a running loop the coroutine is driven by a `ThreadRunner`
+        on a thread of its own.
+
+        The fallback for paths with no live engine loop -- CLI commands, bootstrap
+        workflow runs, worker threads. Blocking is the lesser evil: no editor is waiting
+        on those paths, and dropping the hook would make the feature "fires, except
+        sometimes."
+        """
+        coro = self._run_post_dispatch_hook(request_type, callback, request, result, inherited_chain)
+        try:
+            if _running_loop() is not None:
+                # Both branches must start the hook from an empty context, for the
+                # strict-mode reason in `_run_post_dispatch_hook`. Running on another
+                # thread is not enough on its own: ThreadRunner.run hands the coroutine
+                # over with `run_coroutine_threadsafe`, which has no `context=` parameter
+                # and whose underlying `call_soon_threadsafe` captures
+                # `copy_context()` on *this* thread. Entering a fresh context first is
+                # what makes the copy it takes an empty one.
+                with ThreadRunner() as runner:
+                    contextvars.Context().run(runner.run, coro)
+            else:
+                contextvars.Context().run(asyncio.run, coro)
+        except Exception:
+            # _run_post_dispatch_hook swallows callback errors, so reaching here means the
+            # scheduling machinery itself failed. Still fail open.
+            logging.getLogger("griptape_nodes").exception(
+                "Failed to run post-dispatch hook '%s' for %s inline.",
+                getattr(callback, "__name__", callback),
+                request_type.__name__,
+            )
 
     def add_authorization_hook(
         self,
@@ -709,9 +1057,7 @@ class EventManager(EngineScoped):
                 retained_mode_str = depth_manager.request_retained_mode_translation(request)
 
             # Some requests have fields marked as "omit_from_result" which should be removed from the request
-            for field in fields(request):
-                if field.metadata.get("omit_from_result", False):
-                    setattr(request, field.name, None)
+            self._scrub_omitted_request_fields(request)
             if callback_result.succeeded():
                 result_event = EventResultSuccess(
                     request=request,
@@ -728,6 +1074,12 @@ class EventManager(EngineScoped):
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
                 )
+
+        # Fired here rather than in the two dispatch methods because every path that
+        # produces a result event -- sync, async, and pre-dispatch short-circuit -- runs
+        # through this method. Deliberately outside the operation-depth context above, so
+        # a hook that does issue a request nests cleanly instead of inflating the depth.
+        self._fire_post_dispatch_hooks(request, callback_result)
 
         return result_event
 
@@ -769,13 +1121,17 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         try:
-            # Actually make the handler callback (support both sync and async):
-            result_payload: ResultPayload = await call_function(callback, request)
+            try:
+                # Actually make the handler callback (support both sync and async):
+                result_payload: ResultPayload = await call_function(callback, request)
 
-            # Queue flush request for async context (unless result type should skip flush)
-            with operation_depth_mgr:
-                if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                    self._flush_tracked_parameter_changes()
+                # Queue flush request for async context (unless result type should skip flush)
+                with operation_depth_mgr:
+                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                        self._flush_tracked_parameter_changes()
+            except Exception as exc:
+                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
+                raise
 
             return self._handle_request_core(
                 request,
@@ -785,7 +1141,7 @@ class EventManager(EngineScoped):
         finally:
             _active_request_type.reset(token)
 
-    def handle_request(  # noqa: PLR0912
+    def handle_request(
         self,
         request: RP,
         *,
@@ -823,51 +1179,16 @@ class EventManager(EngineScoped):
         # Expose the dispatching request type to detectors (see current_request_type).
         token = _active_request_type.set(request_type)
         try:
-            # Worker-side RemoteHandler callbacks are async but safe to invoke from a
-            # running loop: forward_to_orchestrator dispatches onto the WS loop via
-            # run_coroutine_threadsafe, which runs on a different thread than the caller's
-            # loop, so no primitives are shared and the #4469 deadlock shape does not apply.
-            # Hop the callback onto the WS loop here and block the caller's thread on the
-            # concurrent.futures.Future so RemoteHandler itself stays a plain async callable.
-            #
-            # Lazy import: worker_routing imports ResultContext from this module at
-            # runtime, so a top-level import here would cycle through event_manager
-            # -> worker_routing -> event_manager during module load.
-            from griptape_nodes.app.worker_routing import RemoteHandler
+            try:
+                result_payload = self._invoke_handler_from_sync(callback, request)
 
-            if isinstance(callback, RemoteHandler):
-                if _running_loop() is not None:
-                    if self._websocket_event_loop is None:
-                        msg = (
-                            f"Cannot forward '{type(request).__name__}' from a running event loop: "
-                            "the websocket event loop is not configured. This indicates a bootstrap order bug."
-                        )
-                        raise RuntimeError(msg)
-                    future = asyncio.run_coroutine_threadsafe(callback(request), self._websocket_event_loop)
-                    result_payload: ResultPayload = future.result()
-                else:
-                    result_payload: ResultPayload = asyncio.run(callback(request))
-            # Support async callbacks invoked from sync code. If no loop is running
-            # (bootstrap, worker threads) asyncio.run drives the coroutine directly.
-            # If a loop IS running (pre-#4449 workflow files exec'd from inside the
-            # engine loop), dispatch onto a side loop via ThreadRunner. The #4469
-            # deadlock shape is specific to callbacks whose coroutines share
-            # primitives with the caller's loop; RemoteHandler is the only such case
-            # and is handled above via run_coroutine_threadsafe onto the WS loop.
-            # For all other async handlers the side-loop path is safe.
-            elif inspect.iscoroutinefunction(callback):
-                if _running_loop() is not None:
-                    with ThreadRunner() as runner:
-                        result_payload: ResultPayload = runner.run(callback(request))
-                else:
-                    result_payload = asyncio.run(callback(request))
-            else:
-                result_payload = callback(request)
-
-            # Queue flush request for sync context (unless result type should skip flush)
-            with operation_depth_mgr:
-                if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
-                    self._flush_tracked_parameter_changes()
+                # Queue flush request for sync context (unless result type should skip flush)
+                with operation_depth_mgr:
+                    if type(result_payload) not in RESULT_TYPES_THAT_SKIP_FLUSH:
+                        self._flush_tracked_parameter_changes()
+            except Exception as exc:
+                self._fire_post_dispatch_hooks_for_handler_exception(request, exc)
+                raise
 
             return self._handle_request_core(
                 request,
@@ -876,6 +1197,48 @@ class EventManager(EngineScoped):
             )
         finally:
             _active_request_type.reset(token)
+
+    def _invoke_handler_from_sync(self, callback: Callable, request: RequestPayload) -> ResultPayload:
+        """Call a request handler from sync code, bridging async handlers onto a loop."""
+        # Worker-side RemoteHandler callbacks are async but safe to invoke from a
+        # running loop: forward_to_orchestrator dispatches onto the WS loop via
+        # run_coroutine_threadsafe, which runs on a different thread than the caller's
+        # loop, so no primitives are shared and the #4469 deadlock shape does not apply.
+        # Hop the callback onto the WS loop here and block the caller's thread on the
+        # concurrent.futures.Future so RemoteHandler itself stays a plain async callable.
+        #
+        # Lazy import: worker_routing imports ResultContext from this module at
+        # runtime, so a top-level import here would cycle through event_manager
+        # -> worker_routing -> event_manager during module load.
+        from griptape_nodes.app.worker_routing import RemoteHandler
+
+        if isinstance(callback, RemoteHandler):
+            if _running_loop() is None:
+                return asyncio.run(callback(request))
+            if self._websocket_event_loop is None:
+                msg = (
+                    f"Cannot forward '{type(request).__name__}' from a running event loop: "
+                    "the websocket event loop is not configured. This indicates a bootstrap order bug."
+                )
+                raise RuntimeError(msg)
+            future = asyncio.run_coroutine_threadsafe(callback(request), self._websocket_event_loop)
+            return future.result()
+
+        # Support async callbacks invoked from sync code. If no loop is running
+        # (bootstrap, worker threads) asyncio.run drives the coroutine directly.
+        # If a loop IS running (pre-#4449 workflow files exec'd from inside the
+        # engine loop), dispatch onto a side loop via ThreadRunner. The #4469
+        # deadlock shape is specific to callbacks whose coroutines share
+        # primitives with the caller's loop; RemoteHandler is the only such case
+        # and is handled above via run_coroutine_threadsafe onto the WS loop.
+        # For all other async handlers the side-loop path is safe.
+        if inspect.iscoroutinefunction(callback):
+            if _running_loop() is None:
+                return asyncio.run(callback(request))
+            with ThreadRunner() as runner:
+                return runner.run(callback(request))
+
+        return callback(request)
 
     def add_listener_to_app_event(
         self, app_event_type: type[AP], callback: Callable[[AP], None] | Callable[[AP], Awaitable[None]]
