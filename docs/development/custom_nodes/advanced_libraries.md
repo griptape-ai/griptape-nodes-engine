@@ -140,6 +140,35 @@ a workflow publisher.
 Errors are handled the same way as the before hook: an `AfterLibraryCallbackProblem` is
 recorded and loading continues.
 
+### Do not clear `importlib` modules from `sys.modules`
+
+A hook may clear third-party packages out of `sys.modules` so they get re-imported from your
+library's own venv — `transformers` and `huggingface_hub` are the usual cases. Never include
+`importlib` or any of its submodules in what you clear.
+
+`importlib._bootstrap` is the running import system. Its source file has no `import sys`,
+because the interpreter injects `sys` into the frozen module at startup. Removing it from
+`sys.modules` means the next import re-executes the file from disk and gets a copy without
+that global, after which **every** import in the engine process fails with
+`NameError: name 'sys' is not defined` — including imports in other libraries and in the
+standard node library.
+
+The engine checks the import machinery after each hook returns, puts the frozen modules
+back, and records an `ImportMachineryDamagedProblem` against your library. Don't treat that
+as a safety net: libraries that loaded between your hook and the repair may already have
+failed, and the user is told to update or disable your library. If you need version
+resolution to pick up your venv, invalidate the caches instead of evicting the modules:
+
+```python
+import importlib
+import importlib.metadata
+import sys
+
+importlib.metadata.MetadataPathFinder.invalidate_caches()
+importlib.invalidate_caches()
+sys.path_importer_cache.clear()
+```
+
 ### `before_library_unregistered`
 
 ```python

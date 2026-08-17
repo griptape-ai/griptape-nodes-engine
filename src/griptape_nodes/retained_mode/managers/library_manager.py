@@ -212,6 +212,7 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     CreateConfigCategoryProblem,
     DuplicateLibraryProblem,
     EngineVersionErrorProblem,
+    ImportMachineryDamagedProblem,
     IncompatibleRequirementsProblem,
     InvalidVersionStringProblem,
     LibraryDependencyProblem,
@@ -267,6 +268,11 @@ from griptape_nodes.utils.git_utils import (
     sparse_checkout_library_json,
     switch_branch_or_tag,
     update_library_git,
+)
+from griptape_nodes.utils.import_machinery_utils import (
+    ImportMachinerySnapshot,
+    restore_import_machinery,
+    snapshot_import_machinery,
 )
 from griptape_nodes.utils.library_utils import (
     LIBRARY_GIT_URLS,
@@ -4735,6 +4741,10 @@ class LibraryManager(EngineScoped):
         # Call the before_library_nodes_loaded callback if available
         advanced_library = library.get_advanced_library()
         if advanced_library:
+            # Snapshot around the hook: libraries clear sys.modules here to force their own venv's
+            # dependencies to win, and clearing importlib's frozen submodules breaks importing for
+            # every library loaded after this one. See import_machinery_utils.
+            machinery_snapshot = snapshot_import_machinery()
             try:
                 advanced_library.before_library_nodes_loaded(library_data, library)
                 details = f"Successfully called before_library_nodes_loaded callback for library '{library_data.name}'"
@@ -4745,6 +4755,14 @@ class LibraryManager(EngineScoped):
                     f"Failed to call before_library_nodes_loaded callback for library '{library_data.name}': {err}"
                 )
                 logger.error(details)
+            # Runs whether or not the hook raised: a hook that breaks the import machinery usually
+            # then fails on its own next import, so the damage arrives with an exception.
+            self._repair_import_machinery_after_hook(
+                machinery_snapshot,
+                hook_name="before_library_nodes_loaded",
+                library_data=library_data,
+                library_info=library_info,
+            )
 
         # Process each node in the metadata. Lazy loading (the default) registers each type with
         # a deferred loader and imports the module on first use, keeping startup from paying the
@@ -4789,6 +4807,7 @@ class LibraryManager(EngineScoped):
 
         # Call the after_library_nodes_loaded callback if available
         if advanced_library:
+            machinery_snapshot = snapshot_import_machinery()
             try:
                 advanced_library.after_library_nodes_loaded(library_data, library)
                 details = f"Successfully called after_library_nodes_loaded callback for library '{library_data.name}'"
@@ -4797,6 +4816,12 @@ class LibraryManager(EngineScoped):
                 library_info.problems.append(AfterLibraryCallbackProblem(error_message=str(err)))
                 details = f"Failed to call after_library_nodes_loaded callback for library '{library_data.name}': {err}"
                 logger.error(details)
+            self._repair_import_machinery_after_hook(
+                machinery_snapshot,
+                hook_name="after_library_nodes_loaded",
+                library_data=library_data,
+                library_info=library_info,
+            )
 
         # Register request/response handlers declared by the library
         if advanced_library:
@@ -4847,6 +4872,40 @@ class LibraryManager(EngineScoped):
 
         # Update lifecycle state to LOADED
         library_info.lifecycle_state = LibraryManager.LibraryLifecycleState.LOADED
+
+    def _repair_import_machinery_after_hook(
+        self,
+        snapshot: ImportMachinerySnapshot,
+        *,
+        hook_name: str,
+        library_data: LibrarySchema,
+        library_info: LibraryManager.LibraryInfo,
+    ) -> None:
+        """Undo any damage a library's advanced hook did to Python's import machinery.
+
+        Attributing the damage to the library whose hook caused it is the point of this check.
+        The failures it produces otherwise appear against whichever library or node module
+        imports next, arbitrarily far from the cause.
+
+        Args:
+            snapshot: Snapshot taken immediately before the hook was called.
+            hook_name: Name of the hook, for the problem description and the log.
+            library_data: Schema of the library whose hook ran.
+            library_info: LibraryInfo to record the problem against.
+        """
+        restored_modules = restore_import_machinery(snapshot)
+        if not restored_modules:
+            return
+
+        library_info.problems.append(ImportMachineryDamagedProblem(hook_name=hook_name, module_names=restored_modules))
+        logger.error(
+            "The %s hook for library '%s' replaced Python's import machinery (%s). The engine restored "
+            "it, but libraries loaded in the meantime may have failed to import. This library needs to "
+            "stop removing importlib's frozen modules from sys.modules.",
+            hook_name,
+            library_data.name,
+            ", ".join(restored_modules),
+        )
 
     # Per-node timeout for the schema probe. Node __init__ methods that make
     # synchronous handle_request calls can deadlock against async handlers that
