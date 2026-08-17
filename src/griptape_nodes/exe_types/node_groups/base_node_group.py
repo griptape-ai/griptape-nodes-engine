@@ -183,6 +183,27 @@ class BaseNodeGroup(BaseNode):
                 msg = f"Node {node.name} is not in node group {self.name}"
                 raise ValueError(msg)
 
+    def handle_child_node_rename(self, old_name: str, new_name: str) -> None:
+        """Update group membership when a child node is renamed.
+
+        Args:
+            old_name: The old name of the child node
+            new_name: The new name of the child node
+        """
+        if old_name not in self.nodes:
+            return
+
+        # Update the nodes dictionary
+        node = self.nodes.pop(old_name)
+        self.nodes[new_name] = node
+
+        # Update the metadata
+        node_names_in_group = self.metadata.get("node_names_in_group", [])
+        if old_name in node_names_in_group:
+            node_names_in_group.remove(old_name)
+            node_names_in_group.append(new_name)
+            self.metadata["node_names_in_group"] = node_names_in_group
+
     @staticmethod
     def get_enclosing_groups(node: BaseNode) -> list[BaseNodeGroup]:
         """Walk the parent_group chain and return every group enclosing the node, innermost first.
@@ -206,24 +227,3 @@ class BaseNodeGroup(BaseNode):
             visited.add(id(current))
             current = current.parent_group
         return enclosing_groups
-
-    def handle_child_node_rename(self, old_name: str, new_name: str) -> None:
-        """Update group membership when a child node is renamed.
-
-        Args:
-            old_name: The old name of the child node
-            new_name: The new name of the child node
-        """
-        if old_name not in self.nodes:
-            return
-
-        # Update the nodes dictionary
-        node = self.nodes.pop(old_name)
-        self.nodes[new_name] = node
-
-        # Update the metadata
-        node_names_in_group = self.metadata.get("node_names_in_group", [])
-        if old_name in node_names_in_group:
-            node_names_in_group.remove(old_name)
-            node_names_in_group.append(new_name)
-            self.metadata["node_names_in_group"] = node_names_in_group

@@ -65,6 +65,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     CreateFlowRequest,
     GetTopLevelFlowRequest,
     GetTopLevelFlowResultSuccess,
+    SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultSuccess,
@@ -266,7 +267,7 @@ class WorkflowCodegenState:
     subflow_name_to_variable_name: dict[str, str] = field(default_factory=dict)
     next_node_index: int = 0
     next_flow_index: int = 0
-    emitted_connection_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
+    emitted_connection_keys: set[SerializedConnectionKey] = field(default_factory=set)
 
     def reserve_node_index(self) -> int:
         """Claim the next unused node variable index."""
@@ -298,12 +299,7 @@ class WorkflowCodegenState:
         """
         unemitted_connections = []
         for connection in connections:
-            connection_key = (
-                connection.source_node_uuid,
-                connection.source_parameter_name,
-                connection.target_node_uuid,
-                connection.target_parameter_name,
-            )
+            connection_key = connection.key()
             if connection_key in self.emitted_connection_keys:
                 continue
             self.emitted_connection_keys.add(connection_key)
@@ -4926,8 +4922,11 @@ class WorkflowManager(EngineScoped):
                 )
             )
 
-        # Connections come after every node in this Flow's whole subtree exists, including the groups
-        # above, whose proxy parameters are what boundary-crossing connections attach to.
+        # Connections come last, once every node in this Flow's whole subtree exists — including the
+        # groups written just above, whose proxy parameters are what boundary-crossing edges attach to.
+        # Claiming edges here, after the subflows were already written, is safe: an edge is only ever
+        # collected by the Flow holding both endpoints or one level above them (_get_connections_for_flow),
+        # so a subflow can never claim an edge that reaches a group node declared out here.
         flow_context_node.body.extend(
             self._generate_connections_code(
                 serialized_connections=codegen_state.take_unemitted_connections(
@@ -4970,6 +4969,9 @@ class WorkflowManager(EngineScoped):
 
         Returns:
             The statements that create the Flow (empty when it already exists)
+
+        Raises:
+            TypeError: If the Flow is created by a command this generator does not know how to write
         """
         match flow_initialization_command:
             case CreateFlowRequest():
@@ -4993,8 +4995,15 @@ class WorkflowManager(EngineScoped):
             case None:
                 # No initialization command; the contents are rebuilt into the current context.
                 return []
+            case _:
+                # A new way of creating a Flow was added without teaching this generator to write it.
+                # Silently returning nothing would emit a file whose Flow is never created, so the
+                # nodes inside it would land wherever the script happened to be pointing.
+                msg = f"Attempted to save a workflow. Failed because a flow is created in a way this version cannot write out: {type(flow_initialization_command).__name__}."
+                raise TypeError(msg)
 
-    def _flow_has_content_to_generate(self, serialized_flow_commands: SerializedFlowCommands) -> bool:
+    @staticmethod
+    def _flow_has_content_to_generate(serialized_flow_commands: SerializedFlowCommands) -> bool:
         """Whether a Flow holds anything worth emitting a context block for.
 
         Args:
@@ -5238,6 +5247,19 @@ class WorkflowManager(EngineScoped):
         node_uuid_to_node_variable_name: dict[SerializedNodeCommands.NodeUUID, str],
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that reconnect a Flow's nodes.
+
+        Args:
+            serialized_connections: The connections this Flow is responsible for writing
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements creating each connection
+
+        Raises:
+            KeyError: If an endpoint's node has not been written into the file yet
+        """
         # Ensure necessary imports are recorded
         import_recorder.add_from_import(
             "griptape_nodes.retained_mode.events.connection_events", "CreateConnectionRequest"
@@ -5246,7 +5268,18 @@ class WorkflowManager(EngineScoped):
         connection_asts = []
 
         for connection in serialized_connections:
-            # Match the connection's node UUID back to its variable name.
+            # Match the connection's node UUID back to its variable name. Both endpoints must already
+            # have been written, since the generated file refers to them by variable. Which Flow
+            # writes a given edge depends on the traversal (see _generate_flow_code), so name the
+            # nodes if that ever slips rather than letting a bare KeyError escape mid-save.
+            missing_endpoints = [
+                endpoint_uuid
+                for endpoint_uuid in (connection.source_node_uuid, connection.target_node_uuid)
+                if endpoint_uuid not in node_uuid_to_node_variable_name
+            ]
+            if missing_endpoints:
+                msg = f"Attempted to save a workflow. Failed because a connection to '{connection.target_parameter_name}' refers to {len(missing_endpoints)} node(s) that had not been written to the file yet."
+                raise KeyError(msg)
             source_node_variable_name = node_uuid_to_node_variable_name[connection.source_node_uuid]
             target_node_variable_name = node_uuid_to_node_variable_name[connection.target_node_uuid]
 

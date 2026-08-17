@@ -132,6 +132,7 @@ from griptape_nodes.retained_mode.events.flow_events import (
     PackageNodesAsSerializedFlowResultFailure,
     PackageNodesAsSerializedFlowResultSuccess,
     SanitizedParameterName,
+    SerializedConnectionKey,
     SerializedFlowCommands,
     SerializeFlowToCommandsRequest,
     SerializeFlowToCommandsResultFailure,
@@ -252,6 +253,18 @@ class MultiNodeEndNodeResult(NamedTuple):
     parameter_name_mappings: dict[SanitizedParameterName, OriginalNodeParameter]
     alter_parameter_commands: list[AlterParameterDetailsRequest]
     end_node_name: str
+
+
+class FlowDeserializationError(Exception):
+    """A saved Flow could not be rebuilt.
+
+    Rebuilding a Flow runs in three passes — nodes, then connections, then values — each of which
+    recurses through every subflow. Any of them can fail deep in the recursion, and all of them fail
+    the whole load. Raising this specific type lets on_deserialize_flow_from_commands catch exactly
+    the failures its own passes report, rather than every RuntimeError from the request handlers
+    those passes call into. The message is user-facing: it is appended to "Attempted to deserialize
+    a Flow 'X'. ", so phrase it as a sentence completing that thought.
+    """
 
 
 @dataclass
@@ -4013,39 +4026,29 @@ class FlowManager(EngineScoped):
             deserialized_nodes = self._deserialize_nodes_for_flow_and_subflows(
                 serialized_flow_commands=request.serialized_flow_commands
             )
-        except RuntimeError as err:
+
+            # Now apply the connections, for this Flow and every Flow beneath it.
+            # We didn't know the exact name that would be used for the nodes, but we knew the node's
+            # creation UUID. Tie the UUID back to the node names.
+            self._deserialize_connections_for_flow_and_subflows(
+                serialized_flow_commands=request.serialized_flow_commands,
+                deserialized_nodes=deserialized_nodes,
+                created_connection_keys=set(),
+            )
+
+            # Now assign the values, again across the whole subtree.
+            # This is the same issue that we handle for Connections:
+            # we don't know the exact node name that would be used, but we do know the UUIDs.
+            self._deserialize_values_for_flow_and_subflows(
+                serialized_flow_commands=request.serialized_flow_commands, deserialized_nodes=deserialized_nodes
+            )
+        except FlowDeserializationError as err:
             details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
             if created_new_flow:
                 self._cleanup_flow_on_failed_deserialization(flow_name, pushed_flow_context=pushed_flow_context)
             return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
         node_name_mappings = deserialized_nodes.original_name_to_node_name
-
-        # Now apply the connections, for this Flow and every Flow beneath it.
-        # We didn't know the exact name that would be used for the nodes, but we knew the node's
-        # creation UUID. Tie the UUID back to the node names.
-        try:
-            self._deserialize_connections_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands, deserialized_nodes=deserialized_nodes
-            )
-        except RuntimeError as err:
-            details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
-            if created_new_flow:
-                self._cleanup_flow_on_failed_deserialization(flow_name, pushed_flow_context=pushed_flow_context)
-            return DeserializeFlowFromCommandsResultFailure(result_details=details)
-
-        # Now assign the values, again across the whole subtree.
-        # This is the same issue that we handle for Connections:
-        # we don't know the exact node name that would be used, but we do know the UUIDs.
-        try:
-            self._deserialize_values_for_flow_and_subflows(
-                serialized_flow_commands=request.serialized_flow_commands, deserialized_nodes=deserialized_nodes
-            )
-        except RuntimeError as err:
-            details = f"Attempted to deserialize a Flow '{flow_name}'. {err}"
-            if created_new_flow:
-                self._cleanup_flow_on_failed_deserialization(flow_name, pushed_flow_context=pushed_flow_context)
-            return DeserializeFlowFromCommandsResultFailure(result_details=details)
 
         # Pop flow context if requested and we pushed it
         if request.pop_flow_context_after and pushed_flow_context:
@@ -4076,7 +4079,7 @@ class FlowManager(EngineScoped):
             The rebuilt nodes of this Flow and its whole subtree
 
         Raises:
-            RuntimeError: If a node, or a subflow holding nodes, could not be rebuilt
+            FlowDeserializationError: If a node, or a subflow holding nodes, could not be rebuilt
         """
         deserialized_nodes = DeserializedFlowNodes()
 
@@ -4113,7 +4116,7 @@ class FlowManager(EngineScoped):
             deserialized_nodes: The collection to record the rebuilt node in
 
         Raises:
-            RuntimeError: If the node could not be rebuilt
+            FlowDeserializationError: If the node could not be rebuilt
         """
         node_name = self._deserialize_one_node(serialized_node=serialized_node, deserialized_nodes=deserialized_nodes)
         deserialized_nodes.node_uuid_to_node_name[serialized_node.node_uuid] = node_name
@@ -4135,7 +4138,7 @@ class FlowManager(EngineScoped):
             The name the rebuilt node was given
 
         Raises:
-            RuntimeError: If the node could not be rebuilt
+            FlowDeserializationError: If the node could not be rebuilt
         """
         create_cmd = serialized_node.create_node_command
         serialized_node_for_deserialization = serialized_node
@@ -4146,11 +4149,18 @@ class FlowManager(EngineScoped):
         # because the names they will be rebuilt under are not known until they are rebuilt.
         if create_cmd.node_names_to_add:
             member_uuids = [SerializedNodeCommands.NodeUUID(name) for name in create_cmd.node_names_to_add]
-            remapped_names = [
-                deserialized_nodes.node_uuid_to_node_name[member_uuid]
-                for member_uuid in member_uuids
-                if member_uuid in deserialized_nodes.node_uuid_to_node_name
-            ]
+            unresolved_count = sum(
+                1 for member_uuid in member_uuids if member_uuid not in deserialized_nodes.node_uuid_to_node_name
+            )
+            # A group IS its membership, so a group that comes back holding three of its five nodes is
+            # worse than a load that stops and says so. Every member is rebuildable by the time we get
+            # here because _deserialize_nodes_for_flow_and_subflows rebuilds groups last; if that
+            # ordering ever regresses, fail loudly instead of quietly returning a hollowed-out group.
+            if unresolved_count:
+                group_name = create_cmd.node_name or create_cmd.node_type
+                msg = f"Failed while rebuilding the group '{group_name}' because {unresolved_count} of its {len(member_uuids)} nodes were not rebuilt."
+                raise FlowDeserializationError(msg)
+            remapped_names = [deserialized_nodes.node_uuid_to_node_name[member_uuid] for member_uuid in member_uuids]
             create_cmd_copy = CreateNodeRequest(
                 node_type=create_cmd.node_type,
                 specific_library_name=create_cmd.specific_library_name,
@@ -4178,7 +4188,7 @@ class FlowManager(EngineScoped):
         deserialized_node_result = self.engine.handle_request(deserialize_node_request)
         if not isinstance(deserialized_node_result, DeserializeNodeFromCommandsResultSuccess):
             msg = f"Failed while rebuilding the node '{create_cmd.node_name}'."
-            raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
+            raise FlowDeserializationError(msg)
 
         return deserialized_node_result.node_name
 
@@ -4192,7 +4202,7 @@ class FlowManager(EngineScoped):
             The rebuilt nodes of the subflow and its whole subtree
 
         Raises:
-            RuntimeError: If the subflow could not be created or entered
+            FlowDeserializationError: If the subflow could not be created or entered
         """
         flow_initialization_command = sub_flow_commands.flow_initialization_command
         if flow_initialization_command is None:
@@ -4204,7 +4214,7 @@ class FlowManager(EngineScoped):
         sub_flow = self.engine.object_manager.attempt_get_object_by_name_as_type(sub_flow_name, ControlFlow)
         if sub_flow is None:
             msg = f"Failed to find the sub-flow '{sub_flow_name}' just created for it."
-            raise RuntimeError(msg)
+            raise FlowDeserializationError(msg)
 
         # Nodes are created into the Flow at the top of the context stack, so enter the subflow
         # while rebuilding its contents and leave it afterwards.
@@ -4223,7 +4233,7 @@ class FlowManager(EngineScoped):
             The name of the created Flow
 
         Raises:
-            RuntimeError: If the Flow could not be created
+            FlowDeserializationError: If the Flow could not be created
         """
         flow_initialization_result = self.engine.handle_request(flow_initialization_command)
 
@@ -4231,38 +4241,55 @@ class FlowManager(EngineScoped):
             case CreateFlowRequest():
                 if not isinstance(flow_initialization_result, CreateFlowResultSuccess):
                     msg = f"Failed to create the sub-flow '{flow_initialization_command.flow_name}'."
-                    raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
+                    raise FlowDeserializationError(msg)
                 return flow_initialization_result.flow_name
             case ImportWorkflowAsReferencedSubFlowRequest():
                 if not isinstance(flow_initialization_result, ImportWorkflowAsReferencedSubFlowResultSuccess):
                     msg = f"Failed to import the workflow '{flow_initialization_command.workflow_name}' as a sub-flow."
-                    raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
+                    raise FlowDeserializationError(msg)
                 return flow_initialization_result.created_flow_name
             case _:
                 msg = f"Failed because the sub-flow used an unknown creation command: {type(flow_initialization_command).__name__}."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
 
     def _deserialize_connections_for_flow_and_subflows(
-        self, serialized_flow_commands: SerializedFlowCommands, deserialized_nodes: DeserializedFlowNodes
+        self,
+        serialized_flow_commands: SerializedFlowCommands,
+        deserialized_nodes: DeserializedFlowNodes,
+        created_connection_keys: set[SerializedConnectionKey],
     ) -> None:
-        """Recreate the connections of a Flow and every Flow beneath it.
+        """Recreate the connections of a Flow and every Flow beneath it, each exactly once.
+
+        Serialization aggregates every subflow's connections up into each of its ancestors (see
+        _aggregate_connections), so an edge crossing N group boundaries is reported N+1 times. It
+        has to be created only once: re-issuing an existing edge is not a no-op, because
+        on_create_connection_request treats a duplicate as a restricted scenario and tears the
+        existing edge down before rebuilding it, which churns the group proxy parameters that the
+        edge was routed through. Claiming each edge the first time it is seen keeps the load path
+        from undoing the wiring it just restored.
 
         Args:
             serialized_flow_commands: The commands for the Flow being rebuilt
             deserialized_nodes: Every node rebuilt for this Flow's whole subtree
+            created_connection_keys: Edges already created for this Flow's subtree, added to here
 
         Raises:
-            RuntimeError: If a connection names a node that was not rebuilt, or could not be made
+            FlowDeserializationError: If a connection names a node that was not rebuilt, or could not be made
         """
         for indirect_connection in serialized_flow_commands.serialized_connections:
             source_node_name = deserialized_nodes.node_uuid_to_node_name.get(indirect_connection.source_node_uuid)
             if source_node_name is None:
                 msg = "Failed while reconnecting the flow because the node a connection starts from was not rebuilt."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
             target_node_name = deserialized_nodes.node_uuid_to_node_name.get(indirect_connection.target_node_uuid)
             if target_node_name is None:
                 msg = "Failed while reconnecting the flow because the node a connection leads to was not rebuilt."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
+
+            connection_key = indirect_connection.key()
+            if connection_key in created_connection_keys:
+                continue
+            created_connection_keys.add(connection_key)
 
             create_connection_request = CreateConnectionRequest(
                 source_node_name=source_node_name,
@@ -4273,11 +4300,13 @@ class FlowManager(EngineScoped):
             create_connection_result = self.engine.handle_request(create_connection_request)
             if create_connection_result.failed():
                 msg = f"Failed while reconnecting '{source_node_name}.{indirect_connection.source_parameter_name}' to '{target_node_name}.{indirect_connection.target_parameter_name}'."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
 
         for sub_flow_commands in serialized_flow_commands.sub_flows_commands:
             self._deserialize_connections_for_flow_and_subflows(
-                serialized_flow_commands=sub_flow_commands, deserialized_nodes=deserialized_nodes
+                serialized_flow_commands=sub_flow_commands,
+                deserialized_nodes=deserialized_nodes,
+                created_connection_keys=created_connection_keys,
             )
 
     def _deserialize_values_for_flow_and_subflows(
@@ -4290,17 +4319,17 @@ class FlowManager(EngineScoped):
             deserialized_nodes: Every node rebuilt for this Flow's whole subtree
 
         Raises:
-            RuntimeError: If a value belongs to a node that was not rebuilt, or could not be set
+            FlowDeserializationError: If a value belongs to a node that was not rebuilt, or could not be set
         """
         for node_uuid, set_value_command_list in serialized_flow_commands.set_parameter_value_commands.items():
             node_name = deserialized_nodes.node_uuid_to_node_name.get(node_uuid)
             if node_name is None:
                 msg = "Failed while restoring saved values because the node they belong to was not rebuilt."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
             node = self.engine.object_manager.attempt_get_object_by_name_as_type(node_name, BaseNode)
             if node is None:
                 msg = f"Failed while restoring the saved values of '{node_name}'."
-                raise RuntimeError(msg)
+                raise FlowDeserializationError(msg)
 
             with self.engine.context_manager.node(node=node):
                 for indirect_set_value_command in set_value_command_list:
@@ -4329,13 +4358,13 @@ class FlowManager(EngineScoped):
             unique_parameter_uuid_to_values: The pool the value UUID resolves against
 
         Raises:
-            RuntimeError: If the value is missing from the pool, or could not be set
+            FlowDeserializationError: If the value is missing from the pool, or could not be set
         """
         parameter_name = indirect_set_value_command.set_parameter_value_command.parameter_name
         unique_value_uuid = indirect_set_value_command.unique_value_uuid
         if unique_value_uuid not in unique_parameter_uuid_to_values:
             msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}' because the value was missing."
-            raise RuntimeError(msg)
+            raise FlowDeserializationError(msg)
 
         # Call the SetParameterValueRequest, subbing in the value from our unique value list.
         indirect_set_value_command.set_parameter_value_command.value = unique_parameter_uuid_to_values[
@@ -4346,7 +4375,7 @@ class FlowManager(EngineScoped):
         set_parameter_value_result = self.engine.handle_request(indirect_set_value_command.set_parameter_value_command)
         if set_parameter_value_result.failed():
             msg = f"Failed while restoring the saved value of '{node.name}.{parameter_name}'."
-            raise RuntimeError(msg)
+            raise FlowDeserializationError(msg)
 
     async def start_flow(
         self,
@@ -4359,12 +4388,12 @@ class FlowManager(EngineScoped):
         if self.check_for_existing_running_flow():
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
-            raise RuntimeError(errormsg)
+            raise FlowDeserializationError(errormsg)
 
         if start_node is None:
             if self._global_flow_queue.empty():
                 errormsg = "No Flow exists. You must create at least one control connection."
-                raise RuntimeError(errormsg)
+                raise FlowDeserializationError(errormsg)
             queue_item = self._global_flow_queue.get()
             start_node = queue_item.node
             self._global_flow_queue.task_done()

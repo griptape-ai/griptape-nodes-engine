@@ -102,16 +102,20 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self._add_subflow_execution_parameters()
 
     def _create_subflow(self) -> None:
-        """Create a dedicated subflow for this NodeGroup's nodes.
+        """Create the dedicated subflow that will hold this NodeGroup's nodes.
 
-        Note: This is called during __init__, so the node may not yet be added to a flow.
-        The subflow will be created without a parent initially, and can be reparented later.
+        Called on demand from add_nodes_to_group, the first time this group is given anything to
+        hold, so the group already knows where it lives and which group (if any) encloses it. That
+        is what lets _get_subflow_parent_flow_name put the subflow in the right place immediately
+        rather than parenting it arbitrarily and reparenting it later.
+
+        Raises:
+            RuntimeError: If the subflow could not be created
         """
         from griptape_nodes.retained_mode.events.flow_events import (
             CreateFlowRequest,
             CreateFlowResultSuccess,
         )
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         subflow_name = f"{self.name}_subflow"
         self.metadata["subflow_name"] = subflow_name
@@ -130,8 +134,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # Drop the name we optimistically recorded: no such flow exists, and leaving it set
             # makes every later lookup point at a phantom flow.
             self.metadata.pop("subflow_name", None)
+            # The engine-side detail goes to the log; the raised message stays readable, since it
+            # surfaces in the editor as the reason the group could not be filled.
             logger.warning("%s failed to create subflow '%s': %s", self.name, subflow_name, result.result_details)
-            msg = f"Attempted to create the group '{self.name}'. Failed because {result.result_details}"
+            msg = f"Attempted to create the group '{self.name}'. Failed because the space to hold its nodes could not be created."
             raise RuntimeError(msg)  # noqa: TRY004 - the request failed at runtime; this is not a type error.
 
         # Final name may be different that initial name due to de-dupe.
@@ -782,15 +788,20 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         return expanded
 
     def _nest_subflow_of(self, node: BaseNode, parent_subflow_name: str) -> None:
-        """Reparent a nested group's own subflow under this group's subflow.
+        """Move a nested group's own subflow so it sits under the flow now holding the group.
 
-        Keeps the flow hierarchy mirroring the group nesting. Without this the inner group's
-        subflow stays parented to whatever flow was current when it was created, so saving walks
-        right past it and the inner group's members are lost on load.
+        Keeps the flow hierarchy mirroring the group nesting, in both directions: when a group is
+        added, its subflow moves under this group's subflow; when it is removed, its subflow moves
+        back out to this group's parent flow. Without this the inner group's subflow stays parented
+        to whatever flow was current when it was created, so saving walks right past it and the inner
+        group's members are lost on load.
 
         Args:
-            node: The node just added to this group; only groups own a subflow
-            parent_subflow_name: This group's subflow, which should become the parent
+            node: The node whose membership just changed; only groups own a subflow
+            parent_subflow_name: The flow that should now own that group's subflow
+
+        Raises:
+            ValueError: If the nested group's subflow could not be moved
         """
         if not isinstance(node, SubflowNodeGroup):
             return
@@ -800,16 +811,17 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             # The nested group has no subflow yet; it will be created under this one on first add.
             return
 
+        # Deliberately not swallowed: a group whose subflow was not moved still looks right in the
+        # editor but loses its contents on save, so the caller has to hear about it. Both callers
+        # turn this into a failure result (see NodeManager.on_add_nodes_to_node_group_request).
         try:
             GriptapeNodes.FlowManager().reparent_flow(child_subflow_name, parent_subflow_name)
-        except ValueError:
-            logger.exception(
-                "%s could not nest subflow '%s' of group '%s' under '%s'",
-                self.name,
-                child_subflow_name,
-                node.name,
-                parent_subflow_name,
+        except ValueError as err:
+            msg = (
+                f"Attempted to change what group '{node.name}' belongs to. "
+                f"Failed because its contents could not be moved to '{parent_subflow_name}': {err}"
             )
+            raise ValueError(msg) from err
 
     def _map_external_connections_for_nodes(
         self, nodes: list[BaseNode], connections: Connections, node_names_in_group: set[str]

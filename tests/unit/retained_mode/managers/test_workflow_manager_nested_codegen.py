@@ -159,6 +159,48 @@ class TestNestedFlowCodegen:
 
         assert content.count("CreateConnectionRequest(") == 1
 
+    def test_writes_a_nested_group_wall_connection_once_and_after_the_group_exists(
+        self, griptape_nodes: Engine
+    ) -> None:
+        """The duplicate that actually happens crosses a nested group's wall, so cover that shape.
+
+        An edge into a nested group attaches to a proxy parameter on the group node, so it belongs to
+        the Flow holding that group -- here the outer group's subflow -- and aggregation then copies
+        it up into the top level as well. Since a Flow writes its own groups before its connections,
+        the level that owns the edge is also the one that has already declared the group variable.
+        This pins both the count and that ordering.
+        """
+        feeder = _node_commands("Feeder")
+        member = _node_commands("Member")
+        inner_group = _node_commands("InnerGroup", is_node_group=True, node_names_to_add=[member.node_uuid])
+        wall_connection = SerializedFlowCommands.IndirectConnectionSerialization(
+            source_node_uuid=feeder.node_uuid,
+            source_parameter_name="text",
+            target_node_uuid=inner_group.node_uuid,
+            target_parameter_name="text",
+        )
+        outer_subflow = _flow_commands(
+            "outer_subflow",
+            nodes=[feeder, inner_group],
+            connections=[wall_connection],
+            sub_flows=[_flow_commands("inner_subflow", nodes=[member])],
+        )
+        # Aggregation copies a subflow's connections up into every ancestor, so the top level reports
+        # this edge too even though neither endpoint lives there.
+        commands = _flow_commands("top", connections=[wall_connection], sub_flows=[outer_subflow])
+
+        content = _generate(griptape_nodes, commands)
+
+        assert content.count("CreateConnectionRequest(") == 1
+        # The group's variable has to be assigned before the connection referring to it is written,
+        # otherwise the generated file raises NameError when it is run.
+        lines = content.splitlines()
+        group_variable_line = next(
+            index for index, line in enumerate(lines) if "'InnerGroup'" in line and "node_names_to_add" in line
+        )
+        connection_line = next(index for index, line in enumerate(lines) if "CreateConnectionRequest(" in line)
+        assert group_variable_line < connection_line
+
     def test_emits_valid_python(self, griptape_nodes: Engine) -> None:
         """Whatever the nesting depth, the file has to parse."""
         commands = _flow_commands(
