@@ -391,6 +391,7 @@ class TestEffectiveProjectPathsThroughEngine:
             SetCurrentProjectRequest,
             SetCurrentProjectResultFailure,
         )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY
 
         monkeypatch.delenv(LIBS_ENV_VAR, raising=False)
         base_path = write_project(tmp_path / "base", DECLARED_LIBRARIES_YAML)
@@ -402,6 +403,9 @@ class TestEffectiveProjectPathsThroughEngine:
         assert isinstance(result, SetCurrentProjectResultFailure)
         assert "declared paths cannot be resolved" in str(result.result_details)
         assert LIBS_ENV_VAR in str(result.result_details)
+        # The refusal must not half-take: the engine stays on the project it had
+        # (system defaults here), with the refused project nowhere in its state.
+        assert engine.project_manager._current_project_id == SYSTEM_DEFAULTS_KEY
 
     def test_a_broken_parent_blocks_its_child_but_not_an_unrelated_project(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace: Path

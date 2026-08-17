@@ -5712,8 +5712,15 @@ class TestProjectManagerProjectWorkspaces:
         assert "engine_version mismatch" in str(result.result_details)
 
     @pytest.mark.asyncio
-    async def test_failed_activation_during_boot_does_not_roll_back(self, tmp_path: Path) -> None:
-        """A failure before startup completes returns as-is without re-activating anything."""
+    async def test_failed_activation_during_boot_rolls_back_to_the_rest_state(self, tmp_path: Path) -> None:
+        """A failure before startup completes re-activates the previous project, the boot rest state.
+
+        During boot the previous project is SYSTEM_DEFAULTS_KEY, and rolling back to it is what
+        keeps _current_project_id off the refused project: on_app_initialization_complete reads
+        it to decide whether an explicit project was selected, and a leftover id would make it
+        skip the system-defaults fallback and finish boot with the failed project current, its
+        config layers half-applied. The original failure is still surfaced to the caller.
+        """
         from unittest.mock import patch
 
         from griptape_nodes.retained_mode.events.project_events import (
@@ -5743,14 +5750,18 @@ class TestProjectManagerProjectWorkspaces:
 
         async def fake_activate(project_id: str) -> _ProjectActivationOutcome:
             calls.append(project_id)
-            return _ProjectActivationOutcome(failure=failure, workspace_changed=False)
+            # First call (the requested target) fails; the rollback to the rest state succeeds.
+            if len(calls) == 1:
+                return _ProjectActivationOutcome(failure=failure, workspace_changed=False)
+            return _ProjectActivationOutcome(failure=None, workspace_changed=False)
 
         with patch.object(pm, "_activate_project", side_effect=fake_activate):
             result = await pm.on_set_current_project_request(SetCurrentProjectRequest(project_id=str(target_file)))
 
-        # Only the target activation runs; no rollback during boot.
-        assert len(calls) == 1
+        target_id = str(canonicalize_for_identity(str(target_file)))
+        assert calls == [target_id, SYSTEM_DEFAULTS_KEY]
         assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "boot failure" in str(result.result_details)
 
 
 class TestRegisterProjectPath:
@@ -8795,7 +8806,7 @@ class TestProjectPathFieldValidation:
     the template cannot be merged without its base. A broken `workspace_dir`/`libraries_dir` loads
     FLAWED with an ERROR problem: the project stays loadable and editable -- so the user can fix the
     bad value in the app instead of hand-editing YAML and restarting -- while activation refuses it
-    (the gate in _apply_workspace_and_libraries_layers).
+    (the gate at the top of _activate_project).
 
     These tests drive the REAL `_read_overlay` through `on_load_project_template_request` with YAML on
     disk, because `_read_overlay` is where the check lives -- the `_build_pm` harness used by the
@@ -9254,8 +9265,11 @@ class TestProjectPathFieldValidation:
 
         Loading FLAWED is what keeps the project editable; this is the other half of the contract --
         the broken declaration is never silently replaced with a fallback location at activation.
-        The gate returns before any config layer is touched, so a refusal leaves no half-applied
-        state for the caller's rollback to fight.
+        Drives _activate_project (not the gate helper) because the ORDERING is part of the
+        contract: the refusal must land before _current_project_id moves or any config layer is
+        touched. Otherwise a boot-time refusal (where the caller's rollback used not to run)
+        strands the engine on the refused project with its layers cleared but never reloaded, and
+        on_app_initialization_complete skips the system-defaults fallback.
         """
         from griptape_nodes.retained_mode.events.project_events import (
             LoadProjectTemplateResultSuccess,
@@ -9271,13 +9285,21 @@ class TestProjectPathFieldValidation:
         )
         result = await self._load(pm, {project_path: project_yaml}, project_path)
         assert isinstance(result, LoadProjectTemplateResultSuccess)
-        project_info = pm._successfully_loaded_project_templates[result.project_id]
 
-        failure = await pm._apply_workspace_and_libraries_layers(project_info, project_path)
+        config = cast("Mock", pm._config_manager)
+        config.clear_project_layers.reset_mock()
+        config.load_project_config.reset_mock()
+        current_before = pm._current_project_id
 
-        assert isinstance(failure, SetCurrentProjectResultFailure)
-        assert "declared paths cannot be resolved" in str(failure.result_details)
-        assert "no value is set for GTN_TEST_LIBS" in str(failure.result_details)
+        outcome = await pm._activate_project(result.project_id)
+
+        assert isinstance(outcome.failure, SetCurrentProjectResultFailure)
+        assert "declared paths cannot be resolved" in str(outcome.failure.result_details)
+        assert "no value is set for GTN_TEST_LIBS" in str(outcome.failure.result_details)
+        # The refusal is a no-op: nothing became current and no config layer was touched.
+        assert pm._current_project_id == current_before
+        config.clear_project_layers.assert_not_called()
+        config.load_project_config.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_activation_gate_re_resolves_after_the_environment_breaks(
@@ -9305,13 +9327,12 @@ class TestProjectPathFieldValidation:
         result = await self._load(pm, {project_path: project_yaml}, project_path)
         assert isinstance(result, LoadProjectTemplateResultSuccess)
         assert result.validation.status is ProjectValidationStatus.GOOD
-        project_info = pm._successfully_loaded_project_templates[result.project_id]
 
         monkeypatch.delenv("GTN_TEST_LIBS")
-        failure = await pm._apply_workspace_and_libraries_layers(project_info, project_path)
+        outcome = await pm._activate_project(result.project_id)
 
-        assert isinstance(failure, SetCurrentProjectResultFailure)
-        assert "no value is set for GTN_TEST_LIBS" in str(failure.result_details)
+        assert isinstance(outcome.failure, SetCurrentProjectResultFailure)
+        assert "no value is set for GTN_TEST_LIBS" in str(outcome.failure.result_details)
 
 
 class TestListProjectTemplatesEffectivePaths:
@@ -9774,6 +9795,57 @@ situations:
         assert isinstance(result, ActivateWorkspaceProjectResultFailure)
         assert str(workspace_project_path) in str(result.result_details)
         assert "Failed because" in str(result.result_details)
+
+    @pytest.mark.asyncio
+    async def test_flawed_workspace_project_refused_at_boot_stays_on_system_defaults(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A boot-time gate refusal leaves the engine exactly where it was: on system defaults.
+
+        The workspace project loads FLAWED (unresolvable libraries_dir) and the activation gate
+        refuses it before _current_project_id or any config layer moves. If the refusal landed
+        after those mutations instead, boot would finish with the refused project current --
+        on_app_initialization_complete reads _current_project_id to decide whether an explicit
+        project was selected, and a leftover id makes it skip the system-defaults fallback.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            ActivateWorkspaceProjectRequest,
+            ActivateWorkspaceProjectResultFailure,
+        )
+        from griptape_nodes.retained_mode.managers.project_manager import SYSTEM_DEFAULTS_KEY, WORKSPACE_PROJECT_FILE
+
+        self._setup_system_defaults(pm, str(tmp_path))
+        monkeypatch.delenv("GTN_BOOT_LIBS", raising=False)
+
+        flawed_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Broken Boot Project\n"
+            'libraries_dir: "${GTN_BOOT_LIBS}/shared-libraries"\n'
+        )
+        workspace_project_path = tmp_path / WORKSPACE_PROJECT_FILE
+        workspace_project_path.write_text(flawed_yaml)
+
+        def get_config_value_side_effect(key: str, **_: object) -> str | dict | None:
+            if key == "project_file":
+                return None
+            if "project_workspaces" in key:
+                return {}
+            return str(tmp_path)
+
+        cast("Mock", pm._config_manager).get_config_value.side_effect = get_config_value_side_effect
+        cast("Mock", pm._config_manager).workspace_path = tmp_path
+
+        with patch("griptape_nodes.retained_mode.managers.project_manager.File") as mock_file_cls:
+            mock_file_instance = Mock()
+            mock_file_instance.aread_text = AsyncMock(return_value=flawed_yaml)
+            mock_file_cls.return_value = mock_file_instance
+
+            result = await pm.on_activate_workspace_project_request(ActivateWorkspaceProjectRequest())
+
+        assert isinstance(result, ActivateWorkspaceProjectResultFailure)
+        assert "declared paths cannot be resolved" in str(result.result_details)
+        assert "no value is set for GTN_BOOT_LIBS" in str(result.result_details)
+        assert pm._current_project_id == SYSTEM_DEFAULTS_KEY
 
     @pytest.mark.asyncio
     async def test_activate_child_seed_resolves_id_parent_registered_only_in_config(

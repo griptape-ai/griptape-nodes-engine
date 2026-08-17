@@ -941,7 +941,7 @@ class ProjectManager(EngineScoped):
         base); a broken workspace_dir/libraries_dir is recorded as a recoverable FLAWED problem and
         the read proceeds, so the project stays loadable and editable. The refusal to substitute a
         different location behind the user's back moves to the consumers: the activation gate
-        (_apply_workspace_and_libraries_layers), the provisioning preview, and the ancestor walks
+        (the top of _activate_project), the provisioning preview, and the ancestor walks
         each check `is_unresolvable` before falling through to another source.
         """
         read_request = ReadFileRequest(
@@ -1037,7 +1037,7 @@ class ProjectManager(EngineScoped):
         template cannot be merged with a base that cannot be found, so there is nothing coherent to
         load. A broken `workspace_dir` or `libraries_dir` is a RECOVERABLE error (FLAWED): the
         template itself is perfectly representable, only activation must refuse it
-        (_apply_workspace_and_libraries_layers). Keeping such a project loadable is what lets the
+        (the gate at the top of _activate_project). Keeping such a project loadable is what lets the
         user see the problem in the app and fix the bad value there, instead of hand-editing the
         YAML and restarting the engine.
 
@@ -2440,7 +2440,7 @@ class ProjectManager(EngineScoped):
         'default', an unset variable, a macro token) comes back with `is_unresolvable` set. A
         project in that state loads as FLAWED (_read_overlay records the problem instead of refusing
         the overlay), so this outcome IS reachable for loaded projects: activation refuses it
-        (_apply_workspace_and_libraries_layers), the ancestor walks report it as a break in the
+        (the gate at the top of _activate_project), the ancestor walks report it as a break in the
         chain, and the listing shows the affected path as unknown. Only the `str | None` projections
         collapse it to "nothing" -- their callers must gate on `is_unresolvable` first when a
         substitute location would be user-visible.
@@ -2955,11 +2955,14 @@ class ProjectManager(EngineScoped):
         """Set which project user has selected.
 
         Establishes the target project's config/workspace/env layers and reloads
-        libraries. When the reload fails (e.g. an engine_version mismatch or a
-        failed provisioning), the previously active project is re-established so
-        the engine is never left adopting a broken project: the user can keep
-        working in the project they had. Re-establishment runs only after startup
-        (interactive switches); during boot the failure is returned as-is.
+        libraries. When the activation fails (e.g. an engine_version mismatch, a
+        failed provisioning, or the gate refusing an unresolvable declared path),
+        the previously active project is re-established so the engine is never
+        left adopting a broken project: the user can keep working in the project
+        they had. During boot the previous project is the system-defaults rest
+        state (or one a CLI executor explicitly selected), so a failed boot
+        activation lands back on the fallback on_app_initialization_complete
+        expects; the failure is still returned to the caller.
         """
         # Remember the project that was active before this switch so a failed
         # activation can roll back to it. SYSTEM_DEFAULTS_KEY is a valid target.
@@ -3002,11 +3005,13 @@ class ProjectManager(EngineScoped):
 
         outcome = await self._activate_project(resolved_project_id)
         if outcome.failure is not None:
-            # During boot, leave the failure to the caller (soft handling); there is
-            # no prior interactive project to fall back to. After startup, restore the
-            # previously active project so the engine stays in a working state, then
-            # surface the original failure to the GUI.
-            if self._initialization_complete and previous_project_id != resolved_project_id:
+            # Restore the previously active project so the engine stays in a working
+            # state, then surface the original failure to the caller. This runs during
+            # boot too: the previous project is then the system-defaults rest state (or
+            # a project a CLI executor explicitly selected), and rolling back to it is
+            # what keeps _current_project_id off the refused project so
+            # on_app_initialization_complete still reaches its system-defaults fallback.
+            if previous_project_id != resolved_project_id:
                 rollback = await self._activate_project(previous_project_id)
                 if rollback.failure is not None:
                     logger.error(
@@ -3034,6 +3039,38 @@ class ProjectManager(EngineScoped):
             self._event_manager.broadcast_app_event(CurrentProjectChanged(project_id=resolved_project_id))
         return result
 
+    def _refuse_unresolvable_declared_paths(
+        self, project_info: ProjectInfo | None
+    ) -> SetCurrentProjectResultFailure | None:
+        """Activation gate for a project's OWN declared paths, or None when activation may proceed.
+
+        A workspace_dir or libraries_dir that is declared but cannot produce a path (a FLAWED
+        load, or an environment change since load) is refused rather than having the ladders
+        silently substitute the next source for a location the user named. _activate_project
+        calls this before _current_project_id or any config layer changes, so a refusal is a
+        no-op: a boot-time refusal leaves the engine on the state it had, and
+        on_app_initialization_complete still reaches its system-defaults fallback. It also runs
+        AFTER _restore_project_env, so a variable only the OUTGOING project's `environment:`
+        block set cannot make a broken declaration look resolvable. Parent-chain breaks are
+        gated later, in _apply_workspace_and_libraries_layers, because deciding them needs the
+        NEW project's config layer; the caller's rollback restores state for that refusal.
+
+        System defaults and unknown ids have no file-backed template, hence no declared paths
+        to gate.
+        """
+        if project_info is None or project_info.project_file_path is None:
+            return None
+        unresolvable_messages = self.unresolvable_declared_path_messages(project_info)
+        if not unresolvable_messages:
+            return None
+        return SetCurrentProjectResultFailure(
+            result_details=(
+                f"Attempted to activate project '{project_info.project_id}'. Failed because its "
+                f"declared paths cannot be resolved. Fix the value in the project's settings (or "
+                f"the project file) and try again. {' '.join(unresolvable_messages)}"
+            ),
+        )
+
     async def _activate_project(self, resolved_project_id: ProjectID) -> _ProjectActivationOutcome:
         """Establish a project's config/workspace/env layers and reload libraries.
 
@@ -3053,6 +3090,12 @@ class ProjectManager(EngineScoped):
         # project's values must not leak into the new project's workspace decision.
         self._restore_project_env()
 
+        project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
+
+        gate_failure = self._refuse_unresolvable_declared_paths(project_info)
+        if gate_failure is not None:
+            return _ProjectActivationOutcome(failure=gate_failure, workspace_changed=False)
+
         # Capture workspace and library-affecting config BEFORE config changes for comparison after
         old_workspace = self._config_manager.workspace_path
         old_library_config = self._snapshot_library_config()
@@ -3068,7 +3111,6 @@ class ProjectManager(EngineScoped):
         # below remerge via load_project_config()/load_workspace_config()/load_configs().
         self._config_manager.clear_project_layers()
 
-        project_info = self._successfully_loaded_project_templates.get(resolved_project_id)
         if project_info is not None and project_info.project_file_path is not None:
             project_file_path = project_info.project_file_path
             project_dir = project_file_path.parent
@@ -3076,21 +3118,19 @@ class ProjectManager(EngineScoped):
 
             apply_failure = await self._apply_workspace_and_libraries_layers(project_info, project_file_path)
             if apply_failure is not None:
-                # The gate refused an unresolvable declared path. The caller's rollback
-                # re-activates the previous project, which re-establishes its layers and env.
+                # The gate refused an unresolvable parent-chain declaration. The config
+                # layers above have already changed, so the caller's rollback re-activates
+                # the previous project, which re-establishes its layers and env.
                 return _ProjectActivationOutcome(failure=apply_failure, workspace_changed=False)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
-        elif project_info is not None and project_info.project_file_path is None:
-            # Switching to system defaults: clear_project_layers() above already dropped
-            # the prior project's override and config-file paths, so reloading configs now
-            # resolves workspace_path and all config layers from defaults only.
-            self._config_manager.load_configs()
         else:
-            # Unknown project id (no loaded template): clear_project_layers() above already
-            # dropped the prior project's layers, so remerge from defaults rather than leave
-            # config in the cleared, unmerged state.
+            # Switching to system defaults (a loaded template with no backing file) or an
+            # unknown project id (no loaded template): clear_project_layers() above already
+            # dropped the prior project's override and config-file paths, so reloading
+            # configs now resolves workspace_path and all config layers from defaults only,
+            # rather than leaving config in the cleared, unmerged state.
             self._config_manager.load_configs()
 
         # Apply the new project's environment variables to os.environ. Happens after
@@ -3144,14 +3184,17 @@ class ProjectManager(EngineScoped):
     ) -> SetCurrentProjectResultFailure | None:
         """Resolve and apply a project's workspace override + libraries-root override during activation.
 
-        This is also the activation gate for unresolvable declared paths: a project whose own
-        workspace_dir or libraries_dir is declared but cannot produce a path (a FLAWED load, or an
-        environment change since load) is refused here, before any config layer is applied, rather
-        than having the ladders silently substitute the next source for a location the user named.
-        Returns the failure for _activate_project to propagate (the caller's rollback restores the
-        previous project), or None when the layers were applied. The gate runs AFTER
-        _restore_project_env, so a variable only the OUTGOING project's `environment:` block set
-        cannot make a broken declaration look resolvable.
+        This also hosts the parent-chain half of the activation gate: an ancestor whose DECLARED
+        workspace_dir or libraries_dir cannot be resolved blocks the descendant (blocked_reason)
+        rather than having the ladders silently substitute a location the chain never named. The
+        project's OWN declarations are gated earlier, at the top of _activate_project, before any
+        state changes; the parent-chain decision cannot run there because it reads the NEW
+        project's config layers (the project-adjacent workspace_directory short-circuit and the
+        registered-projects index), which _activate_project swaps in just before calling this. A
+        refusal here therefore leaves changed config layers behind, and the caller of
+        _activate_project rolls back to the previous project (system defaults during boot) to
+        restore a consistent state. Returns the failure for _activate_project to propagate, or
+        None when the layers were applied.
 
         Branch 4 (workspace) and branch 1 (libraries) inherit from the parent chain, which is the ONLY
         part of the decision that can vary with what is currently loaded. A project that declares a
@@ -3167,16 +3210,6 @@ class ProjectManager(EngineScoped):
         libraries root clears the override so a stale one from a previously-active sharing project is
         dropped and resolved_libraries_root() falls back to the workspace-relative default.
         """
-        unresolvable_messages = self.unresolvable_declared_path_messages(project_info)
-        if unresolvable_messages:
-            return SetCurrentProjectResultFailure(
-                result_details=(
-                    f"Attempted to activate project '{project_info.project_id}'. Failed because its "
-                    f"declared paths cannot be resolved. Fix the value in the project's settings (or "
-                    f"the project file) and try again. {' '.join(unresolvable_messages)}"
-                ),
-            )
-
         template_workspace_dir = self._resolve_template_workspace_dir(
             project_info.template.workspace_dir, project_file_path
         )
