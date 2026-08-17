@@ -5021,7 +5021,7 @@ class WorkflowManager(EngineScoped):
             or len(serialized_flow_commands.serialized_variable_commands) > 0
         )
 
-    def _generate_node_creation_code(  # noqa: C901, PLR0912, PLR0915
+    def _generate_node_creation_code(  # noqa: C901, PLR0912
         self,
         serialized_node_command: SerializedNodeCommands,
         node_index: int,
@@ -5067,27 +5067,36 @@ class WorkflowManager(EngineScoped):
                     # Special handling for node_names_to_add - these are now UUIDs, convert to variable references
                     if field_value is create_node_request.node_names_to_add and field_value:
                         # field_value is now a list of UUIDs (converted in _serialize_package_nodes_for_local_execution)
-                        # Convert each UUID to an AST Name node referencing the generated variable
-                        node_var_ast_list = []
-                        for node_uuid in field_value:
-                            if node_uuid in node_uuid_to_node_variable_name:
-                                variable_name = node_uuid_to_node_variable_name[node_uuid]
-                                node_var_ast_list.append(ast.Name(id=variable_name, ctx=ast.Load()))
-                            else:
-                                logger.info(
-                                    "NodeGroup child UUID '%s' not found in node_uuid_to_node_variable_name. Available UUIDs: %s...",
-                                    node_uuid,
-                                    list(node_uuid_to_node_variable_name.keys())[:5],
-                                )
-                        if node_var_ast_list:
-                            create_node_request_args.append(
-                                ast.keyword(arg=field.name, value=ast.List(elts=node_var_ast_list, ctx=ast.Load()))
+                        # Convert each UUID to an AST Name node referencing the generated variable.
+                        # Every member was written by now: members live in this group's subflow, and
+                        # a Flow's groups are written after its subflows (see _generate_flow_code).
+                        # Dropping the ones we cannot name would write the group out empty, which
+                        # saves cleanly and then loads as a group the artist has to refill by hand,
+                        # so fail the save instead of quietly losing the grouping.
+                        unnamed_member_uuids = [
+                            node_uuid for node_uuid in field_value if node_uuid not in node_uuid_to_node_variable_name
+                        ]
+                        if unnamed_member_uuids:
+                            group_name = create_node_request.node_name or create_node_request.node_type
+                            logger.error(
+                                "Cannot write the members of group '%s': node(s) %s were never written to the file",
+                                group_name,
+                                ", ".join(unnamed_member_uuids),
                             )
-                        else:
-                            logger.info(
-                                "NodeGroup node_names_to_add resulted in empty variable list. Original UUIDs: %s",
-                                field_value,
+                            msg = f"Attempted to save a workflow. Failed because {len(unnamed_member_uuids)} of the {len(field_value)} nodes in the group '{group_name}' had not been written to the file yet."
+                            raise ValueError(msg)
+                        create_node_request_args.append(
+                            ast.keyword(
+                                arg=field.name,
+                                value=ast.List(
+                                    elts=[
+                                        ast.Name(id=node_uuid_to_node_variable_name[node_uuid], ctx=ast.Load())
+                                        for node_uuid in field_value
+                                    ],
+                                    ctx=ast.Load(),
+                                ),
                             )
+                        )
                     else:
                         create_node_request_args.append(
                             self._keyword_from_field_value(field.name, field_value, create_node_request)
@@ -5258,7 +5267,7 @@ class WorkflowManager(EngineScoped):
             The statements creating each connection
 
         Raises:
-            KeyError: If an endpoint's node has not been written into the file yet
+            ValueError: If an endpoint's node has not been written into the file yet
         """
         # Ensure necessary imports are recorded
         import_recorder.add_from_import(
@@ -5270,16 +5279,23 @@ class WorkflowManager(EngineScoped):
         for connection in serialized_connections:
             # Match the connection's node UUID back to its variable name. Both endpoints must already
             # have been written, since the generated file refers to them by variable. Which Flow
-            # writes a given edge depends on the traversal (see _generate_flow_code), so name the
-            # nodes if that ever slips rather than letting a bare KeyError escape mid-save.
+            # writes a given edge depends on the traversal (see _generate_flow_code), so say what
+            # went missing if that ever slips rather than letting a bare KeyError escape mid-save.
             missing_endpoints = [
                 endpoint_uuid
                 for endpoint_uuid in (connection.source_node_uuid, connection.target_node_uuid)
                 if endpoint_uuid not in node_uuid_to_node_variable_name
             ]
             if missing_endpoints:
+                # The UUIDs are the only handle on nodes that were never written, so log them for
+                # whoever has to debug the save and keep the raised message readable.
+                logger.error(
+                    "Cannot write the connection to '%s': node(s) %s were never written to the file",
+                    connection.target_parameter_name,
+                    ", ".join(missing_endpoints),
+                )
                 msg = f"Attempted to save a workflow. Failed because a connection to '{connection.target_parameter_name}' refers to {len(missing_endpoints)} node(s) that had not been written to the file yet."
-                raise KeyError(msg)
+                raise ValueError(msg)
             source_node_variable_name = node_uuid_to_node_variable_name[connection.source_node_uuid]
             target_node_variable_name = node_uuid_to_node_variable_name[connection.target_node_uuid]
 
@@ -5410,8 +5426,30 @@ class WorkflowManager(EngineScoped):
         unique_values_dict_name: str,
         import_recorder: ImportRecorder,
     ) -> list[ast.stmt]:
+        """Write the statements that restore saved parameter values and lock states.
+
+        Args:
+            set_parameter_value_commands: Value commands for the nodes of one Flow, keyed by node
+            lock_commands: Lock-state commands for those same nodes
+            node_uuid_to_node_variable_name: Variable name written for each node so far, file-wide
+            unique_values_dict_name: Name of the generated dict holding the pickled values
+            import_recorder: Import recorder for tracking imports
+
+        Returns:
+            The statements setting each value
+
+        Raises:
+            ValueError: If a node carrying values has not been written into the file yet
+        """
         parameter_value_asts = []
         for node_uuid, indirect_set_parameter_value_commands in set_parameter_value_commands.items():
+            # Values are keyed per Flow and written after that Flow's nodes and subflows, so the node
+            # is always named by now. Say which node went missing if that ever stops holding, rather
+            # than letting a bare KeyError escape halfway through writing the file.
+            if node_uuid not in node_uuid_to_node_variable_name:
+                logger.error("Cannot write saved values: node '%s' was never written to the file", node_uuid)
+                msg = "Attempted to save a workflow. Failed because a node holding saved values had not been written to the file yet."
+                raise ValueError(msg)
             node_variable_name = node_uuid_to_node_variable_name[node_uuid]
             lock_node_command = lock_commands.get(node_uuid)
             parameter_value_asts.extend(

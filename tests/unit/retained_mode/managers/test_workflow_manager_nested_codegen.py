@@ -131,9 +131,12 @@ class TestNestedFlowCodegen:
 
         content = _generate(griptape_nodes, commands)
 
-        # The child is referenced by its generated variable, not dropped for an empty membership list.
+        # The child is referenced by its generated variable, and it is the variable belonging to the
+        # child rather than to the group, which is what an unresolved membership list used to lose.
         assert "node_names_to_add=[node0_name]" in content
-        assert "node_names_to_add=[]" not in content
+        assert "'Child'" in content
+        child_variable_line = next(line for line in content.splitlines() if "'Child'" in line)
+        assert child_variable_line.lstrip().startswith("node0_name")
 
     def test_writes_a_connection_once_even_though_each_level_reports_it(self, griptape_nodes: Engine) -> None:
         """Every Flow's serialized connections include its subflows', so the same edge repeats.
@@ -195,11 +198,37 @@ class TestNestedFlowCodegen:
         # The group's variable has to be assigned before the connection referring to it is written,
         # otherwise the generated file raises NameError when it is run.
         lines = content.splitlines()
-        group_variable_line = next(
+        group_variable_lines = [
             index for index, line in enumerate(lines) if "'InnerGroup'" in line and "node_names_to_add" in line
+        ]
+        connection_lines = [index for index, line in enumerate(lines) if "CreateConnectionRequest(" in line]
+        assert len(group_variable_lines) == 1, f"expected one line creating InnerGroup, got {group_variable_lines}"
+        assert group_variable_lines[0] < connection_lines[0]
+
+    def test_refuses_to_write_a_group_whose_member_is_not_in_the_file(self, griptape_nodes: Engine) -> None:
+        """Silently dropping the member would save a group the artist has to refill by hand."""
+        missing_child = _node_commands("Child")
+        group = _node_commands("Group", is_node_group=True, node_names_to_add=[missing_child.node_uuid])
+        # The child is claimed as a member but never handed to the generator.
+        commands = _flow_commands("top", nodes=[group])
+
+        with pytest.raises(ValueError, match="nodes in the group 'Group'"):
+            _generate(griptape_nodes, commands)
+
+    def test_refuses_to_write_a_connection_whose_endpoint_is_not_in_the_file(self, griptape_nodes: Engine) -> None:
+        """A connection naming an unwritten node would emit a file that raises NameError."""
+        source = _node_commands("A")
+        missing_target = _node_commands("B")
+        connection = SerializedFlowCommands.IndirectConnectionSerialization(
+            source_node_uuid=source.node_uuid,
+            source_parameter_name="text",
+            target_node_uuid=missing_target.node_uuid,
+            target_parameter_name="text",
         )
-        connection_line = next(index for index, line in enumerate(lines) if "CreateConnectionRequest(" in line)
-        assert group_variable_line < connection_line
+        commands = _flow_commands("top", nodes=[source], connections=[connection])
+
+        with pytest.raises(ValueError, match="had not been written to the file yet"):
+            _generate(griptape_nodes, commands)
 
     def test_emits_valid_python(self, griptape_nodes: Engine) -> None:
         """Whatever the nesting depth, the file has to parse."""

@@ -475,6 +475,9 @@ class FlowManager(EngineScoped):
         Serialization walks parent/child links, so a subflow left parented to the top-level flow is
         saved outside its enclosing group and its members go missing on load.
 
+        No peer manager has to be told: ``_name_to_parent_name`` is the only record of parentage, and
+        NodeManager tracks a node's flow by name, which reparenting does not change.
+
         Args:
             flow_name: The Flow to move
             new_parent_flow_name: The Flow that should become its parent
@@ -4388,12 +4391,12 @@ class FlowManager(EngineScoped):
         if self.check_for_existing_running_flow():
             # If flow already exists, throw an error
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
-            raise FlowDeserializationError(errormsg)
+            raise RuntimeError(errormsg)
 
         if start_node is None:
             if self._global_flow_queue.empty():
                 errormsg = "No Flow exists. You must create at least one control connection."
-                raise FlowDeserializationError(errormsg)
+                raise RuntimeError(errormsg)
             queue_item = self._global_flow_queue.get()
             start_node = queue_item.node
             self._global_flow_queue.task_done()
