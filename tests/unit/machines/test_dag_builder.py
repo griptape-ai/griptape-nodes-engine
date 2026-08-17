@@ -3,10 +3,21 @@
 # ruff: noqa: PLR2004
 
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from griptape_nodes.exe_types.node_types import BaseNode
 from griptape_nodes.machines.dag_builder import DagBuilder, DagNode, DagNodeCategories, NodeState
+
+
+def _engine_with_connections(connections: MagicMock) -> MagicMock:
+    """Build a stub engine whose flow_manager hands back `connections`.
+
+    DagBuilder resolves connections through its injected engine, so a stub engine replaces what
+    used to be a patch of the process-wide facade.
+    """
+    engine = MagicMock()
+    engine.flow_manager.get_connections.return_value = connections
+    return engine
 
 
 class TestDagNodeCategories:
@@ -84,29 +95,25 @@ class TestDagBuilder:
 
     def test_add_node_with_dependencies_no_connections(self) -> None:
         """Test adding a node with no upstream dependencies."""
-        dag_builder = DagBuilder()
         mock_node = MagicMock(spec=BaseNode)
         mock_node.name = "test_node"
         mock_node.parameters = []
 
-        # Mock the FlowManager to return no connections
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            mock_connections.get_connected_node.return_value = None
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        # The engine reports no connections
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = None
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
-            added_nodes = dag_builder.add_node_with_dependencies(mock_node)
+        added_nodes = dag_builder.add_node_with_dependencies(mock_node)
 
-            assert len(added_nodes) == 1
-            assert added_nodes[0] is mock_node
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert "test_node" in default_graph.nodes()
+        assert len(added_nodes) == 1
+        assert added_nodes[0] is mock_node
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert "test_node" in default_graph.nodes()
 
     def test_add_node_with_dependencies_with_upstream_nodes(self) -> None:
         """Test adding a node with upstream dependencies."""
-        dag_builder = DagBuilder()
-
         # Create mock nodes
         upstream_node = MagicMock(spec=BaseNode)
         upstream_node.name = "upstream_node"
@@ -124,35 +131,31 @@ class TestDagBuilder:
         mock_param.type = "str"  # Not CONTROL_TYPE
         downstream_node.parameters = [mock_param]
 
-        # Mock the FlowManager connections
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            # First call (for downstream_node): return upstream connection
-            # Second call (for upstream_node): return None
-            mock_connections.get_connected_node.side_effect = [
-                (upstream_node, MagicMock()),  # downstream_node has upstream dependency
-                None,  # upstream_node has no dependencies
-            ]
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        mock_connections = MagicMock()
+        # First call (for downstream_node): return upstream connection
+        # Second call (for upstream_node): return None
+        mock_connections.get_connected_node.side_effect = [
+            (upstream_node, MagicMock()),  # downstream_node has upstream dependency
+            None,  # upstream_node has no dependencies
+        ]
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
-            added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
+        added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
 
-            assert len(added_nodes) == 2
-            assert upstream_node in added_nodes
-            assert downstream_node in added_nodes
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert "upstream_node" in default_graph.nodes()
-            assert "downstream_node" in default_graph.nodes()
+        assert len(added_nodes) == 2
+        assert upstream_node in added_nodes
+        assert downstream_node in added_nodes
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert "upstream_node" in default_graph.nodes()
+        assert "downstream_node" in default_graph.nodes()
 
-            # Check that edge was added
-            assert default_graph.in_degree("downstream_node") == 1
-            assert default_graph.in_degree("upstream_node") == 0
+        # Check that edge was added
+        assert default_graph.in_degree("downstream_node") == 1
+        assert default_graph.in_degree("upstream_node") == 0
 
     def test_add_node_with_dependencies_existing_upstream_node(self) -> None:
         """Test adding a node when upstream dependency already exists in DAG."""
-        dag_builder = DagBuilder()
-
         # Create mock nodes
         upstream_node = MagicMock(spec=BaseNode)
         upstream_node.name = "upstream_node"
@@ -169,33 +172,29 @@ class TestDagBuilder:
         mock_param = MagicMock()
         mock_param.type = "str"  # Not CONTROL_TYPE
         downstream_node.parameters = [mock_param]
+
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.return_value = (upstream_node, MagicMock())
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
         # Add upstream node first
         dag_builder.add_node(upstream_node)
 
-        # Mock the FlowManager connections
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            mock_connections.get_connected_node.return_value = (upstream_node, MagicMock())
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
 
-            added_nodes = dag_builder.add_node_with_dependencies(downstream_node)
+        # Only downstream_node should be added (upstream already existed)
+        assert len(added_nodes) == 1
+        assert added_nodes[0] is downstream_node
 
-            # Only downstream_node should be added (upstream already existed)
-            assert len(added_nodes) == 1
-            assert added_nodes[0] is downstream_node
-
-            # Both nodes should be in the DAG with proper edge
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert len(default_graph.nodes()) == 2
-            assert default_graph.in_degree("downstream_node") == 1
-            assert default_graph.in_degree("upstream_node") == 0
+        # Both nodes should be in the DAG with proper edge
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert len(default_graph.nodes()) == 2
+        assert default_graph.in_degree("downstream_node") == 1
+        assert default_graph.in_degree("upstream_node") == 0
 
     def test_add_node_with_dependencies_prevents_cycles(self) -> None:
         """Test that add_node_with_dependencies handles potential cycles using visited set."""
-        dag_builder = DagBuilder()
-
         # Create mock nodes that could create a cycle
         node_a = MagicMock(spec=BaseNode)
         node_a.name = "node_a"
@@ -215,39 +214,38 @@ class TestDagBuilder:
         node_a.parameters = [param_a]
         node_b.parameters = [param_b]
 
-        # Mock the FlowManager connections to simulate a cycle - but limit recursion depth
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            call_count = {"count": 0}  # Track calls to prevent infinite recursion in test
+        # Connections simulate a cycle - but limit recursion depth
+        mock_connections = MagicMock()
+        call_count = {"count": 0}  # Track calls to prevent infinite recursion in test
 
-            def mock_get_connected_node(
-                current_node: Any,
-                param: Any,  # noqa: ARG001
-                direction: Any = None,  # noqa: ARG001
-                *,
-                include_internal: bool = True,  # noqa: ARG001
-            ) -> Any:
-                call_count["count"] += 1
-                # Safety limit to prevent infinite recursion in test environment
-                if call_count["count"] > 10:
-                    return None
-
-                if current_node.name == "node_a":
-                    return (node_b, MagicMock())
-                if current_node.name == "node_b":
-                    return (node_a, MagicMock())
+        def mock_get_connected_node(
+            current_node: Any,
+            param: Any,  # noqa: ARG001
+            direction: Any = None,  # noqa: ARG001
+            *,
+            include_internal: bool = True,  # noqa: ARG001
+        ) -> Any:
+            call_count["count"] += 1
+            # Safety limit to prevent infinite recursion in test environment
+            if call_count["count"] > 10:
                 return None
 
-            mock_connections.get_connected_node.side_effect = mock_get_connected_node
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+            if current_node.name == "node_a":
+                return (node_b, MagicMock())
+            if current_node.name == "node_b":
+                return (node_a, MagicMock())
+            return None
 
-            # This should not cause infinite recursion due to visited set
-            added_nodes = dag_builder.add_node_with_dependencies(node_a)
+        mock_connections.get_connected_node.side_effect = mock_get_connected_node
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
-            # Both nodes should be added - the visited set should prevent infinite recursion
-            assert len(added_nodes) >= 1  # At least the starting node
-            assert node_a in added_nodes
-            # node_b may or may not be added depending on how the visited set handles the cycle
+        # This should not cause infinite recursion due to visited set
+        added_nodes = dag_builder.add_node_with_dependencies(node_a)
+
+        # Both nodes should be added - the visited set should prevent infinite recursion
+        assert len(added_nodes) >= 1  # At least the starting node
+        assert node_a in added_nodes
+        # node_b may or may not be added depending on how the visited set handles the cycle
 
     def test_clear_removes_all_nodes_and_references(self) -> None:
         """Test that clear() removes all nodes and references from the DAG builder."""
@@ -287,8 +285,6 @@ class TestDagBuilder:
 
     def test_clear_removes_edges(self) -> None:
         """Test that clear() also removes all edges from the graph."""
-        dag_builder = DagBuilder()
-
         # Create nodes with a dependency
         upstream_node = MagicMock(spec=BaseNode)
         upstream_node.name = "upstream_node"
@@ -306,28 +302,27 @@ class TestDagBuilder:
         mock_param.type = "str"  # Not CONTROL_TYPE
         downstream_node.parameters = [mock_param]
 
-        # Mock the FlowManager to create an edge
-        with patch("griptape_nodes.retained_mode.griptape_nodes.GriptapeNodes.FlowManager") as mock_flow_manager:
-            mock_connections = MagicMock()
-            mock_connections.get_connected_node.side_effect = [
-                (upstream_node, MagicMock()),  # downstream has upstream dependency
-                None,  # upstream has no dependencies
-            ]
-            mock_flow_manager.return_value.get_connections.return_value = mock_connections
+        # Connections that create an edge
+        mock_connections = MagicMock()
+        mock_connections.get_connected_node.side_effect = [
+            (upstream_node, MagicMock()),  # downstream has upstream dependency
+            None,  # upstream has no dependencies
+        ]
+        dag_builder = DagBuilder(_engine_with_connections(mock_connections))
 
-            dag_builder.add_node_with_dependencies(downstream_node)
+        dag_builder.add_node_with_dependencies(downstream_node)
 
-            # Verify edge was created
-            default_graph = dag_builder.graphs.get("default")
-            assert default_graph is not None
-            assert default_graph.in_degree("downstream_node") == 1
+        # Verify edge was created
+        default_graph = dag_builder.graphs.get("default")
+        assert default_graph is not None
+        assert default_graph.in_degree("downstream_node") == 1
 
-            # Clear the DAG
-            dag_builder.clear()
+        # Clear the DAG
+        dag_builder.clear()
 
-            # Verify everything is cleared including edges
-            assert len(dag_builder.graphs) == 0
-            assert dag_builder.node_to_reference == {}
+        # Verify everything is cleared including edges
+        assert len(dag_builder.graphs) == 0
+        assert dag_builder.node_to_reference == {}
 
     def test_node_state_preservation(self) -> None:
         """Test that DagNode state is preserved correctly."""

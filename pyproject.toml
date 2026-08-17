@@ -158,22 +158,32 @@ ignore = [
 "src/griptape_nodes/servers/**" = ["TID251"]
 "src/griptape_nodes/bootstrap/**" = ["TID251"]
 "src/griptape_nodes/app/**" = ["TID251"]
+# WorkflowPackager is constructed by node libraries, not by the engine: the standard library's
+# publish_workflow/local_publisher.py does `WorkflowPackager(workflow_name)` off the public
+# `retained_mode.publishing` re-export. Nothing inside src/ constructs it, so there is no Engine
+# to hand it and it belongs on this side of the split.
+"src/griptape_nodes/retained_mode/publishing/workflow_packager.py" = ["TID251"]
 #
 # Group 2 -- not yet migrated. Each of these should eventually receive an Engine instead.
 # Deleting an entry from this list is the definition of done; do not add new entries.
-"src/griptape_nodes/common/**" = ["TID251"]
+# scan.py reaches the facade from a module-level free function, so its engine has to be threaded
+# from os_manager.on_scan_sequences_request down through scan_sequences. It moves with the other
+# free-function modules rather than with the class-based execution internals.
+"src/griptape_nodes/common/sequences/scan.py" = ["TID251"]
+# GriptapeCloudStorageDriver is constructed from inside exe_types
+# (param_components/artifact_url/public_artifact_url_parameter.py), which has no Engine of its own
+# yet, so drivers cannot come off this list until exe_types does.
 "src/griptape_nodes/drivers/**" = ["TID251"]
 "src/griptape_nodes/exe_types/**" = ["TID251"]
 "src/griptape_nodes/files/**" = ["TID251"]
-"src/griptape_nodes/machines/**" = ["TID251"]
 # WorkflowRegistry is still a process-global fake singleton reaching the facade for config.
 # Making it engine-owned is its own change, since it alters what node libraries import.
 "src/griptape_nodes/node_library/workflow_registry.py" = ["TID251"]
 "src/griptape_nodes/utils/**" = ["TID251"]
-"src/griptape_nodes/version_compatibility/**" = ["TID251"]
 "src/griptape_nodes/retained_mode/file_metadata/**" = ["TID251"]
-"src/griptape_nodes/retained_mode/publishing/**" = ["TID251"]
-"src/griptape_nodes/retained_mode/managers/artifact_providers/**" = ["TID251"]
+# project_packager.py reaches the facade from a module-level free function. Its engine has to be
+# threaded from project_manager.on_export_project_request through package_project_to_zip.
+"src/griptape_nodes/retained_mode/publishing/project_packager.py" = ["TID251"]
 
 [tool.ruff.lint.flake8-type-checking]
 runtime-evaluated-base-classes = ["pydantic.BaseModel"]

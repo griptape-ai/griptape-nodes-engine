@@ -10,7 +10,7 @@ worker path the orchestrator stub has not seen the writes, so the copy-back
 is the first (and only) emit per key.
 """
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -19,13 +19,11 @@ from griptape_nodes.common.node_executor import NodeExecutor
 from griptape_nodes.exe_types.node_types import TrackedParameterOutputValues
 from griptape_nodes.retained_mode.events.execution_events import ExecuteNodeResultSuccess
 
-_GRIPTAPE_NODES_PATH = "griptape_nodes.common.node_executor.GriptapeNodes"
-
 _EXPECTED_FRESH_OUTPUT_EMITS = 2
 
 
 def _make_executor() -> NodeExecutor:
-    return NodeExecutor.__new__(NodeExecutor)
+    return NodeExecutor(engine=MagicMock())
 
 
 def _make_node_with_tracked_outputs(name: str = "TestNode") -> MagicMock:
@@ -47,9 +45,10 @@ class TestLocalExecuteCopyBack:
         node = _make_node_with_tracked_outputs()
         result = ExecuteNodeResultSuccess(result_details="ok", parameter_output_values={"out": 42})
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.ahandle_request = AsyncMock(return_value=result)
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(return_value=result)
+        await executor.execute(node)
 
         assert node.parameter_output_values == {"out": 42}
         node.set_parameter_value.assert_not_called()
@@ -69,12 +68,11 @@ class TestLocalExecuteCopyBack:
                 parameter_output_values=dict(node.parameter_output_values),
             )
 
-        with (
-            patch(_GRIPTAPE_NODES_PATH) as mock_gn,
-            patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit,
-        ):
-            mock_gn.ahandle_request = AsyncMock(side_effect=fake_handle)
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
+            await executor.execute(node)
 
         assert mock_emit.call_count == 1
         assert node.parameter_output_values == {"out": 42}
@@ -94,12 +92,11 @@ class TestLocalExecuteCopyBack:
                 parameter_output_values={"a": 1, "b": 2},
             )
 
-        with (
-            patch(_GRIPTAPE_NODES_PATH) as mock_gn,
-            patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit,
-        ):
-            mock_gn.ahandle_request = AsyncMock(side_effect=fake_handle)
-            await _make_executor().execute(node)
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.ahandle_request = AsyncMock(side_effect=fake_handle)
+        with patch.object(TrackedParameterOutputValues, "_emit_parameter_change_event") as mock_emit:
+            await executor.execute(node)
 
         # Two fresh keys; each __setitem__ sees old_value None != new_value.
         assert mock_emit.call_count == _EXPECTED_FRESH_OUTPUT_EMITS

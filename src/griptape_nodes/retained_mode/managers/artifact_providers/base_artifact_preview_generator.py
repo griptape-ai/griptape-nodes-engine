@@ -5,17 +5,19 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.managers.artifact_providers.utils import (
     normalize_friendly_name_to_key,
 )
 
 if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_parameters import (
         BaseGeneratorParameters,
     )
 
 
-class BaseArtifactPreviewGenerator(ABC):
+class BaseArtifactPreviewGenerator(EngineScoped, ABC):
     """Abstract base class for preview generators.
 
     Preview generators perform the actual conversion work.
@@ -31,6 +33,8 @@ class BaseArtifactPreviewGenerator(ABC):
         destination_preview_directory: str,
         destination_preview_file_name: str,
         _params: dict[str, Any],
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the preview generator.
 
@@ -40,10 +44,12 @@ class BaseArtifactPreviewGenerator(ABC):
             destination_preview_directory: Directory where the preview should be saved
             destination_preview_file_name: Filename for the preview
             _params: Generator-specific parameters (validated by subclass __init__)
+            engine: The engine whose request bus this generator reads and writes files through
 
         Note:
             Subclass __init__ must validate _params and set self.params to a Pydantic model instance.
         """
+        super().__init__(engine)
         self.source_file_location = source_file_location
         self.preview_format = preview_format
         self.destination_preview_directory = destination_preview_directory
