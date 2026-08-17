@@ -3744,6 +3744,18 @@ class LibraryManager(EngineScoped):
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
+            # Mirror the activation gate: a project whose declared workspace_dir/libraries_dir
+            # cannot be resolved will be refused by activation, so previewing a plan built from
+            # fallback locations would show the user changes that can never be applied.
+            project_info = self.engine.project_manager.project_info_for_request(request.project_id)
+            if project_info is not None:
+                unresolvable = self.engine.project_manager.unresolvable_declared_path_messages(project_info)
+                if unresolvable:
+                    return PreviewProjectProvisioningResultFailure(
+                        result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
+                        f"Failed because its declared paths cannot be resolved, so activation would refuse it. "
+                        f"{' '.join(unresolvable)}",
+                    )
             dirs = await self.engine.project_manager.resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(

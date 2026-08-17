@@ -4230,14 +4230,16 @@ class TestResolveWorkspaceDirForProjectId:
         assert "GTN_TEST_WS" not in str(result)
 
     @pytest.mark.asyncio
-    async def test_unloaded_workspace_dir_with_unset_env_var_falls_through(
+    async def test_unloaded_workspace_dir_with_unset_env_var_answers_nothing(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """An unset env var in workspace_dir falls through to the next ladder source, not a literal path.
+        """An unset env var in workspace_dir answers None -- not a fallback, not a literal path.
 
-        The value cannot be resolved, so the ladder behaves as if the project declared nothing --
-        which is what activation does -- rather than creating a directory named `${GTN_TEST_WS}`
-        under the project.
+        The value cannot be resolved, so there is no honest workspace to report: activation refuses
+        such a project rather than falling through, so answering the global default here would name
+        a path the project will never use. (Creating a directory literally named `${GTN_TEST_WS}`
+        under the project would be even worse.) None is the "no hint to show" signal the workspace
+        event already defines.
         """
         project_file = tmp_path / "c" / "griptape-nodes-project.yml"
         project_file.parent.mkdir(parents=True)
@@ -4251,7 +4253,7 @@ class TestResolveWorkspaceDirForProjectId:
         )
         result = await pm.resolve_workspace_dir_for_project_id("C")
 
-        assert result == self._resolved("/global/ws")
+        assert result is None
 
     @pytest.mark.asyncio
     async def test_unloaded_parent_link_expands_env_var(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -8781,13 +8783,19 @@ directories:
 
 
 class TestProjectPathFieldValidation:
-    """A declared path field that cannot produce a path fails the load, naming field, line and cause.
+    """A declared path field that cannot produce a path is recorded, naming field, line and cause.
 
     The rule, uniform across `workspace_dir`, `libraries_dir` and `parent_project_path`: ABSENT means
     "fall through to the next source", PRESENT-but-unresolvable means the project is broken. The only
     alternative is to discard what the user wrote and put their workspace or their libraries somewhere
     they never named, which is how a shared project ends up silently installing a second copy of every
     library on a teammate's machine.
+
+    What "broken" costs differs by field. A broken `parent_project_path` fails the load (UNUSABLE):
+    the template cannot be merged without its base. A broken `workspace_dir`/`libraries_dir` loads
+    FLAWED with an ERROR problem: the project stays loadable and editable -- so the user can fix the
+    bad value in the app instead of hand-editing YAML and restarting -- while activation refuses it
+    (the gate in _apply_workspace_and_libraries_layers).
 
     These tests drive the REAL `_read_overlay` through `on_load_project_template_request` with YAML on
     disk, because `_read_overlay` is where the check lives -- the `_build_pm` harness used by the
@@ -8844,16 +8852,19 @@ class TestProjectPathFieldValidation:
             return await pm.on_load_project_template_request(LoadProjectTemplateRequest(project_path=project_path))
 
     @pytest.mark.asyncio
-    async def test_unset_variable_in_libraries_dir_fails_the_load(
+    async def test_unset_variable_in_libraries_dir_loads_flawed(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`${GTN_TEST_LIBS}/libraries` with the variable unset is an error, not a fallback.
+        """`${GTN_TEST_LIBS}/libraries` with the variable unset is a recorded error, not a fallback.
 
-        An unresolvable declaration is never quietly replaced with `<workspace>/libraries`:
-        installing libraries somewhere the project never named is worse than refusing to open.
+        An unresolvable declaration is never quietly replaced with `<workspace>/libraries` --
+        activation refuses the project. But the project still LOADS (FLAWED, with the field, cause
+        and line on the validation) so the bad value can be seen and fixed in the app instead of
+        hand-editing YAML and restarting the engine.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.common.project_templates.validation import ProjectValidationProblemSeverity
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
@@ -8865,22 +8876,24 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.FLAWED
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
+        assert problems[0].severity is ProjectValidationProblemSeverity.ERROR
         assert "no value is set for GTN_TEST_LIBS" in problems[0].message
         assert problems[0].line_number == _line_of(project_yaml, "libraries_dir:")
 
     @pytest.mark.asyncio
-    async def test_macro_token_in_workspace_dir_fails_the_load(self, pm: ProjectManager, tmp_path: Path) -> None:
+    async def test_macro_token_in_workspace_dir_loads_flawed(self, pm: ProjectManager, tmp_path: Path) -> None:
         """A `{macro}` token in a path field is refused rather than becoming a folder of that name.
 
         Macros resolve against runtime state that does not exist yet when these fields are read, so
-        `{outputs}` here can only ever mean a directory literally called `{outputs}`.
+        `{outputs}` here can only ever mean a directory literally called `{outputs}`. The project
+        still loads (FLAWED) so the field can be corrected in the app; activation refuses it.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
         project_yaml = (
@@ -8889,8 +8902,8 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.FLAWED
         problems = [p for p in result.validation.problems if p.field_path == "workspace_dir"]
         assert len(problems) == 1
         assert "macro tokens are not supported" in problems[0].message
@@ -8898,17 +8911,17 @@ class TestProjectPathFieldValidation:
         assert problems[0].line_number == _line_of(project_yaml, "workspace_dir:")
 
     @pytest.mark.asyncio
-    async def test_percent_reference_in_libraries_dir_fails_the_load(
+    async def test_percent_reference_in_libraries_dir_loads_flawed(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A `%NAME%` reference that expands to nothing fails the load on every platform.
+        """A `%NAME%` reference that expands to nothing is a recorded error on every platform.
 
         `%NAME%` expands only on Windows, so elsewhere it never resolves at all. Either way the value
         has no answer, and a real directory whose name happens to contain `%SHOT_CODE%` is now refused
         rather than used literally -- the deliberate cost of treating the form as a variable.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.delenv("SHOT_CODE", raising=False)
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
@@ -8918,24 +8931,24 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.FLAWED
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert "no value is set for SHOT_CODE" in problems[0].message
 
     @pytest.mark.asyncio
-    async def test_platform_gap_in_libraries_dir_fails_the_load(
+    async def test_platform_gap_in_libraries_dir_loads_flawed(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A per-platform mapping with no entry for this OS and no `default` fails the load.
+        """A per-platform mapping with no entry for this OS and no `default` is a recorded error.
 
         `default` exists precisely to say what the platforms you did not name should get. A mapping
         that names only Windows says nothing about a Linux teammate, so there is nothing to honor and
-        nothing to guess.
+        nothing to guess -- the project loads FLAWED and activation refuses it.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.setattr("sys.platform", "linux")
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
@@ -8949,8 +8962,8 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.FLAWED
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert "no path for this platform (linux) and no 'default'" in problems[0].message
@@ -8959,7 +8972,7 @@ class TestProjectPathFieldValidation:
         assert problems[0].line_number == _line_of(project_yaml, "darwin:")
 
     @pytest.mark.asyncio
-    async def test_quoted_variable_value_fails_the_load_instead_of_anchoring_under_the_project(
+    async def test_quoted_variable_value_loads_flawed_instead_of_anchoring_under_the_project(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A variable whose value carries quotes is refused, not quietly relocated.
@@ -8970,7 +8983,7 @@ class TestProjectPathFieldValidation:
         libraries installing somewhere the project never named, reported as a clean resolve.
         """
         from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.setenv("GTN_TEST_QUOTED_ROOT", '"/mnt/studio"')
         project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
@@ -8982,8 +8995,8 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.FLAWED
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert "expanded to a quoted value" in problems[0].message
@@ -9031,7 +9044,7 @@ class TestProjectPathFieldValidation:
         `sys.platform` of `win32` OR `linux` must be absent from the message, and neither is the
         value being reported.
         """
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.setattr(
             "griptape_nodes.common.project_templates.directory.active_platform_key",
@@ -9048,7 +9061,7 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert "no path for this platform (windows) and no 'default'" in problems[0].message
@@ -9065,7 +9078,7 @@ class TestProjectPathFieldValidation:
         a fix that fails validation, which is the same confidently-wrong-cause failure this whole
         field-resolution path exists to avoid. `default` is the only way out, and the message says so.
         """
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.setattr(
             "griptape_nodes.common.project_templates.directory.active_platform_key",
@@ -9083,7 +9096,7 @@ class TestProjectPathFieldValidation:
 
         result = await self._load(pm, {project_path: project_yaml}, project_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
         problems = [p for p in result.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert f"no path for this platform (unsupported ({sys.platform})) and no 'default'" in problems[0].message
@@ -9152,17 +9165,18 @@ class TestProjectPathFieldValidation:
         assert result.template.libraries_dir == "${GTN_TEST_LIBS}/libraries"
 
     @pytest.mark.asyncio
-    async def test_child_of_project_with_unresolvable_libraries_dir_also_fails(
+    async def test_child_of_project_with_unresolvable_libraries_dir_loads_but_cannot_inherit(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A broken parent brings its descendants down, with the error on the child's parent link.
+        """A FLAWED parent no longer bricks its descendants, but they cannot activate around it.
 
-        This is the accepted cost of failing closed: a shared base project pinning an unset variable
-        stops loading for every project derived from it. The alternative is each of those children
-        quietly installing libraries somewhere the base never named.
+        The child loads (its own fields are fine, and the parent's overlay is readable), so the
+        family stays visible and fixable in the app. What is preserved from the old fail-closed
+        behavior is the guarantee that mattered: the libraries decision comes back BLOCKED rather
+        than falling back to the workspace default, so no descendant quietly installs libraries
+        somewhere the base never named.
         """
-        from griptape_nodes.common.project_templates import ProjectValidationStatus
-        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultFailure
+        from griptape_nodes.retained_mode.events.project_events import LoadProjectTemplateResultSuccess
 
         monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
         base_path = (tmp_path / "base.yml").resolve()
@@ -9173,25 +9187,36 @@ class TestProjectPathFieldValidation:
         child_yaml = (
             f'project_template_schema_version: "0.3.3"\nname: Child\nparent_project_path: "{base_path.as_posix()}"\n'
         )
+        # The offline walk locates an unregistered legacy parent by checking the real filesystem
+        # (_resolve_parent_id_to_path), so the files must exist on disk as well as in the router.
+        base_path.write_text(base_yaml, encoding="utf-8")
+        child_path.write_text(child_yaml, encoding="utf-8")
+        files = {base_path: base_yaml, child_path: child_yaml}
 
-        result = await self._load(pm, {base_path: base_yaml, child_path: child_yaml}, child_path)
+        result = await self._load(pm, files, child_path)
 
-        assert isinstance(result, LoadProjectTemplateResultFailure)
-        assert result.validation.status is ProjectValidationStatus.UNUSABLE
-        problems = [p for p in result.validation.problems if p.field_path == "parent_project_path"]
-        assert len(problems) == 1
-        assert "could not be loaded" in problems[0].message
-        assert problems[0].line_number == _line_of(child_yaml, "parent_project_path:")
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+
+        mock_engine = MagicMock()
+        with patch.object(pm, "_engine", mock_engine):
+            mock_engine.ahandle_request = self._file_router(files)
+            libraries_decision = await pm._decide_libraries_root_from_disk(child_path, None, {})
+
+        assert libraries_decision.libraries_root is None
+        assert libraries_decision.blocked_reason is not None
+        assert "cannot be resolved" in libraries_decision.blocked_reason
+        assert "no value is set for GTN_TEST_LIBS" in libraries_decision.blocked_reason
 
     @pytest.mark.asyncio
-    async def test_failed_project_is_listed_as_failed_with_no_paths(
+    async def test_flawed_project_is_listed_as_loaded_with_no_libraries_root(
         self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A refused project surfaces in failed_to_load, and reports no paths at all.
+        """A FLAWED project surfaces in successfully_loaded, with no answer for the broken path.
 
-        The GUI needs to distinguish "here is where this project's libraries live" from "this project
-        is broken" -- so a failed entry carries its validation problems and nothing that looks like an
-        answer.
+        The GUI needs both halves: the project appears in the list (so it can be opened and the bad
+        value fixed in the app), and its libraries_root is None rather than a fallback path it will
+        never use -- the validation problems on the entry say why. The workspace, which the project
+        does not declare, still resolves normally.
         """
         from griptape_nodes.retained_mode.events.project_events import (
             ListProjectTemplatesRequest,
@@ -9214,13 +9239,79 @@ class TestProjectPathFieldValidation:
             )
 
         assert isinstance(listing, ListProjectTemplatesResultSuccess)
-        assert listing.successfully_loaded == []
-        assert len(listing.failed_to_load) == 1
-        failed = listing.failed_to_load[0]
-        assert failed.project_id == str(project_path)
-        assert failed.workspace_dir is None
-        assert failed.libraries_root is None
-        assert any(p.field_path == "libraries_dir" for p in failed.validation.problems)
+        assert listing.failed_to_load == []
+        assert len(listing.successfully_loaded) == 1
+        entry = listing.successfully_loaded[0]
+        assert entry.workspace_dir is not None
+        assert entry.libraries_root is None
+        assert any(p.field_path == "libraries_dir" for p in entry.validation.problems)
+
+    @pytest.mark.asyncio
+    async def test_activation_gate_refuses_a_flawed_project(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A loadable FLAWED project is refused at activation, naming the field and cause.
+
+        Loading FLAWED is what keeps the project editable; this is the other half of the contract --
+        the broken declaration is never silently replaced with a fallback location at activation.
+        The gate returns before any config layer is touched, so a refusal leaves no half-applied
+        state for the caller's rollback to fight.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectResultFailure,
+        )
+
+        monkeypatch.delenv("GTN_TEST_LIBS", raising=False)
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        project_info = pm._successfully_loaded_project_templates[result.project_id]
+
+        failure = await pm._apply_workspace_and_libraries_layers(project_info, project_path)
+
+        assert isinstance(failure, SetCurrentProjectResultFailure)
+        assert "declared paths cannot be resolved" in str(failure.result_details)
+        assert "no value is set for GTN_TEST_LIBS" in str(failure.result_details)
+
+    @pytest.mark.asyncio
+    async def test_activation_gate_re_resolves_after_the_environment_breaks(
+        self, pm: ProjectManager, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The gate re-resolves at activation time instead of trusting the load-time verdict.
+
+        A project can load GOOD and then have its variable deleted (or the reverse); the environment
+        the declaration resolves against is live state. Activating on the stale verdict would apply
+        a workspace/libraries layer built from a value that no longer exists.
+        """
+        from griptape_nodes.common.project_templates import ProjectValidationStatus
+        from griptape_nodes.retained_mode.events.project_events import (
+            LoadProjectTemplateResultSuccess,
+            SetCurrentProjectResultFailure,
+        )
+
+        monkeypatch.setenv("GTN_TEST_LIBS", str(tmp_path / "studio"))
+        project_path = (tmp_path / "griptape-nodes-project.yml").resolve()
+        project_yaml = (
+            'project_template_schema_version: "0.3.3"\n'
+            "name: Studio Project\n"
+            'libraries_dir: "${GTN_TEST_LIBS}/libraries"\n'
+        )
+        result = await self._load(pm, {project_path: project_yaml}, project_path)
+        assert isinstance(result, LoadProjectTemplateResultSuccess)
+        assert result.validation.status is ProjectValidationStatus.GOOD
+        project_info = pm._successfully_loaded_project_templates[result.project_id]
+
+        monkeypatch.delenv("GTN_TEST_LIBS")
+        failure = await pm._apply_workspace_and_libraries_layers(project_info, project_path)
+
+        assert isinstance(failure, SetCurrentProjectResultFailure)
+        assert "no value is set for GTN_TEST_LIBS" in str(failure.result_details)
 
 
 class TestListProjectTemplatesEffectivePaths:

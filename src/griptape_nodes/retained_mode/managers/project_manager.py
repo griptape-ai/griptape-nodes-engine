@@ -457,10 +457,34 @@ class WorkspaceDecision(NamedTuple):
     parent-chain inheritance, and the global-default branches. It is False when env
     vars or the project-adjacent config supply workspace_directory, because activation
     then leaves the override unset so the workspace config layer can re-point it.
+
+    `blocked_reason` is set when the parent-chain walk found an ancestor whose DECLARED
+    workspace_dir cannot be resolved (a FLAWED ancestor). The carried workspace_dir is then the
+    fallback the ladder would otherwise use -- callers that only display may show nothing, but
+    activation must refuse rather than apply it, or a child would adopt a workspace its chain never
+    named. Environmental chain breaks (moved/unreadable ancestor files, cycles) do NOT set this;
+    those keep the long-standing warn-and-fall-back behavior.
     """
 
     workspace_dir: Path
     apply_override: bool
+    blocked_reason: str | None = None
+
+
+class LibrariesRootDecision(NamedTuple):
+    """The libraries root a project resolves to from disk, or why no answer can be trusted.
+
+    `libraries_root` is the project's own or nearest ancestor's declared libraries_dir, or None when
+    nothing in the chain declares one (callers fall back to the workspace-relative default).
+    `blocked_reason` is set when an ancestor DECLARES a libraries_dir that cannot be resolved (a
+    FLAWED ancestor): the chain names a location the engine cannot honor, so activation refuses the
+    descendant instead of installing into the fallback -- the exact substitution the load-time
+    validation exists to prevent. Environmental chain breaks (moved/unreadable ancestor files,
+    cycles) do NOT set this and keep the warn-and-fall-back behavior.
+    """
+
+    libraries_root: Path | None
+    blocked_reason: str | None = None
 
 
 class AncestorValueLookup(NamedTuple):
@@ -477,14 +501,25 @@ class AncestorValueLookup(NamedTuple):
       cycles. A usable value may be hiding behind that break, so the caller logs the fall-through
       rather than treating "nothing declared" as established.
 
+    `unresolvable_declaration` further splits the incomplete state. True means an ancestor DECLARED
+    a value the engine cannot resolve (a FLAWED ancestor, e.g. an unset variable) -- the value the
+    chain would supply is known to exist and known to be broken, so activation refuses the
+    descendant rather than substitute a fallback for it. False covers the environmental breaks (a
+    moved or unreadable ancestor file, a missing parent, a cycle), where activation keeps the
+    long-standing warn-and-fall-back behavior: it has to pick something to run with, and the break
+    is not a declaration being dishonored.
+
     Attributes:
         value: The nearest ancestor's resolved value, or None if there was no hit.
         incomplete_reason: Artist-readable phrase describing why the walk came away incomplete, or
             None when the whole chain was seen and nothing in it declared a value.
+        unresolvable_declaration: True when the break is an ancestor's declared-but-unresolvable
+            path field, the one incomplete state activation must refuse rather than fall back from.
     """
 
     value: str | None
     incomplete_reason: str | None
+    unresolvable_declaration: bool = False
 
 
 class ParentLinkLookup(NamedTuple):
@@ -508,13 +543,17 @@ class ParentLinkLookup(NamedTuple):
 class EffectiveProjectPaths(NamedTuple):
     """The two paths a project activates with, as reported on the project listing.
 
-    Both are absolute and both are always present: each resolution ladder bottoms out in an
-    unconditional default, and a project whose declared path fields could not be resolved fails to
-    load rather than reaching here.
+    A path is None when the project DECLARES it but the declaration cannot currently be resolved (a
+    FLAWED load -- e.g. an unset environment variable in workspace_dir/libraries_dir). The listing
+    shows "unknown" for it and the entry's validation problems say why; activation refuses such a
+    project, so no real path exists to report. A resolvable project always gets absolute paths:
+    each resolution ladder bottoms out in an unconditional default. libraries_root is also None
+    when it is undeclared AND workspace_dir is unresolvable, because the workspace-relative default
+    cannot be computed without a workspace decision.
     """
 
-    workspace_dir: Path
-    libraries_root: Path
+    workspace_dir: Path | None
+    libraries_root: Path | None
 
 
 class _ProvisioningConfigDirs(NamedTuple):
@@ -895,10 +934,15 @@ class ProjectManager(EngineScoped):
         surfaces as failed_to_load. Read-only probes (e.g. resolve_workspace_dir_for_project_id)
         pass record_status=False so a transient lookup does not inject phantom failed-load entries.
 
-        This is also where a declared path field that cannot produce a path is refused
-        (_validate_declared_path_fields). Every consumer funnels through here -- the boot load,
-        activation, the offline ancestor walks and the read-only probes -- so one check means none of
-        them can substitute a different location behind the user's back.
+        This is also where declared path fields are validated (_validate_declared_path_fields).
+        Every consumer funnels through here -- the boot load, activation, the offline ancestor walks
+        and the read-only probes -- so one check means they cannot disagree about what is broken. A
+        broken parent_project_path refuses the overlay (nothing coherent can be merged without the
+        base); a broken workspace_dir/libraries_dir is recorded as a recoverable FLAWED problem and
+        the read proceeds, so the project stays loadable and editable. The refusal to substitute a
+        different location behind the user's back moves to the consumers: the activation gate
+        (_apply_workspace_and_libraries_layers), the provisioning preview, and the ancestor walks
+        each check `is_unresolvable` before falling through to another source.
         """
         read_request = ReadFileRequest(
             file_path=str(project_file_path),
@@ -940,7 +984,12 @@ class ProjectManager(EngineScoped):
             )
 
         unresolvable_fields = self._validate_declared_path_fields(overlay, project_file_path, validation)
-        if unresolvable_fields:
+        if not validation.is_usable():
+            # Only parent_project_path lands here: without the parent there is no base to merge, so
+            # the overlay is genuinely unrepresentable. A broken workspace_dir/libraries_dir is
+            # recorded as a recoverable (FLAWED) problem instead and the read proceeds -- the project
+            # stays loadable and editable while activation refuses it, so the user can fix the bad
+            # value in the app rather than hand-editing YAML.
             return self._overlay_read_failure(
                 project_file_path,
                 validation,
@@ -982,9 +1031,15 @@ class ProjectManager(EngineScoped):
         the next source, which is the documented behavior. A field that is PRESENT but cannot produce
         a path -- an unset `${VAR}` / `%VAR%`, a `{macro}` token, or a per-platform mapping with no
         entry for this OS and no `default` -- is an error, because the only alternative is to discard
-        what the user wrote and put their workspace or their libraries somewhere else. A project that
-        installs libraries into a directory it never named is worse than a project that refuses to
-        open and says which line is wrong.
+        what the user wrote and put their workspace or their libraries somewhere else.
+
+        The error's blast radius differs by field. A broken `parent_project_path` is UNUSABLE: the
+        template cannot be merged with a base that cannot be found, so there is nothing coherent to
+        load. A broken `workspace_dir` or `libraries_dir` is a RECOVERABLE error (FLAWED): the
+        template itself is perfectly representable, only activation must refuse it
+        (_apply_workspace_and_libraries_layers). Keeping such a project loadable is what lets the
+        user see the problem in the app and fix the bad value there, instead of hand-editing the
+        YAML and restarting the engine.
 
         All three fields are checked even after the first error, so one load reports every broken
         field instead of making the user fix them one restart at a time.
@@ -995,7 +1050,7 @@ class ProjectManager(EngineScoped):
         file that names it.
 
         Returns the names of the fields that failed, in declaration order; empty means the overlay's
-        paths are all resolvable and the caller may proceed.
+        paths are all resolvable.
         """
         declarations: dict[str, str | PerPlatformProjectPath | None] = {
             "workspace_dir": overlay.workspace_dir,
@@ -1005,29 +1060,73 @@ class ProjectManager(EngineScoped):
 
         unresolvable_fields: list[str] = []
         for field_name, declared in declarations.items():
-            if declared is None:
+            message = self._declared_path_field_problem(field_name, declared, project_file_path)
+            if message is None:
                 continue
 
-            selected = select_project_path(declared)
-            if selected is None:
-                unresolvable_fields.append(field_name)
+            unresolvable_fields.append(field_name)
+            if field_name == "parent_project_path":
                 validation.add_error(
                     field_path=field_name,
-                    message=self._platform_gap_message(field_name),
+                    message=message,
                     line_number=overlay.line_info.get_line(field_name),
                 )
-                continue
-
-            resolution = resolve_project_path_field(selected, project_file_path.parent)
-            if resolution.path is None:
-                unresolvable_fields.append(field_name)
-                validation.add_error(
+            else:
+                validation.add_recoverable_error(
                     field_path=field_name,
-                    message=self._unresolvable_field_message(field_name, selected, resolution),
+                    message=message,
                     line_number=overlay.line_info.get_line(field_name),
                 )
 
         return unresolvable_fields
+
+    def _declared_path_field_problem(
+        self, field_name: str, declared: str | PerPlatformProjectPath | None, project_file_path: Path
+    ) -> str | None:
+        """Phrase why a DECLARED path field cannot produce a path, or None when it can (or is unset).
+
+        The single check behind every consumer that must refuse an unresolvable declaration rather
+        than substitute another source: load-time validation (_validate_declared_path_fields), the
+        activation gate, and the provisioning preview (via unresolvable_declared_path_messages) all
+        call this, so they cannot disagree about what counts as broken. Resolves fresh on every call
+        -- the environment can change between load and activation, so a load-time verdict is not
+        reusable.
+        """
+        if declared is None:
+            return None
+
+        selected = select_project_path(declared)
+        if selected is None:
+            return self._platform_gap_message(field_name)
+
+        resolution = resolve_project_path_field(selected, project_file_path.parent)
+        if resolution.path is None:
+            return self._unresolvable_field_message(field_name, selected, resolution)
+        return None
+
+    def unresolvable_declared_path_messages(self, project_info: ProjectInfo) -> list[str]:
+        """Phrase every workspace_dir/libraries_dir declaration that cannot currently be resolved.
+
+        Empty means the project's own declared paths all resolve (or it declares none) and it is
+        safe to activate or preview. Non-empty is the activation gate's and provisioning preview's
+        refusal reason: a FLAWED project (or one whose environment changed since load) must not have
+        its declared locations silently replaced with fallbacks. parent_project_path is not checked
+        here because a project with a broken parent link never loads (UNUSABLE), so no ProjectInfo
+        exists to hand in.
+        """
+        if project_info.project_file_path is None:
+            return []
+
+        declarations: dict[str, str | PerPlatformProjectPath | None] = {
+            "workspace_dir": project_info.template.workspace_dir,
+            "libraries_dir": project_info.template.libraries_dir,
+        }
+        messages: list[str] = []
+        for field_name, declared in declarations.items():
+            message = self._declared_path_field_problem(field_name, declared, project_info.project_file_path)
+            if message is not None:
+                messages.append(message)
+        return messages
 
     async def _resolve_parent_chain(  # noqa: C901, PLR0911
         self,
@@ -1332,12 +1431,19 @@ class ProjectManager(EngineScoped):
         engine_version_reason = engine_version_failure_detail(required_engine_version)
 
         # Where this project's files and libraries actually land. Both stay None for an entry with no
-        # backing file (the system defaults), which declares nothing and is never activated.
-        effective_paths: EffectiveProjectPaths | None = None
+        # backing file (the system defaults), which declares nothing and is never activated. A path
+        # is also None when the project declares it but the declaration cannot be resolved (a FLAWED
+        # load) -- the validation problems on this entry carry the reason.
+        workspace_dir: str | None = None
+        libraries_root: str | None = None
         if project_info.project_file_path is not None:
             effective_paths = await self._effective_paths_for_project(
                 project_info.project_file_path, project_info.template, id_index
             )
+            if effective_paths.workspace_dir is not None:
+                workspace_dir = str(effective_paths.workspace_dir)
+            if effective_paths.libraries_root is not None:
+                libraries_root = str(effective_paths.libraries_root)
 
         return ProjectTemplateInfo(
             project_id=project_id,
@@ -1351,8 +1457,8 @@ class ProjectManager(EngineScoped):
             required_engine_version=required_engine_version,
             current_engine_version=engine_version,
             engine_version_reason=engine_version_reason,
-            workspace_dir=str(effective_paths.workspace_dir) if effective_paths is not None else None,
-            libraries_root=str(effective_paths.libraries_root) if effective_paths is not None else None,
+            workspace_dir=workspace_dir,
+            libraries_root=libraries_root,
         )
 
     def on_get_situation_request(
@@ -1712,7 +1818,9 @@ class ProjectManager(EngineScoped):
         resolver activation uses -- so the previewed workspace cannot diverge from what
         activation applies even when an ancestor is registered but not loaded. Returns
         None when the project is not loaded or has no backing file, mirroring
-        get_loaded_project_dir's "nothing to preview" contract. Mutates no config state.
+        get_loaded_project_dir's "nothing to preview" contract -- and when the workspace decision is
+        blocked by an ancestor's unresolvable declared workspace_dir, since a preview computed from
+        the fallback would describe a plan activation refuses. Mutates no config state.
         """
         project_info = self._successfully_loaded_project_templates.get(project_id)
         if project_info is None:
@@ -1731,6 +1839,8 @@ class ProjectManager(EngineScoped):
         decision = await self._decide_workspace_from_disk(
             project_file_path, project_config, env_config, template_workspace_dir, id_index
         )
+        if decision.blocked_reason is not None:
+            return None
         return _ProvisioningConfigDirs(
             project_dir=project_dir,
             workspace_dir=decision.workspace_dir,
@@ -1745,7 +1855,10 @@ class ProjectManager(EngineScoped):
         registry and falls back to a read-only disk scan of projects_to_register (see
         _build_unloaded_id_index); a legacy id that is itself a canonical project file path is
         accepted directly. Returns None when the id resolves to no readable project file, matching
-        resolve_provisioning_config_dirs' "nothing to resolve" contract.
+        resolve_provisioning_config_dirs' "nothing to resolve" contract -- and also when the
+        project's own workspace_dir is declared but cannot be resolved (a FLAWED project), because
+        the fall-through answer would be a location the project never named and activation will
+        refuse. The GUI treats null as "no hint to show", which is the honest display for both.
 
         Branches 0-3 and 4-result/5 are computed by the same _decide_workspace_pre/post_inheritance
         helpers decide_workspace uses, so they cannot drift. The template's own workspace_dir (branch
@@ -1776,11 +1889,19 @@ class ProjectManager(EngineScoped):
         own_overlay_load = await self._read_overlay(project_file_path, record_status=False)
         if not isinstance(own_overlay_load, LoadProjectTemplateResultFailure):
             _, own_overlay = own_overlay_load
-            template_workspace_dir = self._resolve_template_workspace_dir(own_overlay.workspace_dir, project_file_path)
+            workspace_resolution = self._resolve_template_path_field(
+                own_overlay.workspace_dir, project_file_path, "workspace_dir"
+            )
+            if workspace_resolution.is_unresolvable:
+                return None
+            if workspace_resolution.path is not None:
+                template_workspace_dir = str(workspace_resolution.path)
 
         decision = await self._decide_workspace_from_disk(
             project_file_path, project_config, env_config, template_workspace_dir, id_index
         )
+        if decision.blocked_reason is not None:
+            return None
         return self._resolve_workspace_dir(decision.workspace_dir)
 
     async def _decide_workspace_from_disk(
@@ -1820,29 +1941,42 @@ class ProjectManager(EngineScoped):
                 project_file_path,
                 lookup.incomplete_reason,
             )
-        return self._decide_workspace_post_inheritance(project_file_path, lookup.value)
+        decision = self._decide_workspace_post_inheritance(project_file_path, lookup.value)
+        if lookup.unresolvable_declaration:
+            # An ancestor DECLARED a workspace the engine cannot resolve. The fallback decision is
+            # still carried for display-only callers, but activation must refuse it (blocked_reason)
+            # rather than adopt a workspace the chain never named.
+            return WorkspaceDecision(
+                workspace_dir=decision.workspace_dir,
+                apply_override=decision.apply_override,
+                blocked_reason=lookup.incomplete_reason,
+            )
+        return decision
 
     async def _decide_libraries_root_from_disk(
         self, project_file_path: Path, template_libraries_dir: str | None, id_index: dict[str, Path]
-    ) -> Path | None:
+    ) -> LibrariesRootDecision:
         """Decide a project's libraries root, resolving parent inheritance from disk.
 
         Disk-walking analogue of decide_libraries_root: branch 0 (own libraries_dir, passed in
         already resolved) is unchanged, and branch 1 (nearest ancestor's libraries_dir) walks the
         chain offline via _inherit_libraries_dir_from_parents_offline rather than the live registry,
-        so a child's shared libraries/ tree is identical whether or not its parent is loaded. Returns
-        None when no libraries_dir is declared anywhere in the chain (caller falls back to the
-        workspace-relative default).
+        so a child's shared libraries/ tree is identical whether or not its parent is loaded. A None
+        libraries_root means no libraries_dir is declared anywhere in the chain (caller falls back
+        to the workspace-relative default).
 
-        A chain that could not be fully walked still falls back to the workspace-relative default --
-        activation has to pick SOMETHING to run with -- but it says so in the log. That break is rare
-        by construction: a project whose parent link or path fields do not resolve fails its own load,
-        so a chain normally breaks only if an ancestor file was moved or made unreadable after the
-        descendants were registered.
+        An ENVIRONMENTAL chain break (an ancestor file moved or made unreadable after the
+        descendants were registered, a missing parent, a cycle) still falls back to the
+        workspace-relative default -- activation has to pick SOMETHING to run with -- but it says so
+        in the log. A FLAWED ancestor whose DECLARED libraries_dir cannot be resolved instead sets
+        `blocked_reason`: the chain names a location the engine cannot honor, so activation refuses
+        the descendant rather than install into a fallback the chain never named.
         """
         if template_libraries_dir is not None:
-            return Path(template_libraries_dir)
+            return LibrariesRootDecision(libraries_root=Path(template_libraries_dir))
         lookup = await self._inherit_libraries_dir_from_parents_offline(project_file_path, id_index)
+        if lookup.unresolvable_declaration:
+            return LibrariesRootDecision(libraries_root=None, blocked_reason=lookup.incomplete_reason)
         if lookup.incomplete_reason is not None:
             logger.warning(
                 "Could not inherit a libraries root for project '%s' from its parent chain (%s). "
@@ -1851,8 +1985,8 @@ class ProjectManager(EngineScoped):
                 lookup.incomplete_reason,
             )
         if lookup.value is not None:
-            return Path(lookup.value)
-        return None
+            return LibrariesRootDecision(libraries_root=Path(lookup.value))
+        return LibrariesRootDecision(libraries_root=None)
 
     def _resolve_workspace_dir(self, workspace_dir: Path) -> Path:
         """Expand and resolve a decided workspace dir the way ConfigManager.set_workspace_override does."""
@@ -1927,11 +2061,12 @@ class ProjectManager(EngineScoped):
             # The ancestor's workspace_dir template field (branch 0) wins, mirroring how the ancestor
             # would resolve its own workspace as the active project; the overlay was already read by
             # the walker to follow the parent link, so the field is free to read here. Falls through
-            # to the ancestor's project_workspaces override / adjacent config when the field is
-            # unset. (It cannot be set-but-unresolvable: _read_overlay would have refused the
-            # ancestor, and the walker reports that as a break in the chain.)
+            # to the ancestor's project_workspaces override / adjacent config only when the field is
+            # genuinely UNSET. A set-but-unresolvable field (a FLAWED ancestor) is returned as-is so
+            # the walker reports a break in the chain: falling through would inherit a
+            # lower-precedence source in place of the workspace the ancestor actually named.
             template_resolution = self._resolve_template_path_field(overlay.workspace_dir, node_path, "workspace_dir")
-            if template_resolution.path is not None:
+            if template_resolution.path is not None or template_resolution.is_unresolvable:
                 return template_resolution
             explicit_workspace = self._resolve_node_explicit_workspace(node_path, project_workspaces)
             if explicit_workspace is not None:
@@ -1977,8 +2112,10 @@ class ProjectManager(EngineScoped):
         matching what activation reconciles. _effective_paths_for_project is the caller that wants the
         fully-defaulted answer.
 
-        A declared value that cannot be resolved does not reach here: _read_overlay rejects an
-        unresolvable path field, so such a project is UNUSABLE and never gets walked.
+        None ALSO covers a project whose own libraries_dir is declared but cannot be resolved (a
+        FLAWED load): reporting the inherited or default location for it would substitute a place
+        the project never named. A caller for whom that distinction matters must gate first, the way
+        the provisioning preview gates on unresolvable_declared_path_messages before calling this.
 
         Builds its own id -> path index. The listing does NOT come through here (it goes through
         _effective_paths_for_project, which wants the fully-defaulted answer), so there is no caller
@@ -1997,8 +2134,18 @@ class ProjectManager(EngineScoped):
             return None
         _, own_overlay = own_overlay_load
 
-        template_libraries_dir = self._resolve_template_libraries_dir(own_overlay.libraries_dir, project_file_path)
-        return await self._decide_libraries_root_from_disk(project_file_path, template_libraries_dir, id_index)
+        libraries_resolution = self._resolve_template_path_field(
+            own_overlay.libraries_dir, project_file_path, "libraries_dir"
+        )
+        if libraries_resolution.is_unresolvable:
+            return None
+        template_libraries_dir = str(libraries_resolution.path) if libraries_resolution.path is not None else None
+        libraries_decision = await self._decide_libraries_root_from_disk(
+            project_file_path, template_libraries_dir, id_index
+        )
+        if libraries_decision.blocked_reason is not None:
+            return None
+        return libraries_decision.libraries_root
 
     async def _effective_paths_for_project(
         self, project_file_path: Path, template: ProjectTemplate, id_index: dict[str, Path]
@@ -2017,26 +2164,46 @@ class ProjectManager(EngineScoped):
         them from the base (see merged_workspace_dir / merged_libraries_dir), so the loaded value is
         this project's own declaration and anchoring it to this project's directory is correct.
 
-        Both values are always a real path: each ladder bottoms out in an unconditional default, and
-        a project whose declarations could not be resolved would have failed to load.
+        A value is a real path for every resolvable project: each ladder bottoms out in an
+        unconditional default. A DECLARED-but-unresolvable field (a FLAWED load) reports None
+        instead -- activation refuses such a project, so any path shown for it would be one it will
+        never use. The entry's validation problems carry the reason.
         """
-        project_config = self._config_manager.read_config_file(project_file_path.parent / "griptape_nodes_config.json")
-        env_config = self._config_manager.read_env_config()
-        template_workspace_dir = self._resolve_template_workspace_dir(template.workspace_dir, project_file_path)
-        template_libraries_dir = self._resolve_template_libraries_dir(template.libraries_dir, project_file_path)
+        workspace_resolution = self._resolve_template_path_field(
+            template.workspace_dir, project_file_path, "workspace_dir"
+        )
+        libraries_resolution = self._resolve_template_path_field(
+            template.libraries_dir, project_file_path, "libraries_dir"
+        )
 
-        decision = await self._decide_workspace_from_disk(
-            project_file_path, project_config, env_config, template_workspace_dir, id_index
-        )
-        libraries_root = await self._decide_libraries_root_from_disk(
-            project_file_path, template_libraries_dir, id_index
-        )
-        if libraries_root is None:
-            libraries_root = self._workspace_relative_libraries_root(project_file_path, decision)
+        workspace_dir: Path | None = None
+        decision: WorkspaceDecision | None = None
+        if not workspace_resolution.is_unresolvable:
+            project_config = self._config_manager.read_config_file(
+                project_file_path.parent / "griptape_nodes_config.json"
+            )
+            env_config = self._config_manager.read_env_config()
+            template_workspace_dir = str(workspace_resolution.path) if workspace_resolution.path is not None else None
+            decision = await self._decide_workspace_from_disk(
+                project_file_path, project_config, env_config, template_workspace_dir, id_index
+            )
+            if decision.blocked_reason is None:
+                workspace_dir = self._resolve_workspace_dir(decision.workspace_dir)
 
-        return EffectiveProjectPaths(
-            workspace_dir=self._resolve_workspace_dir(decision.workspace_dir), libraries_root=libraries_root
-        )
+        libraries_root: Path | None = None
+        if not libraries_resolution.is_unresolvable:
+            template_libraries_dir = str(libraries_resolution.path) if libraries_resolution.path is not None else None
+            libraries_decision = await self._decide_libraries_root_from_disk(
+                project_file_path, template_libraries_dir, id_index
+            )
+            if libraries_decision.blocked_reason is None:
+                libraries_root = libraries_decision.libraries_root
+                # The workspace-relative default needs the workspace decision; with an unresolvable
+                # workspace_dir there is none, so an undeclared libraries root stays unknown too.
+                if libraries_root is None and decision is not None and decision.blocked_reason is None:
+                    libraries_root = self._workspace_relative_libraries_root(project_file_path, decision)
+
+        return EffectiveProjectPaths(workspace_dir=workspace_dir, libraries_root=libraries_root)
 
     def _workspace_relative_libraries_root(self, project_file_path: Path, decision: WorkspaceDecision) -> Path:
         """Compute the nothing-declared libraries default for a target project, offline.
@@ -2092,7 +2259,7 @@ class ProjectManager(EngineScoped):
 
         return await self._nearest_ancestor_value_offline(project_file_path, id_index, probe)
 
-    async def _nearest_ancestor_value_offline(
+    async def _nearest_ancestor_value_offline(  # noqa: PLR0911 — each terminal walk state returns its own lookup
         self,
         project_file_path: Path,
         id_index: dict[str, Path],
@@ -2116,11 +2283,10 @@ class ProjectManager(EngineScoped):
         None, which callers read as "no ancestor declares one, so use the default" -- turning an
         unreadable ancestor into a confident wrong answer. Now only a chain walked all the way to its
         root reports `incomplete_reason=None`; an ancestor that could not be loaded, a parent id that
-        maps to no file, and a cycle each say why they stopped.
-
-        A probe that comes back unresolved cannot occur: _read_overlay rejects an overlay whose path
-        fields do not resolve, so such an ancestor fails the read above and is reported as a break in
-        the chain rather than silently stepped past.
+        maps to no file, a cycle, and an ancestor whose DECLARED value cannot be resolved (a FLAWED
+        overlay reads fine, so the probe sees the broken declaration) each say why they stopped.
+        Stepping past an unresolvable declaration would inherit a lower-precedence source in place of
+        the one the ancestor actually named.
         """
         file_path_to_id: dict[Path, ProjectID] = {path: pid for pid, path in id_index.items()}
 
@@ -2149,6 +2315,15 @@ class ProjectManager(EngineScoped):
                 probed = probe(current_path, overlay)
                 if probed.path is not None:
                     return AncestorValueLookup(value=str(probed.path), incomplete_reason=None)
+                if probed.is_unresolvable:
+                    return AncestorValueLookup(
+                        value=None,
+                        incomplete_reason=(
+                            f"parent project '{current_path}' declares a path that cannot be resolved "
+                            f"({self._describe_unresolved_path(probed)})"
+                        ),
+                        unresolvable_declaration=True,
+                    )
             is_start = False
 
             parent_id = self._reduce_parent_link_to_id(overlay, current_path, file_path_to_id)
@@ -2197,10 +2372,12 @@ class ProjectManager(EngineScoped):
         `template_workspace_dir` is the highest-priority source: a project that declares its own
         workspace_dir beats the per-user project_workspaces mapping and the env var. The caller
         resolves the (possibly per-platform, possibly relative) raw field to an absolute path before
-        passing it, so this method and the offline resolver share the branch verbatim. For a project
-        that loaded, None means the field was ABSENT and nothing more: a declared value that cannot
-        produce a path is refused by _read_overlay, so the project is UNUSABLE and never reaches this
-        ladder. Branch 0 is skipped only when the project genuinely declares no workspace of its own.
+        passing it, so this method and the offline resolver share the branch verbatim. None must mean
+        the field was ABSENT and nothing more: a declared value that cannot produce a path loads as
+        FLAWED, and every path to this ladder gates on that first (activation via
+        unresolvable_declared_path_messages, the offline resolvers and the listing via
+        `is_unresolvable`), so branch 0 is skipped only when the project genuinely declares no
+        workspace of its own.
 
         Branch 4 walks the project's explicit parent chain (parent_project_id / legacy
         parent_project_path, resolved through the registry) and inherits the first ancestor that
@@ -2256,21 +2433,24 @@ class ProjectManager(EngineScoped):
         _resolve_template_libraries_dir are `str | None` projections of it for the resolution
         ladders, which only need "is there a usable value?".
 
-        An unset field resolves to a None path with empty reason lists -- "nothing declared", so the
+        An unset field resolves to a None path with no failure state -- "nothing declared", so the
         ladder falls through to the next source.
 
         A field that IS declared but cannot produce a path (no entry for this platform and no
-        'default', an unset variable, a macro token) cannot reach here for a project that loaded:
-        _read_overlay validates all three path fields and refuses the overlay, so the project is
-        UNUSABLE and never gets activated or listed. The warn-and-fall-through below is therefore
-        defense in depth rather than a normal outcome, and it keeps the resolvers total for callers
-        that hand them a value from somewhere other than an overlay read.
+        'default', an unset variable, a macro token) comes back with `is_unresolvable` set. A
+        project in that state loads as FLAWED (_read_overlay records the problem instead of refusing
+        the overlay), so this outcome IS reachable for loaded projects: activation refuses it
+        (_apply_workspace_and_libraries_layers), the ancestor walks report it as a break in the
+        chain, and the listing shows the affected path as unknown. Only the `str | None` projections
+        collapse it to "nothing" -- their callers must gate on `is_unresolvable` first when a
+        substitute location would be user-visible.
 
         One window where load-time and activation-time answers can differ: a project registered
         WHILE another project's `environment:` block is applied validates against that mutated
-        os.environ, whereas activation restores the launch environment before resolving. A value that
-        depends on a variable only some other project sets can therefore pass validation and then
-        fail to resolve here.
+        os.environ, whereas activation restores the launch environment before resolving. A value
+        that depends on a variable only some other project sets can therefore load as GOOD and
+        still be refused at activation, or vice versa; both re-resolve rather than trusting the
+        load-time verdict.
         """
         if raw is None:
             return ResolvedProjectPath(path=None, unresolved_variables=[], macro_tokens=[])
@@ -2278,18 +2458,16 @@ class ProjectManager(EngineScoped):
         selected = select_project_path(raw)
         if selected is None:
             logger.warning(
-                "Project '%s' declares %s as a per-platform mapping with no entry for this platform "
-                "and no 'default'. Ignoring it and falling back to the next source.",
+                "Project '%s' declares %s as a per-platform mapping with no entry for this platform and no 'default'.",
                 project_file_path,
                 field_name,
             )
-            return ResolvedProjectPath(path=None, unresolved_variables=[], macro_tokens=[])
+            return ResolvedProjectPath(path=None, unresolved_variables=[], macro_tokens=[], platform_gap=True)
 
         resolution = resolve_project_path_field(selected, project_file_path.parent)
         if resolution.path is None:
             logger.warning(
-                "Project '%s' declares %s as %r, which cannot be resolved (%s). Ignoring it and "
-                "falling back to the next source.",
+                "Project '%s' declares %s as %r, which cannot be resolved (%s).",
                 project_file_path,
                 field_name,
                 selected,
@@ -2363,6 +2541,8 @@ class ProjectManager(EngineScoped):
                 "a variable it references expanded to a quoted value, which is not a usable path "
                 "(remove the quotes from the variable's value, not from this field)"
             )
+        if resolution.platform_gap:
+            reasons.append("it lists no path for this platform and no 'default'")
         if not reasons:
             return "it could not be turned into a usable path"
         return "; ".join(reasons)
@@ -2373,9 +2553,11 @@ class ProjectManager(EngineScoped):
         """Resolve a template's raw workspace_dir field to an absolute path string, or None.
 
         Thin projection of _resolve_template_path_field for the workspace resolution ladder. Returns
-        None when the field is unset -- and, defensively, for the declared-but-unresolvable cases that
-        _read_overlay already refuses at load time. Both mean the same thing to the ladder: fall
-        through to the next workspace source.
+        None both when the field is unset and when it is declared but unresolvable (a FLAWED
+        project), which the ladder cannot tell apart -- so callers for whom the difference is
+        user-visible must gate on the full resolution's `is_unresolvable` (or
+        unresolvable_declared_path_messages) BEFORE consulting the ladder, as activation and the
+        listing do.
         """
         resolution = self._resolve_template_path_field(raw, project_file_path, "workspace_dir")
         if resolution.path is None:
@@ -2531,11 +2713,12 @@ class ProjectManager(EngineScoped):
         library declared on the parent is downloaded once and reused via SKIP. See
         _inherit_libraries_dir_from_parents.
 
-        For a project that loaded, `template_libraries_dir` is None only because the field was ABSENT.
-        A declared value that cannot produce a path (unset variable, macro token, no entry for this
-        platform and no 'default') is refused by _read_overlay, so such a project is UNUSABLE and
-        never reaches this ladder -- branch 2's legacy default is never a substitute for a declaration
-        the engine failed to honor.
+        `template_libraries_dir` must be None only because the field was ABSENT. A declared value
+        that cannot produce a path (unset variable, macro token, no entry for this platform and no
+        'default') loads as FLAWED, and every path to this ladder gates on that first (activation
+        via unresolvable_declared_path_messages, the offline resolvers and the listing via
+        `is_unresolvable`) -- branch 2's legacy default is never a substitute for a declaration the
+        engine failed to honor.
         """
         if template_libraries_dir is not None:
             return Path(template_libraries_dir)
@@ -2549,11 +2732,11 @@ class ProjectManager(EngineScoped):
     ) -> str | None:
         """Resolve a template's raw libraries_dir field to an absolute path string, or None.
 
-        Thin projection of _resolve_template_path_field, mirroring _resolve_template_workspace_dir.
-        Returns None when the field is unset -- and, defensively, for the declared-but-unresolvable
-        cases _read_overlay already refuses at load time. This doubles as the per-node leaf primitive
-        for the parent-chain walks, so an inherited value resolves against the DECLARING node's
-        directory.
+        Thin projection of _resolve_template_path_field, mirroring _resolve_template_workspace_dir --
+        including its caveat: None covers both "unset" and "declared but unresolvable", so callers
+        for whom the difference is user-visible gate on the full resolution first. This doubles as
+        the per-node leaf primitive for the LIVE parent-chain walk, so an inherited value resolves
+        against the DECLARING node's directory.
         """
         resolution = self._resolve_template_path_field(raw, project_file_path, "libraries_dir")
         if resolution.path is None:
@@ -2891,7 +3074,11 @@ class ProjectManager(EngineScoped):
             project_dir = project_file_path.parent
             self._config_manager.load_project_config(project_dir)
 
-            await self._apply_workspace_and_libraries_layers(project_info, project_file_path)
+            apply_failure = await self._apply_workspace_and_libraries_layers(project_info, project_file_path)
+            if apply_failure is not None:
+                # The gate refused an unresolvable declared path. The caller's rollback
+                # re-activates the previous project, which re-establishes its layers and env.
+                return _ProjectActivationOutcome(failure=apply_failure, workspace_changed=False)
 
             # Load workspace config layer from the resolved workspace directory.
             self._config_manager.load_workspace_config(self._config_manager.workspace_path)
@@ -2952,8 +3139,19 @@ class ProjectManager(EngineScoped):
 
         return _ProjectActivationOutcome(failure=None, workspace_changed=workspace_changed)
 
-    async def _apply_workspace_and_libraries_layers(self, project_info: ProjectInfo, project_file_path: Path) -> None:
+    async def _apply_workspace_and_libraries_layers(
+        self, project_info: ProjectInfo, project_file_path: Path
+    ) -> SetCurrentProjectResultFailure | None:
         """Resolve and apply a project's workspace override + libraries-root override during activation.
+
+        This is also the activation gate for unresolvable declared paths: a project whose own
+        workspace_dir or libraries_dir is declared but cannot produce a path (a FLAWED load, or an
+        environment change since load) is refused here, before any config layer is applied, rather
+        than having the ladders silently substitute the next source for a location the user named.
+        Returns the failure for _activate_project to propagate (the caller's rollback restores the
+        previous project), or None when the layers were applied. The gate runs AFTER
+        _restore_project_env, so a variable only the OUTGOING project's `environment:` block set
+        cannot make a broken declaration look resolvable.
 
         Branch 4 (workspace) and branch 1 (libraries) inherit from the parent chain, which is the ONLY
         part of the decision that can vary with what is currently loaded. A project that declares a
@@ -2969,6 +3167,16 @@ class ProjectManager(EngineScoped):
         libraries root clears the override so a stale one from a previously-active sharing project is
         dropped and resolved_libraries_root() falls back to the workspace-relative default.
         """
+        unresolvable_messages = self.unresolvable_declared_path_messages(project_info)
+        if unresolvable_messages:
+            return SetCurrentProjectResultFailure(
+                result_details=(
+                    f"Attempted to activate project '{project_info.project_id}'. Failed because its "
+                    f"declared paths cannot be resolved. Fix the value in the project's settings (or "
+                    f"the project file) and try again. {' '.join(unresolvable_messages)}"
+                ),
+            )
+
         template_workspace_dir = self._resolve_template_workspace_dir(
             project_info.template.workspace_dir, project_file_path
         )
@@ -2989,9 +3197,21 @@ class ProjectManager(EngineScoped):
                 template_workspace_dir,
                 id_index,
             )
-            libraries_root = await self._decide_libraries_root_from_disk(
+            libraries_decision = await self._decide_libraries_root_from_disk(
                 project_file_path, template_libraries_dir, id_index
             )
+            blocked_reasons = [
+                reason for reason in (decision.blocked_reason, libraries_decision.blocked_reason) if reason is not None
+            ]
+            if blocked_reasons:
+                return SetCurrentProjectResultFailure(
+                    result_details=(
+                        f"Attempted to activate project '{project_info.project_id}'. Failed because "
+                        f"its parent chain declares paths that cannot be resolved. Fix the value in "
+                        f"the parent project and try again. {'; '.join(blocked_reasons)}"
+                    ),
+                )
+            libraries_root = libraries_decision.libraries_root
         else:
             decision = self.decide_workspace(
                 project_file_path,
@@ -3004,6 +3224,7 @@ class ProjectManager(EngineScoped):
         if decision.apply_override:
             self._config_manager.set_workspace_override(decision.workspace_dir)
         self._config_manager.set_libraries_root_override(libraries_root)
+        return None
 
     async def ensure_project_loaded(self, project_id: ProjectID) -> bool:
         """Ensure a project id is present in the in-memory registry, re-deriving if absent.

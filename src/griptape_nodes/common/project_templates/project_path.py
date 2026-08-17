@@ -53,7 +53,7 @@ class ResolvedProjectPath(NamedTuple):
     """Outcome of resolving a declared project path field to an absolute path.
 
     Exactly one of these states holds:
-    - `path` is set, both lists are empty, and neither flag is set: the field resolved.
+    - `path` is set, both lists are empty, and no flag is set: the field resolved.
     - `path` is None and at least one list is non-empty: the field declares a variable nothing
       supplied a value for, so there IS no answer. Callers must report this rather than substitute a
       guess -- a wrong path labelled "declared" is worse for users than an honest "unknown".
@@ -64,6 +64,13 @@ class ResolvedProjectPath(NamedTuple):
     - `path` is None and `quoted_expansion` is set: a variable's value carried quotes that expansion
       moved into the middle of the path. The lists are empty for the same reason as a cycle -- every
       variable IS set, the value they produced just is not usable as a path.
+    - `path` is None and `platform_gap` is set: the field is a per-platform mapping with no entry for
+      this platform and no `default`, so the declaration names no value here at all.
+
+    A `path` of None with nothing else set is NOT one of this type's states -- it is the shape
+    `ProjectManager._resolve_template_path_field` returns for a field that was never declared, so
+    ladder callers can fall through. `is_unresolvable` is the property that separates the two:
+    "declared but no answer" (this type's failure states) versus "nothing declared".
 
     Attributes:
         path: Canonical absolute path, or None when the field could not be resolved.
@@ -75,6 +82,8 @@ class ResolvedProjectPath(NamedTuple):
             to each other in a cycle.
         quoted_expansion: True when expansion introduced quote characters the author did not write,
             per `expansion_introduced_quoting`.
+        platform_gap: True when a per-platform mapping has no entry for this platform and no
+            `default`.
     """
 
     path: Path | None
@@ -83,6 +92,28 @@ class ResolvedProjectPath(NamedTuple):
     needs_anchor: bool = False
     reference_cycle: bool = False
     quoted_expansion: bool = False
+    platform_gap: bool = False
+
+    @property
+    def is_unresolvable(self) -> bool:
+        """True when the field was DECLARED but no path could be produced from it.
+
+        False both for a resolved field (`path` is set) and for a field that was never declared
+        (`path` is None with no failure state recorded). Callers on the resolution ladders fall
+        through on "nothing declared" but must refuse on unresolvable -- substituting the next
+        source for a declaration the engine failed to honor would relocate the user's files
+        behind their back.
+        """
+        if self.path is not None:
+            return False
+        return (
+            bool(self.unresolved_variables)
+            or bool(self.macro_tokens)
+            or self.needs_anchor
+            or self.reference_cycle
+            or self.quoted_expansion
+            or self.platform_gap
+        )
 
 
 def resolve_project_path_field(selected: str, anchor_dir: Path | None) -> ResolvedProjectPath:

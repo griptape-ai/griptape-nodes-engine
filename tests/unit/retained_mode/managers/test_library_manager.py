@@ -2570,6 +2570,9 @@ class TestPreviewProjectProvisioning:
         mock_project_manager = MagicMock()
         mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=dirs)
         mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=libraries_root)
+        # The gate that mirrors activation: these projects declare nothing unresolvable, so the
+        # preview must proceed past it to the plan under test.
+        mock_project_manager.unresolvable_declared_path_messages.return_value = []
         mock_config_manager = MagicMock()
         mock_config_manager.compute_project_provisioning_config.return_value = merged
         TestPreviewProjectProvisioning._use_real_libraries_root_formula(mock_config_manager)
@@ -2766,6 +2769,9 @@ class TestPreviewProjectProvisioning:
         mock_project_manager = MagicMock()
         mock_project_manager.resolve_provisioning_config_dirs = AsyncMock(return_value=MagicMock())
         mock_project_manager.resolve_libraries_root_for_project_id = AsyncMock(return_value=None)
+        # This project declares nothing unresolvable, so the preview must proceed past the
+        # activation-mirroring gate to the fallback probe under test.
+        mock_project_manager.unresolvable_declared_path_messages.return_value = []
         with (
             patch.object(griptape_nodes, "_project_manager", mock_project_manager),
             patch.object(griptape_nodes, "_config_manager", live_config),

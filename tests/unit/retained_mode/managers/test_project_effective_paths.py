@@ -203,27 +203,28 @@ class TestEffectiveProjectPathsThroughEngine:
         assert CHAIN_INNER_ENV_VAR not in libraries_root
         assert CHAIN_OUTER_ENV_VAR not in libraries_root
 
-    def test_a_reference_cycle_fails_the_load_as_a_cycle_not_as_a_missing_value(
+    def test_a_reference_cycle_loads_flawed_as_a_cycle_not_as_a_missing_value(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """Mutually referencing variables refuse the load, and say so as a cycle.
+        """Mutually referencing variables load FLAWED, and say so as a cycle.
 
         Both variables ARE set, so "no value is set for A" would be false. Expansion cannot finish,
         which is a different problem with a different fix, and the artist needs to be told which.
+        The project stays loadable (so the field can be fixed in the app) with no libraries root
+        reported for it.
         """
         monkeypatch.setenv(CYCLE_A_ENV_VAR, f"${{{CYCLE_B_ENV_VAR}}}")
         monkeypatch.setenv(CYCLE_B_ENV_VAR, f"${{{CYCLE_A_ENV_VAR}}}")
         cyclic_path = write_project(tmp_path / "cyclic", CYCLIC_LIBRARIES_YAML)
 
-        assert isinstance(self.load(engine, cyclic_path), LoadProjectTemplateResultFailure)
+        assert isinstance(self.load(engine, cyclic_path), LoadProjectTemplateResultSuccess)
         listing = self.listing(engine)
 
-        assert self.loaded_by_path(listing) == {}
-        failed = [info for info in listing.failed_to_load if info.project_id == str(cyclic_path)]
-        assert len(failed) == 1
-        assert failed[0].libraries_root is None
+        assert listing.failed_to_load == []
+        info = self.loaded_by_path(listing)[str(cyclic_path)]
+        assert info.libraries_root is None
 
-        problems = [p for p in failed[0].validation.problems if p.field_path == "libraries_dir"]
+        problems = [p for p in info.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert "cycle" in problems[0].message or "each other" in problems[0].message
         assert "no value is set" not in problems[0].message
@@ -312,6 +313,25 @@ class TestEffectiveProjectPathsThroughEngine:
         assert isinstance(preview, PreviewProjectProvisioningResultFailure)
         assert "not loaded" in str(preview.result_details)
 
+    def test_provisioning_declines_to_preview_a_flawed_project(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The preview mirrors the activation gate rather than planning against a fallback root.
+
+        A FLAWED project's activation will be refused, so a plan computed from the workspace-default
+        libraries root would show the user changes that can never be applied.
+        """
+        monkeypatch.delenv(LIBS_ENV_VAR, raising=False)
+        base_path = write_project(tmp_path / "base", DECLARED_LIBRARIES_YAML)
+        load_result = self.load(engine, base_path)
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        preview = engine.handle_request(PreviewProjectProvisioningRequest(project_id=load_result.project_id))
+
+        assert isinstance(preview, PreviewProjectProvisioningResultFailure)
+        assert "declared paths cannot be resolved" in str(preview.result_details)
+        assert LIBS_ENV_VAR in str(preview.result_details)
+
     @pytest.mark.asyncio
     async def test_resolver_answers_nothing_for_an_id_that_is_not_a_loadable_project(
         self, engine: Engine, tmp_path: Path
@@ -329,27 +349,28 @@ class TestEffectiveProjectPathsThroughEngine:
         assert await engine.project_manager.resolve_libraries_root_for_project_id("no-such-project") is None
         assert await engine.project_manager.resolve_libraries_root_for_project_id(str(unparsable)) is None
 
-    def test_unresolvable_declaration_fails_the_load_with_the_field_and_its_line(
+    def test_unresolvable_declaration_loads_flawed_with_the_field_and_its_line(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        """With the variable unset the project refuses to load instead of substituting a path.
+        """With the variable unset the project loads FLAWED instead of substituting a path.
 
-        The listing reports it under failed_to_load with no paths at all, so the GUI can tell "here is
-        where the libraries live" apart from "this project is broken."
+        The listing reports it as loaded -- so the GUI can open it and the bad value can be fixed in
+        the app -- but with no libraries root, so "here is where the libraries live" stays distinct
+        from "this project is broken." The workspace, which the project does not declare, still
+        resolves normally.
         """
         monkeypatch.delenv(LIBS_ENV_VAR, raising=False)
         base_path = write_project(tmp_path / "base", DECLARED_LIBRARIES_YAML)
 
-        assert isinstance(self.load(engine, base_path), LoadProjectTemplateResultFailure)
+        assert isinstance(self.load(engine, base_path), LoadProjectTemplateResultSuccess)
         listing = self.listing(engine)
 
-        assert self.loaded_by_path(listing) == {}
-        failed = [info for info in listing.failed_to_load if info.project_id == str(base_path)]
-        assert len(failed) == 1
-        assert failed[0].workspace_dir is None
-        assert failed[0].libraries_root is None
+        assert listing.failed_to_load == []
+        info = self.loaded_by_path(listing)[str(base_path)]
+        assert info.workspace_dir is not None
+        assert info.libraries_root is None
 
-        problems = [p for p in failed[0].validation.problems if p.field_path == "libraries_dir"]
+        problems = [p for p in info.validation.problems if p.field_path == "libraries_dir"]
         assert len(problems) == 1
         assert LIBS_ENV_VAR in problems[0].message
         # The scalar's line is tracked from its key's position in the parent mapping; before that,
@@ -358,14 +379,39 @@ class TestEffectiveProjectPathsThroughEngine:
         cited_line = base_path.read_text(encoding="utf-8").splitlines()[problems[0].line_number - 1]
         assert "libraries_dir" in cited_line
 
-    def test_a_broken_parent_takes_its_child_down_but_not_an_unrelated_project(
+    def test_activation_refuses_a_flawed_project_end_to_end(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """The whole point of loading FLAWED: the project opens, but switching to it is refused.
+
+        Drives SetCurrentProjectRequest through the real event system so the gate, not a mock, is
+        what says no. The failure names the field's problem so the GUI can point at it.
+        """
+        from griptape_nodes.retained_mode.events.project_events import (
+            SetCurrentProjectRequest,
+            SetCurrentProjectResultFailure,
+        )
+
+        monkeypatch.delenv(LIBS_ENV_VAR, raising=False)
+        base_path = write_project(tmp_path / "base", DECLARED_LIBRARIES_YAML)
+        load_result = self.load(engine, base_path)
+        assert isinstance(load_result, LoadProjectTemplateResultSuccess)
+
+        result = engine.handle_request(SetCurrentProjectRequest(project_id=load_result.project_id))
+
+        assert isinstance(result, SetCurrentProjectResultFailure)
+        assert "declared paths cannot be resolved" in str(result.result_details)
+        assert LIBS_ENV_VAR in str(result.result_details)
+
+    def test_a_broken_parent_blocks_its_child_but_not_an_unrelated_project(
         self, engine: Engine, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, workspace: Path
     ) -> None:
-        """Failing closed cascades along the parent chain and stops there.
+        """A FLAWED base no longer bricks its family, but nothing inherits around it either.
 
-        A shared base pinning an unset variable stops loading for everything derived from it -- the
-        accepted cost, since the alternative is each child quietly installing libraries elsewhere. A
-        project that never referenced the variable is untouched and still reports its paths.
+        The base and its child both LOAD (so the family stays visible and the base's value can be
+        fixed in the app), and neither reports a libraries root: the base's declaration is
+        unresolvable and the child's inheritance is blocked on it, never quietly replaced with the
+        workspace default. A project that never referenced the variable is untouched.
         """
         monkeypatch.delenv(LIBS_ENV_VAR, raising=False)
         base_dir = tmp_path / "base"
@@ -373,19 +419,15 @@ class TestEffectiveProjectPathsThroughEngine:
         child_path = write_project(base_dir / "shots" / "sc010", CHILD_OF_BASE_YAML)
         solo_path = write_project(tmp_path / "solo", DECLARES_NOTHING_YAML)
 
-        assert isinstance(self.load(engine, base_path), LoadProjectTemplateResultFailure)
-        assert isinstance(self.load(engine, child_path), LoadProjectTemplateResultFailure)
+        assert isinstance(self.load(engine, base_path), LoadProjectTemplateResultSuccess)
+        assert isinstance(self.load(engine, child_path), LoadProjectTemplateResultSuccess)
         assert isinstance(self.load(engine, solo_path), LoadProjectTemplateResultSuccess)
         listing = self.listing(engine)
 
-        failed_ids = {info.project_id for info in listing.failed_to_load}
-        assert {str(base_path), str(child_path)} <= failed_ids
-        assert all(info.libraries_root is None for info in listing.failed_to_load)
+        assert listing.failed_to_load == []
+        by_path = self.loaded_by_path(listing)
+        assert by_path[str(base_path)].libraries_root is None
+        assert by_path[str(child_path)].libraries_root is None
 
-        child_problems = [
-            p for info in listing.failed_to_load if info.project_id == str(child_path) for p in info.validation.problems
-        ]
-        assert any(p.field_path == "parent_project_path" for p in child_problems)
-
-        solo_info = self.loaded_by_path(listing)[str(solo_path)]
+        solo_info = by_path[str(solo_path)]
         assert solo_info.libraries_root == str(canonicalize_for_identity(workspace / "libraries"))
