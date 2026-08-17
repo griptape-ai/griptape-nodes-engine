@@ -4098,16 +4098,18 @@ class FlowManager(EngineScoped):
             errormsg = "This workflow is already in progress. Please wait for the current process to finish before starting again."
             raise RuntimeError(errormsg)
 
+        if start_node is None and self._global_flow_queue.empty():
+            errormsg = "No Flow exists. You must create at least one control connection."
+            raise RuntimeError(errormsg)
+
         # Managed execution: acquire the execution lease exactly where the
         # running-flow signal is about to transition False -> True. No-op on
-        # unmanaged engines. Placed before the queue pop so a refused start
-        # leaves the execution queue intact.
+        # unmanaged engines. Placed after the cheap validations (so an empty
+        # queue never acquires) but before the queue pop (so a refused start
+        # leaves the execution queue intact).
         await self.engine.execution_lease_manager.gate_execution_start()
 
         if start_node is None:
-            if self._global_flow_queue.empty():
-                errormsg = "No Flow exists. You must create at least one control connection."
-                raise RuntimeError(errormsg)
             queue_item = self._global_flow_queue.get()
             start_node = queue_item.node
             self._global_flow_queue.task_done()

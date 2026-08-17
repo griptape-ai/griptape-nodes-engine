@@ -38,6 +38,15 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.payload_registry import PayloadRegistry
 
+# Transport binding for the lease protocol over websocket_direct. The engine
+# publishes its lease requests on the request topic (the balancer subscribes to
+# it on connect); the balancer publishes responses and admission-status events
+# on the response topic (the engine's correlation filter watches it). Defined
+# beside the events because the two sides must agree on them exactly as they
+# must agree on the event shapes.
+LEASE_REQUEST_TOPIC = "execution_lease/request"
+LEASE_RESPONSE_TOPIC = "execution_lease/response"
+
 
 @dataclass
 @PayloadRegistry.register

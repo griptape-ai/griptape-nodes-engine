@@ -204,8 +204,7 @@ class ExecutionLeaseManager(EngineScoped):
                 self._acquire_pending = False
 
         if result.get("result_type") != execution_lease_events.AcquireExecutionLeaseResultSuccess.__name__:
-            details = result.get("result_details", "no reason given")
-            msg = f"Attempted to start execution. The execution manager refused: {details}"
+            msg = f"Attempted to start execution. The execution manager refused: {self._details_of(result)}"
             raise RuntimeError(msg)
 
         async with self._state_lock:
@@ -332,7 +331,7 @@ class ExecutionLeaseManager(EngineScoped):
             self._lease_lost = True
             logger.error(
                 "Execution lease was not renewed (%s); this engine no longer holds admission.",
-                result.get("result_details", "no reason given"),
+                self._details_of(result),
             )
 
     async def _release_locked(self, reason: str) -> None:
@@ -353,7 +352,7 @@ class ExecutionLeaseManager(EngineScoped):
             return
         if result.get("result_type") != execution_lease_events.ReleaseExecutionLeaseResultSuccess.__name__:
             # Already reclaimed (crash eviction won a race) -- treat as released.
-            logger.info("Execution lease release answered: %s", result.get("result_details", ""))
+            logger.info("Execution lease release answered: %s", self._details_of(result))
         else:
             logger.debug("Execution lease released (%s)", reason)
 
@@ -372,3 +371,21 @@ class ExecutionLeaseManager(EngineScoped):
     @staticmethod
     def _payload_of(request: Any) -> dict[str, Any]:
         return converter.unstructure(request)
+
+    @staticmethod
+    def _details_of(result: dict[str, Any]) -> str:
+        """Flatten a result envelope's human-readable details.
+
+        On the wire, a result payload's ``result_details`` is the unstructured
+        ``ResultDetails`` object -- ``{"result_details": [{"level", "message"}]}``
+        nested under the envelope's ``result`` key -- not a plain string.
+        """
+        details = result.get("result", {}).get("result_details", "")
+        if isinstance(details, str):
+            return details or "no reason given"
+        if isinstance(details, dict):
+            details = details.get("result_details", [])
+        if isinstance(details, list):
+            messages = [entry.get("message", "") for entry in details if isinstance(entry, dict)]
+            return " ".join(m for m in messages if m) or "no reason given"
+        return "no reason given"

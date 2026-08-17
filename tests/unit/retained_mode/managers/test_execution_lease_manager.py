@@ -41,14 +41,20 @@ class StubBalancer:
         self.requests.append((request_type, payload))
         if request_type == "AcquireExecutionLeaseRequest":
             await self.grant_gate.wait()
+            details = "granted" if "Success" in self.acquire_result_type else "refused by test"
             return {
                 "result_type": self.acquire_result_type,
-                "result_details": "granted" if "Success" in self.acquire_result_type else "refused by test",
+                # The real wire shape: result_details is an unstructured
+                # ResultDetails object nested under the envelope's result key.
+                "result": {"result_details": {"result_details": [{"level": 10, "message": details}]}},
                 "lease_id": payload["lease_id"],
             }
         if request_type == "RenewExecutionLeaseRequest":
-            return {"result_type": self.renew_result_type, "result_details": "renewed"}
-        return {"result_type": f"{request_type.removesuffix('Request')}ResultSuccess", "result_details": "ok"}
+            return {"result_type": self.renew_result_type, "result": {"result_details": "renewed"}}
+        return {
+            "result_type": f"{request_type.removesuffix('Request')}ResultSuccess",
+            "result": {"result_details": "ok"},
+        }
 
     async def send_no_response(self, request_type: str, payload: dict[str, Any]) -> None:
         self.requests.append((request_type, payload))

@@ -34,6 +34,9 @@ if TYPE_CHECKING:
     from griptape_nodes.retained_mode.managers.context_manager import ContextManager
     from griptape_nodes.retained_mode.managers.engine_identity_manager import EngineIdentityManager
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
+    from griptape_nodes.retained_mode.managers.execution_lease_manager import (
+        ExecutionLeaseManager,
+    )
     from griptape_nodes.retained_mode.managers.flow_manager import FlowManager
     from griptape_nodes.retained_mode.managers.library_manager import LibraryManager
     from griptape_nodes.retained_mode.managers.manifest_manager import ManifestManager
@@ -226,3 +229,7 @@ class GriptapeNodes(metaclass=_EngineRootMeta):
     @classmethod
     def WorkerManager(cls) -> WorkerManager:
         return current_engine().worker_manager
+
+    @classmethod
+    def ExecutionLeaseManager(cls) -> ExecutionLeaseManager:
+        return current_engine().execution_lease_manager
