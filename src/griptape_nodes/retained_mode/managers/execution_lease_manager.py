@@ -40,6 +40,7 @@ from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.managers.settings import (
     EXECUTION_LEASE_ENABLED_KEY,
     EXECUTION_LEASE_RENEW_INTERVAL_KEY,
+    EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
 )
 
 if TYPE_CHECKING:
@@ -85,6 +86,8 @@ class ExecutionLeaseManager(EngineScoped):
 
     DEFAULT_RENEW_INTERVAL_S: float = 30.0
 
+    DEFAULT_TEARDOWN_TIMEOUT_S: float = 120.0
+
     def __init__(self, *, engine: Engine) -> None:
         super().__init__(engine)
         self._transport: _LeaseTransport | None = None
@@ -92,6 +95,7 @@ class ExecutionLeaseManager(EngineScoped):
         # The held lease id, or None. Guarded by _state_lock together with
         # _acquire_pending so concurrent gate calls serialize their decisions.
         self._lease_id: str | None = None
+        self._lease_scope: str = "workflow"
         self._acquire_pending: bool = False
         self._lease_lost: bool = False
         self._state_lock = asyncio.Lock()
@@ -105,6 +109,11 @@ class ExecutionLeaseManager(EngineScoped):
         self.renew_interval_s: float = config.get_config_value(
             EXECUTION_LEASE_RENEW_INTERVAL_KEY,
             default=ExecutionLeaseManager.DEFAULT_RENEW_INTERVAL_S,
+            cast_type=float,
+        )
+        self.teardown_timeout_s: float = config.get_config_value(
+            EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
+            default=ExecutionLeaseManager.DEFAULT_TEARDOWN_TIMEOUT_S,
             cast_type=float,
         )
 
@@ -201,6 +210,7 @@ class ExecutionLeaseManager(EngineScoped):
 
         async with self._state_lock:
             self._lease_id = lease_id
+            self._lease_scope = scope
             self._lease_lost = False
             # A run that started while this acquire waited wins; return the
             # lease rather than piling a second run onto the engine.
@@ -230,10 +240,34 @@ class ExecutionLeaseManager(EngineScoped):
         """Release execution-scoped memory before the lease is returned.
 
         Ordering is the point: teardown happens BEFORE the release is sent, so
-        the next admitted engine starts against a reclaimed machine. The
-        teardown broadcast itself ships separately; until then this is the
-        seam it plugs into.
+        the next admitted engine starts against a reclaimed machine. Broadcasts
+        ExecutionLeaseReleasing and awaits every listener (libraries clearing
+        their pipeline caches). A failing listener is logged and release
+        proceeds; a hung one is abandoned at the teardown timeout -- either
+        way, a broken teardown must not hold the admission queue forever.
         """
+        if self._lease_id is None:
+            return
+        event = execution_lease_events.ExecutionLeaseReleasing(
+            lease_id=self._lease_id,
+            scope=self._lease_scope,
+        )
+        try:
+            await asyncio.wait_for(
+                self.engine.event_manager.abroadcast_app_event(event),
+                timeout=self.teardown_timeout_s,
+            )
+        except TimeoutError:
+            logger.error(
+                "Execution memory teardown did not finish within %.0fs; releasing the lease anyway. "
+                "The machine may still hold this run's memory.",
+                self.teardown_timeout_s,
+            )
+        except ExceptionGroup:
+            logger.exception(
+                "Execution memory teardown listener(s) failed; releasing the lease anyway. "
+                "The machine may still hold this run's memory."
+            )
 
     def _restart_watchdog(self) -> None:
         """(Re)start the release watchdog for a new run under the current lease."""

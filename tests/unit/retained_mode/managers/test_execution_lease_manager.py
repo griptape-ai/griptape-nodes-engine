@@ -15,10 +15,12 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from griptape_nodes.retained_mode.events.execution_lease_events import ExecutionLeaseReleasing
 from griptape_nodes.retained_mode.managers.execution_lease_manager import ExecutionLeaseManager
 from griptape_nodes.retained_mode.managers.settings import (
     EXECUTION_LEASE_ENABLED_KEY,
     EXECUTION_LEASE_RENEW_INTERVAL_KEY,
+    EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
 )
 
 if TYPE_CHECKING:
@@ -69,13 +71,14 @@ def make_manager(
     engine: Engine,
     monkeypatch: pytest.MonkeyPatch,
     *,
-    enabled: bool = True,
     renew_interval_s: float = 30.0,
     startup_grace_s: float = 0.5,
+    teardown_timeout_s: float = 2.0,
 ) -> tuple[ExecutionLeaseManager, StubBalancer, RunningFlowSignal]:
-    """Build a manager against the stub balancer with test-scaled timings."""
-    engine.config_manager.set_config_value(EXECUTION_LEASE_ENABLED_KEY, value=enabled)
+    """Build a manager against the stub balancer with test-scaled timings; always enabled."""
+    engine.config_manager.set_config_value(EXECUTION_LEASE_ENABLED_KEY, value=True)
     engine.config_manager.set_config_value(EXECUTION_LEASE_RENEW_INTERVAL_KEY, value=renew_interval_s)
+    engine.config_manager.set_config_value(EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY, value=teardown_timeout_s)
     monkeypatch.setattr(ExecutionLeaseManager, "_STARTUP_GRACE_S", startup_grace_s)
     monkeypatch.setattr(ExecutionLeaseManager, "_POLL_INTERVAL_S", 0.01)
 
@@ -312,3 +315,98 @@ class TestRenewal:
 
         await wait_for(lambda: manager.lease_id is None)
         assert len(balancer.sent("ReleaseExecutionLeaseRequest")) == 0
+
+
+class TestTeardownBroadcast:
+    """The real _run_pre_release_teardown: ExecutionLeaseReleasing listeners."""
+
+    @pytest.mark.asyncio
+    async def test_listener_completes_before_release(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager, balancer, signal = make_manager(engine, monkeypatch)
+        order: list[str] = []
+
+        async def slow_teardown(event: ExecutionLeaseReleasing) -> None:
+            await asyncio.sleep(0.05)  # long enough that fire-and-forget would lose the race
+            order.append(f"teardown:{event.scope}")
+
+        engine.event_manager.add_listener_to_app_event(ExecutionLeaseReleasing, slow_teardown)
+        original_send = balancer.send_request
+
+        async def recording_send(request_type: str, payload: dict[str, Any]) -> dict[str, Any]:
+            if request_type == "ReleaseExecutionLeaseRequest":
+                order.append("release")
+            return await original_send(request_type, payload)
+
+        manager.attach_transport(send_request=recording_send, send_no_response=balancer.send_no_response)
+        try:
+            await manager.gate_execution_start(scope="single_node")
+            signal.running = True
+            await asyncio.sleep(0.05)
+            signal.running = False
+
+            await wait_for(lambda: "release" in order)
+            assert order == ["teardown:single_node", "release"]
+        finally:
+            engine.event_manager.remove_listener_for_app_event(ExecutionLeaseReleasing, slow_teardown)
+
+    @pytest.mark.asyncio
+    async def test_raising_listener_does_not_block_release(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, balancer, signal = make_manager(engine, monkeypatch)
+
+        async def broken_teardown(_event: ExecutionLeaseReleasing) -> None:
+            msg = "cache clear failed"
+            raise RuntimeError(msg)
+
+        engine.event_manager.add_listener_to_app_event(ExecutionLeaseReleasing, broken_teardown)
+        try:
+            await manager.gate_execution_start()
+            signal.running = True
+            await asyncio.sleep(0.05)
+            signal.running = False
+
+            await wait_for(lambda: len(balancer.sent("ReleaseExecutionLeaseRequest")) == 1)
+            assert manager.lease_id is None
+        finally:
+            engine.event_manager.remove_listener_for_app_event(ExecutionLeaseReleasing, broken_teardown)
+
+    @pytest.mark.asyncio
+    async def test_hung_listener_is_abandoned_at_timeout(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A wedged teardown must not hold the admission queue forever."""
+        manager, balancer, signal = make_manager(engine, monkeypatch, teardown_timeout_s=0.1)
+
+        async def hung_teardown(_event: ExecutionLeaseReleasing) -> None:
+            await asyncio.sleep(30)
+
+        engine.event_manager.add_listener_to_app_event(ExecutionLeaseReleasing, hung_teardown)
+        try:
+            await manager.gate_execution_start()
+            signal.running = True
+            await asyncio.sleep(0.05)
+            signal.running = False
+
+            await wait_for(lambda: len(balancer.sent("ReleaseExecutionLeaseRequest")) == 1)
+        finally:
+            engine.event_manager.remove_listener_for_app_event(ExecutionLeaseReleasing, hung_teardown)
+
+    @pytest.mark.asyncio
+    async def test_event_carries_the_held_lease_id(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager, _balancer, signal = make_manager(engine, monkeypatch)
+        seen: list[ExecutionLeaseReleasing] = []
+
+        async def observing_teardown(event: ExecutionLeaseReleasing) -> None:
+            seen.append(event)
+
+        engine.event_manager.add_listener_to_app_event(ExecutionLeaseReleasing, observing_teardown)
+        try:
+            await manager.gate_execution_start()
+            granted_lease_id = manager.lease_id
+            signal.running = True
+            await asyncio.sleep(0.05)
+            signal.running = False
+
+            await wait_for(lambda: len(seen) == 1)
+            assert seen[0].lease_id == granted_lease_id
+        finally:
+            engine.event_manager.remove_listener_for_app_event(ExecutionLeaseReleasing, observing_teardown)

@@ -218,6 +218,41 @@ class CancelExecutionLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 
 @dataclass
+@PayloadRegistry.register
+class ExecutionLeaseReleasing(AppPayload):
+    """Broadcast inside the engine just before its execution lease is returned.
+
+    ENGINE-INTERNAL, not part of the balancer wire contract above: this never
+    crosses to the admission authority. The release watchdog broadcasts it and
+    **awaits every listener to completion** before sending
+    ReleaseExecutionLeaseRequest, so anything a listener frees is genuinely
+    free before the next engine is admitted. That ordering is the event's
+    entire reason to exist -- on a shared GPU machine, serialized admission
+    buys nothing if the previous run's pipelines still occupy memory.
+
+    Libraries holding execution-scoped memory (model/pipeline caches) opt in
+    from ``after_library_nodes_loaded``::
+
+        GriptapeNodes.EventManager().add_listener_to_app_event(
+            ExecutionLeaseReleasing, self._clear_pipeline_cache
+        )
+
+    Async listeners are supported and awaited. A listener that raises does not
+    block the release (the failure is logged and release proceeds), and a
+    listener that hangs is abandoned after the configured teardown timeout --
+    a wedged teardown must not hold the admission queue forever. Libraries
+    must deregister their listener in ``before_library_unregistered``.
+
+    Args:
+        lease_id: The lease about to be returned.
+        scope: The scope string from the lease's acquire request.
+    """
+
+    lease_id: str
+    scope: str = "workflow"
+
+
+@dataclass
 class ExecutionAdmissionStatusEntry:
     """One engine's standing in the admission state, for status display.
 
