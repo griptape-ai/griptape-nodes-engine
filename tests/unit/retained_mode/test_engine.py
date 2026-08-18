@@ -11,6 +11,7 @@ from collections.abc import Iterator
 
 import pytest
 
+from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.retained_mode.engine import (
     Engine,
     EngineScoped,
@@ -29,6 +30,13 @@ from griptape_nodes.retained_mode.events.base_events import (
 )
 from griptape_nodes.retained_mode.events.execution_events import ControlFlowCancelledEvent
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
+
+
+class _BareNode(BaseNode):
+    """Concrete BaseNode used to exercise engine binding without a library round-trip."""
+
+    def process(self) -> None:
+        return None
 
 
 def _identify(engine: Engine, name: str) -> Engine:
@@ -247,6 +255,59 @@ class TestEngineScope:
         observed = await asyncio.gather(observe(first), observe(second))
 
         assert observed == [first, second]
+
+
+class TestNodeEngineBinding:
+    """A node emits onto its own engine's queue, not the process root's.
+
+    `exe_types` reached the `GriptapeNodes` facade to emit, which resolves the process root
+    engine. That meant a node executing under engine B put its events on engine A's queue,
+    so identity could not be correct no matter where it was stamped. `LibraryRegistry`
+    binds the owning engine at creation instead.
+    """
+
+    def test_node_falls_back_to_the_process_engine_when_unbound(self) -> None:
+        """Directly constructed nodes (tests, subclass `__init__` bodies) still resolve an engine."""
+        node = _BareNode(name="unbound")
+
+        assert node._engine is None
+        assert node.engine is current_engine()
+
+    def test_bound_node_reports_its_own_engine(self) -> None:
+        engine = Engine()
+        node = _BareNode(name="bound")
+        node._engine = engine
+
+        assert node.engine is engine
+        assert node.engine is not current_engine()
+
+    @pytest.mark.asyncio
+    async def test_node_emits_onto_its_own_engines_queue(self) -> None:
+        """Two engines, two nodes: neither node's events land on the other's queue."""
+        first = Engine()
+        second = Engine()
+        first.event_manager.initialize_queue(asyncio.Queue())
+        second.event_manager.initialize_queue(asyncio.Queue())
+
+        first_node = _BareNode(name="first_node")
+        first_node._engine = first
+        second_node = _BareNode(name="second_node")
+        second_node._engine = second
+
+        # make_node_unresolved only emits when the current state is in the trigger set.
+        first_node.state = NodeResolutionState.RESOLVED
+        second_node.state = NodeResolutionState.RESOLVED
+
+        first_node.make_node_unresolved({NodeResolutionState.RESOLVED})
+        second_node.make_node_unresolved({NodeResolutionState.RESOLVED})
+
+        first_event = first.event_manager.event_queue.get_nowait()
+        second_event = second.event_manager.event_queue.get_nowait()
+
+        assert first_event.wrapped_event.payload.node_name == "first_node"
+        assert second_event.wrapped_event.payload.node_name == "second_node"
+        assert first.event_manager.event_queue.empty()
+        assert second.event_manager.event_queue.empty()
 
 
 class TestEventIdentity:

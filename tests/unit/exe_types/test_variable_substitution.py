@@ -105,15 +105,23 @@ def _run_tracked_set(
 ) -> tuple[list, TrackedParameterOutputValues]:
     """Set a value on TrackedParameterOutputValues and return (events, tracker).
 
-    When `variables` is provided, a full GN mock (substitution + event capture) is
-    used. Otherwise only EventManager is mocked (for display-suppression-only tests
-    where the values set contain no {Letter} patterns and thus bypass substitution).
+    Output events are emitted through the owning node's engine, so capture is wired to a
+    stub engine on the node rather than to the process facade.
+
+    When `variables` is provided, a full GN mock is used for the substitution lookups that
+    still go through the facade. Otherwise the facade is stubbed minimally (for
+    display-suppression-only tests where the values set contain no {Letter} patterns and
+    thus bypass substitution).
     """
     tracked = TrackedParameterOutputValues(node)
     captured: list = []
 
+    stub_engine = MagicMock()
+    stub_engine.event_manager.emit_execution.side_effect = captured.append
+    node._engine = stub_engine
+
     if variables is not None:
-        # Build a unified mock that handles both substitution and event capture.
+        # Build a mock covering the substitution lookups that still use the facade.
         mock_gn = MagicMock()
         mock_gn.NodeManager.return_value.get_node_parent_flow_by_name.return_value = "test_flow"
         mock_gn.handle_request.side_effect = lambda req: (
@@ -121,12 +129,9 @@ def _run_tracked_set(
         )
         mock_gn.FlowManager.return_value.get_connections.return_value = MagicMock(incoming_index={})
         mock_gn.WorkflowManager.return_value.is_variable_substitution_enabled.return_value = True
-        mock_gn.EventManager.return_value.emit_execution.side_effect = captured.append
         ctx: Any = patch(_GN_PATCH, mock_gn)
     else:
-        minimal_mock = MagicMock()
-        minimal_mock.EventManager.return_value.emit_execution.side_effect = captured.append
-        ctx = patch(_GN_PATCH, minimal_mock)
+        ctx = patch(_GN_PATCH, MagicMock())
 
     if in_aprocess:
         with ctx, aprocess_scope():

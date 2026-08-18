@@ -237,6 +237,7 @@ class TestExecuteNodeWorkerPathStateless:
             name="test_node",
             metadata={"node_type": "SomeNodeType", "library": "some_library"},
             specific_library_name="some_library",
+            engine=node_manager.engine,
         )
         mock_node.set_parameter_value.assert_called_once_with("input_param", "value")
         mock_node.aprocess.assert_awaited_once()

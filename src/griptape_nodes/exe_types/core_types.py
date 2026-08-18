@@ -414,8 +414,6 @@ class BaseNodeElement:
 
     def _emit_alter_element_event_if_possible(self) -> None:
         """Emit an AlterElementEvent if we have node context and the necessary dependencies."""
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         if self._node_context is None:
             return
 
@@ -443,8 +441,9 @@ class BaseNodeElement:
             self._changes["badge"] = complete_dict["badge"]
 
         event_data.update(self._changes)
-        # Publish the event
-        GriptapeNodes.EventManager().emit_execution(AlterElementEvent(element_details=event_data))
+        # Publish the event. Routed through the owning node so the event lands on that node's
+        # engine rather than whichever engine happens to be the process root.
+        self._node_context.engine.event_manager.emit_execution(AlterElementEvent(element_details=event_data))
         self._changes.clear()
 
     def to_dict(self) -> dict[str, Any]:

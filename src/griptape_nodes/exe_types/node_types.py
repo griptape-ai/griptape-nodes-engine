@@ -46,6 +46,7 @@ from griptape_nodes.utils import async_utils
 if TYPE_CHECKING:
     from griptape_nodes.exe_types.core_types import NodeMessagePayload
     from griptape_nodes.node_library.library_registry import LibraryNameAndVersion
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.variable_types import VariableScope
 
 logger = logging.getLogger("griptape_nodes")
@@ -298,6 +299,11 @@ class BaseNode(ABC):
     ) -> None:
         self.name = name
         self._state = state
+        # Assigned by `LibraryRegistry.create_node` right after construction rather than taken as
+        # a parameter here, because node libraries subclass this and call `super().__init__` with
+        # the signature above. Unset until then, so `engine` falls back to the process engine for
+        # the duration of a subclass `__init__` body.
+        self._engine: Engine | None = None
         if metadata is None:
             self.metadata = {}
         else:
@@ -312,6 +318,23 @@ class BaseNode(ABC):
         self._cancellation_requested = threading.Event()
         self._parent_group = None
         self.set_entry_control_parameter(None)
+
+    @property
+    def engine(self) -> Engine:
+        """The engine this node belongs to.
+
+        Set by `LibraryRegistry.create_node`. Falls back to the process engine when unset,
+        which covers nodes built directly (tests, or a subclass `__init__` that is still
+        running) and mirrors how `EngineScoped` managers resolve their engine.
+        """
+        if self._engine is not None:
+            return self._engine
+
+        # Imported here rather than at module scope: `retained_mode.engine` imports
+        # `exe_types.flow`, so a top-level import would close the cycle back onto this package.
+        from griptape_nodes.retained_mode.engine import current_engine
+
+        return current_engine()
 
     @property
     def state(self) -> NodeResolutionState:
@@ -336,15 +359,13 @@ class BaseNode(ABC):
     # This is gross and we need to have a universal pass on resolution state changes and emission of events. That's what this ticket does!
     # https://github.com/griptape-ai/griptape-nodes/issues/994
     def make_node_unresolved(self, current_states_to_trigger_change_event: set[NodeResolutionState] | None) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
         # See if the current state is in the set of states to trigger a change event.
         if current_states_to_trigger_change_event is not None and self.state in current_states_to_trigger_change_event:
             # Trigger the change event.
             # Send an event to the GUI so it knows this node has changed resolution state.
             from griptape_nodes.retained_mode.events.execution_events import NodeUnresolvedEvent
 
-            GriptapeNodes.EventManager().emit_execution(NodeUnresolvedEvent(node_name=self.name))
+            self.engine.event_manager.emit_execution(NodeUnresolvedEvent(node_name=self.name))
         self.state = NodeResolutionState.UNRESOLVED
         # NOTE: _entry_control_parameter is NOT cleared here as it represents execution context
         # that should persist through the resolve/unresolve cycle during a single execution
@@ -1296,7 +1317,6 @@ class BaseNode(ABC):
         return None
 
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
@@ -1312,13 +1332,12 @@ class BaseNode(ABC):
             self.parameter_output_values[parameter_name] = value
         # Publish the event up!
 
-        GriptapeNodes.EventManager().put_event(
+        self.engine.event_manager.put_event(
             ProgressEvent(value=value, node_name=self.name, parameter_name=parameter_name)
         )
 
     def publish_update_to_parameter(self, parameter_name: str, value: Any) -> None:
         from griptape_nodes.retained_mode.events.execution_events import ParameterValueUpdateEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         parameter = self.get_parameter_by_name(parameter_name)
         if parameter:
@@ -1331,7 +1350,7 @@ class BaseNode(ABC):
                 value=safe_unstructure(value),
             )
 
-            GriptapeNodes.EventManager().emit_execution(payload)
+            self.engine.event_manager.emit_execution(payload)
         else:
             msg = f"Parameter '{parameter_name} doesn't exist on {self.name}'"
             raise RuntimeError(msg)
@@ -1578,7 +1597,6 @@ class BaseNode(ABC):
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-        from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
         # Create event data using the parameter's to_event method
         if remove:
@@ -1592,7 +1610,7 @@ class BaseNode(ABC):
             # Publish the event
             payload = AlterElementEvent(element_details=event_data)
 
-        GriptapeNodes.EventManager().emit_execution(payload)
+        self.engine.event_manager.emit_execution(payload)
 
     def _get_element_name(self, element: str | int, element_names: list[str]) -> str:
         """Convert an element identifier (name or index) to its name.
@@ -1793,7 +1811,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         parameter = self._node.get_parameter_by_name(parameter_name)
         if parameter is not None:
             from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
@@ -1814,7 +1831,7 @@ class TrackedParameterOutputValues(dict[str, Any]):
             event_data["modification_type"] = "deleted" if deleted else "set"
 
             # Publish the event
-            GriptapeNodes.EventManager().emit_execution(AlterElementEvent(element_details=event_data))
+            self._node.engine.event_manager.emit_execution(AlterElementEvent(element_details=event_data))
 
 
 class ControlNode(BaseNode):

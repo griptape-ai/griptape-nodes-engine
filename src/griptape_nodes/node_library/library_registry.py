@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from griptape_nodes.exe_types.node_types import BaseNode
     from griptape_nodes.node_library.advanced_node_library import AdvancedNodeLibrary
     from griptape_nodes.node_library.library_declarations import ResolvedModel
+    from griptape_nodes.retained_mode.engine import Engine
     from griptape_nodes.retained_mode.managers.event_manager import EventManager
     from griptape_nodes.retained_mode.managers.fitness_problems.libraries.library_problem import LibraryProblem
 
@@ -462,11 +463,20 @@ class LibraryRegistry:
         name: str,
         metadata: dict[Any, Any] | None = None,
         specific_library_name: str | None = None,
+        engine: Engine | None = None,
     ) -> BaseNode:
         dest_library = cls.get_library_for_node_type(node_type=node_type, specific_library_name=specific_library_name)
 
         with cls.constructing_node():
-            return dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
+            node = dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
+
+        # Bind after construction rather than passing through `__init__`: node libraries own
+        # their `__init__` signature and call `super().__init__(name=..., metadata=...)`, so the
+        # engine cannot be threaded down without breaking every subclass.
+        if engine is not None:
+            node._engine = engine
+
+        return node
 
     @classmethod
     @contextmanager

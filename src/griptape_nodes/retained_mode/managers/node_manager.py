@@ -780,6 +780,7 @@ class NodeManager(EngineScoped):
                 node_type=request.node_type,
                 specific_library_name=request.specific_library_name,
                 metadata=request.metadata,
+                engine=self.engine,
             )
         # modifying to exception to try to catch all possible issues with node creation.
         except Exception as err:
@@ -3216,6 +3217,7 @@ class NodeManager(EngineScoped):
                 name=node_name,
                 metadata=dict(request.node_metadata),
                 specific_library_name=library_name,
+                engine=self.engine,
             )
         except Exception as e:
             return ExecuteNodeResultFailure(
