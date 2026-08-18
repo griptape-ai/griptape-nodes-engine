@@ -13,6 +13,7 @@ flow through the standard client.
 from __future__ import annotations
 
 import os
+from typing import TYPE_CHECKING, cast
 
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
@@ -22,7 +23,11 @@ from griptape_nodes.drivers.cloud_models import (
     LM_STUDIO_DEFAULT_BASE_URL,
     OLLAMA_DEFAULT_BASE_URL,
     ProviderID,
+    model_settings_for,
 )
+
+if TYPE_CHECKING:
+    from pydantic_ai.settings import ModelSettings
 
 GRIPTAPE_CLOUD_BASE_URL = "https://cloud.griptape.ai"
 """Default Griptape Cloud root. The ``/api/v1`` OpenAI-compatible prefix is added here."""
@@ -33,6 +38,7 @@ def build_griptape_cloud_model(
     *,
     api_key: str | None = None,
     base_url: str | None = None,
+    settings: ModelSettings | None = None,
 ) -> OpenAIChatModel:
     """Return an :class:`OpenAIChatModel` bound to Griptape Cloud's ``/api/v1`` endpoint.
 
@@ -45,6 +51,12 @@ def build_griptape_cloud_model(
         base_url: Griptape Cloud root URL (no ``/api/v1`` suffix). Falls back to
             the ``GT_CLOUD_BASE_URL`` environment variable, then to
             :data:`GRIPTAPE_CLOUD_BASE_URL`.
+        settings: Default :class:`ModelSettings` for the returned model. ``None``
+            falls back to the catalog preset for ``model_name`` via
+            :func:`model_settings_for`; pass a dict to override it. Without
+            either, no ``max_tokens`` reaches the wire and the upstream
+            provider's own default caps the response — 4096 tokens for
+            Anthropic models, well under what the catalog intends.
 
     Raises:
         ValueError: If neither a license nor an API key is available.
@@ -54,10 +66,19 @@ def build_griptape_cloud_model(
         msg = f"Attempted to reach Griptape Cloud. Failed because {MISSING_CREDENTIAL_MESSAGE}"
         raise ValueError(msg)
 
+    resolved_settings = settings
+    if resolved_settings is None:
+        preset = model_settings_for(model_name)
+        # `cloud_models` is a plain catalog and stays free of pydantic-ai types,
+        # so the preset arrives as a plain dict. Its keys are constrained to
+        # ModelSettings fields there and asserted in the catalog's tests, so this
+        # is the boundary where that guarantee becomes the static type.
+        resolved_settings = cast("ModelSettings", preset) if preset is not None else None
     cloud_root = (base_url or os.environ.get("GT_CLOUD_BASE_URL", GRIPTAPE_CLOUD_BASE_URL)).rstrip("/")
     return OpenAIChatModel(
         model_name,
         provider=OpenAIProvider(base_url=f"{cloud_root}/api/v1", api_key=resolved_key),
+        settings=resolved_settings,
     )
 
 
@@ -67,6 +88,7 @@ def build_model(
     provider: str = ProviderID.GRIPTAPE_CLOUD,
     api_key: str | None = None,
     base_url: str | None = None,
+    settings: ModelSettings | None = None,
 ) -> OpenAIChatModel:
     """Return an :class:`OpenAIChatModel` for the given provider.
 
@@ -83,6 +105,12 @@ def build_model(
             defaults to :data:`OLLAMA_DEFAULT_BASE_URL`. For ``"lmstudio"``
             defaults to :data:`LM_STUDIO_DEFAULT_BASE_URL`. Required for
             ``"custom"``.
+        settings: Default :class:`ModelSettings` for the returned model, e.g.
+            ``{"max_tokens": 64000}``. For ``"griptape_cloud"``, ``None`` falls
+            back to the catalog preset for ``model_name``. The other providers
+            serve arbitrary model ids that only coincidentally collide with
+            catalog names, so they apply ``settings`` verbatim and default to
+            sending none.
 
     Raises:
         ValueError: If required credentials or URLs are missing.
@@ -91,13 +119,14 @@ def build_model(
     # branch either raises or returns — case _: is exhaustive. Pyright agrees.
     match provider:
         case ProviderID.GRIPTAPE_CLOUD:
-            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url)
+            return build_griptape_cloud_model(model_name, api_key=api_key, base_url=base_url, settings=settings)
         case ProviderID.OLLAMA:
             resolved_url = (base_url or OLLAMA_DEFAULT_BASE_URL).rstrip("/")
             # Ollama doesn't require auth but the OpenAI client needs a non-empty key.
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="ollama"),
+                settings=settings,
             )
         case ProviderID.LMSTUDIO:
             resolved_url = (base_url or LM_STUDIO_DEFAULT_BASE_URL).rstrip("/")
@@ -105,6 +134,7 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=resolved_url, api_key="lm-studio"),
+                settings=settings,
             )
         case _:
             # "custom" or any future provider: caller must supply both url and key.
@@ -117,4 +147,5 @@ def build_model(
             return OpenAIChatModel(
                 model_name,
                 provider=OpenAIProvider(base_url=base_url.rstrip("/"), api_key=api_key),
+                settings=settings,
             )
