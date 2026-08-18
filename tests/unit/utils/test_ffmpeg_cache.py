@@ -15,7 +15,12 @@ import static_ffmpeg.run
 from filelock import FileLock
 from xdg_base_dirs import xdg_data_home
 
-from griptape_nodes.utils.ffmpeg_cache import redirect_ffmpeg_cache, resolve_ffmpeg_directory
+from griptape_nodes.utils import ffmpeg_cache
+from griptape_nodes.utils.ffmpeg_cache import (
+    install_ffmpeg_cache_redirect,
+    redirect_ffmpeg_cache,
+    resolve_ffmpeg_directory,
+)
 
 # The lock is uncontended in these tests, so any wait at all means something is wrong. Fail fast
 # instead of hanging the suite.
@@ -24,13 +29,16 @@ LOCK_TIMEOUT_SECONDS = 5
 
 @pytest.fixture(autouse=True)
 def _restore_static_ffmpeg_globals(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Restore `static_ffmpeg`'s module globals after each test.
+    """Restore `static_ffmpeg`'s module globals and the install-once flag after each test.
 
     `redirect_ffmpeg_cache` mutates process-wide state. Leaking it would change where
-    unrelated tests in the same session look for ffmpeg.
+    unrelated tests in the same session look for ffmpeg. `_redirect_installed` is forced
+    to `False` so every test starts from an uninstalled state, even when an engine built
+    elsewhere in the session already performed the process-wide install.
     """
     monkeypatch.setattr(static_ffmpeg.run, "SELF_DIR", static_ffmpeg.run.SELF_DIR)
     monkeypatch.setattr(static_ffmpeg.run, "LOCK_FILE", static_ffmpeg.run.LOCK_FILE)
+    monkeypatch.setattr(ffmpeg_cache, "_redirect_installed", False)
 
 
 class TestResolveFfmpegDirectory:
@@ -123,6 +131,27 @@ class TestRedirectFfmpegCache:
         monkeypatch.setattr(Path, "mkdir", _read_only_mkdir)
 
         redirect_ffmpeg_cache(tmp_path / "read-only")
+
+
+class TestInstallFfmpegCacheRedirect:
+    def test_first_call_redirects(self, tmp_path: Path) -> None:
+        install_ffmpeg_cache_redirect(str(tmp_path))
+
+        assert str(tmp_path) == static_ffmpeg.run.SELF_DIR
+
+    def test_second_call_is_a_noop(self, tmp_path: Path) -> None:
+        """The redirect is installed once per process; a later engine must not move the cache.
+
+        `redirect_ffmpeg_cache` itself is last-call-wins, so this pins the install-once
+        guard specifically: the second call's differing directory is ignored, and nothing
+        is created for it.
+        """
+        install_ffmpeg_cache_redirect(str(tmp_path / "first"))
+
+        install_ffmpeg_cache_redirect(str(tmp_path / "second"))
+
+        assert str(tmp_path / "first") == static_ffmpeg.run.SELF_DIR
+        assert not (tmp_path / "second").exists()
 
 
 class TestPackageDirectoryIsNeverWritten:

@@ -35,6 +35,30 @@ from xdg_base_dirs import xdg_data_home
 
 logger = logging.getLogger("griptape_nodes")
 
+_redirect_installed = False
+
+
+def install_ffmpeg_cache_redirect(configured_directory: str) -> None:
+    """Redirect `static_ffmpeg`'s cache to the configured (or default) directory, once per process.
+
+    Mirrors `install_file_url_support`: the redirect mutates process-wide state, so it is
+    installed once and subsequent calls are no-ops. The first caller's configuration wins;
+    building further engines in the same process must not move the cache out from under
+    callers that already resolved ffmpeg.
+
+    Args:
+        configured_directory: The `ffmpeg_directory` config value; see
+            `resolve_ffmpeg_directory`.
+    """
+    global _redirect_installed  # noqa: PLW0603
+
+    if _redirect_installed:
+        logger.debug("ffmpeg cache redirect already installed, skipping")
+        return
+
+    redirect_ffmpeg_cache(resolve_ffmpeg_directory(configured_directory))
+    _redirect_installed = True
+
 
 def resolve_ffmpeg_directory(configured_directory: str) -> Path:
     """Resolve the `ffmpeg_directory` config value to a concrete path.

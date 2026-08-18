@@ -42,7 +42,7 @@ from griptape_nodes.retained_mode.events.execution_events import (
 from griptape_nodes.retained_mode.events.flow_events import (
     DeleteFlowRequest,
 )
-from griptape_nodes.utils.ffmpeg_cache import redirect_ffmpeg_cache, resolve_ffmpeg_directory
+from griptape_nodes.utils.ffmpeg_cache import install_ffmpeg_cache_redirect
 from griptape_nodes.utils.version_utils import engine_version
 
 if TYPE_CHECKING:
@@ -220,12 +220,12 @@ class Engine:
 
         # Move ffmpeg's lock file and downloaded binaries out of `static_ffmpeg`'s own package
         # directory, which is read-only when the engine runs from a packaged app (notably the
-        # Linux AppImage's FUSE mount). Has to happen after ConfigManager so
+        # Linux AppImage's FUSE mount). Process-wide and installed once, like
+        # `install_file_url_support`: the first engine built in the process performs the
+        # redirect and later ones no-op. Has to happen after ConfigManager so
         # GTN_CONFIG_FFMPEG_DIRECTORY is honored, and before any node resolves ffmpeg -- which
         # can only happen once boot is complete. See utils/ffmpeg_cache.py.
-        redirect_ffmpeg_cache(
-            resolve_ffmpeg_directory(self._config_manager.get_config_value("ffmpeg_directory", default=""))
-        )
+        install_ffmpeg_cache_redirect(self._config_manager.get_config_value("ffmpeg_directory", default=""))
 
         self._os_manager = OSManager(self._event_manager, engine=self)
         self._secrets_manager = SecretsManager(self._config_manager, self._event_manager)
