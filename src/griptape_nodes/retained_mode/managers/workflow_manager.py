@@ -1326,10 +1326,13 @@ class WorkflowManager(EngineScoped):
                 )
 
         # If the renamed workflow is the current context, update the context name so the
-        # heartbeat and other callers reflect the new registry key immediately.
+        # heartbeat and other callers reflect the new registry key immediately. The retained
+        # path moves with it: rename keeps the directory, so `workflow_dir` is unaffected, but
+        # the path itself would otherwise name a file that no longer exists.
         context_manager = self.engine.context_manager
         if context_manager.has_current_workflow() and context_manager.get_current_workflow_name() == old_workflow_name:
             context_manager.set_current_workflow_name(new_workflow_name)
+            context_manager.set_current_workflow_file_path(str(save_result.file_path))
 
         return None
 
@@ -1764,6 +1767,11 @@ class WorkflowManager(EngineScoped):
                     and context_manager.get_current_workflow_name() == old_registry_key
                 ):
                     context_manager.set_current_workflow_name(new_registry_key)
+                    # The context also retains the workflow's path, and that is what
+                    # `workflow_dir` answers with. Move is the one operation that changes the
+                    # directory, so without this the builtin keeps resolving to the folder the
+                    # file just left.
+                    context_manager.set_current_workflow_file_path(str(new_absolute_path))
 
         except OSError as e:
             error_messages = []
@@ -2503,6 +2511,11 @@ class WorkflowManager(EngineScoped):
             for workflow_context_state in self.engine.context_manager._workflow_stack:
                 if workflow_context_state._name == unsaved_source_key:
                     workflow_context_state._name = registry_key
+                    # The context also retains the workflow's path, and `workflow_dir` prefers
+                    # it over a registry lookup. An unsaved context has no path; this save is
+                    # where it gets one, so record it here or the builtin keeps falling back to
+                    # the registry key -- the thing that goes stale on the next project switch.
+                    workflow_context_state._file_path = str(save_file_result.file_path)
             registered_workflows = WorkflowRegistry.list_workflows()
 
         if registry_key not in registered_workflows:

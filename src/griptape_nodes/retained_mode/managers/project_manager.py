@@ -1588,11 +1588,26 @@ class ProjectManager(EngineScoped):
         # underlying exception text so users can tell which precondition is missing.
         for var_info in variable_infos:
             unavailable_reason = builtin_resolution.unavailable.get(var_info.name)
-            if unavailable_reason is not None and var_info.is_required:
+            if unavailable_reason is None:
+                continue
+            if var_info.is_required:
                 return GetPathForMacroResultFailure(
                     failure_reason=PathResolutionFailureReason.MACRO_RESOLUTION_ERROR,
                     result_details=f"Attempted to resolve macro path. Failed because builtin variable '{var_info.name}' cannot be resolved: {unavailable_reason}",
                 )
+            # Logged for the same reason as the equivalent degradation in
+            # _ProjectVariableResolver._resolve_macro_string: the degraded result is a
+            # PLAUSIBLE path, not an obviously broken one. Dropping `{workflow_dir}` from
+            # `{workflow_dir?:/}outputs` relocates writes and reads from the workflow's folder
+            # to the workspace root, and without this line the only symptom is media that
+            # resolves to a file which was never written there.
+            logger.warning(
+                "Optional builtin '%s' could not be resolved while resolving macro '%s'; "
+                "dropping it from the path (%s)",
+                var_info.name,
+                request.parsed_macro.template,
+                unavailable_reason,
+            )
         if builtin_resolution.conflicts:
             return GetPathForMacroResultFailure(
                 failure_reason=PathResolutionFailureReason.RESERVED_NAME_COLLISION,
