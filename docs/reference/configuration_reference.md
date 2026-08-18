@@ -36,6 +36,7 @@ Workflow execution and processing settings
 | `workflow_execution_mode` | one of `sequential`, `parallel`                        | `"sequential"`  | `GTN_CONFIG_WORKFLOW_EXECUTION_MODE` | Workflow execution mode for node processing. SEQUENTIAL mode uses ParallelResolutionMachine with max_nodes_in_parallel=1 to execute nodes one at a time. PARALLEL mode uses the configured max_nodes_in_parallel value. |
 | `max_nodes_in_parallel`   | integer                                                | `5`             | `GTN_CONFIG_MAX_NODES_IN_PARALLEL`   | Maximum number of nodes executing at a time for parallel execution.                                                                                                                                                     |
 | `worker`                  | object                                                 | (nested object) | n/a (nested; edit config file)       | Nested settings; edit the sub-keys directly in a config file.                                                                                                                                                           |
+| `execution_lease`         | object                                                 | (nested object) | n/a (nested; edit config file)       | Nested settings; edit the sub-keys directly in a config file.                                                                                                                                                           |
 
 ## Storage
 
