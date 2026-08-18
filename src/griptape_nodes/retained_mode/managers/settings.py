@@ -37,6 +37,16 @@ EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY = "execution_lease.teardown_timeout_s"
 # startup grace covers engine boot + balancer linking before enforcement.
 EXECUTION_LEASE_BALANCER_TIMEOUT_KEY = "execution_lease.balancer_heartbeat_timeout_s"
 EXECUTION_LEASE_BALANCER_GRACE_KEY = "execution_lease.balancer_startup_grace_s"
+# Session-heartbeat lifetime: a managed engine lives exactly as long as its
+# artist's session heartbeats keep arriving -- no heartbeats past the timeout,
+# no engine (its run dies with it; the lease releases with teardown on the way
+# out). Off by default until clients send SessionHeartbeatRequest on a cadence;
+# the timeout is deliberately conservative because the heartbeats cross a LAN
+# from a laptop that may be briefly busy or suspended -- a single missed beat
+# must never kill an engine.
+EXECUTION_LEASE_SESSION_LIFETIME_KEY = "execution_lease.session_lifetime_enabled"
+EXECUTION_LEASE_SESSION_TIMEOUT_KEY = "execution_lease.session_heartbeat_timeout_s"
+EXECUTION_LEASE_SESSION_GRACE_KEY = "execution_lease.session_startup_grace_s"
 DISCOVERY_MAX_DEPTH_KEY = "discovery_max_depth"
 # The `Settings.libraries_directory` field below, named here so every reader of it -- the live
 # libraries root, the provisioning preview, the offline libraries-root resolver, and the packager --

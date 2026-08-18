@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any
 
 import pytest
 
+from griptape_nodes.retained_mode.events.app_events import SessionHeartbeatRequest
 from griptape_nodes.retained_mode.events.execution_lease_events import ExecutionLeaseReleasing
 from griptape_nodes.retained_mode.managers.execution_lease_manager import ExecutionLeaseManager
 from griptape_nodes.retained_mode.managers.settings import (
@@ -220,6 +221,84 @@ class TestAcquire:
         await wait_for(lambda: len(balancer.sent("CancelExecutionLeaseRequest")) == 1)
         assert balancer.sent("CancelExecutionLeaseRequest")[0]["lease_id"] == minted_lease_id
         assert manager.lease_id is None
+
+
+class TestCancelWhileQueued:
+    @pytest.mark.asyncio
+    async def test_cancel_with_no_pending_acquire_returns_false(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+
+        assert await manager.cancel_pending_acquire() is False
+        assert len(balancer.sent("CancelExecutionLeaseRequest")) == 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_is_a_noop_when_unmanaged(self, engine: Engine) -> None:
+        engine.config_manager.set_config_value(EXECUTION_LEASE_ENABLED_KEY, value=False)
+        manager = ExecutionLeaseManager(engine=engine)
+
+        assert await manager.cancel_pending_acquire() is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_unblocks_the_waiting_gate(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Cancel-while-queued: the blocked gate resolves as a refused start."""
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+        balancer.grant_gate.clear()  # acquire waits in line
+
+        gate_task = asyncio.create_task(manager.gate_execution_start())
+        await wait_for(lambda: len(balancer.sent("AcquireExecutionLeaseRequest")) == 1)
+        minted_lease_id = balancer.sent("AcquireExecutionLeaseRequest")[0]["lease_id"]
+
+        assert await manager.cancel_pending_acquire() is True
+        assert balancer.sent("CancelExecutionLeaseRequest")[0]["lease_id"] == minted_lease_id
+        # The real balancer answers the abandoned acquire with a failure.
+        balancer.acquire_result_type = "AcquireExecutionLeaseResultFailure"
+        balancer.grant_gate.set()
+
+        with pytest.raises(RuntimeError, match="cancelled while it was waiting"):
+            await gate_task
+        assert manager.lease_id is None
+
+    @pytest.mark.asyncio
+    async def test_grant_racing_the_cancel_is_handed_back(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A grant that lands after the cancel must be returned, never run."""
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+        balancer.grant_gate.clear()
+
+        gate_task = asyncio.create_task(manager.gate_execution_start())
+        await wait_for(lambda: len(balancer.sent("AcquireExecutionLeaseRequest")) == 1)
+
+        assert await manager.cancel_pending_acquire() is True
+        balancer.grant_gate.set()  # balancer grants anyway: the race the engine must not trust
+
+        with pytest.raises(RuntimeError, match="cancelled while it was waiting"):
+            await gate_task
+        assert manager.lease_id is None
+        assert len(balancer.sent("ReleaseExecutionLeaseRequest")) == 1
+
+    @pytest.mark.asyncio
+    async def test_gate_works_again_after_a_cancelled_wait(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+        balancer.grant_gate.clear()
+
+        gate_task = asyncio.create_task(manager.gate_execution_start())
+        await wait_for(lambda: len(balancer.sent("AcquireExecutionLeaseRequest")) == 1)
+        assert await manager.cancel_pending_acquire() is True
+        balancer.acquire_result_type = "AcquireExecutionLeaseResultFailure"
+        balancer.grant_gate.set()
+        with pytest.raises(RuntimeError, match="cancelled while it was waiting"):
+            await gate_task
+
+        balancer.acquire_result_type = "AcquireExecutionLeaseResultSuccess"
+        await manager.gate_execution_start()
+
+        assert manager.lease_id is not None
+        manager._cancel_watchdog()
 
 
 class TestWatchdogRelease:
@@ -480,3 +559,70 @@ class TestBalancerLiveness:
         manager = ExecutionLeaseManager(engine=engine)
 
         await manager.run_balancer_liveness_monitor()  # returns immediately
+
+
+class TestSessionLiveness:
+    @pytest.mark.asyncio
+    async def test_heartbeat_handler_stamps_liveness(self, engine: Engine) -> None:
+        engine.session_manager.active_session_id = "test-session"
+        assert engine.session_manager.last_heartbeat_monotonic == 0.0
+
+        result = engine.session_manager.handle_session_heartbeat_request(SessionHeartbeatRequest())
+
+        assert result.succeeded()
+        assert engine.session_manager.last_heartbeat_monotonic > 0.0
+
+    @pytest.mark.asyncio
+    async def test_monitor_is_a_noop_unless_session_lifetime_enabled(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Lease-managed alone is not enough: the client must be known to heartbeat."""
+        manager, _, _ = make_manager(engine, monkeypatch)
+        assert manager.session_lifetime_enabled is False
+
+        await manager.run_session_liveness_monitor()  # returns immediately
+
+    @pytest.mark.asyncio
+    async def test_monitor_terminates_when_heartbeats_stop(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, _, _ = make_manager(engine, monkeypatch)
+        manager.session_lifetime_enabled = True
+        manager.session_grace_s = 0.05
+        manager.session_timeout_s = 0.1
+        terminated = asyncio.Event()
+
+        async def fake_terminate() -> None:
+            terminated.set()
+
+        monkeypatch.setattr(manager, "_terminate_process", fake_terminate)
+        monitor = asyncio.create_task(manager.run_session_liveness_monitor())
+        try:
+            await asyncio.wait_for(terminated.wait(), timeout=2.0)
+        finally:
+            monitor.cancel()
+
+    @pytest.mark.asyncio
+    async def test_fresh_heartbeats_keep_the_engine_alive(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, _, _ = make_manager(engine, monkeypatch)
+        manager.session_lifetime_enabled = True
+        manager.session_grace_s = 0.05
+        manager.session_timeout_s = 0.3
+        engine.session_manager.active_session_id = "test-session"
+        terminated = asyncio.Event()
+
+        async def fake_terminate() -> None:
+            terminated.set()
+
+        monkeypatch.setattr(manager, "_terminate_process", fake_terminate)
+        monitor = asyncio.create_task(manager.run_session_liveness_monitor())
+
+        try:
+            for _ in range(10):
+                engine.session_manager.handle_session_heartbeat_request(SessionHeartbeatRequest())
+                await asyncio.sleep(0.08)
+            assert not terminated.is_set()
+        finally:
+            monitor.cancel()

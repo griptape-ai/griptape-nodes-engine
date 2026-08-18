@@ -3052,6 +3052,13 @@ class FlowManager(EngineScoped):
             details = f"Could not cancel flow execution. Error: {err}"
 
             return CancelFlowResultFailure(result_details=details)
+        # Managed execution: a run still waiting for admission has nothing
+        # live to cancel -- abandoning its place in line is the cancel.
+        if await self.engine.execution_lease_manager.cancel_pending_acquire():
+            details = (
+                f"Successfully cancelled flow execution with name {flow_name} while it was waiting for its turn to run."
+            )
+            return CancelFlowResultSuccess(result_details=details)
         try:
             await self.cancel_flow_run()
         except Exception as e:
