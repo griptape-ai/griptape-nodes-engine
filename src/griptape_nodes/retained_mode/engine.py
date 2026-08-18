@@ -214,6 +214,10 @@ class Engine:
         )
 
         self._event_manager = EventManager(engine=self)
+        # Identity comes first: EventManager stamps every outgoing event with this engine's
+        # id and active session id, so both have to exist before any manager below can emit.
+        self._engine_identity_manager = EngineIdentityManager(self._event_manager)
+        self._session_manager = SessionManager(self._engine_identity_manager, self._event_manager)
         self._resource_manager = ResourceManager(self._event_manager)
         self._config_manager = ConfigManager(self._event_manager, engine=self)
         self._os_manager = OSManager(self._event_manager, engine=self)
@@ -235,8 +239,6 @@ class Engine:
         )
         self._agent_manager = AgentManager(self._static_files_manager, self._event_manager, engine=self)
         self._version_compatibility_manager = VersionCompatibilityManager(self._event_manager, engine=self)
-        self._engine_identity_manager = EngineIdentityManager(self._event_manager)
-        self._session_manager = SessionManager(self._engine_identity_manager, self._event_manager)
         self._mcp_manager = MCPManager(self._event_manager, self._config_manager)
         self._sync_manager = SyncManager(self._event_manager, self._config_manager, engine=self)
         self._user_manager = UserManager(self._secrets_manager)

@@ -85,7 +85,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
     async def _process_execution_event_async(self, event: ExecutionGriptapeNodeEvent) -> None:
         """Process execution events asynchronously for real-time websocket emission."""
         logger.debug("REAL-TIME: Processing execution event for session %s", self._session_id)
-        self.send_event("execution_event", event.wrapped_event.json())
+        self.send_engine_event("execution_event", event.wrapped_event)
 
     async def arun(
         self,
@@ -126,7 +126,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 exception=e,
             )
             execution_event = ExecutionEvent(payload=control_flow_cancelled_event)
-            self.send_event("execution_event", execution_event.json())
+            self.send_engine_event("execution_event", execution_event)
             await self._wait_for_websocket_queue_flush()
             await asyncio.sleep(1)
             raise LocalExecutorError(msg) from e
@@ -171,11 +171,11 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                     msg = f"Failed to start flow {flow_name}"
                     logger.error(msg)
                     event_result_failure = EventResultFailure(request=start_flow_request, result=start_flow_result)
-                    self.send_event("failure_result", event_result_failure.json())
+                    self.send_engine_event("failure_result", event_result_failure)
                     raise LocalExecutorError(msg) from start_flow_result.exception  # noqa: TRY301
 
                 event_result_success = EventResultSuccess(request=start_flow_request, result=start_flow_result)
-                self.send_event("success_result", event_result_success.json())
+                self.send_engine_event("success_result", event_result_success)
 
             except Exception as e:
                 msg = "Error starting workflow"
@@ -215,13 +215,13 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                 logger.debug("Processing event: %s", type(event).__name__)
 
                 if isinstance(event, EventRequest):
-                    self.send_event("event_request", event.json())
+                    self.send_engine_event("event_request", event)
                     task = asyncio.create_task(self._handle_event_request(event))
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
                 elif isinstance(event, ExecutionGriptapeNodeEvent):
                     # Emit execution event via WebSocket
-                    self.send_event("execution_event", event.wrapped_event.json())
+                    self.send_engine_event("execution_event", event.wrapped_event)
                     task = asyncio.create_task(self._process_execution_event_async(event))
                     background_tasks.add(task)
                     task.add_done_callback(_handle_task_done)
@@ -235,7 +235,7 @@ class LocalSessionWorkflowExecutor(LocalWorkflowExecutor, SubprocessWebSocketSen
                         value=event.value,
                     )
                     execution_event = ExecutionEvent(payload=payload)
-                    self.send_event("execution_event", execution_event.json())
+                    self.send_engine_event("execution_event", execution_event)
 
                 event_queue.task_done()
 

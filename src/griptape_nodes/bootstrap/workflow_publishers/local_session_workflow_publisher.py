@@ -134,13 +134,13 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                     msg = f"Failed to publish workflow: {publish_result.result_details}"
                     logger.error(msg)
                     event_result_failure = EventResultFailure(request=publish_workflow_request, result=publish_result)
-                    self.send_event("failure_result", event_result_failure.json())
+                    self.send_engine_event("failure_result", event_result_failure)
                     is_publish_finished = True
                     error = LocalPublisherError(msg)
                 else:
                     logger.info("Published workflow successfully")
                     event_result_success = EventResultSuccess(request=publish_workflow_request, result=publish_result)
-                    self.send_event("success_result", event_result_success.json())
+                    self.send_engine_event("success_result", event_result_success)
                     is_publish_finished = True
                     # Add a dummy event to wake up the loop now that publishing is done
                     event_queue = GriptapeNodes.EventManager().event_queue
@@ -186,7 +186,7 @@ class LocalSessionWorkflowPublisher(LocalWorkflowPublisher, SubprocessWebSocketS
                     if isinstance(wrapped_event, ExecutionEvent) and isinstance(
                         wrapped_event.payload, PublishWorkflowProgressEvent
                     ):
-                        self.send_event("execution_event", wrapped_event.json())
+                        self.send_engine_event("execution_event", wrapped_event)
                         logger.debug(
                             "Emitted progress event: %.1f%% - %s",
                             wrapped_event.payload.progress,

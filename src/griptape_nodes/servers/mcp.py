@@ -376,6 +376,9 @@ async def _handle_request_on_engine_loop(request_payload: RequestPayload) -> dic
         )
     else:
         result_event = EventResultFailure(request=request_payload, result=result_payload)
+    # This re-wrap never passes through the EventManager queue, so stamp it explicitly to keep
+    # the dict shape identical to what the WebSocket transport delivers.
+    GriptapeNodes.EventManager().stamp_event_identity(result_event)
     return json.loads(result_event.json())
 
 

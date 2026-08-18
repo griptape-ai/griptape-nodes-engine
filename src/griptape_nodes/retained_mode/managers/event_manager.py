@@ -314,6 +314,24 @@ class EventManager(EngineScoped):
             and self._event_loop is not None
         )
 
+    def stamp_event_identity(self, event: Any) -> None:
+        """Stamp this engine's identity onto an event heading for the transport.
+
+        Events carry no identity at construction, so whichever engine emits one has to
+        record itself before the event leaves. Called from `put_event`/`aput_event` and
+        from `_handle_request_core`, which together cover every path out of the engine.
+        Emitters that reach the transport without passing through this manager -- the
+        subprocess session executors, for instance -- call this directly.
+
+        Args:
+            event: The event to stamp. Non-`BaseEvent` items on the queue (`ProgressEvent`
+                is a plain dataclass) carry no identity fields and are left alone.
+        """
+        if not isinstance(event, BaseEvent):
+            return
+
+        event.stamp_identity(engine_id=self.engine.get_engine_id(), session_id=self.engine.get_session_id())
+
     def put_event(self, event: Any) -> None:
         """Put event into async queue from sync context (non-blocking).
 
@@ -324,6 +342,8 @@ class EventManager(EngineScoped):
         """
         if self._event_queue is None:
             return
+
+        self.stamp_event_identity(event)
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -348,6 +368,8 @@ class EventManager(EngineScoped):
         """
         if self._event_queue is None:
             return
+
+        self.stamp_event_identity(event)
 
         if self._is_cross_thread_call() and self._event_loop is not None:
             # We're in a different thread from the event loop, use thread-safe method
@@ -1074,6 +1096,12 @@ class EventManager(EngineScoped):
                     retained_mode=retained_mode_str,
                     response_topic=context.get("response_topic"),
                 )
+
+        # Stamped here rather than only in put_event because callers can take this result
+        # straight to the transport without it ever reaching the queue: the app's inbound
+        # path awaits ahandle_request and broadcasts the result itself. Stamped before the
+        # hooks fire, because an inline hook blocks this method until it finishes.
+        self.stamp_event_identity(result_event)
 
         # Fired here rather than in the two dispatch methods because every path that
         # produces a result event -- sync, async, and pre-dispatch short-circuit -- runs
