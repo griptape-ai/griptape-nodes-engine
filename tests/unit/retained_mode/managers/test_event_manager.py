@@ -278,6 +278,46 @@ class TestHandleRequestLoopSafety:
         assert event.result.succeeded()
 
 
+class TestHandleRequestStampsIdentity:
+    """`_handle_request_core` stamps identity on its result even when the queue is never touched.
+
+    The app's inbound path awaits `ahandle_request`/`handle_request` and broadcasts the
+    returned result straight to the transport, so a result that never reaches `put_event`/
+    `aput_event` still needs its origin recorded here.
+    """
+
+    def test_handle_request_stamps_identity_without_initializing_the_queue(self) -> None:
+        engine = Engine()
+        engine.engine_identity_manager.active_engine_id = "engine-a"
+        engine.session_manager.active_session_id = "session-a"
+
+        def sync_handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, sync_handler)
+
+        result = engine.event_manager.handle_request(_ProbeRequest())
+
+        assert result.engine_id == "engine-a"
+        assert result.session_id == "session-a"
+
+    @pytest.mark.asyncio
+    async def test_ahandle_request_stamps_identity_without_initializing_the_queue(self) -> None:
+        engine = Engine()
+        engine.engine_identity_manager.active_engine_id = "engine-a"
+        engine.session_manager.active_session_id = "session-a"
+
+        async def async_handler(_request: _ProbeRequest) -> _ProbeResult:
+            return _ProbeResult(result_details="ok")
+
+        engine.event_manager.assign_manager_to_request_type(_ProbeRequest, async_handler)
+
+        result = await engine.event_manager.ahandle_request(_ProbeRequest())
+
+        assert result.engine_id == "engine-a"
+        assert result.session_id == "session-a"
+
+
 @dataclass(kw_only=True)
 class _ForwardableProbeRequest(RequestPayload):
     """Minimal request used to drive the worker-forwarding path in tests."""
@@ -1615,10 +1655,9 @@ class _ProbeAppEvent(AppPayload):
 class TestEmitApi:
     """`emit_execution`/`emit_app` own both the wrapping and the identity stamp.
 
-    Callers used to hand `put_event` a hand-built
-    `ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=...))`, so every call site
-    had to get the nesting right and identity only landed if something remembered to stamp.
-    These pin that the emit API makes both structural.
+    A caller cannot build the event without both: no hand-built
+    `ExecutionGriptapeNodeEvent(wrapped_event=ExecutionEvent(payload=...))` nesting to get
+    wrong, and no stamp to forget.
     """
 
     @staticmethod

@@ -373,6 +373,11 @@ class EventManager(EngineScoped):
     def put_event(self, event: Any) -> None:
         """Put event into async queue from sync context (non-blocking).
 
+        For an `ExecutionPayload` or `AppPayload`, prefer `emit_execution`/`emit_app`, which own
+        the wrapping the transport expects in addition to the identity stamp. `put_event` is for
+        callers that already have a fully-built `BaseEvent` to publish as-is: the `GriptapeNodeEvent`
+        result wrapper, or a plain `ProgressEvent`.
+
         Automatically detects if we're in a different thread and uses thread-safe operations.
 
         Args:
@@ -398,6 +403,11 @@ class EventManager(EngineScoped):
 
     async def aput_event(self, event: Any) -> None:
         """Put event into async queue from async context.
+
+        For an `ExecutionPayload` or `AppPayload`, prefer `aemit_execution`/`aemit_app`, which own
+        the wrapping the transport expects in addition to the identity stamp. `aput_event` is for
+        callers that already have a fully-built `BaseEvent` to publish as-is: the `GriptapeNodeEvent`
+        result wrapper, or a plain `ProgressEvent`.
 
         Automatically detects if we're in a different thread and uses thread-safe operations.
 

@@ -11,7 +11,14 @@ from collections.abc import Iterator
 
 import pytest
 
+from griptape_nodes.exe_types.core_types import Parameter
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
+from griptape_nodes.node_library.library_registry import (
+    LibraryMetadata,
+    LibraryRegistry,
+    LibrarySchema,
+    NodeMetadata,
+)
 from griptape_nodes.retained_mode.engine import (
     Engine,
     EngineScoped,
@@ -37,6 +44,47 @@ class _BareNode(BaseNode):
 
     def process(self) -> None:
         return None
+
+
+class _ParamDeclaringNode(BaseNode):
+    """Concrete BaseNode that declares a parameter from `__init__`, the way real nodes do.
+
+    `add_parameter` emits an `AlterElementEvent` unconditionally, so a node built through this
+    class exercises whether that construction-time emission resolves to the engine constructing
+    it or falls back to the process engine.
+    """
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:
+        super().__init__(name=name, metadata=metadata)
+        self.add_parameter(Parameter(name="value", type="str", tooltip="test"))
+
+    def process(self) -> None:
+        return None
+
+
+_PARAM_DECLARING_LIBRARY_NAME = "node-construction-engine-binding-test-library"
+
+
+def _register_param_declaring_node_library() -> None:
+    """Register `_ParamDeclaringNode` under a throwaway library so `create_node` can build it."""
+    schema = LibrarySchema(
+        name=_PARAM_DECLARING_LIBRARY_NAME,
+        library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+        metadata=LibraryMetadata(
+            author="test",
+            description="node construction engine binding test library",
+            library_version="1.0.0",
+            engine_version="1.0.0",
+            tags=[],
+        ),
+        categories=[],
+        nodes=[],
+    )
+    library = LibraryRegistry.generate_new_library(library_data=schema)
+    library.register_new_node_type(
+        _ParamDeclaringNode,
+        NodeMetadata(category="test", description="probe", display_name="Probe"),
+    )
 
 
 def _identify(engine: Engine, name: str) -> Engine:
@@ -260,10 +308,8 @@ class TestEngineScope:
 class TestNodeEngineBinding:
     """A node emits onto its own engine's queue, not the process root's.
 
-    `exe_types` reached the `GriptapeNodes` facade to emit, which resolves the process root
-    engine. That meant a node executing under engine B put its events on engine A's queue,
-    so identity could not be correct no matter where it was stamped. `LibraryRegistry`
-    binds the owning engine at creation instead.
+    A node executing under engine B must never put its events on engine A's queue.
+    `LibraryRegistry` binds the owning engine at creation to guarantee this.
     """
 
     def test_node_falls_back_to_the_process_engine_when_unbound(self) -> None:
@@ -309,13 +355,77 @@ class TestNodeEngineBinding:
         assert first.event_manager.event_queue.empty()
         assert second.event_manager.event_queue.empty()
 
+    def test_create_node_binds_the_node_to_the_supplied_engine(self) -> None:
+        """`LibraryRegistry.create_node`'s own binding line actually runs, not just the fallback."""
+        LibraryRegistry._clear()
+        _register_param_declaring_node_library()
+        engine = Engine()
+        try:
+            node = LibraryRegistry.create_node(
+                node_type=_ParamDeclaringNode.__name__,
+                name="bound-via-create-node",
+                specific_library_name=_PARAM_DECLARING_LIBRARY_NAME,
+                engine=engine,
+            )
+
+            assert node.engine is engine
+
+            unbound_node = LibraryRegistry.create_node(
+                node_type=_ParamDeclaringNode.__name__,
+                name="unbound-via-create-node",
+                specific_library_name=_PARAM_DECLARING_LIBRARY_NAME,
+            )
+
+            assert unbound_node._engine is None
+            assert unbound_node.engine is current_engine()
+        finally:
+            LibraryRegistry._clear()
+
+    @pytest.mark.asyncio
+    async def test_construction_time_parameter_events_reach_the_creating_engine(self) -> None:
+        """A node's own `__init__` emits parameter events onto the engine creating it.
+
+        `add_parameter` fires an `AlterElementEvent` unconditionally, and declaring parameters
+        from `__init__` is how nodes are normally written, so this covers the construction
+        window rather than just the post-construction `node.engine` getter.
+        """
+        LibraryRegistry._clear()
+        _register_param_declaring_node_library()
+        creating_engine = Engine()
+        other_engine = Engine()
+        creating_engine.event_manager.initialize_queue(asyncio.Queue())
+        other_engine.event_manager.initialize_queue(asyncio.Queue())
+        try:
+            node = LibraryRegistry.create_node(
+                node_type=_ParamDeclaringNode.__name__,
+                name="declares-a-parameter",
+                specific_library_name=_PARAM_DECLARING_LIBRARY_NAME,
+                engine=creating_engine,
+            )
+
+            # add_parameter's own emit and add_child's emit (from add_node_element) both fire for
+            # a single add_parameter call, so drain everything rather than assume exactly one event.
+            emitted_events = []
+            while not creating_engine.event_manager.event_queue.empty():
+                emitted_events.append(creating_engine.event_manager.event_queue.get_nowait())
+
+            assert node.engine is creating_engine
+            assert len(emitted_events) > 0
+            assert all(
+                event.wrapped_event.payload.element_details["node_name"] == "declares-a-parameter"
+                for event in emitted_events
+            )
+            assert other_engine.event_manager.event_queue.empty()
+        finally:
+            LibraryRegistry._clear()
+
 
 class TestEventIdentity:
     """Events must be attributed to the engine that emitted them, not to whoever booted last.
 
-    Identity used to live in `BaseEvent._engine_id` / `_session_id` class variables that every
-    engine overwrote on construction, so a second engine silently re-stamped the whole process.
-    These pin the replacement: no identity at construction, stamped on the way out.
+    An event carries no identity at construction; the emitting engine's `EventManager` stamps
+    it on the way out, and constructing a second engine must never restamp events already
+    attributed to the first.
     """
 
     def test_event_starts_with_no_identity(self) -> None:
@@ -339,7 +449,7 @@ class TestEventIdentity:
         assert (second_event.engine_id, second_event.session_id) == ("engine-b", "session-b")
 
     def test_building_a_second_engine_does_not_restamp_the_first(self) -> None:
-        """The original bug: constructing an engine reattributed every event in the process."""
+        """Constructing a second engine must not reattribute events already stamped by the first."""
         first = _identify(Engine(), "a")
         event = ExecutionEvent(payload=ControlFlowCancelledEvent())
         first.event_manager.stamp_event_identity(event)

@@ -36,6 +36,7 @@ from griptape_nodes.retained_mode.events.base_events import (
 from griptape_nodes.retained_mode.events.event_converter import safe_unstructure
 from griptape_nodes.retained_mode.events.parameter_events import (
     AddParameterToNodeRequest,
+    AlterElementEvent,
     RemoveElementEvent,
     RemoveParameterFromNodeRequest,
 )
@@ -299,11 +300,17 @@ class BaseNode(ABC):
     ) -> None:
         self.name = name
         self._state = state
-        # Assigned by `LibraryRegistry.create_node` right after construction rather than taken as
-        # a parameter here, because node libraries subclass this and call `super().__init__` with
-        # the signature above. Unset until then, so `engine` falls back to the process engine for
-        # the duration of a subclass `__init__` body.
-        self._engine: Engine | None = None
+        # Not taken as a parameter here, because node libraries subclass this and call
+        # `super().__init__` with the signature above, so the engine cannot be threaded through a
+        # constructor argument without breaking every subclass. `LibraryRegistry.create_node`
+        # instead records the constructing engine in a task-local var for the duration of the
+        # call, so it is already bound by the time this line runs and events emitted later in a
+        # subclass `__init__` body (declaring parameters, for instance) resolve to it.
+        # Lazy import: library_registry imports BaseNode from this module, so importing at
+        # module load creates a cycle.
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        self._engine: Engine | None = LibraryRegistry.constructing_engine()
         if metadata is None:
             self.metadata = {}
         else:
@@ -323,9 +330,11 @@ class BaseNode(ABC):
     def engine(self) -> Engine:
         """The engine this node belongs to.
 
-        Set by `LibraryRegistry.create_node`. Falls back to the process engine when unset,
-        which covers nodes built directly (tests, or a subclass `__init__` that is still
-        running) and mirrors how `EngineScoped` managers resolve their engine.
+        Bound in `__init__` from `LibraryRegistry.constructing_engine()`, which is set for the
+        duration of `LibraryRegistry.create_node` (and any other site that wraps construction in
+        `LibraryRegistry.constructing_node(engine=...)`). Falls back to the process engine when
+        a node is constructed outside either, which in production means only bare `NodeClass(...)`
+        calls that skip `LibraryRegistry` entirely; tests do this routinely.
         """
         if self._engine is not None:
             return self._engine
@@ -1317,7 +1326,6 @@ class BaseNode(ABC):
         return None
 
     def append_value_to_parameter(self, parameter_name: str, value: Any) -> None:
-
         # Add the value to the node
         if parameter_name in self.parameter_output_values:
             try:
@@ -1596,8 +1604,6 @@ class BaseNode(ABC):
 
     def _emit_parameter_lifecycle_event(self, parameter: BaseNodeElement, *, remove: bool = False) -> None:
         """Emit an AlterElementEvent for parameter add/remove operations."""
-        from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-
         # Create event data using the parameter's to_event method
         if remove:
             # Import logger here to avoid circular dependency
@@ -1810,8 +1816,6 @@ class TrackedParameterOutputValues(dict[str, Any]):
         """Emit an AlterElementEvent for parameter output value changes."""
         parameter = self._node.get_parameter_by_name(parameter_name)
         if parameter is not None:
-            from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
-
             # Create event data using the parameter's to_event method
             event_data = parameter.to_event(self._node)
 
@@ -2201,8 +2205,6 @@ class ErrorProxyNode(BaseNode):
 
         if existing_param is None:
             # Create new universal parameter with all modes enabled
-            from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
-
             request = AddParameterToNodeRequest(
                 node_name=self.name,
                 parameter_name=param_name,
@@ -2216,7 +2218,7 @@ class ErrorProxyNode(BaseNode):
                 is_user_defined=False,  # Don't serialize this parameter
                 initial_setup=True,  # Allows setting non-settable parameters and prevents resolution cascades during workflow loading
             )
-            result = GriptapeNodes.handle_request(request)
+            result = self.engine.handle_request(request)
 
             # Check if parameter creation was successful
             from griptape_nodes.retained_mode.events.parameter_events import AddParameterToNodeResultSuccess

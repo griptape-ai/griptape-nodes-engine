@@ -41,6 +41,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger("griptape_nodes")
 
 _constructing_node: ContextVar[bool] = ContextVar("_library_registry_constructing_node", default=False)
+_constructing_node_engine: ContextVar[Engine | None] = ContextVar(
+    "_library_registry_constructing_node_engine", default=None
+)
 
 
 class LibraryRegistryError(KeyError):
@@ -467,12 +470,12 @@ class LibraryRegistry:
     ) -> BaseNode:
         dest_library = cls.get_library_for_node_type(node_type=node_type, specific_library_name=specific_library_name)
 
-        with cls.constructing_node():
+        with cls.constructing_node(engine=engine):
             node = dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
 
-        # Bind after construction rather than passing through `__init__`: node libraries own
-        # their `__init__` signature and call `super().__init__(name=..., metadata=...)`, so the
-        # engine cannot be threaded down without breaking every subclass.
+        # Safety net for a subclass __init__ that never calls super().__init__(): BaseNode.__init__
+        # is what reads constructing_engine() to bind _engine, so a subclass that skips it would
+        # otherwise leave the node unbound even though an engine was supplied here.
         if engine is not None:
             node._engine = engine
 
@@ -480,27 +483,36 @@ class LibraryRegistry:
 
     @classmethod
     @contextmanager
-    def constructing_node(cls) -> Iterator[None]:
+    def constructing_node(cls, *, engine: Engine | None = None) -> Iterator[None]:
         """Mark the enclosed block as a node ``__init__`` running on the calling task.
 
-        Sets the same task-local flag that ``create_node`` sets. Use at
-        any direct construction site that bypasses ``create_node``
-        (e.g. ``type(node)(name=...)`` or ``node_class(name=...)`` for
-        an ephemeral probe / reference node), so:
+        Sets the same task-local flag that ``create_node`` sets, and records ``engine`` as the
+        engine constructing the node so ``BaseNode.__init__`` can bind to it before any subclass
+        body runs. Use at any direct construction site that bypasses ``create_node`` (e.g.
+        ``type(node)(name=...)`` or ``node_class(name=...)`` for an ephemeral probe / reference
+        node), so:
 
         - the parameter-mutation-during-aprocess detector skips the
           declarative ``add_parameter`` calls inside the constructed
           node's ``__init__`` (otherwise it would fire once per
-          parameter declared by the helper instance), and
+          parameter declared by the helper instance),
         - the reentrant-bus-in-init detector still fires for the
           right reason if the constructed node's ``__init__`` issues
-          a bus request.
+          a bus request, and
+        - events the constructed node emits during ``__init__`` (declaring parameters, for
+          instance) resolve to ``engine`` instead of falling back to the process engine.
+
+        Args:
+            engine: The engine constructing the node, when one is available. Read by
+                ``BaseNode.__init__`` via ``constructing_engine()``.
         """
-        token = _constructing_node.set(True)
+        node_token = _constructing_node.set(True)
+        engine_token = _constructing_node_engine.set(engine)
         try:
             yield
         finally:
-            _constructing_node.reset(token)
+            _constructing_node.reset(node_token)
+            _constructing_node_engine.reset(engine_token)
 
     @classmethod
     def is_constructing_node(cls) -> bool:
@@ -512,6 +524,17 @@ class LibraryRegistry:
         flag is set by ``create_node`` and by ``constructing_node()``.
         """
         return _constructing_node.get()
+
+    @classmethod
+    def constructing_engine(cls) -> Engine | None:
+        """Return the engine constructing a node on the calling task, if any.
+
+        Read by ``BaseNode.__init__`` to bind a node to its owning engine before any subclass
+        ``__init__`` body runs, so events emitted while declaring parameters resolve to the
+        engine that requested the node rather than falling back to the process engine. Set by
+        ``create_node`` and by ``constructing_node(engine=...)``.
+        """
+        return _constructing_node_engine.get()
 
     @classmethod
     def get_all_library_schemas(cls) -> dict[str, dict]:

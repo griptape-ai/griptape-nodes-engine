@@ -417,8 +417,8 @@ class BaseNodeElement:
         if self._node_context is None:
             return
 
-        # Import here to avoid circular dependencies
-
+        # Lazy import: parameter_events imports ParameterMode from this module at module scope,
+        # so importing parameter_events here at module load would close the cycle.
         from griptape_nodes.retained_mode.events.parameter_events import AlterElementEvent
 
         # Create base event data using the existing to_event method
@@ -441,8 +441,7 @@ class BaseNodeElement:
             self._changes["badge"] = complete_dict["badge"]
 
         event_data.update(self._changes)
-        # Publish the event. Routed through the owning node so the event lands on that node's
-        # engine rather than whichever engine happens to be the process root.
+        # Publish the event through the owning node so it lands on that node's engine.
         self._node_context.engine.event_manager.emit_execution(AlterElementEvent(element_details=event_data))
         self._changes.clear()
 

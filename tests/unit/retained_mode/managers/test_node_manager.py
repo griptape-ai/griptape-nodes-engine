@@ -306,6 +306,34 @@ class TestSerializeNodeWithoutLibraryMetadata:
         griptape_nodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
 
 
+class TestErrorProxyNodeEngineBinding:
+    """Constructing an `ErrorProxyNode` inside `LibraryRegistry.constructing_node(engine=...)` binds it.
+
+    `on_create_node_request` wraps its Error Proxy substitution in exactly this context manager.
+    Driving the full failure path (license checkpoint, library lookup, flow setup) just to reach
+    that construction is disproportionate to what changed; this pins the wrap itself, i.e. that
+    the proxy binds to the constructing engine the same way `LibraryRegistry.create_node` binds
+    every other node type.
+    """
+
+    def test_error_proxy_node_binds_to_the_engine_constructing_it(self) -> None:
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+        from griptape_nodes.node_library.library_registry import LibraryRegistry
+
+        engine = Engine()
+
+        with LibraryRegistry.constructing_node(engine=engine):
+            node = ErrorProxyNode(
+                name="Execute Python",
+                original_node_type="ExecutePython",
+                original_library_name="Missing Library",
+                failure_reason="library failed to load",
+                metadata={},
+            )
+
+        assert node.engine is engine
+
+
 class TestUnresolveNodeRequest:
     """Tests for the on_unresolve_node_request handler."""
 
