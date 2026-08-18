@@ -94,6 +94,9 @@ def make_manager(
     manager = ExecutionLeaseManager(engine=engine)
     balancer = StubBalancer()
     manager.attach_transport(send_request=balancer.send_request, send_no_response=balancer.send_no_response)
+    # The gate requires evidence a balancer is connected (its beacons are the
+    # only connection signal, since it dials in); stamp one for these tests.
+    manager._on_balancer_heartbeat(None)
     return manager, balancer, signal
 
 
@@ -416,3 +419,64 @@ class TestTeardownBroadcast:
             assert seen[0].lease_id == granted_lease_id
         finally:
             engine.event_manager.remove_listener_for_app_event(ExecutionLeaseReleasing, observing_teardown)
+
+
+class TestBalancerLiveness:
+    @pytest.mark.asyncio
+    async def test_gate_fails_fast_when_no_balancer_ever_beaconed(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No beacon = no balancer: refuse with a message, never wait forever."""
+        manager, _, _ = make_manager(engine, monkeypatch)
+        manager._balancer_last_seen = 0.0
+
+        with pytest.raises(RuntimeError, match="no .*load balancer has connected"):
+            await manager.gate_execution_start()
+
+    @pytest.mark.asyncio
+    async def test_monitor_terminates_when_beacons_stop(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager, _, _ = make_manager(engine, monkeypatch)
+        manager.balancer_grace_s = 0.05
+        manager.balancer_timeout_s = 0.1
+        terminated = asyncio.Event()
+
+        async def fake_terminate() -> None:
+            terminated.set()
+
+        monkeypatch.setattr(manager, "_terminate_process", fake_terminate)
+        monitor = asyncio.create_task(manager.run_balancer_liveness_monitor())
+        try:
+            await asyncio.wait_for(terminated.wait(), timeout=2.0)
+        finally:
+            monitor.cancel()
+
+    @pytest.mark.asyncio
+    async def test_fresh_beacons_keep_the_engine_alive(self, engine: Engine, monkeypatch: pytest.MonkeyPatch) -> None:
+        manager, _, _ = make_manager(engine, monkeypatch)
+        manager.balancer_grace_s = 0.05
+        manager.balancer_timeout_s = 0.3
+        terminated = asyncio.Event()
+
+        async def fake_terminate() -> None:
+            terminated.set()
+
+        monkeypatch.setattr(manager, "_terminate_process", fake_terminate)
+        monitor = asyncio.create_task(manager.run_balancer_liveness_monitor())
+
+        async def keep_beaconing() -> None:
+            for _ in range(10):
+                manager._on_balancer_heartbeat(None)
+                await asyncio.sleep(0.08)
+
+        try:
+            await keep_beaconing()
+            assert not terminated.is_set()
+        finally:
+            monitor.cancel()
+
+    @pytest.mark.asyncio
+    async def test_monitor_is_a_noop_when_unmanaged(self, engine: Engine) -> None:
+        engine.config_manager.set_config_value(EXECUTION_LEASE_ENABLED_KEY, value=False)
+        manager = ExecutionLeaseManager(engine=engine)
+
+        await manager.run_balancer_liveness_monitor()  # returns immediately

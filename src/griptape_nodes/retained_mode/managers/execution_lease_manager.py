@@ -29,6 +29,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
+import signal
 import time
 import uuid
 from dataclasses import dataclass
@@ -38,6 +40,8 @@ from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import execution_lease_events
 from griptape_nodes.retained_mode.events.event_converter import converter
 from griptape_nodes.retained_mode.managers.settings import (
+    EXECUTION_LEASE_BALANCER_GRACE_KEY,
+    EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
     EXECUTION_LEASE_ENABLED_KEY,
     EXECUTION_LEASE_RENEW_INTERVAL_KEY,
     EXECUTION_LEASE_TEARDOWN_TIMEOUT_KEY,
@@ -88,6 +92,17 @@ class ExecutionLeaseManager(EngineScoped):
 
     DEFAULT_TEARDOWN_TIMEOUT_S: float = 120.0
 
+    DEFAULT_BALANCER_TIMEOUT_S: float = 30.0
+
+    # Generous: covers engine boot (library load) plus the balancer linking and
+    # sending its first beacon, mirroring the worker heartbeat startup grace.
+    DEFAULT_BALANCER_GRACE_S: float = 600.0
+
+    # After asking the process to shut down gracefully, how long to wait before
+    # forcing the exit -- a wedged shutdown must not leave a zombie engine
+    # claiming GPU memory on a box the balancer has already given up on.
+    _TERMINATE_ESCALATION_S: float = 15.0
+
     def __init__(self, *, engine: Engine) -> None:
         super().__init__(engine)
         self._transport: _LeaseTransport | None = None
@@ -104,8 +119,26 @@ class ExecutionLeaseManager(EngineScoped):
         # is reused for a follow-on run (queued starts draining back-to-back).
         self._watchdog_task: asyncio.Task | None = None
 
+        # Monotonic timestamp of the last balancer beacon; 0.0 = never seen.
+        # Written only by _on_balancer_heartbeat.
+        self._balancer_last_seen: float = 0.0
+
         config = engine.config_manager
         self.enabled: bool = config.get_config_value(EXECUTION_LEASE_ENABLED_KEY, default=False, cast_type=bool)
+        self.balancer_timeout_s: float = config.get_config_value(
+            EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
+            default=ExecutionLeaseManager.DEFAULT_BALANCER_TIMEOUT_S,
+            cast_type=float,
+        )
+        self.balancer_grace_s: float = config.get_config_value(
+            EXECUTION_LEASE_BALANCER_GRACE_KEY,
+            default=ExecutionLeaseManager.DEFAULT_BALANCER_GRACE_S,
+            cast_type=float,
+        )
+        if self.enabled:
+            engine.event_manager.add_listener_to_app_event(
+                execution_lease_events.ExecutionBalancerHeartbeatEvent, self._on_balancer_heartbeat
+            )
         self.renew_interval_s: float = config.get_config_value(
             EXECUTION_LEASE_RENEW_INTERVAL_KEY,
             default=ExecutionLeaseManager.DEFAULT_RENEW_INTERVAL_S,
@@ -165,6 +198,17 @@ class ExecutionLeaseManager(EngineScoped):
                 "Attempted to start execution on a managed engine. Failed because the "
                 "execution manager (load balancer) link is not connected; this engine "
                 "refuses to run unmanaged. Contact your administrator."
+            )
+            raise RuntimeError(msg)
+
+        # The balancer dials in, so "is it connected" is only observable via
+        # its beacons. Without this check an acquire would wait forever on a
+        # topic nobody is subscribed to -- fail closed with a message instead.
+        if self._balancer_last_seen == 0.0:
+            msg = (
+                "Attempted to start execution on a managed engine. Failed because no "
+                "load balancer has connected to this engine yet; this engine refuses "
+                "to run unmanaged. Contact your administrator."
             )
             raise RuntimeError(msg)
 
@@ -367,6 +411,46 @@ class ExecutionLeaseManager(EngineScoped):
     def _engine_id(self) -> str:
         engine_id = self.engine.engine_identity_manager.active_engine_id
         return engine_id if engine_id is not None else "unknown-engine"
+
+    async def run_balancer_liveness_monitor(self) -> None:
+        """Self-terminate when balancer beacons stop: engines die with their balancer.
+
+        The balancer dials in and connection state is invisible to Python, so
+        beacon receipt is the only liveness signal. After the startup grace
+        (covering boot + first link), a beacon gap past the timeout means the
+        admission authority is gone -- and a brokered engine without one must
+        not linger: it cannot run (fail closed) and would only hold memory.
+        Termination goes through the process's own signal handlers so shutdown
+        is graceful, with a hard exit escalation if that wedges.
+
+        Mirrors worker_heartbeat_monitor's shape; a no-op on unmanaged engines.
+        """
+        if not self.enabled:
+            return
+        await asyncio.sleep(self.balancer_grace_s)
+        poll_s = max(0.05, min(self.balancer_timeout_s / 3.0, 10.0))
+        while True:
+            await asyncio.sleep(poll_s)
+            last_seen = self._balancer_last_seen
+            elapsed = time.monotonic() - last_seen if last_seen else float("inf")
+            if elapsed > self.balancer_timeout_s:
+                logger.critical(
+                    "Load balancer heartbeat lost (%s); this engine is shutting down "
+                    "(managed engines do not outlive their admission authority).",
+                    f"{elapsed:.0f}s since last beacon" if last_seen else "never connected",
+                )
+                await self._terminate_process()
+                return
+
+    def _on_balancer_heartbeat(self, _event: Any) -> None:
+        self._balancer_last_seen = time.monotonic()
+
+    async def _terminate_process(self) -> None:
+        """Ask this process to shut down; force the exit if that wedges."""
+        os.kill(os.getpid(), signal.SIGTERM)
+        await asyncio.sleep(ExecutionLeaseManager._TERMINATE_ESCALATION_S)
+        logger.critical("Graceful shutdown did not complete; forcing exit.")
+        os._exit(1)
 
     @staticmethod
     def _payload_of(request: Any) -> dict[str, Any]:

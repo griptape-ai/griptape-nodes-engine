@@ -228,6 +228,23 @@ class CancelExecutionLeaseResultFailure(WorkflowNotAlteredMixin, ResultPayloadFa
 
 @dataclass
 @PayloadRegistry.register
+class ExecutionBalancerHeartbeatEvent(AppPayload):
+    """Periodic liveness beacon from the admission authority to each engine.
+
+    Part of the wire contract: the balancer publishes this on the lease
+    response topic every few seconds per linked engine. Its absence is the
+    engine's ONLY way to observe balancer loss -- the balancer dials in, so
+    the engine holds no connection state of its own -- and a brokered engine
+    whose beacons stop past the configured timeout self-terminates (engines
+    die with their admission authority: fail closed, no orphans holding GPU
+    memory). It also lets the gate fail fast with a clear message when no
+    balancer has ever connected, instead of waiting forever on an acquire
+    nobody will answer.
+    """
+
+
+@dataclass
+@PayloadRegistry.register
 class ExecutionLeaseReleasing(AppPayload):
     """Broadcast inside the engine just before its execution lease is returned.
 
