@@ -227,6 +227,8 @@ from griptape_nodes.retained_mode.managers.fitness_problems.libraries import (
     NodePermissionDeniedProblem,
     OldXdgLocationWarningProblem,
     PermissionDeniedProblem,
+    PostDispatchHookRegistrationProblem,
+    PostDispatchHooksWorkerIncompatibleProblem,
     RequestHandlerRegistrationProblem,
     RequestHandlersWorkerIncompatibleProblem,
     SandboxDirectoryMissingProblem,
@@ -4843,6 +4845,63 @@ class LibraryManager(EngineScoped):
                 library_info.problems.append(RequestHandlerRegistrationProblem(error_message=str(err)))
                 logger.error(
                     "Failed to register request handlers for library '%s': %s",
+                    library_data.name,
+                    err,
+                )
+
+        # Register post-dispatch hooks declared by the library
+        if advanced_library:
+            try:
+                hooks = advanced_library.get_post_dispatch_hooks()
+                if hooks and library_info.requires_worker:
+                    library_info.problems.append(
+                        PostDispatchHooksWorkerIncompatibleProblem(
+                            library_name=library_data.name,
+                            hook_count=len(hooks),
+                        )
+                    )
+                    logger.warning(
+                        "Library '%s' declares %d post-dispatch hook(s) via get_post_dispatch_hooks() but "
+                        "requires worker mode. Hooks are only registered in the worker process and do not "
+                        "observe requests handled by the orchestrator. "
+                        "See https://github.com/griptape-ai/griptape-nodes-engine/issues/4748",
+                        library_data.name,
+                        len(hooks),
+                    )
+                for request_type, callback in hooks:
+                    # Hooks match on the exact request type, so a key that is not a class can
+                    # never equal `type(request)`: the hook would register cleanly and then
+                    # never fire, with nothing in the log to explain why. Fail loudly instead,
+                    # the same way the callable check below does.
+                    if not isinstance(request_type, type):
+                        msg = (
+                            f"Attempted to register a post-dispatch hook from library "
+                            f"'{library_data.name}'. Failed because '{request_type}' is not a request type. "
+                            f"Each entry from get_post_dispatch_hooks() must pair a request type with a "
+                            f"function to run."
+                        )
+                        raise TypeError(msg)  # noqa: TRY301
+                    if not callable(callback):
+                        msg = (
+                            f"Attempted to register a post-dispatch hook for '{request_type.__name__}' "
+                            f"from library '{library_data.name}'. Failed because the hook is not something "
+                            f"that can be called. Each entry from get_post_dispatch_hooks() must pair a "
+                            f"request type with a function to run."
+                        )
+                        raise TypeError(msg)  # noqa: TRY301
+                    event_manager = self.engine.event_manager
+                    event_manager.add_post_dispatch_hook(request_type, callback)
+                    library._registered_post_dispatch_hooks.append((request_type, callback))
+                if hooks:
+                    logger.debug(
+                        "Registered %d post-dispatch hook(s) for library '%s'",
+                        len(hooks),
+                        library_data.name,
+                    )
+            except Exception as err:
+                library_info.problems.append(PostDispatchHookRegistrationProblem(error_message=str(err)))
+                logger.error(
+                    "Failed to register post-dispatch hooks for library '%s': %s",
                     library_data.name,
                     err,
                 )
