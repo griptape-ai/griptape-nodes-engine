@@ -39,6 +39,12 @@ from typing import TYPE_CHECKING, Any
 from griptape_nodes.retained_mode.engine import EngineScoped
 from griptape_nodes.retained_mode.events import execution_lease_events
 from griptape_nodes.retained_mode.events.event_converter import converter
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.settings import (
     EXECUTION_LEASE_BALANCER_GRACE_KEY,
     EXECUTION_LEASE_BALANCER_TIMEOUT_KEY,
@@ -222,6 +228,7 @@ class ExecutionLeaseManager(EngineScoped):
         if not self.enabled:
             return
 
+        self._require_admission_entitlement(scope)
         transport = self._require_admission_authority()
 
         async with self._state_lock:
@@ -321,6 +328,32 @@ class ExecutionLeaseManager(EngineScoped):
             self._pending_cancelled = True
         await self._send_cancel(lease_id)
         return True
+
+    def _require_admission_entitlement(self, scope: str) -> None:
+        """Ask the authorization checkpoint whether managed execution is permitted.
+
+        Managed execution (GPU queueing) is a gated feature: the engine asks
+        any registered authorization hook -- the app maps this onto the
+        license's entitlements -- before requesting admission. An engine with
+        no hooks registered is unrestricted, so a policy-free deployment is
+        unaffected. Evaluated per acquire (not once at startup) so a license
+        change takes effect without an engine restart.
+
+        Raises:
+            RuntimeError: When the checkpoint is denied, carrying every
+                failure detail the hook returned.
+        """
+        engine_id = self._engine_id()
+        checkpoint = AuthorizationCheckpoint(
+            action=CheckpointAction.ACQUIRE_EXECUTION_LEASE,
+            subject_type=CheckpointSubjectType.EXECUTION,
+            subject_id=engine_id,
+            attributes={CheckpointAttribute.ID: engine_id, CheckpointAttribute.SCOPE: scope},
+        )
+        denial = self.engine.event_manager.evaluate_authorization_checkpoint(checkpoint)
+        if denial is not None:
+            msg = f"Attempted to start execution on a managed engine. Failed because: {denial.reason()}"
+            raise RuntimeError(msg)
 
     def _require_admission_authority(self) -> _LeaseTransport:
         """Fail closed unless an admission authority is reachable.

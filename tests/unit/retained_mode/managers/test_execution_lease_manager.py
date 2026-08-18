@@ -17,6 +17,14 @@ import pytest
 
 from griptape_nodes.retained_mode.events.app_events import SessionHeartbeatRequest
 from griptape_nodes.retained_mode.events.execution_lease_events import ExecutionLeaseReleasing
+from griptape_nodes.retained_mode.managers.authorization_checkpoint import (
+    AuthorizationCheckpoint,
+    CheckpointAction,
+    CheckpointAttribute,
+    CheckpointDenial,
+    CheckpointFailure,
+    CheckpointSubjectType,
+)
 from griptape_nodes.retained_mode.managers.execution_lease_manager import ExecutionLeaseManager
 from griptape_nodes.retained_mode.managers.settings import (
     EXECUTION_LEASE_ENABLED_KEY,
@@ -221,6 +229,74 @@ class TestAcquire:
         await wait_for(lambda: len(balancer.sent("CancelExecutionLeaseRequest")) == 1)
         assert balancer.sent("CancelExecutionLeaseRequest")[0]["lease_id"] == minted_lease_id
         assert manager.lease_id is None
+
+
+class TestAdmissionEntitlement:
+    """The paid-tier gate: an authorization hook can deny managed execution."""
+
+    @pytest.mark.asyncio
+    async def test_denied_checkpoint_refuses_the_start_before_any_acquire(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+        seen: list[AuthorizationCheckpoint] = []
+
+        def denying_hook(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen.append(checkpoint)
+            return CheckpointDenial(
+                failures=(CheckpointFailure(detail="Your license does not include GPU queueing."),)
+            )
+
+        engine.event_manager.add_authorization_hook(denying_hook)
+        try:
+            with pytest.raises(RuntimeError, match="does not include GPU queueing"):
+                await manager.gate_execution_start(scope="single_node")
+        finally:
+            engine.event_manager.remove_authorization_hook(denying_hook)
+
+        assert len(balancer.sent("AcquireExecutionLeaseRequest")) == 0
+        assert manager.lease_id is None
+        checkpoint = seen[0]
+        assert checkpoint.action == CheckpointAction.ACQUIRE_EXECUTION_LEASE
+        assert checkpoint.subject_type == CheckpointSubjectType.EXECUTION
+        assert checkpoint.attributes[CheckpointAttribute.SCOPE] == "single_node"
+
+    @pytest.mark.asyncio
+    async def test_allowing_hook_lets_the_acquire_proceed(
+        self, engine: Engine, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        manager, balancer, _ = make_manager(engine, monkeypatch)
+
+        def allowing_hook(_checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            return None
+
+        engine.event_manager.add_authorization_hook(allowing_hook)
+        try:
+            await manager.gate_execution_start()
+        finally:
+            engine.event_manager.remove_authorization_hook(allowing_hook)
+
+        assert manager.lease_id is not None
+        assert len(balancer.sent("AcquireExecutionLeaseRequest")) == 1
+        manager._cancel_watchdog()
+
+    @pytest.mark.asyncio
+    async def test_unmanaged_engine_never_asks_the_checkpoint(self, engine: Engine) -> None:
+        engine.config_manager.set_config_value(EXECUTION_LEASE_ENABLED_KEY, value=False)
+        manager = ExecutionLeaseManager(engine=engine)
+        seen: list[AuthorizationCheckpoint] = []
+
+        def recording_hook(checkpoint: AuthorizationCheckpoint) -> CheckpointDenial | None:
+            seen.append(checkpoint)
+            return None
+
+        engine.event_manager.add_authorization_hook(recording_hook)
+        try:
+            await manager.gate_execution_start()
+        finally:
+            engine.event_manager.remove_authorization_hook(recording_hook)
+
+        assert seen == []
 
 
 class TestCancelWhileQueued:

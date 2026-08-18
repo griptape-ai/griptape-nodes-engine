@@ -39,6 +39,7 @@ class CheckpointAction(StrEnum):
     ACTIVATE_PROJECT = "ActivateProject"
     READ_VIDEO_CODEC = "ReadVideoCodec"
     WRITE_VIDEO_CODEC = "WriteVideoCodec"
+    ACQUIRE_EXECUTION_LEASE = "AcquireExecutionLease"
 
 
 class CheckpointSubjectType(StrEnum):
@@ -49,6 +50,9 @@ class CheckpointSubjectType(StrEnum):
     MODEL = "Model"
     PROJECT = "Project"
     VIDEO_CODEC = "VideoCodec"
+    # An execution about to start on a managed engine (subject_id is the
+    # engine id requesting admission; see CheckpointAction.ACQUIRE_EXECUTION_LEASE).
+    EXECUTION = "Execution"
 
 
 class CheckpointAttribute(StrEnum):
@@ -76,6 +80,9 @@ class CheckpointAttribute(StrEnum):
     MODEL_FAMILIES = "model_families"
     NODE_TYPE = "node_type"
     CONTAINER_FORMAT = "container_format"
+    # The requested execution scope on an ACQUIRE_EXECUTION_LEASE checkpoint
+    # ("workflow" or "single_node").
+    SCOPE = "scope"
 
 
 @dataclass(frozen=True)
