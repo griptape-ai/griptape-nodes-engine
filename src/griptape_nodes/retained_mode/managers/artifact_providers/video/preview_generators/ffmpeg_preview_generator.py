@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import anyio
 from pydantic import PositiveInt  # noqa: TC002 - Runtime validation, not type-only
@@ -18,6 +18,9 @@ from griptape_nodes.retained_mode.managers.artifact_providers.base_generator_par
     Field,
 )
 from griptape_nodes.utils.async_utils import subprocess_run, to_thread
+
+if TYPE_CHECKING:
+    from griptape_nodes.retained_mode.engine import Engine
 
 logger = logging.getLogger("griptape_nodes")
 
@@ -47,13 +50,15 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
     max_width x max_height while preserving aspect ratio.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         source_file_location: str,
         preview_format: str,
         destination_preview_directory: str,
         destination_preview_file_name: str,
         params: dict[str, Any],
+        *,
+        engine: Engine | None = None,
     ) -> None:
         """Initialize the generator.
 
@@ -63,12 +68,18 @@ class FFmpegPreviewGenerator(BaseArtifactPreviewGenerator):
             destination_preview_directory: Directory where the preview should be saved
             destination_preview_file_name: Filename for the preview
             params: Generator parameters (max_width, max_height)
+            engine: The engine whose request bus this generator reads and writes files through
 
         Raises:
             ValidationError: If parameters are invalid
         """
         super().__init__(
-            source_file_location, preview_format, destination_preview_directory, destination_preview_file_name, params
+            source_file_location,
+            preview_format,
+            destination_preview_directory,
+            destination_preview_file_name,
+            params,
+            engine=engine,
         )
 
         # Validate and convert dict -> Pydantic model

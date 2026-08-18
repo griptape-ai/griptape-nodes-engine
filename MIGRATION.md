@@ -1,5 +1,21 @@
 # Unreleased
 
+## Agent streaming payloads carry `thread_id`
+
+`AgentStreamEvent`, `AgentThinkingEvent`, `AgentToolCallEvent`, and `AgentToolResultEvent`
+now require a `thread_id` naming the conversation they belong to. Execution events are
+broadcast to every connected client, so a client with more than one chat surface open
+previously had to assume a delta belonged to whichever turn it started last. The id
+matches the `thread_id` on the `RunAgentResultSuccess` that ends the turn.
+
+If your code constructs one of these payloads, add the thread id:
+
+```python
+AgentStreamEvent(thread_id=thread_id, token=token)
+```
+
+Consumers keep working unchanged; `thread_id` is a new field on the wire, not a rename.
+
 ## Test isolation for node library test suites
 
 `GriptapeNodes` is no longer built by `SingletonMeta`. Its managers now live on an `Engine`

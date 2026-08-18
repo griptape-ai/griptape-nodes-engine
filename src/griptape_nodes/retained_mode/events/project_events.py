@@ -192,8 +192,12 @@ class ResolveProjectWorkspaceResultSuccess(WorkflowNotAlteredMixin, ResultPayloa
     """Resolved workspace directory for a project.
 
     Args:
-        workspace_dir: Absolute path string the project would use, or None when the id resolves to
-            no readable project file (matches the resolver's "nothing to resolve" contract).
+        workspace_dir: Absolute path string the project would use, or None when there is no honest
+            answer: the id resolves to no readable project file (the resolver's "nothing to
+            resolve" contract), or the project declares a workspace_dir that cannot currently be
+            resolved (a FLAWED project -- e.g. an unset environment variable -- whose activation
+            would be refused). Clients treat null as "no hint to show"; the project's validation
+            problems carry the reason for the FLAWED case.
     """
 
     workspace_dir: str | None = None
@@ -227,6 +231,23 @@ class ProjectTemplateInfo:
         current_engine_version: The running engine version, for display.
         engine_version_reason: Human-readable detail explaining an incompatibility,
             None when compatible.
+        workspace_dir: Absolute path of the workspace this project activates with,
+            resolved through the same ladder activation uses (the project's own
+            `workspace_dir`, the `project_workspaces` mapping, an environment or
+            project-adjacent setting, inheritance from the parent chain, or the
+            global default). None when the entry is not file-backed (e.g. the
+            system defaults), its template failed to load, or the project DECLARES
+            a `workspace_dir` that cannot currently be resolved (a FLAWED project
+            -- e.g. an unset environment variable). In the FLAWED case activation
+            refuses the project, so there is no real path to report; `validation`
+            carries the field, reason, and line number so the value can be
+            corrected in the app.
+        libraries_root: Absolute path where this project's libraries install and
+            resolve from -- its own `libraries_dir`, else the nearest ancestor that
+            declares one, else the workspace-relative `libraries_directory`
+            setting. None under the same conditions as `workspace_dir`, plus one
+            more: the fallback cannot be computed when `libraries_dir` is
+            undeclared and `workspace_dir` is unresolvable.
     """
 
     project_id: ProjectID
@@ -238,6 +259,8 @@ class ProjectTemplateInfo:
     required_engine_version: str | None = None
     current_engine_version: str | None = None
     engine_version_reason: str | None = None
+    workspace_dir: str | None = None
+    libraries_root: str | None = None
 
 
 @dataclass

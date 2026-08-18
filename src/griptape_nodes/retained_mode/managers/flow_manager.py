@@ -315,8 +315,8 @@ class FlowManager(EngineScoped):
         self._global_flow_queue = Queue[QueueItem]()
         self._global_control_flow_machine = None  # Track the current control flow machine
         self._global_single_node_resolution = False
-        self._global_dag_builder = DagBuilder()
-        self._node_executor = NodeExecutor()
+        self._global_dag_builder = DagBuilder(self.engine)
+        self._node_executor = NodeExecutor(self.engine)
 
     @property
     def global_single_node_resolution(self) -> bool:
@@ -2992,6 +2992,7 @@ class FlowManager(EngineScoped):
             flow.name,
             pickle_control_flow_result=request.pickle_control_flow_result,
             is_isolated=True,
+            engine=self.engine,
         )
 
         try:
@@ -4109,7 +4110,7 @@ class FlowManager(EngineScoped):
         # Initialize global control flow machine and DAG builder
 
         self._global_control_flow_machine = ControlFlowMachine(
-            flow.name, pickle_control_flow_result=pickle_control_flow_result
+            flow.name, pickle_control_flow_result=pickle_control_flow_result, engine=self.engine
         )
         # Set off the request here.
         try:
@@ -4364,7 +4365,7 @@ class FlowManager(EngineScoped):
             self._global_flow_queue.task_done()
             # Get or create machine
             if self._global_control_flow_machine is None:
-                self._global_control_flow_machine = ControlFlowMachine(flow.name)
+                self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
             await self._global_control_flow_machine.start_flow(start_node, debug_mode=debug_mode)
 
     async def _handle_post_execution_queue_processing(self, *, debug_mode: bool) -> None:
@@ -4393,7 +4394,7 @@ class FlowManager(EngineScoped):
             # Set that we are only working on one node right now!
             self._global_single_node_resolution = True
             # Get or create machine
-            self._global_control_flow_machine = ControlFlowMachine(flow.name)
+            self._global_control_flow_machine = ControlFlowMachine(flow.name, engine=self.engine)
             self._global_control_flow_machine.context.current_nodes = [node]
             resolution_machine = self._global_control_flow_machine.resolution_machine
             resolution_machine.change_debug_mode(debug_mode=debug_mode)

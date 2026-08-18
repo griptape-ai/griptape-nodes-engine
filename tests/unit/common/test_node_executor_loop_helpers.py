@@ -12,7 +12,7 @@ These tests cover small, near-pure helpers that decide loop control flow:
   control parameter name, or None.
 """
 
-from typing import Any
+from typing import Any, cast
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -22,11 +22,9 @@ from griptape_nodes.exe_types.base_iterative_nodes import BaseIterativeEndNode
 from griptape_nodes.exe_types.node_groups.base_iterative_node_group import BaseIterativeNodeGroup
 from griptape_nodes.retained_mode.events.node_events import ListConnectionsForNodeResultSuccess
 
-_GRIPTAPE_NODES_PATH = "griptape_nodes.common.node_executor.GriptapeNodes"
-
 
 def _make_executor() -> NodeExecutor:
-    return NodeExecutor.__new__(NodeExecutor)
+    return NodeExecutor(engine=MagicMock())
 
 
 def _make_package_result(
@@ -112,13 +110,13 @@ class TestGetIterationControlAction:
             return check_fired_returns.get(source[0], False)
 
         executor = _make_executor()
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.handle_request.return_value = connections_result
-            with (
-                patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
-                patch.object(NodeExecutor, "_check_control_source_fired", side_effect=fake_check_fired),
-            ):
-                return executor._get_iteration_control_action(end_node, {})
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.handle_request.return_value = connections_result
+        with (
+            patch.object(NodeExecutor, "_find_sources_for_control_param", side_effect=fake_find_sources),
+            patch.object(NodeExecutor, "_check_control_source_fired", side_effect=fake_check_fired),
+        ):
+            return executor._get_iteration_control_action(end_node, {})
 
     def test_returns_add_when_no_connections(self) -> None:
         end_node = MagicMock(spec=BaseIterativeEndNode)
@@ -176,10 +174,10 @@ class TestGetIterationControlAction:
         end_node = MagicMock(spec=BaseIterativeEndNode)
         end_node.name = "EndLoop"
         executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
         # Return a non-success result from handle_request
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
-            result = executor._get_iteration_control_action(end_node, {})
+        mock_engine.handle_request.return_value = MagicMock(spec=object)  # not ListConnectionsForNodeResultSuccess
+        result = executor._get_iteration_control_action(end_node, {})
         assert result == IterationControlAction.ADD
 
 
@@ -195,40 +193,41 @@ class TestCheckControlSourceFired:
         return node
 
     def test_returns_false_when_source_is_none(self) -> None:
-        with patch(_GRIPTAPE_NODES_PATH):
-            assert _make_executor()._check_control_source_fired(None, {}) is False
+        assert _make_executor()._check_control_source_fired(None, {}) is False
 
     def test_returns_false_when_source_node_not_in_mappings(self) -> None:
-        with patch(_GRIPTAPE_NODES_PATH):
-            result = _make_executor()._check_control_source_fired(("SrcOrig", "out"), {})
+        result = _make_executor()._check_control_source_fired(("SrcOrig", "out"), {})
         assert result is False
 
     def test_returns_false_when_node_manager_raises_value_error(self) -> None:
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.side_effect = ValueError("not found")
-            result = _make_executor()._check_control_source_fired(
-                ("SrcOrig", "out"),
-                {"SrcOrig": "Src_inst1"},
-            )
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.side_effect = ValueError("not found")
+        result = executor._check_control_source_fired(
+            ("SrcOrig", "out"),
+            {"SrcOrig": "Src_inst1"},
+        )
         assert result is False
 
     def test_returns_false_when_node_manager_returns_none(self) -> None:
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = None
-            result = _make_executor()._check_control_source_fired(
-                ("SrcOrig", "out"),
-                {"SrcOrig": "Src_inst1"},
-            )
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = None
+        result = executor._check_control_source_fired(
+            ("SrcOrig", "out"),
+            {"SrcOrig": "Src_inst1"},
+        )
         assert result is False
 
     def test_returns_false_when_no_next_control_output(self) -> None:
         node = self._make_source_node(next_control_output=None)
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = node
-            result = _make_executor()._check_control_source_fired(
-                ("SrcOrig", "out"),
-                {"SrcOrig": "Src_inst1"},
-            )
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        result = executor._check_control_source_fired(
+            ("SrcOrig", "out"),
+            {"SrcOrig": "Src_inst1"},
+        )
         assert result is False
 
     def test_returns_true_when_next_control_output_matches_parameter(self) -> None:
@@ -238,12 +237,13 @@ class TestCheckControlSourceFired:
             next_control_output=target_param,
             params={"out": target_param},
         )
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = node
-            result = _make_executor()._check_control_source_fired(
-                ("SrcOrig", "out"),
-                {"SrcOrig": "Src_inst1"},
-            )
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        result = executor._check_control_source_fired(
+            ("SrcOrig", "out"),
+            {"SrcOrig": "Src_inst1"},
+        )
         assert result is True
 
     def test_returns_false_when_next_control_output_is_a_different_parameter(self) -> None:
@@ -253,12 +253,13 @@ class TestCheckControlSourceFired:
             next_control_output=wrong_param,
             params={"out": target_param},
         )
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.NodeManager.return_value.get_node_by_name.return_value = node
-            result = _make_executor()._check_control_source_fired(
-                ("SrcOrig", "out"),
-                {"SrcOrig": "Src_inst1"},
-            )
+        executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
+        mock_engine.node_manager.get_node_by_name.return_value = node
+        result = executor._check_control_source_fired(
+            ("SrcOrig", "out"),
+            {"SrcOrig": "Src_inst1"},
+        )
         assert result is False
 
 
@@ -313,21 +314,21 @@ class TestGetIterationControlActionEndToEnd:
         node_name_mappings: dict[str, str],
         deserialized_nodes: dict[str, Any],
     ) -> IterationControlAction:
-        """Run _get_iteration_control_action with only GriptapeNodes patched.
+        """Run _get_iteration_control_action with only the engine mocked.
 
         _find_source_for_control_param and _check_control_source_fired execute
         against real logic so that parameter-name matching is exercised.
         """
         connections_result = self._make_connections_result(connections)
         executor = _make_executor()
+        mock_engine = cast("MagicMock", executor.engine)
 
         def fake_get_node(name: str) -> Any:
             return deserialized_nodes.get(name)
 
-        with patch(_GRIPTAPE_NODES_PATH) as mock_gn:
-            mock_gn.handle_request.return_value = connections_result
-            mock_gn.NodeManager.return_value.get_node_by_name.side_effect = fake_get_node
-            return executor._get_iteration_control_action(end_node, node_name_mappings)
+        mock_engine.handle_request.return_value = connections_result
+        mock_engine.node_manager.get_node_by_name.side_effect = fake_get_node
+        return executor._get_iteration_control_action(end_node, node_name_mappings)
 
     def _make_deserialized_node_firing(self, param_name: str) -> MagicMock:
         """Return a mock deserialized node whose get_next_control_output fires the named param."""

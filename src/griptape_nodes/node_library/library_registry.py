@@ -207,6 +207,21 @@ class NodeDefinition(BaseModel):
     metadata: NodeMetadata
 
 
+class WorkflowNodeDefinition(BaseModel):
+    """Defines a node whose behavior comes from a saved workflow file instead of a Python class.
+
+    The workflow must contain at least one Start Flow node and one End Flow node. Its Start Flow
+    parameters become the node's inputs and its End Flow parameters become the node's outputs.
+    """
+
+    # Node type name registered in the library, e.g. "ShoutText". This is what CreateNodeRequest
+    # takes; there is no Python class in the library for it, so the author names it here.
+    node_type: str
+    # Path to the saved workflow `.py`, relative to the library JSON (absolute paths also work).
+    workflow_path: str
+    metadata: NodeMetadata
+
+
 class Setting(BaseModel):
     """Defines a library-specific setting, which will automatically be injected into the user's Configuration."""
 
@@ -238,13 +253,15 @@ class LibrarySchema(BaseModel):
     library itself.
     """
 
-    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.10.0"
+    LATEST_SCHEMA_VERSION: ClassVar[str] = "0.11.0"
 
     name: str
     library_schema_version: str
     metadata: LibraryMetadata
     categories: list[dict[str, CategoryDefinition]]
     nodes: list[NodeDefinition]
+    # Nodes generated from saved workflow files rather than Python classes.
+    workflow_nodes: list[WorkflowNodeDefinition] | None = None
     workflows: list[str] | None = None
     scripts: list[str] | None = None
     settings: list[Setting] | None = None

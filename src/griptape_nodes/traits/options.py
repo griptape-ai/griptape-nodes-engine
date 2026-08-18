@@ -7,6 +7,21 @@ from griptape_nodes.exe_types.core_types import Parameter, Trait
 
 @dataclass(eq=False)
 class Options(Trait):
+    """Offers a parameter's value as a list of choices.
+
+    By default the list is the whole set of valid values: the parameter renders as a
+    dropdown, and a value outside ``choices`` is snapped back to the first choice and
+    fails validation. Use this when an unrecognized value would fail at run time --
+    rejecting bad input up front beats a node that errors mid-flow.
+
+    ``allow_custom=True`` turns the list into hints instead. The parameter renders as a
+    text field that offers matching choices as the user types, and stores whatever they
+    type. Use it when the list is a convenience rather than the full set of valid values,
+    such as a model id the provider added after the node shipped, or a user's own
+    fine-tune. The flag drops the converter and the validator, so updating ``choices`` at
+    run time cannot invalidate a value the node already holds.
+    """
+
     # SERIALIZATION BUG FIX EXPLANATION:
     #
     # PROBLEM: Options trait had a serialization bug where dynamically populated dropdown
@@ -29,13 +44,25 @@ class Options(Trait):
     show_search: bool = field(default=True)
     search_filter: str = field(default="")
 
-    def __init__(self, *, choices: list | None = None, show_search: bool = True, search_filter: str = "") -> None:
+    # Unlike choices, this needs no ui_options round trip: it is fixed in node code, so the
+    # trait a node rebuilds on load carries the right value without consulting what was saved.
+    allow_custom: bool = field(default=False)
+
+    def __init__(
+        self,
+        *,
+        choices: list | None = None,
+        show_search: bool = True,
+        search_filter: str = "",
+        allow_custom: bool = False,
+    ) -> None:
         super().__init__()
         # Set choices through property to ensure dual sync from the start
         if choices is not None:
             self.choices = choices
         self.show_search = show_search
         self.search_filter = search_filter
+        self.allow_custom = allow_custom
 
     @property
     def choices(self) -> list:
@@ -90,6 +117,10 @@ class Options(Trait):
         return ["options", "models"]
 
     def converters_for_trait(self) -> list[Callable]:
+        # The choices are hints, so there is nothing to snap a typed value back to.
+        if self.allow_custom:
+            return []
+
         def converter(value: Any) -> Any:
             # CRITICAL: This converter uses self.choices property (not _choices field)
             # The property reads from ui_options first, ensuring we use post-deserialization
@@ -102,6 +133,10 @@ class Options(Trait):
         return [converter]
 
     def validators_for_trait(self) -> list[Callable[[Parameter, Any], Any]]:
+        # The choices are hints, so any value is allowed and there is nothing to check.
+        if self.allow_custom:
+            return []
+
         def validator(param: Parameter, value: Any) -> None:  # noqa: ARG001
             # CRITICAL: This validator uses self.choices property (not _choices field)
             # Same reasoning as converter - use live ui_options data after deserialization
@@ -125,9 +160,15 @@ class Options(Trait):
 
         Using _choices directly breaks this cycle while still providing the correct
         initial choices for UI rendering. The property-based sync handles runtime updates.
+
+        ``allow_custom`` is published only when set so that every already-saved dropdown
+        keeps serializing exactly the keys it does today.
         """
-        return {
+        options: dict[str, Any] = {
             "simple_dropdown": self._choices,
             "show_search": self.show_search,
             "search_filter": self.search_filter,
         }
+        if self.allow_custom:
+            options["allow_custom"] = True
+        return options

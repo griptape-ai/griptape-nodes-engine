@@ -34,19 +34,24 @@ The Admin Server reads its settings from a `config.yaml` file. Configuration is 
 1. The `config.yaml` file (the default path; it can be pointed elsewhere at startup)
 1. Environment variables
 
+!!! note "Which version this describes"
+
+    This page documents Admin Server 0.3.0 and later — run `./server -version` to check which one you have. On earlier versions `read_timeout` and `write_timeout` default to `30s`, which cuts streamed replies off mid-reply; see the [warning below](#server) for what to set.
+
 A complete `config.yaml` with the default values looks like this:
 
 ```yaml
 server:
   host: "0.0.0.0"
   port: 8080
-  read_timeout: "30s"
-  write_timeout: "30s"
+  read_header_timeout: "10s"
+  write_stall_timeout: "60s"
+  idle_timeout: "120s"
   shutdown_timeout: "10s"
 
 upstream:
   base_url: "https://cloud.griptape.ai"
-  timeout: "30s"
+  timeout: "120s"
   # Name of the environment variable that holds the Griptape Cloud API key.
   # The key value is never stored here — only the variable name.
   api_key_env: "GT_CLOUD_API_KEY"
@@ -62,21 +67,51 @@ forwarding:
 
 ### server
 
-| Key                | Default   | Description                                                           |
-| ------------------ | --------- | --------------------------------------------------------------------- |
-| `host`             | `0.0.0.0` | Address the server listens on.                                        |
-| `port`             | `8080`    | Port the server listens on.                                           |
-| `read_timeout`     | `30s`     | HTTP read timeout (a duration string, e.g. `30s`).                    |
-| `write_timeout`    | `30s`     | HTTP write timeout.                                                   |
-| `shutdown_timeout` | `10s`     | Deadline for in-flight requests to finish during a graceful shutdown. |
+| Key                   | Default   | Description                                                                                                                                                                    |
+| --------------------- | --------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `host`                | `0.0.0.0` | Address the server listens on.                                                                                                                                                 |
+| `port`                | `8080`    | Port the server listens on.                                                                                                                                                    |
+| `read_header_timeout` | `10s`     | Deadline for a request's headers to arrive (a duration string, e.g. `10s`).                                                                                                    |
+| `write_stall_timeout` | `60s`     | How long a single write to a client may block before the connection is dropped. Re-armed before every write, so it does not cap how long a response may take. `0` disables it. |
+| `idle_timeout`        | `120s`    | How long an idle keep-alive connection is held open between requests.                                                                                                          |
+| `shutdown_timeout`    | `10s`     | Deadline for in-flight requests to finish during a graceful shutdown.                                                                                                          |
+| `read_timeout`        | `0` (off) | **Deprecated.** A deadline on reading the *whole* request, so it caps how long an upload may take. Use `read_header_timeout`.                                                  |
+| `write_timeout`       | `0` (off) | **Deprecated.** A deadline on writing the *whole* response — any value above `0` cuts streamed responses off mid-reply. Use `write_stall_timeout`.                             |
+
+!!! warning "`write_timeout` breaks streamed responses"
+
+    Earlier versions of this page and of the example config shipped `read_timeout: "30s"` and `write_timeout: "30s"`. If your `config.yaml` contains either line, **set it to `"0"`**:
+
+    ```yaml
+    server:
+      read_timeout: "0"
+      write_timeout: "0"
+    ```
+
+    Setting `"0"` is correct on every version. *Deleting* the lines only works on 0.3.0 and later, where the defaults are already `0` — on an earlier build a deleted line falls back to that build's `30s` default and replies keep getting cut off. Once every deployment is on 0.3.0 or later you can drop the lines entirely.
+
+    `write_timeout` is a deadline on the entire response, measured from the moment the request arrives — not an idle timeout. Agent replies stream one token at a time and routinely take longer than 30 seconds, so the server cuts them off mid-reply once the deadline passes. In Griptape Nodes that looks like a chat response that stops mid-sentence, and in the application log like:
+
+    ```text
+    httpx.RemoteProtocolError: peer closed connection without sending complete message body
+    ```
+
+    `write_stall_timeout` replaces it: it limits how long a single write may block, so a stalled client is still dropped while a healthy stream runs as long as it needs to.
+
+    You do not have to edit the file to test this — the environment variable wins over `config.yaml`:
+
+    ```bash
+    export SERVER_WRITE_TIMEOUT=0
+    # then restart the Admin Server
+    ```
 
 ### upstream
 
-| Key           | Default                     | Description                                                                     |
-| ------------- | --------------------------- | ------------------------------------------------------------------------------- |
-| `base_url`    | `https://cloud.griptape.ai` | The Griptape Cloud root the server forwards to.                                 |
-| `timeout`     | `30s`                       | How long to wait for the upstream to start responding.                          |
-| `api_key_env` | `GT_CLOUD_API_KEY`          | The **name** of the environment variable that holds the Griptape Cloud API key. |
+| Key           | Default                     | Description                                                                                                                                                                                                                                                                                                                   |
+| ------------- | --------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `base_url`    | `https://cloud.griptape.ai` | The Griptape Cloud root the server forwards to.                                                                                                                                                                                                                                                                               |
+| `timeout`     | `120s`                      | How long to wait for Griptape Cloud to *begin* responding. It never limits how long a response may take, so streamed replies are unaffected. A request that is **not** streamed sends nothing until the whole answer is ready, which is why this default is generous — raise it if long generations return `502 Bad Gateway`. |
+| `api_key_env` | `GT_CLOUD_API_KEY`          | The **name** of the environment variable that holds the Griptape Cloud API key.                                                                                                                                                                                                                                               |
 
 The Admin Server requires a Griptape Cloud API key, which it validates at startup to confirm the operator owns a Griptape organization. The key is **not** used on the request path — your applications still send their own `Authorization` header, which is forwarded untouched.
 
@@ -98,6 +133,16 @@ To use a different variable name, set `api_key_env` and export the key under tha
 | -------- | ------- | --------------------------------------------------- |
 | `level`  | `info`  | Log verbosity: `debug`, `info`, `warn`, or `error`. |
 | `format` | `json`  | Log output format: `json` or `text`.                |
+
+The Admin Server writes logs to standard output and standard error — it does not write a log file. If you need one, redirect when you start it (`./server -config config.yaml > admin-server.log 2>&1`), or let your container runtime or service manager collect the streams. Set `format: "text"` if you will be reading the log by eye rather than feeding it to a log collector.
+
+Three lines are worth knowing when diagnosing a request that ended early:
+
+| Line                                        | Meaning                                                                                                                                                                                                                |
+| ------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `starting server`                           | Lists every timeout actually in effect, with `config.yaml` and environment overrides already resolved. Check this before anything else.                                                                                |
+| `response stream aborted before completion` | A response could not be finished. Includes `bytes_out` (how far it got) and `request_id`. Logged as a warning because the usual cause is a user closing a tab mid-reply; the other cause is a write deadline elapsing. |
+| `panic recovered`                           | A bug in the Admin Server. The caller received a `500`. Worth reporting.                                                                                                                                               |
 
 ### forwarding
 
@@ -148,21 +193,26 @@ This is the minimal set the product cannot run without. Add further rules only f
 
 Every setting can be overridden with an environment variable, which takes precedence over `config.yaml`:
 
-| Variable                  | Default                     | Description                                                                   |
-| ------------------------- | --------------------------- | ----------------------------------------------------------------------------- |
-| `GT_CLOUD_API_KEY`        | _(required)_                | The Griptape Cloud API key (or the variable named by `upstream.api_key_env`). |
-| `SERVER_HOST`             | `0.0.0.0`                   | Listen address.                                                               |
-| `SERVER_PORT`             | `8080`                      | Listen port.                                                                  |
-| `SERVER_READ_TIMEOUT`     | `30s`                       | HTTP read timeout.                                                            |
-| `SERVER_WRITE_TIMEOUT`    | `30s`                       | HTTP write timeout.                                                           |
-| `SERVER_SHUTDOWN_TIMEOUT` | `10s`                       | Graceful shutdown deadline.                                                   |
-| `UPSTREAM_BASE_URL`       | `https://cloud.griptape.ai` | Upstream Griptape Cloud root.                                                 |
-| `UPSTREAM_TIMEOUT`        | `30s`                       | Upstream response-header timeout.                                             |
-| `UPSTREAM_API_KEY_ENV`    | `GT_CLOUD_API_KEY`          | Name of the env var holding the API key.                                      |
-| `LOG_LEVEL`               | `info`                      | Log verbosity.                                                                |
-| `LOG_FORMAT`              | `json`                      | Log output format.                                                            |
-| `FORWARDING_MODE`         | `allow_all`                 | `allow_all`, `allow`, or `deny`.                                              |
-| `FORWARDING_RULES`        | _(empty)_                   | Comma-separated list of paths to allow or deny.                               |
+| Variable                     | Default                     | Description                                                                   |
+| ---------------------------- | --------------------------- | ----------------------------------------------------------------------------- |
+| `GT_CLOUD_API_KEY`           | _(required)_                | The Griptape Cloud API key (or the variable named by `upstream.api_key_env`). |
+| `SERVER_HOST`                | `0.0.0.0`                   | Listen address.                                                               |
+| `SERVER_PORT`                | `8080`                      | Listen port.                                                                  |
+| `SERVER_READ_HEADER_TIMEOUT` | `10s`                       | Request-header deadline.                                                      |
+| `SERVER_WRITE_STALL_TIMEOUT` | `60s`                       | Per-write deadline for a client that stops reading.                           |
+| `SERVER_IDLE_TIMEOUT`        | `120s`                      | Idle keep-alive connection deadline.                                          |
+| `SERVER_SHUTDOWN_TIMEOUT`    | `10s`                       | Graceful shutdown deadline.                                                   |
+| `SERVER_READ_TIMEOUT`        | `0` (off)                   | **Deprecated.** Whole-request read deadline; caps upload duration.            |
+| `SERVER_WRITE_TIMEOUT`       | `0` (off)                   | **Deprecated.** Whole-response write deadline; cuts off streamed replies.     |
+| `UPSTREAM_BASE_URL`          | `https://cloud.griptape.ai` | Upstream Griptape Cloud root.                                                 |
+| `UPSTREAM_TIMEOUT`           | `120s`                      | Upstream response-header timeout.                                             |
+| `UPSTREAM_API_KEY_ENV`       | `GT_CLOUD_API_KEY`          | Name of the env var holding the API key.                                      |
+| `LOG_LEVEL`                  | `info`                      | Log verbosity.                                                                |
+| `LOG_FORMAT`                 | `json`                      | Log output format.                                                            |
+| `FORWARDING_MODE`            | `allow_all`                 | `allow_all`, `allow`, or `deny`.                                              |
+| `FORWARDING_RULES`           | _(empty)_                   | Comma-separated list of paths to allow or deny.                               |
+
+Duration values must carry a unit — `30s`, `2m` — and `0` disables a timeout. A value with no unit (`SERVER_READ_TIMEOUT=30`) makes the Admin Server refuse to start, rather than quietly running with a different timeout than you asked for.
 
 ## Running it
 
@@ -180,6 +230,16 @@ If the API key is missing or invalid, or the upstream cannot be reached, the Adm
 
 ## Troubleshooting
 
-- **The server won't start.** Confirm `GT_CLOUD_API_KEY` is set and valid; the Admin Server validates it at startup and fails closed if it cannot.
+- **Chat replies stop mid-sentence**, or the application logs `peer closed connection without sending complete message body`. A streamed reply was cut off. Almost always `write_timeout` is set in your `config.yaml` — see the [warning above](#server). Set it to `"0"` (or `export SERVER_WRITE_TIMEOUT=0`, which overrides the file) and restart.
+
+    The Admin Server's own log confirms it. The `starting server` line reports every timeout it is using, so check `write_timeout` there first; a `response stream aborted before completion` warning shows the server ended the response and how many bytes it had sent. If `write_timeout=0s` and replies are still truncated, the cut is happening somewhere else — check for a load balancer, ingress controller, or TLS terminator in front of the Admin Server, each of which has its own response timeout.
+
+- **`502 Bad Gateway` on a long generation that isn't streamed.** `upstream.timeout` limits how long Griptape Cloud may take to *begin* responding, and a non-streamed generation sends nothing until the whole answer is ready. Raise it.
+
+- **Large uploads fail partway through.** `read_timeout` limits the total time a request body may take to arrive, which caps upload size in practice. It is off by default on 0.3.0 and later; if your `config.yaml` sets it, set it to `"0"`.
+
+- **The server won't start.** Confirm `GT_CLOUD_API_KEY` is set and valid; the Admin Server validates it at startup and fails closed if it cannot. A startup error naming an environment variable (`invalid SERVER_WRITE_TIMEOUT: "30" is not a duration`) means a duration is missing its unit — use `30s`.
+
 - **`502` on every request.** The Admin Server cannot reach the upstream. Check network egress to `upstream.base_url`, DNS resolution, and TLS interception by corporate proxies.
+
 - **`403 {"error":"path not permitted"}`.** A `forwarding` rule is blocking that path. Adjust `forwarding.mode` / `forwarding.rules` if the path should egress.
