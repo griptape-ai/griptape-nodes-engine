@@ -259,3 +259,112 @@ class TestParameterBehaviorsDropped:
         warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
         assert any("p_with_trait" in r.getMessage() for r in warnings)
         assert any("traits" in r.getMessage() for r in warnings)
+
+
+class _ProbeWithConnectionHook:
+    """Node class overriding a connection lifecycle hook in library code."""
+
+    parameters: list = []  # noqa: RUF012
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def after_incoming_connection(self, source_node: Any, source_parameter: Any, target_parameter: Any) -> None:
+        pass
+
+
+class _ProbeWithValueHook:
+    """Node class overriding a value hook in library code."""
+
+    parameters: list = []  # noqa: RUF012
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def after_value_set(self, parameter: Any, value: Any) -> None:
+        pass
+
+
+class _EngineOwnedHookMixin:
+    """Stands in for an engine-owned component whose hook override is not the author's code."""
+
+    def after_value_set(self, parameter: Any, value: Any) -> None:
+        pass
+
+
+# The detector attributes an override to its defining class's module; stamp an
+# engine-namespace module so this mixin reads as engine-owned.
+_EngineOwnedHookMixin.__module__ = "griptape_nodes.exe_types.param_components.fake_component"
+
+
+class _ProbeInheritingEngineHook(_EngineOwnedHookMixin):
+    """Node class whose only hook override comes from an engine-owned base."""
+
+    parameters: list = []  # noqa: RUF012
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class TestInertWorkerHooks:
+    """#5314: hook overrides that never fire under isolation emit a warn violation."""
+
+    @pytest.mark.asyncio
+    async def test_connection_hook_override_reports_warning_but_keeps_schema(
+        self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
+        manager = GriptapeNodes.LibraryManager()
+        with patched_registry({"WithConnHook": _ProbeWithConnectionHook}):
+            schemas = await manager._serialize_library_node_schemas("libA")
+
+        # Warning, not error: the class still yields a schema.
+        assert [s.class_name for s in schemas] == ["WithConnHook"]
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("after_incoming_connection" in r.getMessage() for r in warnings)
+        assert any("class=WithConnHook" in r.getMessage() for r in warnings)
+        assert any("Shared mode" in r.getMessage() for r in warnings)
+
+    @pytest.mark.asyncio
+    async def test_value_hook_override_reports_warning_but_keeps_schema(
+        self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
+        manager = GriptapeNodes.LibraryManager()
+        with patched_registry({"WithValueHook": _ProbeWithValueHook}):
+            schemas = await manager._serialize_library_node_schemas("libA")
+
+        assert [s.class_name for s in schemas] == ["WithValueHook"]
+
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("after_value_set" in r.getMessage() for r in warnings)
+        assert any("class=WithValueHook" in r.getMessage() for r in warnings)
+        assert any("input hydration" in r.getMessage() for r in warnings)
+
+    @pytest.mark.asyncio
+    async def test_engine_owned_hook_override_is_not_reported(
+        self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        # A hook implemented by an engine-owned base/component (module under
+        # griptape_nodes.) is not the author's code; flagging it would nag on
+        # something the library author cannot remediate.
+        caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
+        manager = GriptapeNodes.LibraryManager()
+        with patched_registry({"EngineHook": _ProbeInheritingEngineHook}):
+            schemas = await manager._serialize_library_node_schemas("libA")
+
+        assert [s.class_name for s in schemas] == ["EngineHook"]
+        assert not any("after_value_set" in r.getMessage() for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_hookless_class_produces_no_hook_violation(
+        self, caplog: pytest.LogCaptureFixture, patched_registry: Callable[[dict[str, type]], Any]
+    ) -> None:
+        caplog.set_level(logging.WARNING, logger="griptape_nodes.strict_mode")
+        manager = GriptapeNodes.LibraryManager()
+        with patched_registry({"Clean": _CleanProbe}):
+            schemas = await manager._serialize_library_node_schemas("libA")
+
+        assert [s.class_name for s in schemas] == ["Clean"]
+        assert not any("hook" in r.getMessage().lower() for r in caplog.records)

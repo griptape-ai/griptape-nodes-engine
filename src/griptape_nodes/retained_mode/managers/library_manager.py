@@ -3744,6 +3744,18 @@ class LibraryManager(EngineScoped):
         if request.project_id == SYSTEM_DEFAULTS_KEY:
             merged = config_mgr.compute_system_defaults_provisioning_config()
         else:
+            # Mirror the activation gate: a project whose declared workspace_dir/libraries_dir
+            # cannot be resolved will be refused by activation, so previewing a plan built from
+            # fallback locations would show the user changes that can never be applied.
+            project_info = self.engine.project_manager.project_info_for_request(request.project_id)
+            if project_info is not None:
+                unresolvable = self.engine.project_manager.unresolvable_declared_path_messages(project_info)
+                if unresolvable:
+                    return PreviewProjectProvisioningResultFailure(
+                        result_details=f"Attempted to preview provisioning for project '{request.project_id}'. "
+                        f"Failed because its declared paths cannot be resolved, so activation would refuse it. "
+                        f"{' '.join(unresolvable)}",
+                    )
             dirs = await self.engine.project_manager.resolve_provisioning_config_dirs(request.project_id)
             if dirs is None:
                 return PreviewProjectProvisioningResultFailure(
@@ -4857,6 +4869,82 @@ class LibraryManager(EngineScoped):
     # discovery. The instance is discarded after its parameters are read.
     _SCHEMA_PROBE_NODE_NAME: str = "__schema_probe__"
 
+    # Hook families that are consulted only on the orchestrator, where a
+    # worker-hosted library is represented by a synthesized stub class (see
+    # _make_worker_stub_class). An author override of any of these never runs
+    # for an Isolated library.
+    _CONNECTION_HOOK_NAMES: tuple[str, ...] = (
+        "allow_incoming_connection",
+        "allow_outgoing_connection",
+        "allow_incoming_connection_by_class",
+        "allow_outgoing_connection_by_class",
+        "before_incoming_connection",
+        "after_incoming_connection",
+        "before_outgoing_connection",
+        "after_outgoing_connection",
+        "before_incoming_connection_removed",
+        "after_incoming_connection_removed",
+        "before_outgoing_connection_removed",
+        "after_outgoing_connection_removed",
+    )
+    # Value hooks fire on the orchestrator stub for editor edits (never the
+    # author's code) and on the worker only during execute-time input
+    # hydration, on a transient node discarded after process returns.
+    _VALUE_HOOK_NAMES: tuple[str, ...] = (
+        "before_value_set",
+        "after_value_set",
+    )
+
+    def _report_inert_worker_hooks(self, probe: BaseNode) -> None:
+        """Report lifecycle-hook overrides that will not fire for a worker-hosted library.
+
+        Connection hooks are invoked exclusively on the orchestrator (connections are
+        orchestrator-owned state), where a worker-hosted library is represented by a
+        synthesized stub that does not carry the override -- the author's code never
+        runs at all. Value hooks fire on the orchestrator stub for editor edits and on
+        the worker only during execute-time input hydration, so value transformation
+        works but editor-time reactivity and parameter-list mutation do not.
+
+        Only overrides defined outside the engine are reported: engine-owned bases and
+        components (modules under ``griptape_nodes.``) also lose these hooks under
+        isolation, but that is the engine's gap to close, not something a library
+        author can remediate.
+        """
+        node_class = type(probe)
+        connection_overrides = [
+            hook for hook in self._CONNECTION_HOOK_NAMES if self._hook_overridden_outside_engine(node_class, hook)
+        ]
+        if connection_overrides:
+            rule = RULES["connection-hooks-inert-on-worker"]
+            STRICT_MODE.report(
+                rule_id=rule.rule_id,
+                message=rule.render(node_class=node_class.__name__, hook_names=", ".join(connection_overrides)),
+            )
+        value_overrides = [
+            hook for hook in self._VALUE_HOOK_NAMES if self._hook_overridden_outside_engine(node_class, hook)
+        ]
+        if value_overrides:
+            rule = RULES["value-hooks-execute-only-on-worker"]
+            STRICT_MODE.report(
+                rule_id=rule.rule_id,
+                message=rule.render(node_class=node_class.__name__, hook_names=", ".join(value_overrides)),
+            )
+
+    @staticmethod
+    def _hook_overridden_outside_engine(node_class: type, hook_name: str) -> bool:
+        """Return True when ``hook_name``'s defining class lives outside the engine package.
+
+        Walks the MRO to the first class whose ``__dict__`` defines the hook -- the
+        implementation that would actually run. ``BaseNode``'s own no-op (and any
+        engine-owned override) attributes to a ``griptape_nodes.`` module and is not
+        the library author's code.
+        """
+        for klass in node_class.__mro__:
+            if hook_name in klass.__dict__:
+                module = klass.__module__ or ""
+                return module != "griptape_nodes" and not module.startswith("griptape_nodes.")
+        return False
+
     def _report_parameter_behavior_losses(self, probe: BaseNode) -> None:
         """Report parameter-behaviors-dropped-in-schema for any probe parameter that has live behaviors.
 
@@ -4929,10 +5017,11 @@ class LibraryManager(EngineScoped):
                 except Exception:
                     logger.debug("Could not probe node class '%s' for schema serialization.", class_name, exc_info=True)
                     continue
-                # Run the parameter-behavior-drop detector inside the scope so
-                # warnings attach to the same LOAD_PROBE scope that owns the
-                # probe attempt.
+                # Run the parameter-behavior-drop and inert-hook detectors
+                # inside the scope so warnings attach to the same LOAD_PROBE
+                # scope that owns the probe attempt.
                 self._report_parameter_behavior_losses(probe)
+                self._report_inert_worker_hooks(probe)
 
             # Drop the class only when a rule flagged drops_class_from_schema
             # fired. Severity is a logging concern; drops_class_from_schema is

@@ -181,7 +181,7 @@ class ArtifactManager(EngineScoped):
         """
         super().__init__(engine)
         # Provider registry for managing artifact providers
-        self._registry = ProviderRegistry()
+        self._registry = ProviderRegistry(engine=engine)
 
         if event_manager is not None:
             event_manager.assign_manager_to_request_type(

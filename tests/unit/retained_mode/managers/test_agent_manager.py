@@ -11,12 +11,21 @@ import json
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 from pydantic_ai.exceptions import ModelHTTPError, ModelRetry
 from pydantic_ai.messages import BinaryContent, ImageUrl, ModelMessage, ModelRequest, UserPromptPart
 
+from griptape_nodes.agents.pydantic_ai.runner import (
+    AgentRunResult,
+    RunEvent,
+    TextDelta,
+    ThinkingDelta,
+    ToolCall,
+    ToolResult,
+)
 from griptape_nodes.drivers.cloud_models import (
     DEPRECATED_MODELS,
     IMAGE_DEPRECATED_MODELS,
@@ -27,6 +36,10 @@ from griptape_nodes.drivers.cloud_models import (
     provider_catalog_entries,
 )
 from griptape_nodes.retained_mode.events.agent_events import (
+    AgentStreamEvent,
+    AgentThinkingEvent,
+    AgentToolCallEvent,
+    AgentToolResultEvent,
     CancelAgentRequest,
     CancelAgentResultSuccess,
     ConfigureAgentRequest,
@@ -50,7 +63,9 @@ from griptape_nodes.retained_mode.events.agent_events import (
     ListProviderModelsResultSuccess,
     PromptDriverConfig,
     ProviderConfig,
+    RunAgentRequest,
     RunAgentRequestArtifact,
+    RunAgentResultSuccess,
     UpdateAgentProviderRequest,
     UpdateAgentProviderResultFailure,
     UpdateAgentProviderResultSuccess,
@@ -69,6 +84,7 @@ from griptape_nodes.retained_mode.managers.agent_manager import (
     _friendly_list_models_error,
     _message_has_image_url,
     _rehydrate_history,
+    _run_event_to_payload,
 )
 
 _AGENT_MANAGER_MODULE = "griptape_nodes.retained_mode.managers.agent_manager"
@@ -210,6 +226,41 @@ class TestOnHandleCancelAgentRequest:
         # The event is set via call_soon_threadsafe; yield once so it runs.
         await asyncio.sleep(0)
         assert cancel_event.is_set()
+
+
+class TestRunEventToPayload:
+    """Every streamed payload carries the thread id so clients can route it."""
+
+    def test_text_delta_becomes_stream_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(TextDelta(delta="hi"), "thread-1")
+
+        assert payload == AgentStreamEvent(thread_id="thread-1", token="hi")  # noqa: S106 - a streamed text token
+
+    def test_thinking_delta_becomes_thinking_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(ThinkingDelta(delta="pondering"), "thread-1")
+
+        assert payload == AgentThinkingEvent(thread_id="thread-1", delta="pondering")
+
+    def test_tool_call_becomes_tool_call_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolCall(tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'), "thread-1"
+        )
+
+        assert payload == AgentToolCallEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", args='{"path": "a.txt"}'
+        )
+
+    def test_tool_result_becomes_tool_result_event_with_thread_id(self) -> None:
+        payload = _run_event_to_payload(
+            ToolResult(tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True), "thread-1"
+        )
+
+        assert payload == AgentToolResultEvent(
+            thread_id="thread-1", tool_call_id="call-1", tool_name="read_file", content="boom", is_error=True
+        )
+
+    def test_unmapped_event_kind_is_dropped(self) -> None:
+        assert _run_event_to_payload(RunEvent(), "thread-1") is None
 
 
 @dataclass
@@ -1176,3 +1227,78 @@ class TestCloudHttpStatusOf:
     def test_returns_none_for_non_http_error(self) -> None:
         """A plain error has no status, so the caller keeps the original message."""
         assert _cloud_http_status_of(ValueError("boom"), _CLOUD_HOST) is None
+
+
+def _run_request() -> RunAgentRequest:
+    """A minimal RunAgentRequest; the payload branches don't read its fields."""
+    return RunAgentRequest(input="hello", url_artifacts=[], thread_id="t1")
+
+
+async def _stub_compose_prompt(text: str, _url_artifacts: list[RunAgentRequestArtifact]) -> ComposedPrompt:
+    """Skip artifact download; these tests only exercise the result branches."""
+    return ComposedPrompt(live=text, persist=text)
+
+
+class TestRunAgentResultPayloadContract:
+    """`_run_agent`'s three success branches must agree on the payload's keys.
+
+    The sidebar reads `output.truncated` on every reply, so a branch that omits
+    it hands the consumer `undefined` where the other branches give a boolean.
+    """
+
+    _BRANCHES = (
+        ("cancelled", AgentRunResult(thread_id="t1", output="partial", message_count=2, cancelled=True)),
+        ("truncated", AgentRunResult(thread_id="t1", output="cut off", message_count=3, truncated=True)),
+        ("normal", AgentRunResult(thread_id="t1", output="all done", message_count=3)),
+    )
+
+    @staticmethod
+    def _manager(monkeypatch: pytest.MonkeyPatch, result: AgentRunResult) -> AgentManager:
+        """An AgentManager whose runner returns `result` and whose I/O is stubbed."""
+        manager = AgentManager.__new__(AgentManager)
+        manager._active_runs = {}
+
+        async def fake_run(*_args: object, **_kwargs: object) -> AgentRunResult:
+            return result
+
+        monkeypatch.setattr(manager, "_validate_thread_for_run", lambda _thread_id: "t1")
+        monkeypatch.setattr(manager, "_build_runner", lambda *_a, **_k: SimpleNamespace(run=fake_run))
+        # A non-empty history keeps `is_first_run` False, so no thread metadata write.
+        manager._thread_storage = SimpleNamespace(load_history=lambda _t: [object()])  # type: ignore[assignment]
+        monkeypatch.setattr(
+            _AGENT_MANAGER_MODULE + "._compose_prompt",
+            _stub_compose_prompt,
+        )
+        # `engine` is a read-only property over `_engine`; set the backing field.
+        manager._engine = SimpleNamespace(  # type: ignore[assignment]
+            event_manager=SimpleNamespace(put_event=lambda _e: None)
+        )
+        return manager
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("branch", "result"), _BRANCHES, ids=[b for b, _ in _BRANCHES])
+    async def test_every_branch_sets_truncated(
+        self, monkeypatch: pytest.MonkeyPatch, branch: str, result: AgentRunResult
+    ) -> None:
+        manager = self._manager(monkeypatch, result)
+
+        payload = await manager._run_agent(_run_request())
+
+        assert isinstance(payload, RunAgentResultSuccess)
+        assert "truncated" in payload.output, f"the {branch} branch omits `truncated` from its payload"
+        assert payload.output["truncated"] is result.truncated
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("branch", "result"), _BRANCHES, ids=[b for b, _ in _BRANCHES])
+    async def test_branches_share_one_key_set(
+        self, monkeypatch: pytest.MonkeyPatch, branch: str, result: AgentRunResult
+    ) -> None:
+        """One shape for all outcomes, so the frontend needs no per-branch handling."""
+        manager = self._manager(monkeypatch, result)
+
+        payload = await manager._run_agent(_run_request())
+
+        assert isinstance(payload, RunAgentResultSuccess)
+        assert set(payload.output) == {"text", "message_count", "cancelled", "truncated", "generated_image_urls"}, (
+            f"the {branch} branch's payload keys differ from the other branches'"
+        )
