@@ -318,6 +318,45 @@ class TestNodeGroupRoundTrip:
             f"expected at least {len(distinct_edge_keys)} edges to be created, got {len(issued_edges)}"
         )
 
+    def test_restores_an_edge_leaving_a_nested_group(self, library_name: str) -> None:
+        """The other direction: a nested node is the source and the far end is outside both groups.
+
+        Incoming and outgoing edges take separate branches when a group decides whether an edge
+        crosses its boundary, and each hands off to a different side of the wall. Every other test
+        here wires outside-in, so the outgoing branch was never taken.
+        """
+        flow = GriptapeNodes.handle_request(
+            CreateFlowRequest(parent_flow_name=None, flow_name="OutgoingRoundTrip", set_as_new_context=False)
+        )
+        assert isinstance(flow, CreateFlowResultSuccess), flow
+
+        with GriptapeNodes.ContextManager().flow(flow.flow_name):
+            outer = _create_node("SubflowGroupNode", "OuterGroup", library_name)
+            inner = _create_node("SubflowGroupNode", "InnerGroup", library_name)
+            leaf = _create_node("EchoNode", "Leaf", library_name, parent_group_name=inner)
+            sink = _create_node("EchoNode", "Sink", library_name)
+
+            nest_result = GriptapeNodes.handle_request(
+                AddNodesToNodeGroupRequest(node_names=[inner], node_group_name=outer)
+            )
+            assert isinstance(nest_result, AddNodesToNodeGroupResultSuccess), nest_result
+
+            _connect(leaf, sink)
+
+        commands = _serialize(flow.flow_name)
+
+        GriptapeNodes.handle_request(ClearAllObjectStateRequest(i_know_what_im_doing=True))
+        result = _deserialize_into_fresh_context(commands)
+
+        restored_outer = _get_group(result.node_name_mappings["OuterGroup"])
+        restored_leaf = GriptapeNodes.NodeManager().get_node_by_name(result.node_name_mappings["Leaf"])
+        assert restored_outer.contains_node(restored_leaf)
+
+        # Exactly one: the edge has to come back, and it must not be duplicated per boundary.
+        assert len(_edges_from(restored_leaf.name)) == 1, (
+            f"expected one outgoing edge from the nested leaf, got {_edges_from(restored_leaf.name)}"
+        )
+
     def test_restores_saved_parameter_values_from_inside_a_subflow(self, library_name: str) -> None:
         """Values are stored per level too, so a value on a nested node must come back."""
         flow = GriptapeNodes.handle_request(

@@ -52,6 +52,40 @@ class TestSubflowNodeGroupCreateSubflow:
         assert group.metadata["subflow_name"] == "G_subflow_1"
 
 
+class TestGetAllNodes:
+    """get_all_nodes has to reach the whole body, not just the first level down.
+
+    Callers use it to package a group for execution (remote, private, iterative), so a node it
+    misses is a node that silently does not run.
+    """
+
+    def test_collects_members_nested_more_than_one_level_deep(
+        self,
+        griptape_nodes: GriptapeNodes,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        outer = _MiniSubflowGroup(name="outer")
+        middle = _MiniSubflowGroup(name="middle")
+        inner = _MiniSubflowGroup(name="inner")
+        leaf = _MiniSubflowGroup(name="leaf")
+
+        # Wire membership directly: this covers the traversal, not the add-to-group machinery.
+        outer.nodes = {"middle": middle}
+        middle.nodes = {"inner": inner}
+        inner.nodes = {"leaf": leaf}
+
+        # "leaf" is three levels down; walking a single level would stop at "middle".
+        assert set(outer.get_all_nodes()) == {"middle", "inner", "leaf"}
+
+    def test_returns_direct_members_when_nothing_is_nested(
+        self,
+        griptape_nodes: GriptapeNodes,  # noqa: ARG002 - initialises the engine singleton for construction
+    ) -> None:
+        group = _MiniSubflowGroup(name="group")
+        group.nodes = {"only": _MiniSubflowGroup(name="only")}
+
+        assert set(group.get_all_nodes()) == {"only"}
+
+
 class _MiniSubflowGroup(SubflowNodeGroup):
     """Minimal concrete SubflowNodeGroup exercising only _create_subflow."""
 
