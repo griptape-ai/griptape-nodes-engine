@@ -112,9 +112,12 @@ class RunAgentResultSuccess(WorkflowNotAlteredMixin, ResultPayloadSuccess):
             ``text`` (the assistant's final text), ``message_count`` (messages in
             the thread after this turn), ``generated_image_urls`` (URLs of images
             produced by the ``generate_image`` tool this turn, in call order;
-            empty when none were generated), and ``cancelled`` (``True`` when the
+            empty when none were generated), ``cancelled`` (``True`` when the
             run was stopped by a ``CancelAgentRequest`` before completing;
-            ``text`` then holds whatever was streamed before cancellation).
+            ``text`` then holds whatever was streamed before cancellation), and
+            ``truncated`` (``True`` when the model hit its output token limit
+            before finishing; the run succeeded but ``text`` ends mid-thought, so
+            surface it rather than rendering the turn as a complete reply).
         thread_id: The thread ID used for this conversation
     """
 
