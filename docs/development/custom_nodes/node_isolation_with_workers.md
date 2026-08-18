@@ -232,12 +232,30 @@ list on the next execute. The
 [`parameter-mutation-during-aprocess`](strict_mode.md) rule fires
 on direct in-execute mutations and tells you which one to use.
 
-**Hydration-time mutations are explicitly sanctioned.** The standard
-dynamic-pipeline pattern — `before_value_set` / `after_value_set`
-adjusts the parameter list as inputs change — does **not** trip this
-rule. The rule only fires once the framework has entered
-`aprocess_scope()`, which it opens specifically around `process`
-execution, not around the input-hydration pass.
+**Hydration-time mutations skip this rule but do not propagate
+either.** `before_value_set` / `after_value_set` run during input
+hydration on the same transient worker-side node, so a
+parameter-list mutation made there is discarded when the node is —
+and under isolation these hooks never run when a value changes in
+the editor, because the orchestrator's stub copy of your class does
+not carry the overrides. The standard dynamic-pipeline pattern
+(hooks adjust the parameter list as inputs change) therefore does
+not work for a worker-hosted library. Overriding a value hook fires
+the [`value-hooks-execute-only-on-worker`](strict_mode.md) warning
+at library load.
+
+### Connection hooks never fire under isolation
+
+`after_incoming_connection`, `after_outgoing_connection`, the
+`allow_*` validators, and the `*_removed` variants are invoked on
+the orchestrator when connections change — connections are
+orchestrator-owned state, and the worker is not consulted. For a
+worker-hosted library those calls land on the stub class, so an
+override you write never runs, silently. Overriding a connection
+hook fires the
+[`connection-hooks-inert-on-worker`](strict_mode.md) warning at
+library load. If your node needs to react to wiring (the
+dynamic-parameter pattern), run the library in Shared mode.
 
 ### Parameter `converters`, `validators`, and `traits` do not cross to the orchestrator
 
@@ -320,6 +338,11 @@ logs a `WARNING` so the asymmetry is visible.
     `GriptapeNodes.handle_request(...)` instead
 - [ ] Cross-node / flow state passed in via parameters, not fetched
     from inside `process`
+- [ ] No connection hooks (`after_incoming_connection` and siblings)
+    overridden -- they never fire for a worker-hosted library
+- [ ] `before_value_set` / `after_value_set` used only for value
+    transformation, not editor-time reactivity or parameter-list
+    mutation
 - [ ] Custom `converters` / `validators` / `traits` either re-run
     inside `process` or accepted as orchestrator-only UI sugar
 - [ ] `pip_dependencies` pinned to specific versions
