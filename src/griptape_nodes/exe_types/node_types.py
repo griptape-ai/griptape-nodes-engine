@@ -1606,7 +1606,6 @@ class BaseNode(ABC):
         """Emit an AlterElementEvent for parameter add/remove operations."""
         # Create event data using the parameter's to_event method
         if remove:
-            # Import logger here to avoid circular dependency
             payload = RemoveElementEvent(element_id=parameter.element_id)
         else:
             event_data = parameter.to_event(self)

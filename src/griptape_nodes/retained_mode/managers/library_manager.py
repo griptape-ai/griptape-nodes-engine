@@ -5052,6 +5052,7 @@ class LibraryManager(EngineScoped):
                             node_type=class_name,
                             name=self._SCHEMA_PROBE_NODE_NAME,
                             specific_library_name=library_name,
+                            engine=self.engine,
                         ),
                         timeout=self._SCHEMA_PROBE_TIMEOUT_S,
                     )

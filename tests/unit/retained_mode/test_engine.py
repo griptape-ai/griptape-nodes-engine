@@ -356,7 +356,7 @@ class TestNodeEngineBinding:
         assert second.event_manager.event_queue.empty()
 
     def test_create_node_binds_the_node_to_the_supplied_engine(self) -> None:
-        """`LibraryRegistry.create_node`'s own binding line actually runs, not just the fallback."""
+        """`create_node` binds a supplied engine; a node created without one falls back to the process engine."""
         LibraryRegistry._clear()
         _register_param_declaring_node_library()
         engine = Engine()
@@ -378,6 +378,25 @@ class TestNodeEngineBinding:
 
             assert unbound_node._engine is None
             assert unbound_node.engine is current_engine()
+        finally:
+            LibraryRegistry._clear()
+
+    def test_nested_constructing_node_without_an_engine_inherits_the_outer_one(self) -> None:
+        """Omitting `engine` on a nested `constructing_node()` inherits the outer call's engine.
+
+        `LibraryRegistry.constructing_node()` is the tool for any construction site that
+        bypasses `create_node`, so a node built from inside another node's `__init__` (a helper
+        or reference node, say) has to keep resolving to the outer engine rather than falling
+        back to the process engine just because the inner call didn't repeat it.
+        """
+        LibraryRegistry._clear()
+        _register_param_declaring_node_library()
+        engine = Engine()
+        try:
+            with LibraryRegistry.constructing_node(engine=engine), LibraryRegistry.constructing_node():
+                node = _ParamDeclaringNode(name="nested")
+
+            assert node.engine is engine
         finally:
             LibraryRegistry._clear()
 

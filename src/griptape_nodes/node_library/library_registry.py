@@ -473,9 +473,8 @@ class LibraryRegistry:
         with cls.constructing_node(engine=engine):
             node = dest_library.create_node(node_type=node_type, name=name, metadata=metadata)
 
-        # Safety net for a subclass __init__ that never calls super().__init__(): BaseNode.__init__
-        # is what reads constructing_engine() to bind _engine, so a subclass that skips it would
-        # otherwise leave the node unbound even though an engine was supplied here.
+        # Redundant with the constructing_engine() seed BaseNode.__init__ already applied; kept as
+        # a belt-and-braces assignment so an explicitly supplied engine is bound regardless.
         if engine is not None:
             node._engine = engine
 
@@ -503,11 +502,14 @@ class LibraryRegistry:
           instance) resolve to ``engine`` instead of falling back to the process engine.
 
         Args:
-            engine: The engine constructing the node, when one is available. Read by
-                ``BaseNode.__init__`` via ``constructing_engine()``.
+            engine: The engine constructing the node, when one is available. Omitting it inherits
+                the engine already recorded for the calling task, so a nested call inside an
+                active ``constructing_node(engine=...)`` keeps that engine rather than clearing it.
+                Read by ``BaseNode.__init__`` via ``constructing_engine()``.
         """
+        resolved_engine = engine if engine is not None else _constructing_node_engine.get()
         node_token = _constructing_node.set(True)
-        engine_token = _constructing_node_engine.set(engine)
+        engine_token = _constructing_node_engine.set(resolved_engine)
         try:
             yield
         finally:

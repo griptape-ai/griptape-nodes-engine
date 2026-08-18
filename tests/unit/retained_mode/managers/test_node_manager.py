@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from griptape_nodes.exe_types.core_types import Parameter
+from griptape_nodes.exe_types.flow import ControlFlow
 from griptape_nodes.exe_types.node_types import BaseNode, NodeResolutionState
 from griptape_nodes.node_library.library_registry import LibraryRegistryError
 from griptape_nodes.retained_mode.engine import Engine
@@ -13,6 +14,8 @@ from griptape_nodes.retained_mode.events.node_events import (
     BatchSetNodeMetadataRequest,
     BatchSetNodeMetadataResultFailure,
     BatchSetNodeMetadataResultSuccess,
+    CreateNodeRequest,
+    CreateNodeResultSuccess,
     UnresolveNodeRequest,
     UnresolveNodeResultFailure,
     UnresolveNodeResultSuccess,
@@ -307,31 +310,75 @@ class TestSerializeNodeWithoutLibraryMetadata:
 
 
 class TestErrorProxyNodeEngineBinding:
-    """Constructing an `ErrorProxyNode` inside `LibraryRegistry.constructing_node(engine=...)` binds it.
+    """`on_create_node_request`'s Error Proxy substitution binds to the engine handling the request.
 
-    `on_create_node_request` wraps its Error Proxy substitution in exactly this context manager.
-    Driving the full failure path (license checkpoint, library lookup, flow setup) just to reach
-    that construction is disproportionate to what changed; this pins the wrap itself, i.e. that
-    the proxy binds to the constructing engine the same way `LibraryRegistry.create_node` binds
-    every other node type.
+    Uses a standalone `Engine()` rather than the process root, so a node that fell back to the
+    process engine (the bug this pins) would resolve to a different object than the one under
+    test and the assertion would fail.
     """
 
-    def test_error_proxy_node_binds_to_the_engine_constructing_it(self) -> None:
-        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+    _LIBRARY_NAME = "error-proxy-engine-binding-test-library"
+
+    @pytest.fixture(autouse=True)
+    def _clean_registry(self):  # noqa: ANN202
         from griptape_nodes.node_library.library_registry import LibraryRegistry
 
+        LibraryRegistry._clear()
+        yield
+        LibraryRegistry._clear()
+
+    def _register_always_failing_node_type(self) -> None:
+        """Register a node type whose `__init__` always raises, forcing the Error Proxy path."""
+        from griptape_nodes.node_library.library_registry import (
+            LibraryMetadata,
+            LibraryRegistry,
+            LibrarySchema,
+            NodeMetadata,
+        )
+
+        schema = LibrarySchema(
+            name=self._LIBRARY_NAME,
+            library_schema_version=LibrarySchema.LATEST_SCHEMA_VERSION,
+            metadata=LibraryMetadata(
+                author="test", description="d", library_version="1.0.0", engine_version="1.0.0", tags=[]
+            ),
+            categories=[],
+            nodes=[],
+        )
+        library = LibraryRegistry.generate_new_library(library_data=schema)
+        library.register_new_node_type(
+            _AlwaysFailsNode, NodeMetadata(category="test", description="probe", display_name="Always Fails")
+        )
+
+    def test_error_proxy_node_binds_to_the_engine_handling_the_request(self) -> None:
+        from griptape_nodes.exe_types.node_types import ErrorProxyNode
+
+        self._register_always_failing_node_type()
         engine = Engine()
+        engine.context_manager.push_workflow(workflow_name="test-workflow")
+        flow = ControlFlow(name="test-flow")
+        engine.context_manager.push_flow(flow)
 
-        with LibraryRegistry.constructing_node(engine=engine):
-            node = ErrorProxyNode(
-                name="Execute Python",
-                original_node_type="ExecutePython",
-                original_library_name="Missing Library",
-                failure_reason="library failed to load",
-                metadata={},
-            )
+        result = engine.node_manager.on_create_node_request(
+            CreateNodeRequest(node_type=_AlwaysFailsNode.__name__, specific_library_name=self._LIBRARY_NAME)
+        )
 
+        assert isinstance(result, CreateNodeResultSuccess)
+        node = engine.object_manager.attempt_get_object_by_name_as_type(result.node_name, ErrorProxyNode)
+
+        assert node is not None
         assert node.engine is engine
+
+
+class _AlwaysFailsNode(BaseNode):
+    """A node type whose `__init__` always raises, so creating it forces the Error Proxy path."""
+
+    def __init__(self, name: str, metadata: dict | None = None) -> None:  # noqa: ARG002
+        msg = "deliberate failure for TestErrorProxyNodeEngineBinding"
+        raise RuntimeError(msg)
+
+    def process(self) -> None:
+        return None
 
 
 class TestUnresolveNodeRequest:
