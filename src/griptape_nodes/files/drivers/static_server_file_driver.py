@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import anyio
 
 from griptape_nodes.files.base_file_driver import BaseFileDriver
+from griptape_nodes.files.path_utils import parse_static_server_url
 from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
 
@@ -47,9 +48,6 @@ class StaticServerFileDriver(BaseFileDriver):
     def _resolve_to_local_path(self, location: str) -> Path:
         """Resolve a localhost URL to the actual file path on disk.
 
-        Strips query parameters (cachebuster ?t=...) from localhost URLs
-        before extracting the workspace-relative path.
-
         Args:
             location: Localhost URL
 
@@ -59,17 +57,14 @@ class StaticServerFileDriver(BaseFileDriver):
         Raises:
             ValueError: If URL format is invalid
         """
-        # Strip query parameters (cachebuster ?t=...)
-        url_without_params = location.split("?", maxsplit=1)[0] if "?" in location else location
-        parsed = urlparse(url_without_params)
+        workspace_path = GriptapeNodes.ConfigManager().workspace_path
+        local_path = parse_static_server_url(location, workspace_path)
 
-        if "/workspace/" not in parsed.path:
+        if local_path is None:
             msg = f"Attempted to resolve localhost URL. Failed with url='{location}' because /workspace/ not found in path."
             raise ValueError(msg)
 
-        workspace_relative_path = parsed.path.split("/workspace/", 1)[1]
-        workspace_path = GriptapeNodes.ConfigManager().workspace_path
-        return workspace_path / workspace_relative_path
+        return local_path
 
     async def read(self, location: str, timeout: float) -> bytes:  # noqa: ARG002, ASYNC109
         """Read file from workspace path resolved from localhost URL.
