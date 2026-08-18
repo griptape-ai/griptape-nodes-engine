@@ -589,6 +589,15 @@ class BaseNode(ABC):
         # Default behavior is to do nothing, and indicate no other modified Parameters.
         return None  # noqa: RET501
 
+    def get_nodes_to_group_with(self) -> list[BaseNode]:
+        """Nodes that must share this node's node group membership.
+
+        Override when a node is only meaningful alongside a partner, e.g. an iterative Start node
+        and its paired End node. Node groups both pull these in on add and pull them out on remove,
+        so the pair is never split across a group boundary.
+        """
+        return []
+
     def after_node_deleted(self) -> None:
         """Called before a node is deleted. Override to perform cleanup (e.g. deleting a loaded subflow)."""
         return

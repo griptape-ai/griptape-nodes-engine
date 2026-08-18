@@ -471,17 +471,6 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
                         msg = f"{self.name}: Failed to create direct incoming connection from {connection.source_node.name}.{connection.source_parameter.name} to {node.name}.{parameter_name}: {create_result.result_details}"
                         raise RuntimeError(msg)
 
-    def _remove_nodes_from_existing_parents(self, nodes: list[BaseNode]) -> None:
-        """Remove nodes from their existing parent groups."""
-        child_nodes = {}
-        for node in nodes:
-            if node.parent_group is not None:
-                existing_parent_group = node.parent_group
-                if isinstance(existing_parent_group, SubflowNodeGroup):
-                    child_nodes.setdefault(existing_parent_group, []).append(node)
-        for parent_group, node_list in child_nodes.items():
-            parent_group.remove_nodes_from_group(node_list)
-
     def _cleanup_proxy_parameter(self, proxy_parameter: Parameter, metadata_key: str) -> None:
         """Clean up proxy parameter if it has no more connections.
 
@@ -678,11 +667,15 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         super().after_value_set(parameter, value)
         self.subflow_execution_component.after_value_set(parameter, value)
 
-    def add_nodes_to_group(self, nodes: list[BaseNode]) -> None:
+    def add_nodes_to_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Add nodes to the group and track their connections.
 
         Args:
             nodes: List of nodes to add to the group
+
+        Returns:
+            The nodes actually added, including any tethered companions pulled in and any extra
+            nodes a previous owner released alongside them.
         """
         from griptape_nodes.retained_mode.events.node_events import (
             MoveNodeToNewFlowRequest,
@@ -690,7 +683,9 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
-        self._remove_nodes_from_existing_parents(nodes)
+        # Pull in companions this group does not already hold, so a Start/End pair joins together.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=False)
+        nodes = nodes + self._remove_nodes_from_existing_parents(nodes)
         self._add_nodes_to_group_dict(nodes)
 
         # Create subflow on-demand if it doesn't exist
@@ -714,6 +709,38 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         self.remap_to_internal(nodes, connections)
         self._map_external_connections_for_nodes(nodes, connections, node_names_in_group)
 
+        return nodes
+
+    def _expand_with_tethered_nodes(self, nodes: list[BaseNode], *, companion_must_be_member: bool) -> list[BaseNode]:
+        """Expand a node list with its tethered companions, so a Start/End pair is never split.
+
+        Only subflow groups enforce this: they own a real subflow, so a split pair would leave one
+        half in the subflow and the other in the parent flow. A plain BaseNodeGroup is a visual
+        grouping with no flow of its own, so it groups exactly what it was asked to.
+
+        Args:
+            nodes: The requested nodes.
+            companion_must_be_member: Which direction is being expanded. On removal (`True`) only
+                companions this group currently holds can be pulled out. On addition (`False`) only
+                companions it does not already hold are worth adding — a companion owned by a
+                different group follows its partner here, and
+                `_remove_nodes_from_existing_parents` detaches it from the old owner so no group
+                advertises a node it no longer holds.
+
+        Returns:
+            The requested nodes plus any companions, with duplicates skipped.
+        """
+        expanded = list(nodes)
+        for node in nodes:
+            for companion in node.get_nodes_to_group_with():
+                if companion in expanded:
+                    continue
+                if (companion.name in self.nodes) is not companion_must_be_member:
+                    continue
+                expanded.append(companion)
+
+        return expanded
+
     def _map_external_connections_for_nodes(
         self, nodes: list[BaseNode], connections: Connections, node_names_in_group: set[str]
     ) -> None:
@@ -724,6 +751,10 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             connections: Connections object from FlowManager
             node_names_in_group: Set of all node names currently in the group
         """
+        # TODO(https://github.com/griptape-ai/griptape-nodes-engine/issues/5272): Skip hidden iterative
+        # tether params here. When a Start/End pair straddles the group boundary, proxying their tethers
+        # deletes the originals and every replacement hop is rejected, destroying the pairing.
+
         # Group outgoing connections by (source_node, source_parameter) to reuse proxy parameters
         # Skip connections that already go to the NodeGroup itself (existing proxy parameters)
         outgoing_by_source: dict[tuple[str, str], list[Connection]] = {}
@@ -904,11 +935,14 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
             self.nodes.pop(node.name)
         self.metadata["node_names_in_group"] = list(self.nodes.keys())
 
-    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> None:
+    def remove_nodes_from_group(self, nodes: list[BaseNode]) -> list[BaseNode]:
         """Remove nodes from the group and untrack their connections.
 
         Args:
             nodes: List of nodes to remove from the group
+
+        Returns:
+            The nodes actually removed, including any tethered companions pulled out.
         """
         from griptape_nodes.retained_mode.events.node_events import (
             MoveNodeToNewFlowRequest,
@@ -916,6 +950,11 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         )
         from griptape_nodes.retained_mode.griptape_nodes import GriptapeNodes
 
+        # Pull out companions this group holds, so removing a Start node does not leave its End node
+        # behind — the same split state the add path prevents, reached from the other direction.
+        # Expand before validating: restricting to current members means expansion cannot introduce a
+        # node that _validate_nodes_in_group would reject.
+        nodes = self._expand_with_tethered_nodes(nodes, companion_must_be_member=True)
         self._validate_nodes_in_group(nodes)
 
         parent_flow_name = None
@@ -951,6 +990,8 @@ class SubflowNodeGroup(BaseNodeGroup, ABC):
         if remaining_nodes:
             node_names_in_group = set(self.nodes.keys())
             self._map_external_connections_for_nodes(remaining_nodes, connections, node_names_in_group)
+
+        return nodes
 
     async def execute_subflow(self) -> None:
         """Execute the subflow and propagate output values.
